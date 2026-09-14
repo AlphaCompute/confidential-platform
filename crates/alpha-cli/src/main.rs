@@ -15,7 +15,7 @@ use alpha_crypto::PublicKey;
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use clap::{Args, Parser, Subcommand};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// The alphacompute CLI: keys, Control calls, the platform document, deploys, and the
 /// custodians' bootstrap and unseal.
@@ -219,7 +219,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 return Err(Exit::Refused("passphrases differ".into()));
             }
             let key = keyfile::generate(algorithm, &out, &pass)?;
-            Ok(serde_json::json!({ "file": out, "public_key": key.public_key_text() }))
+            Ok(json!({ "file": out, "public_key": key.public_key_text() }))
         }
         Command::Call {
             route,
@@ -256,10 +256,10 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 let artifact: SignedDocument = serde_json::from_value(document)
                     .map_err(|e| Exit::Refused(format!("artifact: {e}")))?;
                 let summary = sign::check(&artifact, &alpha_cli::release_key(), now)?;
-                return Ok(serde_json::to_value(summary).expect("serializes"));
+                return Ok(json!(summary));
             }
             let key = read_ed25519(&release_key.expect("required unless --check"))?;
-            Ok(serde_json::to_value(sign::sign(document, &key)?).expect("serializes"))
+            Ok(json!(sign::sign(document, &key)?))
         }
         Command::Deploy {
             register_only,
@@ -295,7 +295,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 node::attested_node(&endpoint, &config.pccs_url, &doc, Some(remembered), now)
                     .await?;
             let reply = node::unseal(&client, &identity, &share, &custodian, doc.version).await?;
-            Ok(serde_json::to_value(reply).expect("serializes"))
+            Ok(json!(reply))
         }
         Command::Bootstrap {
             custodians,

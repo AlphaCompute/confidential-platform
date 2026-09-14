@@ -17,7 +17,8 @@ use crate::random;
 
 pub const FORMAT: &str = "alphacompute-key/1";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Algorithm {
     Ed25519,
     XWing,
@@ -36,7 +37,7 @@ impl Algorithm {
 #[serde(deny_unknown_fields)]
 struct KeyFile {
     format: String,
-    algorithm: String,
+    algorithm: Algorithm,
     kdf: Kdf,
     aead: String,
     nonce: String,
@@ -134,7 +135,7 @@ pub fn generate(algorithm: Algorithm, path: &Path, passphrase: &[u8]) -> Result<
         .expect("AES-GCM encryption cannot fail");
     let file = KeyFile {
         format: FORMAT.into(),
-        algorithm: algorithm.name().into(),
+        algorithm,
         kdf,
         aead: "aes-256-gcm".into(),
         nonce: BASE64_URL_SAFE_NO_PAD.encode(nonce),
@@ -155,11 +156,6 @@ pub fn read(path: &Path, passphrase: &[u8]) -> Result<Key, String> {
     if file.aead != "aes-256-gcm" {
         return Err(format!("key file: unsupported aead {:?}", file.aead));
     }
-    let algorithm = match file.algorithm.as_str() {
-        "ed25519" => Algorithm::Ed25519,
-        "x-wing" => Algorithm::XWing,
-        other => return Err(format!("key file: unsupported algorithm {other:?}")),
-    };
     let key = derive(passphrase, &file.kdf)?;
     let decode = |field: &str, text: &str| {
         BASE64_URL_SAFE_NO_PAD
@@ -176,7 +172,7 @@ pub fn read(path: &Path, passphrase: &[u8]) -> Result<Key, String> {
             &Nonce::from(nonce),
             Payload {
                 msg: &ciphertext,
-                aad: algorithm.name().as_bytes(),
+                aad: file.algorithm.name().as_bytes(),
             },
         )
         .map(Zeroizing::new)
@@ -184,7 +180,7 @@ pub fn read(path: &Path, passphrase: &[u8]) -> Result<Key, String> {
     let seed: Zeroizing<[u8; 32]> = Zeroizing::new(
         <[u8; 32]>::try_from(seed.as_slice()).map_err(|_| "key file: seed is not 32 bytes")?,
     );
-    Ok(Key::from_seed(algorithm, &seed))
+    Ok(Key::from_seed(file.algorithm, &seed))
 }
 
 #[cfg(test)]

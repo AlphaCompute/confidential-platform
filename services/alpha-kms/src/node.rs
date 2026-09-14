@@ -363,9 +363,7 @@ async fn join_via(node: &Node, client: &Client, endpoint: &str) -> Result<(), Ap
         .await
         .map_err(http)?;
     let field = |name: &str, text: &str| {
-        BASE64_URL_SAFE_NO_PAD
-            .decode(text)
-            .map_err(|_| ApiError::internal(format!("join reply: {name}")))
+        alpha_client::decode(name, text).map_err(|e| ApiError::internal(format!("join reply: {e}")))
     };
     let tenant_kek_root = Zeroizing::new(
         <[u8; 32]>::try_from(field("tenant_kek_root", &reply.tenant_kek_root)?.as_slice())

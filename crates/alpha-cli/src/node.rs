@@ -11,7 +11,6 @@ use alpha_client::{
     Anchor, BootstrapBody, BootstrapRequest, Client, NodeEvidence, Pin, UnsealReply, UnsealRequest,
     fetch_node_evidence,
 };
-use alpha_core::ComposeHash;
 use alpha_crypto::{INFO_NODE_BOOTSTRAP, INFO_UNSEAL_SHARE, PublicKey, Sealed};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -24,7 +23,6 @@ use crate::{random, sha256_prefixed};
 pub struct NodeIdentity {
     pub runtime_spki: Vec<u8>,
     pub xwing: PublicKey,
-    pub compose_hash: ComposeHash,
 }
 
 impl NodeIdentity {
@@ -55,7 +53,7 @@ pub fn verify_node(
         ));
     }
     let runtime_spki = evidence.runtime_spki().map_err(|e| e.to_string())?;
-    let appraised = appraise(
+    appraise(
         &evidence.evidence().map_err(|e| e.to_string())?,
         nonce,
         &runtime_spki,
@@ -71,7 +69,6 @@ pub fn verify_node(
     Ok(NodeIdentity {
         runtime_spki,
         xwing: evidence.xwing_pubkey.clone(),
-        compose_hash: appraised.compose_hash,
     })
 }
 
@@ -291,38 +288,23 @@ mod tests {
         let node = verify(&c, &c.evidence, &spki, Some(1)).unwrap();
         assert_eq!(node.runtime_spki, spki);
         assert_eq!(node.xwing, c.evidence.xwing_pubkey);
-        assert_eq!(node.compose_hash, c.doc.kms_revisions[0].compose_hash);
         assert_eq!(node.aad(), <[u8; 32]>::from(Sha256::digest(&spki)));
     }
 
     #[test]
-    fn substituted_xwing_key_beside_a_genuine_quote_is_refused() {
-        let c = capture();
+    fn substituted_key_old_document_foreign_server_or_unlisted_revision_is_refused() {
+        let mut c = capture();
+        let spki = read("runtime_spki.der");
         let mut evidence = c.evidence.clone();
         evidence.xwing_pubkey = alpha_crypto::PrivateKey::generate().public();
-        let err = verify(&c, &evidence, &read("runtime_spki.der"), None).unwrap_err();
+        let err = verify(&c, &evidence, &spki, None).unwrap_err();
         assert!(err.starts_with("attestation_failed"), "{err}");
-    }
-
-    #[test]
-    fn document_below_the_remembered_version_is_refused() {
-        let c = capture();
-        let err = verify(&c, &c.evidence, &read("runtime_spki.der"), Some(2)).unwrap_err();
+        let err = verify(&c, &c.evidence, &spki, Some(2)).unwrap_err();
         assert!(err.contains("below the remembered 2"), "{err}");
-    }
-
-    #[test]
-    fn server_key_other_than_the_attested_one_is_refused() {
-        let c = capture();
         let err = verify(&c, &c.evidence, b"someone else's key", None).unwrap_err();
         assert!(err.contains("not the attested runtime_pubkey"), "{err}");
-    }
-
-    #[test]
-    fn node_revision_outside_the_allowlist_is_unknown() {
-        let mut c = capture();
         c.doc.kms_revisions.clear();
-        let err = verify(&c, &c.evidence, &read("runtime_spki.der"), None).unwrap_err();
+        let err = verify(&c, &c.evidence, &spki, None).unwrap_err();
         assert!(err.starts_with("attestation_unknown"), "{err}");
     }
 

@@ -1,11 +1,11 @@
-//! Client for the Control and Node APIs of `alpha-kms`: a list of endpoints tried in turn on a
-//! connection failure or a 5xx (never on a 4xx), one pinned TLS configuration, typed bodies for
-//! every route, the error envelope as one error, and the signing helper for the Control bodies.
+//! Client for the three APIs of `alpha-kms`: a list of endpoints tried in turn on a connection
+//! failure or a 5xx (never on a 4xx), one pinned TLS configuration, typed bodies for every route,
+//! the error envelope as one error, and the signing helper for the Control bodies.
 
 pub mod platform;
 pub mod tls;
 
-use alpha_attest::{EVIDENCE_FORMAT, EventLogEntry, Evidence};
+use alpha_attest::{AttestationResult, EVIDENCE_FORMAT, EventLogEntry, Evidence};
 use alpha_core::{
     AppId, ComposeHash, KeyId, OrgId, PrincipalId, SecretId, context, signing_digest,
 };
@@ -102,6 +102,28 @@ pub struct Ready {
 pub struct Nonce {
     pub nonce: String,
     pub expires_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttestRequest {
+    pub runtime_pubkey: String,
+    pub nonce: String,
+    pub evidence: Evidence,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AttestReply {
+    pub certificate_chain: Vec<String>,
+    pub not_after: String,
+    pub attestation_result: AttestationResult,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Secret {
+    pub value: String,
+    pub content_sha256: String,
+    pub issued_at: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -286,7 +308,7 @@ impl Client {
             return Err(Error::Invalid("no endpoints".into()));
         }
         let http = reqwest::Client::builder()
-            .tls_backend_preconfigured(tls::client_config(pin, identity)?)
+            .tls_backend_preconfigured(tls::client_config(Some(pin), identity)?)
             .build()
             .map_err(|e| Error::Invalid(format!("http client: {e}")))?;
         Ok(Self {
@@ -349,8 +371,19 @@ impl Client {
         self.request(Method::GET, "/ready", None).await
     }
 
+    // Instance API
+
     pub async fn attest_nonce(&self) -> Result<Nonce, Error> {
         self.request(Method::POST, "/v1/attest/nonce", None).await
+    }
+
+    pub async fn attest(&self, body: &AttestRequest) -> Result<AttestReply, Error> {
+        self.post("/v1/attest", body).await
+    }
+
+    pub async fn get_secret(&self, name: &str) -> Result<Secret, Error> {
+        self.request(Method::GET, &format!("/v1/secrets/{name}"), None)
+            .await
     }
 
     // Control API
@@ -417,7 +450,7 @@ pub async fn fetch_node_evidence(
 ) -> Result<(NodeEvidence, Vec<u8>), Error> {
     let endpoint = endpoint.trim_end_matches('/');
     let http = reqwest::Client::builder()
-        .tls_backend_preconfigured(tls::unpinned_config())
+        .tls_backend_preconfigured(tls::client_config(None, None)?)
         .tls_info(true)
         .build()
         .map_err(|e| Error::Invalid(format!("http client: {e}")))?;

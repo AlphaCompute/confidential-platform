@@ -35,14 +35,7 @@ fn identity_of(node: &alpha_kms::Node) -> cli_node::NodeIdentity {
     cli_node::NodeIdentity {
         runtime_spki: node.runtime_spki.clone(),
         xwing: node.xwing_key.public(),
-        compose_hash: node.compose_hash,
     }
-}
-
-fn temp_dir(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("alpha-cli-{name}-{}", Uuid::now_v7()));
-    fs::create_dir_all(&dir).unwrap();
-    dir
 }
 
 #[tokio::test]
@@ -330,7 +323,8 @@ async fn bootstrap_once_never_again_then_unseal_the_second_node() {
         public_key: spki_b64(&anchor_key),
         label: "pilot anchor".into(),
     };
-    let dir = temp_dir("bootstrap");
+    let dir = std::env::temp_dir().join(format!("alpha-cli-bootstrap-{}", Uuid::now_v7()));
+    fs::create_dir_all(&dir).unwrap();
 
     let reply = cli_node::bootstrap(&client, &identity, pubs.clone(), anchor.clone(), 1, &dir)
         .await

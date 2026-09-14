@@ -14,10 +14,8 @@ use ed25519_dalek::VerifyingKey;
 
 /// The release key's public half, the same file `alpha-kms` compiles in; replaced at the
 /// ceremony, never in CI.
-pub const RELEASE_KEY_HEX: &str = include_str!("../../../services/alpha-kms/release-key.pub");
-
 pub fn release_key() -> VerifyingKey {
-    alpha_core::hex_bytes::<32>(RELEASE_KEY_HEX.trim())
+    alpha_core::hex_bytes::<32>(include_str!("../../../services/alpha-kms/release-key.pub").trim())
         .and_then(|b| VerifyingKey::from_bytes(&b).ok())
         .expect("release-key.pub is an Ed25519 public key")
 }

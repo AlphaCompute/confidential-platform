@@ -157,7 +157,7 @@ impl ServerCertVerifier for PinnedServer {
     }
 }
 
-fn builder(pin: Option<Pin>, identity: Option<Identity>) -> Result<ClientConfig, Error> {
+pub fn client_config(pin: Option<Pin>, identity: Option<Identity>) -> Result<ClientConfig, Error> {
     let builder = ClientConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .expect("TLS 1.3 is supported")
@@ -176,14 +176,6 @@ fn builder(pin: Option<Pin>, identity: Option<Identity>) -> Result<ClientConfig,
             )
             .map_err(|e| Error::Invalid(format!("client identity: {e}")))?,
     })
-}
-
-pub fn client_config(pin: Pin, identity: Option<Identity>) -> Result<ClientConfig, Error> {
-    builder(Some(pin), identity)
-}
-
-pub(crate) fn unpinned_config() -> ClientConfig {
-    builder(None, None).expect("nothing to reject")
 }
 
 pub fn uri_sans(cert: &[u8]) -> Result<Vec<String>, Error> {
