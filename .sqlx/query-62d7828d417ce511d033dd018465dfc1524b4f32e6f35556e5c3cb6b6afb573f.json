@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select app_id from revisions where org_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "app_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "revisions",
+            "name": "app_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "62d7828d417ce511d033dd018465dfc1524b4f32e6f35556e5c3cb6b6afb573f"
+}

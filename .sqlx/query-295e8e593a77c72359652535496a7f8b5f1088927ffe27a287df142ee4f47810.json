@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update principal_keys set public_key = $1 where registered_by_key is null",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "295e8e593a77c72359652535496a7f8b5f1088927ffe27a287df142ee4f47810"
+}

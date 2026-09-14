@@ -233,3 +233,26 @@ mod tests {
         assert!(matches!(quote(&[0; 64]), Err(Error::Io(what, _)) if what == "create tsm entry"));
     }
 }
+
+#[cfg(test)]
+mod capture_tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use super::*;
+
+    /// The raw CCEL table and runtime event file of a real Phala CVM must rebuild the event
+    /// log its guest agent returned from `GetQuote`.
+    #[test]
+    fn rebuilds_the_guest_agents_event_log() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/attest/phala-0.5.9-1c-2g-keyed");
+        let ccel = fs::read(dir.join("ccel.bin")).unwrap();
+        let runtime = fs::read_to_string(dir.join("runtime_events.log")).unwrap();
+        let mut log = boot_events(&ccel).unwrap();
+        log.extend(runtime_events(&runtime).unwrap());
+        let expected: Vec<EventLogEntry> =
+            serde_json::from_slice(&fs::read(dir.join("event_log.json")).unwrap()).unwrap();
+        assert_eq!(log, expected);
+    }
+}

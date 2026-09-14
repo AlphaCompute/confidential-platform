@@ -1,0 +1,45 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select purpose::text as purpose, wrapped, public_part from intermediate_keys",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "purpose",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "wrapped",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "intermediate_keys",
+            "name": "wrapped"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "public_part",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "intermediate_keys",
+            "name": "public_part"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      false,
+      true
+    ]
+  },
+  "hash": "0ad79252ba935c1e58ecd10b1d2772916e9b936143bee01af1a7c5270904775d"
+}

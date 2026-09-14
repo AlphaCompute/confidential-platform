@@ -16,7 +16,7 @@ use dcap_qvl::verify::QuoteVerifier;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
-pub use event_log::EventLogEntry;
+pub use event_log::{EventLogEntry, compose_hash as event_log_compose_hash};
 
 pub const EVIDENCE_FORMAT: &str = "alphacompute-evidence/1";
 pub const RESULT_FORMAT: &str = "alphacompute-attestation-result/1";
