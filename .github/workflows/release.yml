@@ -1,0 +1,43 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  runtime-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the runtime image twice, the second time from nothing
+        run: |
+          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          build() {
+            docker build --platform linux/amd64 --provenance=false \
+              --build-arg SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+              -f images/manager/Dockerfile -t "alpha-runtime:$1" "${@:2}" .
+          }
+          build first
+          build second --no-cache
+          first=$(docker image inspect --format '{{.Id}} {{.RootFS.Layers}}' alpha-runtime:first)
+          second=$(docker image inspect --format '{{.Id}} {{.RootFS.Layers}}' alpha-runtime:second)
+          echo "first:  $first"
+          echo "second: $second"
+          if [ "$first" != "$second" ]; then
+            echo "the two builds of images/manager differ; the image is not reproducible" >&2
+            exit 1
+          fi
+          echo "alpha-runtime image (SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH): $first" >> "$GITHUB_STEP_SUMMARY"
+      - name: Push
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          image="ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/alpha-runtime:${GITHUB_REF_NAME}"
+          docker tag alpha-runtime:first "$image"
+          docker push "$image"
+          echo "pushed $(docker image inspect --format '{{index .RepoDigests 0}}' "$image")" >> "$GITHUB_STEP_SUMMARY"

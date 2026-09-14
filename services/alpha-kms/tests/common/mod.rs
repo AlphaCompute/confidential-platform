@@ -55,6 +55,14 @@ pub fn captured_at(capture: &str) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(t.timestamp() as u64)
 }
 
+/// The instant the capture's nonce was minted (its first eight bytes): a node clocked to it
+/// mints exactly `nonce.bin` again.
+pub fn nonce_minted_at(capture: &str) -> SystemTime {
+    let nonce = read(capture, "nonce.bin");
+    let ts = u64::from_be_bytes(nonce[..8].try_into().unwrap());
+    UNIX_EPOCH + Duration::from_secs(ts)
+}
+
 pub fn evidence(capture: &str, kind: &str) -> Evidence {
     Evidence {
         format: EVIDENCE_FORMAT.into(),

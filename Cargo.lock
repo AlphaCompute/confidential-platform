@@ -101,6 +101,7 @@ dependencies = [
  "rustls-webpki",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "thiserror",
  "x509-parser",
 ]
@@ -144,6 +145,7 @@ dependencies = [
  "alpha-client",
  "alpha-core",
  "alpha-crypto",
+ "alpha-runtime",
  "alpha-tsm",
  "axum",
  "base64 0.23.1",
@@ -161,6 +163,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rustls",
+ "rustls-webpki",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -169,6 +172,27 @@ dependencies = [
  "tokio-rustls",
  "uuid",
  "vsss-rs",
+ "x509-parser",
+ "zeroize",
+]
+
+[[package]]
+name = "alpha-runtime"
+version = "0.1.0"
+dependencies = [
+ "alpha-attest",
+ "alpha-client",
+ "alpha-core",
+ "alpha-tsm",
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "getrandom 0.4.3",
+ "p256 0.14.0",
+ "parking_lot",
+ "serde_json",
+ "thiserror",
+ "tokio",
  "zeroize",
 ]
 

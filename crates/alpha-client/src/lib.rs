@@ -29,8 +29,15 @@ use reqwest::Method;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 pub use tls::{Identity, Pin};
+
+pub type TimeProvider = Arc<dyn rustls::time_provider::TimeProvider>;
+
+pub fn system_time_provider() -> TimeProvider {
+    Arc::new(rustls::time_provider::DefaultTimeProvider)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -51,6 +58,9 @@ pub struct ApiError {
     pub code: String,
     pub message: String,
     pub request_id: String,
+    /// The HTTP status the envelope came with.
+    #[serde(skip)]
+    pub status: u16,
 }
 
 #[derive(Deserialize)]
@@ -60,7 +70,10 @@ struct Envelope {
 
 fn api_error(endpoint: &str, status: reqwest::StatusCode, bytes: &[u8]) -> Error {
     match serde_json::from_slice::<Envelope>(bytes) {
-        Ok(envelope) => Error::Api(envelope.error),
+        Ok(envelope) => Error::Api(ApiError {
+            status: status.as_u16(),
+            ..envelope.error
+        }),
         Err(_) => Error::Invalid(format!("{endpoint}: {status} without an error envelope")),
     }
 }
@@ -314,11 +327,22 @@ impl Client {
         pin: Pin,
         identity: Option<Identity>,
     ) -> Result<Self, Error> {
+        Self::configured(endpoints, pin, identity, system_time_provider())
+    }
+
+    /// Everything the constructors above default: `time` is the clock the server's
+    /// certificate validity is judged by.
+    pub fn configured(
+        endpoints: Vec<String>,
+        pin: Pin,
+        identity: Option<Identity>,
+        time: TimeProvider,
+    ) -> Result<Self, Error> {
         if endpoints.is_empty() {
             return Err(Error::Invalid("no endpoints".into()));
         }
         let http = reqwest::Client::builder()
-            .tls_backend_preconfigured(tls::client_config(Some(pin), identity)?)
+            .tls_backend_preconfigured(tls::client_config(Some(pin), identity, time)?)
             .build()
             .map_err(|e| Error::Invalid(format!("http client: {e}")))?;
         Ok(Self {
@@ -452,7 +476,7 @@ pub async fn fetch_node_evidence(
 ) -> Result<(NodeEvidence, Vec<u8>), Error> {
     let endpoint = endpoint.trim_end_matches('/');
     let http = reqwest::Client::builder()
-        .tls_backend_preconfigured(tls::client_config(None, None)?)
+        .tls_backend_preconfigured(tls::client_config(None, None, system_time_provider())?)
         .tls_info(true)
         .build()
         .map_err(|e| Error::Invalid(format!("http client: {e}")))?;

@@ -47,7 +47,7 @@ pub fn ca_spki_sha256(kms_ca_pem: &str) -> Result<Option<String>, String> {
     if kms_ca_pem.trim().is_empty() {
         return Ok(None);
     }
-    let der = alpha_client::tls::ca_from_pem(kms_ca_pem).map_err(|e| e.to_string())?;
+    let der = alpha_client::tls::cert_from_pem(kms_ca_pem).map_err(|e| e.to_string())?;
     let spki = alpha_client::tls::spki_of(&der).map_err(|e| e.to_string())?;
     Ok(Some(crate::sha256_prefixed(&spki)))
 }

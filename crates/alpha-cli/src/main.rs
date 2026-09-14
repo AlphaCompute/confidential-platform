@@ -195,7 +195,7 @@ async fn platform_document(config: &Config, now: SystemTime) -> Result<PlatformD
 /// The admin's pin: `kms_ca_pem` of the platform document fetched and verified now.
 async fn admin_client(config: &Config, now: SystemTime) -> Result<Client, Exit> {
     let doc = platform_document(config, now).await?;
-    let ca = alpha_client::tls::ca_from_pem(&doc.kms_ca_pem)?;
+    let ca = alpha_client::tls::cert_from_pem(&doc.kms_ca_pem)?;
     if config.endpoints.is_empty() {
         return Err(Exit::Usage(
             "--endpoints (or ALPHACOMPUTE_KMS_ENDPOINTS) is required".into(),
