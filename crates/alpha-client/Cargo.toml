@@ -4,18 +4,8 @@ version = "0.1.0"
 edition.workspace = true
 publish.workspace = true
 
-[lints.rust]
-unsafe_code = "forbid"
-
-[lints.clippy]
-unwrap_used = "deny"
-expect_used = "deny"
-panic = "deny"
-unreachable = "deny"
-todo = "deny"
-unimplemented = "deny"
-indexing_slicing = "deny"
-arithmetic_side_effects = "deny"
+[lints]
+workspace = true
 
 [dependencies]
 alpha-attest = { path = "../alpha-attest" }

@@ -61,11 +61,13 @@ pub enum Key {
 }
 
 impl Key {
-    pub fn from_seed(algorithm: Algorithm, seed: &[u8; 32]) -> Self {
-        match algorithm {
+    pub fn from_seed(algorithm: Algorithm, seed: &[u8; 32]) -> Result<Self, String> {
+        Ok(match algorithm {
             Algorithm::Ed25519 => Self::Ed25519(SigningKey::from_bytes(seed)),
-            Algorithm::XWing => Self::XWing(alpha_crypto::PrivateKey::from_seed(*seed)),
-        }
+            Algorithm::XWing => {
+                Self::XWing(alpha_crypto::PrivateKey::from_seed(*seed).map_err(|e| e.to_string())?)
+            }
+        })
     }
 
     /// What registration takes: the SPKI DER of an admin key, the 1216 bytes of a custodian's.
@@ -143,7 +145,7 @@ pub fn generate(algorithm: Algorithm, path: &Path, passphrase: &[u8]) -> Result<
     };
     let text = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())? + "\n";
     fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(Key::from_seed(algorithm, &seed))
+    Key::from_seed(algorithm, &seed)
 }
 
 pub fn read(path: &Path, passphrase: &[u8]) -> Result<Key, String> {
@@ -180,7 +182,7 @@ pub fn read(path: &Path, passphrase: &[u8]) -> Result<Key, String> {
     let seed: Zeroizing<[u8; 32]> = Zeroizing::new(
         <[u8; 32]>::try_from(seed.as_slice()).map_err(|_| "key file: seed is not 32 bytes")?,
     );
-    Ok(Key::from_seed(file.algorithm, &seed))
+    Key::from_seed(file.algorithm, &seed)
 }
 
 #[cfg(test)]

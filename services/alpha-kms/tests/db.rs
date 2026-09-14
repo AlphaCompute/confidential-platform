@@ -1,5 +1,13 @@
 //! The route contracts against a real Postgres (`DATABASE_URL`; skipped without it).
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+
 mod common;
 
 use std::fs;
@@ -29,7 +37,8 @@ async fn bootstrap_once_unseal_with_two_shares_and_sealed_gate() {
     assert_eq!(ready, (StatusCode::OK, json!({ "sealed": false })));
 
     let aad: [u8; 32] = Sha256::digest(&h.node.runtime_spki).into();
-    let again = alpha_crypto::seal(&h.node.xwing_key.public(), INFO_NODE_BOOTSTRAP, &aad, b"{}");
+    let again =
+        alpha_crypto::seal(&h.node.xwing_key.public(), INFO_NODE_BOOTSTRAP, &aad, b"{}").unwrap();
     let (status, reply) = h
         .post("/v1/node/bootstrap", json!({ "body_hpke": again }))
         .await;
@@ -65,7 +74,7 @@ async fn bootstrap_once_unseal_with_two_shares_and_sealed_gate() {
     );
 
     let aad2: [u8; 32] = Sha256::digest(&node2.runtime_spki).into();
-    let unseal = |share: &Vec<u8>| json!({ "share_hpke": alpha_crypto::seal(&node2.xwing_key.public(), INFO_UNSEAL_SHARE, &aad2, share) });
+    let unseal = |share: &Vec<u8>| json!({ "share_hpke": alpha_crypto::seal(&node2.xwing_key.public(), INFO_UNSEAL_SHARE, &aad2, share).unwrap() });
     let post = |body: Value| send(client().post(format!("{url2}/v1/node/unseal")).json(&body));
     let (status, reply) = post(unseal(&h.shares[2])).await;
     assert_eq!(
@@ -84,7 +93,8 @@ async fn bootstrap_once_unseal_with_two_shares_and_sealed_gate() {
         INFO_NODE_BOOTSTRAP,
         &aad2,
         &h.shares[0],
-    );
+    )
+    .unwrap();
     let (status, reply) = post(json!({ "share_hpke": wrong })).await;
     assert_eq!(
         (status, code(&reply)),
@@ -695,7 +705,7 @@ async fn join_hands_out_intermediates_only_to_an_attested_listed_requesting_node
         return;
     };
     let pkcs8 = read(KEYED, "runtime.key.pkcs8.der");
-    let cert = certs::self_signed(&certs::key_pair(&pkcs8), h.now());
+    let cert = certs::self_signed(&certs::key_pair(&pkcs8).unwrap(), h.now()).unwrap();
     let joiner = client_with(&format!(
         "{}{}",
         text(KEYED, "runtime.key.pem"),
@@ -709,6 +719,7 @@ async fn join_hands_out_intermediates_only_to_an_attested_listed_requesting_node
         )
         .unwrap(),
     )
+    .unwrap()
     .public();
     assert_eq!(
         xwing.as_bytes().as_slice(),
@@ -743,7 +754,7 @@ async fn join_hands_out_intermediates_only_to_an_attested_listed_requesting_node
     sqlx::query!("insert into audit_log (actor_kind, actor, action, outcome, details) values ('node', 'node', 'node.join.request', 'ok', $1)", json!({ "runtime_pubkey_sha256": runtime_sha })).execute(&h.pool).await.unwrap();
 
     let mut wrong_key = body.clone();
-    wrong_key["xwing_pubkey"] = json!(alpha_crypto::PrivateKey::generate().public());
+    wrong_key["xwing_pubkey"] = json!(alpha_crypto::PrivateKey::generate().unwrap().public());
     let (status, reply) = post(&joiner, wrong_key).await;
     assert_eq!(
         (status, code(&reply)),

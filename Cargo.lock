@@ -155,6 +155,7 @@ dependencies = [
  "hmac 0.13.0",
  "hyper-util",
  "p256 0.14.0",
+ "parking_lot",
  "pem 3.0.6",
  "rand_core 0.10.1",
  "rcgen",

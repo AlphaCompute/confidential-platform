@@ -14,7 +14,7 @@ use serde_json::Value;
 pub fn sign(document: Value, key: &SigningKey) -> Result<SignedDocument, String> {
     serde_json::from_value::<PlatformDocument>(document.clone())
         .map_err(|e| format!("document: {e}"))?;
-    Ok(platform::sign(document, key))
+    platform::sign(document, key).map_err(|e| e.to_string())
 }
 
 /// `ALPHACOMPUTE_KMS_CA_SPKI_SHA256` and `ALPHACOMPUTE_KMS_REVISIONS`, from a verified artifact.

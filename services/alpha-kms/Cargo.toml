@@ -28,6 +28,7 @@ hmac = "0.13"
 hyper-util = { version = "0.1", features = ["server", "server-auto", "server-graceful", "service", "tokio"] }
 rand_core = "0.10"
 pem = "3"
+parking_lot = "0.12"
 p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }

@@ -37,7 +37,7 @@ pub fn verify(
         raw: signed.document.clone(),
         signature: BASE64_URL_SAFE_NO_PAD
             .decode(&signed.signature.signature)
-            .expect("verified above"),
+            .map_err(|e| e.to_string())?,
     })
 }
 
@@ -97,9 +97,12 @@ pub async fn apply(node: &Node, verified: Verified) -> Result<(), ApiError> {
         }
     }
     tx.commit().await?;
-    let current = node.platform.read().unwrap().as_ref().map(|d| d.version);
-    if current.is_none_or(|v| v < verified.document.version) {
-        *node.platform.write().unwrap() = Some(Arc::new(verified.document));
+    let mut platform = node.platform.write();
+    if platform
+        .as_ref()
+        .is_none_or(|d| d.version < verified.document.version)
+    {
+        *platform = Some(Arc::new(verified.document));
     }
     Ok(())
 }
@@ -120,7 +123,7 @@ pub async fn reload(node: &Node) -> Result<(), ApiError> {
 /// Start: the stored row, then the URL; afterwards one tick every five minutes.
 pub async fn start(node: &Node) {
     match load_stored(node).await {
-        Ok(Some(stored)) => *node.platform.write().unwrap() = Some(Arc::new(stored.document)),
+        Ok(Some(stored)) => *node.platform.write() = Some(Arc::new(stored.document)),
         Ok(None) => {}
         Err(e) => eprintln!("{}", e.message),
     }

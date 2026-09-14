@@ -30,15 +30,19 @@ pub struct ReleaseSignature {
     pub signature: String,
 }
 
-pub fn sign(document: Value, key: &SigningKey) -> SignedDocument {
-    let digest = signing_digest(context::PLATFORM, &document);
-    SignedDocument {
+pub fn sign(document: Value, key: &SigningKey) -> Result<SignedDocument, Error> {
+    let digest = signing_digest(context::PLATFORM, &document).map_err(canonicalize)?;
+    Ok(SignedDocument {
         document,
         signature: ReleaseSignature {
             algorithm: "ed25519".into(),
             signature: BASE64_URL_SAFE_NO_PAD.encode(key.sign(&digest).to_bytes()),
         },
-    }
+    })
+}
+
+fn canonicalize(e: serde_json::Error) -> Error {
+    Error::Invalid(format!("platform document does not canonicalize: {e}"))
 }
 
 pub fn verify(
@@ -58,7 +62,7 @@ pub fn verify(
         .ok()
         .and_then(|b| Signature::from_slice(&b).ok())
         .ok_or_else(|| refuse("signature is not base64url Ed25519"))?;
-    let digest = signing_digest(context::PLATFORM, &signed.document);
+    let digest = signing_digest(context::PLATFORM, &signed.document).map_err(canonicalize)?;
     release_key
         .verify_strict(&digest, &signature)
         .map_err(|_| refuse("release signature does not verify"))?;
@@ -108,7 +112,7 @@ mod tests {
     fn verify_checks_signature_key_and_issued_at() {
         let key = SigningKey::from_bytes(&[5u8; 32]);
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
-        let signed = sign(document(3, "2026-09-14T00:00:00Z"), &key);
+        let signed = sign(document(3, "2026-09-14T00:00:00Z"), &key).unwrap();
         assert_eq!(
             verify(&signed, &key.verifying_key(), now).unwrap().version,
             3
@@ -118,7 +122,7 @@ mod tests {
         let mut tampered = signed.clone();
         tampered.document["version"] = json!(4);
         assert!(verify(&tampered, &key.verifying_key(), now).is_err());
-        let future = sign(document(3, "2100-01-01T00:00:00Z"), &key);
+        let future = sign(document(3, "2100-01-01T00:00:00Z"), &key).unwrap();
         assert!(
             verify(&future, &key.verifying_key(), now)
                 .unwrap_err()

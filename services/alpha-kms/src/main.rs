@@ -41,7 +41,7 @@ async fn run() -> Result<(), String> {
         Config::from_env()?,
         Arc::new(SystemTime::now),
         CollateralSource::Pccs(alpha_kms::env("ALPHACOMPUTE_PCCS_URL")?),
-        alpha_kms::random(),
+        alpha_kms::random().map_err(|e| e.message)?,
         event_log,
         release_key,
     )?;
@@ -53,16 +53,17 @@ async fn run() -> Result<(), String> {
         .await
         .map_err(|e| format!("bind {LISTEN}: {e}"))?;
     let app = alpha_kms::router(node.clone());
-    let shutdown = async {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("SIGTERM handler");
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| format!("SIGTERM handler: {e}"))?;
+    let shutdown = async move {
         tokio::select! {
             _ = term.recv() => {}
             _ = tokio::signal::ctrl_c() => {}
         }
     };
-    tls::serve(listener, node.server_cert.clone(), app, shutdown).await;
-    Ok(())
+    tls::serve(listener, node.server_cert.clone(), app, shutdown)
+        .await
+        .map_err(|e| e.message)
 }
 
 async fn start_phase(node: &Arc<Node>) {

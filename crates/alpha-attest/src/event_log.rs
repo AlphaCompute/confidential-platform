@@ -45,8 +45,10 @@ impl EventLogEntry {
 /// `SHA-384(register ‖ digest)` by each of its events in order.
 pub fn replay(event_log: &[EventLogEntry]) -> [Measurement; 4] {
     let mut registers = [[0u8; 48]; 4];
-    for entry in event_log.iter().filter(|e| (e.imr as usize) < 4) {
-        let register = &mut registers[entry.imr as usize];
+    for entry in event_log {
+        let Some(register) = registers.get_mut(entry.imr as usize) else {
+            continue;
+        };
         let mut hasher = Sha384::new();
         hasher.update(*register);
         hasher.update(entry.digest());

@@ -9,6 +9,16 @@ publish = false
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+
 # scrypt at log_n = 15 takes seconds unoptimized; the key-file tests derive six keys.
 [profile.dev.package.scrypt]
 opt-level = 3

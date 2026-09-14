@@ -53,12 +53,14 @@ impl FromStr for ComposeHash {
 
 /// Exactly `2 * N` lowercase hex digits; `from_str_radix` alone would take uppercase and `+`.
 pub fn hex_bytes<const N: usize>(hex: &str) -> Option<[u8; N]> {
-    if hex.len() != 2 * N || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+    if hex.len() != N.checked_mul(2)?
+        || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
         return None;
     }
     let mut out = [0u8; N];
-    for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
+    for (byte, pair) in out.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+        *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
     }
     Some(out)
 }
@@ -184,7 +186,7 @@ mod tests {
 
         let document = json!({"app_id": app_id, "compose": compose});
         assert_eq!(expected["signing_context"], context::REVISION);
-        let digest = signing_digest(context::REVISION, &document);
+        let digest = signing_digest(context::REVISION, &document).unwrap();
         assert_eq!(
             format!("sha256:{}", hex(&digest)),
             expected["signing_digest"]

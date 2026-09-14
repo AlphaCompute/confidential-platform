@@ -42,7 +42,7 @@ pub struct PutBody {
 const ISSUED_AT_WINDOW: Duration = Duration::minutes(5);
 
 fn within_window(at: DateTime<Utc>, now: DateTime<Utc>) -> Result<DateTime<Utc>, ApiError> {
-    if (at - now).abs() > ISSUED_AT_WINDOW {
+    if at.signed_duration_since(now).abs() > ISSUED_AT_WINDOW {
         return Err(ApiError::malformed("issued_at is outside ±5 minutes"));
     }
     Ok(at)
@@ -245,7 +245,7 @@ pub async fn revoke_revision(
                 )
                 .fetch_one(&mut *tx)
                 .await?
-                .expect("just set");
+                .ok_or_else(|| ApiError::internal("revoked_at was not set"))?;
                 audited(
                     &mut tx,
                     &chain,
@@ -344,8 +344,8 @@ pub async fn put_secret(
             Some(row) => row.id,
             None => SecretId::mint().into(),
         };
-        let org_key = keys::org_key(&keys.tenant_kek_root, org_id.into(), &chain.anchor_spki);
-        let ciphertext = keys::aead_seal(&org_key, id.as_bytes(), &value);
+        let org_key = keys::org_key(&keys.tenant_kek_root, org_id.into(), &chain.anchor_spki)?;
+        let ciphertext = keys::aead_seal(&org_key, id.as_bytes(), &value)?;
         sqlx::query!(
             "insert into secrets (id, org_id, name, app_ids, ciphertext, content_sha256, document, signed_by_key, signature, issued_at)
              values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -487,7 +487,7 @@ pub async fn revoke_key(
                 )
                 .fetch_one(&mut *tx)
                 .await?
-                .expect("just set");
+                .ok_or_else(|| ApiError::internal("revoked_at was not set"))?;
                 audited(
                     &mut tx,
                     &chain,

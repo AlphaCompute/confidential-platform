@@ -91,16 +91,17 @@ pub struct PutSecretBody {
     pub value: String,
 }
 
-pub fn sign(ctx: &str, payload: Value, key_id: KeyId, key: &SigningKey) -> Signed {
-    let digest = signing_digest(ctx, &payload);
-    Signed {
+pub fn sign(ctx: &str, payload: Value, key_id: KeyId, key: &SigningKey) -> Result<Signed, Error> {
+    let digest = signing_digest(ctx, &payload)
+        .map_err(|e| Error::Invalid(format!("payload does not canonicalize: {e}")))?;
+    Ok(Signed {
         payload,
         signature: SignatureObject {
             key_id,
             algorithm: "ed25519".into(),
             signature: BASE64_URL_SAFE_NO_PAD.encode(key.sign(&digest).to_bytes()),
         },
-    }
+    })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -263,11 +264,10 @@ impl BootstrapReply {
             .ok()
             .and_then(|b| p256::ecdsa::Signature::from_slice(&b).ok())
             .ok_or_else(|| refuse("signature is not r‖s"))?;
-        key.verify(
-            &signing_digest(context::NODE_BOOTSTRAP, &self.payload),
-            &signature,
-        )
-        .map_err(|_| refuse("signature does not verify under the node's runtime key"))?;
+        let digest = signing_digest(context::NODE_BOOTSTRAP, &self.payload)
+            .map_err(|e| refuse(&format!("payload does not canonicalize: {e}")))?;
+        key.verify(&digest, &signature)
+            .map_err(|_| refuse("signature does not verify under the node's runtime key"))?;
         serde_json::from_value(self.payload.clone()).map_err(|e| refuse(&e.to_string()))
     }
 }
@@ -497,7 +497,7 @@ mod tests {
             "shares_hpke": [], "kms_ca_pem": "pem", "anchor_key_id": KeyId::mint()
         });
         let sig: p256::ecdsa::Signature =
-            node.sign(&signing_digest(context::NODE_BOOTSTRAP, &payload));
+            node.sign(&signing_digest(context::NODE_BOOTSTRAP, &payload).unwrap());
         let reply = BootstrapReply {
             payload: payload.clone(),
             signature: NodeSignature {

@@ -1,5 +1,16 @@
 //! The key broker: six tables, twelve routes on one TLS port, one process-wide state.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )
+)]
+
 pub mod audit;
 pub mod body;
 pub mod certs;
@@ -11,7 +22,7 @@ pub mod node;
 pub mod platform;
 pub mod tls;
 
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use alpha_attest::{Collateral, EventLogEntry, PlatformDocument};
@@ -23,6 +34,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use p256::ecdsa::SigningKey;
 use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
+use parking_lot::{Mutex, RwLock};
 use sqlx::PgPool;
 use zeroize::Zeroizing;
 
@@ -76,7 +88,7 @@ pub struct Intermediates {
 }
 
 impl Intermediates {
-    pub fn ca_key(&self) -> rcgen::KeyPair {
+    pub fn ca_key(&self) -> Result<rcgen::KeyPair, ApiError> {
         certs::key_pair(&self.ca_key_der)
     }
 
@@ -127,7 +139,7 @@ impl Node {
     ) -> Result<Arc<Self>, String> {
         let compose_hash = alpha_attest::event_log_compose_hash(&event_log)
             .ok_or("the event log carries no compose-hash event")?;
-        let runtime_key = SigningKey::from_bytes((&random::<32>()).into())
+        let runtime_key = SigningKey::from_bytes((&random::<32>().map_err(|e| e.message)?).into())
             .map_err(|e| format!("runtime key: {e}"))?;
         let runtime_spki = runtime_key
             .verifying_key()
@@ -141,7 +153,8 @@ impl Node {
                 .to_bytes()
                 .to_vec(),
         );
-        let server_cert = Arc::new(tls::ServerCert::sealed(&runtime_pkcs8, (clock)()));
+        let server_cert =
+            Arc::new(tls::ServerCert::sealed(&runtime_pkcs8, (clock)()).map_err(|e| e.message)?);
         Ok(Arc::new(Self {
             pool,
             config,
@@ -151,7 +164,7 @@ impl Node {
             runtime_key,
             runtime_pkcs8,
             runtime_spki,
-            xwing_key: alpha_crypto::PrivateKey::generate(),
+            xwing_key: alpha_crypto::PrivateKey::generate().map_err(|e| e.to_string())?,
             event_log,
             compose_hash,
             release_key,
@@ -171,43 +184,42 @@ impl Node {
     }
 
     pub fn platform_document(&self) -> Option<Arc<PlatformDocument>> {
-        self.platform.read().unwrap().clone()
+        self.platform.read().clone()
     }
 
     pub fn intermediates(&self) -> Result<Arc<Intermediates>, ApiError> {
-        match &*self.phase.read().unwrap() {
+        match &*self.phase.read() {
             Phase::Serving(keys) => Ok(keys.clone()),
             Phase::Sealed { .. } => Err(ApiError::new("sealed", "node is sealed")),
         }
     }
 
     pub fn is_sealed(&self) -> bool {
-        matches!(&*self.phase.read().unwrap(), Phase::Sealed { .. })
+        matches!(&*self.phase.read(), Phase::Sealed { .. })
     }
 
     /// Enters the serving phase: intermediates in memory and a leaf from `ca` on the listener.
     pub fn start_serving(&self, keys: Intermediates) -> Result<(), ApiError> {
         self.issue_own_leaf(&keys)?;
-        *self.phase.write().unwrap() = Phase::Serving(Arc::new(keys));
+        *self.phase.write() = Phase::Serving(Arc::new(keys));
         Ok(())
     }
 
     /// The listener's leaf from `ca`: `alphacompute://kms` and this node's Revision.
     pub fn issue_own_leaf(&self, keys: &Intermediates) -> Result<(), ApiError> {
         let leaf = certs::issue_leaf(
-            &keys.ca_key(),
+            &keys.ca_key()?,
             &keys.ca_cert_der,
             &self.runtime_spki,
             certs::node_sans(self.compose_hash),
             self.now(),
         )?;
         self.server_cert
-            .serve(&self.runtime_pkcs8, leaf, keys.ca_cert_der.clone());
-        Ok(())
+            .serve(&self.runtime_pkcs8, leaf, keys.ca_cert_der.clone())
     }
 
     fn take_token(&self) -> bool {
-        let mut bucket = self.bucket.lock().unwrap();
+        let mut bucket = self.bucket.lock();
         let (tokens, last) = *bucket;
         let now = Instant::now();
         let tokens = (tokens + now.duration_since(last).as_secs_f64() * BUCKET_REFILL_PER_SEC)
@@ -270,10 +282,15 @@ async fn ready(State(node): State<Arc<Node>>) -> Response {
     (status, axum::Json(serde_json::json!({ "sealed": sealed }))).into_response()
 }
 
-pub fn random<const N: usize>() -> [u8; N] {
+pub fn random<const N: usize>() -> Result<[u8; N], ApiError> {
     let mut out = [0u8; N];
-    getrandom::fill(&mut out).expect("the system RNG never fails");
-    out
+    getrandom::fill(&mut out).map_err(|e| ApiError::internal(format!("rng: {e}")))?;
+    Ok(out)
+}
+
+pub fn later(now: SystemTime, by: std::time::Duration) -> Result<SystemTime, ApiError> {
+    now.checked_add(by)
+        .ok_or_else(|| ApiError::internal("time overflows the clock"))
 }
 
 pub fn rfc3339(t: impl Into<chrono::DateTime<chrono::Utc>>) -> String {

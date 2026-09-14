@@ -159,7 +159,8 @@ pub async fn bootstrap(
         INFO_NODE_BOOTSTRAP,
         &node.aad(),
         &serde_json::to_vec(&body).map_err(|e| e.to_string())?,
-    );
+    )
+    .map_err(|e| e.to_string())?;
     let reply = client
         .bootstrap(&BootstrapRequest { body_hpke })
         .await
@@ -205,7 +206,8 @@ pub async fn unseal(
     let mut file = ShareFile::read(share_path)?;
     let share = alpha_crypto::open(custodian, INFO_UNSEAL_SHARE, &file.aad()?, &file.share_hpke)
         .map_err(|e| format!("share file: {e}"))?;
-    let share_hpke = alpha_crypto::seal(&node.xwing, INFO_UNSEAL_SHARE, &node.aad(), &share);
+    let share_hpke = alpha_crypto::seal(&node.xwing, INFO_UNSEAL_SHARE, &node.aad(), &share)
+        .map_err(|e| e.to_string())?;
     if doc_version > file.platform_document_version {
         file.platform_document_version = doc_version;
         file.write(share_path)?;
@@ -296,7 +298,7 @@ mod tests {
         let mut c = capture();
         let spki = read("runtime_spki.der");
         let mut evidence = c.evidence.clone();
-        evidence.xwing_pubkey = alpha_crypto::PrivateKey::generate().public();
+        evidence.xwing_pubkey = alpha_crypto::PrivateKey::generate().unwrap().public();
         let err = verify(&c, &evidence, &spki, None).unwrap_err();
         assert!(err.starts_with("attestation_failed"), "{err}");
         let err = verify(&c, &c.evidence, &spki, Some(2)).unwrap_err();

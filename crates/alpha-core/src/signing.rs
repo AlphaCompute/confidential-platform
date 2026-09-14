@@ -10,18 +10,17 @@ pub mod context {
     pub const NODE_BOOTSTRAP: &str = "alphacompute/node-bootstrap/v1";
 }
 
-pub fn jcs(document: &Value) -> Vec<u8> {
+pub fn jcs(document: &Value) -> serde_json::Result<Vec<u8>> {
     serde_json_canonicalizer::to_vec(document)
-        .expect("a serde_json::Value is always canonicalizable")
 }
 
-pub fn signing_digest(context: &str, document: &Value) -> [u8; 32] {
-    Sha256::new()
+pub fn signing_digest(context: &str, document: &Value) -> serde_json::Result<[u8; 32]> {
+    Ok(Sha256::new()
         .chain_update(context)
         .chain_update([0u8])
-        .chain_update(jcs(document))
+        .chain_update(jcs(document)?)
         .finalize()
-        .into()
+        .into())
 }
 
 #[cfg(test)]
@@ -33,7 +32,7 @@ mod tests {
     fn jcs_sorts_keys_and_formats_numbers_per_rfc8785() {
         let doc = json!({"b": 1.0, "a": [true, null, "ü"], "c": 1e21});
         assert_eq!(
-            jcs(&doc),
+            jcs(&doc).unwrap(),
             r#"{"a":[true,null,"ü"],"b":1,"c":1e+21}"#.as_bytes()
         );
     }
@@ -42,10 +41,10 @@ mod tests {
     fn digest_binds_the_context() {
         let doc = json!({"x": 1});
         assert_ne!(
-            signing_digest(context::REVISION, &doc),
-            signing_digest(context::CONTROL, &doc)
+            signing_digest(context::REVISION, &doc).unwrap(),
+            signing_digest(context::CONTROL, &doc).unwrap()
         );
         let manual: [u8; 32] = Sha256::digest(b"alphacompute/revision/v1\0{\"x\":1}").into();
-        assert_eq!(signing_digest(context::REVISION, &doc), manual);
+        assert_eq!(signing_digest(context::REVISION, &doc).unwrap(), manual);
     }
 }

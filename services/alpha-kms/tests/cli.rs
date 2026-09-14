@@ -2,6 +2,14 @@
 //! in-process node (`DATABASE_URL`; skipped without it). The node runs on the wall clock so
 //! that a pinned TLS client accepts its one-hour leaf; nothing here attests with a quote.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+
 mod common;
 
 use std::fs;
@@ -36,7 +44,7 @@ async fn call_refuses_a_kms_whose_chain_does_not_end_in_the_pinned_ca() {
     let Some(h) = wall_clock_harness().await else {
         return;
     };
-    let (_, other_ca) = certs::new_ca(SystemTime::now());
+    let (_, other_ca) = certs::new_ca(SystemTime::now()).unwrap();
     let err = pinned(&h, Pin::Ca(other_ca.into()))
         .ready()
         .await

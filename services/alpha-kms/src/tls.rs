@@ -1,7 +1,9 @@
 //! The one listener: TLS 1.3 with `X25519MLKEM768`, a server certificate that follows the
 //! node's phase, and a client certificate that is requested but checked by the route.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use parking_lot::RwLock;
 use std::time::SystemTime;
 
 use alpha_client::tls::provider;
@@ -21,40 +23,47 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use crate::certs;
+use crate::error::ApiError;
 
 /// The certificate chain the peer presented, if any; routes that need one verify it.
 #[derive(Clone, Debug, Default)]
 pub struct PeerCerts(pub Vec<CertificateDer<'static>>);
 
-fn certified(pkcs8: &[u8], chain: Vec<Vec<u8>>) -> Arc<CertifiedKey> {
+fn certified(pkcs8: &[u8], chain: Vec<Vec<u8>>) -> Result<Arc<CertifiedKey>, ApiError> {
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8.to_vec()));
     let signing = provider()
         .key_provider
         .load_private_key(key)
-        .expect("a P-256 key we generated");
-    Arc::new(CertifiedKey::new(
+        .map_err(|e| ApiError::internal(format!("runtime key: {e}")))?;
+    Ok(Arc::new(CertifiedKey::new(
         chain.into_iter().map(CertificateDer::from).collect(),
         signing,
-    ))
+    )))
 }
 
 #[derive(Debug)]
 pub struct ServerCert(RwLock<Arc<CertifiedKey>>);
 
 impl ServerCert {
-    pub fn sealed(runtime_pkcs8: &[u8], now: SystemTime) -> Self {
-        let cert = certs::self_signed(&certs::key_pair(runtime_pkcs8), now);
-        Self(RwLock::new(certified(runtime_pkcs8, vec![cert])))
+    pub fn sealed(runtime_pkcs8: &[u8], now: SystemTime) -> Result<Self, ApiError> {
+        let cert = certs::self_signed(&certs::key_pair(runtime_pkcs8)?, now)?;
+        Ok(Self(RwLock::new(certified(runtime_pkcs8, vec![cert])?)))
     }
 
-    pub fn serve(&self, runtime_pkcs8: &[u8], leaf_der: Vec<u8>, ca_der: Vec<u8>) {
-        *self.0.write().unwrap() = certified(runtime_pkcs8, vec![leaf_der, ca_der]);
+    pub fn serve(
+        &self,
+        runtime_pkcs8: &[u8],
+        leaf_der: Vec<u8>,
+        ca_der: Vec<u8>,
+    ) -> Result<(), ApiError> {
+        *self.0.write() = certified(runtime_pkcs8, vec![leaf_der, ca_der])?;
+        Ok(())
     }
 }
 
 impl ResolvesServerCert for ServerCert {
     fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        Some(self.0.read().unwrap().clone())
+        Some(self.0.read().clone())
     }
 }
 
@@ -111,15 +120,15 @@ impl ClientCertVerifier for AcceptAnyClient {
     }
 }
 
-pub fn server_config(server_cert: Arc<ServerCert>) -> Arc<ServerConfig> {
+pub fn server_config(server_cert: Arc<ServerCert>) -> Result<Arc<ServerConfig>, ApiError> {
     let provider = provider();
     let mut config = ServerConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])
-        .expect("TLS 1.3 is supported")
+        .map_err(|e| ApiError::internal(format!("tls: {e}")))?
         .with_client_cert_verifier(Arc::new(AcceptAnyClient(provider)))
         .with_cert_resolver(server_cert);
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Arc::new(config)
+    Ok(Arc::new(config))
 }
 
 /// Accepts until `shutdown` resolves, then drains the open connections.
@@ -128,8 +137,8 @@ pub async fn serve(
     server_cert: Arc<ServerCert>,
     app: Router,
     shutdown: impl Future<Output = ()>,
-) {
-    let acceptor = TlsAcceptor::from(server_config(server_cert));
+) -> Result<(), ApiError> {
+    let acceptor = TlsAcceptor::from(server_config(server_cert)?);
     let graceful = GracefulShutdown::new();
     let mut shutdown = std::pin::pin!(shutdown);
     loop {
@@ -161,4 +170,5 @@ pub async fn serve(
         });
     }
     graceful.shutdown().await;
+    Ok(())
 }

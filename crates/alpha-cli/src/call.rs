@@ -61,8 +61,8 @@ pub async fn run(
     if route != Route::PutSecret && value.is_some() {
         return Err("--value is only for put-secret".into());
     }
-    let signed = sign(ctx.unwrap_or(route.context()), payload, signer.0, signer.1);
     let api = |e: alpha_client::Error| e.to_string();
+    let signed = sign(ctx.unwrap_or(route.context()), payload, signer.0, signer.1).map_err(api)?;
     let reply = match route {
         Route::RegisterRevision => json!(client.register_revision(&signed).await.map_err(api)?),
         Route::RevokeRevision => {

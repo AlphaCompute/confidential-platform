@@ -129,7 +129,7 @@ pub fn compose(spec: &AppSpec) -> Result<String, String> {
         "public_tcbinfo": false,
         "no_instance_id": false,
     });
-    let compose = phala::canonicalize(&envelope);
+    let compose = phala::canonicalize(&envelope).map_err(|e| e.to_string())?;
     check_registration(&compose, spec.app_id).map_err(|e| e.to_string())?;
     Ok(compose)
 }
@@ -154,7 +154,8 @@ pub async fn run(
         json!({ "app_id": spec.app_id, "compose": compose }),
         key_id,
         key,
-    );
+    )
+    .map_err(|e| e.to_string())?;
     let revision = client
         .register_revision(&signed)
         .await

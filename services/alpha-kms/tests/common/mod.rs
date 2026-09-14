@@ -112,7 +112,8 @@ impl ReleaseServer {
         let app = axum::Router::new().route(
             "/platform.json",
             axum::routing::get(move || {
-                let signed = alpha_client::platform::sign(doc.read().unwrap().clone(), &signer);
+                let signed =
+                    alpha_client::platform::sign(doc.read().unwrap().clone(), &signer).unwrap();
                 async move { axum::Json(signed) }
             }),
         );
@@ -249,7 +250,7 @@ pub async fn harness_with_clock(clock: Clock) -> Option<Harness> {
     let pool = fresh_database().await?;
     let release = ReleaseServer::start(platform_document(KEYED)).await;
     let (node, base, shutdown) = start_node(pool.clone(), &release.url, &release.key, clock).await;
-    let custodians: Vec<PrivateKey> = (0..3).map(|_| PrivateKey::generate()).collect();
+    let custodians: Vec<PrivateKey> = (0..3).map(|_| PrivateKey::generate().unwrap()).collect();
     let anchor_key = SigningKey::from_bytes(&[7u8; 32]);
     let org = OrgId::mint();
     let anchor = Anchor {
@@ -314,7 +315,7 @@ impl Harness {
     }
 
     pub fn signed(&self, ctx: &str, payload: Value, key: &(KeyId, SigningKey)) -> Value {
-        json!(alpha_client::sign(ctx, payload, key.0, &key.1))
+        json!(alpha_client::sign(ctx, payload, key.0, &key.1).unwrap())
     }
 
     pub async fn call(

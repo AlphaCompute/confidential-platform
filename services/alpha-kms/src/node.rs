@@ -80,16 +80,16 @@ pub async fn bootstrap(
         .map_err(|_| ApiError::malformed("anchor public_key: not an Ed25519 SPKI"))?;
     let now = node.now();
 
-    let root = root_kek(&node);
-    let tenant_kek_root = Zeroizing::new(random());
-    let (ca_key_der, ca_cert_der) = certs::new_ca(now);
+    let root = root_kek(&node)?;
+    let tenant_kek_root = Zeroizing::new(random()?);
+    let (ca_key_der, ca_cert_der) = certs::new_ca(now)?;
     let ca_key_der = Zeroizing::new(ca_key_der);
     let mut tx = node.pool.begin().await?;
     let inserted = sqlx::query!(
         "insert into intermediate_keys (purpose, wrapped, public_part) values
            ('tenant-kek-root', $1, null), ('ca', $2, $3) on conflict (purpose) do nothing",
-        aead_seal(&root, b"tenant-kek-root", tenant_kek_root.as_slice()),
-        aead_seal(&root, b"ca", &ca_key_der),
+        aead_seal(&root, b"tenant-kek-root", tenant_kek_root.as_slice())?,
+        aead_seal(&root, b"ca", &ca_key_der)?,
         ca_cert_der,
     )
     .execute(&mut *tx)
@@ -99,7 +99,7 @@ pub async fn bootstrap(
         return Err(ApiError::new("already_exists", "database is not empty"));
     }
     let anchor_id: Uuid = alpha_core::KeyId::mint().into();
-    let check = keys::anchor_check(&tenant_kek_root, body.anchor.org_id, &anchor_spki);
+    let check = keys::anchor_check(&tenant_kek_root, body.anchor.org_id, &anchor_spki)?;
     sqlx::query!(
         "insert into principal_keys (id, org_id, principal_id, public_key, document, anchor_check)
          values ($1, $2, $3, $4, $5, $6)",
@@ -132,7 +132,8 @@ pub async fn bootstrap(
         .iter()
         .zip(&body.custodians)
         .map(|(share, custodian)| alpha_crypto::seal(custodian, INFO_UNSEAL_SHARE, &aad, share))
-        .collect();
+        .collect::<Result<_, _>>()
+        .map_err(|e| ApiError::internal(format!("seal share: {e}")))?;
     drop(root);
     let keys = Intermediates {
         tenant_kek_root,
@@ -144,10 +145,10 @@ pub async fn bootstrap(
         "kms_ca_pem": keys.ca_pem(),
         "anchor_key_id": anchor_id,
     });
+    let digest = signing_digest(context::NODE_BOOTSTRAP, &payload)
+        .map_err(|e| ApiError::internal(format!("payload: {e}")))?;
     node.start_serving(keys)?;
-    let signature: p256::ecdsa::Signature = node
-        .runtime_key
-        .sign(&signing_digest(context::NODE_BOOTSTRAP, &payload));
+    let signature: p256::ecdsa::Signature = node.runtime_key.sign(&digest);
     Ok(Json(json!({
         "payload": payload,
         "signature": {
@@ -157,12 +158,12 @@ pub async fn bootstrap(
     })))
 }
 
-fn root_kek(_node: &Node) -> Zeroizing<[u8; 32]> {
+fn root_kek(_node: &Node) -> Result<Zeroizing<[u8; 32]>, ApiError> {
     #[cfg(feature = "dev-root")]
     if let Some(root) = &_node.config.dev_root_kek {
-        return root.clone();
+        return Ok(root.clone());
     }
-    Zeroizing::new(random())
+    Ok(Zeroizing::new(random()?))
 }
 
 /// Unwraps both rows under `root`.
@@ -207,7 +208,7 @@ pub async fn unseal(
     )
     .map_err(|e| ApiError::malformed(format!("share_hpke: {e}")))?;
     let collected = {
-        let mut phase = node.phase.write().unwrap();
+        let mut phase = node.phase.write();
         let Phase::Sealed { shares } = &mut *phase else {
             return Err(ApiError::new("already_exists", "node is already serving"));
         };
@@ -230,7 +231,7 @@ pub async fn unseal(
     }
     .await;
     if let Err(e) = outcome {
-        if let Phase::Sealed { shares } = &mut *node.phase.write().unwrap() {
+        if let Phase::Sealed { shares } = &mut *node.phase.write() {
             shares.clear();
         }
         audit::node("node.unseal", "denied", e.details())
@@ -387,7 +388,7 @@ fn join_client(
     let internal = |e: alpha_client::Error| ApiError::internal(e.to_string());
     let ca = alpha_client::tls::ca_from_pem(kms_ca_pem).map_err(internal)?;
     let pin = Pin::CaAndRevisions(ca, revisions.iter().map(|r| r.compose_hash).collect());
-    let cert = certs::self_signed(&certs::key_pair(&node.runtime_pkcs8), node.now());
+    let cert = certs::self_signed(&certs::key_pair(&node.runtime_pkcs8)?, node.now())?;
     let identity = Identity {
         chain: vec![cert],
         pkcs8: node.runtime_pkcs8.to_vec(),
