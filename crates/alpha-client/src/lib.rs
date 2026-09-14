@@ -2,6 +2,16 @@
 //! failure or a 5xx (never on a 4xx), one pinned TLS configuration, typed bodies for every route,
 //! the error envelope as one error, and the signing helper for the Control bodies.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )
+)]
 pub mod platform;
 pub mod tls;
 

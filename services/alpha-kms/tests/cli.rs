@@ -270,7 +270,7 @@ async fn sign_and_check_feed_the_node_and_the_admin_pin() {
     );
     assert_eq!(summary.kms_revisions, vec![h.node.compose_hash]);
     assert!(
-        sign::check(&artifact, &alpha_cli::release_key(), h.now()).is_err(),
+        sign::check(&artifact, &alpha_cli::release_key().unwrap(), h.now()).is_err(),
         "not the pilot key"
     );
 

@@ -189,7 +189,7 @@ async fn platform_document(config: &Config, now: SystemTime) -> Result<PlatformD
         config.platform_document_url.as_deref(),
         "platform-document-url",
     )?;
-    Ok(alpha_client::platform::fetch(url, &alpha_cli::release_key(), now).await?)
+    Ok(alpha_client::platform::fetch(url, &alpha_cli::release_key()?, now).await?)
 }
 
 /// The admin's pin: `kms_ca_pem` of the platform document fetched and verified now.
@@ -219,7 +219,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 return Err(Exit::Refused("passphrases differ".into()));
             }
             let key = keyfile::generate(algorithm, &out, &pass)?;
-            Ok(json!({ "file": out, "public_key": key.public_key_text() }))
+            Ok(json!({ "file": out, "public_key": key.public_key_text()? }))
         }
         Command::Call {
             route,
@@ -255,10 +255,10 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             if check {
                 let artifact: SignedDocument = serde_json::from_value(document)
                     .map_err(|e| Exit::Refused(format!("artifact: {e}")))?;
-                let summary = sign::check(&artifact, &alpha_cli::release_key(), now)?;
+                let summary = sign::check(&artifact, &alpha_cli::release_key()?, now)?;
                 return Ok(json!(summary));
             }
-            let key = read_ed25519(&release_key.expect("required unless --check"))?;
+            let key = read_ed25519(&need(release_key, "release-key")?)?;
             Ok(json!(sign::sign(document, &key)?))
         }
         Command::Deploy {
@@ -314,7 +314,9 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                         .map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))?,
                 );
             }
-            let custodians: [PublicKey; 3] = keys.try_into().expect("clap took exactly three");
+            let custodians: [PublicKey; 3] = keys
+                .try_into()
+                .map_err(|_| Exit::Usage("--custodians takes exactly three files".into()))?;
             let anchor: Anchor = serde_json::from_value(read_json(&anchor)?)
                 .map_err(|e| Exit::Usage(format!("anchor: {e}")))?;
             let doc = platform_document(config, now).await?;
@@ -337,10 +339,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
 async fn main() {
     let cli = Cli::parse();
     match run(cli).await {
-        Ok(value) => println!(
-            "{}",
-            serde_json::to_string_pretty(&value).expect("serializes")
-        ),
+        Ok(value) => println!("{value:#}"),
         Err(Exit::Refused(message)) => {
             eprintln!("alpha: {message}");
             std::process::exit(1);

@@ -160,7 +160,7 @@ impl ServerCertVerifier for PinnedServer {
 pub fn client_config(pin: Option<Pin>, identity: Option<Identity>) -> Result<ClientConfig, Error> {
     let builder = ClientConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
-        .expect("TLS 1.3 is supported")
+        .map_err(|e| Error::Invalid(format!("tls: {e}")))?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(PinnedServer::new(pin)?));
     Ok(match identity {

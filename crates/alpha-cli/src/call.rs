@@ -48,15 +48,15 @@ pub async fn run(
     value: Option<&[u8]>,
     now: SystemTime,
 ) -> Result<Value, String> {
-    if !payload.is_object() {
-        return Err("payload is not a JSON object".into());
+    let object = payload
+        .as_object_mut()
+        .ok_or("payload is not a JSON object")?;
+    if route != Route::RegisterRevision && !object.contains_key("issued_at") {
+        object.insert("issued_at".into(), json!(rfc3339(now)));
     }
-    if route != Route::RegisterRevision && payload.get("issued_at").is_none() {
-        payload["issued_at"] = json!(rfc3339(now));
-    }
-    if route == Route::PutSecret && payload.get("content_sha256").is_none() {
+    if route == Route::PutSecret && !object.contains_key("content_sha256") {
         let value = value.ok_or("put-secret needs --value")?;
-        payload["content_sha256"] = json!(sha256_prefixed(value));
+        object.insert("content_sha256".into(), json!(sha256_prefixed(value)));
     }
     if route != Route::PutSecret && value.is_some() {
         return Err("--value is only for put-secret".into());

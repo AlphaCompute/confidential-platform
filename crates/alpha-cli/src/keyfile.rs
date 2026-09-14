@@ -69,16 +69,16 @@ impl Key {
     }
 
     /// What registration takes: the SPKI DER of an admin key, the 1216 bytes of a custodian's.
-    pub fn public_key_text(&self) -> String {
-        match self {
+    pub fn public_key_text(&self) -> Result<String, String> {
+        Ok(match self {
             Self::Ed25519(key) => BASE64_URL_SAFE_NO_PAD.encode(
                 key.verifying_key()
                     .to_public_key_der()
-                    .expect("ed25519 spki")
+                    .map_err(|e| format!("spki: {e}"))?
                     .as_bytes(),
             ),
             Self::XWing(key) => BASE64_URL_SAFE_NO_PAD.encode(key.public().as_bytes()),
-        }
+        })
     }
 
     pub fn ed25519(self) -> Result<SigningKey, String> {
@@ -114,16 +114,16 @@ fn derive(passphrase: &[u8], kdf: &Kdf) -> Result<Zeroizing<[u8; 32]>, String> {
 }
 
 pub fn generate(algorithm: Algorithm, path: &Path, passphrase: &[u8]) -> Result<Key, String> {
-    let seed = Zeroizing::new(random::<32>());
+    let seed = Zeroizing::new(random::<32>()?);
     let kdf = Kdf {
         name: "scrypt".into(),
         log_n: 15,
         r: 8,
         p: 1,
-        salt: BASE64_URL_SAFE_NO_PAD.encode(random::<16>()),
+        salt: BASE64_URL_SAFE_NO_PAD.encode(random::<16>()?),
     };
     let key = derive(passphrase, &kdf)?;
-    let nonce = random::<12>();
+    let nonce = random::<12>()?;
     let ciphertext = Aes256Gcm::new((&*key).into())
         .encrypt(
             &Nonce::from(nonce),
@@ -132,7 +132,7 @@ pub fn generate(algorithm: Algorithm, path: &Path, passphrase: &[u8]) -> Result<
                 aad: algorithm.name().as_bytes(),
             },
         )
-        .expect("AES-GCM encryption cannot fail");
+        .map_err(|_| "key file: encryption failed")?;
     let file = KeyFile {
         format: FORMAT.into(),
         algorithm,
@@ -141,7 +141,7 @@ pub fn generate(algorithm: Algorithm, path: &Path, passphrase: &[u8]) -> Result<
         nonce: BASE64_URL_SAFE_NO_PAD.encode(nonce),
         ciphertext: BASE64_URL_SAFE_NO_PAD.encode(ciphertext),
     };
-    let text = serde_json::to_string_pretty(&file).expect("serializes") + "\n";
+    let text = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())? + "\n";
     fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(Key::from_seed(algorithm, &seed))
 }
@@ -194,7 +194,10 @@ mod tests {
         let path = dir.join("admin.key");
         let generated = generate(Algorithm::Ed25519, &path, b"correct horse").unwrap();
         let loaded = read(&path, b"correct horse").unwrap();
-        assert_eq!(generated.public_key_text(), loaded.public_key_text());
+        assert_eq!(
+            generated.public_key_text().unwrap(),
+            loaded.public_key_text().unwrap()
+        );
         assert!(loaded.xwing().is_err());
         assert!(
             read(&path, b"wrong")
@@ -209,10 +212,13 @@ mod tests {
         let custodian = dir.join("c.key");
         let generated = generate(Algorithm::XWing, &custodian, b"pw").unwrap();
         let loaded = read(&custodian, b"pw").unwrap();
-        assert_eq!(generated.public_key_text(), loaded.public_key_text());
+        assert_eq!(
+            generated.public_key_text().unwrap(),
+            loaded.public_key_text().unwrap()
+        );
         assert_eq!(
             BASE64_URL_SAFE_NO_PAD
-                .decode(loaded.public_key_text())
+                .decode(loaded.public_key_text().unwrap())
                 .unwrap()
                 .len(),
             alpha_crypto::PUBLIC_KEY_LEN

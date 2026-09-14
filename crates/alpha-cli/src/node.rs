@@ -80,7 +80,7 @@ pub async fn attested_node(
     remembered_version: Option<u64>,
     now: SystemTime,
 ) -> Result<(NodeIdentity, Client), String> {
-    let nonce = random::<32>();
+    let nonce = random::<32>()?;
     let (evidence, server_spki) = fetch_node_evidence(endpoint, &nonce)
         .await
         .map_err(|e| e.to_string())?;
@@ -130,7 +130,7 @@ impl ShareFile {
     }
 
     pub fn write(&self, path: &Path) -> Result<(), String> {
-        let text = serde_json::to_string_pretty(self).expect("serializes") + "\n";
+        let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())? + "\n";
         fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
     }
 
@@ -158,7 +158,7 @@ pub async fn bootstrap(
         &node.xwing,
         INFO_NODE_BOOTSTRAP,
         &node.aad(),
-        &serde_json::to_vec(&body).expect("serializes"),
+        &serde_json::to_vec(&body).map_err(|e| e.to_string())?,
     );
     let reply = client
         .bootstrap(&BootstrapRequest { body_hpke })
@@ -174,8 +174,8 @@ pub async fn bootstrap(
         ));
     }
     let mut paths: Vec<PathBuf> = Vec::new();
-    for (i, share_hpke) in payload.shares_hpke.into_iter().enumerate() {
-        let path = out_dir.join(format!("share-{}.json", i + 1));
+    for (i, share_hpke) in (1..).zip(payload.shares_hpke) {
+        let path = out_dir.join(format!("share-{i}.json"));
         ShareFile {
             format: SHARE_FORMAT.into(),
             share_hpke,
