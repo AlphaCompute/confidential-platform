@@ -9,13 +9,15 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alpha_attest::{EVIDENCE_FORMAT, EventLogEntry, Evidence};
-use alpha_core::{AppId, KeyId, OrgId, PrincipalId, context, signing_digest};
-use alpha_crypto::{INFO_NODE_BOOTSTRAP, INFO_UNSEAL_SHARE, Sealed};
+use alpha_cli::node::{NodeIdentity, ShareFile};
+use alpha_client::{Anchor, Client, Pin};
+use alpha_core::{AppId, KeyId, OrgId, PrincipalId, context};
+use alpha_crypto::{INFO_UNSEAL_SHARE, PrivateKey, PublicKey};
 use alpha_kms::{Clock, CollateralSource, Config, Node, platform, rfc3339, tls};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
+use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePublicKey;
-use ed25519_dalek::{Signer, SigningKey};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -110,7 +112,7 @@ impl ReleaseServer {
         let app = axum::Router::new().route(
             "/platform.json",
             axum::routing::get(move || {
-                let signed = sign_platform(&doc.read().unwrap(), &signer);
+                let signed = alpha_client::platform::sign(doc.read().unwrap().clone(), &signer);
                 async move { axum::Json(signed) }
             }),
         );
@@ -125,11 +127,6 @@ impl ReleaseServer {
     }
 }
 
-pub fn sign_platform(document: &Value, key: &SigningKey) -> Value {
-    let digest = signing_digest(context::PLATFORM, document);
-    json!({ "document": document, "signature": { "algorithm": "ed25519", "signature": b64(&key.sign(&digest).to_bytes()) } })
-}
-
 pub struct Harness {
     pub node: Arc<Node>,
     pub pool: PgPool,
@@ -137,9 +134,40 @@ pub struct Harness {
     pub release: ReleaseServer,
     pub org: OrgId,
     pub anchor: (KeyId, SigningKey),
+    pub custodians: Vec<PrivateKey>,
     pub shares: Vec<Vec<u8>>,
+    /// `alpha bootstrap`'s reply; the share files it names live in `dir` until the harness drops.
+    pub bootstrap: Value,
+    pub dir: PathBuf,
     pub ca_pem: String,
     pub _shutdown: tokio::sync::oneshot::Sender<()>,
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+pub fn node_identity(node: &Node) -> NodeIdentity {
+    NodeIdentity {
+        runtime_spki: node.runtime_spki.clone(),
+        xwing: node.xwing_key.public(),
+    }
+}
+
+/// The custodian CLI's client: pinned to the node's runtime key, so any clock passes.
+pub fn spki_client(url: &str, node: &Node) -> Client {
+    Client::new(vec![url.to_owned()], Pin::Spki(node.runtime_spki.clone())).unwrap()
+}
+
+pub fn custodian_pubs(custodians: &[PrivateKey]) -> [PublicKey; 3] {
+    custodians
+        .iter()
+        .map(PrivateKey::public)
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap()
 }
 
 pub fn client() -> reqwest::Client {
@@ -210,7 +238,8 @@ pub fn platform_document(capture: &str) -> Value {
     serde_json::from_slice(&read(capture, "platform-document.json")).unwrap()
 }
 
-/// Bootstraps a fresh node on a fresh database: three custodians, the pilot organization's anchor.
+/// Bootstraps a fresh node on a fresh database through `alpha bootstrap`: three custodians,
+/// the pilot organization's anchor.
 pub async fn harness() -> Option<Harness> {
     let now = captured_at(KEYED);
     harness_with_clock(Arc::new(move || now)).await
@@ -220,69 +249,61 @@ pub async fn harness_with_clock(clock: Clock) -> Option<Harness> {
     let pool = fresh_database().await?;
     let release = ReleaseServer::start(platform_document(KEYED)).await;
     let (node, base, shutdown) = start_node(pool.clone(), &release.url, &release.key, clock).await;
-    let custodians: Vec<alpha_crypto::PrivateKey> = (0..3)
-        .map(|_| alpha_crypto::PrivateKey::generate())
-        .collect();
+    let custodians: Vec<PrivateKey> = (0..3).map(|_| PrivateKey::generate()).collect();
     let anchor_key = SigningKey::from_bytes(&[7u8; 32]);
     let org = OrgId::mint();
-    let body = json!({
-        "custodians": custodians.iter().map(|c| c.public()).collect::<Vec<_>>(),
-        "anchor": { "org_id": org, "principal_id": PrincipalId::mint(),
-                    "public_key": spki_b64(&anchor_key),
-                    "label": "pilot anchor" },
-    });
-    let aad: [u8; 32] = Sha256::digest(&node.runtime_spki).into();
-    let sealed = alpha_crypto::seal(
-        &node.xwing_key.public(),
-        INFO_NODE_BOOTSTRAP,
-        &aad,
-        &serde_json::to_vec(&body).unwrap(),
-    );
-    let reply: Value = client()
-        .post(format!("{base}/v1/node/bootstrap"))
-        .json(&json!({ "body_hpke": sealed }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let shares_hpke: Vec<Sealed> =
-        serde_json::from_value(reply["payload"]["shares_hpke"].clone()).unwrap();
-    let shares: Vec<Vec<u8>> = shares_hpke
-        .iter()
+    let anchor = Anchor {
+        org_id: org,
+        principal_id: PrincipalId::mint(),
+        public_key: spki_b64(&anchor_key),
+        label: "pilot anchor".into(),
+    };
+    let dir = std::env::temp_dir().join(format!("alpha-harness-{}", Uuid::now_v7()));
+    fs::create_dir_all(&dir).unwrap();
+    let identity = node_identity(&node);
+    let bootstrap = alpha_cli::node::bootstrap(
+        &spki_client(&base, &node),
+        &identity,
+        custodian_pubs(&custodians),
+        anchor,
+        1,
+        &dir,
+    )
+    .await
+    .unwrap();
+    let shares = (1..=3)
         .zip(&custodians)
-        .map(|(s, c)| {
-            alpha_crypto::open(c, INFO_UNSEAL_SHARE, &aad, s)
-                .unwrap()
-                .to_vec()
+        .map(|(i, custodian)| {
+            let file = ShareFile::read(&dir.join(format!("share-{i}.json"))).unwrap();
+            alpha_crypto::open(
+                custodian,
+                INFO_UNSEAL_SHARE,
+                &identity.aad(),
+                &file.share_hpke,
+            )
+            .unwrap()
+            .to_vec()
         })
         .collect();
-    let sig = BASE64_URL_SAFE_NO_PAD
-        .decode(reply["signature"]["signature"].as_str().unwrap())
-        .unwrap();
-    let digest = signing_digest(context::NODE_BOOTSTRAP, &reply["payload"]);
-    use p256::ecdsa::signature::Verifier;
-    node.runtime_key
-        .verifying_key()
-        .verify(&digest, &p256::ecdsa::Signature::from_slice(&sig).unwrap())
-        .unwrap();
-    let anchor_id: Uuid =
-        sqlx::query_scalar!("select id from principal_keys where registered_by_key is null")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
     Some(Harness {
         node,
         pool,
         url: base,
         release,
         org,
-        anchor: (anchor_id.into(), anchor_key),
+        anchor: (
+            bootstrap["anchor_key_id"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap(),
+            anchor_key,
+        ),
+        custodians,
         shares,
-        ca_pem: reply["payload"]["kms_ca_pem"].as_str().unwrap().to_owned(),
+        ca_pem: bootstrap["kms_ca_pem"].as_str().unwrap().to_owned(),
+        bootstrap,
+        dir,
         _shutdown: shutdown,
     })
 }
@@ -293,8 +314,7 @@ impl Harness {
     }
 
     pub fn signed(&self, ctx: &str, payload: Value, key: &(KeyId, SigningKey)) -> Value {
-        let digest = signing_digest(ctx, &payload);
-        json!({ "payload": payload, "signature": { "key_id": key.0, "algorithm": "ed25519", "signature": b64(&key.1.sign(&digest).to_bytes()) } })
+        json!(alpha_client::sign(ctx, payload, key.0, &key.1))
     }
 
     pub async fn call(

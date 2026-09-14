@@ -418,15 +418,7 @@ impl Client {
         self.post(&format!("/v1/keys/{key_id}/revoke"), body).await
     }
 
-    // Node API
-
-    pub async fn node_evidence(&self, nonce: &[u8; 32]) -> Result<NodeEvidence, Error> {
-        let path = format!(
-            "/v1/node/evidence?nonce={}",
-            BASE64_URL_SAFE_NO_PAD.encode(nonce)
-        );
-        self.request(Method::GET, &path, None).await
-    }
+    // Node API; the evidence route is [`fetch_node_evidence`], the pin comes from its reply.
 
     pub async fn bootstrap(&self, body: &BootstrapRequest) -> Result<BootstrapReply, Error> {
         self.post("/v1/node/bootstrap", body).await

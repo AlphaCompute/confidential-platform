@@ -31,13 +31,6 @@ fn ca_pin(h: &Harness) -> Pin {
     Pin::Ca(tls::ca_from_pem(&h.ca_pem).unwrap())
 }
 
-fn identity_of(node: &alpha_kms::Node) -> cli_node::NodeIdentity {
-    cli_node::NodeIdentity {
-        runtime_spki: node.runtime_spki.clone(),
-        xwing: node.xwing_key.public(),
-    }
-}
-
 #[tokio::test]
 async fn call_refuses_a_kms_whose_chain_does_not_end_in_the_pinned_ca() {
     let Some(h) = wall_clock_harness().await else {
@@ -294,95 +287,65 @@ async fn sign_and_check_feed_the_node_and_the_admin_pin() {
 
 #[tokio::test]
 async fn bootstrap_once_never_again_then_unseal_the_second_node() {
-    let Some(pool) = fresh_database().await else {
+    let Some(h) = wall_clock_harness().await else {
         return;
     };
-    let release = ReleaseServer::start(platform_document(KEYED)).await;
-    let (node, url, _shutdown) = start_node(
-        pool.clone(),
-        &release.url,
-        &release.key,
-        Arc::new(SystemTime::now),
-    )
-    .await;
-    let identity = identity_of(&node);
-    let client = Client::new(vec![url.clone()], Pin::Spki(identity.runtime_spki.clone())).unwrap();
-    let custodians: Vec<alpha_crypto::PrivateKey> = (0..3)
-        .map(|_| alpha_crypto::PrivateKey::generate())
-        .collect();
-    let pubs: [alpha_crypto::PublicKey; 3] = custodians
-        .iter()
-        .map(|c| c.public())
-        .collect::<Vec<_>>()
-        .try_into()
-        .unwrap();
-    let anchor_key = SigningKey::from_bytes(&[7u8; 32]);
-    let anchor = Anchor {
-        org_id: alpha_core::OrgId::mint(),
-        principal_id: PrincipalId::mint(),
-        public_key: spki_b64(&anchor_key),
-        label: "pilot anchor".into(),
-    };
-    let dir = std::env::temp_dir().join(format!("alpha-cli-bootstrap-{}", Uuid::now_v7()));
-    fs::create_dir_all(&dir).unwrap();
-
-    let reply = cli_node::bootstrap(&client, &identity, pubs.clone(), anchor.clone(), 1, &dir)
-        .await
-        .unwrap();
-    assert!(!node.is_sealed());
-    let ca_pem = reply["kms_ca_pem"].as_str().unwrap();
-    assert_eq!(ca_pem, node.intermediates().unwrap().ca_pem());
+    assert!(!h.node.is_sealed());
+    assert_eq!(h.ca_pem, h.node.intermediates().unwrap().ca_pem());
     assert_eq!(
-        reply["kms_ca_spki_sha256"],
-        json!(sign::ca_spki_sha256(ca_pem).unwrap().unwrap())
+        h.bootstrap["kms_ca_spki_sha256"],
+        json!(sign::ca_spki_sha256(&h.ca_pem).unwrap().unwrap())
     );
     let anchor_id: Uuid =
         sqlx::query_scalar!("select id from principal_keys where registered_by_key is null")
-            .fetch_one(&pool)
+            .fetch_one(&h.pool)
             .await
             .unwrap();
-    assert_eq!(reply["anchor_key_id"], json!(anchor_id));
-    let shares: Vec<std::path::PathBuf> = serde_json::from_value(reply["shares"].clone()).unwrap();
+    assert_eq!(h.anchor.0, KeyId::from(anchor_id));
+    let identity = node_identity(&h.node);
+    let shares: Vec<std::path::PathBuf> =
+        serde_json::from_value(h.bootstrap["shares"].clone()).unwrap();
     assert_eq!(shares.len(), 3);
-    for (path, custodian) in shares.iter().zip(&custodians) {
+    for path in &shares {
         let file = cli_node::ShareFile::read(path).unwrap();
         assert_eq!(file.platform_document_version, 1);
         assert_eq!(
             file.kms_node_spki_sha256,
             format!("sha256:{}", hex::encode(identity.aad()))
         );
-        alpha_crypto::open(
-            custodian,
-            alpha_crypto::INFO_UNSEAL_SHARE,
-            &identity.aad(),
-            &file.share_hpke,
-        )
-        .unwrap();
     }
 
     // Never again: the serving node refuses, and so does a fresh sealed node over the same database.
-    let err = cli_node::bootstrap(&client, &identity, pubs.clone(), anchor.clone(), 1, &dir)
+    let pubs = custodian_pubs(&h.custodians);
+    let anchor = Anchor {
+        org_id: h.org,
+        principal_id: PrincipalId::mint(),
+        public_key: spki_b64(&h.anchor.1),
+        label: "again".into(),
+    };
+    let client = spki_client(&h.url, &h.node);
+    let err = cli_node::bootstrap(&client, &identity, pubs.clone(), anchor.clone(), 1, &h.dir)
         .await
         .unwrap_err();
     assert!(err.starts_with("already_exists"), "{err}");
     let (node2, url2, _shutdown2) = start_node(
-        pool.clone(),
-        &release.url,
-        &release.key,
+        h.pool.clone(),
+        &h.release.url,
+        &h.release.key,
         Arc::new(SystemTime::now),
     )
     .await;
     assert!(node2.is_sealed());
-    let identity2 = identity_of(&node2);
-    let client2 = Client::new(vec![url2], Pin::Spki(identity2.runtime_spki.clone())).unwrap();
-    let err = cli_node::bootstrap(&client2, &identity2, pubs, anchor, 1, &dir)
+    let identity2 = node_identity(&node2);
+    let client2 = spki_client(&url2, &node2);
+    let err = cli_node::bootstrap(&client2, &identity2, pubs, anchor, 1, &h.dir)
         .await
         .unwrap_err();
     assert!(err.starts_with("already_exists"), "{err}");
     assert!(node2.is_sealed());
 
     // The self-signed sealed listener is pinned by SPKI: another node's key is refused.
-    let wrong = Client::new(vec![url], Pin::Spki(identity2.runtime_spki.clone())).unwrap();
+    let wrong = spki_client(&h.url, &node2);
     assert!(matches!(
         wrong.ready().await.unwrap_err(),
         alpha_client::Error::Connect(_)
@@ -390,7 +353,7 @@ async fn bootstrap_once_never_again_then_unseal_the_second_node() {
 
     // Unseal through the CLI: one share leaves it sealed, the second opens it; the share file
     // remembers the higher document version it was verified against.
-    let reply = cli_node::unseal(&client2, &identity2, &shares[2], &custodians[2], 3)
+    let reply = cli_node::unseal(&client2, &identity2, &shares[2], &h.custodians[2], 3)
         .await
         .unwrap();
     assert!(reply.sealed);
@@ -401,11 +364,11 @@ async fn bootstrap_once_never_again_then_unseal_the_second_node() {
             .platform_document_version,
         3
     );
-    let err = cli_node::unseal(&client2, &identity2, &shares[0], &custodians[2], 1)
+    let err = cli_node::unseal(&client2, &identity2, &shares[0], &h.custodians[2], 1)
         .await
         .unwrap_err();
     assert!(err.contains("share file"), "{err}");
-    let reply = cli_node::unseal(&client2, &identity2, &shares[0], &custodians[0], 1)
+    let reply = cli_node::unseal(&client2, &identity2, &shares[0], &h.custodians[0], 1)
         .await
         .unwrap();
     assert!(!reply.sealed);
@@ -418,7 +381,6 @@ async fn bootstrap_once_never_again_then_unseal_the_second_node() {
     );
     assert_eq!(
         *node2.intermediates().unwrap().tenant_kek_root,
-        *node.intermediates().unwrap().tenant_kek_root
+        *h.node.intermediates().unwrap().tenant_kek_root
     );
-    fs::remove_dir_all(&dir).unwrap();
 }
