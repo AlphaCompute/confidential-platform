@@ -16,6 +16,8 @@ The key broker of the trust plane: six tables, twelve `/v1` routes on one TLS po
 
 The release key's public half is `release-key.pub`; replacing it means rebuilding the image.
 
+The image is `images/kms/Dockerfile` (`alpha-kms`, or `alpha-kms-dev` with `--build-arg FEATURES=dev-root`), built and reproducibility-checked by `.github/workflows/release.yml`; the two nodes' compose and the operator's steps are `deploy/README.md`.
+
 ## Tests
 
 `cargo test -p alpha-kms` runs the unit tests always and `tests/db.rs` when `DATABASE_URL` points at a Postgres the tests may `create database` in (each test makes its own). The db tests attest with real Phala quotes from `testdata/attest/*-keyed`, pinned to the capture's time, nonce key and collateral, and cover the server side of every route: bootstrap once, unseal with one and two shares, join only for an attested, listed, requesting node; the Control API's checks and idempotency; attestation, release, revocation on the next call, re-verification of a tampered row, the anchor and chain rules, `cert_invalid` for a self-signed client certificate; the monotone platform document; and the append-only audit role.
