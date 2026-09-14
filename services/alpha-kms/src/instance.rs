@@ -164,12 +164,13 @@ pub async fn attest(
         .map_err(|_| ApiError::malformed("runtime_pubkey: not a P-256 SPKI"))?;
     let actor = keys::sha256_hex(&spki);
     let evidence_sha256 = Sha256::digest(alpha_core::jcs(&json!(request.evidence))).to_vec();
-    let result = attest_inner(&node, &spki, &request).await;
+    let now = node.now();
+    let result = attest_inner(&node, &spki, &request, now).await;
     let (outcome, details, org_id) = match &result {
-        Ok(ok) => (
+        Ok((_, result)) => (
             "ok",
-            json!(ok.result),
-            Some(Uuid::from(ok.result.revision.org_id)),
+            json!(result),
+            Some(Uuid::from(result.revision.org_id)),
         ),
         Err(e) => (e.outcome(), e.details(), None),
     };
@@ -181,34 +182,28 @@ pub async fn attest(
         object: result
             .as_ref()
             .ok()
-            .map(|ok| format!("revision:{}", ok.result.revision.compose_hash)),
+            .map(|(_, result)| format!("revision:{}", result.revision.compose_hash)),
         outcome,
         details,
         evidence_sha256: Some(evidence_sha256),
     }
     .insert(&node.pool)
     .await?;
-    let ok = result?;
+    let (leaf_der, result) = result?;
     Ok(Json(json!({
-        "certificate_chain": [certs::pem(&ok.leaf_der), ok.ca_pem],
-        "not_after": rfc3339(ok.not_after),
-        "attestation_result": ok.result,
+        "certificate_chain": [certs::pem(&leaf_der), node.intermediates()?.ca_pem()],
+        "not_after": rfc3339(now + certs::LEAF_TTL),
+        "attestation_result": result,
     })))
 }
 
-struct Attested {
-    leaf_der: Vec<u8>,
-    ca_pem: String,
-    not_after: DateTime<Utc>,
-    result: AttestationResult,
-}
-
+/// The leaf's DER and the result behind it.
 async fn attest_inner(
     node: &Node,
     spki: &[u8],
     request: &AttestRequest,
-) -> Result<Attested, ApiError> {
-    let now = node.now();
+    now: SystemTime,
+) -> Result<(Vec<u8>, AttestationResult), ApiError> {
     let nonce = decode32("nonce", &request.nonce)?;
     check_nonce(&node.nonce_key, &nonce, now)?;
     let doc = node
@@ -273,12 +268,7 @@ async fn attest_inner(
         verified_at: rfc3339(now),
         policy_version: appraised.policy_version,
     };
-    Ok(Attested {
-        leaf_der,
-        ca_pem: keys.ca_pem(),
-        not_after: (now + certs::LEAF_TTL).into(),
-        result,
-    })
+    Ok((leaf_der, result))
 }
 
 pub async fn get_secret(

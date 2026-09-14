@@ -28,27 +28,27 @@ use zeroize::Zeroizing;
 
 use crate::error::ApiError;
 
+/// What the node keeps of its environment; the database and PCCS URLs are consumed on start.
 pub struct Config {
-    pub database_url: String,
     pub kms_endpoints: Vec<String>,
-    pub pccs_url: String,
     pub platform_document_url: String,
     #[cfg(feature = "dev-root")]
     pub dev_root_kek: Option<Zeroizing<[u8; 32]>>,
 }
 
+pub fn env(name: &str) -> Result<String, String> {
+    std::env::var(name).map_err(|_| format!("{name} is not set"))
+}
+
 impl Config {
     pub fn from_env() -> Result<Self, String> {
-        let var = |name: &str| std::env::var(name).map_err(|_| format!("{name} is not set"));
         Ok(Self {
-            database_url: var("ALPHACOMPUTE_DATABASE_URL")?,
-            kms_endpoints: var("ALPHACOMPUTE_KMS_ENDPOINTS")?
+            kms_endpoints: env("ALPHACOMPUTE_KMS_ENDPOINTS")?
                 .split(',')
                 .map(|s| s.trim().trim_end_matches('/').to_owned())
                 .filter(|s| !s.is_empty())
                 .collect(),
-            pccs_url: var("ALPHACOMPUTE_PCCS_URL")?,
-            platform_document_url: var("ALPHACOMPUTE_PLATFORM_DOCUMENT_URL")?,
+            platform_document_url: env("ALPHACOMPUTE_PLATFORM_DOCUMENT_URL")?,
             #[cfg(feature = "dev-root")]
             dev_root_kek: std::env::var("ALPHACOMPUTE_KMS_DEV_ROOT_KEK")
                 .ok()
@@ -127,7 +127,7 @@ impl Node {
     ) -> Result<Arc<Self>, String> {
         let compose_hash = alpha_attest::event_log_compose_hash(&event_log)
             .ok_or("the event log carries no compose-hash event")?;
-        let runtime_key = SigningKey::from_bytes((&random32()).into())
+        let runtime_key = SigningKey::from_bytes((&random::<32>()).into())
             .map_err(|e| format!("runtime key: {e}"))?;
         let runtime_spki = runtime_key
             .verifying_key()
@@ -270,8 +270,8 @@ async fn ready(State(node): State<Arc<Node>>) -> Response {
     (status, axum::Json(serde_json::json!({ "sealed": sealed }))).into_response()
 }
 
-pub fn random32() -> [u8; 32] {
-    let mut out = [0u8; 32];
+pub fn random<const N: usize>() -> [u8; N] {
+    let mut out = [0u8; N];
     getrandom::fill(&mut out).expect("the system RNG never fails");
     out
 }

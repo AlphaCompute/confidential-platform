@@ -22,9 +22,7 @@ use crate::error::ApiError;
 pub type Key32 = Zeroizing<[u8; 32]>;
 
 fn derive(ikm: &[u8; 32], salt: &[u8], org: OrgId, anchor_spki: &[u8]) -> Key32 {
-    let mut info = Vec::with_capacity(48);
-    info.extend_from_slice(org.as_bytes());
-    info.extend_from_slice(&Sha256::digest(anchor_spki));
+    let info = [org.as_bytes().as_slice(), &Sha256::digest(anchor_spki)].concat();
     let mut out = Zeroizing::new([0u8; 32]);
     Hkdf::<Sha256>::new(Some(salt), ikm)
         .expand(&info, out.as_mut())
@@ -52,8 +50,7 @@ pub fn anchor_check(tenant_kek_root: &[u8; 32], org: OrgId, anchor_spki: &[u8]) 
 
 /// `nonce(12) ‖ AES-256-GCM(key, plaintext, aad)`.
 pub fn aead_seal(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
-    let mut nonce = [0u8; 12];
-    getrandom::fill(&mut nonce).expect("the system RNG never fails");
+    let nonce = crate::random::<12>();
     let ct = Aes256Gcm::new(key.into())
         .encrypt(
             &Nonce::try_from(nonce.as_slice()).unwrap(),

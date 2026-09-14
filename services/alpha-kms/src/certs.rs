@@ -22,8 +22,7 @@ pub const LEAF_TTL: Duration = Duration::from_secs(3600);
 pub const KMS_SAN: &str = "alphacompute://kms";
 
 fn serial() -> rcgen::SerialNumber {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).expect("the system RNG never fails");
+    let mut bytes = crate::random::<16>();
     bytes[0] &= 0x7f;
     rcgen::SerialNumber::from(bytes.to_vec())
 }

@@ -21,10 +21,9 @@ async fn main() {
 }
 
 async fn run() -> Result<(), String> {
-    let config = Config::from_env()?;
     let pool = PgPoolOptions::new()
         .max_connections(8)
-        .connect(&config.database_url)
+        .connect(&alpha_kms::env("ALPHACOMPUTE_DATABASE_URL")?)
         .await
         .map_err(|e| format!("database: {e}"))?;
     if std::env::args().nth(1).as_deref() == Some("migrate") {
@@ -37,13 +36,12 @@ async fn run() -> Result<(), String> {
         .and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok())
         .ok_or("release-key.pub is not an Ed25519 public key")?;
     let event_log = alpha_tsm::event_log().map_err(|e| format!("event log: {e}"))?;
-    let pccs_url = config.pccs_url.clone();
     let node = Node::new(
         pool,
-        config,
+        Config::from_env()?,
         Arc::new(SystemTime::now),
-        CollateralSource::Pccs(pccs_url),
-        alpha_kms::random32(),
+        CollateralSource::Pccs(alpha_kms::env("ALPHACOMPUTE_PCCS_URL")?),
+        alpha_kms::random(),
         event_log,
         release_key,
     )?;

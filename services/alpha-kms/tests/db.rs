@@ -65,7 +65,7 @@ fn b64(bytes: &[u8]) -> String {
 }
 
 /// A fresh database per test, migrated.
-async fn fresh_database() -> Option<(PgPool, String)> {
+async fn fresh_database() -> Option<PgPool> {
     let admin_url = std::env::var("DATABASE_URL").ok()?;
     let admin = PgPoolOptions::new()
         .max_connections(1)
@@ -88,7 +88,7 @@ async fn fresh_database() -> Option<(PgPool, String)> {
         .await
         .unwrap();
     alpha_kms::migrate(&pool).await.unwrap();
-    Some((pool, url))
+    Some(pool)
 }
 
 struct ReleaseServer {
@@ -134,7 +134,6 @@ struct Harness {
     anchor: (KeyId, SigningKey),
     shares: Vec<Vec<u8>>,
     ca_pem: String,
-    capture: &'static str,
     _shutdown: tokio::sync::oneshot::Sender<()>,
 }
 
@@ -153,21 +152,18 @@ fn client_with(identity_pem: &str) -> reqwest::Client {
         .unwrap()
 }
 
+/// A node acting as the keyed capture's CVM, its clock pinned to the capture.
 async fn start_node(
     pool: PgPool,
-    url: String,
-    capture: &'static str,
     release_url: &str,
     release_key: &SigningKey,
 ) -> (Arc<Node>, String, tokio::sync::oneshot::Sender<()>) {
     let event_log: Vec<EventLogEntry> =
-        serde_json::from_slice(&read(capture, "event_log.json")).unwrap();
-    let collateral = serde_json::from_slice(&read(capture, "collateral.json")).unwrap();
-    let now = captured_at(capture);
+        serde_json::from_slice(&read(KEYED, "event_log.json")).unwrap();
+    let collateral = serde_json::from_slice(&read(KEYED, "collateral.json")).unwrap();
+    let now = captured_at(KEYED);
     let config = Config {
-        database_url: url,
         kms_endpoints: vec![],
-        pccs_url: "unused".into(),
         platform_document_url: release_url.to_owned(),
         #[cfg(feature = "dev-root")]
         dev_root_kek: None,
@@ -202,17 +198,10 @@ fn platform_document(capture: &str) -> Value {
 }
 
 /// Bootstraps a fresh node on a fresh database: three custodians, the pilot organization's anchor.
-async fn harness(capture: &'static str) -> Option<Harness> {
-    let (pool, url) = fresh_database().await?;
-    let release = ReleaseServer::start(platform_document(capture)).await;
-    let (node, base, shutdown) = start_node(
-        pool.clone(),
-        url.clone(),
-        capture,
-        &release.url,
-        &release.key,
-    )
-    .await;
+async fn harness() -> Option<Harness> {
+    let pool = fresh_database().await?;
+    let release = ReleaseServer::start(platform_document(KEYED)).await;
+    let (node, base, shutdown) = start_node(pool.clone(), &release.url, &release.key).await;
     let custodians: Vec<alpha_crypto::PrivateKey> = (0..3)
         .map(|_| alpha_crypto::PrivateKey::generate())
         .collect();
@@ -276,14 +265,13 @@ async fn harness(capture: &'static str) -> Option<Harness> {
         anchor: (anchor_id.into(), anchor_key),
         shares,
         ca_pem: reply["payload"]["kms_ca_pem"].as_str().unwrap().to_owned(),
-        capture,
         _shutdown: shutdown,
     })
 }
 
 impl Harness {
     fn now(&self) -> SystemTime {
-        captured_at(self.capture)
+        captured_at(KEYED)
     }
 
     fn signed(&self, ctx: &str, payload: Value, key: &(KeyId, SigningKey)) -> Value {
@@ -328,7 +316,7 @@ impl Harness {
         app_id: AppId,
         signer: &(KeyId, SigningKey),
     ) -> alpha_core::ComposeHash {
-        let compose = text(self.capture, "app-compose.json");
+        let compose = text(KEYED, "app-compose.json");
         let hash = alpha_core::compose_hash(&compose);
         let document = json!({ "app_id": app_id, "compose": compose });
         let sig = self.signed(context::REVISION, document, signer)["signature"].clone();
@@ -355,7 +343,7 @@ impl Harness {
     }
 
     fn nonce(&self) -> String {
-        b64(&read(self.capture, "nonce.bin"))
+        b64(&read(KEYED, "nonce.bin"))
     }
 
     async fn attest(&self, capture: &str) -> (StatusCode, Value) {
@@ -365,10 +353,10 @@ impl Harness {
 
     /// Attests and returns an HTTPS client holding the Instance's leaf and the capture's key.
     async fn instance_client(&self) -> reqwest::Client {
-        let (status, reply) = self.attest(self.capture).await;
+        let (status, reply) = self.attest(KEYED).await;
         assert_eq!(status, StatusCode::OK, "{reply}");
         let leaf = reply["certificate_chain"][0].as_str().unwrap();
-        client_with(&format!("{}{leaf}", text(self.capture, "runtime.key.pem")))
+        client_with(&format!("{}{leaf}", text(KEYED, "runtime.key.pem")))
     }
 
     async fn audit(&self, action: &str) -> Vec<(i64, String, Value)> {
@@ -391,7 +379,7 @@ fn code(reply: &Value) -> &str {
 
 #[tokio::test]
 async fn bootstrap_once_unseal_with_two_shares_and_sealed_gate() {
-    let Some(h) = harness(KEYED).await else {
+    let Some(h) = harness().await else {
         return;
     };
     assert!(h.ca_pem.starts_with("-----BEGIN CERTIFICATE-----"));
@@ -417,14 +405,8 @@ async fn bootstrap_once_unseal_with_two_shares_and_sealed_gate() {
     );
 
     // A second node over the same database comes up sealed and refuses everything but the Node API.
-    let (node2, url2, _shutdown2) = start_node(
-        h.pool.clone(),
-        h.url.clone(),
-        KEYED,
-        &h.release.url,
-        &h.release.key,
-    )
-    .await;
+    let (node2, url2, _shutdown2) =
+        start_node(h.pool.clone(), &h.release.url, &h.release.key).await;
     assert!(node2.is_sealed());
     let r = client().get(format!("{url2}/ready")).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -501,7 +483,7 @@ async fn bootstrap_once_unseal_with_two_shares_and_sealed_gate() {
 
 #[tokio::test]
 async fn control_routes_register_revoke_and_put() {
-    let Some(h) = harness(KEYED).await else {
+    let Some(h) = harness().await else {
         return;
     };
     let admin = h.register_key(&h.anchor, 11).await;
@@ -766,7 +748,7 @@ async fn control_routes_register_revoke_and_put() {
 
 #[tokio::test]
 async fn attest_release_revoke_and_tamper() {
-    let Some(h) = harness(KEYED).await else {
+    let Some(h) = harness().await else {
         return;
     };
     let admin = h.register_key(&h.anchor, 21).await;
@@ -1078,7 +1060,7 @@ fn forged_client(h: &Harness, sans: &[String]) -> reqwest::Client {
 
 #[tokio::test]
 async fn join_hands_out_intermediates_only_to_an_attested_listed_requesting_node() {
-    let Some(h) = harness(KEYED).await else {
+    let Some(h) = harness().await else {
         return;
     };
     let pkcs8 = read(KEYED, "runtime.key.pkcs8.der");
@@ -1189,7 +1171,7 @@ async fn join_hands_out_intermediates_only_to_an_attested_listed_requesting_node
 
 #[tokio::test]
 async fn platform_document_is_monotone_and_audited_on_change() {
-    let Some(h) = harness(KEYED).await else {
+    let Some(h) = harness().await else {
         return;
     };
     assert_eq!(h.audit("platform.reload").await.len(), 1);
@@ -1224,7 +1206,7 @@ async fn platform_document_is_monotone_and_audited_on_change() {
 
 #[tokio::test]
 async fn nonce_route_malformed_body_and_unknown_route() {
-    let Some(h) = harness(KEYED).await else {
+    let Some(h) = harness().await else {
         return;
     };
     let (status, reply) = h.post("/v1/attest/nonce", json!({})).await;

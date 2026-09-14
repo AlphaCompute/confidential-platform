@@ -25,7 +25,7 @@ use crate::error::ApiError;
 use crate::instance::{check_nonce, collateral, decode32};
 use crate::keys::{self, aead_open, aead_seal};
 use crate::tls::PeerCerts;
-use crate::{Intermediates, Node, Phase, certs, random32};
+use crate::{Intermediates, Node, Phase, certs, random};
 
 pub const CONTEXT_BOOTSTRAP: &str = "alphacompute/node-bootstrap/v1";
 
@@ -103,28 +103,23 @@ pub async fn bootstrap(
     let now = node.now();
 
     let root = root_kek(&node);
-    let tenant_kek_root = Zeroizing::new(random32());
+    let tenant_kek_root = Zeroizing::new(random());
     let (ca_key_der, ca_cert_der) = certs::new_ca(now);
     let ca_key_der = Zeroizing::new(ca_key_der);
     let mut tx = node.pool.begin().await?;
-    sqlx::query!("lock table intermediate_keys in access exclusive mode")
-        .execute(&mut *tx)
-        .await?;
-    let existing = sqlx::query_scalar!("select count(*) from intermediate_keys")
-        .fetch_one(&mut *tx)
-        .await?;
-    if existing.unwrap_or(0) != 0 {
-        return Err(ApiError::new("already_exists", "database is not empty"));
-    }
-    sqlx::query!(
+    let inserted = sqlx::query!(
         "insert into intermediate_keys (purpose, wrapped, public_part) values
-           ('tenant-kek-root', $1, null), ('ca', $2, $3)",
+           ('tenant-kek-root', $1, null), ('ca', $2, $3) on conflict (purpose) do nothing",
         aead_seal(&root, b"tenant-kek-root", tenant_kek_root.as_slice()),
         aead_seal(&root, b"ca", &ca_key_der),
         ca_cert_der,
     )
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if inserted != 2 {
+        return Err(ApiError::new("already_exists", "database is not empty"));
+    }
     let anchor_id: Uuid = alpha_core::KeyId::mint().into();
     let check = keys::anchor_check(&tenant_kek_root, body.anchor.org_id, &anchor_spki);
     sqlx::query!(
@@ -180,17 +175,12 @@ pub async fn bootstrap(
     })))
 }
 
-#[cfg(feature = "dev-root")]
-fn root_kek(node: &Node) -> Zeroizing<[u8; 32]> {
-    node.config
-        .dev_root_kek
-        .clone()
-        .unwrap_or_else(|| Zeroizing::new(random32()))
-}
-
-#[cfg(not(feature = "dev-root"))]
-fn root_kek(_: &Node) -> Zeroizing<[u8; 32]> {
-    Zeroizing::new(random32())
+fn root_kek(_node: &Node) -> Zeroizing<[u8; 32]> {
+    #[cfg(feature = "dev-root")]
+    if let Some(root) = &_node.config.dev_root_kek {
+        return root.clone();
+    }
+    Zeroizing::new(random())
 }
 
 /// Unwraps both rows under `root`.
