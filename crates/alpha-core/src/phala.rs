@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde_json::Value;
 use serde_json::ser::PrettyFormatter;
 
@@ -20,13 +22,12 @@ pub fn canonicalize(value: &Value) -> String {
 // the workspace can switch on for everyone; the order must not depend on that.
 fn sort_keys(value: &Value) -> Value {
     match value {
-        Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            keys.into_iter()
-                .map(|key| (key.clone(), sort_keys(&map[key])))
-                .collect()
-        }
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, value)| (key.clone(), sort_keys(value)))
+            .collect::<BTreeMap<_, _>>()
+            .into_iter()
+            .collect(),
         Value::Array(items) => items.iter().map(sort_keys).collect(),
         other => other.clone(),
     }

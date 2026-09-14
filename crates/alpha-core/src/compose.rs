@@ -44,21 +44,23 @@ impl FromStr for ComposeHash {
     type Err = ParseComposeHashError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let hex = s.strip_prefix("sha256:").ok_or(ParseComposeHashError)?;
-        if hex.len() != 64 {
-            return Err(ParseComposeHashError);
-        }
-        let mut bytes = [0u8; 32];
-        for (i, pair) in hex.as_bytes().chunks(2).enumerate() {
-            let nibble = |b: u8| match b {
-                b'0'..=b'9' => Ok(b - b'0'),
-                b'a'..=b'f' => Ok(b - b'a' + 10),
-                _ => Err(ParseComposeHashError),
-            };
-            bytes[i] = (nibble(pair[0])? << 4) | nibble(pair[1])?;
-        }
-        Ok(Self(bytes))
+        s.strip_prefix("sha256:")
+            .and_then(hex_bytes)
+            .map(Self)
+            .ok_or(ParseComposeHashError)
     }
+}
+
+/// Exactly `2 * N` lowercase hex digits; `from_str_radix` alone would take uppercase and `+`.
+pub fn hex_bytes<const N: usize>(hex: &str) -> Option<[u8; N]> {
+    if hex.len() != 2 * N || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 impl Serialize for ComposeHash {
@@ -141,9 +143,9 @@ fn check_images(node: &Yaml) -> Result<(), RegistrationError> {
 }
 
 fn has_sha256_digest(image: &str) -> bool {
-    image.rsplit_once("@sha256:").is_some_and(|(_, hex)| {
-        hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    })
+    image
+        .rsplit_once("@sha256:")
+        .is_some_and(|(_, hex)| hex_bytes::<32>(hex).is_some())
 }
 
 #[cfg(test)]

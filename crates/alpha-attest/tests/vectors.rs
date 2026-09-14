@@ -62,46 +62,33 @@ impl Case {
 
     fn now(&self) -> SystemTime {
         let text = String::from_utf8(self.file("captured_at.txt")).unwrap();
-        UNIX_EPOCH + Duration::from_secs(rfc3339_secs(text.trim()))
+        let secs = chrono::DateTime::parse_from_rfc3339(text.trim())
+            .unwrap()
+            .timestamp();
+        UNIX_EPOCH + Duration::from_secs(secs as u64)
     }
 
     fn run(&self) -> Result<Appraised, alpha_attest::AppraisalError> {
+        self.run_with(&self.evidence(), self.now())
+    }
+
+    fn run_with(
+        &self,
+        evidence: &Evidence,
+        now: SystemTime,
+    ) -> Result<Appraised, alpha_attest::AppraisalError> {
         let nonce: [u8; 32] = self.file("nonce.bin").try_into().unwrap();
         let node_spki = self.file("node_xwing_spki.der");
         appraise(
-            &self.evidence(),
+            evidence,
             &nonce,
             &self.file("runtime_spki.der"),
             (self.kind() == "node").then_some(node_spki.as_slice()),
             &self.json::<PlatformDocument>("platform-document.json"),
             &self.json::<Collateral>("collateral.json"),
-            self.now(),
+            now,
         )
     }
-}
-
-fn rfc3339_secs(s: &str) -> u64 {
-    let (date, time) = s.trim_end_matches('Z').split_once('T').unwrap();
-    let [y, m, d]: [u64; 3] = date
-        .split('-')
-        .map(|p| p.parse().unwrap())
-        .collect::<Vec<_>>()
-        .try_into()
-        .unwrap();
-    let [hh, mm, ss]: [u64; 3] = time
-        .split(':')
-        .map(|p| p.parse().unwrap())
-        .collect::<Vec<_>>()
-        .try_into()
-        .unwrap();
-    // Days from civil, Howard Hinnant's algorithm.
-    let (y, m) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
-    let era = y / 400;
-    let yoe = y - era * 400;
-    let doy = (153 * m + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-    days * 86400 + hh * 3600 + mm * 60 + ss
 }
 
 fn positive(name: &str) {
@@ -169,36 +156,18 @@ fn wrong_evidence_format_is_unknown() {
     let case = Case::load("01-instance");
     let mut evidence = case.evidence();
     evidence.format = "alphacompute-evidence/2".into();
-    let nonce: [u8; 32] = case.file("nonce.bin").try_into().unwrap();
-    let error = appraise(
-        &evidence,
-        &nonce,
-        &case.file("runtime_spki.der"),
-        None,
-        &case.json::<PlatformDocument>("platform-document.json"),
-        &case.json::<Collateral>("collateral.json"),
-        case.now(),
-    )
-    .err()
-    .unwrap();
+    let error = case.run_with(&evidence, case.now()).err().unwrap();
     assert_eq!(error.code(), "attestation_unknown");
 }
 
 #[test]
 fn expired_collateral_fails() {
     let case = Case::load("01-instance");
-    let nonce: [u8; 32] = case.file("nonce.bin").try_into().unwrap();
-    let error = appraise(
-        &case.evidence(),
-        &nonce,
-        &case.file("runtime_spki.der"),
-        None,
-        &case.json::<PlatformDocument>("platform-document.json"),
-        &case.json::<Collateral>("collateral.json"),
-        case.now() + Duration::from_secs(10 * 365 * 86400),
-    )
-    .err()
-    .unwrap();
+    let ten_years = Duration::from_secs(10 * 365 * 86400);
+    let error = case
+        .run_with(&case.evidence(), case.now() + ten_years)
+        .err()
+        .unwrap();
     assert_eq!(error.code(), "attestation_failed");
 }
 

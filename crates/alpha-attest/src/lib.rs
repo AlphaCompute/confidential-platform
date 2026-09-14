@@ -8,7 +8,7 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alpha_core::{AppId, ComposeHash, OrgId};
+use alpha_core::{AppId, ComposeHash, OrgId, hex_bytes};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 pub use dcap_qvl::QuoteCollateralV3 as Collateral;
@@ -21,7 +21,7 @@ pub use event_log::EventLogEntry;
 pub const EVIDENCE_FORMAT: &str = "alphacompute-evidence/1";
 pub const RESULT_FORMAT: &str = "alphacompute-attestation-result/1";
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Evidence {
     pub format: String,
@@ -69,13 +69,10 @@ impl FromStr for Measurement {
     type Err = ParseMeasurementError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let hex = s.strip_prefix("sha384:").ok_or(ParseMeasurementError)?;
-        if hex.bytes().any(|b| b.is_ascii_uppercase()) {
-            return Err(ParseMeasurementError);
-        }
-        let mut bytes = [0u8; 48];
-        hex::decode_to_slice(hex, &mut bytes).map_err(|_| ParseMeasurementError)?;
-        Ok(Self(bytes))
+        s.strip_prefix("sha384:")
+            .and_then(hex_bytes)
+            .map(Self)
+            .ok_or(ParseMeasurementError)
     }
 }
 
@@ -173,7 +170,7 @@ pub struct Revision {
 
 /// Everything an [`AttestationResult`] needs except `revision` and `verified_at`, which the
 /// KMS fills after looking `compose_hash` up in its Revisions.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Appraised {
     pub measured: Measured,
     pub tcb_status: String,
@@ -264,8 +261,7 @@ pub fn appraise(
         rtmr2: Measurement(report.rt_mr2),
         rtmr3: Measurement(report.rt_mr3),
     };
-    let [rtmr0, rtmr1, rtmr2, rtmr3] = event_log::replay(&evidence.event_log);
-    if [rtmr0, rtmr1, rtmr2, rtmr3]
+    if event_log::replay(&evidence.event_log)
         != [
             measured.rtmr0,
             measured.rtmr1,
@@ -378,22 +374,14 @@ mod tests {
     }
 
     #[test]
-    fn policy_admits_listed_status_and_tolerated_advisories() {
+    fn policy_check() {
         assert_eq!(denied("UpToDate", &[], PROD), None);
         assert_eq!(denied("SWHardeningNeeded", &["INTEL-SA-00837"], PROD), None);
-    }
-
-    #[test]
-    fn policy_denies_unlisted_status_even_without_advisories() {
         assert!(
             denied("OutOfDate", &[], PROD)
                 .unwrap()
                 .contains("OutOfDate")
         );
-    }
-
-    #[test]
-    fn policy_denies_untolerated_advisory_under_listed_status() {
         assert!(
             denied(
                 "SWHardeningNeeded",
@@ -403,10 +391,6 @@ mod tests {
             .unwrap()
             .contains("INTEL-SA-00999")
         );
-    }
-
-    #[test]
-    fn policy_denies_debug_td() {
         assert!(denied("UpToDate", &[], DEBUG).unwrap().contains("debug"));
     }
 

@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "alpha-core",
  "base64 0.23.1",
+ "chrono",
  "dcap-qvl",
  "hex",
  "serde",

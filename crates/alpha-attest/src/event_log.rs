@@ -56,15 +56,16 @@ pub fn replay(event_log: &[EventLogEntry]) -> [Measurement; 4] {
 }
 
 pub fn compose_hash(event_log: &[EventLogEntry]) -> Option<ComposeHash> {
-    let payload = &event_log
+    event_log
         .iter()
         .find(|e| {
             e.imr == 3 && e.event_type == DSTACK_RUNTIME_EVENT_TYPE && e.event == COMPOSE_HASH_EVENT
         })?
-        .event_payload;
-    Some(ComposeHash::from(
-        <[u8; 32]>::try_from(payload.as_slice()).ok()?,
-    ))
+        .event_payload
+        .as_slice()
+        .try_into()
+        .ok()
+        .map(|bytes: [u8; 32]| ComposeHash::from(bytes))
 }
 
 #[cfg(test)]
