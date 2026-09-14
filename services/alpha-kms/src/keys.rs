@@ -98,6 +98,7 @@ pub fn verify_ed25519(spki_der: &[u8], digest: &[u8; 32], signature_b64: &str) -
 }
 
 /// A `principal_keys` row as the chain walk needs it.
+#[derive(Clone)]
 pub struct KeyRow {
     pub id: Uuid,
     pub org_id: Uuid,
@@ -141,7 +142,7 @@ pub async fn walk_chain(
     let first = load_key(exec, key_id)
         .await?
         .ok_or_else(|| invalid("unknown key"))?;
-    let mut current = load_key(exec, key_id).await?;
+    let mut current = Some(first.clone());
     let mut hops = 0;
     while let Some(link) = current {
         if let Some(revoked_at) = link.revoked_at {

@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alpha_attest::{EVIDENCE_FORMAT, EventLogEntry, Evidence};
 use alpha_core::{AppId, KeyId, OrgId, PrincipalId, context, signing_digest};
 use alpha_crypto::{INFO_NODE_BOOTSTRAP, INFO_UNSEAL_SHARE, Sealed};
-use alpha_kms::{CollateralSource, Config, Node, NodeParams, certs, instance, platform, tls};
+use alpha_kms::{CollateralSource, Config, Node, certs, instance, platform, tls};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use ed25519_dalek::pkcs8::EncodePublicKey;
@@ -175,22 +175,23 @@ async fn start_node(
         serde_json::from_slice(&read(capture, "event_log.json")).unwrap();
     let collateral = serde_json::from_slice(&read(capture, "collateral.json")).unwrap();
     let now = captured_at(capture);
-    let node = Node::new(NodeParams {
+    let config = Config {
+        database_url: url,
+        kms_endpoints: vec![],
+        pccs_url: "unused".into(),
+        platform_document_url: release_url.to_owned(),
+        #[cfg(feature = "dev-root")]
+        dev_root_kek: None,
+    };
+    let node = Node::new(
         pool,
-        config: Config {
-            database_url: url,
-            kms_endpoints: vec![],
-            pccs_url: "unused".into(),
-            platform_document_url: release_url.to_owned(),
-            #[cfg(feature = "dev-root")]
-            dev_root_kek: None,
-        },
-        clock: Arc::new(move || now),
-        collateral: CollateralSource::Fixed(Box::new(collateral)),
-        nonce_key: nonce_key(),
+        config,
+        Arc::new(move || now),
+        CollateralSource::Fixed(Box::new(collateral)),
+        nonce_key(),
         event_log,
-        release_key: release_key.verifying_key(),
-    })
+        release_key.verifying_key(),
+    )
     .unwrap();
     platform::start(&node).await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

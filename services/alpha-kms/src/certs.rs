@@ -21,10 +21,6 @@ use crate::error::ApiError;
 pub const LEAF_TTL: Duration = Duration::from_secs(3600);
 pub const KMS_SAN: &str = "alphacompute://kms";
 
-fn offset(t: SystemTime) -> time::OffsetDateTime {
-    time::OffsetDateTime::from(t)
-}
-
 fn serial() -> rcgen::SerialNumber {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("the system RNG never fails");
@@ -48,8 +44,8 @@ pub fn self_signed(key: &KeyPair, now: SystemTime) -> Vec<u8> {
     let mut params = CertificateParams::default();
     params.distinguished_name = subject("alpha-kms sealed node");
     params.subject_alt_names = vec![SanType::URI(Ia5String::try_from(KMS_SAN).unwrap())];
-    params.not_before = offset(now);
-    params.not_after = offset(now + Duration::from_secs(365 * 86400));
+    params.not_before = now.into();
+    params.not_after = (now + Duration::from_secs(365 * 86400)).into();
     params.serial_number = Some(serial());
     params
         .self_signed(key)
@@ -65,8 +61,8 @@ pub fn new_ca(now: SystemTime) -> (Vec<u8>, Vec<u8>) {
     params.distinguished_name = subject("alpha-kms ca");
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    params.not_before = offset(now);
-    params.not_after = offset(now + Duration::from_secs(20 * 365 * 86400));
+    params.not_before = now.into();
+    params.not_after = (now + Duration::from_secs(20 * 365 * 86400)).into();
     params.serial_number = Some(serial());
     let cert = params.self_signed(&key).expect("self-signing cannot fail");
     (key.serialize_der(), cert.der().to_vec())
@@ -98,8 +94,8 @@ pub fn issue_leaf(
         ExtendedKeyUsagePurpose::ServerAuth,
     ];
     params.use_authority_key_identifier_extension = true;
-    params.not_before = offset(now);
-    params.not_after = offset(now + LEAF_TTL);
+    params.not_before = now.into();
+    params.not_after = (now + LEAF_TTL).into();
     params.serial_number = Some(serial());
     Ok(params
         .signed_by(&spki, &issuer)
@@ -128,17 +124,7 @@ pub fn node_sans(compose_hash: ComposeHash) -> [String; 2] {
 }
 
 pub fn pem(der: &[u8]) -> String {
-    use base64::Engine;
-    let body = base64::prelude::BASE64_STANDARD.encode(der);
-    let lines: Vec<&str> = body
-        .as_bytes()
-        .chunks(64)
-        .map(|c| std::str::from_utf8(c).unwrap())
-        .collect();
-    format!(
-        "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
-        lines.join("\n")
-    )
+    pem::encode(&pem::Pem::new("CERTIFICATE", der))
 }
 
 pub fn ca_verifier(ca_cert_der: &[u8]) -> Arc<dyn ClientCertVerifier> {

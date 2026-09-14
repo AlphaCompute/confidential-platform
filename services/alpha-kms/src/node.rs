@@ -28,7 +28,6 @@ use crate::tls::PeerCerts;
 use crate::{Intermediates, Node, Phase, certs};
 
 pub const CONTEXT_BOOTSTRAP: &str = "alphacompute/node-bootstrap/v1";
-const JOIN_REQUEST_MAX_AGE: &str = "10 minutes";
 
 fn runtime_spki_sha256(node: &Node) -> [u8; 32] {
     Sha256::digest(&node.runtime_spki).into()
@@ -200,38 +199,32 @@ fn root_kek(_: &Node) -> Zeroizing<[u8; 32]> {
     Zeroizing::new(random32())
 }
 
-/// Unwraps both rows under `root`; a wrong root fails on the first.
+/// Unwraps both rows under `root`.
 pub async fn unwrap_intermediates(node: &Node, root: &[u8; 32]) -> Result<Intermediates, ApiError> {
-    let rows = sqlx::query!(
-        "select purpose::text as purpose, wrapped, public_part from intermediate_keys"
-    )
-    .fetch_all(&node.pool)
-    .await?;
-    let mut tenant_kek_root = None;
-    let mut ca = None;
-    for row in rows {
-        let purpose = row.purpose.unwrap_or_default();
-        let key = aead_open(root, purpose.as_bytes(), &row.wrapped).ok_or_else(|| {
-            ApiError::malformed(format!("{purpose} does not unwrap under this root"))
-        })?;
-        match purpose.as_str() {
-            "tenant-kek-root" => {
-                tenant_kek_root = Some(Zeroizing::new(
-                    <[u8; 32]>::try_from(key.as_slice())
-                        .map_err(|_| ApiError::internal("tenant-kek-root is not 32 bytes"))?,
-                ))
-            }
-            "ca" => ca = Some((key, row.public_part.unwrap_or_default())),
-            _ => {}
-        }
-    }
-    let (Some(tenant_kek_root), Some((ca_key_der, ca_cert_der))) = (tenant_kek_root, ca) else {
-        return Err(ApiError::malformed("database holds no intermediate keys"));
+    let unwrap = |purpose: &str, wrapped: Option<Vec<u8>>| {
+        wrapped
+            .and_then(|w| aead_open(root, purpose.as_bytes(), &w))
+            .ok_or_else(|| {
+                ApiError::malformed(format!("{purpose} does not unwrap under this root"))
+            })
     };
+    let tenant = sqlx::query_scalar!(
+        "select wrapped from intermediate_keys where purpose = 'tenant-kek-root'"
+    )
+    .fetch_optional(&node.pool)
+    .await?;
+    let ca =
+        sqlx::query!("select wrapped, public_part from intermediate_keys where purpose = 'ca'")
+            .fetch_optional(&node.pool)
+            .await?;
+    let tenant_kek_root = <[u8; 32]>::try_from(unwrap("tenant-kek-root", tenant)?.as_slice())
+        .map(Zeroizing::new)
+        .map_err(|_| ApiError::internal("tenant-kek-root is not 32 bytes"))?;
+    let ca_key_der = unwrap("ca", ca.as_ref().map(|r| r.wrapped.clone()))?;
     Ok(Intermediates {
         tenant_kek_root,
         ca_key_der,
-        ca_cert_der,
+        ca_cert_der: ca.and_then(|r| r.public_part).unwrap_or_default(),
     })
 }
 
@@ -356,17 +349,15 @@ async fn join_inner(
         "select exists(select 1 from audit_log
            where action = 'node.join.request' and outcome = 'ok'
              and details->>'runtime_pubkey_sha256' = $1
-             and ts > now() - $2::interval)",
+             and ts > now() - interval '10 minutes')",
         keys::sha256_hex(spki),
-        sqlx::postgres::types::PgInterval::try_from(std::time::Duration::from_secs(600))
-            .expect("a fixed interval"),
     )
     .fetch_one(&node.pool)
     .await?;
     if !requested.unwrap_or(false) {
         return Err(ApiError::new(
             "not_found",
-            format!("no node.join.request in the last {JOIN_REQUEST_MAX_AGE}"),
+            "no node.join.request in the last 10 minutes",
         ));
     }
     Ok(appraised.compose_hash)
@@ -463,9 +454,8 @@ fn join_client(
             .map(|r| format!("urn:alphacompute:revision:{}", r.compose_hash))
             .collect(),
     )?;
-    let pkcs8 = node.runtime_pkcs8();
-    let cert = certs::self_signed(&certs::key_pair(&pkcs8), node.now());
-    let config = crate::tls::client_config(verifier, cert, &pkcs8);
+    let cert = certs::self_signed(&certs::key_pair(&node.runtime_pkcs8), node.now());
+    let config = crate::tls::client_config(verifier, cert, &node.runtime_pkcs8);
     reqwest::Client::builder()
         .tls_backend_preconfigured(config)
         .build()

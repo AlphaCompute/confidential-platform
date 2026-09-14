@@ -108,6 +108,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "p256 0.14.0",
+ "pem 3.0.6",
  "rand_core 0.10.1",
  "rcgen",
  "reqwest",

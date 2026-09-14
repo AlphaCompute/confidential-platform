@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::error::ApiError;
-use crate::{Node, audit, certs};
+use crate::{Node, audit};
 
 pub const RELOAD_EVERY: Duration = Duration::from_secs(300);
 
@@ -137,7 +137,7 @@ pub async fn apply(node: &Node, verified: Verified) -> Result<(), ApiError> {
     Ok(())
 }
 
-pub async fn fetch(node: &Node) -> Result<Verified, ApiError> {
+pub async fn reload(node: &Node) -> Result<(), ApiError> {
     let signed: SignedDocument = reqwest::get(&node.config.platform_document_url)
         .await
         .and_then(|r| r.error_for_status())
@@ -145,12 +145,8 @@ pub async fn fetch(node: &Node) -> Result<Verified, ApiError> {
         .json()
         .await
         .map_err(|e| ApiError::internal(format!("platform document body: {e}")))?;
-    verify(&signed, &node.release_key, node.now())
-        .map_err(|e| ApiError::internal(format!("platform document: {e}")))
-}
-
-pub async fn reload(node: &Node) -> Result<(), ApiError> {
-    let verified = fetch(node).await?;
+    let verified = verify(&signed, &node.release_key, node.now())
+        .map_err(|e| ApiError::internal(format!("platform document: {e}")))?;
     apply(node, verified).await
 }
 
@@ -176,33 +172,12 @@ pub async fn run(node: Arc<Node>) {
     }
 }
 
-/// The node's own leaf is renewed on the timer once a third of its hour is left.
+/// The node's own one-hour leaf is simply reissued on every tick.
 fn renew_leaf(node: &Node) {
-    let Ok(keys) = node.intermediates() else {
-        return;
-    };
-    let current = node.server_cert.current();
-    let Some(leaf) = current.cert.first() else {
-        return;
-    };
-    use x509_parser::prelude::{FromDer, X509Certificate};
-    let Ok((_, cert)) = X509Certificate::from_der(leaf) else {
-        return;
-    };
-    let not_after = SystemTime::UNIX_EPOCH
-        + Duration::from_secs(cert.validity().not_after.timestamp().max(0) as u64);
-    if not_after > node.now() + certs::LEAF_TTL / 3 {
-        return;
-    }
-    if let Ok(leaf) = certs::issue_leaf(
-        &keys.ca_key(),
-        &keys.ca_cert_der,
-        &node.runtime_spki,
-        certs::node_sans(node.compose_hash),
-        node.now(),
-    ) {
-        node.server_cert
-            .serve(&node.runtime_pkcs8(), leaf, keys.ca_cert_der.clone());
+    if let Ok(keys) = node.intermediates()
+        && let Err(e) = node.issue_own_leaf(&keys)
+    {
+        eprintln!("leaf renewal: {}", e.message);
     }
 }
 

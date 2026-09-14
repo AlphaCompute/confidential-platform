@@ -22,7 +22,7 @@ use crate::body::Body;
 use crate::error::ApiError;
 use crate::keys::{self, SignatureObject};
 use crate::tls::PeerCerts;
-use crate::{CollateralSource, Node, certs};
+use crate::{CollateralSource, Node, certs, rfc3339};
 
 pub const NONCE_MAX_AGE: Duration = Duration::from_secs(300);
 
@@ -58,10 +58,9 @@ pub fn check_nonce(key: &[u8; 32], nonce: &[u8; 32], now: SystemTime) -> Result<
 pub async fn nonce(State(node): State<Arc<Node>>) -> Json<Value> {
     let now = node.now();
     let nonce = mint_nonce(&node.nonce_key, now);
-    let expires: DateTime<Utc> = (now + NONCE_MAX_AGE).into();
     Json(json!({
         "nonce": BASE64_URL_SAFE_NO_PAD.encode(nonce),
-        "expires_at": expires.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "expires_at": rfc3339(now + NONCE_MAX_AGE),
     }))
 }
 
@@ -121,6 +120,9 @@ pub async fn verify_revision(
     compose_hash: ComposeHash,
     revision: &RevisionRow,
 ) -> Result<keys::Chain, ApiError> {
+    if revision.revoked_at.is_some() {
+        return Err(ApiError::new("revision_revoked", "revision is revoked"));
+    }
     if alpha_core::compose_hash(&revision.compose) != compose_hash {
         return Err(ApiError::signature_invalid(
             "revision bytes do not hash to their key",
@@ -189,7 +191,7 @@ pub async fn attest(
     let ok = result?;
     Ok(Json(json!({
         "certificate_chain": [certs::pem(&ok.leaf_der), ok.ca_pem],
-        "not_after": ok.not_after.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "not_after": rfc3339(ok.not_after),
         "attestation_result": ok.result,
     })))
 }
@@ -231,9 +233,6 @@ async fn attest_inner(
                 format!("no revision {}", appraised.compose_hash),
             )
         })?;
-    if revision.revoked_at.is_some() {
-        return Err(ApiError::new("revision_revoked", "revision is revoked"));
-    }
     verify_revision(
         &node.pool,
         &keys.tenant_kek_root,
@@ -271,7 +270,7 @@ async fn attest_inner(
         },
         runtime_pubkey_sha256: appraised.runtime_pubkey_sha256,
         evidence_sha256: appraised.evidence_sha256,
-        verified_at: DateTime::<Utc>::from(now).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        verified_at: rfc3339(now),
         policy_version: appraised.policy_version,
     };
     Ok(Attested {
@@ -323,9 +322,6 @@ async fn get_secret_inner(
             r.org_id == Uuid::from(identity.org_id) && r.app_id == Uuid::from(identity.app_id)
         })
         .ok_or_else(|| ApiError::not_found("no such revision"))?;
-    if revision.revoked_at.is_some() {
-        return Err(ApiError::new("revision_revoked", "revision is revoked"));
-    }
     verify_revision(
         &node.pool,
         tenant_kek_root,
@@ -368,7 +364,7 @@ async fn get_secret_inner(
     Ok(json!({
         "value": BASE64_URL_SAFE_NO_PAD.encode(&*value),
         "content_sha256": format!("sha256:{}", hex::encode(secret.content_sha256)),
-        "issued_at": secret.issued_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "issued_at": rfc3339(secret.issued_at),
     }))
 }
 

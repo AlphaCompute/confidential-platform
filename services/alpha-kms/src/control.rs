@@ -21,15 +21,22 @@ use crate::body::Body;
 use crate::error::ApiError;
 use crate::instance::load_revision;
 use crate::keys::{self, Chain, SignatureObject};
-use crate::{Intermediates, Node};
+use crate::{Intermediates, Node, rfc3339};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Signed {
     pub payload: Value,
     pub signature: SignatureObject,
-    #[serde(default)]
-    pub value: Option<String>,
+}
+
+/// Route 3 alone carries the value beside the signed document.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PutBody {
+    pub payload: Value,
+    pub signature: SignatureObject,
+    pub value: String,
 }
 
 const ISSUED_AT_WINDOW: Duration = Duration::minutes(5);
@@ -105,10 +112,6 @@ async fn denied(node: &Node, key_id: KeyId, action: &str, error: &ApiError) {
     .await;
 }
 
-fn rfc3339(t: DateTime<Utc>) -> String {
-    t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-}
-
 macro_rules! audited_route {
     ($node:expr, $body:expr, $action:literal, $inner:expr) => {{
         let result = $inner.await;
@@ -131,9 +134,6 @@ pub async fn register_revision(
     Body(body): Body<Signed>,
 ) -> Result<Json<Value>, ApiError> {
     audited_route!(node, body, "revision.register", async {
-        if body.value.is_some() {
-            return Err(ApiError::malformed("unexpected field value"));
-        }
         let keys = node.intermediates()?;
         let p: RevisionPayload = payload(&body.payload)?;
         let compose_hash = alpha_core::check_registration(&p.compose, p.app_id)?;
@@ -218,9 +218,6 @@ pub async fn revoke_revision(
     Body(body): Body<Signed>,
 ) -> Result<Json<Value>, ApiError> {
     audited_route!(node, body, "revision.revoke", async {
-        if body.value.is_some() {
-            return Err(ApiError::malformed("unexpected field value"));
-        }
         let keys = node.intermediates()?;
         let p: RevokeRevisionPayload = payload(&body.payload)?;
         if path_hash != p.compose_hash.to_string() {
@@ -271,8 +268,16 @@ struct SecretPayload {
 pub async fn put_secret(
     State(node): State<Arc<Node>>,
     Path(name): Path<String>,
-    Body(body): Body<Signed>,
+    Body(PutBody {
+        payload: document,
+        signature,
+        value,
+    }): Body<PutBody>,
 ) -> Result<Json<Value>, ApiError> {
+    let body = Signed {
+        payload: document,
+        signature,
+    };
     audited_route!(node, body, "secret.put", async {
         let keys = node.intermediates()?;
         let p: SecretPayload = payload(&body.payload)?;
@@ -282,11 +287,9 @@ pub async fn put_secret(
         if p.app_ids.is_empty() {
             return Err(ApiError::malformed("app_ids is empty"));
         }
-        let value = body
-            .value
-            .as_deref()
-            .and_then(|v| BASE64_URL_SAFE_NO_PAD.decode(v).ok())
-            .ok_or_else(|| ApiError::malformed("value: expected base64url"))?;
+        let value = BASE64_URL_SAFE_NO_PAD
+            .decode(&value)
+            .map_err(|_| ApiError::malformed("value: expected base64url"))?;
         let content_sha256: [u8; 32] = p
             .content_sha256
             .strip_prefix("sha256:")
@@ -380,9 +383,6 @@ pub async fn register_key(
     Body(body): Body<Signed>,
 ) -> Result<Json<Value>, ApiError> {
     audited_route!(node, body, "key.register", async {
-        if body.value.is_some() {
-            return Err(ApiError::malformed("unexpected field value"));
-        }
         let keys = node.intermediates()?;
         let p: KeyPayload = payload(&body.payload)?;
         let spki = BASE64_URL_SAFE_NO_PAD
@@ -447,9 +447,6 @@ pub async fn revoke_key(
     Body(body): Body<Signed>,
 ) -> Result<Json<Value>, ApiError> {
     audited_route!(node, body, "key.revoke", async {
-        if body.value.is_some() {
-            return Err(ApiError::malformed("unexpected field value"));
-        }
         let keys = node.intermediates()?;
         let p: RevokeKeyPayload = payload(&body.payload)?;
         if path_id != p.key_id.to_string() {

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use alpha_kms::{CollateralSource, Config, Node, NodeParams, node, platform, tls};
+use alpha_kms::{CollateralSource, Config, Node, node, platform, tls};
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 
@@ -39,15 +39,16 @@ async fn run() -> Result<(), String> {
     let mut nonce_key = [0u8; 32];
     getrandom::fill(&mut nonce_key).map_err(|e| e.to_string())?;
     let event_log = alpha_tsm::event_log().map_err(|e| format!("event log: {e}"))?;
-    let node = Node::new(NodeParams {
+    let pccs_url = config.pccs_url.clone();
+    let node = Node::new(
         pool,
-        collateral: CollateralSource::Pccs(config.pccs_url.clone()),
         config,
-        clock: Arc::new(SystemTime::now),
+        Arc::new(SystemTime::now),
+        CollateralSource::Pccs(pccs_url),
         nonce_key,
         event_log,
         release_key,
-    })?;
+    )?;
     platform::start(&node).await;
     tokio::spawn(platform::run(node.clone()));
     start_phase(&node).await;

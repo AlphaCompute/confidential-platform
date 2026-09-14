@@ -90,11 +90,6 @@ pub enum Phase {
     Serving(Arc<Intermediates>),
 }
 
-pub struct Bucket {
-    tokens: f64,
-    last: Instant,
-}
-
 // ponytail: chosen without load data; set from the renewal rate once two nodes run on Phala.
 const BUCKET_CAPACITY: f64 = 200.0;
 const BUCKET_REFILL_PER_SEC: f64 = 100.0;
@@ -108,6 +103,7 @@ pub struct Node {
     pub collateral: CollateralSource,
     pub nonce_key: [u8; 32],
     pub runtime_key: SigningKey,
+    pub runtime_pkcs8: Zeroizing<Vec<u8>>,
     pub runtime_spki: Vec<u8>,
     pub xwing_key: alpha_crypto::PrivateKey,
     pub event_log: Vec<EventLogEntry>,
@@ -116,30 +112,19 @@ pub struct Node {
     pub platform: RwLock<Option<Arc<PlatformDocument>>>,
     pub phase: RwLock<Phase>,
     pub server_cert: Arc<tls::ServerCert>,
-    bucket: Mutex<Bucket>,
-}
-
-pub struct NodeParams {
-    pub pool: PgPool,
-    pub config: Config,
-    pub clock: Clock,
-    pub collateral: CollateralSource,
-    pub nonce_key: [u8; 32],
-    pub event_log: Vec<EventLogEntry>,
-    pub release_key: ed25519_dalek::VerifyingKey,
+    bucket: Mutex<(f64, Instant)>,
 }
 
 impl Node {
-    pub fn new(params: NodeParams) -> Result<Arc<Self>, String> {
-        let NodeParams {
-            pool,
-            config,
-            clock,
-            collateral,
-            nonce_key,
-            event_log,
-            release_key,
-        } = params;
+    pub fn new(
+        pool: PgPool,
+        config: Config,
+        clock: Clock,
+        collateral: CollateralSource,
+        nonce_key: [u8; 32],
+        event_log: Vec<EventLogEntry>,
+        release_key: ed25519_dalek::VerifyingKey,
+    ) -> Result<Arc<Self>, String> {
         let compose_hash = alpha_attest::event_log_compose_hash(&event_log)
             .ok_or("the event log carries no compose-hash event")?;
         let mut seed = [0u8; 32];
@@ -151,14 +136,14 @@ impl Node {
             .to_public_key_der()
             .map_err(|e| format!("runtime key: {e}"))?
             .into_vec();
-        let pkcs8 = Zeroizing::new(
+        let runtime_pkcs8 = Zeroizing::new(
             runtime_key
                 .to_pkcs8_der()
                 .map_err(|e| format!("runtime key: {e}"))?
                 .to_bytes()
                 .to_vec(),
         );
-        let server_cert = Arc::new(tls::ServerCert::sealed(&pkcs8, (clock)()));
+        let server_cert = Arc::new(tls::ServerCert::sealed(&runtime_pkcs8, (clock)()));
         Ok(Arc::new(Self {
             pool,
             config,
@@ -166,6 +151,7 @@ impl Node {
             collateral,
             nonce_key,
             runtime_key,
+            runtime_pkcs8,
             runtime_spki,
             xwing_key: alpha_crypto::PrivateKey::generate(),
             event_log,
@@ -174,10 +160,7 @@ impl Node {
             platform: RwLock::new(None),
             phase: RwLock::new(Phase::Sealed { shares: Vec::new() }),
             server_cert,
-            bucket: Mutex::new(Bucket {
-                tokens: BUCKET_CAPACITY,
-                last: Instant::now(),
-            }),
+            bucket: Mutex::new((BUCKET_CAPACITY, Instant::now())),
         }))
     }
 
@@ -206,6 +189,13 @@ impl Node {
 
     /// Enters the serving phase: intermediates in memory and a leaf from `ca` on the listener.
     pub fn start_serving(&self, keys: Intermediates) -> Result<(), ApiError> {
+        self.issue_own_leaf(&keys)?;
+        *self.phase.write().unwrap() = Phase::Serving(Arc::new(keys));
+        Ok(())
+    }
+
+    /// The listener's leaf from `ca`: `alphacompute://kms` and this node's Revision.
+    pub fn issue_own_leaf(&self, keys: &Intermediates) -> Result<(), ApiError> {
         let leaf = certs::issue_leaf(
             &keys.ca_key(),
             &keys.ca_cert_der,
@@ -214,33 +204,19 @@ impl Node {
             self.now(),
         )?;
         self.server_cert
-            .serve(&self.runtime_pkcs8(), leaf, keys.ca_cert_der.clone());
-        *self.phase.write().unwrap() = Phase::Serving(Arc::new(keys));
+            .serve(&self.runtime_pkcs8, leaf, keys.ca_cert_der.clone());
         Ok(())
-    }
-
-    pub fn runtime_pkcs8(&self) -> Zeroizing<Vec<u8>> {
-        Zeroizing::new(
-            self.runtime_key
-                .to_pkcs8_der()
-                .expect("a key we generated")
-                .to_bytes()
-                .to_vec(),
-        )
     }
 
     fn take_token(&self) -> bool {
         let mut bucket = self.bucket.lock().unwrap();
+        let (tokens, last) = *bucket;
         let now = Instant::now();
-        let elapsed = now.duration_since(bucket.last).as_secs_f64();
-        bucket.tokens = (bucket.tokens + elapsed * BUCKET_REFILL_PER_SEC).min(BUCKET_CAPACITY);
-        bucket.last = now;
-        if bucket.tokens >= 1.0 {
-            bucket.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
+        let tokens = (tokens + now.duration_since(last).as_secs_f64() * BUCKET_REFILL_PER_SEC)
+            .min(BUCKET_CAPACITY);
+        let taken = tokens >= 1.0;
+        *bucket = (if taken { tokens - 1.0 } else { tokens }, now);
+        taken
     }
 }
 
@@ -294,6 +270,10 @@ async fn ready(State(node): State<Arc<Node>>) -> Response {
         axum::http::StatusCode::OK
     };
     (status, axum::Json(serde_json::json!({ "sealed": sealed }))).into_response()
+}
+
+pub fn rfc3339(t: impl Into<chrono::DateTime<chrono::Utc>>) -> String {
+    t.into().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 pub async fn migrate(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
