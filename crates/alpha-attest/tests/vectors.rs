@@ -135,6 +135,16 @@ fn kms_node_quote_is_appraised() {
 }
 
 #[test]
+fn production_image_instance_quote_is_appraised() {
+    positive("07-prod-instance");
+}
+
+#[test]
+fn production_image_kms_node_quote_is_appraised() {
+    positive("08-prod-node");
+}
+
+#[test]
 fn wrong_nonce_fails() {
     negative("03-wrong-report-data");
 }
