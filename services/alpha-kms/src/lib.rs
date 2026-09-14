@@ -127,10 +127,8 @@ impl Node {
     ) -> Result<Arc<Self>, String> {
         let compose_hash = alpha_attest::event_log_compose_hash(&event_log)
             .ok_or("the event log carries no compose-hash event")?;
-        let mut seed = [0u8; 32];
-        getrandom::fill(&mut seed).expect("the system RNG never fails");
-        let runtime_key =
-            SigningKey::from_bytes((&seed).into()).map_err(|e| format!("runtime key: {e}"))?;
+        let runtime_key = SigningKey::from_bytes((&random32()).into())
+            .map_err(|e| format!("runtime key: {e}"))?;
         let runtime_spki = runtime_key
             .verifying_key()
             .to_public_key_der()
@@ -270,6 +268,12 @@ async fn ready(State(node): State<Arc<Node>>) -> Response {
         axum::http::StatusCode::OK
     };
     (status, axum::Json(serde_json::json!({ "sealed": sealed }))).into_response()
+}
+
+pub fn random32() -> [u8; 32] {
+    let mut out = [0u8; 32];
+    getrandom::fill(&mut out).expect("the system RNG never fails");
+    out
 }
 
 pub fn rfc3339(t: impl Into<chrono::DateTime<chrono::Utc>>) -> String {

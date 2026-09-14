@@ -12,14 +12,14 @@ use hyper_util::service::TowerToHyperService;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::crypto::aws_lc_rs::{self, kx_group};
+use rustls::pki_types::{
+    CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, TrustAnchor, UnixTime,
+};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::{
     ClientConfig, DigitallySignedStruct, DistinguishedName, ServerConfig, SignatureScheme,
-};
-use rustls_pki_types::{
-    CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, TrustAnchor, UnixTime,
 };
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -62,15 +62,11 @@ impl ServerCert {
     pub fn serve(&self, runtime_pkcs8: &[u8], leaf_der: Vec<u8>, ca_der: Vec<u8>) {
         *self.0.write().unwrap() = certified(runtime_pkcs8, vec![leaf_der, ca_der]);
     }
-
-    pub fn current(&self) -> Arc<CertifiedKey> {
-        self.0.read().unwrap().clone()
-    }
 }
 
 impl ResolvesServerCert for ServerCert {
     fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        Some(self.current())
+        Some(self.0.read().unwrap().clone())
     }
 }
 

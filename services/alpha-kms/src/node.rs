@@ -25,7 +25,7 @@ use crate::error::ApiError;
 use crate::instance::{check_nonce, collateral, decode32};
 use crate::keys::{self, aead_open, aead_seal};
 use crate::tls::PeerCerts;
-use crate::{Intermediates, Node, Phase, certs};
+use crate::{Intermediates, Node, Phase, certs, random32};
 
 pub const CONTEXT_BOOTSTRAP: &str = "alphacompute/node-bootstrap/v1";
 
@@ -178,12 +178,6 @@ pub async fn bootstrap(
             "signature": BASE64_URL_SAFE_NO_PAD.encode(signature.to_bytes()),
         },
     })))
-}
-
-fn random32() -> [u8; 32] {
-    let mut out = [0u8; 32];
-    getrandom::fill(&mut out).expect("the system RNG never fails");
-    out
 }
 
 #[cfg(feature = "dev-root")]
@@ -445,7 +439,7 @@ fn join_client(
     kms_ca_pem: &str,
     revisions: &[alpha_attest::KmsRevision],
 ) -> Result<reqwest::Client, ApiError> {
-    let ca = rustls_pki_types::pem::PemObject::from_pem_slice(kms_ca_pem.as_bytes())
+    let ca = rustls::pki_types::pem::PemObject::from_pem_slice(kms_ca_pem.as_bytes())
         .map_err(|e| ApiError::internal(format!("kms_ca_pem: {e}")))?;
     let verifier = crate::tls::PinnedServer::new(
         ca,

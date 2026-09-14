@@ -11,9 +11,9 @@ use rcgen::{
     Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256, SanType, SubjectPublicKeyInfo,
 };
 use rustls::RootCertStore;
+use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::server::WebPkiClientVerifier;
 use rustls::server::danger::ClientCertVerifier;
-use rustls_pki_types::{CertificateDer, UnixTime};
 use x509_parser::prelude::{FromDer, GeneralName, ParsedExtension, X509Certificate};
 
 use crate::error::ApiError;
@@ -181,7 +181,7 @@ pub fn spki_of(cert: &[u8]) -> Result<Vec<u8>, ApiError> {
 }
 
 /// The identity an Instance certificate carries: `alphacompute://<org>/<app>/<key sha256>`
-/// and `urn:alphacompute:revision:sha256:<hex>`, nothing else.
+/// then `urn:alphacompute:revision:sha256:<hex>`, in the order `instance_sans` issues them.
 pub struct InstanceIdentity {
     pub org_id: OrgId,
     pub app_id: AppId,
@@ -191,13 +191,8 @@ pub struct InstanceIdentity {
 
 pub fn parse_instance_sans(sans: &[String]) -> Result<InstanceIdentity, ApiError> {
     let invalid = || ApiError::new("cert_invalid", "certificate SANs are not an Instance's");
-    let [a, b] = sans else {
+    let [identity, revision] = sans else {
         return Err(invalid());
-    };
-    let (identity, revision) = if a.starts_with("alphacompute://") {
-        (a, b)
-    } else {
-        (b, a)
     };
     let parts: Vec<&str> = identity
         .strip_prefix("alphacompute://")

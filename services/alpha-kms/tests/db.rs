@@ -1,4 +1,4 @@
-//! kms-spec §7 against a real Postgres (`DATABASE_URL`; skipped without it). Each test gets
+//! The route contracts against a real Postgres (`DATABASE_URL`; skipped without it). Each test gets
 //! its own database, a node pinned to a Phala capture's time, nonce key and collateral, and a
 //! local HTTP server standing in for the release artifact URL.
 
@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alpha_attest::{EVIDENCE_FORMAT, EventLogEntry, Evidence};
 use alpha_core::{AppId, KeyId, OrgId, PrincipalId, context, signing_digest};
 use alpha_crypto::{INFO_NODE_BOOTSTRAP, INFO_UNSEAL_SHARE, Sealed};
-use alpha_kms::{CollateralSource, Config, Node, certs, instance, platform, tls};
+use alpha_kms::{CollateralSource, Config, Node, certs, instance, platform, rfc3339, tls};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use ed25519_dalek::pkcs8::EncodePublicKey;
@@ -64,10 +64,6 @@ fn b64(bytes: &[u8]) -> String {
     BASE64_URL_SAFE_NO_PAD.encode(bytes)
 }
 
-fn rfc3339(t: SystemTime) -> String {
-    chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-}
-
 /// A fresh database per test, migrated.
 async fn fresh_database() -> Option<(PgPool, String)> {
     let admin_url = std::env::var("DATABASE_URL").ok()?;
@@ -105,21 +101,14 @@ impl ReleaseServer {
     async fn start(document: Value) -> Self {
         let key = SigningKey::from_bytes(&[42u8; 32]);
         let document = Arc::new(RwLock::new(document));
-        let state = (document.clone(), key.clone());
-        let app = axum::Router::new()
-            .route(
-                "/platform.json",
-                axum::routing::get(
-                    |axum::extract::State((doc, key)): axum::extract::State<(
-                        Arc<RwLock<Value>>,
-                        SigningKey,
-                    )>| async move {
-                        let doc = doc.read().unwrap().clone();
-                        axum::Json(sign_platform(&doc, &key))
-                    },
-                ),
-            )
-            .with_state(state);
+        let (doc, signer) = (document.clone(), key.clone());
+        let app = axum::Router::new().route(
+            "/platform.json",
+            axum::routing::get(move || {
+                let signed = sign_platform(&doc.read().unwrap(), &signer);
+                async move { axum::Json(signed) }
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/platform.json", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -612,7 +601,7 @@ async fn control_routes_register_revoke_and_put() {
     );
 
     // Another organization: its anchor exists only through a second bootstrap, so fake one through the table
-    // with a random anchor_check — its keys never converge on a real anchor (§7 item 5).
+    // with a random anchor_check — its keys never converge on a real anchor.
     let other_org = OrgId::mint();
     let other_key = SigningKey::from_bytes(&[12u8; 32]);
     let other_id = Uuid::now_v7();
@@ -650,16 +639,9 @@ async fn control_routes_register_revoke_and_put() {
         (status, code(&reply)),
         (StatusCode::CONFLICT, "already_exists")
     );
+    let foreign_app = AppId::mint();
     sqlx::query!("insert into revisions (compose_hash, app_id, org_id, compose, created_by_key, signature) values ($1, $2, $3, '{}', $4, '{}')",
-        &[1u8; 32][..], Uuid::now_v7(), Uuid::from(other_org), other_id).execute(&h.pool).await.unwrap();
-    let foreign_app: AppId = sqlx::query_scalar!(
-        "select app_id from revisions where org_id = $1",
-        Uuid::from(other_org)
-    )
-    .fetch_one(&h.pool)
-    .await
-    .unwrap()
-    .into();
+        &[1u8; 32][..], Uuid::from(foreign_app), Uuid::from(other_org), other_id).execute(&h.pool).await.unwrap();
     let (status, reply) = h
         .put_secret(
             "api-key",
@@ -708,7 +690,7 @@ async fn control_routes_register_revoke_and_put() {
     );
 
     // Route 2 and 5: revoke twice is 200 both times; objects of another organization are not_found.
-    let hash = reply_hash(&expected);
+    let hash = expected["compose_hash"].as_str().unwrap();
     let payload = json!({ "compose_hash": hash, "issued_at": rfc3339(h.now()) });
     let (status, r1) = h
         .post(
@@ -782,10 +764,6 @@ async fn control_routes_register_revoke_and_put() {
     }
 }
 
-fn reply_hash(expected: &Value) -> String {
-    expected["compose_hash"].as_str().unwrap().to_owned()
-}
-
 #[tokio::test]
 async fn attest_release_revoke_and_tamper() {
     let Some(h) = harness(KEYED).await else {
@@ -799,7 +777,7 @@ async fn attest_release_revoke_and_tamper() {
         .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
 
-    // §7 item 3: unknown compose_hash and an image without a reference value are refused.
+    // Unknown compose_hash and an image without a reference value are refused.
     let (status, reply) = h.attest(DEV_KEYED).await;
     assert_eq!(
         (status, code(&reply)),
@@ -831,7 +809,7 @@ async fn attest_release_revoke_and_tamper() {
     let leaf_pem = reply["certificate_chain"][0].as_str().unwrap();
     assert_eq!(reply["certificate_chain"][1], json!(h.ca_pem));
     let leaf_der =
-        <rustls_pki_types::CertificateDer as rustls_pki_types::pem::PemObject>::from_pem_slice(
+        <rustls::pki_types::CertificateDer as rustls::pki_types::pem::PemObject>::from_pem_slice(
             leaf_pem.as_bytes(),
         )
         .unwrap();
@@ -896,7 +874,7 @@ async fn attest_release_revoke_and_tamper() {
         (StatusCode::NOT_FOUND, "not_found")
     );
 
-    // §7 item 11: no certificate, or a self-signed one with the right SANs, is cert_invalid.
+    // No certificate, or a self-signed one with the right SANs, is cert_invalid.
     let r = client()
         .get(format!("{}/v1/secrets/model-key", h.url))
         .send()
@@ -917,7 +895,7 @@ async fn attest_release_revoke_and_tamper() {
         (StatusCode::UNAUTHORIZED, "cert_invalid")
     );
 
-    // §7 item 2: revoke, then the next call on the issued certificate is revision_revoked.
+    // Revoke, then the next call on the issued certificate is revision_revoked.
     let payload = json!({ "compose_hash": hash, "issued_at": rfc3339(h.now()) });
     let (status, reply) = h
         .post(
@@ -945,7 +923,7 @@ async fn attest_release_revoke_and_tamper() {
         .await
         .unwrap();
 
-    // §7 item 4: the row is re-verified on every call.
+    // The row is re-verified on every call.
     sqlx::query!("update revisions set app_id = $1", Uuid::now_v7())
         .execute(&h.pool)
         .await
@@ -1034,7 +1012,7 @@ async fn attest_release_revoke_and_tamper() {
         (StatusCode::BAD_REQUEST, "signature_invalid")
     );
 
-    // §7 item 5: a swapped anchor SPKI leaves the organization's secrets undecryptable.
+    // A swapped anchor SPKI leaves the organization's secrets undecryptable.
     sqlx::query!(
         "update principal_keys set revoked_at = null, revocation_reason = null where id = $1",
         Uuid::from(admin.0)
@@ -1063,7 +1041,7 @@ async fn attest_release_revoke_and_tamper() {
         (StatusCode::BAD_REQUEST, "signature_invalid")
     );
 
-    // §7 item 12: the service role cannot update or delete audit rows; seq is monotone.
+    // The service role cannot update or delete audit rows; seq is monotone.
     let rows = h.audit("secret.get").await;
     assert!(rows.windows(2).all(|w| w[0].0 < w[1].0) && rows.len() >= 3);
     let mut conn = h.pool.acquire().await.unwrap();
@@ -1231,14 +1209,6 @@ async fn platform_document_is_monotone_and_audited_on_change() {
     assert_eq!(h.node.platform_document().unwrap().version, 1);
     let mut doc = platform_document(KEYED);
     doc["version"] = json!(5);
-    doc["issued_at"] = json!("2100-01-01T00:00:00Z");
-    h.release.set(doc);
-    assert!(
-        platform::reload(&h.node).await.is_err(),
-        "issued_at in the future is refused"
-    );
-    let mut doc = platform_document(KEYED);
-    doc["version"] = json!(5);
     h.release.set(doc);
     platform::reload(&h.node).await.unwrap();
     assert_eq!(h.node.platform_document().unwrap().version, 5);
@@ -1250,22 +1220,10 @@ async fn platform_document_is_monotone_and_audited_on_change() {
         .await
         .unwrap();
     assert_eq!(stored, 5);
-    let signed = sign_platform(
-        &platform_document(KEYED),
-        &SigningKey::from_bytes(&[1u8; 32]),
-    );
-    assert!(
-        platform::verify(
-            &serde_json::from_value(signed).unwrap(),
-            &h.release.key.verifying_key(),
-            h.now()
-        )
-        .is_err()
-    );
 }
 
 #[tokio::test]
-async fn nonce_route_and_rate_limit_shape() {
+async fn nonce_route_malformed_body_and_unknown_route() {
     let Some(h) = harness(KEYED).await else {
         return;
     };

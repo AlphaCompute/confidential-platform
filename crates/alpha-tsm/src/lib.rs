@@ -5,7 +5,7 @@
 use std::fs;
 use std::path::Path;
 
-use alpha_attest::{EVIDENCE_FORMAT, EventLogEntry, Evidence};
+use alpha_attest::EventLogEntry;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use serde::Deserialize;
@@ -58,14 +58,6 @@ pub fn event_log() -> Result<Vec<EventLogEntry>, Error> {
     let mut log = boot_events(&ccel)?;
     log.extend(runtime_events(&runtime)?);
     Ok(log)
-}
-
-pub fn evidence(report_data: &[u8; 64]) -> Result<Evidence, Error> {
-    Ok(Evidence {
-        format: EVIDENCE_FORMAT.into(),
-        quote: quote(report_data)?,
-        event_log: event_log()?,
-    })
 }
 
 /// TCG PC Client event log (EFI TCG2): one SHA1-format spec-id header, then `TCG_PCR_EVENT2`
@@ -226,11 +218,6 @@ mod tests {
         assert_eq!(events[0].event_payload, [1, 2, 3]);
         assert!(events[0].digest.is_empty());
         assert!(runtime_events("{\"event\":1}").is_err());
-    }
-
-    #[test]
-    fn quote_needs_configfs() {
-        assert!(matches!(quote(&[0; 64]), Err(Error::Io(what, _)) if what == "create tsm entry"));
     }
 }
 

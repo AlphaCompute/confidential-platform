@@ -36,8 +36,6 @@ async fn run() -> Result<(), String> {
     let release_key = alpha_core::hex_bytes::<32>(RELEASE_KEY_HEX.trim())
         .and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok())
         .ok_or("release-key.pub is not an Ed25519 public key")?;
-    let mut nonce_key = [0u8; 32];
-    getrandom::fill(&mut nonce_key).map_err(|e| e.to_string())?;
     let event_log = alpha_tsm::event_log().map_err(|e| format!("event log: {e}"))?;
     let pccs_url = config.pccs_url.clone();
     let node = Node::new(
@@ -45,7 +43,7 @@ async fn run() -> Result<(), String> {
         config,
         Arc::new(SystemTime::now),
         CollateralSource::Pccs(pccs_url),
-        nonce_key,
+        alpha_kms::random32(),
         event_log,
         release_key,
     )?;
@@ -69,8 +67,8 @@ async fn run() -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(feature = "dev-root")]
 async fn start_phase(node: &Arc<Node>) {
+    #[cfg(feature = "dev-root")]
     if let Some(root) = &node.config.dev_root_kek {
         match node::unwrap_intermediates(node, root).await {
             Ok(keys) => {
@@ -82,15 +80,6 @@ async fn start_phase(node: &Arc<Node>) {
             Err(e) => eprintln!("dev root: {}", e.message),
         }
     }
-    join_or_wait(node).await;
-}
-
-#[cfg(not(feature = "dev-root"))]
-async fn start_phase(node: &Arc<Node>) {
-    join_or_wait(node).await;
-}
-
-async fn join_or_wait(node: &Arc<Node>) {
     match node::try_join(node).await {
         Ok(()) => eprintln!("joined; serving"),
         Err(e) => eprintln!("sealed: {}; waiting for unseal", e.message),

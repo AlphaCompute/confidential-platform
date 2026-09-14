@@ -118,7 +118,7 @@ pub enum Error {
 /// The aad binds a body to the node whose evidence carried the X-Wing key.
 pub fn aad(kms_node_spki_sha256: &[u8; 32]) -> Vec<u8> {
     alpha_core::jcs(&json!({
-        "kms_node_spki_sha256": format!("sha256:{}", to_hex(kms_node_spki_sha256)),
+        "kms_node_spki_sha256": format!("sha256:{}", hex::encode(kms_node_spki_sha256)),
     }))
 }
 
@@ -172,10 +172,6 @@ pub fn open(
     )
     .map(Zeroizing::new)
     .map_err(|_| Error::Open)
-}
-
-fn to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
