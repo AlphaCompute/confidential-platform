@@ -8,3 +8,7 @@ publish = false
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+# scrypt at log_n = 15 takes seconds unoptimized; the key-file tests derive six keys.
+[profile.dev.package.scrypt]
+opt-level = 3

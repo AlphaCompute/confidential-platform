@@ -15,3 +15,8 @@ provider that writes them into the CVM.
 - `03-reject-name` — `name` is not the `app_id`.
 - `04-trailing-newline` — `01`'s bytes with a trailing newline, as an editor would leave them:
   the KMS accepts them as a distinct Revision; `canonicalize` maps them back to `01`.
+- `05-deploy` — `app.yaml` is what a tenant hands to `alpha deploy`; `app-compose.json` is the
+  compose the generator builds from it (envelope, the `alpha-runtime` service last with its three
+  host mounts and pins, the socket volume on the containers that asked for it), already in
+  Phala's form; `expected.json` holds its `compose_hash`. Produced by the generator itself, so it
+  pins the generator's output; Phala's serialization is what `01` proves.

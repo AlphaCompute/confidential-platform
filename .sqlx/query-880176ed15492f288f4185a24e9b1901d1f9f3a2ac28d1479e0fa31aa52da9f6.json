@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select compose from revisions where app_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "compose",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "revisions",
+            "name": "compose"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "880176ed15492f288f4185a24e9b1901d1f9f3a2ac28d1479e0fa31aa52da9f6"
+}

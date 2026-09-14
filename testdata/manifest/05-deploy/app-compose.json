@@ -1,0 +1,14 @@
+{
+    "allowed_envs":[
+        "ALPHACOMPUTE_KMS_ENDPOINTS"
+    ],
+    "docker_compose_file":"services:\n  app:\n    image: ghcr.io/acme/app@sha256:3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a\n    environment:\n      LOG_LEVEL: info\n    volumes:\n    - alpha-run:/run/alpha\n  alpha-runtime:\n    image: ghcr.io/alphacompute/alpha-runtime@sha256:7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d\n    environment:\n      ALPHACOMPUTE_KMS_CA_SPKI_SHA256: sha256:c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1\n      ALPHACOMPUTE_KMS_REVISIONS: sha256:e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1,sha256:e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2\n      ALPHACOMPUTE_KMS_ENDPOINTS: ${ALPHACOMPUTE_KMS_ENDPOINTS}\n    volumes:\n    - /sys/kernel/config:/sys/kernel/config\n    - /run/log/dstack:/run/log/dstack:ro\n    - /sys/firmware/acpi/tables/data/CCEL:/sys/firmware/acpi/tables/data/CCEL:ro\n    - alpha-run:/run/alpha\nvolumes:\n  alpha-run: {}\n",
+    "gateway_enabled":true,
+    "key_provider":"kms",
+    "kms_enabled":true,
+    "manifest_version":2,
+    "name":"01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b",
+    "no_instance_id":false,
+    "public_tcbinfo":false,
+    "runner":"docker-compose"
+}

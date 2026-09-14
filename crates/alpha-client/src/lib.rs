@@ -24,7 +24,7 @@ pub use tls::{Identity, Pin};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The §3.4 envelope.
+    /// The KMS error envelope `{ "error": { code, message, request_id } }`.
     #[error("{code}: {message} (request {request_id})")]
     Api {
         status: u16,

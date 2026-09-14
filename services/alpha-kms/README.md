@@ -20,4 +20,6 @@ The release key's public half is `release-key.pub`; replacing it means rebuildin
 
 `cargo test -p alpha-kms` runs the unit tests always and `tests/db.rs` when `DATABASE_URL` points at a Postgres the tests may `create database` in (each test makes its own). The db tests attest with real Phala quotes from `testdata/attest/*-keyed`, pinned to the capture's time, nonce key and collateral, and cover the server side of every route: bootstrap once, unseal with one and two shares, join only for an attested, listed, requesting node; the Control API's checks and idempotency; attestation, release, revocation on the next call, re-verification of a tampered row, the anchor and chain rules, `cert_invalid` for a self-signed client certificate; the monotone platform document; and the append-only audit role.
 
-Not here: the CLI side (`alpha-client`, `alpha-cli`), the `alpha-runtime` pins, the backup/restore drill, anything that needs a live CVM with configfs-tsm (`GET /v1/node/evidence`, a real `join` client run), and the HPKE/X-Wing known-answer tests (`alpha-crypto`).
+`tests/cli.rs` drives `alpha-cli`'s library functions against the same in-process node (`crates/alpha-cli/README.md`).
+
+Not here: the `alpha-runtime` pins, the backup/restore drill, anything that needs a live CVM with configfs-tsm (`GET /v1/node/evidence`, a real `join` client run), and the HPKE/X-Wing known-answer tests (`alpha-crypto`).
