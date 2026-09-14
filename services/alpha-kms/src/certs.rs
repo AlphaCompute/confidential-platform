@@ -14,7 +14,6 @@ use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::server::WebPkiClientVerifier;
 use rustls::server::danger::ClientCertVerifier;
-use x509_parser::prelude::{FromDer, GeneralName, ParsedExtension, X509Certificate};
 
 use crate::error::ApiError;
 
@@ -156,27 +155,11 @@ pub fn verify_to_ca(
 }
 
 pub fn uri_sans(cert: &[u8]) -> Result<Vec<String>, ApiError> {
-    let (_, cert) = X509Certificate::from_der(cert)
-        .map_err(|e| ApiError::new("cert_invalid", format!("client certificate: {e}")))?;
-    Ok(cert
-        .extensions()
-        .iter()
-        .filter_map(|ext| match ext.parsed_extension() {
-            ParsedExtension::SubjectAlternativeName(san) => Some(&san.general_names),
-            _ => None,
-        })
-        .flatten()
-        .filter_map(|name| match name {
-            GeneralName::URI(uri) => Some((*uri).to_owned()),
-            _ => None,
-        })
-        .collect())
+    alpha_client::tls::uri_sans(cert).map_err(|e| ApiError::new("cert_invalid", e.to_string()))
 }
 
 pub fn spki_of(cert: &[u8]) -> Result<Vec<u8>, ApiError> {
-    let (_, cert) = X509Certificate::from_der(cert)
-        .map_err(|e| ApiError::new("cert_invalid", format!("client certificate: {e}")))?;
-    Ok(cert.public_key().raw.to_vec())
+    alpha_client::tls::spki_of(cert).map_err(|e| ApiError::new("cert_invalid", e.to_string()))
 }
 
 /// The identity an Instance certificate carries: `alphacompute://<org>/<app>/<key sha256>`

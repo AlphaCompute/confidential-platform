@@ -251,7 +251,7 @@ async fn harness() -> Option<Harness> {
     let sig = BASE64_URL_SAFE_NO_PAD
         .decode(reply["signature"]["signature"].as_str().unwrap())
         .unwrap();
-    let digest = signing_digest(alpha_kms::node::CONTEXT_BOOTSTRAP, &reply["payload"]);
+    let digest = signing_digest(context::NODE_BOOTSTRAP, &reply["payload"]);
     use p256::ecdsa::signature::Verifier;
     node.runtime_key
         .verifying_key()

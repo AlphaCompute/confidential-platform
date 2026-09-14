@@ -5,12 +5,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use alpha_attest::PlatformDocument;
-use alpha_core::{context, signing_digest};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
-use chrono::{DateTime, Utc};
-use ed25519_dalek::{Signature, VerifyingKey};
-use serde::{Deserialize, Serialize};
+use ed25519_dalek::VerifyingKey;
 use serde_json::{Value, json};
 
 use crate::error::ApiError;
@@ -18,21 +15,7 @@ use crate::{Node, audit};
 
 pub const RELOAD_EVERY: Duration = Duration::from_secs(300);
 
-/// What the release artifact URL serves: the document as signed and the signature over
-/// `signing_digest("alphacompute/platform/v1", document)`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SignedDocument {
-    pub document: Value,
-    pub signature: ReleaseSignature,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReleaseSignature {
-    pub algorithm: String,
-    pub signature: String,
-}
+pub use alpha_client::platform::{ReleaseSignature, SignedDocument};
 
 #[derive(Debug)]
 pub struct Verified {
@@ -47,30 +30,14 @@ pub fn verify(
     release_key: &VerifyingKey,
     now: SystemTime,
 ) -> Result<Verified, String> {
-    if signed.signature.algorithm != "ed25519" {
-        return Err(format!("algorithm {:?}", signed.signature.algorithm));
-    }
-    let signature = BASE64_URL_SAFE_NO_PAD
-        .decode(&signed.signature.signature)
-        .ok()
-        .and_then(|b| Signature::from_slice(&b).ok())
-        .ok_or("signature is not base64url Ed25519")?;
-    let digest = signing_digest(context::PLATFORM, &signed.document);
-    release_key
-        .verify_strict(&digest, &signature)
-        .map_err(|_| "release signature does not verify")?;
-    let document: PlatformDocument =
-        serde_json::from_value(signed.document.clone()).map_err(|e| format!("document: {e}"))?;
-    let issued_at = DateTime::parse_from_rfc3339(&document.issued_at)
-        .map_err(|e| format!("issued_at: {e}"))?
-        .with_timezone(&Utc);
-    if issued_at > DateTime::<Utc>::from(now) {
-        return Err("issued_at is in the future".into());
-    }
+    let document =
+        alpha_client::platform::verify(signed, release_key, now).map_err(|e| e.to_string())?;
     Ok(Verified {
         document,
         raw: signed.document.clone(),
-        signature: signature.to_bytes().to_vec(),
+        signature: BASE64_URL_SAFE_NO_PAD
+            .decode(&signed.signature.signature)
+            .expect("verified above"),
     })
 }
 
@@ -178,58 +145,5 @@ fn renew_leaf(node: &Node) {
         && let Err(e) = node.issue_own_leaf(&keys)
     {
         eprintln!("leaf renewal: {}", e.message);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
-
-    pub fn sign(document: &Value, key: &SigningKey) -> SignedDocument {
-        let digest = signing_digest(context::PLATFORM, document);
-        SignedDocument {
-            document: document.clone(),
-            signature: ReleaseSignature {
-                algorithm: "ed25519".into(),
-                signature: BASE64_URL_SAFE_NO_PAD.encode(key.sign(&digest).to_bytes()),
-            },
-        }
-    }
-
-    fn document(version: u64, issued_at: &str) -> Value {
-        json!({
-            "version": version, "issued_at": issued_at,
-            "policy": { "tcb_statuses": ["UpToDate"], "tolerated_advisories": [] },
-            "reference_values": [], "kms_ca_pem": "", "kms_revisions": []
-        })
-    }
-
-    #[test]
-    fn verify_checks_signature_key_and_issued_at() {
-        let key = SigningKey::from_bytes(&[5u8; 32]);
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
-        let signed = sign(&document(3, "2026-09-14T00:00:00Z"), &key);
-        assert_eq!(
-            verify(&signed, &key.verifying_key(), now)
-                .unwrap()
-                .document
-                .version,
-            3
-        );
-        let other = SigningKey::from_bytes(&[6u8; 32]);
-        assert!(verify(&signed, &other.verifying_key(), now).is_err());
-        let mut tampered = signed.clone();
-        tampered.document["version"] = json!(4);
-        assert!(verify(&tampered, &key.verifying_key(), now).is_err());
-        let future = sign(&document(3, "2100-01-01T00:00:00Z"), &key);
-        assert!(
-            verify(&future, &key.verifying_key(), now)
-                .unwrap_err()
-                .contains("future")
-        );
-        let mut alg = signed.clone();
-        alg.signature.algorithm = "ml-dsa".into();
-        assert!(verify(&alg, &key.verifying_key(), now).is_err());
     }
 }

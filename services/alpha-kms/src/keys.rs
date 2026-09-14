@@ -3,14 +3,13 @@
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
-use alpha_core::{KeyId, OrgId, signing_digest};
+use alpha_core::{OrgId, signing_digest};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::pkcs8::DecodePublicKey;
 use ed25519_dalek::{Signature, VerifyingKey};
 use hkdf::Hkdf;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgExecutor;
@@ -71,14 +70,7 @@ pub fn aead_open(key: &[u8; 32], aad: &[u8], blob: &[u8]) -> Option<Zeroizing<Ve
         .map(Zeroizing::new)
 }
 
-/// The signature object every signed body carries.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SignatureObject {
-    pub key_id: KeyId,
-    pub algorithm: String,
-    pub signature: String,
-}
+pub use alpha_client::SignatureObject;
 
 pub fn verify_ed25519(spki_der: &[u8], digest: &[u8; 32], signature_b64: &str) -> bool {
     let Ok(key) = VerifyingKey::from_public_key_der(spki_der) else {

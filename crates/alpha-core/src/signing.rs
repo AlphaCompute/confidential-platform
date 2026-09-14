@@ -7,6 +7,7 @@ pub mod context {
     pub const PRINCIPAL_KEY: &str = "alphacompute/principal-key/v1";
     pub const CONTROL: &str = "alphacompute/control/v1";
     pub const PLATFORM: &str = "alphacompute/platform/v1";
+    pub const NODE_BOOTSTRAP: &str = "alphacompute/node-bootstrap/v1";
 }
 
 pub fn jcs(document: &Value) -> Vec<u8> {

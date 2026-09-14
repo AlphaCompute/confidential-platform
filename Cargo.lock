@@ -60,6 +60,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "alpha-client"
+version = "0.1.0"
+dependencies = [
+ "alpha-attest",
+ "alpha-core",
+ "alpha-crypto",
+ "base64 0.23.1",
+ "chrono",
+ "ed25519-dalek 3.0.0",
+ "p256 0.14.0",
+ "reqwest",
+ "rustls",
+ "rustls-webpki",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "x509-parser",
+]
+
+[[package]]
 name = "alpha-core"
 version = "0.1.0"
 dependencies = [
@@ -94,6 +115,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "alpha-attest",
+ "alpha-client",
  "alpha-core",
  "alpha-crypto",
  "alpha-tsm",
@@ -112,7 +134,6 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rustls",
- "rustls-webpki",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -121,7 +142,6 @@ dependencies = [
  "tokio-rustls",
  "uuid",
  "vsss-rs",
- "x509-parser",
  "zeroize",
 ]
 

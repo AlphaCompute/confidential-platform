@@ -1,0 +1,25 @@
+[package]
+name = "alpha-client"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+alpha-attest = { path = "../alpha-attest" }
+alpha-core = { path = "../alpha-core" }
+alpha-crypto = { path = "../alpha-crypto" }
+base64 = "0.23"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+ed25519-dalek = { version = "3", features = ["pkcs8", "alloc"] }
+p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+thiserror = "2"
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["aws-lc-rs", "std"] }
+x509-parser = "0.18"
