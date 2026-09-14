@@ -3,7 +3,8 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use alpha_cli::call::{ROUTES, Route};
+use alpha_attest::PlatformDocument;
+use alpha_cli::call::Route;
 use alpha_cli::deploy::Shroud;
 use alpha_cli::keyfile::{self, Algorithm};
 use alpha_cli::{node, sign};
@@ -79,8 +80,7 @@ enum Command {
     },
     /// One signed Control call; the path comes from the payload.
     Call {
-        #[arg(value_parser = ROUTES)]
-        route: String,
+        route: Route,
         /// Signing context; defaults to the route's.
         #[arg(long)]
         context: Option<String>,
@@ -184,13 +184,17 @@ fn read_ed25519(path: &Path) -> Result<ed25519_dalek::SigningKey, Exit> {
     Ok(keyfile::read(path, &passphrase("passphrase: ")?)?.ed25519()?)
 }
 
-/// The admin's pin: `kms_ca_pem` of the platform document fetched and verified now.
-async fn admin_client(config: &Config, now: SystemTime) -> Result<Client, Exit> {
+async fn platform_document(config: &Config, now: SystemTime) -> Result<PlatformDocument, Exit> {
     let url = need(
         config.platform_document_url.as_deref(),
         "platform-document-url",
     )?;
-    let (_, doc) = alpha_client::platform::fetch(url, &alpha_cli::release_key(), now).await?;
+    Ok(alpha_client::platform::fetch(url, &alpha_cli::release_key(), now).await?)
+}
+
+/// The admin's pin: `kms_ca_pem` of the platform document fetched and verified now.
+async fn admin_client(config: &Config, now: SystemTime) -> Result<Client, Exit> {
+    let doc = platform_document(config, now).await?;
     let ca = alpha_client::tls::ca_from_pem(&doc.kms_ca_pem)?;
     if config.endpoints.is_empty() {
         return Err(Exit::Usage(
@@ -225,7 +229,6 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             value,
             payload,
         } => {
-            let route: Route = route.parse().map_err(Exit::Usage)?;
             let payload = read_json(&payload)?;
             let value = value
                 .map(|p| fs::read(&p).map_err(|e| Exit::Usage(format!("{}: {e}", p.display()))))
@@ -286,12 +289,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             endpoint,
         } => {
             let remembered = node::ShareFile::read(&share)?.platform_document_version;
-            let url = need(
-                config.platform_document_url.as_deref(),
-                "platform-document-url",
-            )?;
-            let (_, doc) =
-                alpha_client::platform::fetch(url, &alpha_cli::release_key(), now).await?;
+            let doc = platform_document(config, now).await?;
             let custodian = keyfile::read(&key, &passphrase("passphrase: ")?)?.xwing()?;
             let (identity, client) =
                 node::attested_node(&endpoint, &config.pccs_url, &doc, Some(remembered), now)
@@ -319,12 +317,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let custodians: [PublicKey; 3] = keys.try_into().expect("clap took exactly three");
             let anchor: Anchor = serde_json::from_value(read_json(&anchor)?)
                 .map_err(|e| Exit::Usage(format!("anchor: {e}")))?;
-            let url = need(
-                config.platform_document_url.as_deref(),
-                "platform-document-url",
-            )?;
-            let (_, doc) =
-                alpha_client::platform::fetch(url, &alpha_cli::release_key(), now).await?;
+            let doc = platform_document(config, now).await?;
             let (identity, client) =
                 node::attested_node(&endpoint, &config.pccs_url, &doc, None, now).await?;
             Ok(node::bootstrap(

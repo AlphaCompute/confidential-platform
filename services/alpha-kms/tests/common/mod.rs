@@ -65,6 +65,10 @@ pub fn b64(bytes: &[u8]) -> String {
     BASE64_URL_SAFE_NO_PAD.encode(bytes)
 }
 
+pub fn spki_b64(key: &SigningKey) -> String {
+    b64(key.verifying_key().to_public_key_der().unwrap().as_bytes())
+}
+
 /// A fresh database per test, migrated.
 pub async fn fresh_database() -> Option<PgPool> {
     let admin_url = std::env::var("DATABASE_URL").ok()?;
@@ -134,7 +138,6 @@ pub struct Harness {
     pub org: OrgId,
     pub anchor: (KeyId, SigningKey),
     pub shares: Vec<Vec<u8>>,
-    pub custodians: Vec<alpha_crypto::PrivateKey>,
     pub ca_pem: String,
     pub _shutdown: tokio::sync::oneshot::Sender<()>,
 }
@@ -225,7 +228,7 @@ pub async fn harness_with_clock(clock: Clock) -> Option<Harness> {
     let body = json!({
         "custodians": custodians.iter().map(|c| c.public()).collect::<Vec<_>>(),
         "anchor": { "org_id": org, "principal_id": PrincipalId::mint(),
-                    "public_key": b64(anchor_key.verifying_key().to_public_key_der().unwrap().as_bytes()),
+                    "public_key": spki_b64(&anchor_key),
                     "label": "pilot anchor" },
     });
     let aad: [u8; 32] = Sha256::digest(&node.runtime_spki).into();
@@ -279,7 +282,6 @@ pub async fn harness_with_clock(clock: Clock) -> Option<Harness> {
         org,
         anchor: (anchor_id.into(), anchor_key),
         shares,
-        custodians,
         ca_pem: reply["payload"]["kms_ca_pem"].as_str().unwrap().to_owned(),
         _shutdown: shutdown,
     })
@@ -320,7 +322,7 @@ impl Harness {
         seed: u8,
     ) -> (KeyId, SigningKey) {
         let key = SigningKey::from_bytes(&[seed; 32]);
-        let payload = json!({ "principal_id": PrincipalId::mint(), "public_key": b64(key.verifying_key().to_public_key_der().unwrap().as_bytes()),
+        let payload = json!({ "principal_id": PrincipalId::mint(), "public_key": spki_b64(&key),
                               "label": format!("key {seed}"), "issued_at": rfc3339(self.now()) });
         let (status, reply) = self
             .post(

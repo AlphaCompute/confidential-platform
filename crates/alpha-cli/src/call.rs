@@ -1,6 +1,5 @@
 //! `alpha call <route>`: one signed Control body, the path derived from the payload.
 
-use std::str::FromStr;
 use std::time::SystemTime;
 
 use alpha_client::{Client, PutSecretBody, sign};
@@ -12,41 +11,13 @@ use serde_json::{Value, json};
 
 use crate::{rfc3339, sha256_prefixed};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Route {
     RegisterRevision,
     RevokeRevision,
     PutSecret,
     RegisterKey,
     RevokeKey,
-}
-
-pub const ROUTES: [&str; 5] = [
-    "register-revision",
-    "revoke-revision",
-    "put-secret",
-    "register-key",
-    "revoke-key",
-];
-
-impl FromStr for Route {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, String> {
-        Ok(match s {
-            "register-revision" => Self::RegisterRevision,
-            "revoke-revision" => Self::RevokeRevision,
-            "put-secret" => Self::PutSecret,
-            "register-key" => Self::RegisterKey,
-            "revoke-key" => Self::RevokeKey,
-            other => {
-                return Err(format!(
-                    "unknown route {other:?}; one of {}",
-                    ROUTES.join(", ")
-                ));
-            }
-        })
-    }
 }
 
 impl Route {
@@ -126,17 +97,10 @@ mod tests {
 
     #[test]
     fn routes_parse_and_name_their_context() {
-        for name in ROUTES {
-            name.parse::<Route>().unwrap();
-        }
-        assert_eq!(
-            "put-secret".parse::<Route>().unwrap().context(),
-            context::SECRET
-        );
-        assert_eq!(
-            "revoke-key".parse::<Route>().unwrap().context(),
-            context::CONTROL
-        );
-        assert!("secrets".parse::<Route>().is_err());
+        use clap::ValueEnum;
+        let parse = |s| Route::from_str(s, false);
+        assert_eq!(parse("put-secret").unwrap().context(), context::SECRET);
+        assert_eq!(parse("revoke-key").unwrap().context(), context::CONTROL);
+        assert!(parse("secrets").is_err());
     }
 }

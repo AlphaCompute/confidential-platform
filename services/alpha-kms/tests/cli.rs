@@ -13,11 +13,8 @@ use alpha_cli::{call, deploy, node as cli_node, sign};
 use alpha_client::{Anchor, Client, Pin, tls};
 use alpha_core::{AppId, KeyId, PrincipalId};
 use alpha_kms::{certs, platform};
-use base64::Engine;
-use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use common::*;
 use ed25519_dalek::SigningKey;
-use ed25519_dalek::pkcs8::EncodePublicKey;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -40,10 +37,6 @@ fn identity_of(node: &alpha_kms::Node) -> cli_node::NodeIdentity {
         xwing: node.xwing_key.public(),
         compose_hash: node.compose_hash,
     }
-}
-
-fn spki_b64(key: &SigningKey) -> String {
-    BASE64_URL_SAFE_NO_PAD.encode(key.verifying_key().to_public_key_der().unwrap().as_bytes())
 }
 
 fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -87,9 +80,8 @@ async fn call_signs_all_five_control_routes() {
     };
     let client = pinned(&h, ca_pin(&h));
     let now = h.now();
-    let run = |route: &str, key: &(KeyId, SigningKey), payload: Value, value: Option<Vec<u8>>| {
+    let run = |route: Route, key: &(KeyId, SigningKey), payload: Value, value: Option<Vec<u8>>| {
         let (key_id, key) = (key.0, key.1.clone());
-        let route: Route = route.parse().unwrap();
         let client = &client;
         async move {
             call::run(
@@ -108,7 +100,7 @@ async fn call_signs_all_five_control_routes() {
     // Route 4 by the anchor, whose id the bootstrap reply handed out.
     let admin_key = SigningKey::from_bytes(&[21u8; 32]);
     let reply = run(
-        "register-key",
+        Route::RegisterKey,
         &h.anchor,
         json!({ "principal_id": PrincipalId::mint(), "public_key": spki_b64(&admin_key), "label": "day-to-day" }),
         None,
@@ -130,7 +122,7 @@ async fn call_signs_all_five_control_routes() {
     .unwrap();
     let app_id: AppId = expected["app_id"].as_str().unwrap().parse().unwrap();
     let reply = run(
-        "register-revision",
+        Route::RegisterRevision,
         &admin,
         json!({ "app_id": app_id, "compose": compose }),
         None,
@@ -152,7 +144,7 @@ async fn call_signs_all_five_control_routes() {
 
     // Route 3: content_sha256 and issued_at filled in from the value and the clock.
     let reply = run(
-        "put-secret",
+        Route::PutSecret,
         &admin,
         json!({ "name": "api-key", "app_ids": [app_id] }),
         Some(b"s3cret".to_vec()),
@@ -165,7 +157,7 @@ async fn call_signs_all_five_control_routes() {
     );
     assert_eq!(reply["name"], "api-key");
     let err = run(
-        "put-secret",
+        Route::PutSecret,
         &admin,
         json!({ "name": "api-key", "app_ids": [app_id] }),
         None,
@@ -173,14 +165,14 @@ async fn call_signs_all_five_control_routes() {
     .await
     .unwrap_err();
     assert!(err.contains("--value"), "{err}");
-    let err = run("register-key", &admin, json!({}), Some(b"x".to_vec()))
+    let err = run(Route::RegisterKey, &admin, json!({}), Some(b"x".to_vec()))
         .await
         .unwrap_err();
     assert!(err.contains("only for put-secret"), "{err}");
 
     // Route 2: the path comes from the payload.
     let reply = run(
-        "revoke-revision",
+        Route::RevokeRevision,
         &admin,
         json!({ "compose_hash": expected["compose_hash"] }),
         None,
@@ -192,7 +184,7 @@ async fn call_signs_all_five_control_routes() {
 
     // Route 5, then the revoked key signs nothing.
     let reply = run(
-        "revoke-key",
+        Route::RevokeKey,
         &h.anchor,
         json!({ "key_id": admin.0, "reason": "compromised" }),
         None,
@@ -201,7 +193,7 @@ async fn call_signs_all_five_control_routes() {
     .unwrap();
     assert_eq!(reply["reason"], "compromised");
     let err = run(
-        "revoke-revision",
+        Route::RevokeRevision,
         &admin,
         json!({ "compose_hash": expected["compose_hash"] }),
         None,
@@ -302,8 +294,7 @@ async fn sign_and_check_feed_the_node_and_the_admin_pin() {
     let served =
         alpha_client::platform::fetch(&h.release.url, &h.release.key.verifying_key(), h.now())
             .await
-            .unwrap()
-            .1;
+            .unwrap();
     let client = pinned(&h, Pin::Ca(tls::ca_from_pem(&served.kms_ca_pem).unwrap()));
     assert!(client.ready().await.is_ok());
 }

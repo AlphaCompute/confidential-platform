@@ -46,22 +46,24 @@ pub struct Identity {
     pub pkcs8: Vec<u8>,
 }
 
+/// `pin: None` accepts any certificate; it exists only to read a sealed node's evidence, whose
+/// quote is what authenticates it, and the caller compares the observed SPKI with the attested key.
 #[derive(Debug)]
-pub struct PinnedServer {
-    pin: Pin,
+struct PinnedServer {
+    pin: Option<Pin>,
     anchor: Option<TrustAnchor<'static>>,
     provider: Arc<CryptoProvider>,
 }
 
 impl PinnedServer {
-    pub fn new(pin: Pin) -> Result<Self, Error> {
+    fn new(pin: Option<Pin>) -> Result<Self, Error> {
         let anchor = match &pin {
-            Pin::Ca(ca) | Pin::CaAndRevisions(ca, _) => Some(
+            Some(Pin::Ca(ca) | Pin::CaAndRevisions(ca, _)) => Some(
                 webpki::anchor_from_trusted_cert(ca)
                     .map_err(|e| Error::Invalid(format!("pinned ca: {e}")))?
                     .to_owned(),
             ),
-            Pin::Spki(_) => None,
+            Some(Pin::Spki(_)) | None => None,
         };
         Ok(Self {
             pin,
@@ -81,6 +83,9 @@ impl ServerCertVerifier for PinnedServer {
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
         let refuse = |m: String| rustls::Error::General(m);
+        let Some(pin) = &self.pin else {
+            return Ok(ServerCertVerified::assertion());
+        };
         if let Some(anchor) = &self.anchor {
             webpki::EndEntityCert::try_from(end_entity)
                 .map_err(|e| refuse(e.to_string()))?
@@ -95,7 +100,7 @@ impl ServerCertVerifier for PinnedServer {
                 )
                 .map_err(|e| refuse(format!("server chain does not end at the pinned ca: {e}")))?;
         }
-        match &self.pin {
+        match pin {
             Pin::Ca(_) => {}
             Pin::CaAndRevisions(_, revisions) => {
                 let sans = uri_sans(end_entity).map_err(|e| refuse(e.to_string()))?;
@@ -152,62 +157,12 @@ impl ServerCertVerifier for PinnedServer {
     }
 }
 
-/// Accepts any server certificate; used only to read a sealed node's evidence, whose quote is
-/// what authenticates it, and the caller compares the observed SPKI with the attested key.
-#[derive(Debug)]
-struct Unpinned(Arc<CryptoProvider>);
-
-impl ServerCertVerifier for Unpinned {
-    fn verify_server_cert(
-        &self,
-        _: &CertificateDer<'_>,
-        _: &[CertificateDer<'_>],
-        _: &ServerName<'_>,
-        _: &[u8],
-        _: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _: &[u8],
-        _: &CertificateDer<'_>,
-        _: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Err(rustls::Error::PeerIncompatible(
-            rustls::PeerIncompatible::Tls12NotOffered,
-        ))
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.0.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
-}
-
-fn builder(
-    verifier: Arc<dyn ServerCertVerifier>,
-    identity: Option<Identity>,
-) -> Result<ClientConfig, Error> {
+fn builder(pin: Option<Pin>, identity: Option<Identity>) -> Result<ClientConfig, Error> {
     let builder = ClientConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .expect("TLS 1.3 is supported")
         .dangerous()
-        .with_custom_certificate_verifier(verifier);
+        .with_custom_certificate_verifier(Arc::new(PinnedServer::new(pin)?));
     Ok(match identity {
         None => builder.with_no_client_auth(),
         Some(identity) => builder
@@ -224,11 +179,11 @@ fn builder(
 }
 
 pub fn client_config(pin: Pin, identity: Option<Identity>) -> Result<ClientConfig, Error> {
-    builder(Arc::new(PinnedServer::new(pin)?), identity)
+    builder(Some(pin), identity)
 }
 
 pub(crate) fn unpinned_config() -> ClientConfig {
-    builder(Arc::new(Unpinned(provider())), None).expect("no identity to reject")
+    builder(None, None).expect("nothing to reject")
 }
 
 pub fn uri_sans(cert: &[u8]) -> Result<Vec<String>, Error> {

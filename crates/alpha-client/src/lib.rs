@@ -1,11 +1,11 @@
-//! Client for the three APIs of `alpha-kms`: a list of endpoints tried in turn on a connection
-//! failure or a 5xx (never on a 4xx), one pinned TLS configuration, typed bodies for every route,
-//! the error envelope as one error, and the signing helpers for the Control bodies.
+//! Client for the Control and Node APIs of `alpha-kms`: a list of endpoints tried in turn on a
+//! connection failure or a 5xx (never on a 4xx), one pinned TLS configuration, typed bodies for
+//! every route, the error envelope as one error, and the signing helper for the Control bodies.
 
 pub mod platform;
 pub mod tls;
 
-use alpha_attest::{AttestationResult, EVIDENCE_FORMAT, EventLogEntry, Evidence};
+use alpha_attest::{EVIDENCE_FORMAT, EventLogEntry, Evidence};
 use alpha_core::{
     AppId, ComposeHash, KeyId, OrgId, PrincipalId, SecretId, context, signing_digest,
 };
@@ -18,20 +18,15 @@ use p256::pkcs8::DecodePublicKey;
 use reqwest::Method;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 pub use tls::{Identity, Pin};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The KMS error envelope `{ "error": { code, message, request_id } }`.
-    #[error("{code}: {message} (request {request_id})")]
-    Api {
-        status: u16,
-        code: String,
-        message: String,
-        request_id: String,
-    },
+    #[error(transparent)]
+    Api(ApiError),
     /// No endpoint answered.
     #[error("{0}")]
     Connect(String),
@@ -40,25 +35,24 @@ pub enum Error {
     Invalid(String),
 }
 
-impl Error {
-    pub fn code(&self) -> Option<&str> {
-        match self {
-            Self::Api { code, .. } => Some(code),
-            _ => None,
-        }
-    }
+#[derive(Debug, Deserialize, thiserror::Error)]
+#[error("{code}: {message} (request {request_id})")]
+pub struct ApiError {
+    pub code: String,
+    pub message: String,
+    pub request_id: String,
 }
 
 #[derive(Deserialize)]
 struct Envelope {
-    error: EnvelopeBody,
+    error: ApiError,
 }
 
-#[derive(Deserialize)]
-struct EnvelopeBody {
-    code: String,
-    message: String,
-    request_id: String,
+fn api_error(endpoint: &str, status: reqwest::StatusCode, bytes: &[u8]) -> Error {
+    match serde_json::from_slice::<Envelope>(bytes) {
+        Ok(envelope) => Error::Api(envelope.error),
+        Err(_) => Error::Invalid(format!("{endpoint}: {status} without an error envelope")),
+    }
 }
 
 /// `{ "key_id", "algorithm": "ed25519", "signature" }`.
@@ -108,28 +102,6 @@ pub struct Ready {
 pub struct Nonce {
     pub nonce: String,
     pub expires_at: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AttestRequest {
-    pub runtime_pubkey: String,
-    pub nonce: String,
-    pub evidence: Evidence,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct AttestReply {
-    pub certificate_chain: Vec<String>,
-    pub not_after: String,
-    pub attestation_result: AttestationResult,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Secret {
-    pub value: String,
-    pub content_sha256: String,
-    pub issued_at: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -326,10 +298,6 @@ impl Client {
         })
     }
 
-    pub fn endpoints(&self) -> &[String] {
-        &self.endpoints
-    }
-
     /// Walks the endpoints: a connection failure or a 5xx moves to the next one, a 4xx is final.
     async fn request<T: DeserializeOwned>(
         &self,
@@ -361,52 +329,34 @@ impl Client {
                 return serde_json::from_slice(&bytes)
                     .map_err(|e| Error::Invalid(format!("{method} {path}: reply: {e}")));
             }
-            let error = match serde_json::from_slice::<Envelope>(&bytes) {
-                Ok(env) => Error::Api {
-                    status: status.as_u16(),
-                    code: env.error.code,
-                    message: env.error.message,
-                    request_id: env.error.request_id,
-                },
-                Err(_) => Error::Invalid(format!("{endpoint}: {status} without an error envelope")),
-            };
+            last = api_error(endpoint, status, &bytes);
             if !status.is_server_error() {
-                return Err(error);
+                return Err(last);
             }
-            last = error;
         }
         Err(last)
     }
 
-    fn json<T: Serialize>(body: &T) -> Value {
-        serde_json::to_value(body).expect("request bodies serialize")
+    async fn post<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &impl Serialize,
+    ) -> Result<T, Error> {
+        self.request(Method::POST, path, Some(&json!(body))).await
     }
 
     pub async fn ready(&self) -> Result<Ready, Error> {
         self.request(Method::GET, "/ready", None).await
     }
 
-    // Instance API
-
     pub async fn attest_nonce(&self) -> Result<Nonce, Error> {
         self.request(Method::POST, "/v1/attest/nonce", None).await
-    }
-
-    pub async fn attest(&self, body: &AttestRequest) -> Result<AttestReply, Error> {
-        self.request(Method::POST, "/v1/attest", Some(&Self::json(body)))
-            .await
-    }
-
-    pub async fn get_secret(&self, name: &str) -> Result<Secret, Error> {
-        self.request(Method::GET, &format!("/v1/secrets/{name}"), None)
-            .await
     }
 
     // Control API
 
     pub async fn register_revision(&self, body: &Signed) -> Result<RevisionRegistered, Error> {
-        self.request(Method::POST, "/v1/revisions", Some(&Self::json(body)))
-            .await
+        self.post("/v1/revisions", body).await
     }
 
     pub async fn revoke_revision(
@@ -414,35 +364,25 @@ impl Client {
         compose_hash: ComposeHash,
         body: &Signed,
     ) -> Result<RevisionRevoked, Error> {
-        self.request(
-            Method::POST,
-            &format!("/v1/revisions/{compose_hash}/revoke"),
-            Some(&Self::json(body)),
-        )
-        .await
+        self.post(&format!("/v1/revisions/{compose_hash}/revoke"), body)
+            .await
     }
 
     pub async fn put_secret(&self, name: &str, body: &PutSecretBody) -> Result<SecretPut, Error> {
         self.request(
             Method::PUT,
             &format!("/v1/secrets/{name}"),
-            Some(&Self::json(body)),
+            Some(&json!(body)),
         )
         .await
     }
 
     pub async fn register_key(&self, body: &Signed) -> Result<KeyRegistered, Error> {
-        self.request(Method::POST, "/v1/keys", Some(&Self::json(body)))
-            .await
+        self.post("/v1/keys", body).await
     }
 
     pub async fn revoke_key(&self, key_id: KeyId, body: &Signed) -> Result<KeyRevoked, Error> {
-        self.request(
-            Method::POST,
-            &format!("/v1/keys/{key_id}/revoke"),
-            Some(&Self::json(body)),
-        )
-        .await
+        self.post(&format!("/v1/keys/{key_id}/revoke"), body).await
     }
 
     // Node API
@@ -456,18 +396,15 @@ impl Client {
     }
 
     pub async fn bootstrap(&self, body: &BootstrapRequest) -> Result<BootstrapReply, Error> {
-        self.request(Method::POST, "/v1/node/bootstrap", Some(&Self::json(body)))
-            .await
+        self.post("/v1/node/bootstrap", body).await
     }
 
     pub async fn unseal(&self, body: &UnsealRequest) -> Result<UnsealReply, Error> {
-        self.request(Method::POST, "/v1/node/unseal", Some(&Self::json(body)))
-            .await
+        self.post("/v1/node/unseal", body).await
     }
 
     pub async fn join(&self, body: &JoinRequest) -> Result<JoinReply, Error> {
-        self.request(Method::POST, "/v1/node/join", Some(&Self::json(body)))
-            .await
+        self.post("/v1/node/join", body).await
     }
 }
 
@@ -504,15 +441,7 @@ pub async fn fetch_node_evidence(
         .await
         .map_err(|e| Error::Connect(format!("{endpoint}: {e}")))?;
     if !status.is_success() {
-        return Err(match serde_json::from_slice::<Envelope>(&bytes) {
-            Ok(env) => Error::Api {
-                status: status.as_u16(),
-                code: env.error.code,
-                message: env.error.message,
-                request_id: env.error.request_id,
-            },
-            Err(_) => Error::Invalid(format!("{endpoint}: {status} without an error envelope")),
-        });
+        return Err(api_error(endpoint, status, &bytes));
     }
     let evidence = serde_json::from_slice(&bytes)
         .map_err(|e| Error::Invalid(format!("node evidence: {e}")))?;
@@ -522,21 +451,6 @@ pub async fn fetch_node_evidence(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sign_produces_the_wire_object() {
-        let key = SigningKey::from_bytes(&[1u8; 32]);
-        let id = KeyId::mint();
-        let signed = sign(context::CONTROL, serde_json::json!({"a": 1}), id, &key);
-        assert_eq!(signed.signature.key_id, id);
-        assert_eq!(signed.signature.algorithm, "ed25519");
-        let digest = signing_digest(context::CONTROL, &signed.payload);
-        let sig = ed25519_dalek::Signature::from_slice(
-            &decode("s", &signed.signature.signature).unwrap(),
-        )
-        .unwrap();
-        key.verifying_key().verify_strict(&digest, &sig).unwrap();
-    }
 
     #[test]
     fn bootstrap_reply_is_typed_only_after_its_signature_verifies() {

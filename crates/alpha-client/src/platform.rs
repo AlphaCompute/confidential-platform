@@ -77,7 +77,7 @@ pub async fn fetch(
     url: &str,
     release_key: &VerifyingKey,
     now: SystemTime,
-) -> Result<(SignedDocument, PlatformDocument), Error> {
+) -> Result<PlatformDocument, Error> {
     let signed: SignedDocument = reqwest::get(url)
         .await
         .and_then(|r| r.error_for_status())
@@ -85,8 +85,7 @@ pub async fn fetch(
         .json()
         .await
         .map_err(|e| Error::Invalid(format!("platform document body: {e}")))?;
-    let document = verify(&signed, release_key, now)?;
-    Ok((signed, document))
+    verify(&signed, release_key, now)
 }
 
 #[cfg(test)]

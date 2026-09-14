@@ -114,16 +114,6 @@ fn derive(passphrase: &[u8], kdf: &Kdf) -> Result<Zeroizing<[u8; 32]>, String> {
 
 pub fn generate(algorithm: Algorithm, path: &Path, passphrase: &[u8]) -> Result<Key, String> {
     let seed = Zeroizing::new(random::<32>());
-    write(algorithm, &seed, path, passphrase)?;
-    Ok(Key::from_seed(algorithm, &seed))
-}
-
-pub fn write(
-    algorithm: Algorithm,
-    seed: &[u8; 32],
-    path: &Path,
-    passphrase: &[u8],
-) -> Result<(), String> {
     let kdf = Kdf {
         name: "scrypt".into(),
         log_n: 15,
@@ -137,7 +127,7 @@ pub fn write(
         .encrypt(
             &Nonce::from(nonce),
             Payload {
-                msg: seed,
+                msg: seed.as_slice(),
                 aad: algorithm.name().as_bytes(),
             },
         )
@@ -151,7 +141,8 @@ pub fn write(
         ciphertext: BASE64_URL_SAFE_NO_PAD.encode(ciphertext),
     };
     let text = serde_json::to_string_pretty(&file).expect("serializes") + "\n";
-    fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
+    fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Key::from_seed(algorithm, &seed))
 }
 
 pub fn read(path: &Path, passphrase: &[u8]) -> Result<Key, String> {
