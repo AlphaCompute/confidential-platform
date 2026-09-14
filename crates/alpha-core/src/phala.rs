@@ -9,11 +9,27 @@ pub fn canonicalize(value: &Value) -> String {
     let mut out = Vec::new();
     let mut ser =
         serde_json::Serializer::with_formatter(&mut out, PrettyFormatter::with_indent(b"    "));
-    serde::Serialize::serialize(value, &mut ser)
+    serde::Serialize::serialize(&sort_keys(value), &mut ser)
         .expect("serializing a Value into a Vec cannot fail");
     String::from_utf8(out)
         .expect("serde_json emits UTF-8")
         .replace("\": ", "\":")
+}
+
+// serde_json's map is only sorted without the `preserve_order` feature, which any crate in
+// the workspace can switch on for everyone; the order must not depend on that.
+fn sort_keys(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            keys.into_iter()
+                .map(|key| (key.clone(), sort_keys(&map[key])))
+                .collect()
+        }
+        Value::Array(items) => items.iter().map(sort_keys).collect(),
+        other => other.clone(),
+    }
 }
 
 #[cfg(test)]

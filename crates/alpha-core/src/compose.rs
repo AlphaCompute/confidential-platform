@@ -1,5 +1,7 @@
 use std::fmt;
+use std::str::FromStr;
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use yaml_rust2::{Yaml, YamlLoader};
@@ -25,6 +27,50 @@ impl fmt::Display for ComposeHash {
 impl fmt::Debug for ComposeHash {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, f)
+    }
+}
+
+impl From<[u8; 32]> for ComposeHash {
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("expected sha256:<64 lowercase hex>")]
+pub struct ParseComposeHashError;
+
+impl FromStr for ComposeHash {
+    type Err = ParseComposeHashError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let hex = s.strip_prefix("sha256:").ok_or(ParseComposeHashError)?;
+        if hex.len() != 64 {
+            return Err(ParseComposeHashError);
+        }
+        let mut bytes = [0u8; 32];
+        for (i, pair) in hex.as_bytes().chunks(2).enumerate() {
+            let nibble = |b: u8| match b {
+                b'0'..=b'9' => Ok(b - b'0'),
+                b'a'..=b'f' => Ok(b - b'a' + 10),
+                _ => Err(ParseComposeHashError),
+            };
+            bytes[i] = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+        }
+        Ok(Self(bytes))
+    }
+}
+
+impl Serialize for ComposeHash {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for ComposeHash {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -136,6 +182,18 @@ mod tests {
             format!("sha256:{}", hex(&digest)),
             expected["signing_digest"]
         );
+    }
+
+    #[test]
+    fn compose_hash_round_trips_through_text_and_json() {
+        let hash = compose_hash("{}");
+        assert_eq!(hash.to_string().parse::<ComposeHash>().unwrap(), hash);
+        let json = serde_json::to_string(&hash).unwrap();
+        assert_eq!(json, format!("\"{hash}\""));
+        assert_eq!(serde_json::from_str::<ComposeHash>(&json).unwrap(), hash);
+        for bad in ["", "sha256:", "sha256:zz", &hash.to_string().to_uppercase()] {
+            assert!(bad.parse::<ComposeHash>().is_err(), "{bad}");
+        }
     }
 
     #[test]
