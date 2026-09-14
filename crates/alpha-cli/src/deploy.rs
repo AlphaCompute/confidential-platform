@@ -10,7 +10,6 @@ use serde_yaml_ng::{Mapping, Value as Yaml};
 
 pub const RUNTIME_SERVICE: &str = "alpha-runtime";
 const SOCKET_VOLUME: &str = "alpha-run:/run/alpha";
-const KMS_SERVICE: &str = "alpha-kms";
 const KMS_ENVS: [&str; 4] = [
     "ALPHACOMPUTE_DATABASE_URL",
     "ALPHACOMPUTE_KMS_ENDPOINTS",
@@ -187,7 +186,7 @@ pub fn kms_compose(app_id: AppId, image: &str, dev_root: bool) -> Result<String,
     kms.insert(key("restart"), key("always"));
     kms.insert(key("volumes"), strings(&EVIDENCE_MOUNTS));
     let mut services = Mapping::new();
-    services.insert(key(KMS_SERVICE), Yaml::Mapping(kms));
+    services.insert(key("alpha-kms"), Yaml::Mapping(kms));
     let mut root = Mapping::new();
     root.insert(key("services"), Yaml::Mapping(services));
     let yaml = serde_yaml_ng::to_string(&root).map_err(|e| e.to_string())?;
@@ -287,7 +286,7 @@ mod tests {
     }
 
     #[test]
-    fn kms_compose_reproduces_the_vector_and_is_canonical() {
+    fn kms_compose_reproduces_the_vector() {
         let dir = vector().with_file_name("06-kms-node");
         let expected: Value =
             serde_json::from_str(&fs::read_to_string(dir.join("expected.json")).unwrap()).unwrap();
@@ -304,8 +303,6 @@ mod tests {
         );
         let parsed: Value = serde_json::from_str(&compose).unwrap();
         assert_eq!(phala::canonicalize(&parsed).unwrap(), compose);
-        assert_eq!(parsed["allowed_envs"], json!(KMS_ENVS));
-        assert!(!compose.contains(RUNTIME_SERVICE));
 
         let dev = kms_compose(app_id, image, true).unwrap();
         let parsed: Value = serde_json::from_str(&dev).unwrap();

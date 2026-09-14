@@ -1,13 +1,9 @@
 # syntax=docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
-# The alpha-kms image: one static binary and nothing else. Built from the repository root:
+# The alpha-kms image: one static binary and nothing else, built the way images/manager builds
+# alpha-runtime (pinned base, offline compile, timestamps from SOURCE_DATE_EPOCH). From the root:
 #   docker build --platform linux/amd64 --build-arg SOURCE_DATE_EPOCH=<unix seconds> \
 #     [--build-arg FEATURES=dev-root] -f images/kms/Dockerfile .
-# Same shape as images/manager: base pinned by digest, dependencies fetched in their own stage,
-# no network while compiling, every timestamp from SOURCE_DATE_EPOCH, so two builds of one
-# commit give one image digest (.github/workflows/release.yml checks that). FEATURES is a
-# compile-time cargo feature list: empty for production, `dev-root` for the dev App's image,
-# which is a distinct image (alpha-kms-dev), never a runtime switch. `migrate` is this same
-# binary with an argument.
+# FEATURES is compiled in: empty gives alpha-kms, `dev-root` the distinct alpha-kms-dev image.
 
 ARG SOURCE_DATE_EPOCH=0
 

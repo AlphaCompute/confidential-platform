@@ -67,13 +67,10 @@ jobs:
       - name: Render the KMS compose from the pushed digest
         if: matrix.app_id && startsWith(github.ref, 'refs/tags/')
         run: |
-          flags=""
-          [ "$FEATURES" = dev-root ] && flags=--dev-root
-          cargo run -q -p alpha-cli --example kms_compose -- $flags \
-            "${{ matrix.app_id }}" "${{ steps.push.outputs.digest }}" "release/${{ matrix.name }}"
           {
             echo '```json'
-            cat "release/${{ matrix.name }}/manifest.json"
+            cargo run -q -p alpha-cli --example kms_compose -- ${FEATURES:+--dev-root} \
+              "${{ matrix.app_id }}" "${{ steps.push.outputs.digest }}" "release/${{ matrix.name }}"
             echo '```'
             echo '```json'
             cat "release/${{ matrix.name }}/app-compose.json"
