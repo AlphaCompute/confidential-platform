@@ -144,6 +144,12 @@ fn client() -> reqwest::Client {
         .unwrap()
 }
 
+/// Status and JSON body (`null` when the body is not JSON).
+async fn send(request: reqwest::RequestBuilder) -> (StatusCode, Value) {
+    let r = request.send().await.unwrap();
+    (r.status(), r.json().await.unwrap_or(Value::Null))
+}
+
 fn client_with(identity_pem: &str) -> reqwest::Client {
     reqwest::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -280,14 +286,12 @@ impl Harness {
     }
 
     async fn call(&self, method: reqwest::Method, path: &str, body: Value) -> (StatusCode, Value) {
-        let r = client()
-            .request(method, format!("{}{path}", self.url))
-            .json(&body)
-            .send()
-            .await
-            .unwrap();
-        let status = r.status();
-        (status, r.json().await.unwrap_or(Value::Null))
+        send(
+            client()
+                .request(method, format!("{}{path}", self.url))
+                .json(&body),
+        )
+        .await
     }
 
     async fn post(&self, path: &str, body: Value) -> (StatusCode, Value) {
@@ -384,15 +388,8 @@ async fn bootstrap_once_unseal_with_two_shares_and_sealed_gate() {
     };
     assert!(h.ca_pem.starts_with("-----BEGIN CERTIFICATE-----"));
     assert_eq!(h.shares.len(), 3);
-    let ready: Value = client()
-        .get(format!("{}/ready", h.url))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(ready, json!({ "sealed": false }));
+    let ready = send(client().get(format!("{}/ready", h.url))).await;
+    assert_eq!(ready, (StatusCode::OK, json!({ "sealed": false })));
 
     let aad: [u8; 32] = Sha256::digest(&h.node.runtime_spki).into();
     let again = alpha_crypto::seal(&h.node.xwing_key.public(), INFO_NODE_BOOTSTRAP, &aad, b"{}");
@@ -408,9 +405,10 @@ async fn bootstrap_once_unseal_with_two_shares_and_sealed_gate() {
     let (node2, url2, _shutdown2) =
         start_node(h.pool.clone(), &h.release.url, &h.release.key).await;
     assert!(node2.is_sealed());
-    let r = client().get(format!("{url2}/ready")).send().await.unwrap();
-    assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(r.json::<Value>().await.unwrap(), json!({ "sealed": true }));
+    assert_eq!(
+        send(client().get(format!("{url2}/ready"))).await,
+        (StatusCode::SERVICE_UNAVAILABLE, json!({ "sealed": true }))
+    );
     let r = client()
         .post(format!("{url2}/v1/attest/nonce"))
         .send()
@@ -419,27 +417,14 @@ async fn bootstrap_once_unseal_with_two_shares_and_sealed_gate() {
     assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(r.headers().get("retry-after").unwrap(), "30");
     assert_eq!(code(&r.json().await.unwrap()), "sealed");
-    let r = client()
-        .get(format!("{url2}/healthz"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(
+        send(client().get(format!("{url2}/healthz"))).await.0,
+        StatusCode::OK
+    );
 
     let aad2: [u8; 32] = Sha256::digest(&node2.runtime_spki).into();
     let unseal = |share: &Vec<u8>| json!({ "share_hpke": alpha_crypto::seal(&node2.xwing_key.public(), INFO_UNSEAL_SHARE, &aad2, share) });
-    let post = |body: Value| {
-        let url2 = url2.clone();
-        async move {
-            let r = client()
-                .post(format!("{url2}/v1/node/unseal"))
-                .json(&body)
-                .send()
-                .await
-                .unwrap();
-            (r.status(), r.json::<Value>().await.unwrap())
-        }
-    };
+    let post = |body: Value| send(client().post(format!("{url2}/v1/node/unseal")).json(&body));
     let (status, reply) = post(unseal(&h.shares[2])).await;
     assert_eq!(
         (status, reply),
@@ -469,8 +454,10 @@ async fn bootstrap_once_unseal_with_two_shares_and_sealed_gate() {
         (StatusCode::OK, json!({ "sealed": false, "shares": 2 }))
     );
     assert!(!node2.is_sealed());
-    let r = client().get(format!("{url2}/ready")).send().await.unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(
+        send(client().get(format!("{url2}/ready"))).await.0,
+        StatusCode::OK
+    );
     assert_eq!(
         node2.intermediates().unwrap().ca_cert_der,
         h.node.intermediates().unwrap().ca_cert_der
@@ -831,13 +818,9 @@ async fn attest_release_revoke_and_tamper() {
     );
 
     let instance = h.instance_client().await;
-    let r = instance
-        .get(format!("{}/v1/secrets/model-key", h.url))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
-    let secret: Value = r.json().await.unwrap();
+    let secret_url = format!("{}/v1/secrets/model-key", h.url);
+    let (status, secret) = send(instance.get(&secret_url)).await;
+    assert_eq!(status, StatusCode::OK, "{secret}");
     assert_eq!(secret["value"], json!(b64(b"the value")));
     assert_eq!(
         secret["content_sha256"],
@@ -846,34 +829,18 @@ async fn attest_release_revoke_and_tamper() {
             hex::encode(Sha256::digest(b"the value"))
         ))
     );
-    let r = instance
-        .get(format!("{}/v1/secrets/other", h.url))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        (r.status(), code(&r.json().await.unwrap())),
-        (StatusCode::NOT_FOUND, "not_found")
-    );
+    let (status, reply) = send(instance.get(format!("{}/v1/secrets/other", h.url))).await;
+    assert_eq!((status, code(&reply)), (StatusCode::NOT_FOUND, "not_found"));
 
     // No certificate, or a self-signed one with the right SANs, is cert_invalid.
-    let r = client()
-        .get(format!("{}/v1/secrets/model-key", h.url))
-        .send()
-        .await
-        .unwrap();
+    let (status, reply) = send(client().get(&secret_url)).await;
     assert_eq!(
-        (r.status(), code(&r.json().await.unwrap())),
+        (status, code(&reply)),
         (StatusCode::UNAUTHORIZED, "cert_invalid")
     );
-    let forged = forged_client(&h, &sans);
-    let r = forged
-        .get(format!("{}/v1/secrets/model-key", h.url))
-        .send()
-        .await
-        .unwrap();
+    let (status, reply) = send(forged_client(&h, &sans).get(&secret_url)).await;
     assert_eq!(
-        (r.status(), code(&r.json().await.unwrap())),
+        (status, code(&reply)),
         (StatusCode::UNAUTHORIZED, "cert_invalid")
     );
 
@@ -886,13 +853,9 @@ async fn attest_release_revoke_and_tamper() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
-    let r = instance
-        .get(format!("{}/v1/secrets/model-key", h.url))
-        .send()
-        .await
-        .unwrap();
+    let (status, reply) = send(instance.get(&secret_url)).await;
     assert_eq!(
-        (r.status(), code(&r.json().await.unwrap())),
+        (status, code(&reply)),
         (StatusCode::CONFLICT, "revision_revoked")
     );
     let (status, reply) = h.attest(KEYED).await;
@@ -915,13 +878,8 @@ async fn attest_release_revoke_and_tamper() {
         (status, code(&reply)),
         (StatusCode::BAD_REQUEST, "signature_invalid")
     );
-    let r = instance
-        .get(format!("{}/v1/secrets/model-key", h.url))
-        .send()
-        .await
-        .unwrap();
     assert_eq!(
-        r.status(),
+        send(instance.get(&secret_url)).await.0,
         StatusCode::NOT_FOUND,
         "the certificate's app no longer matches the row"
     );
@@ -933,25 +891,16 @@ async fn attest_release_revoke_and_tamper() {
         .execute(&h.pool)
         .await
         .unwrap();
-    let r = instance
-        .get(format!("{}/v1/secrets/model-key", h.url))
-        .send()
-        .await
-        .unwrap();
+    let (status, reply) = send(instance.get(&secret_url)).await;
     assert_eq!(
-        (r.status(), code(&r.json().await.unwrap())),
+        (status, code(&reply)),
         (StatusCode::BAD_REQUEST, "signature_invalid")
     );
     sqlx::query!("update revisions set compose = left(compose, length(compose) - 1)")
         .execute(&h.pool)
         .await
         .unwrap();
-    let r = instance
-        .get(format!("{}/v1/secrets/model-key", h.url))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(send(instance.get(&secret_url)).await.0, StatusCode::OK);
 
     // A retired registering key keeps old objects valid; compromised fails them closed.
     let payload = json!({ "key_id": admin.0, "reason": "retired", "issued_at": rfc3339(h.now() + Duration::from_secs(1)) });
@@ -962,13 +911,8 @@ async fn attest_release_revoke_and_tamper() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
-    let r = instance
-        .get(format!("{}/v1/secrets/model-key", h.url))
-        .send()
-        .await
-        .unwrap();
     assert_eq!(
-        r.status(),
+        send(instance.get(&secret_url)).await.0,
         StatusCode::OK,
         "retired: objects signed before revoked_at stay valid"
     );
@@ -979,13 +923,9 @@ async fn attest_release_revoke_and_tamper() {
     .execute(&h.pool)
     .await
     .unwrap();
-    let r = instance
-        .get(format!("{}/v1/secrets/model-key", h.url))
-        .send()
-        .await
-        .unwrap();
+    let (status, reply) = send(instance.get(&secret_url)).await;
     assert_eq!(
-        (r.status(), code(&r.json().await.unwrap())),
+        (status, code(&reply)),
         (StatusCode::BAD_REQUEST, "signature_invalid")
     );
     let (status, reply) = h.attest(KEYED).await;
@@ -1013,13 +953,9 @@ async fn attest_release_revoke_and_tamper() {
     .execute(&h.pool)
     .await
     .unwrap();
-    let r = instance
-        .get(format!("{}/v1/secrets/model-key", h.url))
-        .send()
-        .await
-        .unwrap();
+    let (status, reply) = send(instance.get(&secret_url)).await;
     assert_eq!(
-        (r.status(), code(&r.json().await.unwrap())),
+        (status, code(&reply)),
         (StatusCode::BAD_REQUEST, "signature_invalid")
     );
 
@@ -1086,17 +1022,7 @@ async fn join_hands_out_intermediates_only_to_an_attested_listed_requesting_node
     let body =
         json!({ "nonce": h.nonce(), "evidence": evidence(KEYED, "node"), "xwing_pubkey": xwing });
     let post = |client: &reqwest::Client, body: Value| {
-        let url = h.url.clone();
-        let client = client.clone();
-        async move {
-            let r = client
-                .post(format!("{url}/v1/node/join"))
-                .json(&body)
-                .send()
-                .await
-                .unwrap();
-            (r.status(), r.json::<Value>().await.unwrap())
-        }
+        send(client.post(format!("{}/v1/node/join", h.url)).json(&body))
     };
 
     let (status, reply) = post(&joiner, body.clone()).await;
@@ -1226,10 +1152,8 @@ async fn nonce_route_malformed_body_and_unknown_route() {
         (StatusCode::BAD_REQUEST, "malformed")
     );
     assert!(Uuid::parse_str(reply["error"]["request_id"].as_str().unwrap()).is_ok());
-    let r = client()
-        .get(format!("{}/v1/nope", h.url))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        send(client().get(format!("{}/v1/nope", h.url))).await.0,
+        StatusCode::NOT_FOUND
+    );
 }

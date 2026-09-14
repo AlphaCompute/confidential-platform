@@ -37,10 +37,6 @@ impl PrivateKey {
         Self(SecretKey::from_bytes(&seed).expect("32 bytes is the seed length"))
     }
 
-    pub fn seed(&self) -> Zeroizing<[u8; 32]> {
-        Zeroizing::new(self.0.to_bytes().0)
-    }
-
     pub fn public(&self) -> PublicKey {
         PublicKey(XWing::sk_to_pk(&self.0).to_bytes().0)
     }
@@ -211,9 +207,8 @@ mod tests {
     }
 
     #[test]
-    fn keys_round_trip_through_seed_and_json() {
+    fn public_key_round_trips_through_json() {
         let key = PrivateKey::generate();
-        assert_eq!(PrivateKey::from_seed(*key.seed()).public(), key.public());
         let json = serde_json::to_string(&key.public()).unwrap();
         assert_eq!(
             serde_json::from_str::<PublicKey>(&json).unwrap(),
