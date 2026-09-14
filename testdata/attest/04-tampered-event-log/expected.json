@@ -1,0 +1,6 @@
+{
+  "capture": "phala-dev-0.5.9",
+  "quote": "instance",
+  "error": "attestation_failed",
+  "reason": "replay"
+}

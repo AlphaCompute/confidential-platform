@@ -1,0 +1,6 @@
+{
+  "capture": "phala-dev-0.5.9",
+  "quote": "node",
+  "error": "attestation_unknown",
+  "reason": "kms revision"
+}
