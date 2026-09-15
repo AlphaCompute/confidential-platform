@@ -56,6 +56,19 @@ fn strings(items: &[&str]) -> Yaml {
 }
 
 fn docker_compose_file(spec: &AppSpec) -> Result<String, String> {
+    // alpha-runtime refuses these at start; a Revision that cannot boot is better refused here.
+    if spec.runtime.kms_revisions.is_empty() {
+        return Err("runtime.kms_revisions is empty".into());
+    }
+    if spec
+        .runtime
+        .kms_ca_spki_sha256
+        .strip_prefix("sha256:")
+        .and_then(alpha_core::hex_bytes::<32>)
+        .is_none()
+    {
+        return Err("runtime.kms_ca_spki_sha256 is not sha256:<64 hex>".into());
+    }
     let mut services = Mapping::new();
     for (name, service) in &spec.services {
         let name = name
@@ -242,6 +255,15 @@ mod tests {
                 .unwrap_err()
                 .contains("added by alpha deploy")
         );
+        let ca = base
+            .lines()
+            .find(|l| l.contains("kms_ca_spki_sha256"))
+            .unwrap();
+        let spec = parse(&base.replace(ca, "  kms_ca_spki_sha256: sha256:zz")).unwrap();
+        assert!(compose(&spec).unwrap_err().contains("kms_ca_spki_sha256"));
+        let mut spec = parse(&base).unwrap();
+        spec.runtime.kms_revisions.clear();
+        assert!(compose(&spec).unwrap_err().contains("kms_revisions"));
         assert!(parse(&(base + "extra: 1\n")).is_err());
     }
 }

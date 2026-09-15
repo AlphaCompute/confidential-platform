@@ -171,40 +171,11 @@ pub fn spki_of(cert: &[u8]) -> Result<Vec<u8>, ApiError> {
     alpha_client::tls::spki_of(cert).map_err(|e| ApiError::new("cert_invalid", e.to_string()))
 }
 
-/// The identity an Instance certificate carries: `alphacompute://<org>/<app>/<key sha256>`
-/// then `urn:alphacompute:revision:sha256:<hex>`, in the order `instance_sans` issues them.
-pub struct InstanceIdentity {
-    pub org_id: OrgId,
-    pub app_id: AppId,
-    pub runtime_pubkey_sha256_hex: String,
-    pub compose_hash: ComposeHash,
-}
+pub use alpha_client::tls::InstanceSans as InstanceIdentity;
 
 pub fn parse_instance_sans(sans: &[String]) -> Result<InstanceIdentity, ApiError> {
-    let invalid = || ApiError::new("cert_invalid", "certificate SANs are not an Instance's");
-    let [identity, revision] = sans else {
-        return Err(invalid());
-    };
-    let parts: Vec<&str> = identity
-        .strip_prefix("alphacompute://")
-        .ok_or_else(invalid)?
-        .split('/')
-        .collect();
-    let [org, app, key] = parts[..] else {
-        return Err(invalid());
-    };
-    let compose_hash = revision
-        .strip_prefix("urn:alphacompute:revision:")
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(invalid)?;
-    Ok(InstanceIdentity {
-        org_id: org.parse().map_err(|_| invalid())?,
-        app_id: app.parse().map_err(|_| invalid())?,
-        runtime_pubkey_sha256_hex: alpha_core::hex_bytes::<32>(key)
-            .map(|_| key.to_owned())
-            .ok_or_else(invalid)?,
-        compose_hash,
-    })
+    alpha_client::tls::parse_instance_sans(sans)
+        .map_err(|e| ApiError::new("cert_invalid", e.to_string()))
 }
 
 #[cfg(test)]

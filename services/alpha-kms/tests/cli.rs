@@ -36,7 +36,7 @@ fn pinned(h: &Harness, pin: Pin) -> Client {
 }
 
 fn ca_pin(h: &Harness) -> Pin {
-    Pin::Ca(tls::ca_from_pem(&h.ca_pem).unwrap())
+    Pin::Ca(tls::cert_from_pem(&h.ca_pem).unwrap())
 }
 
 #[tokio::test]
@@ -45,14 +45,14 @@ async fn call_refuses_a_kms_whose_chain_does_not_end_in_the_pinned_ca() {
         return;
     };
     let (_, other_ca) = certs::new_ca(SystemTime::now()).unwrap();
-    let err = pinned(&h, Pin::Ca(other_ca.into()))
+    let err = pinned(&h, Pin::Ca(other_ca.clone().into()))
         .ready()
         .await
         .unwrap_err();
     assert!(matches!(err, alpha_client::Error::Connect(_)), "{err}");
     assert!(pinned(&h, ca_pin(&h)).ready().await.is_ok());
 
-    let ca = tls::ca_from_pem(&h.ca_pem).unwrap();
+    let ca = tls::cert_from_pem(&h.ca_pem).unwrap();
     let listed = Pin::CaAndRevisions(ca.clone(), vec![h.node.compose_hash]);
     assert!(pinned(&h, listed).ready().await.is_ok());
     let unlisted = Pin::CaAndRevisions(ca, vec![alpha_core::compose_hash("other")]);
@@ -65,6 +65,29 @@ async fn call_refuses_a_kms_whose_chain_does_not_end_in_the_pinned_ca() {
         pinned(&h, Pin::Spki(spki)).ready().await.unwrap_err(),
         alpha_client::Error::Connect(_)
     ));
+
+    // The runtime's pin: the CA taken from the presented chain by its SPKI hash.
+    let ca_hash = tls::spki_sha256(&h.node.intermediates().unwrap().ca_cert_der).unwrap();
+    let by_hash = |hash, revisions| Pin::CaSpkiAndRevisions(hash, revisions);
+    assert!(
+        pinned(&h, by_hash(ca_hash, vec![h.node.compose_hash]))
+            .ready()
+            .await
+            .is_ok()
+    );
+    for pin in [
+        by_hash(ca_hash, vec![alpha_core::compose_hash("other")]),
+        by_hash(ca_hash, vec![]),
+        by_hash(
+            tls::spki_sha256(&other_ca).unwrap(),
+            vec![h.node.compose_hash],
+        ),
+    ] {
+        assert!(matches!(
+            pinned(&h, pin).ready().await.unwrap_err(),
+            alpha_client::Error::Connect(_)
+        ));
+    }
 }
 
 #[tokio::test]
@@ -289,7 +312,7 @@ async fn sign_and_check_feed_the_node_and_the_admin_pin() {
         alpha_client::platform::fetch(&h.release.url, &h.release.key.verifying_key(), h.now())
             .await
             .unwrap();
-    let client = pinned(&h, Pin::Ca(tls::ca_from_pem(&served.kms_ca_pem).unwrap()));
+    let client = pinned(&h, Pin::Ca(tls::cert_from_pem(&served.kms_ca_pem).unwrap()));
     assert!(client.ready().await.is_ok());
 }
 

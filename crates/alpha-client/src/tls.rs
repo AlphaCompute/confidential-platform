@@ -1,10 +1,11 @@
 //! The client side of every platform TLS hop: TLS 1.3 with `X25519MLKEM768` and the server
-//! pinned by value — a CA plus a Revision allowlist (runtime, join), a CA alone (the admin CLI)
-//! or one exact SPKI (the custodian CLI on a sealed node). The host name is only routing.
+//! pinned by value — a CA plus a Revision allowlist (join), the CA's SPKI hash plus a Revision
+//! allowlist (the runtime, which holds only the hash), a CA alone (the admin CLI) or one exact
+//! SPKI (the custodian CLI on a sealed node). The host name is only routing.
 
 use std::sync::Arc;
 
-use alpha_core::ComposeHash;
+use alpha_core::{AppId, ComposeHash, OrgId};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::crypto::aws_lc_rs::{self, kx_group};
@@ -12,7 +13,9 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, TrustAnchor, UnixTime,
 };
+use rustls::time_provider::TimeProvider;
 use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use sha2::{Digest, Sha256};
 use x509_parser::prelude::{FromDer, GeneralName, ParsedExtension, X509Certificate};
 
 use crate::Error;
@@ -34,13 +37,16 @@ pub enum Pin {
     Ca(CertificateDer<'static>),
     /// The chain ends at this CA and the leaf carries one of these Revisions.
     CaAndRevisions(CertificateDer<'static>, Vec<ComposeHash>),
+    /// The chain ends at a CA the server presents whose SPKI SHA-256 is these bytes, and the
+    /// leaf carries one of these Revisions; an empty list matches nothing.
+    CaSpkiAndRevisions([u8; 32], Vec<ComposeHash>),
     /// The leaf's SubjectPublicKeyInfo is exactly these bytes.
     Spki(Vec<u8>),
 }
 
-pub fn ca_from_pem(pem: &str) -> Result<CertificateDer<'static>, Error> {
+pub fn cert_from_pem(pem: &str) -> Result<CertificateDer<'static>, Error> {
     CertificateDer::from_pem_slice(pem.as_bytes())
-        .map_err(|e| Error::Invalid(format!("ca pem: {e}")))
+        .map_err(|e| Error::Invalid(format!("certificate pem: {e}")))
 }
 
 /// The client's own certificate for mTLS hops: an Instance leaf or a node's self-signed one.
@@ -66,7 +72,7 @@ impl PinnedServer {
                     .map_err(|e| Error::Invalid(format!("pinned ca: {e}")))?
                     .to_owned(),
             ),
-            Some(Pin::Spki(_)) | None => None,
+            Some(Pin::CaSpkiAndRevisions(..) | Pin::Spki(_)) | None => None,
         };
         Ok(Self {
             pin,
@@ -89,7 +95,29 @@ impl ServerCertVerifier for PinnedServer {
         let Some(pin) = &self.pin else {
             return Ok(ServerCertVerified::assertion());
         };
-        if let Some(anchor) = &self.anchor {
+        let presented;
+        let anchor = match pin {
+            Pin::Ca(_) | Pin::CaAndRevisions(..) => Some(
+                self.anchor
+                    .as_ref()
+                    .ok_or_else(|| refuse("pinned ca is not an anchor".into()))?,
+            ),
+            Pin::CaSpkiAndRevisions(sha256, _) => {
+                let ca = intermediates
+                    .iter()
+                    .find(|c| spki_sha256(c).as_ref() == Some(sha256))
+                    .ok_or_else(|| {
+                        refuse(
+                            "no certificate in the server chain carries the pinned ca key".into(),
+                        )
+                    })?;
+                presented =
+                    webpki::anchor_from_trusted_cert(ca).map_err(|e| refuse(e.to_string()))?;
+                Some(&presented)
+            }
+            Pin::Spki(_) => None,
+        };
+        if let Some(anchor) = anchor {
             webpki::EndEntityCert::try_from(end_entity)
                 .map_err(|e| refuse(e.to_string()))?
                 .verify_for_usage(
@@ -105,7 +133,7 @@ impl ServerCertVerifier for PinnedServer {
         }
         match pin {
             Pin::Ca(_) => {}
-            Pin::CaAndRevisions(_, revisions) => {
+            Pin::CaAndRevisions(_, revisions) | Pin::CaSpkiAndRevisions(_, revisions) => {
                 let sans = uri_sans(end_entity).map_err(|e| refuse(e.to_string()))?;
                 // An Instance leaf from the same CA also carries a Revision SAN and the
                 // server-auth EKU; only a node's leaf carries the KMS identity.
@@ -165,8 +193,14 @@ impl ServerCertVerifier for PinnedServer {
     }
 }
 
-pub fn client_config(pin: Option<Pin>, identity: Option<Identity>) -> Result<ClientConfig, Error> {
-    let builder = ClientConfig::builder_with_provider(provider())
+/// `time` is the clock certificate validity is judged by; `main` passes
+/// `rustls::time_provider::DefaultTimeProvider`, a test can pin it to a capture.
+pub fn client_config(
+    pin: Option<Pin>,
+    identity: Option<Identity>,
+    time: Arc<dyn TimeProvider>,
+) -> Result<ClientConfig, Error> {
+    let builder = ClientConfig::builder_with_details(provider(), time)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| Error::Invalid(format!("tls: {e}")))?
         .dangerous()
@@ -208,4 +242,45 @@ pub fn spki_of(cert: &[u8]) -> Result<Vec<u8>, Error> {
     let (_, cert) =
         X509Certificate::from_der(cert).map_err(|e| Error::Invalid(format!("certificate: {e}")))?;
     Ok(cert.public_key().raw.to_vec())
+}
+
+pub fn spki_sha256(cert: &[u8]) -> Option<[u8; 32]> {
+    spki_of(cert).ok().map(|spki| Sha256::digest(spki).into())
+}
+
+/// The identity an Instance certificate carries: `alphacompute://<org>/<app>/<key sha256>`
+/// then `urn:alphacompute:revision:sha256:<hex>`, in the order the KMS issues them.
+#[derive(Clone, Debug)]
+pub struct InstanceSans {
+    pub org_id: OrgId,
+    pub app_id: AppId,
+    pub runtime_pubkey_sha256_hex: String,
+    pub compose_hash: ComposeHash,
+}
+
+pub fn parse_instance_sans(sans: &[String]) -> Result<InstanceSans, Error> {
+    let invalid = || Error::Invalid("certificate SANs are not an Instance's".into());
+    let [identity, revision] = sans else {
+        return Err(invalid());
+    };
+    let parts: Vec<&str> = identity
+        .strip_prefix("alphacompute://")
+        .ok_or_else(invalid)?
+        .split('/')
+        .collect();
+    let [org, app, key] = parts[..] else {
+        return Err(invalid());
+    };
+    let compose_hash = revision
+        .strip_prefix("urn:alphacompute:revision:")
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(invalid)?;
+    Ok(InstanceSans {
+        org_id: org.parse().map_err(|_| invalid())?,
+        app_id: app.parse().map_err(|_| invalid())?,
+        runtime_pubkey_sha256_hex: alpha_core::hex_bytes::<32>(key)
+            .map(|_| key.to_owned())
+            .ok_or_else(invalid)?,
+        compose_hash,
+    })
 }

@@ -386,7 +386,7 @@ fn join_client(
     revisions: &[alpha_attest::KmsRevision],
 ) -> Result<Client, ApiError> {
     let internal = |e: alpha_client::Error| ApiError::internal(e.to_string());
-    let ca = alpha_client::tls::ca_from_pem(kms_ca_pem).map_err(internal)?;
+    let ca = alpha_client::tls::cert_from_pem(kms_ca_pem).map_err(internal)?;
     let pin = Pin::CaAndRevisions(ca, revisions.iter().map(|r| r.compose_hash).collect());
     let cert = certs::self_signed(&certs::key_pair(&node.runtime_pkcs8)?, node.now())?;
     let identity = Identity {
