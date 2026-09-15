@@ -34,6 +34,17 @@ dev `01a09f07-8d09-7aff-b257-83dbd9e6e641`); `testdata/manifest/06-kms-node` pin
 the root KEK from `ALPHACOMPUTE_KMS_DEV_ROOT_KEK` instead of the custodians' shares. It is a
 different image with a different `compose_hash`; a production platform document never lists it.
 
+## Pulling from ghcr
+
+The images are private. Every compose, the node's and every tenant's, carries a one-line
+`pre_launch_script` that logs in to ghcr with `ALPHACOMPUTE_GHCR_TOKEN` from the encrypted env
+when it is set; the script and the variable name are measured, the token is not. The deploy
+that starts a new image supplies a token that can read the package: `.github/workflows/deploy.yml`
+passes the job's own `github.token` and waits until the container answers, because the token
+expires with the job. A reboot starts from the image already on the CVM's disk and needs no
+token. `deploy/phala.py` is the create/update call itself (exact compose, `compose_hash` check,
+encrypted env) for a deploy run by hand with a token of your own.
+
 ## Signing the Revision
 
 The release-key holder adds `{ "compose_hash": "<from manifest.json>", "build": "kms <tag>",
