@@ -66,6 +66,10 @@ the platform-document URL are served; the signed document lists the Revision.
    anchor.json --endpoint https://<node 1>` (`crates/alpha-cli/README.md`). The CLI verifies the
    node's evidence against the signed document before it seals anything; it writes one share
    file per custodian (hand each over, delete it) and prints `kms_ca_pem` and `anchor_key_id`.
+   The node commits genesis before it answers, and the shares exist only in that answer: if
+   the CLI does not get it (connection lost, CLI killed), do not retry — the retry is refused
+   as `already_exists` and nothing can unseal the row it wrote. Drop the database, recreate it
+   (step 1) and bootstrap again; nothing else has been written yet.
 4. **Re-sign the document** with `kms_ca_pem` filled in; both nodes pick it up on their
    five-minute timer. From now on `alpha sign --check` prints the two values a tenant pins.
 5. **Register the everyday admin key** of the pilot organization with the anchor key
