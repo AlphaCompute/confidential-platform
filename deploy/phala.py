@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Creates or updates a Phala Cloud CVM from an app-compose.json.
+
+  deploy/phala.py create <app-compose.json> <cvm name>
+  deploy/phala.py update <cvm id> <app-compose.json>
+
+PHALA_API_KEY authenticates. On create, PHALA_INSTANCE_TYPE (default tdx.small), PHALA_IMAGE
+and PHALA_NODE_ID choose the machine. Every name in the compose's allowed_envs that is set in
+this process's environment travels in the encrypted env; nothing else does. Prints
+{cvm_id, app_id, gateway_base_domain}.
+"""
+
+import hashlib
+import json
+import os
+import secrets
+import sys
+import urllib.error
+import urllib.request
+
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+API = "https://cloud-api.phala.network/api/v1"
+
+
+def call(method, path, body=None):
+    request = urllib.request.Request(
+        API + path,
+        data=None if body is None else json.dumps(body).encode(),
+        method=method,
+        headers={
+            "X-API-Key": os.environ["PHALA_API_KEY"],
+            "Content-Type": "application/json",
+            # The edge in front of the API refuses urllib's default user agent with a bare 403.
+            "User-Agent": "alphacompute-deploy/1",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=180) as reply:
+            raw = reply.read()
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as refused:
+        sys.exit(f"{method} {path}: {refused.code} {refused.read().decode()[:600]}")
+
+
+def seal(values, pubkey_hex):
+    """dstack's scheme: an ephemeral X25519 agreement, the raw shared secret as the AES-256-GCM
+    key, hex(ephemeral public key || nonce || ciphertext)."""
+    plaintext = json.dumps({"env": [{"key": k, "value": v} for k, v in values.items()]}).encode()
+    ephemeral = X25519PrivateKey.generate()
+    shared = ephemeral.exchange(
+        X25519PublicKey.from_public_bytes(bytes.fromhex(pubkey_hex.removeprefix("0x")))
+    )
+    nonce = secrets.token_bytes(12)
+    sealed = AESGCM(shared).encrypt(nonce, plaintext, None)
+    return (ephemeral.public_key().public_bytes_raw() + nonce + sealed).hex()
+
+
+def check(phala_hash, compose_bytes):
+    want = hashlib.sha256(compose_bytes).hexdigest()
+    got = phala_hash.removeprefix("sha256:").removeprefix("0x")
+    if got != want:
+        sys.exit(
+            f"compose_hash mismatch: Phala would measure {got}, the file hashes to {want}; "
+            "nothing was committed"
+        )
+
+
+def report(cvm_id):
+    info = call("GET", f"/cvms/{cvm_id}")
+    print(json.dumps({
+        "cvm_id": cvm_id,
+        "app_id": info["app_id"],
+        "gateway_base_domain": info["gateway"]["base_domain"],
+    }))
+
+
+def main():
+    if len(sys.argv) != 4 or sys.argv[1] not in ("create", "update"):
+        sys.exit(__doc__)
+    action = sys.argv[1]
+    path = sys.argv[2] if action == "create" else sys.argv[3]
+    with open(path, "rb") as f:
+        compose_bytes = f.read()
+    compose = json.loads(compose_bytes)
+    values = {n: os.environ[n] for n in compose.get("allowed_envs", []) if os.environ.get(n)}
+
+    if action == "create":
+        body = {
+            "name": sys.argv[3],
+            "instance_type": os.environ.get("PHALA_INSTANCE_TYPE", "tdx.small"),
+            "compose_file": compose,
+        }
+        if os.environ.get("PHALA_IMAGE"):
+            body["image"] = os.environ["PHALA_IMAGE"]
+        if os.environ.get("PHALA_NODE_ID"):
+            body["node_id"] = int(os.environ["PHALA_NODE_ID"])
+        prepared = call("POST", "/cvms/provision", body)
+        check(prepared["compose_hash"], compose_bytes)
+        made = call("POST", "/cvms", {
+            "app_id": prepared["app_id"],
+            "compose_hash": prepared["compose_hash"],
+            "encrypted_env": seal(values, prepared["app_env_encrypt_pubkey"]),
+            "env_keys": list(values),
+        })
+        report(made["id"])
+        return
+
+    cvm_id = sys.argv[2]
+    prepared = call("POST", f"/cvms/{cvm_id}/compose_file/provision", compose)
+    check(prepared["compose_hash"], compose_bytes)
+    pubkey = call("GET", f"/cvms/{cvm_id}")["kms_info"]["encrypted_env_pubkey"]
+    sealed = seal(values, pubkey)
+    if prepared.get("compose_unchanged"):
+        call("PATCH", f"/cvms/{cvm_id}/envs", {"encrypted_env": sealed, "env_keys": list(values)})
+    else:
+        call("PATCH", f"/cvms/{cvm_id}/compose_file", {
+            "compose_hash": prepared["compose_hash"],
+            "encrypted_env": sealed,
+            "env_keys": list(values),
+            "update_env_vars": True,
+        })
+    report(cvm_id)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,76 @@
+name: deploy
+
+# A CVM pulls its images from ghcr itself. The credential is this job's own token: it reads
+# this repository's packages and expires with the job, so the job waits until the container
+# answers. A reboot later starts from the image already on the CVM's disk; a new image needs
+# a new run.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag whose alpha-kms-dev image the node runs
+        required: true
+      cvm_id:
+        description: Update this CVM; empty creates one
+        required: false
+      name:
+        description: CVM name when creating
+        required: false
+        default: alpha-kms-dev-1
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  kms-dev:
+    runs-on: ubuntu-latest
+    environment: dev
+    env:
+      APP_ID: 01a09f07-8d09-7aff-b257-83dbd9e6e641
+      IMAGE: ghcr.io/alphacompute/alpha-kms-dev
+      TAG: ${{ inputs.tag }}
+      CVM_ID: ${{ inputs.cvm_id }}
+      CVM_NAME: ${{ inputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Render the node compose from the release image
+        run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          digest=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{json .Manifest}}' | jq -r .digest)
+          {
+            echo '```json'
+            cargo run -q -p alpha-cli --example kms_compose -- --dev-root "$APP_ID" "$IMAGE@$digest" out
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Create or update the CVM
+        env:
+          PHALA_API_KEY: ${{ secrets.PHALA_API_KEY }}
+          PHALA_IMAGE: dstack-0.5.9
+          ALPHACOMPUTE_DATABASE_URL: ${{ secrets.ALPHACOMPUTE_DATABASE_URL }}
+          ALPHACOMPUTE_KMS_DEV_ROOT_KEK: ${{ secrets.ALPHACOMPUTE_KMS_DEV_ROOT_KEK }}
+          ALPHACOMPUTE_KMS_ENDPOINTS: ${{ vars.ALPHACOMPUTE_KMS_ENDPOINTS }}
+          ALPHACOMPUTE_PCCS_URL: ${{ vars.ALPHACOMPUTE_PCCS_URL }}
+          ALPHACOMPUTE_PLATFORM_DOCUMENT_URL: ${{ vars.ALPHACOMPUTE_PLATFORM_DOCUMENT_URL }}
+          ALPHACOMPUTE_GHCR_TOKEN: ${{ github.token }}
+        run: |
+          pip install --quiet cryptography
+          if [ -n "$CVM_ID" ]; then
+            python3 deploy/phala.py update "$CVM_ID" out/app-compose.json > cvm.json
+          else
+            python3 deploy/phala.py create out/app-compose.json "$CVM_NAME" > cvm.json
+          fi
+          cat cvm.json >> "$GITHUB_STEP_SUMMARY"
+      - name: Wait for the node to answer while the token is still valid
+        run: |
+          url="https://$(jq -r .app_id cvm.json)-8443s.$(jq -r .gateway_base_domain cvm.json)/ready"
+          for _ in $(seq 1 120); do
+            code=$(curl -ks -o /dev/null -w '%{http_code}' -m 10 "$url" || true)
+            if [ "$code" != "000" ]; then
+              echo "$url answered $code" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "$url did not answer in 20 minutes" >&2
+          exit 1
