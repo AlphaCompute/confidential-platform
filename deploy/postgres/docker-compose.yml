@@ -1,0 +1,31 @@
+# The trust-zone Postgres CVM. The dstack gateway passes `<app id>-5432s.<gateway base>` through to
+# port 5432 unchanged, so Postgres terminates TLS itself and accepts the KMS's direct negotiation.
+# The certificate is self-signed and made once into the volume: the KMS connects with
+# sslmode=require and does not verify it.
+services:
+  postgres:
+    image: postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+    restart: always
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: alpha
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql
+    entrypoint:
+      - bash
+      - -c
+      - |
+        set -e
+        tls=/var/lib/postgresql/tls
+        if [ ! -f "$$tls/server.key" ]; then
+          mkdir -p "$$tls"
+          openssl req -new -x509 -days 3650 -nodes -subj /CN=postgres -keyout "$$tls/server.key" -out "$$tls/server.crt"
+          chown -R postgres "$$tls"
+          chmod 600 "$$tls/server.key"
+        fi
+        exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file="$$tls/server.crt" -c ssl_key_file="$$tls/server.key"
+
+volumes:
+  pgdata:

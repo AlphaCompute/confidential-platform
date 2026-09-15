@@ -19,6 +19,19 @@ unimplemented = "deny"
 indexing_slicing = "deny"
 arithmetic_side_effects = "deny"
 
+# ponytail: sqlx 0.9.0 plus launchbadge/sqlx#3879 (sslnegotiation=direct). A Phala CVM is reachable
+# only through the dstack gateway, which routes by the SNI of the first bytes, so the KMS must open
+# its Postgres connection with a TLS ClientHello rather than an SSLRequest. Drop this section for
+# the first sqlx release that has the option.
+[patch.crates-io]
+sqlx = { git = "https://github.com/AlphaCompute/sqlx", rev = "cbfd2eee5b84c5f8549dd2810ec31df441255659" }
+sqlx-core = { git = "https://github.com/AlphaCompute/sqlx", rev = "cbfd2eee5b84c5f8549dd2810ec31df441255659" }
+sqlx-macros = { git = "https://github.com/AlphaCompute/sqlx", rev = "cbfd2eee5b84c5f8549dd2810ec31df441255659" }
+sqlx-macros-core = { git = "https://github.com/AlphaCompute/sqlx", rev = "cbfd2eee5b84c5f8549dd2810ec31df441255659" }
+sqlx-mysql = { git = "https://github.com/AlphaCompute/sqlx", rev = "cbfd2eee5b84c5f8549dd2810ec31df441255659" }
+sqlx-postgres = { git = "https://github.com/AlphaCompute/sqlx", rev = "cbfd2eee5b84c5f8549dd2810ec31df441255659" }
+sqlx-sqlite = { git = "https://github.com/AlphaCompute/sqlx", rev = "cbfd2eee5b84c5f8549dd2810ec31df441255659" }
+
 # scrypt at log_n = 15 takes seconds unoptimized; the key-file tests derive six keys.
 [profile.dev.package.scrypt]
 opt-level = 3
