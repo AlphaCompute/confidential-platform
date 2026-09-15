@@ -2,13 +2,13 @@ name: deploy
 
 # A CVM pulls its images from ghcr itself. The credential is this job's own token: it reads
 # this repository's packages and expires with the job, so the job waits until the container
-# answers. A reboot later starts from the image already on the CVM's disk; a new image needs
+# runs. A reboot later starts from the image already on the CVM's disk; a new image needs
 # a new run.
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag whose alpha-kms-dev image the node runs
+        description: Release tag (v…) or dev-image tag (dev-…) whose alpha-kms-dev image the node runs
         required: true
       cvm_id:
         description: Update this CVM; empty creates one
@@ -34,7 +34,7 @@ jobs:
       CVM_NAME: ${{ inputs.name }}
     steps:
       - uses: actions/checkout@v4
-      - name: Render the node compose from the release image
+      - name: Render the node compose from the image
         run: |
           echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           digest=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{json .Manifest}}' | jq -r .digest)
@@ -61,16 +61,17 @@ jobs:
             python3 deploy/phala.py create out/app-compose.json "$CVM_NAME" > cvm.json
           fi
           cat cvm.json >> "$GITHUB_STEP_SUMMARY"
-      - name: Wait for the node to answer while the token is still valid
+      # The node's TLS is X25519MLKEM768 only, which the runner's curl cannot speak, so the job
+      # waits on the container state instead: running means the image was pulled.
+      - name: Wait for the container to run while the token is still valid
+        env:
+          PHALA_API_KEY: ${{ secrets.PHALA_API_KEY }}
         run: |
-          url="https://$(jq -r .app_id cvm.json)-8443s.$(jq -r .gateway_base_domain cvm.json)/ready"
-          for _ in $(seq 1 120); do
-            code=$(curl -ks -o /dev/null -w '%{http_code}' -m 10 "$url" || true)
-            if [ "$code" != "000" ]; then
-              echo "$url answered $code" | tee -a "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-            sleep 10
-          done
-          echo "$url did not answer in 20 minutes" >&2
-          exit 1
+          python3 deploy/phala.py wait "$(jq -r .cvm_id cvm.json)"
+          app=$(jq -r .app_id cvm.json)
+          base=$(jq -r .gateway_base_domain cvm.json)
+          {
+            echo '```'
+            curl -s -m 20 "https://$app-8090.$base/logs/dstack-alpha-kms-1?text=true&bare=true&tail=20" || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
