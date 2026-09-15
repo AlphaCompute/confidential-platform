@@ -1,6 +1,6 @@
-//! What a dstack CVM reads about itself: a TDX quote through configfs-tsm and the event log
-//! that replays its RTMRs — the boot-time events from the CCEL ACPI table and dstack's own
-//! runtime events under `/run/log/dstack`. No guest-agent socket is involved.
+//! What a dstack CVM reads about itself: a TDX quote from the guest agent's socket and the
+//! event log that replays its RTMRs — the boot-time events from the CCEL ACPI table and dstack's
+//! own runtime events under `/run/log/dstack`.
 
 #![cfg_attr(
     test,
@@ -14,6 +14,8 @@
 )]
 
 use std::fs;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use alpha_attest::EventLogEntry;
@@ -21,7 +23,11 @@ use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use serde::Deserialize;
 
-pub const TSM_REPORT_DIR: &str = "/sys/kernel/config/tsm/report";
+/// The dstack guest agent, which quotes the TD for us: Phala's guest image carries no
+/// configfs-tsm (`/sys/kernel/config` is an empty configfs there, so `TSM_REPORT_DIR` never
+/// existed). The agent cannot forge a quote — the TD signs it — and the appraisal checks that
+/// it is over our `report_data`, so this is a different source, not weaker evidence.
+pub const DSTACK_SOCKET: &str = "/var/run/dstack.sock";
 /// The host's `/sys/firmware/acpi/tables/data/CCEL`, bind-mounted outside `/sys`: a container
 /// does not see a file mounted under `/sys/firmware`, and a dstack node running this path failed
 /// to start with the table missing.
@@ -34,32 +40,113 @@ const DSTACK_RUNTIME_EVENT_TYPE: u32 = 0x0800_0001;
 pub enum Error {
     #[error("{0}: {1}")]
     Io(String, std::io::Error),
+    #[error("guest agent: {0}")]
+    Agent(String),
     #[error("CCEL: {0}")]
     Ccel(&'static str),
     #[error("runtime event log: {0}")]
     RuntimeEvents(String),
 }
 
-/// One quote over `report_data`: a fresh entry under configfs-tsm, `inblob` in, `outblob` out.
+#[derive(Deserialize)]
+struct QuoteReply {
+    quote: String,
+}
+
+/// One quote over `report_data`, from the guest agent's `GetQuote`.
 pub fn quote(report_data: &[u8; 64]) -> Result<Vec<u8>, Error> {
-    let entry = Path::new(TSM_REPORT_DIR).join(format!("alpha-{}", std::process::id()));
-    let io = |what: &str| {
-        let what = what.to_owned();
-        move |e| Error::Io(what, e)
-    };
-    fs::create_dir(&entry).map_err(io("create tsm entry"))?;
-    let result = fs::write(entry.join("inblob"), report_data)
-        .map_err(io("write inblob"))
-        .and_then(|()| fs::read(entry.join("outblob")).map_err(io("read outblob")));
-    let _ = fs::remove_dir(&entry);
-    let quote = result?;
-    if quote.is_empty() {
-        return Err(Error::Io(
-            "read outblob".into(),
-            std::io::Error::other("empty outblob"),
-        ));
+    quote_from(Path::new(DSTACK_SOCKET), report_data)
+}
+
+fn quote_from(socket: &Path, report_data: &[u8; 64]) -> Result<Vec<u8>, Error> {
+    let io = |what: String| move |e| Error::Io(what.clone(), e);
+    let mut stream =
+        UnixStream::connect(socket).map_err(io(format!("connect {}", socket.display())))?;
+    // HTTP/1.0: the agent then answers without chunked framing and closes, which is the whole
+    // protocol we need. `handle` reads a GET's query as the request body and replies in JSON.
+    let request = format!(
+        "GET /GetQuote?report_data=0x{} HTTP/1.0\r\nHost: dstack\r\nAccept: application/json\r\n\r\n",
+        hex(report_data)
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(io("write to the guest agent".into()))?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .map_err(io("read from the guest agent".into()))?;
+    let body = http_body(&response)?;
+    let reply: QuoteReply =
+        serde_json::from_slice(&body).map_err(|e| Error::Agent(format!("GetQuote reply: {e}")))?;
+    unhex(reply.quote.trim().trim_start_matches("0x"))
+}
+
+/// The body of a `200` response, chunked or not.
+fn http_body(response: &[u8]) -> Result<Vec<u8>, Error> {
+    let end = response
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or_else(|| Error::Agent("response has no header".into()))?;
+    let (head, rest) = response.split_at(end);
+    let body = rest.get(4..).unwrap_or_default();
+    let head = String::from_utf8_lossy(head);
+    let mut lines = head.split("\r\n");
+    let status = lines.next().unwrap_or_default();
+    if !status.contains(" 200") {
+        return Err(Error::Agent(format!(
+            "{status}: {}",
+            String::from_utf8_lossy(body.get(..200).unwrap_or(body))
+        )));
     }
-    Ok(quote)
+    let chunked = lines.any(|line| {
+        let line = line.to_ascii_lowercase();
+        line.starts_with("transfer-encoding:") && line.contains("chunked")
+    });
+    if chunked {
+        dechunk(body)
+    } else {
+        Ok(body.to_vec())
+    }
+}
+
+fn dechunk(mut body: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::new();
+    loop {
+        let end = body
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or_else(|| Error::Agent("chunk header".into()))?;
+        let header = String::from_utf8_lossy(body.get(..end).unwrap_or_default()).to_string();
+        let size = usize::from_str_radix(header.split(';').next().unwrap_or_default().trim(), 16)
+            .map_err(|_| Error::Agent("chunk size".into()))?;
+        let rest = body.get(end.saturating_add(2)..).unwrap_or_default();
+        if size == 0 {
+            return Ok(out);
+        }
+        out.extend_from_slice(
+            rest.get(..size)
+                .ok_or_else(|| Error::Agent("chunk is short".into()))?,
+        );
+        body = rest.get(size.saturating_add(2)..).unwrap_or_default();
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex(text: &str) -> Result<Vec<u8>, Error> {
+    let bad = || Error::Agent("quote is not hex".into());
+    if !text.len().is_multiple_of(2) || text.is_empty() {
+        return Err(bad());
+    }
+    text.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).map_err(|_| bad())?;
+            u8::from_str_radix(pair, 16).map_err(|_| bad())
+        })
+        .collect()
 }
 
 pub fn event_log() -> Result<Vec<EventLogEntry>, Error> {
@@ -232,6 +319,73 @@ mod tests {
         assert_eq!(events[0].event_payload, [1, 2, 3]);
         assert!(events[0].digest.is_empty());
         assert!(runtime_events("{\"event\":1}").is_err());
+    }
+}
+
+#[cfg(test)]
+mod agent_tests {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::thread;
+
+    use super::*;
+
+    /// A guest agent that answers one request with `response` and reports the request line.
+    fn fake_agent(response: &'static str) -> (PathBuf, mpsc::Receiver<String>) {
+        let path = std::env::temp_dir().join(format!(
+            "alpha-tsm-{}-{:?}.sock",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let _ = fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            tx.send(line).unwrap();
+            (&stream).write_all(response.as_bytes()).unwrap();
+        });
+        (path, rx)
+    }
+
+    #[test]
+    fn asks_the_agent_for_a_quote_over_report_data() {
+        let (path, requests) = fake_agent(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\"quote\":\"0xdeadBEEF\",\"event_log\":\"[]\"}",
+        );
+        let quote = quote_from(&path, &[0x2a; 64]).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(quote, [0xde, 0xad, 0xbe, 0xef]);
+        let request = requests.recv().unwrap();
+        assert!(
+            request.starts_with("GET /GetQuote?report_data=0x"),
+            "{request}"
+        );
+        assert!(request.contains(&"2a".repeat(64)), "{request}");
+    }
+
+    #[test]
+    fn reads_a_chunked_reply_and_refuses_a_failure() {
+        let (path, _requests) = fake_agent(
+            "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\nc\r\n{\"quote\":\"aa\r\n4\r\nbb\"}\r\n0\r\n\r\n",
+        );
+        let quote = quote_from(&path, &[0; 64]).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(quote, [0xaa, 0xbb]);
+
+        let (path, _requests) = fake_agent("HTTP/1.1 500 Internal Server Error\r\n\r\nno tdx");
+        let error = quote_from(&path, &[0; 64]).unwrap_err().to_string();
+        let _ = fs::remove_file(&path);
+        assert!(error.contains("500") && error.contains("no tdx"), "{error}");
+
+        let (path, _requests) = fake_agent("HTTP/1.1 200 OK\r\n\r\n{\"quote\":\"zz\"}");
+        let error = quote_from(&path, &[0; 64]).unwrap_err().to_string();
+        let _ = fs::remove_file(&path);
+        assert!(error.contains("not hex"), "{error}");
     }
 }
 

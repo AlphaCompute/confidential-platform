@@ -2,7 +2,7 @@
 
 The sidecar inside every Instance. On start it makes a P-256 key in memory (one per Instance
 life), asks the KMS for a nonce, quotes `report_data` over its key and the nonce through
-configfs-tsm, sends the quote and the dstack event log to `POST /v1/attest`, and keeps the
+the guest agent's socket, sends the quote and the dstack event log to `POST /v1/attest`, and keeps the
 one-hour leaf it gets back, renewing it with fresh evidence ten minutes before it expires. If
 the KMS answers `revision_revoked` — at the first attestation, a renewal or a secret read — the
 process exits with code 78 and the socket disappears. Startup and configuration refusals exit
@@ -41,7 +41,7 @@ SAN URI with rustls and webpki alone, the refusal of a listener under another CA
 unlisted Revision (and the walk to the next endpoint), the cache expiring with the leaf, and
 `revision_revoked` ending the runtime with 78.
 
-What only a live CVM proves: the real quote from `/sys/kernel/config/tsm/report`, the real
+What only a live CVM proves: the real quote from the guest agent's socket, the real
 event log from the CCEL table and `/run/log/dstack`, that the registered `compose_hash` equals
 the CVM's `compose-hash` event (`docs/kms-spec.md` §7 item 9), and the image running on Phala
 Cloud with the three host mounts of `docs/manifest.md`.

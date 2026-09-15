@@ -24,10 +24,10 @@ const REGISTRY_TOKEN_ENV: &str = "ALPHACOMPUTE_GHCR_TOKEN";
 /// short-lived deploy token expired would lose the image it runs. ghcr checks the token, not
 /// the user name.
 const PRE_LAUNCH_SCRIPT: &str = "if [ -n \"${ALPHACOMPUTE_GHCR_TOKEN:-}\" ]; then printf '%s' \"$ALPHACOMPUTE_GHCR_TOKEN\" | docker login ghcr.io -u x-access-token --password-stdin; fi\n";
-/// configfs-tsm for the quote, dstack's runtime events, the CCEL boot events: what any
-/// container that produces evidence mounts.
+/// The guest agent's socket for the quote, dstack's runtime events, the CCEL boot events: what
+/// any container that produces evidence mounts.
 const EVIDENCE_MOUNTS: [&str; 3] = [
-    "/sys/kernel/config:/sys/kernel/config",
+    "/var/run/dstack.sock:/var/run/dstack.sock",
     "/run/log/dstack:/run/log/dstack:ro",
     "/sys/firmware/acpi/tables/data/CCEL:/ccel:ro",
 ];

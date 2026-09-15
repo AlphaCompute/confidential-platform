@@ -28,8 +28,8 @@ RUN --network=none cargo build --release --locked --offline -p alpha-kms --featu
  && install -D -m 0755 target/release/alpha-kms /out/alpha-kms \
  && touch -h -d "@$SOURCE_DATE_EPOCH" /out/alpha-kms /out
 
-# Runs as root, no USER: the quote is taken by creating a directory under
-# /sys/kernel/config/tsm/report, and that configfs tree is root-owned.
+# Runs as root, no USER: scratch has no /etc/passwd to name another user, and the evidence
+# mounts (the guest agent's socket, the CCEL table) are root-owned.
 FROM scratch
 # The node fetches its platform document and the PCCS collateral over WebPKI, and reqwest's
 # rustls verifier reads the system roots; scratch has none, so the pinned base image's bundle
