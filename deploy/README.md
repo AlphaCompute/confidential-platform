@@ -106,7 +106,7 @@ the platform-document URL are served; the signed document lists the Revision.
    `ALPHACOMPUTE_PCCS_URL`, `ALPHACOMPUTE_PLATFORM_DOCUMENT_URL`, and after the commit check that
    the stored compose still hashes to `manifest.json`'s `compose_hash`. The node comes up
    `sealed`: `GET /ready` answers 503 `{"sealed": true}`.
-3. **Bootstrap** on the first node: `alpha bootstrap --custodians c1.pub,c2.pub,c3.pub --anchor
+3. **Bootstrap** on the first node: `alpha bootstrap --custodians c1.pub c2.pub c3.pub --anchor
    anchor.json --endpoint https://<node 1>` (`crates/alpha-cli/README.md`). The CLI verifies the
    node's evidence against the signed document before it seals anything; it writes one share
    file per custodian (hand each over, delete it) and prints `kms_ca_pem` and `anchor_key_id`.

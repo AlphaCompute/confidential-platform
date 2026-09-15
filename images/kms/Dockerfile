@@ -31,5 +31,9 @@ RUN --network=none cargo build --release --locked --offline -p alpha-kms --featu
 # Runs as root, no USER: the quote is taken by creating a directory under
 # /sys/kernel/config/tsm/report, and that configfs tree is root-owned.
 FROM scratch
+# The node fetches its platform document and the PCCS collateral over WebPKI, and reqwest's
+# rustls verifier reads the system roots; scratch has none, so the pinned base image's bundle
+# goes where rustls-native-certs looks for it.
+COPY --from=deps /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=build /out/alpha-kms /alpha-kms
 ENTRYPOINT ["/alpha-kms"]
