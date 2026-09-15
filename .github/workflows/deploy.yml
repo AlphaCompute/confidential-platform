@@ -32,7 +32,6 @@ jobs:
       TAG: ${{ inputs.tag }}
       CVM_ID: ${{ inputs.cvm_id }}
       CVM_NAME: ${{ inputs.name }}
-      PHALA_API_KEY: ${{ secrets.PHALA_API_KEY }}
     steps:
       - uses: actions/checkout@v4
       - name: Render the node compose from the image
@@ -46,6 +45,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Create or update the CVM
         env:
+          PHALA_API_KEY: ${{ secrets.PHALA_API_KEY }}
           PHALA_IMAGE: dstack-0.5.9
           ALPHACOMPUTE_DATABASE_URL: ${{ secrets.ALPHACOMPUTE_DATABASE_URL }}
           ALPHACOMPUTE_KMS_DEV_ROOT_KEK: ${{ secrets.ALPHACOMPUTE_KMS_DEV_ROOT_KEK }}
@@ -64,6 +64,8 @@ jobs:
       # The node's TLS is X25519MLKEM768 only, which the runner's curl cannot speak, so the job
       # waits on the container state instead: running means the image was pulled.
       - name: Wait for the container to run while the token is still valid
+        env:
+          PHALA_API_KEY: ${{ secrets.PHALA_API_KEY }}
         run: |
           python3 deploy/phala.py wait "$(jq -r .cvm_id cvm.json)"
           app=$(jq -r .app_id cvm.json)
