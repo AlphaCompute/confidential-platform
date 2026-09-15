@@ -1,6 +1,6 @@
 {
   "app_id": "01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b",
-  "compose_hash": "sha256:2f2bc633f244b195a0ff605ec0cb23c1ea5796c300f0ed5bd1244b698f655889",
+  "compose_hash": "sha256:9eecbcabec78993e17bef456a2db0a21f3779aacd75e5b8f39e44533425277c8",
   "signing_context": "alphacompute/revision/v1",
-  "signing_digest": "sha256:2928fcfefec237e956fd18d0ff264c4015cada0625b334968ba4da13a61538a9"
+  "signing_digest": "sha256:57669e0f5da32e171273558fd14ebc14055525c5e60a28e7741356f4369dc85c"
 }

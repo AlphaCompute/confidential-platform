@@ -157,11 +157,21 @@ fn envelope(
         "docker_compose_file": docker_compose_file,
         "pre_launch_script": PRE_LAUNCH_SCRIPT,
         "kms_enabled": true,
-        "key_provider": "kms",
         "gateway_enabled": true,
         "allowed_envs": allowed_envs,
         "public_tcbinfo": false,
         "no_instance_id": false,
+        // Phala's API writes these fields when they are absent, inserts its own pre-launch script
+        // when there is none, and changes the compose when `key_provider` is present, so the
+        // bytes it measures would not be the signed ones. Spelled out, next to our script and
+        // with no `key_provider`, the compose is stored unchanged.
+        "features": ["kms", "tproxy-net"],
+        "local_key_provider_enabled": false,
+        "public_logs": false,
+        "public_sysinfo": false,
+        "secure_time": false,
+        "storage_fs": "zfs",
+        "tproxy_enabled": true,
     });
     let compose = phala::canonicalize(&envelope).map_err(|e| e.to_string())?;
     check_registration(&compose, app_id).map_err(|e| e.to_string())?;
