@@ -29,7 +29,7 @@ const PRE_LAUNCH_SCRIPT: &str = "if [ -n \"${ALPHACOMPUTE_GHCR_TOKEN:-}\" ]; the
 const EVIDENCE_MOUNTS: [&str; 3] = [
     "/sys/kernel/config:/sys/kernel/config",
     "/run/log/dstack:/run/log/dstack:ro",
-    "/sys/firmware/acpi/tables/data/CCEL:/sys/firmware/acpi/tables/data/CCEL:ro",
+    "/sys/firmware/acpi/tables/data/CCEL:/ccel:ro",
 ];
 
 /// What the tenant writes.
