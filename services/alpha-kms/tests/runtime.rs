@@ -484,6 +484,31 @@ async fn runtime_refuses_another_ca_or_an_unlisted_revision_and_tries_the_next_e
     runtime.attest().await.unwrap();
     assert_eq!(handshakes.load(Ordering::SeqCst), 0);
 
+    // An Instance leaf from the real CA whose Revision is the node's own: not a node's leaf.
+    let keys = h.node.intermediates().unwrap();
+    let posing_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let posing_leaf = certs::issue_leaf(
+        &keys.ca_key().unwrap(),
+        &keys.ca_cert_der,
+        &posing_key.subject_public_key_info(),
+        certs::instance_sans(
+            alpha_core::OrgId::mint(),
+            alpha_core::AppId::mint(),
+            &"0".repeat(64),
+            h.node.compose_hash,
+        ),
+        h.now(),
+    )
+    .unwrap();
+    let (addr, posing_handshakes) = tls_listener(
+        vec![posing_leaf.into(), keys.ca_cert_der.clone().into()],
+        posing_key.serialize_der(),
+    )
+    .await;
+    let (runtime, _) = start_runtime(&h, config(&h, vec![format!("https://{addr}")]));
+    connect_error(runtime.attest().await);
+    assert_eq!(posing_handshakes.load(Ordering::SeqCst), 0);
+
     // Pinned to the impostor's CA, the handshake completes (the pin anchors on the presented
     // chain by SPKI) and the real node is the one refused.
     let mut pinned_to_impostor = config(&h, vec![impostor.clone()]);

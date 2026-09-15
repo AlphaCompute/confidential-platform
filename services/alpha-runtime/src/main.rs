@@ -46,6 +46,13 @@ async fn run() -> Result<Exit, Error> {
         Err(e) => return Err(socket(e)),
     }
     let listener = UnixListener::bind(SOCKET_PATH).map_err(socket)?;
+    // Connecting needs write permission on the socket and tenant services run as any uid;
+    // the volume mount, not the mode, decides who reaches it.
+    std::fs::set_permissions(
+        SOCKET_PATH,
+        std::os::unix::fs::PermissionsExt::from_mode(0o666),
+    )
+    .map_err(socket)?;
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| Error::Socket(format!("SIGTERM handler: {e}")))?;
     let shutdown = async move {
