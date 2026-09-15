@@ -48,8 +48,17 @@ day 0 `kms_ca_pem` is still empty; it is filled in after bootstrap (below).
 Before anything: the trust-zone Postgres CVM is up and addressed by our CNAME; the PCCS URL and
 the platform-document URL are served; the signed document lists the Revision.
 
+0. **The trust-zone Postgres CVM**: `deploy/postgres/docker-compose.yml`, deployed with
+   `POSTGRES_PASSWORD` in the encrypted env. Every client, the KMS included, reaches it through
+   the gateway at `<app id>-5432s.<gateway base>:443` and must open with TLS:
+   `postgres://<user>:<password>@<app id>-5432s.<gateway base>:443/<db>?sslmode=require&sslnegotiation=direct`.
+   The gateway routes by the SNI of the first bytes and drops a connection that starts with
+   Postgres's plaintext `SSLRequest`, so a client without direct negotiation (`psql` before 17,
+   an unpatched sqlx) hangs or is refused. `sslmode=require` does not verify the server
+   certificate; whoever routes the connection could relay it, which is Phala, already the
+   holder of the volume.
 1. **Migrate once**, as the schema owner, from a machine that reaches the trust-zone Postgres:
-   `docker run --rm -e ALPHACOMPUTE_DATABASE_URL=postgres://<owner>@<cname>/<db>
+   `docker run --rm -e ALPHACOMPUTE_DATABASE_URL=postgres://<owner>@<pg app id>-5432s.<gateway base>:443/<db>?sslmode=require&sslnegotiation=direct
    ghcr.io/<owner>/alpha-kms@sha256:<digest> migrate`. The migration creates the `alpha_kms`
    role the service connects as (a member of it, not the owner).
 2. **Create the first CVM.** Provision through the Phala Cloud API with `compose_file` set to the
