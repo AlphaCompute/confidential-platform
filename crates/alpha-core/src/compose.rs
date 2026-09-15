@@ -95,6 +95,8 @@ pub enum RegistrationError {
     Yaml(#[from] yaml_rust2::ScanError),
     #[error("image {0:?} carries no @sha256:<64 hex> digest")]
     ImageWithoutDigest(String),
+    #[error("a build: key is present; every service must resolve to a pinned image")]
+    BuildNotAllowed,
 }
 
 impl RegistrationError {
@@ -129,6 +131,9 @@ pub fn check_registration(compose: &str, app_id: AppId) -> Result<ComposeHash, R
 fn check_images(node: &Yaml) -> Result<(), RegistrationError> {
     match node {
         Yaml::Hash(map) => map.iter().try_for_each(|(key, value)| {
+            if key.as_str() == Some("build") {
+                return Err(RegistrationError::BuildNotAllowed);
+            }
             if key.as_str() == Some("image") {
                 let image = value.as_str().unwrap_or_default();
                 if !has_sha256_digest(image) {
@@ -233,6 +238,12 @@ mod tests {
             "services:\n  app:\n    image: a@sha256:{}\n",
             "A".repeat(64)
         );
+        let built =
+            format!("services:\n  app:\n    image: a{ok}\n    build: https://x/y.git#main\n");
+        assert!(matches!(
+            check_images(&YamlLoader::load_from_str(&built).unwrap()[0]),
+            Err(RegistrationError::BuildNotAllowed)
+        ));
         for bad in [
             "services: {app: {image: a:latest}}",
             "x-base:\n  image: a@sha256:abc\n",
