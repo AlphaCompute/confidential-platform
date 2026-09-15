@@ -147,6 +147,7 @@ fn envelope(
     app_id: AppId,
     docker_compose_file: String,
     allowed_envs: &[&str],
+    public_logs: bool,
 ) -> Result<String, String> {
     let mut allowed_envs = allowed_envs.to_vec();
     allowed_envs.push(REGISTRY_TOKEN_ENV);
@@ -167,7 +168,7 @@ fn envelope(
         // with no `key_provider`, the compose is stored unchanged.
         "features": ["kms", "tproxy-net"],
         "local_key_provider_enabled": false,
-        "public_logs": false,
+        "public_logs": public_logs,
         "public_sysinfo": false,
         "secure_time": false,
         "storage_fs": "zfs",
@@ -184,12 +185,15 @@ pub fn compose(spec: &AppSpec) -> Result<String, String> {
         spec.app_id,
         docker_compose_file(spec)?,
         &["ALPHACOMPUTE_KMS_ENDPOINTS"],
+        false,
     )
 }
 
 /// The KMS node's own compose: the same envelope with one service, the KMS image, port 8443
 /// published for the dstack gateway's TLS passthrough, the evidence mounts, and its config as
-/// encrypted env. `dev_root` adds the root KEK variable the `dev-root` build reads.
+/// encrypted env. `dev_root` adds the root KEK variable the `dev-root` build reads and makes the
+/// container logs public: Phala serves a container's logs only with `public_logs`, and they are
+/// the one view into a dev node that fails to start. A production node's logs stay private.
 pub fn kms_compose(app_id: AppId, image: &str, dev_root: bool) -> Result<String, String> {
     let mut envs = KMS_ENVS.to_vec();
     if dev_root {
@@ -210,7 +214,7 @@ pub fn kms_compose(app_id: AppId, image: &str, dev_root: bool) -> Result<String,
     let mut root = Mapping::new();
     root.insert(key("services"), Yaml::Mapping(services));
     let yaml = serde_yaml_ng::to_string(&root).map_err(|e| e.to_string())?;
-    envelope(app_id, yaml, &envs)
+    envelope(app_id, yaml, &envs, dev_root)
 }
 
 pub struct Shroud {
@@ -334,8 +338,11 @@ mod tests {
             "the registry token reaches the pre-launch script, never a container"
         );
 
+        assert_eq!(parsed["public_logs"], false);
+
         let dev = kms_compose(app_id, image, true).unwrap();
         let parsed: Value = serde_json::from_str(&dev).unwrap();
+        assert_eq!(parsed["public_logs"], true);
         assert_eq!(parsed["allowed_envs"][4], DEV_ROOT_ENV);
         assert_eq!(parsed["allowed_envs"][5], REGISTRY_TOKEN_ENV);
         assert!(
