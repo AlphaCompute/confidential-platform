@@ -24,4 +24,4 @@ The image is `images/kms/Dockerfile` (`alpha-kms`, or `alpha-kms-dev` with `--bu
 
 `tests/cli.rs` drives `alpha-cli`'s library functions against the same in-process node (`crates/alpha-cli/README.md`).
 
-Not here: the `alpha-runtime` pins, the backup/restore drill, anything that needs a live CVM with configfs-tsm (`GET /v1/node/evidence`, a real `join` client run), and the HPKE/X-Wing known-answer tests (`alpha-crypto`).
+Not here: the `alpha-runtime` pins, the backup/restore drill, anything that needs a live CVM with the guest agent's socket (`GET /v1/node/evidence`, a real `join` client run), and the HPKE/X-Wing known-answer tests (`alpha-crypto`).

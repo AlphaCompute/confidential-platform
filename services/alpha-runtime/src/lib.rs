@@ -155,7 +155,7 @@ fn list(text: &str) -> impl Iterator<Item = &str> {
 
 pub type Clock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 
-/// A quote over `report_data` and the event log behind it; configfs-tsm in `main`, a capture in tests.
+/// A quote over `report_data` and the event log behind it; the guest agent in `main`, a capture in tests.
 pub type EvidenceSource = Arc<dyn Fn(&[u8; 64]) -> Result<Evidence, String> + Send + Sync>;
 
 pub fn tsm_evidence() -> EvidenceSource {
