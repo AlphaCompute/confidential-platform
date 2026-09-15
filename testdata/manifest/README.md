@@ -20,3 +20,8 @@ provider that writes them into the CVM.
   host mounts and pins, the socket volume on the containers that asked for it), already in
   Phala's form; `expected.json` holds its `compose_hash`. Produced by the generator itself, so it
   pins the generator's output; Phala's serialization is what `01` proves.
+- `06-kms-node` — the KMS node's own compose as `kms_compose` renders it for the `app_id` and
+  image in `expected.json` (a placeholder digest; the release workflow renders the real one from
+  the pushed image): the same envelope with one service, the four `allowed_envs`, port 8443
+  published, the three evidence mounts. `expected.json` holds its `compose_hash`; the dev image's
+  compose differs only by `ALPHACOMPUTE_KMS_DEV_ROOT_KEK` and is not pinned.

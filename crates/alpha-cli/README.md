@@ -28,7 +28,7 @@ What `unseal` and `bootstrap` check, in this order, before anything is sealed to
 
 ## Tests
 
-`cargo test -p alpha-cli`: the key file, the route table, the compose generator against `testdata/manifest/05-deploy`, `sign`/`--check`, and the verification function over the real keyed node quote in `testdata/attest/phala-0.5.9-1c-2g-keyed` — accepted over its own key; refused with a substituted `xwing_pubkey`, a platform document below the remembered version, a server key other than the attested one, or a Revision outside `kms_revisions`.
+`cargo test -p alpha-cli`: the key file, the route table, the compose generators against `testdata/manifest/05-deploy` and `06-kms-node` (`examples/kms_compose.rs` renders the KMS node's compose for the release workflow, `deploy/README.md`), `sign`/`--check`, and the verification function over the real keyed node quote in `testdata/attest/phala-0.5.9-1c-2g-keyed` — accepted over its own key; refused with a substituted `xwing_pubkey`, a platform document below the remembered version, a server key other than the attested one, or a Revision outside `kms_revisions`.
 
 `cargo test -p alpha-kms --test cli` (with `DATABASE_URL`) drives the same library functions against an in-process node: `call` on all five Control routes and its refusal of a KMS whose chain does not end at the pinned CA, `deploy --register-only` with the vector, `sign`/`--check` feeding the node and the admin pin, and `bootstrap` succeeding once and never again followed by `unseal` of a second node with two shares.
 

@@ -10,6 +10,20 @@ use serde_yaml_ng::{Mapping, Value as Yaml};
 
 pub const RUNTIME_SERVICE: &str = "alpha-runtime";
 const SOCKET_VOLUME: &str = "alpha-run:/run/alpha";
+const KMS_ENVS: [&str; 4] = [
+    "ALPHACOMPUTE_DATABASE_URL",
+    "ALPHACOMPUTE_KMS_ENDPOINTS",
+    "ALPHACOMPUTE_PCCS_URL",
+    "ALPHACOMPUTE_PLATFORM_DOCUMENT_URL",
+];
+const DEV_ROOT_ENV: &str = "ALPHACOMPUTE_KMS_DEV_ROOT_KEK";
+/// configfs-tsm for the quote, dstack's runtime events, the CCEL boot events: what any
+/// container that produces evidence mounts.
+const EVIDENCE_MOUNTS: [&str; 3] = [
+    "/sys/kernel/config:/sys/kernel/config",
+    "/run/log/dstack:/run/log/dstack:ro",
+    "/sys/firmware/acpi/tables/data/CCEL:/sys/firmware/acpi/tables/data/CCEL:ro",
+];
 
 /// What the tenant writes.
 #[derive(Debug, Deserialize)]
@@ -110,15 +124,9 @@ fn docker_compose_file(spec: &AppSpec) -> Result<String, String> {
     let mut runtime = Mapping::new();
     runtime.insert(key("image"), key(&spec.runtime.image));
     runtime.insert(key("environment"), Yaml::Mapping(environment));
-    runtime.insert(
-        key("volumes"),
-        strings(&[
-            "/sys/kernel/config:/sys/kernel/config",
-            "/run/log/dstack:/run/log/dstack:ro",
-            "/sys/firmware/acpi/tables/data/CCEL:/sys/firmware/acpi/tables/data/CCEL:ro",
-            SOCKET_VOLUME,
-        ]),
-    );
+    let mut mounts = EVIDENCE_MOUNTS.to_vec();
+    mounts.push(SOCKET_VOLUME);
+    runtime.insert(key("volumes"), strings(&mounts));
     services.insert(key(RUNTIME_SERVICE), Yaml::Mapping(runtime));
     let mut volumes = Mapping::new();
     volumes.insert(key("alpha-run"), Yaml::Mapping(Mapping::new()));
@@ -128,23 +136,61 @@ fn docker_compose_file(spec: &AppSpec) -> Result<String, String> {
     serde_yaml_ng::to_string(&root).map_err(|e| e.to_string())
 }
 
-/// The exact bytes that will be signed, measured and registered.
-pub fn compose(spec: &AppSpec) -> Result<String, String> {
+fn envelope(
+    app_id: AppId,
+    docker_compose_file: String,
+    allowed_envs: &[&str],
+) -> Result<String, String> {
     let envelope = json!({
         "manifest_version": 2,
-        "name": spec.app_id,
+        "name": app_id,
         "runner": "docker-compose",
-        "docker_compose_file": docker_compose_file(spec)?,
+        "docker_compose_file": docker_compose_file,
         "kms_enabled": true,
         "key_provider": "kms",
         "gateway_enabled": true,
-        "allowed_envs": ["ALPHACOMPUTE_KMS_ENDPOINTS"],
+        "allowed_envs": allowed_envs,
         "public_tcbinfo": false,
         "no_instance_id": false,
     });
     let compose = phala::canonicalize(&envelope).map_err(|e| e.to_string())?;
-    check_registration(&compose, spec.app_id).map_err(|e| e.to_string())?;
+    check_registration(&compose, app_id).map_err(|e| e.to_string())?;
     Ok(compose)
+}
+
+/// The exact bytes that will be signed, measured and registered.
+pub fn compose(spec: &AppSpec) -> Result<String, String> {
+    envelope(
+        spec.app_id,
+        docker_compose_file(spec)?,
+        &["ALPHACOMPUTE_KMS_ENDPOINTS"],
+    )
+}
+
+/// The KMS node's own compose: the same envelope with one service, the KMS image, port 8443
+/// published for the dstack gateway's TLS passthrough, the evidence mounts, and its config as
+/// encrypted env. `dev_root` adds the root KEK variable the `dev-root` build reads.
+pub fn kms_compose(app_id: AppId, image: &str, dev_root: bool) -> Result<String, String> {
+    let mut envs = KMS_ENVS.to_vec();
+    if dev_root {
+        envs.push(DEV_ROOT_ENV);
+    }
+    let mut environment = Mapping::new();
+    for name in &envs {
+        environment.insert(key(name), key(&format!("${{{name}}}")));
+    }
+    let mut kms = Mapping::new();
+    kms.insert(key("image"), key(image));
+    kms.insert(key("environment"), Yaml::Mapping(environment));
+    kms.insert(key("ports"), strings(&["8443:8443"]));
+    kms.insert(key("restart"), key("always"));
+    kms.insert(key("volumes"), strings(&EVIDENCE_MOUNTS));
+    let mut services = Mapping::new();
+    services.insert(key("alpha-kms"), Yaml::Mapping(kms));
+    let mut root = Mapping::new();
+    root.insert(key("services"), Yaml::Mapping(services));
+    let yaml = serde_yaml_ng::to_string(&root).map_err(|e| e.to_string())?;
+    envelope(app_id, yaml, &envs)
 }
 
 pub struct Shroud {
@@ -237,6 +283,37 @@ mod tests {
             2,
             "app and runtime mount the socket"
         );
+    }
+
+    #[test]
+    fn kms_compose_reproduces_the_vector() {
+        let dir = vector().with_file_name("06-kms-node");
+        let expected: Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("expected.json")).unwrap()).unwrap();
+        let app_id: AppId = expected["app_id"].as_str().unwrap().parse().unwrap();
+        let image = expected["image"].as_str().unwrap();
+        let compose = kms_compose(app_id, image, false).unwrap();
+        assert_eq!(
+            compose,
+            fs::read_to_string(dir.join("app-compose.json")).unwrap()
+        );
+        assert_eq!(
+            alpha_core::compose_hash(&compose).to_string(),
+            expected["compose_hash"]
+        );
+        let parsed: Value = serde_json::from_str(&compose).unwrap();
+        assert_eq!(phala::canonicalize(&parsed).unwrap(), compose);
+
+        let dev = kms_compose(app_id, image, true).unwrap();
+        let parsed: Value = serde_json::from_str(&dev).unwrap();
+        assert_eq!(parsed["allowed_envs"][4], DEV_ROOT_ENV);
+        assert!(
+            parsed["docker_compose_file"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("{DEV_ROOT_ENV}: ${{{DEV_ROOT_ENV}}}"))
+        );
+        assert!(kms_compose(app_id, "ghcr.io/alphacompute/alpha-kms:v1", false).is_err());
     }
 
     #[test]

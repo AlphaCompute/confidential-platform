@@ -1,0 +1,17 @@
+{
+    "allowed_envs":[
+        "ALPHACOMPUTE_DATABASE_URL",
+        "ALPHACOMPUTE_KMS_ENDPOINTS",
+        "ALPHACOMPUTE_PCCS_URL",
+        "ALPHACOMPUTE_PLATFORM_DOCUMENT_URL"
+    ],
+    "docker_compose_file":"services:\n  alpha-kms:\n    image: ghcr.io/alphacompute/alpha-kms@sha256:6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b\n    environment:\n      ALPHACOMPUTE_DATABASE_URL: ${ALPHACOMPUTE_DATABASE_URL}\n      ALPHACOMPUTE_KMS_ENDPOINTS: ${ALPHACOMPUTE_KMS_ENDPOINTS}\n      ALPHACOMPUTE_PCCS_URL: ${ALPHACOMPUTE_PCCS_URL}\n      ALPHACOMPUTE_PLATFORM_DOCUMENT_URL: ${ALPHACOMPUTE_PLATFORM_DOCUMENT_URL}\n    ports:\n    - 8443:8443\n    restart: always\n    volumes:\n    - /sys/kernel/config:/sys/kernel/config\n    - /run/log/dstack:/run/log/dstack:ro\n    - /sys/firmware/acpi/tables/data/CCEL:/sys/firmware/acpi/tables/data/CCEL:ro\n",
+    "gateway_enabled":true,
+    "key_provider":"kms",
+    "kms_enabled":true,
+    "manifest_version":2,
+    "name":"01994c2e-0000-7000-8000-000000000006",
+    "no_instance_id":false,
+    "public_tcbinfo":false,
+    "runner":"docker-compose"
+}
