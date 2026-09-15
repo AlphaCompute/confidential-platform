@@ -1,0 +1,51 @@
+name: dev-image
+
+# The dev KMS and runtime images, built once with the build cache and pushed as dev-<commit>,
+# so a fix reaches the dev node in minutes. A release builds every image twice from nothing and
+# fails on any difference; these images have no such check, and a production platform document
+# never lists them.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: alpha-runtime
+            dockerfile: images/manager/Dockerfile
+          - name: alpha-kms-dev
+            dockerfile: images/kms/Dockerfile
+            features: dev-root
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: |
+          echo "tag=dev-$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "epoch=$(git log -1 --format=%ct)" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          provenance: false
+          push: true
+          tags: ghcr.io/alphacompute/${{ matrix.name }}:${{ steps.meta.outputs.tag }}
+          build-args: |
+            SOURCE_DATE_EPOCH=${{ steps.meta.outputs.epoch }}
+            FEATURES=${{ matrix.features }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+      - run: echo "pushed ghcr.io/alphacompute/${{ matrix.name }}:${{ steps.meta.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
