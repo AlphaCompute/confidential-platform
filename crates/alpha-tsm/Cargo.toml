@@ -1,0 +1,15 @@
+[package]
+name = "alpha-tsm"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+alpha-attest = { path = "../alpha-attest" }
+base64 = "0.23"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"

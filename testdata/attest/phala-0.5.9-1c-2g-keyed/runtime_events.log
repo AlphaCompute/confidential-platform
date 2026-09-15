@@ -1,0 +1,10 @@
+{"event":"system-preparing","payload":""}
+{"event":"app-id","payload":"JzF3OsCGeOz5uQB8NiHKMcbWSiM="}
+{"event":"compose-hash","payload":"7gl+CcSCTrZCQgL+IO2ILRmjOlY/Oz3VmI8/+O4bgzU="}
+{"event":"instance-id","payload":"LmYu/QvIdqzSBZiWRpRM77n3WBs="}
+{"event":"boot-mr-done","payload":""}
+{"event":"mr-kms","payload":"W0s8JyFypKgK6ZBFuFzmiJM0uCjZkkWJv5w/9aXjnx8="}
+{"event":"os-image-hash","payload":"vTaajC+e2ytS2tSKyOCzLd5fEzfEI6UGtI0HQDp9gDM="}
+{"event":"key-provider","payload":"eyJuYW1lIjoia21zIiwiaWQiOiIzMDU5MzAxMzA2MDcyYTg2NDhjZTNkMDIwMTA2MDgyYTg2NDhjZTNkMDMwMTA3MDM0MjAwMDQ4ODQ0ZWI0MmNjZGY4YzUyZmQ0ZjE3NGYzNjJmY2I5YmJkMTljNDVmZDQ4ZjFlZGVjMmQ4ZjFjYTIzNTM2ZWMxYTc0MDIxYjRjZWU2MTBjMDc0ZjgyOTRkNDMxYjJiN2ZlZTJjMzllNTMzM2ZkYWYwYTQ1MjJkNDNmYjE1OWQ5ZiJ9"}
+{"event":"storage-fs","payload":"emZz"}
+{"event":"system-ready","payload":""}

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into platform_document (one, version, document, signature) values (1, $1, $2, $3)\n                 on conflict (one) do update set version = $1, document = $2, signature = $3, verified_at = now()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int4",
+        "Jsonb",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "838d24a938326943856aef51800c45fa1d969cdc46f9903117ca04702a03dc45"
+}

@@ -1,0 +1,20 @@
+{
+  "capture": "phala-0.5.9-1c-2g-keyed",
+  "quote": "instance",
+  "appraised": {
+    "measured": {
+      "mrtd": "sha384:f06dfda6dce1cf904d4e2bab1dc370634cf95cefa2ceb2de2eee127c9382698090d7a4a13e14c536ec6c9c3c8fa87077",
+      "rtmr0": "sha384:68102e7b524af310f7b7d426ce75481e36c40f5d513a9009c046e9d37e31551f0134d954b496a3357fd61d03f07ffe96",
+      "rtmr1": "sha384:07e6f51aa763abfe75c3ddfbf4f425fe3f0ceff66d807a75e049303dce9addf68e7218729bd419638af63a370f65878c",
+      "rtmr2": "sha384:df67e467e60edc1737bcf8e682d48131bfb427f523226aa7f197a7608e9b3784783fa759ef5b28191fa12f9ddb36b858",
+      "rtmr3": "sha384:1807da3b34abf0ab40902274286324d5b4bfc8b0da9540b500772e814e99d3904332b99b471507719d4e4f937b0753ba"
+    },
+    "tcb_status": "UpToDate",
+    "advisories": [],
+    "os_image": "dstack-0.5.9/1c-2g",
+    "compose_hash": "sha256:ee097e09c4824eb6424202fe20ed882d19a33a563f3b3dd5988f3ff8ee1b8335",
+    "runtime_pubkey_sha256": "sha256:144ec829153be27068b0c421cf0ecd1db84f73e66da7e4a1bfca23f678e3a958",
+    "policy_version": 1,
+    "evidence_sha256": "sha256:1b32ed3ec47bb5d13c95eddd713a43172fabdf4add73453a15c1c293016d9194"
+  }
+}

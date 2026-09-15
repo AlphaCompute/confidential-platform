@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select version from platform_document for update",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "platform_document",
+            "name": "version"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f8e8cc853943162a508135a245ae321581d242bb6cb371bf18fb468c7dc8131e"
+}

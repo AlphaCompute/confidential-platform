@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select wrapped, public_part from intermediate_keys where purpose = 'ca'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "wrapped",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "intermediate_keys",
+            "name": "wrapped"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "public_part",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "intermediate_keys",
+            "name": "public_part"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "f6c0b043fd58e1d8837fd66d6608b98c43b3b14bdec91a42f038013462eeef46"
+}

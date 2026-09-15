@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update principal_keys set public_key = $1 where id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b8419f3020e0688bc78e26f7fb951ad8fb23a3f3dfe3f2dbf06a548636ede7fd"
+}

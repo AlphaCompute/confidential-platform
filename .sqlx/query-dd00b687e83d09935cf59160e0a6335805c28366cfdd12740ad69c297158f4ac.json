@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select wrapped from intermediate_keys where purpose = 'tenant-kek-root'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "wrapped",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "intermediate_keys",
+            "name": "wrapped"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "dd00b687e83d09935cf59160e0a6335805c28366cfdd12740ad69c297158f4ac"
+}

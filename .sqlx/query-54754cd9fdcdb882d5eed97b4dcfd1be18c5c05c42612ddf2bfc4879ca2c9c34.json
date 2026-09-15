@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update revisions set app_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "54754cd9fdcdb882d5eed97b4dcfd1be18c5c05c42612ddf2bfc4879ca2c9c34"
+}

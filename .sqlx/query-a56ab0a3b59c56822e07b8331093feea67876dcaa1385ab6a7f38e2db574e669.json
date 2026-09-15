@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select exists(select 1 from audit_log\n           where action = 'node.join.request' and outcome = 'ok'\n             and details->>'runtime_pubkey_sha256' = $1\n             and ts > now() - interval '10 minutes')",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exists",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "a56ab0a3b59c56822e07b8331093feea67876dcaa1385ab6a7f38e2db574e669"
+}

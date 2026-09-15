@@ -16,7 +16,7 @@ use dcap_qvl::verify::QuoteVerifier;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
-pub use event_log::EventLogEntry;
+pub use event_log::{EventLogEntry, compose_hash as event_log_compose_hash};
 
 pub const EVIDENCE_FORMAT: &str = "alphacompute-evidence/1";
 pub const RESULT_FORMAT: &str = "alphacompute-attestation-result/1";
@@ -202,6 +202,26 @@ impl AppraisalError {
     }
 }
 
+/// The 64 bytes an Instance or a KMS node binds into its quote: `SHA-256(SPKI ‖ nonce)` and,
+/// for a node, `SHA-256(xwing_pubkey)`; zeros for an Instance.
+pub fn report_data(
+    runtime_pubkey_spki: &[u8],
+    nonce: &[u8; 32],
+    node_xwing_pubkey: Option<&[u8]>,
+) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    out[..32].copy_from_slice(
+        &Sha256::new()
+            .chain_update(runtime_pubkey_spki)
+            .chain_update(nonce)
+            .finalize(),
+    );
+    if let Some(xwing) = node_xwing_pubkey {
+        out[32..].copy_from_slice(&Sha256::digest(xwing));
+    }
+    out
+}
+
 /// Steps 1–8a of the appraisal: everything up to and including reading `compose_hash`
 /// from the event log. `node_xwing_spki` is `Some` for a KMS node, whose `compose_hash`
 /// must then be in `doc.kms_revisions`; for an Instance the KMS looks it up in its own
@@ -238,17 +258,7 @@ pub fn appraise(
     let advisories = verified.advisory_ids;
     check_policy(&doc.policy, &tcb_status, &advisories, &report.td_attributes)?;
 
-    let mut expected = [0u8; 64];
-    expected[..32].copy_from_slice(
-        &Sha256::new()
-            .chain_update(runtime_pubkey_spki)
-            .chain_update(nonce)
-            .finalize(),
-    );
-    if let Some(xwing_spki) = node_xwing_spki {
-        expected[32..].copy_from_slice(&Sha256::digest(xwing_spki));
-    }
-    if report.report_data != expected {
+    if report.report_data != report_data(runtime_pubkey_spki, nonce, node_xwing_spki) {
         return Err(Failed(
             "report_data is not bound to this key and nonce".into(),
         ));

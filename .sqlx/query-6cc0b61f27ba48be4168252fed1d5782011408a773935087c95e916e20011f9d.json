@@ -1,0 +1,39 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update principal_keys set revoked_at = now(), revocation_reason = $2::principal_key_revocation\n                     where id = $1 returning revoked_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "revoked_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "principal_keys",
+            "name": "revoked_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        {
+          "Custom": {
+            "name": "principal_key_revocation",
+            "kind": {
+              "Enum": [
+                "retired",
+                "compromised"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "6cc0b61f27ba48be4168252fed1d5782011408a773935087c95e916e20011f9d"
+}

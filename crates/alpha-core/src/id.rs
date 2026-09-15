@@ -30,6 +30,18 @@ macro_rules! id {
             }
         }
 
+        impl From<Uuid> for $name {
+            fn from(uuid: Uuid) -> Self {
+                Self(uuid)
+            }
+        }
+
+        impl From<$name> for Uuid {
+            fn from(id: $name) -> Uuid {
+                id.0
+            }
+        }
+
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 self.0.as_hyphenated().fmt(f)

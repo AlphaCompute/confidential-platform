@@ -1,0 +1,119 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select id, org_id, public_key, document, signature, registered_by_key, anchor_check, revoked_at,\n                  revocation_reason::text as \"revocation_reason\"\n           from principal_keys where id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "principal_keys",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "org_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "principal_keys",
+            "name": "org_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "public_key",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "principal_keys",
+            "name": "public_key"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "document",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "principal_keys",
+            "name": "document"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "signature",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "principal_keys",
+            "name": "signature"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "registered_by_key",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "principal_keys",
+            "name": "registered_by_key"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "anchor_check",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "principal_keys",
+            "name": "anchor_check"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "revoked_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "principal_keys",
+            "name": "revoked_at"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "revocation_reason",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      null
+    ]
+  },
+  "hash": "f1dee8002417d0cce3f08b3bbd54ac40a2a409f1ffc531a5ab50991d813d83d4"
+}

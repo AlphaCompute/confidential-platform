@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into intermediate_keys (purpose, wrapped, public_part) values\n           ('tenant-kek-root', $1, null), ('ca', $2, $3) on conflict (purpose) do nothing",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Bytea",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "29160f4fc171d13f7af78d8b834524427f1ca9faffe6440b7bb6244cf84af76e"
+}

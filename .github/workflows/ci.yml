@@ -43,7 +43,8 @@ jobs:
         run: |
           if [ -d services ]; then
             cargo install sqlx-cli --no-default-features --features postgres,rustls --locked
-            cargo sqlx prepare --workspace --check
+            cargo sqlx migrate run --source services/alpha-kms/migrations
+            cargo sqlx prepare --workspace --check -- --all-targets
           else
             echo "no service crate yet; skipping"
           fi

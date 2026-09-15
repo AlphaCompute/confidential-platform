@@ -78,12 +78,12 @@ impl Case {
         now: SystemTime,
     ) -> Result<Appraised, alpha_attest::AppraisalError> {
         let nonce: [u8; 32] = self.file("nonce.bin").try_into().unwrap();
-        let node_spki = self.file("node_xwing_spki.der");
+        let node_xwing = self.file("node_xwing_pubkey.bin");
         appraise(
             evidence,
             &nonce,
             &self.file("runtime_spki.der"),
-            (self.kind() == "node").then_some(node_spki.as_slice()),
+            (self.kind() == "node").then_some(node_xwing.as_slice()),
             &self.json::<PlatformDocument>("platform-document.json"),
             &self.json::<Collateral>("collateral.json"),
             now,
@@ -180,4 +180,14 @@ fn evidence_round_trips_as_json() {
     assert_eq!(back.quote, evidence.quote);
     assert_eq!(back.event_log, evidence.event_log);
     assert!(text.contains(r#""format":"alphacompute-evidence/1""#));
+}
+
+#[test]
+fn keyed_capture_instance_quote_is_appraised() {
+    positive("09-keyed-instance");
+}
+
+#[test]
+fn keyed_capture_kms_node_quote_is_appraised() {
+    positive("10-keyed-node");
 }
