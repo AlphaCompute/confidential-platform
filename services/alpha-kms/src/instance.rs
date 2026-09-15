@@ -32,20 +32,31 @@ fn unix(now: SystemTime) -> u64 {
 }
 
 /// `ts(8, BE) ‖ HMAC-SHA256(node_nonce_key, ts)[0..24]`.
-pub fn mint_nonce(key: &[u8; 32], now: SystemTime) -> [u8; 32] {
+pub fn mint_nonce(key: &[u8; 32], now: SystemTime) -> Result<[u8; 32], ApiError> {
     let ts = unix(now).to_be_bytes();
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("any key length");
+    let mut mac = Hmac::<Sha256>::new_from_slice(key)
+        .map_err(|e| ApiError::internal(format!("hmac: {e}")))?;
     mac.update(&ts);
-    let tag = mac.finalize().into_bytes();
+    let tag: [u8; 32] = mac.finalize().into_bytes().into();
+    let (tag, _) = tag
+        .split_first_chunk::<24>()
+        .ok_or_else(|| ApiError::internal("hmac"))?;
     let mut nonce = [0u8; 32];
-    nonce[..8].copy_from_slice(&ts);
-    nonce[8..].copy_from_slice(&tag[..24]);
-    nonce
+    for (dst, src) in nonce.iter_mut().zip(ts.iter().chain(tag)) {
+        *dst = *src;
+    }
+    Ok(nonce)
 }
 
 pub fn check_nonce(key: &[u8; 32], nonce: &[u8; 32], now: SystemTime) -> Result<(), ApiError> {
-    let ts = u64::from_be_bytes(nonce[..8].try_into().unwrap());
-    let expected = mint_nonce(key, UNIX_EPOCH + Duration::from_secs(ts));
+    let (ts, _) = nonce
+        .split_first_chunk::<8>()
+        .ok_or_else(|| ApiError::internal("nonce"))?;
+    let ts = u64::from_be_bytes(*ts);
+    let minted = UNIX_EPOCH
+        .checked_add(Duration::from_secs(ts))
+        .ok_or_else(|| ApiError::new("nonce_invalid", "nonce timestamp overflows"))?;
+    let expected = mint_nonce(key, minted)?;
     if expected != *nonce {
         return Err(ApiError::new("nonce_invalid", "nonce does not verify"));
     }
@@ -56,13 +67,13 @@ pub fn check_nonce(key: &[u8; 32], nonce: &[u8; 32], now: SystemTime) -> Result<
     Ok(())
 }
 
-pub async fn nonce(State(node): State<Arc<Node>>) -> Json<Value> {
+pub async fn nonce(State(node): State<Arc<Node>>) -> Result<Json<Value>, ApiError> {
     let now = node.now();
-    let nonce = mint_nonce(&node.nonce_key, now);
-    Json(json!({
+    let nonce = mint_nonce(&node.nonce_key, now)?;
+    Ok(Json(json!({
         "nonce": BASE64_URL_SAFE_NO_PAD.encode(nonce),
-        "expires_at": rfc3339(now + NONCE_MAX_AGE),
-    }))
+        "expires_at": rfc3339(crate::later(now, NONCE_MAX_AGE)?),
+    })))
 }
 
 #[derive(Deserialize)]
@@ -164,7 +175,9 @@ pub async fn attest(
     p256::PublicKey::from_public_key_der(&spki)
         .map_err(|_| ApiError::malformed("runtime_pubkey: not a P-256 SPKI"))?;
     let actor = keys::sha256_hex(&spki);
-    let evidence_sha256 = Sha256::digest(alpha_core::jcs(&json!(request.evidence))).to_vec();
+    let evidence_json = alpha_core::jcs(&json!(request.evidence))
+        .map_err(|e| ApiError::malformed(format!("evidence: {e}")))?;
+    let evidence_sha256 = Sha256::digest(evidence_json).to_vec();
     let now = node.now();
     let result = attest_inner(&node, &spki, &request, now).await;
     let (outcome, details, org_id) = match &result {
@@ -193,7 +206,7 @@ pub async fn attest(
     let (leaf_der, result) = result?;
     Ok(Json(json!({
         "certificate_chain": [certs::pem(&leaf_der), node.intermediates()?.ca_pem()],
-        "not_after": rfc3339(now + certs::LEAF_TTL),
+        "not_after": rfc3339(crate::later(now, certs::LEAF_TTL)?),
         "attestation_result": result,
     })))
 }
@@ -241,7 +254,7 @@ async fn attest_inner(
         .trim_start_matches("sha256:")
         .to_owned();
     let leaf_der = certs::issue_leaf(
-        &keys.ca_key(),
+        &keys.ca_key()?,
         &keys.ca_cert_der,
         spki,
         certs::instance_sans(
@@ -278,7 +291,7 @@ pub async fn get_secret(
     Extension(peer): Extension<PeerCerts>,
 ) -> Result<Json<Value>, ApiError> {
     let keys = node.intermediates()?;
-    let verifier = certs::ca_verifier(&keys.ca_cert_der);
+    let verifier = certs::ca_verifier(&keys.ca_cert_der)?;
     let sans = certs::verify_to_ca(verifier.as_ref(), &peer.0, node.now())?;
     let identity = certs::parse_instance_sans(&sans)?;
     let result = get_secret_inner(&node, &keys.tenant_kek_root, &identity, &name).await;
@@ -362,7 +375,7 @@ async fn get_secret_inner(
             "secret signer is not of its organization",
         ));
     }
-    let org_key = keys::org_key(tenant_kek_root, identity.org_id, &chain.anchor_spki);
+    let org_key = keys::org_key(tenant_kek_root, identity.org_id, &chain.anchor_spki)?;
     let value = keys::aead_open(&org_key, secret.id.as_bytes(), &secret.ciphertext)
         .ok_or_else(|| ApiError::internal("secret does not decrypt under org_key"))?;
     Ok(json!({
@@ -380,7 +393,7 @@ mod tests {
     fn nonce_is_hmac_bound_and_expires() {
         let key = [4u8; 32];
         let t0 = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
-        let nonce = mint_nonce(&key, t0);
+        let nonce = mint_nonce(&key, t0).unwrap();
         assert!(check_nonce(&key, &nonce, t0).is_ok());
         assert!(check_nonce(&key, &nonce, t0 + Duration::from_secs(299)).is_ok());
         assert_eq!(
@@ -395,8 +408,8 @@ mod tests {
         flipped[31] ^= 1;
         assert!(check_nonce(&key, &flipped, t0).is_err());
         assert_ne!(
-            mint_nonce(&key, t0),
-            mint_nonce(&key, t0 + Duration::from_secs(1))
+            mint_nonce(&key, t0).unwrap(),
+            mint_nonce(&key, t0 + Duration::from_secs(1)).unwrap()
         );
     }
 }

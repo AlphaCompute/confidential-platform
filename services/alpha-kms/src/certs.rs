@@ -14,18 +14,21 @@ use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, UnixTime};
 use rustls::server::WebPkiClientVerifier;
 use rustls::server::danger::ClientCertVerifier;
-use x509_parser::prelude::{FromDer, GeneralName, ParsedExtension, X509Certificate};
 
 use crate::error::ApiError;
 
 pub const LEAF_TTL: Duration = Duration::from_secs(3600);
-pub const KMS_SAN: &str = "alphacompute://kms";
+pub use alpha_client::tls::KMS_SAN;
 
-fn serial() -> rcgen::SerialNumber {
-    let mut bytes = crate::random::<16>();
-    bytes[0] &= 0x7f;
-    rcgen::SerialNumber::from(bytes.to_vec())
+fn serial() -> Result<rcgen::SerialNumber, ApiError> {
+    let mut bytes = crate::random::<16>()?;
+    if let Some(first) = bytes.first_mut() {
+        *first &= 0x7f;
+    }
+    Ok(rcgen::SerialNumber::from(bytes.to_vec()))
 }
+
+use crate::later;
 
 fn subject(cn: &str) -> DistinguishedName {
     let mut dn = DistinguishedName::new();
@@ -33,38 +36,43 @@ fn subject(cn: &str) -> DistinguishedName {
     dn
 }
 
-pub fn key_pair(pkcs8_der: &[u8]) -> KeyPair {
+pub fn key_pair(pkcs8_der: &[u8]) -> Result<KeyPair, ApiError> {
     KeyPair::from_pkcs8_der_and_sign_algo(&pkcs8_der.into(), &PKCS_ECDSA_P256_SHA256)
-        .expect("a P-256 key we generated")
+        .map_err(|e| ApiError::internal(format!("key pair: {e}")))
 }
 
 /// Sealed phase: the listener speaks with the runtime key itself.
-pub fn self_signed(key: &KeyPair, now: SystemTime) -> Vec<u8> {
+pub fn self_signed(key: &KeyPair, now: SystemTime) -> Result<Vec<u8>, ApiError> {
     let mut params = CertificateParams::default();
     params.distinguished_name = subject("alpha-kms sealed node");
-    params.subject_alt_names = vec![SanType::URI(Ia5String::try_from(KMS_SAN).unwrap())];
+    params.subject_alt_names = vec![SanType::URI(
+        Ia5String::try_from(KMS_SAN).map_err(|e| ApiError::internal(format!("san: {e}")))?,
+    )];
     params.not_before = now.into();
-    params.not_after = (now + Duration::from_secs(365 * 86400)).into();
-    params.serial_number = Some(serial());
-    params
+    params.not_after = later(now, Duration::from_secs(365 * 86400))?.into();
+    params.serial_number = Some(serial()?);
+    Ok(params
         .self_signed(key)
-        .expect("self-signing cannot fail")
+        .map_err(|e| ApiError::internal(format!("self-signed certificate: {e}")))?
         .der()
-        .to_vec()
+        .to_vec())
 }
 
 /// The `ca` intermediate: a self-signed P-256 root; returns (PKCS#8 DER, certificate DER).
-pub fn new_ca(now: SystemTime) -> (Vec<u8>, Vec<u8>) {
-    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("key generation");
+pub fn new_ca(now: SystemTime) -> Result<(Vec<u8>, Vec<u8>), ApiError> {
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)
+        .map_err(|e| ApiError::internal(format!("ca key: {e}")))?;
     let mut params = CertificateParams::default();
     params.distinguished_name = subject("alpha-kms ca");
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
     params.not_before = now.into();
-    params.not_after = (now + Duration::from_secs(20 * 365 * 86400)).into();
-    params.serial_number = Some(serial());
-    let cert = params.self_signed(&key).expect("self-signing cannot fail");
-    (key.serialize_der(), cert.der().to_vec())
+    params.not_after = later(now, Duration::from_secs(20 * 365 * 86400))?.into();
+    params.serial_number = Some(serial()?);
+    let cert = params
+        .self_signed(&key)
+        .map_err(|e| ApiError::internal(format!("ca certificate: {e}")))?;
+    Ok((key.serialize_der(), cert.der().to_vec()))
 }
 
 /// A one-hour leaf from `ca` over a foreign SPKI with the two URI SANs and both EKUs.
@@ -94,8 +102,8 @@ pub fn issue_leaf(
     ];
     params.use_authority_key_identifier_extension = true;
     params.not_before = now.into();
-    params.not_after = (now + LEAF_TTL).into();
-    params.serial_number = Some(serial());
+    params.not_after = later(now, LEAF_TTL)?.into();
+    params.serial_number = Some(serial()?);
     Ok(params
         .signed_by(&spki, &issuer)
         .map_err(|e| ApiError::internal(format!("leaf: {e}")))?
@@ -126,14 +134,14 @@ pub fn pem(der: &[u8]) -> String {
     pem::encode(&pem::Pem::new("CERTIFICATE", der))
 }
 
-pub fn ca_verifier(ca_cert_der: &[u8]) -> Arc<dyn ClientCertVerifier> {
+pub fn ca_verifier(ca_cert_der: &[u8]) -> Result<Arc<dyn ClientCertVerifier>, ApiError> {
     let mut roots = RootCertStore::empty();
     roots
         .add(CertificateDer::from(ca_cert_der.to_vec()))
-        .expect("the ca certificate parses");
+        .map_err(|e| ApiError::internal(format!("ca certificate: {e}")))?;
     WebPkiClientVerifier::builder(Arc::new(roots))
         .build()
-        .expect("a verifier over one root")
+        .map_err(|e| ApiError::internal(format!("client verifier: {e}")))
 }
 
 /// Verifies `chain` to `ca` at `now` and returns the leaf's URI SANs.
@@ -156,27 +164,11 @@ pub fn verify_to_ca(
 }
 
 pub fn uri_sans(cert: &[u8]) -> Result<Vec<String>, ApiError> {
-    let (_, cert) = X509Certificate::from_der(cert)
-        .map_err(|e| ApiError::new("cert_invalid", format!("client certificate: {e}")))?;
-    Ok(cert
-        .extensions()
-        .iter()
-        .filter_map(|ext| match ext.parsed_extension() {
-            ParsedExtension::SubjectAlternativeName(san) => Some(&san.general_names),
-            _ => None,
-        })
-        .flatten()
-        .filter_map(|name| match name {
-            GeneralName::URI(uri) => Some((*uri).to_owned()),
-            _ => None,
-        })
-        .collect())
+    alpha_client::tls::uri_sans(cert).map_err(|e| ApiError::new("cert_invalid", e.to_string()))
 }
 
 pub fn spki_of(cert: &[u8]) -> Result<Vec<u8>, ApiError> {
-    let (_, cert) = X509Certificate::from_der(cert)
-        .map_err(|e| ApiError::new("cert_invalid", format!("client certificate: {e}")))?;
-    Ok(cert.public_key().raw.to_vec())
+    alpha_client::tls::spki_of(cert).map_err(|e| ApiError::new("cert_invalid", e.to_string()))
 }
 
 /// The identity an Instance certificate carries: `alphacompute://<org>/<app>/<key sha256>`
@@ -224,8 +216,8 @@ mod tests {
     #[test]
     fn leaf_chains_to_ca_and_carries_the_two_sans() {
         let now = SystemTime::now();
-        let (ca_key_der, ca_cert) = new_ca(now);
-        let ca_key = key_pair(&ca_key_der);
+        let (ca_key_der, ca_cert) = new_ca(now).unwrap();
+        let ca_key = key_pair(&ca_key_der).unwrap();
         let runtime = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
         let org = OrgId::mint();
         let app = AppId::mint();
@@ -239,7 +231,7 @@ mod tests {
             now,
         )
         .unwrap();
-        let verifier = ca_verifier(&ca_cert);
+        let verifier = ca_verifier(&ca_cert).unwrap();
         let chain = vec![CertificateDer::from(leaf.clone())];
         let got = verify_to_ca(verifier.as_ref(), &chain, now + Duration::from_secs(60)).unwrap();
         assert_eq!(got, sans);
@@ -255,14 +247,14 @@ mod tests {
         );
         assert_eq!(spki_of(&leaf).unwrap(), runtime.subject_public_key_info());
 
-        let (_, other_ca) = new_ca(now);
+        let (_, other_ca) = new_ca(now).unwrap();
         assert_eq!(
-            verify_to_ca(ca_verifier(&other_ca).as_ref(), &chain, now)
+            verify_to_ca(ca_verifier(&other_ca).unwrap().as_ref(), &chain, now)
                 .unwrap_err()
                 .code,
             "cert_invalid"
         );
-        let self_signed = self_signed(&runtime, now);
+        let self_signed = self_signed(&runtime, now).unwrap();
         assert_eq!(
             verify_to_ca(verifier.as_ref(), &[CertificateDer::from(self_signed)], now)
                 .unwrap_err()

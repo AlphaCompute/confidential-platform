@@ -2,6 +2,17 @@
 //! checks that are ours — `report_data` binding, RTMR replay, reference values, the measured
 //! `compose_hash`. Pure over its arguments except [`fetch_collateral`].
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )
+)]
+
 mod event_log;
 
 use std::fmt;
@@ -320,7 +331,9 @@ pub fn appraise(
         ),
         evidence_sha256: format!(
             "sha256:{}",
-            hex::encode(Sha256::digest(alpha_core::jcs(&evidence_json)))
+            hex::encode(Sha256::digest(
+                alpha_core::jcs(&evidence_json).map_err(|e| Failed(e.to_string()))?
+            ))
         ),
         policy_version: doc.version,
     })

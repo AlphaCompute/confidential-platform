@@ -1,6 +1,17 @@
 //! HPKE (RFC 9180, `mode_base`) with the X-Wing KEM, HKDF-SHA256 and AES-256-GCM, for the two
 //! bodies that cross a custodian's boundary: unseal shares and the bootstrap request and reply.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )
+)]
+
 use std::fmt;
 
 use base64::Engine;
@@ -25,20 +36,26 @@ type SecretKey = <XWing as Kem>::PrivateKey;
 pub struct PrivateKey(SecretKey);
 
 impl PrivateKey {
-    pub fn generate() -> Self {
+    pub fn generate() -> Result<Self, Error> {
         let mut seed = [0u8; 32];
-        getrandom::fill(&mut seed).expect("the system RNG never fails");
+        getrandom::fill(&mut seed).map_err(|_| Error::Rng)?;
         let key = Self::from_seed(seed);
         seed.zeroize();
         key
     }
 
-    pub fn from_seed(seed: [u8; 32]) -> Self {
-        Self(SecretKey::from_bytes(&seed).expect("32 bytes is the seed length"))
+    pub fn from_seed(seed: [u8; 32]) -> Result<Self, Error> {
+        SecretKey::from_bytes(&seed)
+            .map(Self)
+            .map_err(|_| Error::Seed)
     }
 
     pub fn public(&self) -> PublicKey {
         PublicKey(XWing::sk_to_pk(&self.0).to_bytes().0)
+    }
+
+    pub fn seed(&self) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new(self.0.to_bytes().0)
     }
 }
 
@@ -109,13 +126,21 @@ pub enum Error {
     Encoding,
     #[error("ciphertext does not open under this key, info and aad")]
     Open,
+    #[error("the system RNG failed")]
+    Rng,
+    #[error("not an X-Wing seed")]
+    Seed,
+    #[error("aad does not canonicalize: {0}")]
+    Aad(#[from] serde_json::Error),
+    #[error("sealing failed: {0}")]
+    Seal(hpke::HpkeError),
 }
 
 /// The aad binds a body to the node whose evidence carried the X-Wing key.
-pub fn aad(kms_node_spki_sha256: &[u8; 32]) -> Vec<u8> {
-    alpha_core::jcs(&json!({
+pub fn aad(kms_node_spki_sha256: &[u8; 32]) -> Result<Vec<u8>, Error> {
+    Ok(alpha_core::jcs(&json!({
         "kms_node_spki_sha256": format!("sha256:{}", hex::encode(kms_node_spki_sha256)),
-    }))
+    }))?)
 }
 
 pub fn seal(
@@ -123,22 +148,21 @@ pub fn seal(
     info: &[u8],
     kms_node_spki_sha256: &[u8; 32],
     plaintext: &[u8],
-) -> Sealed {
-    let pk =
-        <XWing as Kem>::PublicKey::from_bytes(&recipient.0).expect("validated on construction");
+) -> Result<Sealed, Error> {
+    let pk = <XWing as Kem>::PublicKey::from_bytes(&recipient.0).map_err(|_| Error::PublicKey)?;
     let (enc, ct) = hpke::single_shot_seal::<AesGcm256, HkdfSha256, XWing>(
         &OpModeS::Base,
         &pk,
         info,
         plaintext,
-        &aad(kms_node_spki_sha256),
+        &aad(kms_node_spki_sha256)?,
     )
-    .expect("sealing to a valid public key cannot fail");
-    Sealed {
+    .map_err(Error::Seal)?;
+    Ok(Sealed {
         kem: KEM_NAME.into(),
         enc: BASE64_URL_SAFE_NO_PAD.encode(enc.to_bytes()),
         ct: BASE64_URL_SAFE_NO_PAD.encode(ct),
-    }
+    })
 }
 
 pub fn open(
@@ -164,7 +188,7 @@ pub fn open(
         &enc,
         info,
         &ct,
-        &aad(kms_node_spki_sha256),
+        &aad(kms_node_spki_sha256)?,
     )
     .map(Zeroizing::new)
     .map_err(|_| Error::Open)
@@ -176,9 +200,9 @@ mod tests {
 
     #[test]
     fn round_trip_and_binding() {
-        let key = PrivateKey::generate();
+        let key = PrivateKey::generate().unwrap();
         let node = [7u8; 32];
-        let sealed = seal(&key.public(), INFO_UNSEAL_SHARE, &node, b"share");
+        let sealed = seal(&key.public(), INFO_UNSEAL_SHARE, &node, b"share").unwrap();
         assert_eq!(sealed.kem, "x-wing");
         assert_eq!(
             open(&key, INFO_UNSEAL_SHARE, &node, &sealed)
@@ -195,7 +219,12 @@ mod tests {
             Err(Error::Open)
         ));
         assert!(matches!(
-            open(&PrivateKey::generate(), INFO_UNSEAL_SHARE, &node, &sealed),
+            open(
+                &PrivateKey::generate().unwrap(),
+                INFO_UNSEAL_SHARE,
+                &node,
+                &sealed
+            ),
             Err(Error::Open)
         ));
         let mut wrong_kem = sealed.clone();
@@ -208,7 +237,11 @@ mod tests {
 
     #[test]
     fn public_key_round_trips_through_json() {
-        let key = PrivateKey::generate();
+        let key = PrivateKey::generate().unwrap();
+        assert_eq!(
+            PrivateKey::from_seed(*key.seed()).unwrap().public(),
+            key.public()
+        );
         let json = serde_json::to_string(&key.public()).unwrap();
         assert_eq!(
             serde_json::from_str::<PublicKey>(&json).unwrap(),
@@ -220,7 +253,7 @@ mod tests {
     #[test]
     fn aad_is_jcs() {
         assert_eq!(
-            aad(&[0xab; 32]),
+            aad(&[0xab; 32]).unwrap(),
             format!(r#"{{"kms_node_spki_sha256":"sha256:{}"}}"#, "ab".repeat(32)).as_bytes()
         );
     }

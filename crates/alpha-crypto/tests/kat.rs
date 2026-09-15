@@ -2,6 +2,14 @@
 //! vector of draft-ietf-hpke-pq for X-Wing + HKDF-SHA256 (recipient side, with the AEAD the
 //! draft ships), and a fixed envelope of our own suite that `open` must reproduce.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+
 use std::fs;
 use std::path::PathBuf;
 
@@ -51,7 +59,11 @@ fn xwing_kem_vectors() {
         assert_eq!(ss.as_slice(), v.ss);
         assert_eq!(dk.decapsulate(&ct).as_slice(), v.ss);
         assert_eq!(
-            PrivateKey::from_seed(v.seed).public().as_bytes().as_slice(),
+            PrivateKey::from_seed(v.seed)
+                .unwrap()
+                .public()
+                .as_bytes()
+                .as_slice(),
             v.pk
         );
     }
@@ -136,7 +148,7 @@ struct EnvelopeVector {
 fn envelope_vector() {
     let v: EnvelopeVector = serde_json::from_str(&read("envelope-unseal-share.json")).unwrap();
     assert_eq!(v.info.as_bytes(), INFO_UNSEAL_SHARE);
-    let key = PrivateKey::from_seed(v.seed);
+    let key = PrivateKey::from_seed(v.seed).unwrap();
     let opened = open(&key, v.info.as_bytes(), &v.kms_node_spki_sha256, &v.sealed).unwrap();
     assert_eq!(opened.as_slice(), v.plaintext);
     let mut other = v.kms_node_spki_sha256;

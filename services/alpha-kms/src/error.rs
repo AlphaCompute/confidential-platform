@@ -1,5 +1,5 @@
 use alpha_core::RequestId;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
@@ -70,14 +70,12 @@ impl IntoResponse for ApiError {
         }});
         let mut response = (self.status(), axum::Json(body)).into_response();
         let retry_after = match self.code {
-            "rate_limited" => Some("1"),
-            "sealed" => Some("30"),
+            "rate_limited" => Some(HeaderValue::from_static("1")),
+            "sealed" => Some(HeaderValue::from_static("30")),
             _ => None,
         };
         if let Some(seconds) = retry_after {
-            response
-                .headers_mut()
-                .insert(header::RETRY_AFTER, seconds.parse().unwrap());
+            response.headers_mut().insert(header::RETRY_AFTER, seconds);
         }
         response
     }

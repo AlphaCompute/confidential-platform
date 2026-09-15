@@ -4,15 +4,16 @@
 use std::sync::Arc;
 
 use alpha_attest::{Evidence, appraise, report_data};
-use alpha_core::{OrgId, PrincipalId, signing_digest};
-use alpha_crypto::{INFO_NODE_BOOTSTRAP, INFO_UNSEAL_SHARE, PublicKey, Sealed};
+use alpha_client::{Client, Identity, JoinRequest, Pin, UnsealRequest};
+use alpha_core::{context, signing_digest};
+use alpha_crypto::{INFO_NODE_BOOTSTRAP, INFO_UNSEAL_SHARE, Sealed};
 use axum::Json;
 use axum::extract::{Extension, Query, State};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use ed25519_dalek::pkcs8::DecodePublicKey;
 use p256::ecdsa::signature::Signer;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -26,8 +27,6 @@ use crate::instance::{check_nonce, collateral, decode32};
 use crate::keys::{self, aead_open, aead_seal};
 use crate::tls::PeerCerts;
 use crate::{Intermediates, Node, Phase, certs, random};
-
-pub const CONTEXT_BOOTSTRAP: &str = "alphacompute/node-bootstrap/v1";
 
 fn runtime_spki_sha256(node: &Node) -> [u8; 32] {
     Sha256::digest(&node.runtime_spki).into()
@@ -55,28 +54,7 @@ pub async fn evidence(
     })))
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BootstrapRequest {
-    pub body_hpke: Sealed,
-}
-
-/// What `alpha bootstrap` seals to the node.
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BootstrapBody {
-    pub custodians: [PublicKey; 3],
-    pub anchor: Anchor,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Anchor {
-    pub org_id: OrgId,
-    pub principal_id: PrincipalId,
-    pub public_key: String,
-    pub label: String,
-}
+pub use alpha_client::{BootstrapBody, BootstrapRequest};
 
 pub async fn bootstrap(
     State(node): State<Arc<Node>>,
@@ -102,16 +80,16 @@ pub async fn bootstrap(
         .map_err(|_| ApiError::malformed("anchor public_key: not an Ed25519 SPKI"))?;
     let now = node.now();
 
-    let root = root_kek(&node);
-    let tenant_kek_root = Zeroizing::new(random());
-    let (ca_key_der, ca_cert_der) = certs::new_ca(now);
+    let root = root_kek(&node)?;
+    let tenant_kek_root = Zeroizing::new(random()?);
+    let (ca_key_der, ca_cert_der) = certs::new_ca(now)?;
     let ca_key_der = Zeroizing::new(ca_key_der);
     let mut tx = node.pool.begin().await?;
     let inserted = sqlx::query!(
         "insert into intermediate_keys (purpose, wrapped, public_part) values
            ('tenant-kek-root', $1, null), ('ca', $2, $3) on conflict (purpose) do nothing",
-        aead_seal(&root, b"tenant-kek-root", tenant_kek_root.as_slice()),
-        aead_seal(&root, b"ca", &ca_key_der),
+        aead_seal(&root, b"tenant-kek-root", tenant_kek_root.as_slice())?,
+        aead_seal(&root, b"ca", &ca_key_der)?,
         ca_cert_der,
     )
     .execute(&mut *tx)
@@ -121,7 +99,7 @@ pub async fn bootstrap(
         return Err(ApiError::new("already_exists", "database is not empty"));
     }
     let anchor_id: Uuid = alpha_core::KeyId::mint().into();
-    let check = keys::anchor_check(&tenant_kek_root, body.anchor.org_id, &anchor_spki);
+    let check = keys::anchor_check(&tenant_kek_root, body.anchor.org_id, &anchor_spki)?;
     sqlx::query!(
         "insert into principal_keys (id, org_id, principal_id, public_key, document, anchor_check)
          values ($1, $2, $3, $4, $5, $6)",
@@ -154,18 +132,23 @@ pub async fn bootstrap(
         .iter()
         .zip(&body.custodians)
         .map(|(share, custodian)| alpha_crypto::seal(custodian, INFO_UNSEAL_SHARE, &aad, share))
-        .collect();
+        .collect::<Result<_, _>>()
+        .map_err(|e| ApiError::internal(format!("seal share: {e}")))?;
     drop(root);
     let keys = Intermediates {
         tenant_kek_root,
         ca_key_der,
         ca_cert_der,
     };
-    let payload = json!({ "shares_hpke": shares_hpke, "kms_ca_pem": keys.ca_pem() });
+    let payload = json!({
+        "shares_hpke": shares_hpke,
+        "kms_ca_pem": keys.ca_pem(),
+        "anchor_key_id": anchor_id,
+    });
+    let digest = signing_digest(context::NODE_BOOTSTRAP, &payload)
+        .map_err(|e| ApiError::internal(format!("payload: {e}")))?;
     node.start_serving(keys)?;
-    let signature: p256::ecdsa::Signature = node
-        .runtime_key
-        .sign(&signing_digest(CONTEXT_BOOTSTRAP, &payload));
+    let signature: p256::ecdsa::Signature = node.runtime_key.sign(&digest);
     Ok(Json(json!({
         "payload": payload,
         "signature": {
@@ -175,12 +158,12 @@ pub async fn bootstrap(
     })))
 }
 
-fn root_kek(_node: &Node) -> Zeroizing<[u8; 32]> {
+fn root_kek(_node: &Node) -> Result<Zeroizing<[u8; 32]>, ApiError> {
     #[cfg(feature = "dev-root")]
     if let Some(root) = &_node.config.dev_root_kek {
-        return root.clone();
+        return Ok(root.clone());
     }
-    Zeroizing::new(random())
+    Ok(Zeroizing::new(random()?))
 }
 
 /// Unwraps both rows under `root`.
@@ -212,12 +195,6 @@ pub async fn unwrap_intermediates(node: &Node, root: &[u8; 32]) -> Result<Interm
     })
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct UnsealRequest {
-    pub share_hpke: Sealed,
-}
-
 pub async fn unseal(
     State(node): State<Arc<Node>>,
     Body(request): Body<UnsealRequest>,
@@ -231,7 +208,7 @@ pub async fn unseal(
     )
     .map_err(|e| ApiError::malformed(format!("share_hpke: {e}")))?;
     let collected = {
-        let mut phase = node.phase.write().unwrap();
+        let mut phase = node.phase.write();
         let Phase::Sealed { shares } = &mut *phase else {
             return Err(ApiError::new("already_exists", "node is already serving"));
         };
@@ -254,7 +231,7 @@ pub async fn unseal(
     }
     .await;
     if let Err(e) = outcome {
-        if let Phase::Sealed { shares } = &mut *node.phase.write().unwrap() {
+        if let Phase::Sealed { shares } = &mut *node.phase.write() {
             shares.clear();
         }
         audit::node("node.unseal", "denied", e.details())
@@ -266,14 +243,6 @@ pub async fn unseal(
         .insert(&node.pool)
         .await?;
     Ok(Json(json!({ "sealed": false, "shares": 2 })))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct JoinRequest {
-    pub nonce: String,
-    pub evidence: Evidence,
-    pub xwing_pubkey: PublicKey,
 }
 
 pub async fn join(
@@ -353,10 +322,10 @@ pub async fn try_join(node: &Node) -> Result<(), ApiError> {
     let doc = node
         .platform_document()
         .ok_or_else(|| ApiError::internal("no platform document to pin the other node"))?;
-    let client = join_client(node, &doc.kms_ca_pem, &doc.kms_revisions)?;
     for endpoint in &node.config.kms_endpoints {
-        let ready = client.get(format!("{endpoint}/ready")).send().await;
-        if !ready.is_ok_and(|r| r.status().is_success()) {
+        // One node per client: the nonce is bound to the node that minted it.
+        let client = join_client(node, endpoint, &doc.kms_ca_pem, &doc.kms_revisions)?;
+        if !client.ready().await.is_ok_and(|r| !r.sealed) {
             continue;
         }
         match join_via(node, &client, endpoint).await {
@@ -367,17 +336,9 @@ pub async fn try_join(node: &Node) -> Result<(), ApiError> {
     Err(ApiError::internal("no ready node to join"))
 }
 
-async fn join_via(node: &Node, client: &reqwest::Client, endpoint: &str) -> Result<(), ApiError> {
-    let http = |e: reqwest::Error| ApiError::internal(format!("join: {e}"));
-    let nonce: Value = client
-        .post(format!("{endpoint}/v1/attest/nonce"))
-        .send()
-        .await
-        .map_err(http)?
-        .json()
-        .await
-        .map_err(http)?;
-    let nonce_text = nonce["nonce"].as_str().unwrap_or_default().to_owned();
+async fn join_via(node: &Node, client: &Client, endpoint: &str) -> Result<(), ApiError> {
+    let http = |e: alpha_client::Error| ApiError::internal(format!("join: {e}"));
+    let nonce_text = client.attest_nonce().await.map_err(http)?.nonce;
     let nonce = decode32("nonce", &nonce_text)?;
     audit::node(
         "node.join.request",
@@ -394,31 +355,25 @@ async fn join_via(node: &Node, client: &reqwest::Client, endpoint: &str) -> Resu
         quote,
         event_log: node.event_log.clone(),
     };
-    let reply: Value = client
-        .post(format!("{endpoint}/v1/node/join"))
-        .json(&json!({ "nonce": nonce_text, "evidence": evidence, "xwing_pubkey": xwing }))
-        .send()
-        .await
-        .map_err(http)?
-        .error_for_status()
-        .map_err(http)?
-        .json()
+    let reply = client
+        .join(&JoinRequest {
+            nonce: nonce_text,
+            evidence,
+            xwing_pubkey: xwing,
+        })
         .await
         .map_err(http)?;
-    let field = |name: &str| {
-        reply[name]
-            .as_str()
-            .and_then(|s| BASE64_URL_SAFE_NO_PAD.decode(s).ok())
-            .ok_or_else(|| ApiError::internal(format!("join reply: {name}")))
+    let field = |name: &str, text: &str| {
+        alpha_client::decode(name, text).map_err(|e| ApiError::internal(format!("join reply: {e}")))
     };
     let tenant_kek_root = Zeroizing::new(
-        <[u8; 32]>::try_from(field("tenant_kek_root")?.as_slice())
+        <[u8; 32]>::try_from(field("tenant_kek_root", &reply.tenant_kek_root)?.as_slice())
             .map_err(|_| ApiError::internal("join reply: tenant_kek_root"))?,
     );
     node.start_serving(Intermediates {
         tenant_kek_root,
-        ca_key_der: Zeroizing::new(field("ca_key")?),
-        ca_cert_der: field("ca_cert")?,
+        ca_key_der: Zeroizing::new(field("ca_key", &reply.ca_key)?),
+        ca_cert_der: field("ca_cert", &reply.ca_cert)?,
     })
 }
 
@@ -426,22 +381,17 @@ async fn join_via(node: &Node, client: &reqwest::Client, endpoint: &str) -> Resu
 /// server pinned to `kms_ca_pem` and to a Revision in `kms_revisions`.
 fn join_client(
     node: &Node,
+    endpoint: &str,
     kms_ca_pem: &str,
     revisions: &[alpha_attest::KmsRevision],
-) -> Result<reqwest::Client, ApiError> {
-    let ca = rustls::pki_types::pem::PemObject::from_pem_slice(kms_ca_pem.as_bytes())
-        .map_err(|e| ApiError::internal(format!("kms_ca_pem: {e}")))?;
-    let verifier = crate::tls::PinnedServer::new(
-        ca,
-        revisions
-            .iter()
-            .map(|r| format!("urn:alphacompute:revision:{}", r.compose_hash))
-            .collect(),
-    )?;
-    let cert = certs::self_signed(&certs::key_pair(&node.runtime_pkcs8), node.now());
-    let config = crate::tls::client_config(verifier, cert, &node.runtime_pkcs8);
-    reqwest::Client::builder()
-        .tls_backend_preconfigured(config)
-        .build()
-        .map_err(|e| ApiError::internal(format!("client: {e}")))
+) -> Result<Client, ApiError> {
+    let internal = |e: alpha_client::Error| ApiError::internal(e.to_string());
+    let ca = alpha_client::tls::ca_from_pem(kms_ca_pem).map_err(internal)?;
+    let pin = Pin::CaAndRevisions(ca, revisions.iter().map(|r| r.compose_hash).collect());
+    let cert = certs::self_signed(&certs::key_pair(&node.runtime_pkcs8)?, node.now())?;
+    let identity = Identity {
+        chain: vec![cert],
+        pkcs8: node.runtime_pkcs8.to_vec(),
+    };
+    Client::with_identity(vec![endpoint.to_owned()], pin, Some(identity)).map_err(internal)
 }

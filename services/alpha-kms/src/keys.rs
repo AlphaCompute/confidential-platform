@@ -3,14 +3,13 @@
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
-use alpha_core::{KeyId, OrgId, signing_digest};
+use alpha_core::{OrgId, signing_digest};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::pkcs8::DecodePublicKey;
 use ed25519_dalek::{Signature, VerifyingKey};
 use hkdf::Hkdf;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgExecutor;
@@ -21,16 +20,20 @@ use crate::error::ApiError;
 
 pub type Key32 = Zeroizing<[u8; 32]>;
 
-fn derive(ikm: &[u8; 32], salt: &[u8], org: OrgId, anchor_spki: &[u8]) -> Key32 {
+fn derive(ikm: &[u8; 32], salt: &[u8], org: OrgId, anchor_spki: &[u8]) -> Result<Key32, ApiError> {
     let info = [org.as_bytes().as_slice(), &Sha256::digest(anchor_spki)].concat();
     let mut out = Zeroizing::new([0u8; 32]);
     Hkdf::<Sha256>::new(Some(salt), ikm)
         .expand(&info, out.as_mut())
-        .expect("32 bytes is within the HKDF-SHA256 limit");
-    out
+        .map_err(|e| ApiError::internal(format!("hkdf: {e}")))?;
+    Ok(out)
 }
 
-pub fn org_key(tenant_kek_root: &[u8; 32], org: OrgId, anchor_spki: &[u8]) -> Key32 {
+pub fn org_key(
+    tenant_kek_root: &[u8; 32],
+    org: OrgId,
+    anchor_spki: &[u8],
+) -> Result<Key32, ApiError> {
     derive(
         tenant_kek_root,
         b"alphacompute-kms/org-key/v1",
@@ -39,7 +42,11 @@ pub fn org_key(tenant_kek_root: &[u8; 32], org: OrgId, anchor_spki: &[u8]) -> Ke
     )
 }
 
-pub fn anchor_check(tenant_kek_root: &[u8; 32], org: OrgId, anchor_spki: &[u8]) -> Key32 {
+pub fn anchor_check(
+    tenant_kek_root: &[u8; 32],
+    org: OrgId,
+    anchor_spki: &[u8],
+) -> Result<Key32, ApiError> {
     derive(
         tenant_kek_root,
         b"alphacompute-kms/anchor-check/v1",
@@ -49,18 +56,18 @@ pub fn anchor_check(tenant_kek_root: &[u8; 32], org: OrgId, anchor_spki: &[u8]) 
 }
 
 /// `nonce(12) ‖ AES-256-GCM(key, plaintext, aad)`.
-pub fn aead_seal(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
-    let nonce = crate::random::<12>();
+pub fn aead_seal(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, ApiError> {
+    let nonce = crate::random::<12>()?;
     let ct = Aes256Gcm::new(key.into())
         .encrypt(
-            &Nonce::try_from(nonce.as_slice()).unwrap(),
+            &Nonce::from(nonce),
             Payload {
                 msg: plaintext,
                 aad,
             },
         )
-        .expect("AES-GCM encryption cannot fail");
-    [nonce.as_slice(), &ct].concat()
+        .map_err(|_| ApiError::internal("aead: encryption failed"))?;
+    Ok([nonce.as_slice(), &ct].concat())
 }
 
 pub fn aead_open(key: &[u8; 32], aad: &[u8], blob: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
@@ -71,14 +78,7 @@ pub fn aead_open(key: &[u8; 32], aad: &[u8], blob: &[u8]) -> Option<Zeroizing<Ve
         .map(Zeroizing::new)
 }
 
-/// The signature object every signed body carries.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SignatureObject {
-    pub key_id: KeyId,
-    pub algorithm: String,
-    pub signature: String,
-}
+pub use alpha_client::SignatureObject;
 
 pub fn verify_ed25519(spki_der: &[u8], digest: &[u8; 32], signature_b64: &str) -> bool {
     let Ok(key) = VerifyingKey::from_public_key_der(spki_der) else {
@@ -161,7 +161,7 @@ pub async fn walk_chain(
         match link.registered_by_key {
             None => {
                 let expected =
-                    anchor_check(tenant_kek_root, OrgId::from(link.org_id), &link.public_key);
+                    anchor_check(tenant_kek_root, OrgId::from(link.org_id), &link.public_key)?;
                 if link.anchor_check.as_deref() != Some(expected.as_slice()) {
                     return Err(invalid(
                         "the chain does not end at the organization's anchor",
@@ -173,12 +173,14 @@ pub async fn walk_chain(
                 });
             }
             Some(parent) => {
-                signed_at = link.document["issued_at"]
-                    .as_str()
+                signed_at = link
+                    .document
+                    .get("issued_at")
+                    .and_then(Value::as_str)
                     .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                     .map(|t| t.with_timezone(&Utc))
                     .ok_or_else(|| invalid("a key in the chain has no issued_at"))?;
-                hops += 1;
+                hops = u32::saturating_add(hops, 1);
                 if hops > 64 {
                     return Err(invalid("the chain does not end"));
                 }
@@ -213,7 +215,8 @@ fn verify_registration(child: &KeyRow, parent: &KeyRow) -> Result<(), ApiError> 
             "a key in the chain differs from its registration document",
         ));
     }
-    let digest = signing_digest(alpha_core::context::PRINCIPAL_KEY, &child.document);
+    let digest = signing_digest(alpha_core::context::PRINCIPAL_KEY, &child.document)
+        .map_err(|e| invalid(&format!("registration document: {e}")))?;
     if !verify_ed25519(&parent.public_key, &digest, &signature.signature) {
         return Err(invalid(
             "a key in the chain has a bad registration signature",
@@ -235,7 +238,8 @@ pub async fn verify_signed(
         return Err(ApiError::signature_invalid("unsupported algorithm"));
     }
     let chain = walk_chain(exec, tenant_kek_root, signature.key_id.into(), signed_at).await?;
-    let digest = signing_digest(context, document);
+    let digest = signing_digest(context, document)
+        .map_err(|e| ApiError::malformed(format!("payload: {e}")))?;
     if !verify_ed25519(&chain.key.public_key, &digest, &signature.signature) {
         return Err(ApiError::signature_invalid("signature does not verify"));
     }
@@ -254,17 +258,17 @@ mod tests {
     fn derivations_separate_salts_orgs_and_anchors() {
         let root = [1u8; 32];
         let org = OrgId::mint();
-        let a = org_key(&root, org, b"anchor");
-        assert_ne!(*a, *anchor_check(&root, org, b"anchor"));
-        assert_ne!(*a, *org_key(&root, OrgId::mint(), b"anchor"));
-        assert_ne!(*a, *org_key(&root, org, b"other"));
-        assert_eq!(*a, *org_key(&root, org, b"anchor"));
+        let a = org_key(&root, org, b"anchor").unwrap();
+        assert_ne!(*a, *anchor_check(&root, org, b"anchor").unwrap());
+        assert_ne!(*a, *org_key(&root, OrgId::mint(), b"anchor").unwrap());
+        assert_ne!(*a, *org_key(&root, org, b"other").unwrap());
+        assert_eq!(*a, *org_key(&root, org, b"anchor").unwrap());
     }
 
     #[test]
     fn aead_round_trip_binds_aad() {
         let key = [9u8; 32];
-        let blob = aead_seal(&key, b"aad", b"value");
+        let blob = aead_seal(&key, b"aad", b"value").unwrap();
         assert_eq!(aead_open(&key, b"aad", &blob).unwrap().as_slice(), b"value");
         assert!(aead_open(&key, b"other", &blob).is_none());
         assert!(aead_open(&[0; 32], b"aad", &blob).is_none());
@@ -277,7 +281,7 @@ mod tests {
         use ed25519_dalek::pkcs8::EncodePublicKey;
         let sk = SigningKey::from_bytes(&[3u8; 32]);
         let spki = sk.verifying_key().to_public_key_der().unwrap();
-        let digest = signing_digest("ctx", &serde_json::json!({"a": 1}));
+        let digest = signing_digest("ctx", &serde_json::json!({"a": 1})).unwrap();
         let sig =
             BASE64_URL_SAFE_NO_PAD.encode(ed25519_dalek::Signer::sign(&sk, &digest).to_bytes());
         assert!(verify_ed25519(spki.as_bytes(), &digest, &sig));

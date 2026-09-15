@@ -2,6 +2,17 @@
 //! that replays its RTMRs — the boot-time events from the CCEL ACPI table and dstack's own
 //! runtime events under `/run/log/dstack`. No guest-agent socket is involved.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )
+)]
+
 use std::fs;
 use std::path::Path;
 
@@ -113,13 +124,13 @@ pub fn boot_events(ccel: &[u8]) -> Result<Vec<EventLogEntry>, Error> {
         }
         let event_len = u32_at(&mut input)? as usize;
         take(&mut input, event_len)?;
-        if index == 0 {
+        let Some(imr) = index.checked_sub(1) else {
             continue;
-        }
+        };
         let [digest] = <[Vec<u8>; 1]>::try_from(digests)
             .map_err(|_| Error::Ccel("expected exactly one digest per event"))?;
         events.push(EventLogEntry {
-            imr: index - 1,
+            imr,
             event_type,
             digest,
             event: String::new(),
