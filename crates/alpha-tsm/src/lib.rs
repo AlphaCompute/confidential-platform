@@ -22,7 +22,10 @@ use base64::prelude::BASE64_STANDARD;
 use serde::Deserialize;
 
 pub const TSM_REPORT_DIR: &str = "/sys/kernel/config/tsm/report";
-pub const CCEL_PATH: &str = "/sys/firmware/acpi/tables/data/CCEL";
+/// The host's `/sys/firmware/acpi/tables/data/CCEL`, bind-mounted outside `/sys`: a container
+/// does not see a file mounted under `/sys/firmware`, and a dstack node running this path failed
+/// to start with the table missing.
+pub const CCEL_PATH: &str = "/ccel";
 pub const RUNTIME_EVENTS_PATH: &str = "/run/log/dstack/runtime_events.log";
 
 const DSTACK_RUNTIME_EVENT_TYPE: u32 = 0x0800_0001;
