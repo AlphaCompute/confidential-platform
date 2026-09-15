@@ -5,8 +5,9 @@ about them: they parse as a JSON object, `name` equals the `app_id`, every `imag
 `docker_compose_file` carries an `@sha256:` digest. The form of the bytes belongs to the
 provider that writes them into the CVM.
 
-- `01-canonical` — `input.json` is the compose as the tenant wrote it (unsorted keys, two-space
-  indent); `app-compose.json` is the same compose in the form Phala Cloud's API stores it
+- `01-canonical` — `input.json` is a compose the API stores unchanged (the fields it would fill
+  in spelled out, a `pre_launch_script`, no `key_provider`; confirmed by provisioning it) as the
+  tenant wrote it (unsorted keys, two-space indent); `app-compose.json` is the same compose in the form Phala Cloud's API stores it
   and dstack measures it: keys sorted recursively, no whitespace between tokens (checked against
   a running CVM, whose `tcb_info.app_compose` hashes to the API's `compose_hash`; the SDK's
   `dumpAppCompose` indents and is not that form); `expected.json` holds its `compose_hash` and the signing digest of

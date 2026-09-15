@@ -161,9 +161,10 @@ fn envelope(
         "allowed_envs": allowed_envs,
         "public_tcbinfo": false,
         "no_instance_id": false,
-        // Phala's API writes these fields when they are absent and changes the compose when
-        // `key_provider` is present, so the bytes it measures would not be the signed ones.
-        // Spelled out, with no `key_provider`, the compose is stored unchanged.
+        // Phala's API writes these fields when they are absent, inserts its own pre-launch script
+        // when there is none, and changes the compose when `key_provider` is present, so the
+        // bytes it measures would not be the signed ones. Spelled out, next to our script and
+        // with no `key_provider`, the compose is stored unchanged.
         "features": ["kms", "tproxy-net"],
         "local_key_provider_enabled": false,
         "public_logs": false,

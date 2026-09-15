@@ -2,10 +2,13 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-/// The bytes Phala Cloud's API writes into the CVM as `app-compose.json`, and therefore the
-/// bytes dstack measures: keys sorted recursively, no whitespace between tokens. Checked against
-/// a running CVM, whose `tcb_info.app_compose` hashes to the API's `compose_hash`; the SDK's
-/// `dumpAppCompose` (four-space indent) is not the form the API measures.
+/// Phala Cloud's serialization of a compose: keys sorted recursively, no whitespace between
+/// tokens (a running CVM's `tcb_info.app_compose` is this form and hashes to the API's
+/// `compose_hash`; the SDK's indented `dumpAppCompose` is not). It adds and removes no fields,
+/// so the result is what dstack measures only for a compose the API stores unchanged: one that
+/// already spells out the fields the API fills in, has a `pre_launch_script` (without one the
+/// API inserts its own) and has no `key_provider`, as `alpha_cli::deploy` builds it. For any other compose the API measures different bytes, which
+/// the `compose_hash` comparison at provision time reports.
 pub fn canonicalize(value: &Value) -> serde_json::Result<String> {
     serde_json::to_string(&sort_keys(value)?)
 }
