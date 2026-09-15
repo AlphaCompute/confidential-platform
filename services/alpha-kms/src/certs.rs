@@ -18,7 +18,7 @@ use rustls::server::danger::ClientCertVerifier;
 use crate::error::ApiError;
 
 pub const LEAF_TTL: Duration = Duration::from_secs(3600);
-pub const KMS_SAN: &str = "alphacompute://kms";
+pub use alpha_client::tls::KMS_SAN;
 
 fn serial() -> Result<rcgen::SerialNumber, ApiError> {
     let mut bytes = crate::random::<16>()?;

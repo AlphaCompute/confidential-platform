@@ -24,6 +24,9 @@ pub fn provider() -> Arc<CryptoProvider> {
     })
 }
 
+/// The URI SAN every KMS node's leaf carries beside its Revision.
+pub const KMS_SAN: &str = "alphacompute://kms";
+
 /// What the server must prove, as a value.
 #[derive(Clone, Debug)]
 pub enum Pin {
@@ -104,6 +107,11 @@ impl ServerCertVerifier for PinnedServer {
             Pin::Ca(_) => {}
             Pin::CaAndRevisions(_, revisions) => {
                 let sans = uri_sans(end_entity).map_err(|e| refuse(e.to_string()))?;
+                // An Instance leaf from the same CA also carries a Revision SAN and the
+                // server-auth EKU; only a node's leaf carries the KMS identity.
+                if !sans.iter().any(|s| s == KMS_SAN) {
+                    return Err(refuse("server certificate is not a KMS node's".into()));
+                }
                 let allowed = revisions
                     .iter()
                     .map(|r| format!("urn:alphacompute:revision:{r}"))

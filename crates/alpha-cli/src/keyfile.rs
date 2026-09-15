@@ -144,7 +144,13 @@ pub fn generate(algorithm: Algorithm, path: &Path, passphrase: &[u8]) -> Result<
         ciphertext: BASE64_URL_SAFE_NO_PAD.encode(ciphertext),
     };
     let text = serde_json::to_string_pretty(&file).map_err(|e| e.to_string())? + "\n";
-    fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut out = fs::OpenOptions::new();
+    out.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut out, 0o600);
+    out.open(path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     Key::from_seed(algorithm, &seed)
 }
 
@@ -207,6 +213,14 @@ mod tests {
                 .unwrap()
                 .contains("wrong passphrase")
         );
+        assert!(
+            generate(Algorithm::Ed25519, &path, b"again")
+                .err()
+                .unwrap()
+                .contains("exists"),
+            "an existing key file is never overwritten"
+        );
+        assert!(read(&path, b"correct horse").is_ok());
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"kdf\"") && text.contains("\"scrypt\""));
         assert!(text.contains("\"aead\": \"aes-256-gcm\""));
