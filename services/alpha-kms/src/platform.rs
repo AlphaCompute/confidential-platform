@@ -131,7 +131,7 @@ pub async fn apply(node: &Node, verified: Verified) -> Result<(), ApiError> {
     }
     tx.commit().await?;
     let current = node.platform.read().unwrap().as_ref().map(|d| d.version);
-    if current.is_none_or(|v| v <= verified.document.version) {
+    if current.is_none_or(|v| v < verified.document.version) {
         *node.platform.write().unwrap() = Some(Arc::new(verified.document));
     }
     Ok(())

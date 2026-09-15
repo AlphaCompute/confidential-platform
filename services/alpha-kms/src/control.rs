@@ -151,6 +151,12 @@ pub async fn register_revision(
                 existing.created_at,
             ));
         }
+        sqlx::query!(
+            "select pg_advisory_xact_lock(hashtext($1))",
+            p.app_id.to_string()
+        )
+        .execute(&mut *tx)
+        .await?;
         let other_org = sqlx::query_scalar!(
             "select exists(select 1 from revisions where app_id = $1 and org_id <> $2)",
             Uuid::from(p.app_id),
@@ -258,11 +264,11 @@ pub async fn revoke_revision(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SecretPayload {
-    name: String,
-    app_ids: Vec<AppId>,
-    content_sha256: String,
-    issued_at: DateTime<Utc>,
+pub struct SecretPayload {
+    pub name: String,
+    pub app_ids: Vec<AppId>,
+    pub content_sha256: String,
+    pub issued_at: DateTime<Utc>,
 }
 
 pub async fn put_secret(
@@ -303,6 +309,12 @@ pub async fn put_secret(
         let org_id = chain.key.org_id;
         let app_ids: Vec<Uuid> = p.app_ids.iter().map(|a| Uuid::from(*a)).collect();
         let mut tx = node.pool.begin().await?;
+        sqlx::query!(
+            "select pg_advisory_xact_lock(hashtext($1))",
+            format!("{org_id}/{name}")
+        )
+        .execute(&mut *tx)
+        .await?;
         let foreign = sqlx::query_scalar!(
             "select exists(select 1 from revisions where app_id = any($1) and org_id <> $2)",
             &app_ids,
@@ -316,7 +328,7 @@ pub async fn put_secret(
             ));
         }
         let existing = sqlx::query!(
-            "select id, issued_at from secrets where org_id = $1 and name = $2 for update",
+            "select id, issued_at from secrets where org_id = $1 and name = $2",
             org_id,
             name
         )

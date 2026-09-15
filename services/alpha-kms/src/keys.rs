@@ -101,6 +101,7 @@ pub struct KeyRow {
     pub org_id: Uuid,
     pub public_key: Vec<u8>,
     pub document: Value,
+    pub signature: Option<Value>,
     pub registered_by_key: Option<Uuid>,
     pub anchor_check: Option<Vec<u8>>,
     pub revoked_at: Option<DateTime<Utc>>,
@@ -110,7 +111,7 @@ pub struct KeyRow {
 pub async fn load_key(exec: impl PgExecutor<'_>, id: Uuid) -> Result<Option<KeyRow>, ApiError> {
     Ok(sqlx::query_as!(
         KeyRow,
-        r#"select id, org_id, public_key, document, registered_by_key, anchor_check, revoked_at,
+        r#"select id, org_id, public_key, document, signature, registered_by_key, anchor_check, revoked_at,
                   revocation_reason::text as "revocation_reason"
            from principal_keys where id = $1"#,
         id
@@ -126,9 +127,11 @@ pub struct Chain {
 }
 
 /// Walks `key_id` → `registered_by_key` → … → the anchor, without a cache, and recomputes
-/// the anchor's `anchor_check`. A link is good while unrevoked, or retired after the moment
-/// the thing it signed was signed; `compromised` anywhere fails the chain. Each hop moves
-/// `signed_at` back to the moment the link itself was registered.
+/// the anchor's `anchor_check`. Each delegated link's registration document must carry its
+/// own SPKI and verify under its parent's key, so a row edited in the database no longer
+/// chains. A link is good while unrevoked, or retired after the moment the thing it signed
+/// was signed; `compromised` anywhere fails the chain. Each hop moves `signed_at` back to
+/// the moment the link itself was registered.
 pub async fn walk_chain(
     exec: impl PgExecutor<'_> + Copy,
     tenant_kek_root: &[u8; 32],
@@ -140,8 +143,15 @@ pub async fn walk_chain(
         .await?
         .ok_or_else(|| invalid("unknown key"))?;
     let mut current = Some(first.clone());
+    let mut child: Option<KeyRow> = None;
     let mut hops = 0;
     while let Some(link) = current {
+        if link.org_id != first.org_id {
+            return Err(invalid("the chain crosses organizations"));
+        }
+        if let Some(child) = &child {
+            verify_registration(child, &link)?;
+        }
         if let Some(revoked_at) = link.revoked_at {
             let retired = link.revocation_reason.as_deref() == Some("retired");
             if !retired || signed_at >= revoked_at {
@@ -156,9 +166,6 @@ pub async fn walk_chain(
                     return Err(invalid(
                         "the chain does not end at the organization's anchor",
                     ));
-                }
-                if link.org_id != first.org_id {
-                    return Err(invalid("the chain crosses organizations"));
                 }
                 return Ok(Chain {
                     key: first,
@@ -176,10 +183,43 @@ pub async fn walk_chain(
                     return Err(invalid("the chain does not end"));
                 }
                 current = load_key(exec, parent).await?;
+                child = Some(link);
             }
         }
     }
     Err(invalid("the chain is broken"))
+}
+
+/// The child's registration document names the child's own SPKI and is signed by the parent.
+fn verify_registration(child: &KeyRow, parent: &KeyRow) -> Result<(), ApiError> {
+    let invalid = |m: &str| ApiError::signature_invalid(m.to_owned());
+    let signature: SignatureObject = child
+        .signature
+        .clone()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .ok_or_else(|| invalid("a key in the chain has no registration signature"))?;
+    if Uuid::from(signature.key_id) != parent.id || signature.algorithm != "ed25519" {
+        return Err(invalid(
+            "a key in the chain was not registered by its parent",
+        ));
+    }
+    let registered_spki = child
+        .document
+        .get("public_key")
+        .and_then(Value::as_str)
+        .and_then(|s| BASE64_URL_SAFE_NO_PAD.decode(s).ok());
+    if registered_spki.as_deref() != Some(child.public_key.as_slice()) {
+        return Err(invalid(
+            "a key in the chain differs from its registration document",
+        ));
+    }
+    let digest = signing_digest(alpha_core::context::PRINCIPAL_KEY, &child.document);
+    if !verify_ed25519(&parent.public_key, &digest, &signature.signature) {
+        return Err(invalid(
+            "a key in the chain has a bad registration signature",
+        ));
+    }
+    Ok(())
 }
 
 /// Verifies a signature object over `document` under `context` and walks the signer's chain.

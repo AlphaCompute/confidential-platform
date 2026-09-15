@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select id, issued_at from secrets where org_id = $1 and name = $2 for update",
+  "query": "select id, issued_at from secrets where org_id = $1 and name = $2",
   "describe": {
     "columns": [
       {
@@ -37,5 +37,5 @@
       false
     ]
   },
-  "hash": "7d37778a2d8f30a486f545a85c117a1140ce461943c81320a3899b4f515da867"
+  "hash": "1a029cc4c3a6bebcfbda438008df467d629d9b5e11c8844f9496f9959a8d7110"
 }

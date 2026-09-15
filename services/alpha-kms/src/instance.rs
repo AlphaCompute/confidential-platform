@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use crate::audit::Audit;
 use crate::body::Body;
+use crate::control::SecretPayload;
 use crate::error::ApiError;
 use crate::keys::{self, SignatureObject};
 use crate::tls::PeerCerts;
@@ -320,7 +321,7 @@ async fn get_secret_inner(
     )
     .await?;
     let secret = sqlx::query!(
-        "select id, ciphertext, content_sha256, document, signed_by_key, signature, issued_at
+        "select id, ciphertext, content_sha256, document, signed_by_key, signature
          from secrets where org_id = $1 and name = $2 and $3 = any(app_ids)",
         Uuid::from(identity.org_id),
         name,
@@ -334,13 +335,26 @@ async fn get_secret_inner(
     if Uuid::from(signature.key_id) != secret.signed_by_key {
         return Err(ApiError::signature_invalid("secret signer does not match"));
     }
+    // The signature covers the document alone, so the release decision is taken from the
+    // document, not from the columns beside it.
+    let document: SecretPayload = serde_json::from_value(secret.document.clone())
+        .map_err(|_| ApiError::signature_invalid("secret document"))?;
+    let content_sha256 = format!("sha256:{}", hex::encode(secret.content_sha256));
+    if document.name != name || document.content_sha256 != content_sha256 {
+        return Err(ApiError::signature_invalid(
+            "secret row differs from its signed document",
+        ));
+    }
+    if !document.app_ids.contains(&identity.app_id) {
+        return Err(ApiError::not_found("no such secret for this app"));
+    }
     let chain = keys::verify_signed(
         &node.pool,
         tenant_kek_root,
         &signature,
         context::SECRET,
         &secret.document,
-        secret.issued_at,
+        document.issued_at,
     )
     .await?;
     if chain.key.org_id != Uuid::from(identity.org_id) {
@@ -353,8 +367,8 @@ async fn get_secret_inner(
         .ok_or_else(|| ApiError::internal("secret does not decrypt under org_key"))?;
     Ok(json!({
         "value": BASE64_URL_SAFE_NO_PAD.encode(&*value),
-        "content_sha256": format!("sha256:{}", hex::encode(secret.content_sha256)),
-        "issued_at": rfc3339(secret.issued_at),
+        "content_sha256": content_sha256,
+        "issued_at": rfc3339(document.issued_at),
     }))
 }
 

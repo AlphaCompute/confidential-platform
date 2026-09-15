@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select id, org_id, public_key, document, registered_by_key, anchor_check, revoked_at,\n                  revocation_reason::text as \"revocation_reason\"\n           from principal_keys where id = $1",
+  "query": "select id, org_id, public_key, document, signature, registered_by_key, anchor_check, revoked_at,\n                  revocation_reason::text as \"revocation_reason\"\n           from principal_keys where id = $1",
   "describe": {
     "columns": [
       {
@@ -49,6 +49,17 @@
       },
       {
         "ordinal": 4,
+        "name": "signature",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "principal_keys",
+            "name": "signature"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
         "name": "registered_by_key",
         "type_info": "Uuid",
         "origin": {
@@ -59,7 +70,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "anchor_check",
         "type_info": "Bytea",
         "origin": {
@@ -70,7 +81,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "revoked_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -81,7 +92,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "revocation_reason",
         "type_info": "Text",
         "origin": "Expression"
@@ -100,8 +111,9 @@
       true,
       true,
       true,
+      true,
       null
     ]
   },
-  "hash": "1121888a8e4686590f5de8fd4ce1ebbdebceb06c021558455013635d92292f2e"
+  "hash": "f1dee8002417d0cce3f08b3bbd54ac40a2a409f1ffc531a5ab50991d813d83d4"
 }

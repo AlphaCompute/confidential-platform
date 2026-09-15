@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select id, ciphertext, content_sha256, document, signed_by_key, signature, issued_at\n         from secrets where org_id = $1 and name = $2 and $3 = any(app_ids)",
+  "query": "select id, ciphertext, content_sha256, document, signed_by_key, signature\n         from secrets where org_id = $1 and name = $2 and $3 = any(app_ids)",
   "describe": {
     "columns": [
       {
@@ -68,17 +68,6 @@
             "name": "signature"
           }
         }
-      },
-      {
-        "ordinal": 6,
-        "name": "issued_at",
-        "type_info": "Timestamptz",
-        "origin": {
-          "Table": {
-            "table": "secrets",
-            "name": "issued_at"
-          }
-        }
       }
     ],
     "parameters": {
@@ -94,9 +83,8 @@
       false,
       false,
       false,
-      false,
       false
     ]
   },
-  "hash": "8d561383d1a8a593f4dd0bfd51ba2397e321281b160fd15ff4c458f98f86776f"
+  "hash": "cf10056d3f958d545e65a6b5b6510397bb7c03e8851f80f912971aed3d75a292"
 }

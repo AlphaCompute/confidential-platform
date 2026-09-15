@@ -934,7 +934,8 @@ async fn attest_release_revoke_and_tamper() {
         (StatusCode::BAD_REQUEST, "signature_invalid")
     );
 
-    // A swapped anchor SPKI leaves the organization's secrets undecryptable.
+    // A delegated key's row must match its signed registration document: with the SPKI
+    // swapped, the holder of the replacement key signs nothing.
     sqlx::query!(
         "update principal_keys set revoked_at = null, revocation_reason = null where id = $1",
         Uuid::from(admin.0)
@@ -942,10 +943,62 @@ async fn attest_release_revoke_and_tamper() {
     .execute(&h.pool)
     .await
     .unwrap();
-    let other = SigningKey::from_bytes(&[22u8; 32])
-        .verifying_key()
-        .to_public_key_der()
-        .unwrap();
+    let impostor = (admin.0, SigningKey::from_bytes(&[22u8; 32]));
+    let other = impostor.1.verifying_key().to_public_key_der().unwrap();
+    sqlx::query!(
+        "update principal_keys set public_key = $1 where id = $2",
+        other.as_bytes(),
+        Uuid::from(admin.0)
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let payload = json!({ "key_id": admin.0, "reason": "retired", "issued_at": rfc3339(h.now()) });
+    let (status, reply) = h
+        .post(
+            &format!("/v1/keys/{}/revoke", admin.0),
+            h.signed(context::CONTROL, payload, &impostor),
+        )
+        .await;
+    assert_eq!(
+        (status, code(&reply)),
+        (StatusCode::BAD_REQUEST, "signature_invalid"),
+        "{reply}"
+    );
+    let genuine = admin.1.verifying_key().to_public_key_der().unwrap();
+    sqlx::query!(
+        "update principal_keys set public_key = $1 where id = $2",
+        genuine.as_bytes(),
+        Uuid::from(admin.0)
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(send(instance.get(&secret_url)).await.0, StatusCode::OK);
+
+    // Release follows the signed document, not the app_ids column.
+    let (status, reply) = h
+        .put_secret(
+            "foreign",
+            &[AppId::mint()],
+            b"not for this app",
+            h.now(),
+            &admin,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let added = [Uuid::from(app)];
+    sqlx::query!(
+        "update secrets set app_ids = app_ids || $1 where name = 'foreign'",
+        &added[..]
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let (status, reply) = send(instance.get(format!("{}/v1/secrets/foreign", h.url))).await;
+    assert_eq!((status, code(&reply)), (StatusCode::NOT_FOUND, "not_found"));
+
+    // A swapped anchor SPKI leaves the organization's secrets undecryptable.
     sqlx::query!(
         "update principal_keys set public_key = $1 where registered_by_key is null",
         other.as_bytes()
