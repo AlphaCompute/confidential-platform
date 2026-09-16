@@ -467,6 +467,56 @@ impl Client {
     }
 }
 
+/// What one handshake against an App's Endpoint proved. The Instance's leaf is issued by the
+/// KMS CA, lives an hour and names its Revision in the second URI SAN, so the handshake is the
+/// readable form of the attestation verdict: no route is asked, and
+/// checking it needs no key of ours.
+#[derive(Debug)]
+pub enum Probe {
+    /// A leaf chaining to the KMS CA carried the Revision asked about.
+    Attested(tls::InstanceSans),
+    /// A leaf chaining to the KMS CA carried a different Revision: during an in-place deploy the
+    /// previous Instance answers until the new one has attested.
+    OtherRevision(tls::InstanceSans),
+    /// Nothing the KMS CA vouches for answered: still booting, still attesting, or not ours.
+    Silent(String),
+}
+
+/// One attempt, with its own short timeout; the deadline over many attempts is the caller's.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Handshake with `url`, pinning the chain to the KMS CA and reading the Revision out of the
+/// leaf. Any HTTP answer means the handshake completed, so the status is not looked at.
+pub async fn probe_instance(
+    url: &str,
+    kms_ca_pem: &str,
+    expected: &ComposeHash,
+    time: TimeProvider,
+) -> Result<Probe, Error> {
+    let ca = tls::cert_from_pem(kms_ca_pem)?;
+    let http = reqwest::Client::builder()
+        .tls_backend_preconfigured(tls::client_config(Some(Pin::Ca(ca)), None, time)?)
+        .tls_info(true)
+        .timeout(PROBE_TIMEOUT)
+        .build()
+        .map_err(|e| Error::Invalid(format!("http client: {e}")))?;
+    let response = match http.get(url).send().await {
+        Ok(response) => response,
+        Err(e) => return Ok(Probe::Silent(format!("{url}: {e}"))),
+    };
+    let leaf = response
+        .extensions()
+        .get::<reqwest::tls::TlsInfo>()
+        .and_then(|info| info.peer_certificate().map(<[u8]>::to_vec))
+        .ok_or_else(|| Error::Invalid("no server certificate on the connection".into()))?;
+    let sans = tls::parse_instance_sans(&tls::uri_sans(&leaf)?)?;
+    Ok(if sans.compose_hash == *expected {
+        Probe::Attested(sans)
+    } else {
+        Probe::OtherRevision(sans)
+    })
+}
+
 /// A sealed node's evidence over an unpinned connection, together with the SPKI the server
 /// proved possession of: the quote authenticates the node, and the caller must check that
 /// this SPKI is the attested `runtime_pubkey` before anything is sealed to the node.

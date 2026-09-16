@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use alpha_attest::PlatformDocument;
 use alpha_cli::call::Route;
@@ -111,6 +111,10 @@ enum Command {
         /// Register the Revision and stop before shroud-go.
         #[arg(long)]
         register_only: bool,
+        /// After deploying, probe the App's Endpoint for this many seconds and fail unless an
+        /// Instance answers with a leaf from the KMS CA naming this Revision.
+        #[arg(long, value_name = "SECONDS")]
+        wait: Option<u64>,
         #[arg(long)]
         key: PathBuf,
         #[arg(long)]
@@ -194,6 +198,15 @@ async fn platform_document(config: &Config, now: SystemTime) -> Result<PlatformD
 
 /// The admin's pin: `kms_ca_pem` of the platform document fetched and verified now.
 async fn admin_client(config: &Config, now: SystemTime) -> Result<Client, Exit> {
+    Ok(admin_client_and_document(config, now).await?.0)
+}
+
+/// The same, keeping the document: `deploy --wait` pins the Endpoint to the same `kms_ca_pem`
+/// and must not fetch it twice.
+async fn admin_client_and_document(
+    config: &Config,
+    now: SystemTime,
+) -> Result<(Client, PlatformDocument), Exit> {
     let doc = platform_document(config, now).await?;
     let ca = alpha_client::tls::cert_from_pem(&doc.kms_ca_pem)?;
     if config.endpoints.is_empty() {
@@ -201,7 +214,13 @@ async fn admin_client(config: &Config, now: SystemTime) -> Result<Client, Exit> 
             "--endpoints (or ALPHACOMPUTE_KMS_ENDPOINTS) is required".into(),
         ));
     }
-    Ok(Client::new(config.endpoints.clone(), Pin::Ca(ca))?)
+    // The CA also issues Instance leaves with the server-auth EKU, so a chain to it alone would
+    // let any attested tenant Instance stand in for a node and receive a secret value.
+    let revisions = doc.kms_revisions.iter().map(|r| r.compose_hash).collect();
+    Ok((
+        Client::new(config.endpoints.clone(), Pin::CaAndRevisions(ca, revisions))?,
+        doc,
+    ))
 }
 
 async fn run(cli: Cli) -> Result<Value, Exit> {
@@ -263,6 +282,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
         }
         Command::Deploy {
             register_only,
+            wait,
             key,
             key_id,
             app,
@@ -280,8 +300,9 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 })
             };
             let key = read_ed25519(&key)?;
-            let client = admin_client(config, now).await?;
-            Ok(alpha_cli::deploy::run(&client, &spec, key_id, &key, shroud.as_ref()).await?)
+            let (client, doc) = admin_client_and_document(config, now).await?;
+            let wait = wait.map(|secs| (Duration::from_secs(secs), doc.kms_ca_pem.as_str()));
+            Ok(alpha_cli::deploy::run(&client, &spec, key_id, &key, shroud.as_ref(), wait).await?)
         }
         Command::Unseal {
             share,

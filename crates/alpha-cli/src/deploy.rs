@@ -1,12 +1,13 @@
 //! `alpha deploy`: the tenant's YAML → `app-compose.json` in Phala's form → registered as a
 //! Revision under the admin key → shroud-go's deploy route under the organization's API key.
 
-use alpha_client::{Client, sign};
+use alpha_client::{Client, Probe, sign};
 use alpha_core::{AppId, ComposeHash, KeyId, check_registration, context, phala};
 use ed25519_dalek::SigningKey;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use serde_yaml_ng::{Mapping, Value as Yaml};
+use std::time::{Duration, Instant};
 
 pub const RUNTIME_SERVICE: &str = "alpha-runtime";
 const SOCKET_VOLUME: &str = "alpha-run:/run/alpha";
@@ -222,14 +223,64 @@ pub struct Shroud {
     pub api_key: String,
 }
 
+/// How often the Endpoint is probed while waiting; a CVM takes minutes to boot, so there is
+/// nothing to gain from asking faster.
+const POLL: Duration = Duration::from_secs(5);
+
+/// Polls the App's Endpoint until an Instance answers under `expected`. Success is a handshake
+/// whose chain ends at the KMS CA and whose leaf names that Revision, so it proves the Instance
+/// attested within its certificate's hour. The previous Instance
+/// answering under its own Revision is the normal middle of an in-place deploy, not an error.
+pub async fn wait_for_attestation(
+    url: &str,
+    kms_ca_pem: &str,
+    expected: ComposeHash,
+    deadline: Duration,
+) -> Result<Value, String> {
+    let started = Instant::now();
+    loop {
+        let last = match alpha_client::probe_instance(
+            url,
+            kms_ca_pem,
+            &expected,
+            alpha_client::system_time_provider(),
+        )
+        .await
+        {
+            Ok(Probe::Attested(sans)) => {
+                return Ok(json!({
+                    "url": url,
+                    "compose_hash": sans.compose_hash.to_string(),
+                    "app_id": sans.app_id.to_string(),
+                    "runtime_pubkey_sha256": sans.runtime_pubkey_sha256_hex,
+                }));
+            }
+            Ok(Probe::OtherRevision(sans)) => {
+                format!("another Revision is still serving: {}", sans.compose_hash)
+            }
+            Ok(Probe::Silent(why)) => why,
+            Err(e) => return Err(format!("probe: {e}")),
+        };
+        if started.elapsed() >= deadline {
+            return Err(format!(
+                "{url} did not attest under {expected} within {}s: {last}. The reason a KMS \
+                 refused, if it did, is in the Instance's log",
+                deadline.as_secs()
+            ));
+        }
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 /// Registers the Revision, then deploys through shroud-go unless `shroud` is `None`
-/// (`--register-only`). Returns both replies.
+/// (`--register-only`), then waits for the Endpoint to attest when `wait` is set.
 pub async fn run(
     client: &Client,
     spec: &AppSpec,
     key_id: KeyId,
     key: &SigningKey,
     shroud: Option<&Shroud>,
+    wait: Option<(Duration, &str)>,
 ) -> Result<Value, String> {
     let compose = compose(spec)?;
     let signed = sign(
@@ -268,7 +319,15 @@ pub async fn run(
     if !status.is_success() {
         return Err(format!("shroud-go deploy: {status}: {body}"));
     }
-    Ok(json!({ "revision": revision, "deploy": body }))
+    let Some((deadline, kms_ca_pem)) = wait else {
+        return Ok(json!({ "revision": revision, "deploy": body }));
+    };
+    let url = body
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or("shroud-go deploy: no url to wait on")?;
+    let attested = wait_for_attestation(url, kms_ca_pem, revision.compose_hash, deadline).await?;
+    Ok(json!({ "revision": revision, "deploy": body, "attested": attested }))
 }
 
 #[cfg(test)]

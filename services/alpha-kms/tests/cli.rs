@@ -247,7 +247,7 @@ async fn deploy_register_only_registers_the_generated_compose() {
     let expected: Value =
         serde_json::from_str(&fs::read_to_string(vector.join("expected.json")).unwrap()).unwrap();
 
-    let reply = deploy::run(&client, &spec, admin.0, &admin.1, None)
+    let reply = deploy::run(&client, &spec, admin.0, &admin.1, None, None)
         .await
         .unwrap();
     assert_eq!(reply["revision"]["compose_hash"], expected["compose_hash"]);
@@ -268,7 +268,7 @@ async fn deploy_register_only_registers_the_generated_compose() {
         fs::read_to_string(vector.join("app-compose.json")).unwrap()
     );
 
-    let again = deploy::run(&client, &spec, admin.0, &admin.1, None)
+    let again = deploy::run(&client, &spec, admin.0, &admin.1, None, None)
         .await
         .unwrap();
     assert_eq!(
