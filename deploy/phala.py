@@ -75,19 +75,25 @@ def check(phala_hash, compose_bytes):
         )
 
 
-def check_stored(cvm_id, compose_bytes):
-    """The compose Phala keeps for the CVM, in the form it measures, must still be the file. A
+def check_stored(cvm_id, compose_bytes, timeout_s=5 * 60, interval_s=10):
+    """The compose Phala keeps for the CVM, in the form it measures, must become the file. A
     commit that carries env can rewrite allowed_envs (drop names, reorder them), which changes
-    the measured compose after the provision-time check passed."""
-    stored = call("GET", f"/cvms/{cvm_id}/compose_file")
-    form = json.dumps(stored, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    got = hashlib.sha256(form.encode()).hexdigest()
+    the measured compose after the provision-time check passed. Phala applies a commit
+    asynchronously, so this waits for the stored compose rather than reading it once."""
     want = sha256_hex(compose_bytes)
-    if got != want:
-        sys.exit(
-            f"stored compose of {cvm_id} hashes to {got}, the file to {want}: the CVM would "
-            f"not attest; its allowed_envs are {stored.get('allowed_envs')}. Recreate the CVM."
-        )
+    deadline = time.monotonic() + timeout_s
+    while True:
+        stored = call("GET", f"/cvms/{cvm_id}/compose_file")
+        form = json.dumps(stored, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        got = hashlib.sha256(form.encode()).hexdigest()
+        if got == want:
+            return
+        if time.monotonic() >= deadline:
+            sys.exit(
+                f"stored compose of {cvm_id} hashes to {got}, the file to {want}: the CVM would "
+                f"not attest; its allowed_envs are {stored.get('allowed_envs')}. Recreate the CVM."
+            )
+        time.sleep(interval_s)
 
 
 def report(cvm_id):
