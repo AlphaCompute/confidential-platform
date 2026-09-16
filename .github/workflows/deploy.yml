@@ -1,9 +1,6 @@
 name: deploy
 
-# A CVM pulls its images from ghcr itself. The credential is this job's own token: it reads
-# this repository's packages and expires with the job, so the job waits until the container
-# runs. A reboot later starts from the image already on the CVM's disk; a new image needs
-# a new run.
+# A CVM pulls its images from ghcr itself, anonymously: they are public.
 on:
   workflow_dispatch:
     inputs:
@@ -20,7 +17,6 @@ on:
 
 permissions:
   contents: read
-  packages: read
 
 jobs:
   kms-dev:
@@ -36,7 +32,6 @@ jobs:
       - uses: actions/checkout@v4
       - name: Render the node compose from the image
         run: |
-          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
           digest=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{json .Manifest}}' | jq -r .digest)
           {
             echo '```json'
@@ -52,7 +47,6 @@ jobs:
           ALPHACOMPUTE_KMS_ENDPOINTS: ${{ vars.ALPHACOMPUTE_KMS_ENDPOINTS }}
           ALPHACOMPUTE_PCCS_URL: ${{ vars.ALPHACOMPUTE_PCCS_URL }}
           ALPHACOMPUTE_PLATFORM_DOCUMENT_URL: ${{ vars.ALPHACOMPUTE_PLATFORM_DOCUMENT_URL }}
-          ALPHACOMPUTE_GHCR_TOKEN: ${{ github.token }}
         run: |
           pip install --quiet cryptography
           if [ -n "$CVM_ID" ]; then
