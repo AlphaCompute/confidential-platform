@@ -18,13 +18,11 @@ const KMS_ENVS: [&str; 4] = [
     "ALPHACOMPUTE_PLATFORM_DOCUMENT_URL",
 ];
 const DEV_ROOT_ENV: &str = "ALPHACOMPUTE_KMS_DEV_ROOT_KEK";
-const REGISTRY_TOKEN_ENV: &str = "ALPHACOMPUTE_GHCR_TOKEN";
-/// dstack's `app-compose.sh` sources this before `docker compose up`, with the encrypted env
-/// already filtered by `allowed_envs`; it is sourced, so it must not `exit`. It only logs in:
-/// Phala's default script prunes every image before pulling, so a CVM rebooted after its
-/// short-lived deploy token expired would lose the image it runs. ghcr checks the token, not
-/// the user name.
-const PRE_LAUNCH_SCRIPT: &str = "if [ -n \"${ALPHACOMPUTE_GHCR_TOKEN:-}\" ]; then printf '%s' \"$ALPHACOMPUTE_GHCR_TOKEN\" | docker login ghcr.io -u x-access-token --password-stdin; fi\n";
+/// dstack's `app-compose.sh` sources this before `docker compose up`; it is sourced, so it
+/// must not `exit`. It does nothing, and exists only so that Phala's API does not insert its
+/// own, which prunes every image before pulling: a CVM rebooted afterwards would lose the
+/// image it runs.
+const PRE_LAUNCH_SCRIPT: &str = ":\n";
 /// The guest agent's socket for the quote, dstack's runtime events, the CCEL boot events: what
 /// any container that produces evidence mounts.
 const EVIDENCE_MOUNTS: [&str; 3] = [
@@ -150,8 +148,6 @@ fn envelope(
     allowed_envs: &[&str],
     public_logs: bool,
 ) -> Result<String, String> {
-    let mut allowed_envs = allowed_envs.to_vec();
-    allowed_envs.push(REGISTRY_TOKEN_ENV);
     let envelope = json!({
         "manifest_version": 2,
         "name": app_id,
@@ -388,22 +384,12 @@ mod tests {
         assert_eq!(phala::canonicalize(&parsed).unwrap(), compose);
 
         assert_eq!(parsed["pre_launch_script"], PRE_LAUNCH_SCRIPT);
-        assert_eq!(parsed["allowed_envs"][4], REGISTRY_TOKEN_ENV);
-        assert!(
-            !parsed["docker_compose_file"]
-                .as_str()
-                .unwrap()
-                .contains(REGISTRY_TOKEN_ENV),
-            "the registry token reaches the pre-launch script, never a container"
-        );
-
         assert_eq!(parsed["public_logs"], false);
 
         let dev = kms_compose(app_id, image, true).unwrap();
         let parsed: Value = serde_json::from_str(&dev).unwrap();
         assert_eq!(parsed["public_logs"], true);
         assert_eq!(parsed["allowed_envs"][4], DEV_ROOT_ENV);
-        assert_eq!(parsed["allowed_envs"][5], REGISTRY_TOKEN_ENV);
         assert!(
             parsed["docker_compose_file"]
                 .as_str()

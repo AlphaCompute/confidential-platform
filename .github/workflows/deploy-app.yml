@@ -2,8 +2,7 @@ name: deploy-app
 
 # Deploys a tenant App's CVM from a compose the tenant already registered as a Revision. The
 # compose comes in as base64 because it is the tenant's artifact, not a file of this repository,
-# and its bytes must reach Phala unchanged. The credential for the private alpha-runtime image is
-# this job's own token, which is why the job waits until the container runs.
+# and its bytes must reach Phala unchanged.
 on:
   workflow_dispatch:
     inputs:
@@ -20,7 +19,6 @@ on:
 
 permissions:
   contents: read
-  packages: read
 
 jobs:
   app:
@@ -37,7 +35,6 @@ jobs:
           PHALA_API_KEY: ${{ secrets.PHALA_API_KEY }}
           PHALA_IMAGE: dstack-0.5.9
           ALPHACOMPUTE_KMS_ENDPOINTS: ${{ vars.ALPHACOMPUTE_KMS_ENDPOINTS }}
-          ALPHACOMPUTE_GHCR_TOKEN: ${{ github.token }}
         run: |
           pip install --quiet cryptography
           printf '%s' "$COMPOSE_B64" | base64 -d > app-compose.json

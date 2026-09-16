@@ -37,14 +37,11 @@ different image with a different `compose_hash`; a production platform document 
 
 ## Pulling from ghcr
 
-The images are private. Every compose, the node's and every tenant's, carries a one-line
-`pre_launch_script` that logs in to ghcr with `ALPHACOMPUTE_GHCR_TOKEN` from the encrypted env
-when it is set; the script and the variable name are measured, the token is not. The deploy
-that starts a new image supplies a token that can read the package: `.github/workflows/deploy.yml`
-passes the job's own `github.token` and waits until the container runs, because the token
-expires with the job. A reboot starts from the image already on the CVM's disk and needs no
-token. `deploy/phala.py` is the create/update call itself (exact compose, `compose_hash` check,
-encrypted env) for a deploy run by hand with a token of your own.
+The images are public, so a CVM pulls them anonymously and no credential is delivered to one.
+Every compose, the node's and every tenant's, still carries a one-line `pre_launch_script` that
+does nothing: without one the API inserts its own, which prunes every image before pulling, and
+a CVM rebooted afterwards would lose the image it runs. `deploy/phala.py` is the create/update
+call itself (exact compose, `compose_hash` check, encrypted env) for a deploy run by hand.
 
 ## Deploying the dev node
 
