@@ -1,0 +1,54 @@
+name: deploy-app
+
+# Deploys a tenant App's CVM from a compose the tenant already registered as a Revision. The
+# compose comes in as base64 because it is the tenant's artifact, not a file of this repository,
+# and its bytes must reach Phala unchanged. The credential for the private alpha-runtime image is
+# this job's own token, which is why the job waits until the container runs.
+on:
+  workflow_dispatch:
+    inputs:
+      compose_b64:
+        description: The registered app-compose.json, base64
+        required: true
+      name:
+        description: CVM name when creating
+        required: false
+        default: alpha-test-app-1
+      cvm_id:
+        description: Update this CVM; empty creates one
+        required: false
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  app:
+    runs-on: ubuntu-latest
+    environment: dev
+    env:
+      CVM_ID: ${{ inputs.cvm_id }}
+      CVM_NAME: ${{ inputs.name }}
+      COMPOSE_B64: ${{ inputs.compose_b64 }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy the App's CVM
+        env:
+          PHALA_API_KEY: ${{ secrets.PHALA_API_KEY }}
+          PHALA_IMAGE: dstack-0.5.9
+          ALPHACOMPUTE_KMS_ENDPOINTS: ${{ vars.ALPHACOMPUTE_KMS_ENDPOINTS }}
+          ALPHACOMPUTE_GHCR_TOKEN: ${{ github.token }}
+        run: |
+          pip install --quiet cryptography
+          printf '%s' "$COMPOSE_B64" | base64 -d > app-compose.json
+          python3 -c "import json;c=json.load(open('app-compose.json'));print('app', c['name'], '| allowed_envs', c['allowed_envs'])"
+          if [ -n "$CVM_ID" ]; then
+            python3 deploy/phala.py update "$CVM_ID" app-compose.json > cvm.json
+          else
+            python3 deploy/phala.py create app-compose.json "$CVM_NAME" > cvm.json
+          fi
+          cat cvm.json >> "$GITHUB_STEP_SUMMARY"
+      - name: Wait for the container to run while the token is still valid
+        env:
+          PHALA_API_KEY: ${{ secrets.PHALA_API_KEY }}
+        run: python3 deploy/phala.py wait "$(jq -r .cvm_id cvm.json)"
