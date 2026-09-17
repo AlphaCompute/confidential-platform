@@ -10,6 +10,10 @@ use serde_yaml_ng::{Mapping, Value as Yaml};
 use std::time::{Duration, Instant};
 
 pub const RUNTIME_SERVICE: &str = "alpha-runtime";
+/// The App's Endpoint is the CVM's 443: the dstack gateway passes
+/// `<app id>-443s.<base>` through to it, and shroud-go builds the App's URL on
+/// that port. One service publishes it, or nothing answers there.
+const APP_PORT: u16 = 443;
 const SOCKET_VOLUME: &str = "alpha-run:/run/alpha";
 const KMS_ENVS: [&str; 4] = [
     "ALPHACOMPUTE_DATABASE_URL",
@@ -48,6 +52,10 @@ pub struct AppSpec {
 #[serde(deny_unknown_fields)]
 pub struct Service {
     pub image: String,
+    /// The container port that serves the App's Endpoint, published as the
+    /// CVM's 443. Exactly one service declares it.
+    #[serde(default)]
+    pub port: Option<u16>,
     /// What the image runs, when its entrypoint is not what the tenant wants.
     /// A string is a shell command, a list is an argv, as docker compose reads
     /// them; either way it is part of the compose and therefore measured.
@@ -95,6 +103,7 @@ fn docker_compose_file(spec: &AppSpec) -> Result<String, String> {
         return Err("runtime.kms_ca_spki_sha256 is not sha256:<64 hex>".into());
     }
     let mut services = Mapping::new();
+    let mut publishing: Vec<String> = Vec::new();
     for (name, service) in &spec.services {
         let name = name
             .as_str()
@@ -114,10 +123,27 @@ fn docker_compose_file(spec: &AppSpec) -> Result<String, String> {
         if !service.environment.is_empty() {
             out.insert(key("environment"), Yaml::Mapping(service.environment));
         }
+        if let Some(port) = service.port {
+            publishing.push(name.to_owned());
+            out.insert(key("ports"), strings(&[&format!("{APP_PORT}:{port}")]));
+        }
         if service.socket {
             out.insert(key("volumes"), strings(&[SOCKET_VOLUME]));
         }
         services.insert(key(name), Yaml::Mapping(out));
+    }
+    // A Revision whose Endpoint answers nothing cannot be confirmed by anyone:
+    // the deploy hands back a URL, the wait for it times out, and the reason is
+    // invisible. Refuse it here instead.
+    if publishing.len() != 1 {
+        return Err(format!(
+            "exactly one service must declare `port`, the App's Endpoint being the CVM's {APP_PORT}; these do: {}",
+            if publishing.is_empty() {
+                "none".to_owned()
+            } else {
+                publishing.join(", ")
+            }
+        ));
     }
     let revisions: Vec<String> = spec
         .runtime
@@ -425,6 +451,14 @@ mod tests {
             alpha_core::compose_hash(&compose).to_string(),
             alpha_core::compose_hash(&super::compose(&parse(&base).unwrap()).unwrap()).to_string()
         );
+    }
+
+    #[test]
+    fn a_revision_whose_endpoint_answers_nothing_is_refused() {
+        let base = fs::read_to_string(vector().join("app.yaml")).unwrap();
+        let unpublished = base.replace("    port: 443\n", "");
+        let spec = parse(&unpublished).unwrap();
+        assert!(compose(&spec).unwrap_err().contains("exactly one service"));
     }
 
     #[test]
