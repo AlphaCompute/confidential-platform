@@ -48,6 +48,11 @@ pub struct AppSpec {
 #[serde(deny_unknown_fields)]
 pub struct Service {
     pub image: String,
+    /// What the image runs, when its entrypoint is not what the tenant wants.
+    /// A string is a shell command, a list is an argv, as docker compose reads
+    /// them; either way it is part of the compose and therefore measured.
+    #[serde(default)]
+    pub command: Option<Yaml>,
     #[serde(default)]
     pub environment: Mapping,
     /// Mounts `/run/alpha`; not for the container that runs model-written code.
@@ -103,6 +108,9 @@ fn docker_compose_file(spec: &AppSpec) -> Result<String, String> {
             .map_err(|e| format!("services.{name}: {e}"))?;
         let mut out = Mapping::new();
         out.insert(key("image"), key(&service.image));
+        if let Some(command) = service.command {
+            out.insert(key("command"), command);
+        }
         if !service.environment.is_empty() {
             out.insert(key("environment"), Yaml::Mapping(service.environment));
         }
@@ -397,6 +405,26 @@ mod tests {
                 .contains(&format!("{DEV_ROOT_ENV}: ${{{DEV_ROOT_ENV}}}"))
         );
         assert!(kms_compose(app_id, "ghcr.io/alphacompute/alpha-kms:v1", false).is_err());
+    }
+
+    /// An image whose entrypoint is not what the tenant wants runs a command,
+    /// and that command is compose and therefore measured.
+    #[test]
+    fn a_service_command_reaches_the_measured_compose() {
+        let base = fs::read_to_string(vector().join("app.yaml")).unwrap();
+        let with_command = base.replace(
+            "    socket: true\n",
+            "    socket: true\n    command: sh -c 'sleep 1'\n",
+        );
+        let spec = parse(&with_command).unwrap();
+        let compose = compose(&spec).unwrap();
+        let parsed: Value = serde_json::from_str(&compose).unwrap();
+        let services = parsed["docker_compose_file"].as_str().unwrap();
+        assert!(services.contains("command: sh -c 'sleep 1'"), "{services}");
+        assert_ne!(
+            alpha_core::compose_hash(&compose).to_string(),
+            alpha_core::compose_hash(&super::compose(&parse(&base).unwrap()).unwrap()).to_string()
+        );
     }
 
     #[test]
