@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 pub mod context {
     pub const REVISION: &str = "alphacompute/revision/v1";
     pub const SECRET: &str = "alphacompute/secret/v1";
+    pub const ORG_ROOT_KEY: &str = "alphacompute/org-root-key/v1";
     pub const PRINCIPAL_KEY: &str = "alphacompute/principal-key/v1";
     pub const CONTROL: &str = "alphacompute/control/v1";
     pub const PLATFORM: &str = "alphacompute/platform/v1";

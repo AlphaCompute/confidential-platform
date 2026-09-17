@@ -78,11 +78,13 @@ fn api_error(endpoint: &str, status: reqwest::StatusCode, bytes: &[u8]) -> Error
     }
 }
 
-/// `{ "key_id", "algorithm": "ed25519", "signature" }`.
+/// `{ "key_id", "algorithm": "ed25519", "signature" }`; `key_id` is absent only on an
+/// organization's root key registration, whose signer is not in the roster yet.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignatureObject {
-    pub key_id: KeyId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<KeyId>,
     pub algorithm: String,
     pub signature: String,
 }
@@ -105,6 +107,21 @@ pub struct PutSecretBody {
 }
 
 pub fn sign(ctx: &str, payload: Value, key_id: KeyId, key: &SigningKey) -> Result<Signed, Error> {
+    sign_as(ctx, payload, Some(key_id), key)
+}
+
+/// A document a key signs for itself: the organization's root key registration, whose signer
+/// the roster does not know yet.
+pub fn sign_self(ctx: &str, payload: Value, key: &SigningKey) -> Result<Signed, Error> {
+    sign_as(ctx, payload, None, key)
+}
+
+fn sign_as(
+    ctx: &str,
+    payload: Value,
+    key_id: Option<KeyId>,
+    key: &SigningKey,
+) -> Result<Signed, Error> {
     let digest = signing_digest(ctx, &payload)
         .map_err(|e| Error::Invalid(format!("payload does not canonicalize: {e}")))?;
     Ok(Signed {
@@ -229,16 +246,6 @@ pub struct BootstrapRequest {
 #[serde(deny_unknown_fields)]
 pub struct BootstrapBody {
     pub custodians: [PublicKey; 3],
-    pub anchor: Anchor,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Anchor {
-    pub org_id: OrgId,
-    pub principal_id: PrincipalId,
-    pub public_key: String,
-    pub label: String,
 }
 
 /// The reply as received; `payload` is typed only after its signature has been checked.
@@ -261,7 +268,6 @@ pub struct NodeSignature {
 pub struct BootstrapPayload {
     pub shares_hpke: Vec<Sealed>,
     pub kms_ca_pem: String,
-    pub anchor_key_id: KeyId,
 }
 
 impl BootstrapReply {
@@ -568,7 +574,7 @@ mod tests {
         let node = p256::ecdsa::SigningKey::from_bytes((&[3u8; 32]).into()).unwrap();
         let spki = node.verifying_key().to_public_key_der().unwrap().into_vec();
         let payload = serde_json::json!({
-            "shares_hpke": [], "kms_ca_pem": "pem", "anchor_key_id": KeyId::mint()
+            "shares_hpke": [], "kms_ca_pem": "pem"
         });
         let sig: p256::ecdsa::Signature =
             node.sign(&signing_digest(context::NODE_BOOTSTRAP, &payload).unwrap());

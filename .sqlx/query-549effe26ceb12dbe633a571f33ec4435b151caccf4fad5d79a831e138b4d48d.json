@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "insert into principal_keys (id, org_id, principal_id, public_key, document, registered_by_key, signature)\n             values ($1, $2, $3, $4, $5, $6, $7) returning created_at",
+  "query": "insert into principal_keys (id, org_id, principal_id, public_key, document, signature, anchor_check)\n         values ($1, $2, $3, $4, $5, $6, $7) returning created_at",
   "describe": {
     "columns": [
       {
@@ -22,13 +22,13 @@
         "Uuid",
         "Bytea",
         "Jsonb",
-        "Uuid",
-        "Jsonb"
+        "Jsonb",
+        "Bytea"
       ]
     },
     "nullable": [
       false
     ]
   },
-  "hash": "7bba5018c7b10c6d39c7a51d79c96af287d1862c5f497aabb8bd54aa6d4e910e"
+  "hash": "549effe26ceb12dbe633a571f33ec4435b151caccf4fad5d79a831e138b4d48d"
 }

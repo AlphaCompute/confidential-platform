@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select id, principal_id, public_key, created_at from principal_keys\n         where org_id = $1 and registered_by_key is null",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "principal_keys",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "principal_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "principal_keys",
+            "name": "principal_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "public_key",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "principal_keys",
+            "name": "public_key"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "principal_keys",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "f17ec997a0368adc2e84d26eb1c87ac3ab6e40f25b1eaae4882f3107f4ef28db"
+}

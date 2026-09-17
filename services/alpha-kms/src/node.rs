@@ -11,12 +11,10 @@ use axum::Json;
 use axum::extract::{Extension, Query, State};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
-use ed25519_dalek::pkcs8::DecodePublicKey;
 use p256::ecdsa::signature::Signer;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use uuid::Uuid;
 use vsss_rs::Gf256;
 use zeroize::Zeroizing;
 
@@ -73,11 +71,6 @@ pub async fn bootstrap(
     .map_err(|e| ApiError::malformed(format!("body_hpke: {e}")))?;
     let body: BootstrapBody =
         serde_json::from_slice(&body).map_err(|e| ApiError::malformed(format!("body: {e}")))?;
-    let anchor_spki = BASE64_URL_SAFE_NO_PAD
-        .decode(&body.anchor.public_key)
-        .map_err(|_| ApiError::malformed("anchor public_key: not base64url"))?;
-    ed25519_dalek::VerifyingKey::from_public_key_der(&anchor_spki)
-        .map_err(|_| ApiError::malformed("anchor public_key: not an Ed25519 SPKI"))?;
     let now = node.now();
 
     let root = root_kek(&node)?;
@@ -98,27 +91,9 @@ pub async fn bootstrap(
     if inserted != 2 {
         return Err(ApiError::new("already_exists", "database is not empty"));
     }
-    let anchor_id: Uuid = alpha_core::KeyId::mint().into();
-    let check = keys::anchor_check(&tenant_kek_root, body.anchor.org_id, &anchor_spki)?;
-    sqlx::query!(
-        "insert into principal_keys (id, org_id, principal_id, public_key, document, anchor_check)
-         values ($1, $2, $3, $4, $5, $6)",
-        anchor_id,
-        Uuid::from(body.anchor.org_id),
-        Uuid::from(body.anchor.principal_id),
-        anchor_spki,
-        json!(body.anchor),
-        check.as_slice(),
-    )
-    .execute(&mut *tx)
-    .await?;
-    audit::node(
-        "node.bootstrap",
-        "ok",
-        json!({ "org_id": body.anchor.org_id, "anchor_key": anchor_id }),
-    )
-    .insert(&mut *tx)
-    .await?;
+    audit::node("node.bootstrap", "ok", json!({}))
+        .insert(&mut *tx)
+        .await?;
     tx.commit().await?;
 
     let shares = Gf256::split_bytes(
@@ -143,7 +118,6 @@ pub async fn bootstrap(
     let payload = json!({
         "shares_hpke": shares_hpke,
         "kms_ca_pem": keys.ca_pem(),
-        "anchor_key_id": anchor_id,
     });
     let digest = signing_digest(context::NODE_BOOTSTRAP, &payload)
         .map_err(|e| ApiError::internal(format!("payload: {e}")))?;

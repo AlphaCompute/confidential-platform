@@ -18,7 +18,7 @@ use std::time::SystemTime;
 
 use alpha_cli::call::Route;
 use alpha_cli::{call, deploy, node as cli_node, sign};
-use alpha_client::{Anchor, Client, Pin, tls};
+use alpha_client::{Client, Pin, tls};
 use alpha_core::{AppId, KeyId, PrincipalId};
 use alpha_kms::{certs, platform};
 use common::*;
@@ -114,11 +114,11 @@ async fn call_signs_all_five_control_routes() {
         }
     };
 
-    // Route 4 by the anchor, whose id the bootstrap reply handed out.
+    // Route 4 by the organization's root key.
     let admin_key = SigningKey::from_bytes(&[21u8; 32]);
     let reply = run(
         Route::RegisterKey,
-        &h.anchor,
+        &h.root,
         json!({ "principal_id": PrincipalId::mint(), "public_key": spki_b64(&admin_key), "label": "day-to-day" }),
         None,
     )
@@ -202,7 +202,7 @@ async fn call_signs_all_five_control_routes() {
     // Route 5, then the revoked key signs nothing.
     let reply = run(
         Route::RevokeKey,
-        &h.anchor,
+        &h.root,
         json!({ "key_id": admin.0, "reason": "compromised" }),
         None,
     )
@@ -224,7 +224,7 @@ async fn call_signs_all_five_control_routes() {
         &client,
         Route::RevokeKey,
         Some(alpha_core::context::SECRET),
-        (h.anchor.0, &h.anchor.1),
+        (h.root.0, &h.root.1),
         json!({ "key_id": admin.0, "reason": "retired" }),
         None,
         now,
@@ -241,7 +241,7 @@ async fn deploy_register_only_registers_the_generated_compose() {
         return;
     };
     let client = pinned(&h, ca_pin(&h));
-    let admin = h.register_key(&h.anchor, 22).await;
+    let admin = h.register_key(&h.root, 22).await;
     let vector = testdata().join("manifest/05-deploy");
     let spec = deploy::parse(&fs::read_to_string(vector.join("app.yaml")).unwrap()).unwrap();
     let expected: Value =
@@ -327,12 +327,12 @@ async fn bootstrap_once_never_again_then_unseal_the_second_node() {
         h.bootstrap["kms_ca_spki_sha256"],
         json!(sign::ca_spki_sha256(&h.ca_pem).unwrap().unwrap())
     );
-    let anchor_id: Uuid =
+    let root_id: Uuid =
         sqlx::query_scalar!("select id from principal_keys where registered_by_key is null")
             .fetch_one(&h.pool)
             .await
             .unwrap();
-    assert_eq!(h.anchor.0, KeyId::from(anchor_id));
+    assert_eq!(h.root.0, KeyId::from(root_id));
     let identity = node_identity(&h.node);
     let shares: Vec<std::path::PathBuf> =
         serde_json::from_value(h.bootstrap["shares"].clone()).unwrap();
@@ -348,14 +348,8 @@ async fn bootstrap_once_never_again_then_unseal_the_second_node() {
 
     // Never again: the serving node refuses, and so does a fresh sealed node over the same database.
     let pubs = custodian_pubs(&h.custodians);
-    let anchor = Anchor {
-        org_id: h.org,
-        principal_id: PrincipalId::mint(),
-        public_key: spki_b64(&h.anchor.1),
-        label: "again".into(),
-    };
     let client = spki_client(&h.url, &h.node);
-    let err = cli_node::bootstrap(&client, &identity, pubs.clone(), anchor.clone(), 1, &h.dir)
+    let err = cli_node::bootstrap(&client, &identity, pubs.clone(), 1, &h.dir)
         .await
         .unwrap_err();
     assert!(err.starts_with("already_exists"), "{err}");
@@ -369,7 +363,7 @@ async fn bootstrap_once_never_again_then_unseal_the_second_node() {
     assert!(node2.is_sealed());
     let identity2 = node_identity(&node2);
     let client2 = spki_client(&url2, &node2);
-    let err = cli_node::bootstrap(&client2, &identity2, pubs, anchor, 1, &h.dir)
+    let err = cli_node::bootstrap(&client2, &identity2, pubs, 1, &h.dir)
         .await
         .unwrap_err();
     assert!(err.starts_with("already_exists"), "{err}");

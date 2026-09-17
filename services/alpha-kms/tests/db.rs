@@ -120,19 +120,118 @@ async fn bootstrap_once_unseal_with_two_shares_and_sealed_gate() {
     );
 }
 
+/// Nobody authorizes a root key: an `org_id` is claimed once, and re-sending the same document
+/// is how the organization learns whose key the claim holds.
+#[tokio::test]
+async fn a_root_key_claims_its_organization_once() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let genesis = h.audit("node.bootstrap").await;
+    assert_eq!(
+        genesis.iter().map(|r| (&r.1, &r.2)).collect::<Vec<_>>(),
+        vec![(&"ok".to_owned(), &json!({}))],
+        "genesis names no organization"
+    );
+
+    let org = OrgId::mint();
+    let key = SigningKey::from_bytes(&[31u8; 32]);
+    let document = root_key_registration(org, &key, h.now());
+    let (status, first) = h.post("/v1/keys", document.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["org_id"], json!(org));
+    assert_eq!(first["public_key"], json!(spki_b64(&key)));
+    let (status, again) = h.post("/v1/keys", document.clone()).await;
+    assert_eq!(
+        (status, &again["id"], &again["public_key"]),
+        (StatusCode::OK, &first["id"], &first["public_key"]),
+        "the same document again is the same row"
+    );
+
+    let stranger = SigningKey::from_bytes(&[32u8; 32]);
+    let (status, reply) = h
+        .post("/v1/keys", root_key_registration(org, &stranger, h.now()))
+        .await;
+    assert_eq!(
+        (status, code(&reply)),
+        (StatusCode::CONFLICT, "already_exists"),
+        "the claim is not reassigned"
+    );
+    let (status, reply) = h
+        .post(
+            "/v1/keys",
+            root_key_registration(OrgId::mint(), &key, h.now()),
+        )
+        .await;
+    assert_eq!(
+        (status, code(&reply)),
+        (StatusCode::CONFLICT, "already_exists"),
+        "one key, one organization"
+    );
+
+    // The signature is checked against the key inside the document, so naming another key fails.
+    let mut forged = root_key_registration(OrgId::mint(), &key, h.now());
+    forged["payload"]["public_key"] = json!(spki_b64(&stranger));
+    let (status, reply) = h.post("/v1/keys", forged).await;
+    assert_eq!(
+        (status, code(&reply)),
+        (StatusCode::BAD_REQUEST, "signature_invalid")
+    );
+    // A claim signed under the context of an endorsed registration is not a claim: without a
+    // separate context, a document signed for another purpose would register a root key.
+    let elsewhere = SigningKey::from_bytes(&[33u8; 32]);
+    let mut payload = document["payload"].clone();
+    payload["org_id"] = json!(OrgId::mint());
+    payload["public_key"] = json!(spki_b64(&elsewhere));
+    let wrong_ctx =
+        json!(alpha_client::sign_self(context::PRINCIPAL_KEY, payload, &elsewhere).unwrap());
+    let (status, reply) = h.post("/v1/keys", wrong_ctx).await;
+    assert_eq!(
+        (status, code(&reply)),
+        (StatusCode::BAD_REQUEST, "signature_invalid")
+    );
+
+    // The new root key endorses a key of its own, and that key's chain ends at it.
+    let root = (first["id"].as_str().unwrap().parse().unwrap(), key);
+    let admin = h.register_key(&root, 34).await;
+
+    // Grafted onto the pilot organization's root by a superuser, the same row signs nothing:
+    // its registration signature no longer verifies under its new parent.
+    sqlx::query!(
+        "update principal_keys set org_id = $1, registered_by_key = $2 where id = $3",
+        Uuid::from(h.org),
+        Uuid::from(h.root.0),
+        Uuid::from(admin.0)
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    let payload = json!({ "key_id": admin.0, "reason": "retired", "issued_at": rfc3339(h.now()) });
+    let (status, reply) = h
+        .post(
+            &format!("/v1/keys/{}/revoke", admin.0),
+            h.signed(context::CONTROL, payload, &admin),
+        )
+        .await;
+    assert_eq!(
+        (status, code(&reply)),
+        (StatusCode::BAD_REQUEST, "signature_invalid")
+    );
+}
+
 #[tokio::test]
 async fn control_routes_register_revoke_and_put() {
     let Some(h) = harness().await else {
         return;
     };
-    let admin = h.register_key(&h.anchor, 11).await;
+    let admin = h.register_key(&h.root, 11).await;
 
     // Route 4 idempotency: the same public key again is already_exists; unknown signer is signature_invalid.
     let payload = json!({ "principal_id": PrincipalId::mint(), "public_key": b64(admin.1.verifying_key().to_public_key_der().unwrap().as_bytes()), "label": "dup", "issued_at": rfc3339(h.now()) });
     let (status, reply) = h
         .post(
             "/v1/keys",
-            h.signed(context::PRINCIPAL_KEY, payload.clone(), &h.anchor),
+            h.signed(context::PRINCIPAL_KEY, payload.clone(), &h.root),
         )
         .await;
     assert_eq!(
@@ -150,7 +249,7 @@ async fn control_routes_register_revoke_and_put() {
         (status, code(&reply)),
         (StatusCode::BAD_REQUEST, "signature_invalid")
     );
-    let mut wrong_ctx = h.signed(context::CONTROL, payload.clone(), &h.anchor);
+    let mut wrong_ctx = h.signed(context::CONTROL, payload.clone(), &h.root);
     wrong_ctx["payload"]["label"] = json!("dup2");
     let (status, reply) = h.post("/v1/keys", wrong_ctx).await;
     assert_eq!(
@@ -159,7 +258,7 @@ async fn control_routes_register_revoke_and_put() {
     );
     let old = json!({ "principal_id": PrincipalId::mint(), "public_key": payload["public_key"], "label": "old", "issued_at": "2020-01-01T00:00:00Z" });
     let (status, reply) = h
-        .post("/v1/keys", h.signed(context::PRINCIPAL_KEY, old, &h.anchor))
+        .post("/v1/keys", h.signed(context::PRINCIPAL_KEY, old, &h.root))
         .await;
     assert_eq!(
         (status, code(&reply)),
@@ -221,13 +320,13 @@ async fn control_routes_register_revoke_and_put() {
         "name != app_id"
     );
 
-    // Another organization: its anchor exists only through a second bootstrap, so fake one through the table
-    // with a random anchor_check — its keys never converge on a real anchor.
+    // A root row forged in the table with a random anchor_check: its keys never converge on a
+    // real root key, whatever its own signature says.
     let other_org = OrgId::mint();
     let other_key = SigningKey::from_bytes(&[12u8; 32]);
     let other_id = Uuid::now_v7();
     let other_spki = other_key.verifying_key().to_public_key_der().unwrap();
-    sqlx::query!("insert into principal_keys (id, org_id, principal_id, public_key, document, anchor_check) values ($1, $2, $3, $4, '{}', $5)",
+    sqlx::query!("insert into principal_keys (id, org_id, principal_id, public_key, document, signature, anchor_check) values ($1, $2, $3, $4, '{}', '{}', $5)",
         other_id, Uuid::from(other_org), Uuid::now_v7(), other_spki.as_bytes(), &[0u8; 32][..])
         .execute(&h.pool).await.unwrap();
     let other = (KeyId::from(other_id), other_key);
@@ -341,14 +440,14 @@ async fn control_routes_register_revoke_and_put() {
     let (status, r1) = h
         .post(
             &format!("/v1/keys/{}/revoke", admin.0),
-            h.signed(context::CONTROL, payload.clone(), &h.anchor),
+            h.signed(context::CONTROL, payload.clone(), &h.root),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{r1}");
     let (status, r2) = h
         .post(
             &format!("/v1/keys/{}/revoke", admin.0),
-            h.signed(context::CONTROL, payload, &h.anchor),
+            h.signed(context::CONTROL, payload, &h.root),
         )
         .await;
     assert_eq!((status, &r2), (StatusCode::OK, &r1));
@@ -363,7 +462,7 @@ async fn control_routes_register_revoke_and_put() {
     let (status, reply) = h
         .post(
             &format!("/v1/keys/{}/revoke", payload["key_id"].as_str().unwrap()),
-            h.signed(context::CONTROL, payload, &h.anchor),
+            h.signed(context::CONTROL, payload, &h.root),
         )
         .await;
     assert_eq!((status, code(&reply)), (StatusCode::NOT_FOUND, "not_found"));
@@ -390,7 +489,7 @@ async fn attest_release_revoke_and_tamper() {
     let Some(h) = harness().await else {
         return;
     };
-    let admin = h.register_key(&h.anchor, 21).await;
+    let admin = h.register_key(&h.root, 21).await;
     let app = AppId::mint();
     let hash = h.insert_capture_revision(app, &admin).await;
     let (status, reply) = h
@@ -559,7 +658,7 @@ async fn attest_release_revoke_and_tamper() {
     let (status, reply) = h
         .post(
             &format!("/v1/keys/{}/revoke", admin.0),
-            h.signed(context::CONTROL, payload, &h.anchor),
+            h.signed(context::CONTROL, payload, &h.root),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{reply}");

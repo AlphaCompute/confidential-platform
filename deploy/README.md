@@ -103,19 +103,25 @@ the platform-document URL are served; the signed document lists the Revision.
    `ALPHACOMPUTE_PCCS_URL`, `ALPHACOMPUTE_PLATFORM_DOCUMENT_URL`, and after the commit check that
    the stored compose still hashes to `manifest.json`'s `compose_hash`. The node comes up
    `sealed`: `GET /ready` answers 503 `{"sealed": true}`.
-3. **Bootstrap** on the first node: `alpha bootstrap --custodians c1.pub c2.pub c3.pub --anchor
-   anchor.json --endpoint https://<node 1>` (`crates/alpha-cli/README.md`). The CLI verifies the
+3. **Bootstrap** on the first node: `alpha bootstrap --custodians c1.pub c2.pub c3.pub
+   --endpoint https://<node 1>` (`crates/alpha-cli/README.md`). The CLI verifies the
    node's evidence against the signed document before it seals anything; it writes one share
-   file per custodian (hand each over, delete it) and prints `kms_ca_pem` and `anchor_key_id`.
+   file per custodian (hand each over, delete it) and prints `kms_ca_pem`. Genesis carries no
+   organization: custodians hold the platform's key material and have nothing to do with tenants.
    The node commits genesis before it answers, and the shares exist only in that answer: if
    the CLI does not get it (connection lost, CLI killed), do not retry — the retry is refused
    as `already_exists` and nothing can unseal the row it wrote. Drop the database, recreate it
    (step 1) and bootstrap again; nothing else has been written yet.
 4. **Re-sign the document** with `kms_ca_pem` filled in; both nodes pick it up on their
    five-minute timer. From now on `alpha sign --check` prints the two values a tenant pins.
-5. **Register the everyday admin key** of the pilot organization with the anchor key
-   (`alpha call register-key --key anchor.key --key-id <anchor_key_id> …`); the anchor goes
-   offline.
+5. **The organization registers its root key** against the `org_id` the console shows, by
+   posting `{payload, signature}` to `POST /v1/keys`: the payload is
+   `{org_id, principal_id, public_key, label, issued_at}`, signed by the key it names under
+   `alphacompute/org-root-key/v1` and with no `key_id` in the signature object. An `org_id` is
+   claimed once; re-sending the same document answers 200 with the stored row, which is how the
+   organization checks that the key against its identifier is its own. It then registers the
+   everyday admin key (`alpha call register-key --key root.key --key-id <the reply's id> …`) and
+   the root key goes offline.
 6. **Create the second CVM** in the other region with the same compose and env. On start it walks
    `ALPHACOMPUTE_KMS_ENDPOINTS`, finds the first node ready, writes `node.join.request` and
    joins; `GET /ready` on it answers 200 `{"sealed": false}`. A node that started before the
