@@ -8,7 +8,7 @@ use std::time::SystemTime;
 
 use alpha_attest::{Collateral, PlatformDocument, appraise};
 use alpha_client::{
-    Anchor, BootstrapBody, BootstrapRequest, Client, NodeEvidence, Pin, UnsealReply, UnsealRequest,
+    BootstrapBody, BootstrapRequest, Client, NodeEvidence, Pin, UnsealReply, UnsealRequest,
     fetch_node_evidence,
 };
 use alpha_crypto::{INFO_NODE_BOOTSTRAP, INFO_UNSEAL_SHARE, PublicKey, Sealed};
@@ -144,16 +144,15 @@ impl ShareFile {
 
 /// Seals the bootstrap body to the verified node, checks the reply's signature under the
 /// node's runtime key, writes `share-1.json` … `share-3.json` into `out_dir` and returns
-/// `kms_ca_pem`, its SPKI hash and the anchor's key id.
+/// `kms_ca_pem` with its SPKI hash.
 pub async fn bootstrap(
     client: &Client,
     node: &NodeIdentity,
     custodians: [PublicKey; 3],
-    anchor: Anchor,
     doc_version: u64,
     out_dir: &Path,
 ) -> Result<Value, String> {
-    let body = BootstrapBody { custodians, anchor };
+    let body = BootstrapBody { custodians };
     let body_hpke = alpha_crypto::seal(
         &node.xwing,
         INFO_NODE_BOOTSTRAP,
@@ -189,7 +188,6 @@ pub async fn bootstrap(
     Ok(json!({
         "kms_ca_pem": payload.kms_ca_pem,
         "kms_ca_spki_sha256": crate::sign::ca_spki_sha256(&payload.kms_ca_pem)?,
-        "anchor_key_id": payload.anchor_key_id,
         "shares": paths,
     }))
 }

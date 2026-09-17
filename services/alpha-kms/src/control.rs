@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use alpha_core::{AppId, ComposeHash, KeyId, PrincipalId, SecretId, context};
+use alpha_core::{AppId, ComposeHash, KeyId, OrgId, PrincipalId, SecretId, context};
 use axum::Json;
 use axum::extract::{Path, State};
 use base64::Engine;
@@ -97,10 +97,11 @@ async fn audited(
     Ok(())
 }
 
-async fn denied(node: &Node, key_id: KeyId, action: &str, error: &ApiError) {
+async fn denied(node: &Node, key_id: Option<KeyId>, action: &str, error: &ApiError) {
+    let actor = key_id.map_or_else(|| "unregistered".to_owned(), |k| k.to_string());
     let _ = Audit {
         actor_kind: "principal",
-        actor: &key_id.to_string(),
+        actor: &actor,
         action,
         org_id: None,
         object: None,
@@ -390,58 +391,201 @@ struct KeyPayload {
     issued_at: DateTime<Utc>,
 }
 
+/// The degenerate registration: the organization's own identifier, because the signer is not in
+/// the roster and cannot be asked which organization it belongs to.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RootKeyPayload {
+    org_id: OrgId,
+    principal_id: PrincipalId,
+    public_key: String,
+    #[allow(dead_code)]
+    label: String,
+    issued_at: DateTime<Utc>,
+}
+
+fn registered_spki(public_key: &str) -> Result<Vec<u8>, ApiError> {
+    let spki = BASE64_URL_SAFE_NO_PAD
+        .decode(public_key)
+        .map_err(|_| ApiError::malformed("public_key: not base64url"))?;
+    ed25519_dalek::VerifyingKey::from_public_key_der(&spki)
+        .map_err(|_| ApiError::malformed("public_key: not an Ed25519 SPKI"))?;
+    Ok(spki)
+}
+
+/// A missing `key_id` is the organization's root key registering itself; anything else is a
+/// key an existing one endorses.
 pub async fn register_key(
     State(node): State<Arc<Node>>,
     Body(body): Body<Signed>,
 ) -> Result<Json<Value>, ApiError> {
     audited_route!(node, body, "key.register", async {
         let keys = node.intermediates()?;
-        let p: KeyPayload = payload(&body.payload)?;
-        let spki = BASE64_URL_SAFE_NO_PAD
-            .decode(&p.public_key)
-            .map_err(|_| ApiError::malformed("public_key: not base64url"))?;
-        ed25519_dalek::VerifyingKey::from_public_key_der(&spki)
-            .map_err(|_| ApiError::malformed("public_key: not an Ed25519 SPKI"))?;
-        let at = within_window(p.issued_at, node.now_utc())?;
-        let chain = authorize(&node, &keys, context::PRINCIPAL_KEY, &body, at).await?;
-        let id: Uuid = KeyId::mint().into();
-        let mut tx = node.pool.begin().await?;
-        let inserted = sqlx::query_scalar!(
-            "insert into principal_keys (id, org_id, principal_id, public_key, document, registered_by_key, signature)
-             values ($1, $2, $3, $4, $5, $6, $7) returning created_at",
-            id,
-            chain.key.org_id,
-            Uuid::from(p.principal_id),
-            spki,
-            body.payload,
-            chain.key.id,
-            json!(body.signature),
-        )
-        .fetch_one(&mut *tx)
-        .await;
-        let created_at = match inserted {
-            Ok(t) => t,
-            Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
-                return Err(ApiError::new(
-                    "already_exists",
-                    "public_key is already registered",
-                ));
-            }
-            Err(e) => return Err(e.into()),
-        };
-        audited(
-            &mut tx,
-            &chain,
-            "key.register",
-            format!("key:{id}"),
-            json!({ "principal_id": p.principal_id }),
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(json!({
-            "id": id, "principal_id": p.principal_id, "org_id": chain.key.org_id,
-            "created_at": rfc3339(created_at),
-        }))
+        match body.signature.key_id {
+            Some(_) => register_endorsed_key(&node, &keys, &body).await,
+            None => register_root_key(&node, &keys, &body).await,
+        }
+    })
+}
+
+async fn register_endorsed_key(
+    node: &Node,
+    keys: &Intermediates,
+    body: &Signed,
+) -> Result<Value, ApiError> {
+    let p: KeyPayload = payload(&body.payload)?;
+    let spki = registered_spki(&p.public_key)?;
+    let at = within_window(p.issued_at, node.now_utc())?;
+    let chain = authorize(node, keys, context::PRINCIPAL_KEY, body, at).await?;
+    let id: Uuid = KeyId::mint().into();
+    let mut tx = node.pool.begin().await?;
+    let inserted = sqlx::query_scalar!(
+        "insert into principal_keys (id, org_id, principal_id, public_key, document, registered_by_key, signature)
+         values ($1, $2, $3, $4, $5, $6, $7) returning created_at",
+        id,
+        chain.key.org_id,
+        Uuid::from(p.principal_id),
+        spki,
+        body.payload,
+        chain.key.id,
+        json!(body.signature),
+    )
+    .fetch_one(&mut *tx)
+    .await;
+    let created_at = match inserted {
+        Ok(t) => t,
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+            return Err(ApiError::new(
+                "already_exists",
+                "public_key is already registered",
+            ));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    audited(
+        &mut tx,
+        &chain,
+        "key.register",
+        format!("key:{id}"),
+        json!({ "principal_id": p.principal_id }),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(json!({
+        "id": id, "principal_id": p.principal_id, "org_id": chain.key.org_id,
+        "created_at": rfc3339(created_at),
+    }))
+}
+
+/// Nobody authorizes this: the organization claims its identifier once, and afterwards the only
+/// question the route answers is whose key is stored against it — its own document back means
+/// its own key, `already_exists` means somebody else claimed it first.
+async fn register_root_key(
+    node: &Node,
+    keys: &Intermediates,
+    body: &Signed,
+) -> Result<Value, ApiError> {
+    let p: RootKeyPayload = payload(&body.payload)?;
+    let spki = registered_spki(&p.public_key)?;
+    within_window(p.issued_at, node.now_utc())?;
+    if body.signature.algorithm != "ed25519" {
+        return Err(ApiError::signature_invalid("unsupported algorithm"));
+    }
+    let digest = alpha_core::signing_digest(context::ORG_ROOT_KEY, &body.payload)
+        .map_err(|e| ApiError::malformed(format!("payload: {e}")))?;
+    if !keys::verify_ed25519(&spki, &digest, &body.signature.signature) {
+        return Err(ApiError::signature_invalid("signature does not verify"));
+    }
+    let org_id = Uuid::from(p.org_id);
+    let mut tx = node.pool.begin().await?;
+    sqlx::query!(
+        "select pg_advisory_xact_lock(hashtext($1))",
+        org_id.to_string()
+    )
+    .execute(&mut *tx)
+    .await?;
+    let claimed = sqlx::query!(
+        "select id, principal_id, public_key, created_at from principal_keys
+         where org_id = $1 and registered_by_key is null",
+        org_id
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(row) = claimed {
+        if row.public_key != spki {
+            return Err(ApiError::new(
+                "already_exists",
+                "org_id is registered to another root key",
+            ));
+        }
+        return Ok(root_key_json(
+            row.id,
+            row.principal_id,
+            org_id,
+            &row.public_key,
+            row.created_at,
+        ));
+    }
+    let id: Uuid = KeyId::mint().into();
+    let check = keys::anchor_check(&keys.tenant_kek_root, p.org_id, &spki)?;
+    let inserted = sqlx::query_scalar!(
+        "insert into principal_keys (id, org_id, principal_id, public_key, document, signature, anchor_check)
+         values ($1, $2, $3, $4, $5, $6, $7) returning created_at",
+        id,
+        org_id,
+        Uuid::from(p.principal_id),
+        spki,
+        body.payload,
+        json!(body.signature),
+        check.as_slice(),
+    )
+    .fetch_one(&mut *tx)
+    .await;
+    let created_at = match inserted {
+        Ok(t) => t,
+        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+            return Err(ApiError::new(
+                "already_exists",
+                "public_key is already registered",
+            ));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    Audit {
+        actor_kind: "principal",
+        actor: &id.to_string(),
+        action: "key.register",
+        org_id: Some(org_id),
+        object: Some(format!("key:{id}")),
+        outcome: "ok",
+        details: json!({ "principal_id": p.principal_id, "root": true }),
+        evidence_sha256: None,
+    }
+    .insert(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(root_key_json(
+        id,
+        Uuid::from(p.principal_id),
+        org_id,
+        &spki,
+        created_at,
+    ))
+}
+
+fn root_key_json(
+    id: Uuid,
+    principal_id: Uuid,
+    org_id: Uuid,
+    spki: &[u8],
+    created_at: DateTime<Utc>,
+) -> Value {
+    json!({
+        "id": id,
+        "principal_id": principal_id,
+        "org_id": org_id,
+        "public_key": BASE64_URL_SAFE_NO_PAD.encode(spki),
+        "created_at": rfc3339(created_at),
     })
 }
 

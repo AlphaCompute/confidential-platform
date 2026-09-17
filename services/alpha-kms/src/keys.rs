@@ -101,7 +101,7 @@ pub struct KeyRow {
     pub org_id: Uuid,
     pub public_key: Vec<u8>,
     pub document: Value,
-    pub signature: Option<Value>,
+    pub signature: Value,
     pub registered_by_key: Option<Uuid>,
     pub anchor_check: Option<Vec<u8>>,
     pub revoked_at: Option<DateTime<Utc>>,
@@ -167,6 +167,7 @@ pub async fn walk_chain(
                         "the chain does not end at the organization's anchor",
                     ));
                 }
+                verify_self_registration(&link)?;
                 return Ok(Chain {
                     key: first,
                     anchor_spki: link.public_key,
@@ -195,31 +196,62 @@ pub async fn walk_chain(
 /// The child's registration document names the child's own SPKI and is signed by the parent.
 fn verify_registration(child: &KeyRow, parent: &KeyRow) -> Result<(), ApiError> {
     let invalid = |m: &str| ApiError::signature_invalid(m.to_owned());
-    let signature: SignatureObject = child
-        .signature
-        .clone()
-        .and_then(|v| serde_json::from_value(v).ok())
-        .ok_or_else(|| invalid("a key in the chain has no registration signature"))?;
-    if Uuid::from(signature.key_id) != parent.id || signature.algorithm != "ed25519" {
+    let signature = registration_signature(child)?;
+    if signature.key_id.map(Uuid::from) != Some(parent.id) || signature.algorithm != "ed25519" {
         return Err(invalid(
             "a key in the chain was not registered by its parent",
         ));
     }
-    let registered_spki = child
-        .document
-        .get("public_key")
-        .and_then(Value::as_str)
-        .and_then(|s| BASE64_URL_SAFE_NO_PAD.decode(s).ok());
-    if registered_spki.as_deref() != Some(child.public_key.as_slice()) {
-        return Err(invalid(
-            "a key in the chain differs from its registration document",
-        ));
-    }
+    verify_document_spki(child)?;
     let digest = signing_digest(alpha_core::context::PRINCIPAL_KEY, &child.document)
         .map_err(|e| invalid(&format!("registration document: {e}")))?;
     if !verify_ed25519(&parent.public_key, &digest, &signature.signature) {
         return Err(invalid(
             "a key in the chain has a bad registration signature",
+        ));
+    }
+    Ok(())
+}
+
+/// The root key's registration is signed by the key it carries, under its own context and with
+/// no `key_id`. It proves nothing on its own — a forged one verifies against itself — but it is
+/// what binds `org_id` to the key, and `anchor_check` above is what a forger cannot recompute.
+fn verify_self_registration(root: &KeyRow) -> Result<(), ApiError> {
+    let invalid = |m: &str| ApiError::signature_invalid(m.to_owned());
+    let signature = registration_signature(root)?;
+    if signature.key_id.is_some() || signature.algorithm != "ed25519" {
+        return Err(invalid("the root key's registration names a signer"));
+    }
+    verify_document_spki(root)?;
+    if root.document.get("org_id").and_then(Value::as_str) != Some(root.org_id.to_string().as_str())
+    {
+        return Err(invalid(
+            "the root key is registered to another organization",
+        ));
+    }
+    let digest = signing_digest(alpha_core::context::ORG_ROOT_KEY, &root.document)
+        .map_err(|e| invalid(&format!("registration document: {e}")))?;
+    if !verify_ed25519(&root.public_key, &digest, &signature.signature) {
+        return Err(invalid("the root key has a bad registration signature"));
+    }
+    Ok(())
+}
+
+fn registration_signature(row: &KeyRow) -> Result<SignatureObject, ApiError> {
+    serde_json::from_value(row.signature.clone()).map_err(|_| {
+        ApiError::signature_invalid("a key in the chain has no registration signature")
+    })
+}
+
+fn verify_document_spki(row: &KeyRow) -> Result<(), ApiError> {
+    let registered = row
+        .document
+        .get("public_key")
+        .and_then(Value::as_str)
+        .and_then(|s| BASE64_URL_SAFE_NO_PAD.decode(s).ok());
+    if registered.as_deref() != Some(row.public_key.as_slice()) {
+        return Err(ApiError::signature_invalid(
+            "a key in the chain differs from its registration document",
         ));
     }
     Ok(())
@@ -237,7 +269,10 @@ pub async fn verify_signed(
     if signature.algorithm != "ed25519" {
         return Err(ApiError::signature_invalid("unsupported algorithm"));
     }
-    let chain = walk_chain(exec, tenant_kek_root, signature.key_id.into(), signed_at).await?;
+    let key_id = signature
+        .key_id
+        .ok_or_else(|| ApiError::malformed("signature: key_id is required"))?;
+    let chain = walk_chain(exec, tenant_kek_root, key_id.into(), signed_at).await?;
     let digest = signing_digest(context, document)
         .map_err(|e| ApiError::malformed(format!("payload: {e}")))?;
     if !verify_ed25519(&chain.key.public_key, &digest, &signature.signature) {

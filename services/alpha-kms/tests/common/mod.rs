@@ -10,7 +10,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alpha_attest::{EVIDENCE_FORMAT, EventLogEntry, Evidence};
 use alpha_cli::node::{NodeIdentity, ShareFile};
-use alpha_client::{Anchor, Client, Pin};
+use alpha_client::{Client, Pin};
 use alpha_core::{AppId, KeyId, OrgId, PrincipalId, context};
 use alpha_crypto::{INFO_UNSEAL_SHARE, PrivateKey, PublicKey};
 use alpha_kms::{Clock, CollateralSource, Config, Node, platform, rfc3339, tls};
@@ -142,7 +142,7 @@ pub struct Harness {
     pub url: String,
     pub release: ReleaseServer,
     pub org: OrgId,
-    pub anchor: (KeyId, SigningKey),
+    pub root: (KeyId, SigningKey),
     pub custodians: Vec<PrivateKey>,
     pub shares: Vec<Vec<u8>>,
     /// `alpha bootstrap`'s reply; the share files it names live in `dir` until the harness drops.
@@ -168,6 +168,14 @@ pub fn node_identity(node: &Node) -> NodeIdentity {
 /// The custodian CLI's client: pinned to the node's runtime key, so any clock passes.
 pub fn spki_client(url: &str, node: &Node) -> Client {
     Client::new(vec![url.to_owned()], Pin::Spki(node.runtime_spki.clone())).unwrap()
+}
+
+/// Route 4's degenerate case: `org_id` beside the key, signed by the key itself.
+pub fn root_key_registration(org: OrgId, key: &SigningKey, now: SystemTime) -> Value {
+    let payload = json!({ "org_id": org, "principal_id": PrincipalId::mint(),
+                          "public_key": spki_b64(key), "label": "root key",
+                          "issued_at": rfc3339(now) });
+    json!(alpha_client::sign_self(context::ORG_ROOT_KEY, payload, key).unwrap())
 }
 
 pub fn custodian_pubs(custodians: &[PrivateKey]) -> [PublicKey; 3] {
@@ -247,8 +255,8 @@ pub fn platform_document(capture: &str) -> Value {
     serde_json::from_slice(&read(capture, "platform-document.json")).unwrap()
 }
 
-/// Bootstraps a fresh node on a fresh database through `alpha bootstrap`: three custodians,
-/// the pilot organization's anchor.
+/// Bootstraps a fresh node on a fresh database through `alpha bootstrap`, then lets the pilot
+/// organization claim its identifier with a root key that signs for itself.
 pub async fn harness() -> Option<Harness> {
     let now = captured_at(KEYED);
     harness_with_clock(Arc::new(move || now)).await
@@ -259,14 +267,6 @@ pub async fn harness_with_clock(clock: Clock) -> Option<Harness> {
     let release = ReleaseServer::start(platform_document(KEYED)).await;
     let (node, base, shutdown) = start_node(pool.clone(), &release.url, &release.key, clock).await;
     let custodians: Vec<PrivateKey> = (0..3).map(|_| PrivateKey::generate().unwrap()).collect();
-    let anchor_key = SigningKey::from_bytes(&[7u8; 32]);
-    let org = OrgId::mint();
-    let anchor = Anchor {
-        org_id: org,
-        principal_id: PrincipalId::mint(),
-        public_key: spki_b64(&anchor_key),
-        label: "pilot anchor".into(),
-    };
     let dir = std::env::temp_dir().join(format!("alpha-harness-{}", Uuid::now_v7()));
     fs::create_dir_all(&dir).unwrap();
     let identity = node_identity(&node);
@@ -274,12 +274,21 @@ pub async fn harness_with_clock(clock: Clock) -> Option<Harness> {
         &spki_client(&base, &node),
         &identity,
         custodian_pubs(&custodians),
-        anchor,
         1,
         &dir,
     )
     .await
     .unwrap();
+    let org = OrgId::mint();
+    let root_key = SigningKey::from_bytes(&[7u8; 32]);
+    let (status, reply) = send(
+        client()
+            .post(format!("{base}/v1/keys"))
+            .json(&root_key_registration(org, &root_key, node.now())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let root_id: KeyId = reply["id"].as_str().unwrap().parse().unwrap();
     let shares = (1..=3)
         .zip(&custodians)
         .map(|(i, custodian)| {
@@ -300,14 +309,7 @@ pub async fn harness_with_clock(clock: Clock) -> Option<Harness> {
         url: base,
         release,
         org,
-        anchor: (
-            bootstrap["anchor_key_id"]
-                .as_str()
-                .unwrap()
-                .parse()
-                .unwrap(),
-            anchor_key,
-        ),
+        root: (root_id, root_key),
         custodians,
         shares,
         ca_pem: bootstrap["kms_ca_pem"].as_str().unwrap().to_owned(),

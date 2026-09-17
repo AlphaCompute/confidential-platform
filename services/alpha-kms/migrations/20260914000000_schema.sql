@@ -6,13 +6,12 @@ create table principal_keys (
   public_key        bytea not null unique,
   document          jsonb not null,
   registered_by_key uuid references principal_keys(id),
-  signature         jsonb,
+  signature         jsonb not null,
   anchor_check      bytea,
   created_at        timestamptz not null default now(),
   revoked_at        timestamptz,
   revocation_reason principal_key_revocation,
   check (revoked_at is null or revocation_reason is not null),
-  check ((registered_by_key is null) = (signature is null)),
   check ((registered_by_key is null) = (anchor_check is not null))
 );
 create unique index on principal_keys (org_id) where registered_by_key is null;

@@ -105,7 +105,7 @@ async fn app_with_secret(
     h: &Harness,
     value: &[u8],
 ) -> (AppId, ComposeHash, (KeyId, ed25519_dalek::SigningKey)) {
-    let admin = h.register_key(&h.anchor, 21).await;
+    let admin = h.register_key(&h.root, 21).await;
     let app = AppId::mint();
     let hash = h.insert_capture_revision(app, &admin).await;
     let (status, reply) = h

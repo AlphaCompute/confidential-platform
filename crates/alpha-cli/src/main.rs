@@ -9,7 +9,7 @@ use alpha_cli::deploy::Shroud;
 use alpha_cli::keyfile::{self, Algorithm};
 use alpha_cli::{node, sign};
 use alpha_client::platform::SignedDocument;
-use alpha_client::{Anchor, Client, Pin};
+use alpha_client::{Client, Pin};
 use alpha_core::KeyId;
 use alpha_crypto::PublicKey;
 use base64::Engine;
@@ -131,14 +131,11 @@ enum Command {
         #[arg(long)]
         endpoint: String,
     },
-    /// Genesis on an empty database: three custodian public keys and the anchor.
+    /// Genesis on an empty database: three custodian public keys.
     Bootstrap {
         /// Three files, each holding a custodian's public key as `keygen --custodian` printed it.
         #[arg(long, value_delimiter = ',', num_args = 3)]
         custodians: Vec<PathBuf>,
-        /// JSON `{org_id, principal_id, public_key, label}`.
-        #[arg(long)]
-        anchor: PathBuf,
         #[arg(long)]
         endpoint: String,
     },
@@ -320,7 +317,6 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
         }
         Command::Bootstrap {
             custodians,
-            anchor,
             endpoint,
         } => {
             let mut keys = Vec::new();
@@ -338,20 +334,13 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let custodians: [PublicKey; 3] = keys
                 .try_into()
                 .map_err(|_| Exit::Usage("--custodians takes exactly three files".into()))?;
-            let anchor: Anchor = serde_json::from_value(read_json(&anchor)?)
-                .map_err(|e| Exit::Usage(format!("anchor: {e}")))?;
             let doc = platform_document(config, now).await?;
             let (identity, client) =
                 node::attested_node(&endpoint, &config.pccs_url, &doc, None, now).await?;
-            Ok(node::bootstrap(
-                &client,
-                &identity,
-                custodians,
-                anchor,
-                doc.version,
-                Path::new("."),
+            Ok(
+                node::bootstrap(&client, &identity, custodians, doc.version, Path::new("."))
+                    .await?,
             )
-            .await?)
         }
     }
 }

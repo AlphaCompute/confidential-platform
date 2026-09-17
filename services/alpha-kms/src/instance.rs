@@ -142,7 +142,7 @@ pub async fn verify_revision(
     }
     let signature: SignatureObject = serde_json::from_value(revision.signature.clone())
         .map_err(|_| ApiError::signature_invalid("revision signature object"))?;
-    if Uuid::from(signature.key_id) != revision.created_by_key {
+    if signature.key_id.map(Uuid::from) != Some(revision.created_by_key) {
         return Err(ApiError::signature_invalid(
             "revision signer does not match",
         ));
@@ -345,7 +345,7 @@ async fn get_secret_inner(
     .ok_or_else(|| ApiError::not_found("no such secret for this app"))?;
     let signature: SignatureObject = serde_json::from_value(secret.signature)
         .map_err(|_| ApiError::signature_invalid("secret signature object"))?;
-    if Uuid::from(signature.key_id) != secret.signed_by_key {
+    if signature.key_id.map(Uuid::from) != Some(secret.signed_by_key) {
         return Err(ApiError::signature_invalid("secret signer does not match"));
     }
     // The signature covers the document alone, so the release decision is taken from the
