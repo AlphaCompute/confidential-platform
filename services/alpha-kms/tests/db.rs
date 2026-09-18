@@ -135,15 +135,12 @@ async fn two_organizations_live_side_by_side() {
     .unwrap();
     let app_a: AppId = expected["app_id"].as_str().unwrap().parse().unwrap();
 
+    let revision = |compose: &str| json!({ "app_id": app_a, "compose": compose });
     let admin_a = h.register_key(&h.root, 51).await;
     let (status, reply) = h
         .post(
             "/v1/revisions",
-            h.signed(
-                context::REVISION,
-                json!({ "app_id": app_a, "compose": compose }),
-                &admin_a,
-            ),
+            h.signed(context::REVISION, revision(&compose), &admin_a),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
@@ -169,51 +166,34 @@ async fn two_organizations_live_side_by_side() {
 
     // A second, different Revision of the same App, so that the refusal below is the App's owner
     // and not the Revision already stored under the first one's hash.
-    let mut other_bytes: Value = serde_json::from_str(&compose).unwrap();
-    other_bytes["public_logs"] = json!(true);
-    let other_bytes = serde_json::to_string(&other_bytes).unwrap();
-    assert_ne!(
-        alpha_core::compose_hash(&other_bytes),
-        alpha_core::compose_hash(&compose)
-    );
+    let other_bytes = compose.replace("\"public_logs\":false", "\"public_logs\":true");
+    assert_ne!(other_bytes, compose);
 
     // Everything of the first organization is absent to the second, never forbidden.
     let foreign = [
         (
             "/v1/revisions".to_owned(),
-            h.signed(
-                context::REVISION,
-                json!({ "app_id": app_a, "compose": compose }),
-                &admin_b,
-            ),
+            context::REVISION,
+            revision(&compose),
         ),
         (
             "/v1/revisions".to_owned(),
-            h.signed(
-                context::REVISION,
-                json!({ "app_id": app_a, "compose": other_bytes }),
-                &admin_b,
-            ),
+            context::REVISION,
+            revision(&other_bytes),
         ),
         (
             format!("/v1/revisions/{revision_a}/revoke"),
-            h.signed(
-                context::CONTROL,
-                json!({ "compose_hash": revision_a, "issued_at": rfc3339(h.now()) }),
-                &admin_b,
-            ),
+            context::CONTROL,
+            json!({ "compose_hash": revision_a, "issued_at": rfc3339(h.now()) }),
         ),
         (
             format!("/v1/keys/{}/revoke", admin_a.0),
-            h.signed(
-                context::CONTROL,
-                json!({ "key_id": admin_a.0, "reason": "retired", "issued_at": rfc3339(h.now()) }),
-                &admin_b,
-            ),
+            context::CONTROL,
+            json!({ "key_id": admin_a.0, "reason": "retired", "issued_at": rfc3339(h.now()) }),
         ),
     ];
-    for (path, body) in foreign {
-        let (status, reply) = h.post(&path, body).await;
+    for (path, ctx, payload) in foreign {
+        let (status, reply) = h.post(&path, h.signed(ctx, payload, &admin_b)).await;
         assert_eq!(
             (status, code(&reply)),
             (StatusCode::NOT_FOUND, "not_found"),
@@ -238,23 +218,20 @@ async fn two_organizations_live_side_by_side() {
     .fetch_one(&h.pool)
     .await
     .unwrap();
-    let spki = |key: &SigningKey| key.verifying_key().to_public_key_der().unwrap();
-    let key_b = alpha_kms::keys::org_key(
-        &intermediates.tenant_kek_root,
-        org_b,
-        spki(&root_b.1).as_bytes(),
-    )
-    .unwrap();
+    let org_key = |org, key: &SigningKey| {
+        alpha_kms::keys::org_key(
+            &intermediates.tenant_kek_root,
+            org,
+            key.verifying_key().to_public_key_der().unwrap().as_bytes(),
+        )
+        .unwrap()
+    };
+    let key_b = org_key(org_b, &root_b.1);
     assert!(
         alpha_kms::keys::aead_open(&key_b, stored.id.as_bytes(), &stored.ciphertext).is_none(),
         "the neighbour's key opens the secret"
     );
-    let key_a = alpha_kms::keys::org_key(
-        &intermediates.tenant_kek_root,
-        h.org,
-        spki(&h.root.1).as_bytes(),
-    )
-    .unwrap();
+    let key_a = org_key(h.org, &h.root.1);
     assert_eq!(
         alpha_kms::keys::aead_open(&key_a, stored.id.as_bytes(), &stored.ciphertext)
             .unwrap()
@@ -338,17 +315,10 @@ async fn a_root_key_claims_its_organization_once() {
     // so a claim made that way must go on signing rather than burning the identifier.
     let shouty = OrgId::mint();
     let shouty_key = SigningKey::from_bytes(&[35u8; 32]);
-    let shouty_payload = json!({ "org_id": shouty.to_string().to_uppercase(),
-                                 "principal_id": PrincipalId::mint(),
-                                 "public_key": spki_b64(&shouty_key), "label": "root key",
-                                 "issued_at": rfc3339(h.now()) });
     let (status, reply) = h
         .post(
             "/v1/keys",
-            json!(
-                alpha_client::sign_self(context::ORG_ROOT_KEY, shouty_payload, &shouty_key)
-                    .unwrap()
-            ),
+            root_key_registration(shouty.to_string().to_uppercase(), &shouty_key, h.now()),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
