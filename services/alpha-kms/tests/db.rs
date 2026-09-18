@@ -167,6 +167,16 @@ async fn two_organizations_live_side_by_side() {
     let root_b = (reply["id"].as_str().unwrap().parse().unwrap(), root_b_key);
     let admin_b = h.register_key(&root_b, 53).await;
 
+    // A second, different Revision of the same App, so that the refusal below is the App's owner
+    // and not the Revision already stored under the first one's hash.
+    let mut other_bytes: Value = serde_json::from_str(&compose).unwrap();
+    other_bytes["public_logs"] = json!(true);
+    let other_bytes = serde_json::to_string(&other_bytes).unwrap();
+    assert_ne!(
+        alpha_core::compose_hash(&other_bytes),
+        alpha_core::compose_hash(&compose)
+    );
+
     // Everything of the first organization is absent to the second, never forbidden.
     let foreign = [
         (
@@ -174,6 +184,14 @@ async fn two_organizations_live_side_by_side() {
             h.signed(
                 context::REVISION,
                 json!({ "app_id": app_a, "compose": compose }),
+                &admin_b,
+            ),
+        ),
+        (
+            "/v1/revisions".to_owned(),
+            h.signed(
+                context::REVISION,
+                json!({ "app_id": app_a, "compose": other_bytes }),
                 &admin_b,
             ),
         ),
@@ -315,6 +333,28 @@ async fn a_root_key_claims_its_organization_once() {
         (status, code(&reply)),
         (StatusCode::BAD_REQUEST, "signature_invalid")
     );
+
+    // An identifier spelled in uppercase is the same identifier: the row keeps the parsed value,
+    // so a claim made that way must go on signing rather than burning the identifier.
+    let shouty = OrgId::mint();
+    let shouty_key = SigningKey::from_bytes(&[35u8; 32]);
+    let shouty_payload = json!({ "org_id": shouty.to_string().to_uppercase(),
+                                 "principal_id": PrincipalId::mint(),
+                                 "public_key": spki_b64(&shouty_key), "label": "root key",
+                                 "issued_at": rfc3339(h.now()) });
+    let (status, reply) = h
+        .post(
+            "/v1/keys",
+            json!(
+                alpha_client::sign_self(context::ORG_ROOT_KEY, shouty_payload, &shouty_key)
+                    .unwrap()
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply["org_id"], json!(shouty));
+    let shouty_root = (reply["id"].as_str().unwrap().parse().unwrap(), shouty_key);
+    h.register_key(&shouty_root, 36).await;
 
     // The new root key endorses a key of its own, and that key's chain ends at it.
     let root = (first["id"].as_str().unwrap().parse().unwrap(), key);
