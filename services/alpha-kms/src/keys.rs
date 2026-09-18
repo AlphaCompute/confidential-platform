@@ -223,8 +223,12 @@ fn verify_self_registration(root: &KeyRow) -> Result<(), ApiError> {
         return Err(invalid("the root key's registration names a signer"));
     }
     verify_document_spki(root)?;
-    if root.document.get("org_id").and_then(Value::as_str) != Some(root.org_id.to_string().as_str())
-    {
+    let claimed = root
+        .document
+        .get("org_id")
+        .and_then(Value::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok());
+    if claimed != Some(root.org_id) {
         return Err(invalid(
             "the root key is registered to another organization",
         ));

@@ -120,6 +120,126 @@ async fn bootstrap_once_unseal_with_two_shares_and_sealed_gate() {
     );
 }
 
+/// Two organizations over one node see nothing of each other: a foreign object is absent, not
+/// forbidden, and a secret does not decrypt under the neighbour's key.
+#[tokio::test]
+async fn two_organizations_live_side_by_side() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let compose =
+        fs::read_to_string(testdata().join("manifest/01-canonical/app-compose.json")).unwrap();
+    let expected: Value = serde_json::from_str(
+        &fs::read_to_string(testdata().join("manifest/01-canonical/expected.json")).unwrap(),
+    )
+    .unwrap();
+    let app_a: AppId = expected["app_id"].as_str().unwrap().parse().unwrap();
+
+    let revision = |compose: &str| json!({ "app_id": app_a, "compose": compose });
+    let admin_a = h.register_key(&h.root, 51).await;
+    let (status, reply) = h
+        .post(
+            "/v1/revisions",
+            h.signed(context::REVISION, revision(&compose), &admin_a),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let revision_a = reply["compose_hash"].as_str().unwrap().to_owned();
+    let (status, reply) = h
+        .put_secret("a-secret", &[app_a], b"a's value", h.now(), &admin_a)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+
+    // The second organization claims its own identifier and endorses its own key.
+    let org_b = OrgId::mint();
+    let root_b_key = SigningKey::from_bytes(&[52u8; 32]);
+    let (status, reply) = h
+        .post(
+            "/v1/keys",
+            root_key_registration(org_b, &root_b_key, h.now()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply["org_id"], json!(org_b));
+    let root_b = (reply["id"].as_str().unwrap().parse().unwrap(), root_b_key);
+    let admin_b = h.register_key(&root_b, 53).await;
+
+    // A second, different Revision of the same App, so that the refusal below is the App's owner
+    // and not the Revision already stored under the first one's hash.
+    let other_bytes = compose.replace("\"public_logs\":false", "\"public_logs\":true");
+    assert_ne!(other_bytes, compose);
+
+    // Everything of the first organization is absent to the second, never forbidden.
+    let foreign = [
+        (
+            "/v1/revisions".to_owned(),
+            context::REVISION,
+            revision(&compose),
+        ),
+        (
+            "/v1/revisions".to_owned(),
+            context::REVISION,
+            revision(&other_bytes),
+        ),
+        (
+            format!("/v1/revisions/{revision_a}/revoke"),
+            context::CONTROL,
+            json!({ "compose_hash": revision_a, "issued_at": rfc3339(h.now()) }),
+        ),
+        (
+            format!("/v1/keys/{}/revoke", admin_a.0),
+            context::CONTROL,
+            json!({ "key_id": admin_a.0, "reason": "retired", "issued_at": rfc3339(h.now()) }),
+        ),
+    ];
+    for (path, ctx, payload) in foreign {
+        let (status, reply) = h.post(&path, h.signed(ctx, payload, &admin_b)).await;
+        assert_eq!(
+            (status, code(&reply)),
+            (StatusCode::NOT_FOUND, "not_found"),
+            "{path}: {reply}"
+        );
+    }
+    let (status, reply) = h
+        .put_secret("b-secret", &[app_a], b"b's value", h.now(), &admin_b)
+        .await;
+    assert_eq!(
+        (status, code(&reply)),
+        (StatusCode::NOT_FOUND, "not_found"),
+        "{reply}"
+    );
+
+    // Each organization's secrets are sealed under its own root key.
+    let intermediates = h.node.intermediates().unwrap();
+    let stored = sqlx::query!(
+        "select id, ciphertext from secrets where org_id = $1 and name = 'a-secret'",
+        Uuid::from(h.org)
+    )
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    let org_key = |org, key: &SigningKey| {
+        alpha_kms::keys::org_key(
+            &intermediates.tenant_kek_root,
+            org,
+            key.verifying_key().to_public_key_der().unwrap().as_bytes(),
+        )
+        .unwrap()
+    };
+    let key_b = org_key(org_b, &root_b.1);
+    assert!(
+        alpha_kms::keys::aead_open(&key_b, stored.id.as_bytes(), &stored.ciphertext).is_none(),
+        "the neighbour's key opens the secret"
+    );
+    let key_a = org_key(h.org, &h.root.1);
+    assert_eq!(
+        alpha_kms::keys::aead_open(&key_a, stored.id.as_bytes(), &stored.ciphertext)
+            .unwrap()
+            .as_slice(),
+        b"a's value"
+    );
+}
+
 /// Nobody authorizes a root key: an `org_id` is claimed once, and re-sending the same document
 /// is how the organization learns whose key the claim holds.
 #[tokio::test]
@@ -190,6 +310,21 @@ async fn a_root_key_claims_its_organization_once() {
         (status, code(&reply)),
         (StatusCode::BAD_REQUEST, "signature_invalid")
     );
+
+    // An identifier spelled in uppercase is the same identifier: the row keeps the parsed value,
+    // so a claim made that way must go on signing rather than burning the identifier.
+    let shouty = OrgId::mint();
+    let shouty_key = SigningKey::from_bytes(&[35u8; 32]);
+    let (status, reply) = h
+        .post(
+            "/v1/keys",
+            root_key_registration(shouty.to_string().to_uppercase(), &shouty_key, h.now()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply["org_id"], json!(shouty));
+    let shouty_root = (reply["id"].as_str().unwrap().parse().unwrap(), shouty_key);
+    h.register_key(&shouty_root, 36).await;
 
     // The new root key endorses a key of its own, and that key's chain ends at it.
     let root = (first["id"].as_str().unwrap().parse().unwrap(), key);

@@ -19,6 +19,7 @@ use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePublicKey;
 use reqwest::StatusCode;
+use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -171,7 +172,7 @@ pub fn spki_client(url: &str, node: &Node) -> Client {
 }
 
 /// Route 4's degenerate case: `org_id` beside the key, signed by the key itself.
-pub fn root_key_registration(org: OrgId, key: &SigningKey, now: SystemTime) -> Value {
+pub fn root_key_registration(org: impl Serialize, key: &SigningKey, now: SystemTime) -> Value {
     let payload = json!({ "org_id": org, "principal_id": PrincipalId::mint(),
                           "public_key": spki_b64(key), "label": "root key",
                           "issued_at": rfc3339(now) });
