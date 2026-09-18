@@ -2,11 +2,12 @@
 
 use std::time::SystemTime;
 
-use alpha_client::{Client, PutSecretBody, sign};
-use alpha_core::{ComposeHash, KeyId, context};
+use alpha_client::{Client, PutSecretBody, sign, sign_self};
+use alpha_core::{ComposeHash, KeyId, OrgId, PrincipalId, context};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use ed25519_dalek::SigningKey;
+use ed25519_dalek::pkcs8::EncodePublicKey;
 use serde_json::{Value, json};
 
 use crate::{rfc3339, sha256_prefixed};
@@ -89,6 +90,33 @@ pub async fn run(
         }
     };
     Ok(reply)
+}
+
+/// The organization's root key, which signs its own registration because the roster does not
+/// know it yet. Sending the same document again is how the organization reads back whose root
+/// key holds its identifier: its own reply, or `already_exists`.
+pub async fn root_key(
+    client: &Client,
+    org_id: OrgId,
+    principal_id: PrincipalId,
+    label: &str,
+    key: &SigningKey,
+    now: SystemTime,
+) -> Result<Value, String> {
+    let spki = key
+        .verifying_key()
+        .to_public_key_der()
+        .map_err(|e| format!("spki: {e}"))?;
+    let payload = json!({
+        "org_id": org_id,
+        "principal_id": principal_id,
+        "public_key": BASE64_URL_SAFE_NO_PAD.encode(spki.as_bytes()),
+        "label": label,
+        "issued_at": rfc3339(now),
+    });
+    let api = |e: alpha_client::Error| e.to_string();
+    let signed = sign_self(context::ORG_ROOT_KEY, payload, key).map_err(api)?;
+    Ok(json!(client.register_key(&signed).await.map_err(api)?))
 }
 
 #[cfg(test)]

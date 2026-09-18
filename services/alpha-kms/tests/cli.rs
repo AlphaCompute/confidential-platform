@@ -19,7 +19,7 @@ use std::time::SystemTime;
 use alpha_cli::call::Route;
 use alpha_cli::{call, deploy, node as cli_node, sign};
 use alpha_client::{Client, Pin, tls};
-use alpha_core::{AppId, KeyId, PrincipalId};
+use alpha_core::{AppId, KeyId, OrgId, PrincipalId};
 use alpha_kms::{certs, platform};
 use common::*;
 use ed25519_dalek::SigningKey;
@@ -88,6 +88,52 @@ async fn call_refuses_a_kms_whose_chain_does_not_end_in_the_pinned_ca() {
             alpha_client::Error::Connect(_)
         ));
     }
+}
+
+#[tokio::test]
+async fn an_organization_registers_its_root_key_and_the_root_key_registers_a_signing_key() {
+    let Some(h) = wall_clock_harness().await else {
+        return;
+    };
+    let client = pinned(&h, ca_pin(&h));
+    let org = OrgId::mint();
+    let root_key = SigningKey::from_bytes(&[42u8; 32]);
+    let now = h.now();
+    let register = |key: SigningKey| {
+        let client = &client;
+        async move { call::root_key(client, org, PrincipalId::mint(), "root key", &key, now).await }
+    };
+
+    let reply = register(root_key.clone()).await.unwrap();
+    assert_eq!(reply["org_id"], json!(org));
+    assert_eq!(reply["public_key"], json!(spki_b64(&root_key)));
+    let root = (
+        reply["id"].as_str().unwrap().parse::<KeyId>().unwrap(),
+        root_key.clone(),
+    );
+
+    let again = register(root_key).await.unwrap();
+    assert_eq!(again["id"], reply["id"]);
+    let err = register(SigningKey::from_bytes(&[43u8; 32]))
+        .await
+        .unwrap_err();
+    assert!(err.contains("already_exists"), "{err}");
+
+    let signing_key = SigningKey::from_bytes(&[44u8; 32]);
+    let reply = call::run(
+        &client,
+        Route::RegisterKey,
+        None,
+        (root.0, &root.1),
+        json!({ "principal_id": PrincipalId::mint(), "public_key": spki_b64(&signing_key),
+                "label": "day-to-day" }),
+        None,
+        h.now(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply["org_id"], json!(org));
+    assert!(reply["public_key"].is_null());
 }
 
 #[tokio::test]
