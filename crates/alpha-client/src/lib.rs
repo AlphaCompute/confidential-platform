@@ -195,6 +195,10 @@ pub struct KeyRegistered {
     pub id: KeyId,
     pub principal_id: PrincipalId,
     pub org_id: OrgId,
+    /// Only a root key registration answers with the stored key: it is how the organization
+    /// learns whose root key holds its identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
     pub created_at: String,
 }
 

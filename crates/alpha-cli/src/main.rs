@@ -10,7 +10,7 @@ use alpha_cli::keyfile::{self, Algorithm};
 use alpha_cli::{node, sign};
 use alpha_client::platform::SignedDocument;
 use alpha_client::{Client, Pin};
-use alpha_core::KeyId;
+use alpha_core::{KeyId, OrgId, PrincipalId};
 use alpha_crypto::PublicKey;
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
@@ -96,6 +96,21 @@ enum Command {
         #[arg(long)]
         value: Option<PathBuf>,
         payload: PathBuf,
+    },
+    /// Register the organization's root key, which signs for itself and claims the
+    /// organization's identifier once and for all.
+    RegisterRootKey {
+        /// The key to register; it signs its own registration.
+        #[arg(long)]
+        key: PathBuf,
+        /// The organization's identifier, as the console shows it.
+        #[arg(long)]
+        org_id: OrgId,
+        /// The Principal the key acts for.
+        #[arg(long)]
+        principal_id: PrincipalId,
+        #[arg(long, default_value = "root key")]
+        label: String,
     },
     /// Sign a platform document with the release key, or check a signed artifact.
     Sign {
@@ -261,6 +276,16 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 now,
             )
             .await?)
+        }
+        Command::RegisterRootKey {
+            key,
+            org_id,
+            principal_id,
+            label,
+        } => {
+            let key = read_ed25519(&key)?;
+            let client = admin_client(config, now).await?;
+            Ok(alpha_cli::call::root_key(&client, org_id, principal_id, &label, &key, now).await?)
         }
         Command::Sign {
             release_key,
