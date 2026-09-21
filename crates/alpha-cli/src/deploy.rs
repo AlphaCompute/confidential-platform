@@ -505,6 +505,34 @@ mod tests {
     }
 
     #[test]
+    fn the_daemon_socket_needs_the_runtime_socket() {
+        let base =
+            fs::read_to_string(vector().with_file_name("07-deploy-docker").join("app.yaml"))
+                .unwrap();
+        let without_socket = base.replace("    socket: true\n", "");
+        let spec = parse(&without_socket).unwrap();
+        let err = compose(&spec).unwrap_err();
+        assert!(err.contains("services.app"), "{err}");
+        assert!(err.contains("docker"), "{err}");
+        assert!(err.contains("socket"), "{err}");
+    }
+
+    #[test]
+    fn only_one_service_gets_the_daemon_socket() {
+        let base =
+            fs::read_to_string(vector().with_file_name("07-deploy-docker").join("app.yaml"))
+                .unwrap();
+        let two_holders = base.replace(
+            "runtime:\n",
+            "  worker:\n    image: ghcr.io/acme/app@sha256:3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a\n    socket: true\n    docker: true\nruntime:\n",
+        );
+        let spec = parse(&two_holders).unwrap();
+        let err = compose(&spec).unwrap_err();
+        assert!(err.contains("at most one service"), "{err}");
+        assert!(err.contains("app, worker"), "{err}");
+    }
+
+    #[test]
     fn generator_refuses_what_registration_would() {
         let base = fs::read_to_string(vector().join("app.yaml")).unwrap();
         let tagged = base.replace(
