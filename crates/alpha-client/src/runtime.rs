@@ -151,3 +151,99 @@ pub struct RuntimeHealth {
     pub attested: bool,
     pub cert_not_after: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixListener;
+
+    use super::*;
+
+    /// Short: a unix socket path is capped at 104 bytes on macOS.
+    fn socket_path() -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("ac{:x}-{n}.sock", std::process::id()))
+    }
+
+    /// Binds a fresh socket, accepts one connection, answers with `status` and `body` once.
+    fn canned(status: u16, body: &'static str) -> PathBuf {
+        let path = socket_path();
+        let listener = UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let reply = format!(
+                "HTTP/1.1 {status} x\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(reply.as_bytes()).await;
+            let _ = stream.shutdown().await;
+        });
+        path
+    }
+
+    fn api_code(err: Error) -> String {
+        match err {
+            Error::Api(e) => e.code,
+            other => panic!("expected Error::Api, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn not_attested_surfaces_as_an_api_error_with_the_runtimes_code() {
+        let body =
+            r#"{"error":{"code":"not_attested","message":"not attested","request_id":"r1"}}"#;
+        let path = canned(503, body);
+        let err = RuntimeSocket::at(path).identity().await.unwrap_err();
+        assert_eq!(api_code(err), "not_attested");
+    }
+
+    #[tokio::test]
+    async fn a_missing_secret_surfaces_as_an_api_error_with_the_runtimes_code() {
+        let body = r#"{"error":{"code":"not_found","message":"no such secret","request_id":"r2"}}"#;
+        let path = canned(404, body);
+        let err = RuntimeSocket::at(path).secret("x").await.unwrap_err();
+        assert_eq!(api_code(err), "not_found");
+    }
+
+    #[tokio::test]
+    async fn a_missing_socket_is_a_connect_error_naming_the_path_on_every_route() {
+        let path = socket_path();
+        let client = RuntimeSocket::at(&path);
+        let want = path.display().to_string();
+        let assert_connect = |err: Error| match err {
+            Error::Connect(msg) => assert!(msg.contains(&want), "{msg}"),
+            other => panic!("expected Error::Connect, got {other}"),
+        };
+        assert_connect(client.identity().await.unwrap_err());
+        assert_connect(client.secret("x").await.unwrap_err());
+        assert_connect(client.healthz().await.unwrap_err());
+    }
+
+    // Nothing is listening at this path in either test below: a connect attempt would surface
+    // as `Error::Connect`, not `Error::Invalid` — that is how each proves the client never tries.
+
+    #[tokio::test]
+    async fn a_secret_name_with_a_path_separator_is_refused_before_any_request() {
+        let client = RuntimeSocket::at(socket_path());
+        match client.secret("../x").await {
+            Err(Error::Invalid(_)) => {}
+            other => panic!("expected Error::Invalid, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_secret_name_is_refused_before_any_request() {
+        let client = RuntimeSocket::at(socket_path());
+        match client.secret("").await {
+            Err(Error::Invalid(_)) => {}
+            other => panic!("expected Error::Invalid, got {other:?}"),
+        }
+    }
+}

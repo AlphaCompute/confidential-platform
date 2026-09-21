@@ -338,3 +338,158 @@ pub fn server_config(cert: Arc<InstanceCert>) -> Result<Arc<ServerConfig>, Error
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Arc::new(config))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, SystemTime};
+
+    use alpha_attest::{AttestationResult, Measured, Measurement, Revision, Verdict};
+    use rcgen::string::Ia5String;
+    use rcgen::{
+        BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, SanType, SerialNumber,
+    };
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
+    use zeroize::Zeroizing;
+
+    use super::*;
+
+    fn dummy_attestation() -> AttestationResult {
+        let m = Measurement([0u8; 48]);
+        AttestationResult {
+            format: "test".into(),
+            verdict: Verdict::Verified,
+            measured: Measured {
+                mrtd: m,
+                rtmr0: m,
+                rtmr1: m,
+                rtmr2: m,
+                rtmr3: m,
+            },
+            tcb_status: "UpToDate".into(),
+            advisories: Vec::new(),
+            os_image: "test".into(),
+            revision: Revision {
+                compose_hash: alpha_core::compose_hash("test"),
+                app_id: AppId::mint(),
+                org_id: OrgId::mint(),
+            },
+            runtime_pubkey_sha256: format!("sha256:{}", "0".repeat(64)),
+            evidence_sha256: format!("sha256:{}", "0".repeat(64)),
+            verified_at: "1970-01-01T00:00:00Z".into(),
+            policy_version: 1,
+        }
+    }
+
+    fn new_ca() -> (KeyPair, rcgen::Certificate) {
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.not_before = (SystemTime::now() - Duration::from_secs(3600)).into();
+        params.not_after = (SystemTime::now() + Duration::from_secs(3600)).into();
+        let cert = params.self_signed(&key).unwrap();
+        (key, cert)
+    }
+
+    /// A leaf under `ca`, one URI SAN, its own key, and a one-byte serial to tell it apart from
+    /// a sibling leaf.
+    fn new_leaf(ca_key: &KeyPair, ca_cert: &rcgen::Certificate, serial: u8) -> RuntimeIdentity {
+        let leaf_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let issuer = Issuer::from_ca_cert_der(ca_cert.der(), ca_key).unwrap();
+        let mut params = CertificateParams::default();
+        let san = format!(
+            "urn:alphacompute:revision:sha256:{}{serial:02x}",
+            "0".repeat(62)
+        );
+        params.subject_alt_names = vec![SanType::URI(Ia5String::try_from(san).unwrap())];
+        params.serial_number = Some(SerialNumber::from(vec![serial]));
+        params.not_before = (SystemTime::now() - Duration::from_secs(3600)).into();
+        params.not_after = (SystemTime::now() + Duration::from_secs(3600)).into();
+        let cert = params.signed_by(&leaf_key, &issuer).unwrap();
+        RuntimeIdentity {
+            app_id: AppId::mint(),
+            org_id: OrgId::mint(),
+            compose_hash: alpha_core::compose_hash("test"),
+            certificate_chain: format!("{}\n{}", cert.pem(), ca_cert.pem()),
+            tls_private_key: Zeroizing::new(leaf_key.serialize_der()),
+            attestation_result: dummy_attestation(),
+        }
+    }
+
+    fn client_config_for(ca_cert: &rcgen::Certificate) -> Arc<ClientConfig> {
+        let ca = CertificateDer::from(ca_cert.der().to_vec());
+        Arc::new(
+            crate::tls::client_config(
+                Some(crate::tls::Pin::Ca(ca)),
+                None,
+                crate::system_time_provider(),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// The one-byte serial number the leaf was minted with.
+    fn served_serial(chain: &[CertificateDer<'_>]) -> u8 {
+        let leaf = chain.first().expect("a served chain has a leaf");
+        let (_, cert) = X509Certificate::from_der(leaf).unwrap();
+        *cert.raw_serial().last().expect("a nonempty serial")
+    }
+
+    async fn handshake(addr: std::net::SocketAddr, ca_cert: &rcgen::Certificate) -> u8 {
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let connector = TlsConnector::from(client_config_for(ca_cert));
+        let tls = connector
+            .connect(ServerName::try_from("app.example").unwrap(), tcp)
+            .await
+            .unwrap();
+        served_serial(tls.get_ref().1.peer_certificates().unwrap())
+    }
+
+    #[tokio::test]
+    async fn replace_serves_the_new_leaf_and_never_a_torn_chain_to_a_concurrent_handshake() {
+        let (ca_key, ca_cert) = new_ca();
+        let identity1 = new_leaf(&ca_key, &ca_cert, 1);
+        let identity2 = new_leaf(&ca_key, &ca_cert, 2);
+
+        let cert = Arc::new(InstanceCert::new(&identity1).unwrap());
+        let acceptor = TlsAcceptor::from(server_config(cert.clone()).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    return;
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    if let Ok(mut tls) = acceptor.accept(tcp).await {
+                        let _ = tokio::io::AsyncWriteExt::shutdown(&mut tls).await;
+                    }
+                });
+            }
+        });
+
+        // Before the swap, only the first leaf is ever served.
+        assert_eq!(handshake(addr, &ca_cert).await, 1);
+
+        // A burst of handshakes races the swap; each sees one whole chain, never a mix of the
+        // two — the resolver swaps a single Arc under a lock, so there is nothing to tear.
+        let swap = {
+            let cert = cert.clone();
+            tokio::spawn(async move { cert.replace(&identity2).unwrap() })
+        };
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let ca_cert = ca_cert.clone();
+            handles.push(tokio::spawn(async move { handshake(addr, &ca_cert).await }));
+        }
+        swap.await.unwrap();
+        for h in handles {
+            let serial = h.await.unwrap();
+            assert!(serial == 1 || serial == 2, "{serial}: neither known leaf");
+        }
+
+        // After the swap, only the second leaf is served.
+        assert_eq!(handshake(addr, &ca_cert).await, 2);
+    }
+}
