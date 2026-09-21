@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use alpha_core::{AppId, ComposeHash, OrgId};
+use parking_lot::RwLock;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::crypto::aws_lc_rs::{self, kx_group};
@@ -13,12 +14,15 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, TrustAnchor, UnixTime,
 };
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
 use rustls::time_provider::TimeProvider;
-use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use rustls::{ClientConfig, DigitallySignedStruct, ServerConfig, SignatureScheme};
 use sha2::{Digest, Sha256};
 use x509_parser::prelude::{FromDer, GeneralName, ParsedExtension, X509Certificate};
 
 use crate::Error;
+use crate::runtime::RuntimeIdentity;
 
 pub fn provider() -> Arc<CryptoProvider> {
     Arc::new(CryptoProvider {
@@ -283,4 +287,54 @@ pub fn parse_instance_sans(sans: &[String]) -> Result<InstanceSans, Error> {
             .ok_or_else(invalid)?,
         compose_hash,
     })
+}
+
+fn certified_key(identity: &RuntimeIdentity) -> Result<Arc<CertifiedKey>, Error> {
+    let chain: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_slice_iter(identity.certificate_chain.as_bytes())
+            .collect::<Result<_, _>>()
+            .map_err(|e| Error::Invalid(format!("certificate chain: {e}")))?;
+    if chain.is_empty() {
+        return Err(Error::Invalid("certificate chain is empty".into()));
+    }
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.tls_private_key.to_vec()));
+    let signing = provider()
+        .key_provider
+        .load_private_key(key)
+        .map_err(|e| Error::Invalid(format!("runtime key: {e}")))?;
+    Ok(Arc::new(CertifiedKey::new(chain, signing)))
+}
+
+/// The Endpoint's TLS key material, swapped whole on renewal so a handshake in flight during a
+/// `replace` still sees one complete chain — old or new, never a mix.
+#[derive(Debug)]
+pub struct InstanceCert(RwLock<Arc<CertifiedKey>>);
+
+impl InstanceCert {
+    pub fn new(identity: &RuntimeIdentity) -> Result<Self, Error> {
+        Ok(Self(RwLock::new(certified_key(identity)?)))
+    }
+
+    pub fn replace(&self, identity: &RuntimeIdentity) -> Result<(), Error> {
+        let certified = certified_key(identity)?;
+        *self.0.write() = certified;
+        Ok(())
+    }
+}
+
+impl ResolvesServerCert for InstanceCert {
+    fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(self.0.read().clone())
+    }
+}
+
+/// TLS 1.3 only, no client auth, `http/1.1` — an Endpoint listener over `cert`.
+pub fn server_config(cert: Arc<InstanceCert>) -> Result<Arc<ServerConfig>, Error> {
+    let mut config = ServerConfig::builder_with_provider(provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| Error::Invalid(format!("tls: {e}")))?
+        .with_no_client_auth()
+        .with_cert_resolver(cert);
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
 }

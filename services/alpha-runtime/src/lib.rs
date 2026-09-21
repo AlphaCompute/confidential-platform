@@ -33,7 +33,8 @@ use tokio::net::UnixListener;
 use tokio::sync::watch;
 use zeroize::Zeroizing;
 
-pub const SOCKET_PATH: &str = "/run/alpha/runtime.sock";
+pub use alpha_client::runtime::SOCKET_PATH;
+
 pub const RENEW_BEFORE: Duration = Duration::from_secs(600);
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 

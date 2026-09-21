@@ -95,7 +95,11 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "ed25519-dalek 3.0.0",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "p256 0.14.0",
+ "parking_lot",
  "reqwest",
  "rustls",
  "rustls-webpki",
@@ -103,7 +107,9 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "thiserror",
+ "tokio",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]
