@@ -15,6 +15,9 @@ pub const RUNTIME_SERVICE: &str = "alpha-runtime";
 /// that port. One service publishes it, or nothing answers there.
 const APP_PORT: u16 = 443;
 const SOCKET_VOLUME: &str = "alpha-run:/run/alpha";
+/// The guest daemon's own socket; its API is root in the CVM, so it goes only to the one
+/// service that also holds `/run/alpha`, never to a container that runs untrusted code.
+const DOCKER_SOCKET_VOLUME: &str = "/var/run/docker.sock:/var/run/docker.sock";
 const KMS_ENVS: [&str; 4] = [
     "ALPHACOMPUTE_DATABASE_URL",
     "ALPHACOMPUTE_KMS_ENDPOINTS",
@@ -66,6 +69,10 @@ pub struct Service {
     /// Mounts `/run/alpha`; not for the container that runs model-written code.
     #[serde(default)]
     pub socket: bool,
+    /// Mounts the guest Docker daemon's socket so this service can create containers of its
+    /// own; only beside `socket`, and only on one service.
+    #[serde(default)]
+    pub docker: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,8 +134,15 @@ fn docker_compose_file(spec: &AppSpec) -> Result<String, String> {
             publishing.push(name.to_owned());
             out.insert(key("ports"), strings(&[&format!("{APP_PORT}:{port}")]));
         }
+        let mut mounts: Vec<&str> = Vec::new();
         if service.socket {
-            out.insert(key("volumes"), strings(&[SOCKET_VOLUME]));
+            mounts.push(SOCKET_VOLUME);
+        }
+        if service.docker {
+            mounts.push(DOCKER_SOCKET_VOLUME);
+        }
+        if !mounts.is_empty() {
+            out.insert(key("volumes"), strings(&mounts));
         }
         services.insert(key(name), Yaml::Mapping(out));
     }
@@ -391,6 +405,35 @@ mod tests {
             "runtime service is last"
         );
         assert!(yaml.contains("${ALPHACOMPUTE_KMS_ENDPOINTS}"));
+        assert_eq!(
+            yaml.matches(SOCKET_VOLUME).count(),
+            2,
+            "app and runtime mount the socket"
+        );
+    }
+
+    #[test]
+    fn generator_reproduces_the_docker_vector() {
+        let dir = vector().with_file_name("07-deploy-docker");
+        let spec = parse(&fs::read_to_string(dir.join("app.yaml")).unwrap()).unwrap();
+        let expected = fs::read_to_string(dir.join("app-compose.json")).unwrap();
+        let compose = compose(&spec).unwrap();
+        assert_eq!(compose, expected);
+        let expected_hash: Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("expected.json")).unwrap()).unwrap();
+        assert_eq!(
+            alpha_core::compose_hash(&compose).to_string(),
+            expected_hash["compose_hash"]
+        );
+        let yaml = docker_compose_file(&spec).unwrap();
+        let runtime_at = yaml.find("  alpha-runtime:").unwrap();
+        let docker_at = yaml.find(DOCKER_SOCKET_VOLUME).unwrap();
+        assert!(docker_at < runtime_at, "docker socket is on app, not runtime");
+        assert_eq!(
+            yaml.matches(DOCKER_SOCKET_VOLUME).count(),
+            1,
+            "only the one service mounts the daemon socket"
+        );
         assert_eq!(
             yaml.matches(SOCKET_VOLUME).count(),
             2,
