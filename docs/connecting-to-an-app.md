@@ -86,3 +86,12 @@ With OpenSSL 3.5 or newer this prints the issuer, the two SANs and the hour the
 certificate is good for. An Instance that has not attested serves no certificate at all:
 the connection is accepted by the gateway and closes with none, because there is nothing
 behind it to forward to.
+
+## Serving the Endpoint from Rust
+
+A service mounting `/run/alpha` reads its own identity with
+`alpha_client::runtime::RuntimeSocket`, and serves its Endpoint's TLS with
+`alpha_client::tls::server_config` built over an `InstanceCert`. Because the leaf lives one
+hour and the runtime renews it ten minutes early while the key stays the same, the service
+should re-read `identity()` every few minutes and call `InstanceCert::replace` with the
+fresh chain — the listener keeps serving the old leaf to any handshake already in flight.

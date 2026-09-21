@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use alpha_client::runtime::RuntimeSocket;
 use alpha_client::tls::{self, Pin};
 use alpha_client::{Client, Error as ClientError};
 use alpha_core::{AppId, ComposeHash, KeyId, context};
@@ -442,6 +443,64 @@ async fn tenant_backend_pins_the_kms_ca_and_reads_the_revision_from_the_san() {
             .await
             .is_err()
     );
+}
+
+/// A tenant-shaped caller: `RuntimeSocket` for identity and a Secret over the real socket,
+/// `InstanceCert` and `server_config` to serve the Endpoint, the same CA-pinned client the
+/// tenant backend above uses to accept a hybrid handshake and read the Revision back off it.
+#[tokio::test]
+async fn a_tenant_serves_its_endpoint_with_the_runtime_identity() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    let (app, hash, _) = app_with_secret(&h, b"v1").await;
+    let (runtime, _) = start_runtime(&h, config(&h, vec![h.url.clone()]));
+    runtime.attest().await.unwrap();
+    let socket = Socket::start(runtime.clone());
+
+    let client = RuntimeSocket::at(&socket.path);
+    let identity = client.identity().await.unwrap();
+    assert_eq!(identity.app_id, app);
+    assert_eq!(identity.compose_hash, hash);
+
+    let secret = client.secret("model-key").await.unwrap();
+    assert_eq!(secret.as_slice(), b"v1");
+
+    let health = client.healthz().await.unwrap();
+    assert!(health.attested);
+
+    // The App terminates TLS with `InstanceCert` and `server_config` — the new helpers.
+    let cert = Arc::new(tls::InstanceCert::new(&identity).unwrap());
+    let acceptor = TlsAcceptor::from(tls::server_config(cert).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut tls = acceptor.accept(tcp).await.unwrap();
+        let _ = tls.write_all(b"hello from the app\n").await;
+        let _ = tls.shutdown().await;
+    });
+
+    let ca_der = tls::cert_from_pem(&h.ca_pem).unwrap().to_vec();
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let mut tls = backend_client(&ca_der, h.now())
+        .connect(ServerName::try_from("app.example").unwrap(), tcp)
+        .await
+        .unwrap();
+    let group = tls
+        .get_ref()
+        .1
+        .negotiated_key_exchange_group()
+        .unwrap()
+        .name();
+    assert_eq!(group, rustls::NamedGroup::X25519MLKEM768);
+    let leaf = tls.get_ref().1.peer_certificates().unwrap()[0].to_vec();
+    assert_eq!(revision_san(&leaf), hash);
+    let mut line = String::new();
+    tls.read_to_string(&mut line).await.unwrap();
+    assert_eq!(line, "hello from the app\n");
+
+    socket.stop().await;
 }
 
 #[tokio::test]

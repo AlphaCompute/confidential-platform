@@ -13,6 +13,7 @@
     )
 )]
 pub mod platform;
+pub mod runtime;
 pub mod tls;
 
 use alpha_attest::{AttestationResult, EVIDENCE_FORMAT, EventLogEntry, Evidence};
@@ -68,7 +69,7 @@ struct Envelope {
     error: ApiError,
 }
 
-fn api_error(endpoint: &str, status: reqwest::StatusCode, bytes: &[u8]) -> Error {
+pub(crate) fn api_error(endpoint: &str, status: reqwest::StatusCode, bytes: &[u8]) -> Error {
     match serde_json::from_slice::<Envelope>(bytes) {
         Ok(envelope) => Error::Api(ApiError {
             status: status.as_u16(),
