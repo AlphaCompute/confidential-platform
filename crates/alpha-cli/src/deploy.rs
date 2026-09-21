@@ -111,6 +111,7 @@ fn docker_compose_file(spec: &AppSpec) -> Result<String, String> {
     }
     let mut services = Mapping::new();
     let mut publishing: Vec<String> = Vec::new();
+    let mut docker_holders: Vec<String> = Vec::new();
     for (name, service) in &spec.services {
         let name = name
             .as_str()
@@ -122,6 +123,16 @@ fn docker_compose_file(spec: &AppSpec) -> Result<String, String> {
         }
         let service: Service = serde_yaml_ng::from_value(service.clone())
             .map_err(|e| format!("services.{name}: {e}"))?;
+        // The guest daemon's socket goes only to the service holding `/run/alpha`, never to a
+        // container that runs untrusted code.
+        if service.docker && !service.socket {
+            return Err(format!(
+                "services.{name}: `docker` needs `socket`, since the guest daemon's socket goes only to the service holding `/run/alpha`"
+            ));
+        }
+        if service.docker {
+            docker_holders.push(name.to_owned());
+        }
         let mut out = Mapping::new();
         out.insert(key("image"), key(&service.image));
         if let Some(command) = service.command {
@@ -157,6 +168,14 @@ fn docker_compose_file(spec: &AppSpec) -> Result<String, String> {
             } else {
                 publishing.join(", ")
             }
+        ));
+    }
+    // The guest daemon's API is root in the CVM; spreading it across services multiplies who
+    // can reach it.
+    if docker_holders.len() > 1 {
+        return Err(format!(
+            "at most one service may declare `docker`, the guest daemon's API being root in the CVM; these do: {}",
+            docker_holders.join(", ")
         ));
     }
     let revisions: Vec<String> = spec
@@ -341,8 +360,6 @@ pub async fn run(
     let Some(shroud) = shroud else {
         return Ok(json!({ "revision": revision }));
     };
-    // ponytail: shroud-go does not serve this route yet, so the call has run against nothing;
-    // first real deploy is the test.
     let response = reqwest::Client::new()
         .post(format!(
             "{}/v1/apps/{}/deploy",
@@ -428,7 +445,10 @@ mod tests {
         let yaml = docker_compose_file(&spec).unwrap();
         let runtime_at = yaml.find("  alpha-runtime:").unwrap();
         let docker_at = yaml.find(DOCKER_SOCKET_VOLUME).unwrap();
-        assert!(docker_at < runtime_at, "docker socket is on app, not runtime");
+        assert!(
+            docker_at < runtime_at,
+            "docker socket is on app, not runtime"
+        );
         assert_eq!(
             yaml.matches(DOCKER_SOCKET_VOLUME).count(),
             1,
@@ -506,9 +526,8 @@ mod tests {
 
     #[test]
     fn the_daemon_socket_needs_the_runtime_socket() {
-        let base =
-            fs::read_to_string(vector().with_file_name("07-deploy-docker").join("app.yaml"))
-                .unwrap();
+        let base = fs::read_to_string(vector().with_file_name("07-deploy-docker").join("app.yaml"))
+            .unwrap();
         let without_socket = base.replace("    socket: true\n", "");
         let spec = parse(&without_socket).unwrap();
         let err = compose(&spec).unwrap_err();
@@ -519,9 +538,8 @@ mod tests {
 
     #[test]
     fn only_one_service_gets_the_daemon_socket() {
-        let base =
-            fs::read_to_string(vector().with_file_name("07-deploy-docker").join("app.yaml"))
-                .unwrap();
+        let base = fs::read_to_string(vector().with_file_name("07-deploy-docker").join("app.yaml"))
+            .unwrap();
         let two_holders = base.replace(
             "runtime:\n",
             "  worker:\n    image: ghcr.io/acme/app@sha256:3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a\n    socket: true\n    docker: true\nruntime:\n",
