@@ -15,6 +15,9 @@ pub const RUNTIME_SERVICE: &str = "alpha-runtime";
 /// that port. One service publishes it, or nothing answers there.
 const APP_PORT: u16 = 443;
 const SOCKET_VOLUME: &str = "alpha-run:/run/alpha";
+/// The guest daemon's own socket; its API is root in the CVM, so it goes only to the one
+/// service that also holds `/run/alpha`, never to a container that runs untrusted code.
+const DOCKER_SOCKET_VOLUME: &str = "/var/run/docker.sock:/var/run/docker.sock";
 const KMS_ENVS: [&str; 4] = [
     "ALPHACOMPUTE_DATABASE_URL",
     "ALPHACOMPUTE_KMS_ENDPOINTS",
@@ -66,6 +69,10 @@ pub struct Service {
     /// Mounts `/run/alpha`; not for the container that runs model-written code.
     #[serde(default)]
     pub socket: bool,
+    /// Mounts the guest Docker daemon's socket so this service can create containers of its
+    /// own; only beside `socket`, and only on one service.
+    #[serde(default)]
+    pub docker: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,6 +111,7 @@ fn docker_compose_file(spec: &AppSpec) -> Result<String, String> {
     }
     let mut services = Mapping::new();
     let mut publishing: Vec<String> = Vec::new();
+    let mut docker_holders: Vec<String> = Vec::new();
     for (name, service) in &spec.services {
         let name = name
             .as_str()
@@ -115,6 +123,16 @@ fn docker_compose_file(spec: &AppSpec) -> Result<String, String> {
         }
         let service: Service = serde_yaml_ng::from_value(service.clone())
             .map_err(|e| format!("services.{name}: {e}"))?;
+        // The guest daemon's socket goes only to the service holding `/run/alpha`, never to a
+        // container that runs untrusted code.
+        if service.docker && !service.socket {
+            return Err(format!(
+                "services.{name}: `docker` needs `socket`, since the guest daemon's socket goes only to the service holding `/run/alpha`"
+            ));
+        }
+        if service.docker {
+            docker_holders.push(name.to_owned());
+        }
         let mut out = Mapping::new();
         out.insert(key("image"), key(&service.image));
         if let Some(command) = service.command {
@@ -127,8 +145,15 @@ fn docker_compose_file(spec: &AppSpec) -> Result<String, String> {
             publishing.push(name.to_owned());
             out.insert(key("ports"), strings(&[&format!("{APP_PORT}:{port}")]));
         }
+        let mut mounts: Vec<&str> = Vec::new();
         if service.socket {
-            out.insert(key("volumes"), strings(&[SOCKET_VOLUME]));
+            mounts.push(SOCKET_VOLUME);
+        }
+        if service.docker {
+            mounts.push(DOCKER_SOCKET_VOLUME);
+        }
+        if !mounts.is_empty() {
+            out.insert(key("volumes"), strings(&mounts));
         }
         services.insert(key(name), Yaml::Mapping(out));
     }
@@ -143,6 +168,14 @@ fn docker_compose_file(spec: &AppSpec) -> Result<String, String> {
             } else {
                 publishing.join(", ")
             }
+        ));
+    }
+    // The guest daemon's API is root in the CVM; spreading it across services multiplies who
+    // can reach it.
+    if docker_holders.len() > 1 {
+        return Err(format!(
+            "at most one service may declare `docker`, the guest daemon's API being root in the CVM; these do: {}",
+            docker_holders.join(", ")
         ));
     }
     let revisions: Vec<String> = spec
@@ -327,8 +360,6 @@ pub async fn run(
     let Some(shroud) = shroud else {
         return Ok(json!({ "revision": revision }));
     };
-    // ponytail: shroud-go does not serve this route yet, so the call has run against nothing;
-    // first real deploy is the test.
     let response = reqwest::Client::new()
         .post(format!(
             "{}/v1/apps/{}/deploy",
@@ -399,6 +430,38 @@ mod tests {
     }
 
     #[test]
+    fn generator_reproduces_the_docker_vector() {
+        let dir = vector().with_file_name("07-deploy-docker");
+        let spec = parse(&fs::read_to_string(dir.join("app.yaml")).unwrap()).unwrap();
+        let expected = fs::read_to_string(dir.join("app-compose.json")).unwrap();
+        let compose = compose(&spec).unwrap();
+        assert_eq!(compose, expected);
+        let expected_hash: Value =
+            serde_json::from_str(&fs::read_to_string(dir.join("expected.json")).unwrap()).unwrap();
+        assert_eq!(
+            alpha_core::compose_hash(&compose).to_string(),
+            expected_hash["compose_hash"]
+        );
+        let yaml = docker_compose_file(&spec).unwrap();
+        let runtime_at = yaml.find("  alpha-runtime:").unwrap();
+        let docker_at = yaml.find(DOCKER_SOCKET_VOLUME).unwrap();
+        assert!(
+            docker_at < runtime_at,
+            "docker socket is on app, not runtime"
+        );
+        assert_eq!(
+            yaml.matches(DOCKER_SOCKET_VOLUME).count(),
+            1,
+            "only the one service mounts the daemon socket"
+        );
+        assert_eq!(
+            yaml.matches(SOCKET_VOLUME).count(),
+            2,
+            "app and runtime mount the socket"
+        );
+    }
+
+    #[test]
     fn kms_compose_reproduces_the_vector() {
         let dir = vector().with_file_name("06-kms-node");
         let expected: Value =
@@ -459,6 +522,32 @@ mod tests {
         let unpublished = base.replace("    port: 443\n", "");
         let spec = parse(&unpublished).unwrap();
         assert!(compose(&spec).unwrap_err().contains("exactly one service"));
+    }
+
+    #[test]
+    fn the_daemon_socket_needs_the_runtime_socket() {
+        let base = fs::read_to_string(vector().with_file_name("07-deploy-docker").join("app.yaml"))
+            .unwrap();
+        let without_socket = base.replace("    socket: true\n", "");
+        let spec = parse(&without_socket).unwrap();
+        let err = compose(&spec).unwrap_err();
+        assert!(err.contains("services.app"), "{err}");
+        assert!(err.contains("docker"), "{err}");
+        assert!(err.contains("socket"), "{err}");
+    }
+
+    #[test]
+    fn only_one_service_gets_the_daemon_socket() {
+        let base = fs::read_to_string(vector().with_file_name("07-deploy-docker").join("app.yaml"))
+            .unwrap();
+        let two_holders = base.replace(
+            "runtime:\n",
+            "  worker:\n    image: ghcr.io/acme/app@sha256:3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a\n    socket: true\n    docker: true\nruntime:\n",
+        );
+        let spec = parse(&two_holders).unwrap();
+        let err = compose(&spec).unwrap_err();
+        assert!(err.contains("at most one service"), "{err}");
+        assert!(err.contains("app, worker"), "{err}");
     }
 
     #[test]
