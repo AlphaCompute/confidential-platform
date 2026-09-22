@@ -233,6 +233,58 @@ pub fn report_data(
     out
 }
 
+/// What [`verify_quote`] proves about a TDX quote, independent of whose it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedQuote {
+    pub report_data: [u8; 64],
+    pub measured: Measured,
+    pub tcb_status: String,
+    pub advisories: Vec<String>,
+}
+
+/// The DCAP verification, TD10 extraction and policy check, for any TDX quote — a third
+/// party's or our own. The crate's one production quote verifier runs here.
+pub fn verify_quote(
+    quote: &[u8],
+    collateral: &Collateral,
+    policy: &Policy,
+    now: SystemTime,
+) -> Result<VerifiedQuote, AppraisalError> {
+    use AppraisalError::*;
+
+    let now = now
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Failed("now is before the epoch".into()))?
+        .as_secs();
+    // The debug bit is a policy decision here, not a verification failure.
+    let verified = QuoteVerifier::new_prod()
+        .allow_debug(true)
+        .verify(quote, collateral, now)
+        .map_err(|e| Failed(format!("dcap: {e:#}")))?;
+    let report = verified
+        .report
+        .as_td10()
+        .ok_or_else(|| Failed("quote is not a TDX quote".into()))?;
+
+    let tcb_status = verified.status;
+    let advisories = verified.advisory_ids;
+    check_policy(policy, &tcb_status, &advisories, &report.td_attributes)?;
+
+    let measured = Measured {
+        mrtd: Measurement(report.mr_td),
+        rtmr0: Measurement(report.rt_mr0),
+        rtmr1: Measurement(report.rt_mr1),
+        rtmr2: Measurement(report.rt_mr2),
+        rtmr3: Measurement(report.rt_mr3),
+    };
+    Ok(VerifiedQuote {
+        report_data: report.report_data,
+        measured,
+        tcb_status,
+        advisories,
+    })
+}
+
 /// Steps 1–8a of the appraisal: everything up to and including reading `compose_hash`
 /// from the event log. `node_xwing_spki` is `Some` for a KMS node, whose `compose_hash`
 /// must then be in `doc.kms_revisions`; for an Instance the KMS looks it up in its own
@@ -251,37 +303,19 @@ pub fn appraise(
     if evidence.format != EVIDENCE_FORMAT {
         return Err(Unknown(format!("evidence format {:?}", evidence.format)));
     }
-    let now = now
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| Failed("now is before the epoch".into()))?
-        .as_secs();
-    // The debug bit is a policy decision here, not a verification failure.
-    let verified = QuoteVerifier::new_prod()
-        .allow_debug(true)
-        .verify(&evidence.quote, collateral, now)
-        .map_err(|e| Failed(format!("dcap: {e:#}")))?;
-    let report = verified
-        .report
-        .as_td10()
-        .ok_or_else(|| Failed("quote is not a TDX quote".into()))?;
+    let VerifiedQuote {
+        report_data: verified_report_data,
+        measured,
+        tcb_status,
+        advisories,
+    } = verify_quote(&evidence.quote, collateral, &doc.policy, now)?;
 
-    let tcb_status = verified.status;
-    let advisories = verified.advisory_ids;
-    check_policy(&doc.policy, &tcb_status, &advisories, &report.td_attributes)?;
-
-    if report.report_data != report_data(runtime_pubkey_spki, nonce, node_xwing_spki) {
+    if verified_report_data != report_data(runtime_pubkey_spki, nonce, node_xwing_spki) {
         return Err(Failed(
             "report_data is not bound to this key and nonce".into(),
         ));
     }
 
-    let measured = Measured {
-        mrtd: Measurement(report.mr_td),
-        rtmr0: Measurement(report.rt_mr0),
-        rtmr1: Measurement(report.rt_mr1),
-        rtmr2: Measurement(report.rt_mr2),
-        rtmr3: Measurement(report.rt_mr3),
-    };
     if event_log::replay(&evidence.event_log)
         != [
             measured.rtmr0,
@@ -425,5 +459,35 @@ mod tests {
         for bad in ["", "sha384:", "sha256:0707", &m.to_string().to_uppercase()] {
             assert!(bad.parse::<Measurement>().is_err(), "{bad}");
         }
+    }
+
+    /// `verify_quote` used standalone, over a third party's quote and our own policy —
+    /// the shape `services/alpha-inference` needs, proven here on a real capture rather
+    /// than a synthetic one.
+    #[test]
+    fn verify_quote_reports_the_capture_report_data() {
+        use std::path::PathBuf;
+        use std::time::Duration;
+
+        let dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/attest/phala-dev-0.5.9");
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
+        let quote = hex::decode(read("quote.instance.hex").trim()).unwrap();
+        let collateral: Collateral = serde_json::from_str(&read("collateral.json")).unwrap();
+        let doc: PlatformDocument = serde_json::from_str(&read("platform-document.json")).unwrap();
+        let now = UNIX_EPOCH
+            + Duration::from_secs(
+                chrono::DateTime::parse_from_rfc3339(read("captured_at.txt").trim())
+                    .unwrap()
+                    .timestamp() as u64,
+            );
+
+        let verified = verify_quote(&quote, &collateral, &doc.policy, now).unwrap();
+
+        assert_eq!(
+            hex::encode(verified.report_data),
+            read("report_data.instance.hex").trim()
+        );
+        assert_eq!(verified.tcb_status, "UpToDate");
     }
 }
