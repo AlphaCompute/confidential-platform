@@ -80,6 +80,10 @@ pub fn spki_b64(key: &SigningKey) -> String {
     b64(key.verifying_key().to_public_key_der().unwrap().as_bytes())
 }
 
+pub fn trust_org(key: &SigningKey) -> OrgId {
+    OrgId::from_root_spki(key.verifying_key().to_public_key_der().unwrap().as_bytes())
+}
+
 /// A fresh database per test, migrated.
 pub async fn fresh_database() -> Option<PgPool> {
     let admin_url = match std::env::var("DATABASE_URL") {
@@ -301,8 +305,8 @@ pub async fn harness_with_clock(clock: Clock) -> Option<Harness> {
     )
     .await
     .unwrap();
-    let org = OrgId::mint();
     let root_key = SigningKey::from_bytes(&[7u8; 32]);
+    let org = trust_org(&root_key);
     let (status, reply) = send(
         client()
             .post(format!("{base}/v1/keys"))

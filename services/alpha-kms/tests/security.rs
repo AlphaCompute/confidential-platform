@@ -10,6 +10,7 @@ mod common;
 use alpha_core::{AppId, context};
 use alpha_kms::{keys, rfc3339};
 use common::*;
+use ed25519_dalek::SigningKey;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use sqlx::Row;
@@ -166,4 +167,20 @@ async fn trusted_database_model_does_not_claim_superuser_rollback_resistance() {
         .await
         .unwrap();
     assert_eq!(send(instance.get(&url)).await.0, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn concurrent_first_claim_cannot_preempt_the_root_identity() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let victim = SigningKey::from_bytes(&[81; 32]);
+    let attacker = SigningKey::from_bytes(&[82; 32]);
+    let org = trust_org(&victim);
+    let wrong = root_key_registration(org, &attacker, h.now());
+    let right = root_key_registration(org, &victim, h.now());
+    let (bad, good) = tokio::join!(h.post("/v1/keys", wrong), h.post("/v1/keys", right));
+    assert_ne!(bad.0, StatusCode::OK);
+    assert_eq!(good.0, StatusCode::OK);
+    assert_eq!(good.1["public_key"], spki_b64(&victim));
 }

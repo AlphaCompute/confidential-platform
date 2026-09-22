@@ -5,3 +5,10 @@ Customer root/signing keys and custodian unseal shares stay on customer-controll
 ## Provisioning encryption
 
 Shroud and the Python helper require an independently installed compressed secp256k1 KMS signer pin. A v1 signed environment key must bind the expected 20-byte provider app ID, match the offered 32-byte key and be at most five minutes old or one minute in the future. Unsigned/legacy-only responses fail before credential encryption/commit. Install the Alpha-owned adapter from `integrations/dstack-tee` before running `deploy/phala.py`. Its SDK is pinned to `c12e96adaeea51d1c79608123d41a6f521db46cd`; transitive Python packages still need a fully hashed release lock before production qualification.
+
+## Self-certifying organization IDs
+
+Hash `alphacompute/trust-org/v1\0 || canonical_Ed25519_SPKI_DER` with SHA-256, take the first 16 bytes and set UUID version 8 and variant bits. The UUID carries 122 fingerprint bits; the complete SPKI remains the anchor. This is not a claim of 256-bit identifier collision resistance. The CLI derives it by default; another root cannot first-claim it.
+
+Existing UUID/root pairs remain anchored to the exact old root and allow idempotent replay. No automatic rename or root substitution occurs. Registration's optional `--org-id` supports legacy replay. Billing organization UUIDs are distinct from trust IDs and need an authorized mapping. Migration to a derived ID is new enrollment: the customer signs new key/revision/secret records, applications adopt the new public identity, then old approvals are revoked and archived. Never move certificates, KDF inputs or ciphertext by editing an organization column.
+
