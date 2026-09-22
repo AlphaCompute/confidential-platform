@@ -659,3 +659,146 @@ async fn revoked_revision_ends_the_runtime_with_78() {
     assert_eq!(err.exit_code(), 78);
     assert!(runtime.is_revoked());
 }
+
+#[tokio::test]
+async fn cpu_application_uses_real_kms_secret_over_runtime_socket_and_pinned_tls() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    let (app_id, hash, admin) = app_with_secret(&h, b"initial").await;
+    let key = b"customer-owned-secret-at-least-32-bytes";
+    assert_eq!(
+        h.put_secret("cpu-app-key", &[app_id], key, h.now(), &admin)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let (runtime, _) = start_runtime(&h, config(&h, vec![h.url.clone()]));
+    runtime.attest().await.unwrap();
+    let socket = Socket::start(runtime.clone());
+    let app = alpha_cpu_app::Application::connect(&socket.path)
+        .await
+        .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let url = format!("https://{address}");
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let serving = tokio::spawn(async move {
+        app.serve(listener, async {
+            let _ = stopped.await;
+        })
+        .await
+        .unwrap()
+    });
+    let conf = tls::client_config(
+        Some(Pin::Ca(tls::cert_from_pem(&h.ca_pem).unwrap())),
+        None,
+        pinned_time(h.now()),
+    )
+    .unwrap();
+    let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(conf)
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .pool_max_idle_per_host(0)
+        .build()
+        .unwrap();
+    let response = client
+        .get(format!("{url}/healthz?challenge=unique-challenge"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let health: Value = response.json().await.unwrap();
+    assert_eq!(health["challenge"], "unique-challenge");
+    assert_eq!(health["org_id"], json!(h.org));
+    assert_eq!(health["app_id"], json!(app_id));
+    assert_eq!(health["compose_hash"], json!(hash));
+    assert_eq!(health["secret_access"], true);
+    let answer: Value = client
+        .post(format!("{url}/v1/hmac"))
+        .body("customer data")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut expected = Hmac::<sha2::Sha256>::new_from_slice(key).unwrap();
+    expected.update(b"customer data");
+    assert_eq!(
+        answer["hmac_sha256"],
+        hex::encode(expected.finalize().into_bytes())
+    );
+    let wrong = alpha_core::compose_hash("wrong");
+    assert!(matches!(
+        alpha_client::probe_instance(&url, &h.ca_pem, &wrong, pinned_time(h.now()))
+            .await
+            .unwrap(),
+        alpha_client::Probe::OtherRevision(_)
+    ));
+    // Losing the runtime must fail even after a successful secret read.
+    socket.stop().await;
+    assert!(
+        client
+            .get(format!("{url}/healthz?challenge=runtime-failed"))
+            .send()
+            .await
+            .is_err()
+    );
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+    // Stop and recreate both socket service and application, preserving the endpoint.
+    let socket = Socket::start(runtime.clone());
+    let app = alpha_cpu_app::Application::connect(&socket.path)
+        .await
+        .unwrap();
+    let listener = TcpListener::bind(address).await.unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let serving = tokio::spawn(async move {
+        app.serve(listener, async {
+            let _ = stopped.await;
+        })
+        .await
+        .unwrap()
+    });
+    assert_eq!(
+        client
+            .get(format!("{url}/healthz?challenge=restarted"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    // Revoke only this secret's policy; the runtime certificate is still valid.
+    assert_eq!(
+        h.put_secret(
+            "cpu-app-key",
+            &[AppId::mint()],
+            key,
+            h.now() + Duration::from_secs(1),
+            &admin
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert!(
+        client
+            .get(format!("{url}/healthz?challenge=after-revocation"))
+            .send()
+            .await
+            .is_err()
+    );
+    assert!(
+        alpha_cpu_app::Application::connect(&socket.path)
+            .await
+            .is_err()
+    );
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+    socket.stop().await;
+}

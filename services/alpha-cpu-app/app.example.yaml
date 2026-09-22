@@ -1,0 +1,17 @@
+# Fill from independently approved release artifacts before signing. Placeholders
+# intentionally fail registration and are not acceptance or deployable evidence.
+app_id: REPLACE_WITH_CUSTOMER_APP_UUID
+services:
+  app:
+    image: ghcr.io/alphacompute/alpha-cpu-app@sha256:REPLACE_WITH_APPROVED_DIGEST
+    port: 8443
+    socket: true
+    restart: on-failure:5
+runtime:
+  image: ghcr.io/alphacompute/alpha-runtime@sha256:REPLACE_WITH_APPROVED_DIGEST
+  kms_ca_spki_sha256: sha256:REPLACE_WITH_CUSTOMER_CA_PIN
+  kms_revisions:
+    - sha256:REPLACE_WITH_APPROVED_KMS_REVISION
+resources:
+  cpu: 1
+  memory_mib: 2048

@@ -128,6 +128,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "alpha-cpu-app"
+version = "0.1.0"
+dependencies = [
+ "alpha-client",
+ "axum",
+ "base64 0.23.1",
+ "hex",
+ "hmac 0.13.0",
+ "hyper-util",
+ "parking_lot",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tokio",
+ "tokio-rustls",
+ "zeroize",
+]
+
+[[package]]
 name = "alpha-crypto"
 version = "0.1.0"
 dependencies = [
@@ -152,6 +173,7 @@ dependencies = [
  "alpha-cli",
  "alpha-client",
  "alpha-core",
+ "alpha-cpu-app",
  "alpha-crypto",
  "alpha-runtime",
  "alpha-tsm",
