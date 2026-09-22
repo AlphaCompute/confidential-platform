@@ -21,12 +21,12 @@ to the socket), and comes up only after the first attestation succeeded:
 | Route | Reply |
 |---|---|
 | `GET /v1/identity` | `{app_id, org_id, compose_hash, certificate_chain, tls_private_key, attestation_result}` — the ids and the hash are read from the leaf's SANs; `tls_private_key` is the PKCS#8 DER, base64url |
-| `GET /v1/secrets/{name}` | the KMS reply, fetched over mTLS with the leaf and cached until the leaf expires; a KMS error passes through in its envelope with its status |
+| `GET /v1/secrets/{name}` | fetched and authorized over KMS mTLS on every read, with an independent plaintext digest check; a KMS error passes through with its status |
 | `GET /healthz` | `{attested, cert_not_after}` |
 
 With no valid leaf (the last renewal failed and the hour is over) the first two answer
-`503 not_attested`. A cached secret is served until the leaf expires even after its Revision is
-revoked; the next call that reaches the KMS is the one that ends the process.
+`503 not_attested`. There is no secret response cache. Every secret read checks current KMS
+policy; revision revocation ends the process even when that name was previously read.
 
 ## Tests
 
@@ -51,5 +51,5 @@ Cloud with the three host mounts of `docs/manifest.md`.
 `images/manager/Dockerfile` builds the binary as a static musl executable in a stage with no
 network (dependencies are fetched in the stage before) and ships it alone in a `scratch` image;
 the base image is pinned by digest and every timestamp comes from `SOURCE_DATE_EPOCH`, so one
-commit gives one image digest. `.github/workflows/release.yml` builds it twice, the second time
-with `--no-cache`, and fails when the two differ.
+commit is expected to reproduce one image digest. `.github/workflows/release.yml` builds on
+two independent runners with `--no-cache` and fails when image fingerprints differ.

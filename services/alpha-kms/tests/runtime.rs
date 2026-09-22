@@ -222,7 +222,7 @@ async fn runtime_attests_with_the_captures_key_and_serves_the_three_routes() {
         json!({ "attested": true, "cert_not_after": rfc3339(h.now() + certs::LEAF_TTL) })
     );
 
-    // Secrets over mTLS with the leaf, cached with it: a later put is not seen until renewal.
+    // Secrets over mTLS reauthorize each read and observe rotation before renewal.
     let (status, secret) = socket.get("/v1/secrets/model-key").await;
     assert_eq!(status, 200, "{secret}");
     assert_eq!(secret["value"], json!(b64(b"v1")));
@@ -237,7 +237,11 @@ async fn runtime_attests_with_the_captures_key_and_serves_the_three_routes() {
         .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
     let (_, secret) = socket.get("/v1/secrets/model-key").await;
-    assert_eq!(secret["value"], json!(b64(b"v1")), "cached");
+    assert_eq!(
+        secret["value"],
+        json!(b64(b"v2")),
+        "read-through authorization"
+    );
     let (status, reply) = socket.get("/v1/secrets/other").await;
     assert_eq!((status, code(&reply)), (404, "not_found"), "{reply}");
     assert!(reply["error"]["request_id"].is_string());
@@ -638,11 +642,8 @@ async fn revoked_revision_ends_the_runtime_with_78() {
         .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
 
-    // The cached secret is still served; the next call that reaches the KMS is refused and
-    // the runtime ends itself.
-    let (status, _) = socket.get("/v1/secrets/model-key").await;
-    assert_eq!(status, 200);
-    let (status, reply) = socket.get("/v1/secrets/other").await;
+    // Even a previously read name is reauthorized and terminates the revoked runtime.
+    let (status, reply) = socket.get("/v1/secrets/model-key").await;
     assert_eq!((status, code(&reply)), (409, "revision_revoked"), "{reply}");
     assert!(runtime.is_revoked());
     let exit = (&mut socket.task).await.unwrap();

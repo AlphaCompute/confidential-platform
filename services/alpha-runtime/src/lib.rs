@@ -16,7 +16,6 @@
 
 pub mod socket;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -28,7 +27,8 @@ use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use p256::ecdsa::SigningKey;
 use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
+use sha2::{Digest, Sha256};
 use tokio::net::UnixListener;
 use tokio::sync::watch;
 use zeroize::Zeroizing;
@@ -184,7 +184,6 @@ pub struct Attested {
     pub not_after: SystemTime,
     pub result: AttestationResult,
     client: Client,
-    secrets: Mutex<HashMap<String, Secret>>,
 }
 
 pub struct Runtime {
@@ -331,25 +330,23 @@ impl Runtime {
             not_after,
             result: reply.attestation_result,
             client,
-            secrets: Mutex::new(HashMap::new()),
         }))
     }
 
-    /// From the KMS over mTLS with the current leaf, cached with it.
+    /// Reauthorize every read with the KMS. An issued leaf is not a secret-policy cache.
     pub async fn secret(&self, name: &str) -> Result<Secret, Error> {
         let attested = self.attested().ok_or(Error::NotAttested)?;
-        if let Some(secret) = attested.secrets.lock().get(name) {
-            return Ok(secret.clone());
-        }
         let secret = attested
             .client
             .get_secret(name)
             .await
             .map_err(|e| self.note(e.into()))?;
-        attested
-            .secrets
-            .lock()
-            .insert(name.to_owned(), secret.clone());
+        let value = BASE64_URL_SAFE_NO_PAD
+            .decode(&secret.value)
+            .map_err(|_| Error::Certificate("secret value is not base64url".into()))?;
+        if format!("sha256:{}", hex::encode(Sha256::digest(&value))) != secret.content_sha256 {
+            return Err(Error::Certificate("secret plaintext hash mismatch".into()));
+        }
         Ok(secret)
     }
 

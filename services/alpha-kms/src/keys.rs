@@ -80,6 +80,20 @@ pub fn aead_open(key: &[u8; 32], aad: &[u8], blob: &[u8]) -> Option<Zeroizing<Ve
 
 pub use alpha_client::SignatureObject;
 
+/// Secret format v2 binds the tenant, immutable row identity and the entire signed
+/// authorization document. There is deliberately no fallback to UUID-only AAD.
+pub fn secret_aad(org: OrgId, id: Uuid, document: &Value) -> Result<Vec<u8>, ApiError> {
+    let digest = signing_digest(alpha_core::context::SECRET, document)
+        .map_err(|e| ApiError::signature_invalid(format!("secret document: {e}")))?;
+    Ok([
+        b"alphacompute-kms/secret/v2\0".as_slice(),
+        org.as_bytes().as_slice(),
+        id.as_bytes().as_slice(),
+        digest.as_slice(),
+    ]
+    .concat())
+}
+
 pub fn verify_ed25519(spki_der: &[u8], digest: &[u8; 32], signature_b64: &str) -> bool {
     let Ok(key) = VerifyingKey::from_public_key_der(spki_der) else {
         return false;

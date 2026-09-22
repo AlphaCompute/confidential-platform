@@ -227,13 +227,20 @@ async fn two_organizations_live_side_by_side() {
         .unwrap()
     };
     let key_b = org_key(org_b, &root_b.1);
+    let document: Value = sqlx::query_scalar("select document from secrets where id=$1")
+        .bind(stored.id)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    let aad = alpha_kms::keys::secret_aad(h.org, stored.id, &document).unwrap();
+    let ciphertext = stored.ciphertext.strip_prefix(b"AKS2").unwrap();
     assert!(
-        alpha_kms::keys::aead_open(&key_b, stored.id.as_bytes(), &stored.ciphertext).is_none(),
+        alpha_kms::keys::aead_open(&key_b, &aad, ciphertext).is_none(),
         "the neighbour's key opens the secret"
     );
     let key_a = org_key(h.org, &h.root.1);
     assert_eq!(
-        alpha_kms::keys::aead_open(&key_a, stored.id.as_bytes(), &stored.ciphertext)
+        alpha_kms::keys::aead_open(&key_a, &aad, ciphertext)
             .unwrap()
             .as_slice(),
         b"a's value"

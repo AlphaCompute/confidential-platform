@@ -82,7 +82,16 @@ pub fn spki_b64(key: &SigningKey) -> String {
 
 /// A fresh database per test, migrated.
 pub async fn fresh_database() -> Option<PgPool> {
-    let admin_url = std::env::var("DATABASE_URL").ok()?;
+    let admin_url = match std::env::var("DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            assert!(
+                std::env::var_os("ALPHA_REQUIRE_DATABASE_TESTS").is_none(),
+                "DATABASE_URL required; acceptance must not silently skip database tests"
+            );
+            return None;
+        }
+    };
     let admin = PgPoolOptions::new()
         .max_connections(1)
         .connect(&admin_url)
@@ -103,7 +112,19 @@ pub async fn fresh_database() -> Option<PgPool> {
         .connect(&url)
         .await
         .unwrap();
-    alpha_kms::migrate(&pool).await.unwrap();
+    // Migrations create a cluster-wide role. Separate test databases do not
+    // isolate CREATE ROLE, so serialize migration on the common admin database.
+    let mut migration_lock = admin.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock(741259031)")
+        .execute(&mut *migration_lock)
+        .await
+        .unwrap();
+    let migrated = alpha_kms::migrate(&pool).await;
+    sqlx::query("SELECT pg_advisory_unlock(741259031)")
+        .execute(&mut *migration_lock)
+        .await
+        .unwrap();
+    migrated.unwrap();
     Some(pool)
 }
 
@@ -367,7 +388,7 @@ impl Harness {
     }
 
     /// The capture's compose as a Revision of `app_id`, signed by `signer`, straight into the table
-    /// (its Phala `name` is not a UUID, so route 1 would refuse it — the KMS never checks the form later).
+    /// (its Phala `name` is not a UUID, so route 1 would refuse it â€” the KMS never checks the form later).
     pub async fn insert_capture_revision(
         &self,
         app_id: AppId,

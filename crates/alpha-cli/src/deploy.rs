@@ -18,11 +18,12 @@ const SOCKET_VOLUME: &str = "alpha-run:/run/alpha";
 /// The guest daemon's own socket; its API is root in the CVM, so it goes only to the one
 /// service that also holds `/run/alpha`, never to a container that runs untrusted code.
 const DOCKER_SOCKET_VOLUME: &str = "/var/run/docker.sock:/var/run/docker.sock";
-const KMS_ENVS: [&str; 4] = [
+const KMS_ENVS: [&str; 5] = [
     "ALPHACOMPUTE_DATABASE_URL",
     "ALPHACOMPUTE_KMS_ENDPOINTS",
     "ALPHACOMPUTE_PCCS_URL",
     "ALPHACOMPUTE_PLATFORM_DOCUMENT_URL",
+    "ALPHACOMPUTE_DATABASE_INTEGRITY",
 ];
 const DEV_ROOT_ENV: &str = "ALPHACOMPUTE_KMS_DEV_ROOT_KEK";
 /// dstack's `app-compose.sh` sources this before `docker compose up`; it is sourced, so it
@@ -486,7 +487,7 @@ mod tests {
         let dev = kms_compose(app_id, image, true).unwrap();
         let parsed: Value = serde_json::from_str(&dev).unwrap();
         assert_eq!(parsed["public_logs"], true);
-        assert_eq!(parsed["allowed_envs"][4], DEV_ROOT_ENV);
+        assert_eq!(parsed["allowed_envs"][5], DEV_ROOT_ENV);
         assert!(
             parsed["docker_compose_file"]
                 .as_str()
