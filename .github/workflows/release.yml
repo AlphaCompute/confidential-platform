@@ -27,6 +27,9 @@ jobs:
             dockerfile: images/kms/Dockerfile
             features: dev-root
             app_id: 01a09f07-8d09-7aff-b257-83dbd9e6e641
+          # No app_id: the release workflow renders a compose only for the KMS.
+          - name: alpha-inference
+            dockerfile: images/inference/Dockerfile
     env:
       FEATURES: ${{ matrix.features }}
     steps:

@@ -23,6 +23,8 @@ jobs:
           - name: alpha-kms-dev
             dockerfile: images/kms/Dockerfile
             features: dev-root
+          - name: alpha-inference
+            dockerfile: images/inference/Dockerfile
     steps:
       - uses: actions/checkout@v4
       - id: meta

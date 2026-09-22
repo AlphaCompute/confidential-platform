@@ -273,6 +273,9 @@ impl Upstream {
         let spki =
             alpha_client::tls::spki_of(&leaf.ok_or(Reason::Shape)?).map_err(|_| Reason::Shape)?;
 
+        // ponytail: one PCCS round trip per check (at most once a minute per model, the
+        // `VERIFIED_TTL` bound) rather than a cache keyed on the quote's FMSPC. Add the cache
+        // if PCCS latency or rate limits become a problem.
         let collateral = alpha_attest::fetch_collateral(&self.pccs_url, &quote)
             .await
             .map_err(|_| Reason::Collateral)?;
