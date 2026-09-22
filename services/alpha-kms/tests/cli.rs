@@ -178,9 +178,9 @@ async fn call_signs_all_five_control_routes() {
 
     // Route 1 with the canonical manifest vector.
     let compose =
-        fs::read_to_string(testdata().join("manifest/01-canonical/app-compose.json")).unwrap();
+        fs::read_to_string(testdata().join("manifest/05-deploy/app-compose.json")).unwrap();
     let expected: Value = serde_json::from_str(
-        &fs::read_to_string(testdata().join("manifest/01-canonical/expected.json")).unwrap(),
+        &fs::read_to_string(testdata().join("manifest/05-deploy/expected.json")).unwrap(),
     )
     .unwrap();
     let app_id: AppId = expected["app_id"].as_str().unwrap().parse().unwrap();
@@ -202,7 +202,7 @@ async fn call_signs_all_five_control_routes() {
     .unwrap();
     assert_eq!(
         stored,
-        fs::read_to_string(testdata().join("manifest/01-canonical/app-compose.json")).unwrap()
+        fs::read_to_string(testdata().join("manifest/05-deploy/app-compose.json")).unwrap()
     );
 
     // Route 3: content_sha256 and issued_at filled in from the value and the clock.
