@@ -302,7 +302,15 @@ impl Upstream {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::UNIX_EPOCH;
+
+    use axum::Router;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::{get, post};
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
     use super::*;
 
@@ -338,6 +346,439 @@ mod tests {
             check_report(&report, &spki, &nonce, &collateral, &policy, now),
             Ok(())
         );
+    }
+
+    /// The real capture's report, nonce, SPKI, collateral, policy and clock — a baseline every
+    /// negative golden test mutates exactly one field of.
+    fn golden_inputs() -> (Report, [u8; 32], Vec<u8>, Collateral, Policy, SystemTime) {
+        let report: Report = serde_json::from_str(&read("report.json")).unwrap();
+        let nonce: [u8; 32] = alpha_core::hex_bytes(read("nonce.hex").trim()).unwrap();
+        let spki = spki_of_pem(&read("api.redpill.ai.pem"));
+        let collateral: Collateral = serde_json::from_str(&read("collateral.json")).unwrap();
+        let policy = Policy {
+            tcb_statuses: vec!["UpToDate".into()],
+            tolerated_advisories: vec![],
+        };
+        let secs = chrono::DateTime::parse_from_rfc2822(read("captured_at.txt").trim())
+            .unwrap()
+            .timestamp();
+        let now = UNIX_EPOCH + Duration::from_secs(secs.try_into().unwrap());
+        (report, nonce, spki, collateral, policy, now)
+    }
+
+    #[test]
+    fn check_report_fails_with_a_different_nonce() {
+        let (report, mut nonce, spki, collateral, policy, now) = golden_inputs();
+        nonce[0] ^= 0xff;
+        assert_eq!(
+            check_report(&report, &spki, &nonce, &collateral, &policy, now),
+            Err(Reason::Binding)
+        );
+    }
+
+    #[test]
+    fn check_report_fails_with_the_spki_of_a_different_host() {
+        let (report, nonce, _spki, collateral, policy, now) = golden_inputs();
+        let wrong_spki = spki_of_pem(&read("tee.redpill.ai.pem"));
+        assert_eq!(
+            check_report(&report, &wrong_spki, &nonce, &collateral, &policy, now),
+            Err(Reason::Binding)
+        );
+    }
+
+    #[test]
+    fn check_report_fails_with_one_byte_of_the_quote_altered() {
+        let (mut report, nonce, spki, collateral, policy, now) = golden_inputs();
+        // Byte 50 sits inside the TD report body (past the ~48-byte quote header), squarely
+        // within the region the quote's own ECDSA signature covers — any TDX-quote byte here
+        // breaks that signature, unlike bytes deep in the trailing PCK certificate data.
+        let mut chars: Vec<char> = report.intel_quote.chars().collect();
+        let index = 100;
+        let Some(c) = chars.get_mut(index) else {
+            panic!("quote.hex has no byte at {index}");
+        };
+        *c = if *c == '0' { '1' } else { '0' };
+        report.intel_quote = chars.into_iter().collect();
+        assert_eq!(
+            check_report(&report, &spki, &nonce, &collateral, &policy, now),
+            Err(Reason::Quote)
+        );
+    }
+
+    #[test]
+    fn check_report_fails_when_the_policy_tolerates_no_status_the_report_has() {
+        let (report, nonce, spki, collateral, _policy, now) = golden_inputs();
+        let policy = Policy {
+            tcb_statuses: vec!["OutOfDate".into()],
+            tolerated_advisories: vec![],
+        };
+        assert_eq!(
+            check_report(&report, &spki, &nonce, &collateral, &policy, now),
+            Err(Reason::Policy)
+        );
+    }
+
+    #[test]
+    fn check_report_fails_once_the_collateral_has_expired() {
+        let (report, nonce, spki, collateral, policy, now) = golden_inputs();
+        let ten_years = Duration::from_secs(10 * 365 * 86400);
+        assert_eq!(
+            check_report(
+                &report,
+                &spki,
+                &nonce,
+                &collateral,
+                &policy,
+                now + ten_years
+            ),
+            Err(Reason::Quote)
+        );
+    }
+
+    fn test_config(upstream_url: &str, models: &[&str]) -> crate::Config {
+        crate::Config {
+            upstream_url: upstream_url.to_string(),
+            models: models.iter().map(|s| (*s).to_string()).collect(),
+            pccs_url: "https://pccs.example".to_string(),
+            upstream_policy: Policy {
+                tcb_statuses: vec!["UpToDate".into()],
+                tolerated_advisories: vec![],
+            },
+        }
+    }
+
+    async fn build_upstream(
+        upstream_url: &str,
+        models: &[&str],
+        report_timeout: Duration,
+        now: SystemTime,
+    ) -> Upstream {
+        let clock: Clock = Arc::new(move || now);
+        Upstream::build(&test_config(upstream_url, models), clock, report_timeout).unwrap()
+    }
+
+    #[derive(Clone)]
+    struct ReportBehavior {
+        status: StatusCode,
+        body: String,
+        delay: Option<Duration>,
+    }
+
+    #[derive(Clone)]
+    struct ReportServerState {
+        behavior: ReportBehavior,
+        report_hits: Arc<AtomicUsize>,
+        completions_hits: Arc<AtomicUsize>,
+    }
+
+    async fn report_route(State(state): State<ReportServerState>) -> Response {
+        state.report_hits.fetch_add(1, Ordering::SeqCst);
+        if let Some(delay) = state.behavior.delay {
+            tokio::time::sleep(delay).await;
+        }
+        (state.behavior.status, state.behavior.body.clone()).into_response()
+    }
+
+    async fn completions_route(State(state): State<ReportServerState>) -> StatusCode {
+        state.completions_hits.fetch_add(1, Ordering::SeqCst);
+        StatusCode::OK
+    }
+
+    /// A plain-HTTP fake RedPill: the report route answers `behavior`, and counts hits on both
+    /// routes so a test can prove the completions route was never reached.
+    async fn spawn_report_server(
+        behavior: ReportBehavior,
+    ) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let state = ReportServerState {
+            behavior,
+            report_hits: Arc::new(AtomicUsize::new(0)),
+            completions_hits: Arc::new(AtomicUsize::new(0)),
+        };
+        let report_hits = state.report_hits.clone();
+        let completions_hits = state.completions_hits.clone();
+        let app = Router::new()
+            .route("/attestation/report", get(report_route))
+            .route("/chat/completions", post(completions_route))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), report_hits, completions_hits)
+    }
+
+    #[tokio::test]
+    async fn verified_fails_with_fetch_when_the_report_endpoint_refuses_the_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let upstream = build_upstream(
+            &format!("http://{addr}"),
+            &["m1"],
+            Duration::from_secs(5),
+            SystemTime::now(),
+        )
+        .await;
+        assert!(matches!(
+            upstream.verified("m1").await.unwrap_err(),
+            VerifyOutcome::Unverified(Reason::Fetch)
+        ));
+    }
+
+    #[tokio::test]
+    async fn verified_fails_with_status_when_the_report_endpoint_answers_500() {
+        let (base, hits, completions) = spawn_report_server(ReportBehavior {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: String::new(),
+            delay: None,
+        })
+        .await;
+        let upstream =
+            build_upstream(&base, &["m1"], Duration::from_secs(5), SystemTime::now()).await;
+        assert!(matches!(
+            upstream.verified("m1").await.unwrap_err(),
+            VerifyOutcome::Unverified(Reason::Status)
+        ));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(completions.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn verified_fails_with_fetch_when_the_report_endpoint_exceeds_the_timeout() {
+        let (base, _hits, _completions) = spawn_report_server(ReportBehavior {
+            status: StatusCode::OK,
+            body: "{}".into(),
+            delay: Some(Duration::from_millis(300)),
+        })
+        .await;
+        let upstream =
+            build_upstream(&base, &["m1"], Duration::from_millis(50), SystemTime::now()).await;
+        assert!(matches!(
+            upstream.verified("m1").await.unwrap_err(),
+            VerifyOutcome::Unverified(Reason::Fetch)
+        ));
+    }
+
+    #[tokio::test]
+    async fn verified_fails_with_shape_when_the_report_is_not_json() {
+        let (base, _hits, _completions) = spawn_report_server(ReportBehavior {
+            status: StatusCode::OK,
+            body: "not json".into(),
+            delay: None,
+        })
+        .await;
+        let upstream =
+            build_upstream(&base, &["m1"], Duration::from_secs(5), SystemTime::now()).await;
+        assert!(matches!(
+            upstream.verified("m1").await.unwrap_err(),
+            VerifyOutcome::Unverified(Reason::Shape)
+        ));
+    }
+
+    #[tokio::test]
+    async fn verified_fails_with_shape_when_the_report_omits_a_field() {
+        for body in [r#"{"signing_address":"0x00"}"#, r#"{"intel_quote":"00"}"#] {
+            let (base, _hits, _completions) = spawn_report_server(ReportBehavior {
+                status: StatusCode::OK,
+                body: body.into(),
+                delay: None,
+            })
+            .await;
+            let upstream =
+                build_upstream(&base, &["m1"], Duration::from_secs(5), SystemTime::now()).await;
+            assert!(
+                matches!(
+                    upstream.verified("m1").await.unwrap_err(),
+                    VerifyOutcome::Unverified(Reason::Shape)
+                ),
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_verification_younger_than_the_ttl_is_reused_without_a_fetch_and_a_failed_refetch_clears_a_good_slot()
+     {
+        let (base, hits, _completions) = spawn_report_server(ReportBehavior {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: String::new(),
+            delay: None,
+        })
+        .await;
+        let start = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let clock_cell = Arc::new(parking_lot::Mutex::new(start));
+        let clock: Clock = {
+            let cell = clock_cell.clone();
+            Arc::new(move || *cell.lock())
+        };
+        let upstream =
+            Upstream::build(&test_config(&base, &["m1"]), clock, Duration::from_secs(5)).unwrap();
+        *upstream.slots.get("m1").unwrap().lock().await = Some(Verified {
+            checked_at: start,
+            client: pinned_client(&[7u8; 32]).unwrap(),
+        });
+
+        assert!(upstream.verified("m1").await.is_ok());
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "a fresh slot must not refetch"
+        );
+
+        *clock_cell.lock() = start + VERIFIED_TTL + Duration::from_secs(1);
+        assert!(matches!(
+            upstream.verified("m1").await.unwrap_err(),
+            VerifyOutcome::Unverified(Reason::Status)
+        ));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "an expired slot must refetch once"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_concurrent_checks_on_a_cold_model_make_one_report_fetch_and_share_its_result() {
+        let (base, hits, _completions) = spawn_report_server(ReportBehavior {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: String::new(),
+            delay: Some(Duration::from_millis(50)),
+        })
+        .await;
+        let upstream = Arc::new(
+            build_upstream(&base, &["m1"], Duration::from_secs(5), SystemTime::now()).await,
+        );
+        let (a, b) = tokio::join!(
+            {
+                let upstream = upstream.clone();
+                async move { upstream.verified("m1").await }
+            },
+            {
+                let upstream = upstream.clone();
+                async move { upstream.verified("m1").await }
+            }
+        );
+        assert!(matches!(
+            a.unwrap_err(),
+            VerifyOutcome::Unverified(Reason::Status)
+        ));
+        assert!(matches!(
+            b.unwrap_err(),
+            VerifyOutcome::Unverified(Reason::Status)
+        ));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    fn self_signed_leaf() -> (
+        CertificateDer<'static>,
+        PrivatePkcs8KeyDer<'static>,
+        Vec<u8>,
+    ) {
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let der = CertificateDer::from(cert.der().to_vec());
+        let spki = alpha_client::tls::spki_of(&der).unwrap();
+        (der, PrivatePkcs8KeyDer::from(key.serialize_der()), spki)
+    }
+
+    /// A bare TLS server (no HTTP framework needed beyond one hyper service_fn) that records
+    /// every request it actually receives — a failed handshake never reaches it.
+    async fn spawn_tls_fake(
+        cert: CertificateDer<'static>,
+        key: PrivatePkcs8KeyDer<'static>,
+    ) -> (
+        String,
+        Arc<AtomicUsize>,
+        Arc<parking_lot::Mutex<Option<String>>>,
+    ) {
+        let server_config =
+            rustls::ServerConfig::builder_with_provider(alpha_client::tls::provider())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert], PrivateKeyDer::Pkcs8(key))
+                .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let last_auth: Arc<parking_lot::Mutex<Option<String>>> =
+            Arc::new(parking_lot::Mutex::new(None));
+        {
+            let hits = hits.clone();
+            let last_auth = last_auth.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let acceptor = acceptor.clone();
+                    let hits = hits.clone();
+                    let last_auth = last_auth.clone();
+                    tokio::spawn(async move {
+                        let Ok(tls) = acceptor.accept(stream).await else {
+                            return;
+                        };
+                        let hits = hits.clone();
+                        let last_auth = last_auth.clone();
+                        let service = hyper::service::service_fn(
+                            move |req: hyper::Request<hyper::body::Incoming>| {
+                                hits.fetch_add(1, Ordering::SeqCst);
+                                *last_auth.lock() = req
+                                    .headers()
+                                    .get(hyper::header::AUTHORIZATION)
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(String::from);
+                                async move {
+                                    Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                                        http_body_util::Full::new(hyper::body::Bytes::new()),
+                                    ))
+                                }
+                            },
+                        );
+                        let _ = hyper_util::server::conn::auto::Builder::new(
+                            hyper_util::rt::TokioExecutor::new(),
+                        )
+                        .serve_connection(hyper_util::rt::TokioIo::new(tls), service)
+                        .await;
+                    });
+                }
+            });
+        }
+        (format!("https://{addr}"), hits, last_auth)
+    }
+
+    #[tokio::test]
+    async fn a_pinned_client_reaches_its_own_spki_and_carries_the_bearer_it_was_given() {
+        let (cert, key, spki) = self_signed_leaf();
+        let (base, hits, last_auth) = spawn_tls_fake(cert, key).await;
+        let client = pinned_client(&spki).unwrap();
+        let response = client
+            .post(format!("{base}/chat/completions"))
+            .bearer_auth("provider-key")
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(last_auth.lock().as_deref(), Some("Bearer provider-key"));
+    }
+
+    #[tokio::test]
+    async fn a_pinned_client_fails_the_handshake_against_a_different_key_and_the_fake_sees_no_request()
+     {
+        let (cert_a, key_a, _spki_a) = self_signed_leaf();
+        let (_cert_b, _key_b, spki_b) = self_signed_leaf();
+        let (base_a, hits_a, _last_auth) = spawn_tls_fake(cert_a, key_a).await;
+        let client = pinned_client(&spki_b).unwrap();
+        let result = client
+            .post(format!("{base_a}/chat/completions"))
+            .send()
+            .await;
+        assert!(result.is_err());
+        assert_eq!(hits_a.load(Ordering::SeqCst), 0);
     }
 
     fn live_config() -> crate::Config {
