@@ -325,29 +325,8 @@ mod tests {
         alpha_client::tls::spki_of(cert.as_ref()).unwrap()
     }
 
-    #[test]
-    fn check_report_accepts_the_redpill_capture() {
-        let report: Report = serde_json::from_str(&read("report.json")).unwrap();
-        let nonce: [u8; 32] = alpha_core::hex_bytes(read("nonce.hex").trim()).unwrap();
-        let spki = spki_of_pem(&read("api.redpill.ai.pem"));
-        let collateral: Collateral = serde_json::from_str(&read("collateral.json")).unwrap();
-        let policy = Policy {
-            tcb_statuses: vec!["UpToDate".into()],
-            tolerated_advisories: vec![],
-        };
-        let secs = chrono::DateTime::parse_from_rfc2822(read("captured_at.txt").trim())
-            .unwrap()
-            .timestamp();
-        let now = UNIX_EPOCH + Duration::from_secs(secs.try_into().unwrap());
-
-        assert_eq!(
-            check_report(&report, &spki, &nonce, &collateral, &policy, now),
-            Ok(())
-        );
-    }
-
     /// The real capture's report, nonce, SPKI, collateral, policy and clock — a baseline every
-    /// negative golden test mutates exactly one field of.
+    /// golden test uses as is or mutates exactly one field of.
     fn golden_inputs() -> (Report, [u8; 32], Vec<u8>, Collateral, Policy, SystemTime) {
         let report: Report = serde_json::from_str(&read("report.json")).unwrap();
         let nonce: [u8; 32] = alpha_core::hex_bytes(read("nonce.hex").trim()).unwrap();
@@ -362,6 +341,15 @@ mod tests {
             .timestamp();
         let now = UNIX_EPOCH + Duration::from_secs(secs.try_into().unwrap());
         (report, nonce, spki, collateral, policy, now)
+    }
+
+    #[test]
+    fn check_report_accepts_the_redpill_capture() {
+        let (report, nonce, spki, collateral, policy, now) = golden_inputs();
+        assert_eq!(
+            check_report(&report, &spki, &nonce, &collateral, &policy, now),
+            Ok(())
+        );
     }
 
     #[test]
