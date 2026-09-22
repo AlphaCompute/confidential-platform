@@ -428,15 +428,7 @@ mod tests {
         caller_bearer: &[u8],
         provider_key: &str,
     ) -> Arc<AppState> {
-        let config = Config {
-            upstream_url: upstream_url.to_string(),
-            models: models.iter().map(|s| (*s).to_string()).collect(),
-            pccs_url: "https://pccs.example".to_string(),
-            upstream_policy: alpha_attest::Policy {
-                tcb_statuses: vec!["UpToDate".into()],
-                tolerated_advisories: vec![],
-            },
-        };
+        let config = crate::test_support::test_config(upstream_url, models);
         let clock: upstream::Clock = Arc::new(SystemTime::now);
         let upstream = Upstream::build(&config, clock, Duration::from_secs(5)).unwrap();
         Arc::new(AppState {

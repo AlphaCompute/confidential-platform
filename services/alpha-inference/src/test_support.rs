@@ -19,6 +19,20 @@ pub(crate) struct ReportBehavior {
     pub delay: Option<Duration>,
 }
 
+/// A `Config` pointing at `upstream_url` with `models` allowlisted — everything both test
+/// modules need for a config that never has to pass the `https://` check `Config::build` runs.
+pub(crate) fn test_config(upstream_url: &str, models: &[&str]) -> crate::Config {
+    crate::Config {
+        upstream_url: upstream_url.to_string(),
+        models: models.iter().map(|s| (*s).to_string()).collect(),
+        pccs_url: "https://pccs.example".to_string(),
+        upstream_policy: alpha_attest::Policy {
+            tcb_statuses: vec!["UpToDate".into()],
+            tolerated_advisories: vec![],
+        },
+    }
+}
+
 #[derive(Clone)]
 struct FakeState {
     behavior: ReportBehavior,

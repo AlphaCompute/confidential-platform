@@ -433,17 +433,9 @@ mod tests {
         );
     }
 
-    fn test_config(upstream_url: &str, models: &[&str]) -> crate::Config {
-        crate::Config {
-            upstream_url: upstream_url.to_string(),
-            models: models.iter().map(|s| (*s).to_string()).collect(),
-            pccs_url: "https://pccs.example".to_string(),
-            upstream_policy: Policy {
-                tcb_statuses: vec!["UpToDate".into()],
-                tolerated_advisories: vec![],
-            },
-        }
-    }
+    use crate::test_support::{
+        ReportBehavior, spawn_fake_upstream as spawn_report_server, test_config,
+    };
 
     async fn build_upstream(
         upstream_url: &str,
@@ -454,8 +446,6 @@ mod tests {
         let clock: Clock = Arc::new(move || now);
         Upstream::build(&test_config(upstream_url, models), clock, report_timeout).unwrap()
     }
-
-    use crate::test_support::{ReportBehavior, spawn_fake_upstream as spawn_report_server};
 
     #[tokio::test]
     async fn verified_fails_with_fetch_when_the_report_endpoint_refuses_the_connection() {
