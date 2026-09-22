@@ -11,6 +11,14 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  provisioning-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: python3 -m pip install ./integrations/dstack-tee
+      - run: python3 -m unittest discover -s integrations/dstack-tee/tests -v
+      - run: python3 -m unittest discover -s deploy/tests -v
+
   check:
     runs-on: ubuntu-latest
     steps:

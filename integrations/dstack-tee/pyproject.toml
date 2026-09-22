@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alpha-dstack-tee"
+version = "0.1.0"
+description = "Alpha-owned fail-closed environment encryption adapter for dstack-tee"
+requires-python = ">=3.10"
+dependencies = [
+  "dstack-sdk @ git+https://github.com/AlphaCompute/dstack-tee.git@c12e96adaeea51d1c79608123d41a6f521db46cd#subdirectory=sdk/python",
+  "eth-hash[pycryptodome]>=0.7,<1"
+]
+
+[project.entry-points."alphacompute.integrations"]
+dstack_tee = "alpha_dstack_tee:AlphaDstackTEEPlugin"
+
+[project.scripts]
+alpha-tee-seal = "alpha_dstack_tee.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
