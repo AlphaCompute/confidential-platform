@@ -349,10 +349,15 @@ impl Client {
         identity: Option<Identity>,
         time: TimeProvider,
     ) -> Result<Self, Error> {
-        if endpoints.is_empty() {
-            return Err(Error::Invalid("no endpoints".into()));
+        if endpoints.is_empty() || endpoints.len() > 4 {
+            return Err(Error::Invalid(
+                "one to four HTTPS endpoints required".into(),
+            ));
         }
-        let http = reqwest::Client::builder()
+        for endpoint in &endpoints {
+            validate_https(endpoint, true)?;
+        }
+        let http = bounded_http()
             .tls_backend_preconfigured(tls::client_config(Some(pin), identity, time)?)
             .build()
             .map_err(|e| Error::Invalid(format!("http client: {e}")))?;
@@ -388,10 +393,7 @@ impl Client {
                 }
             };
             let status = response.status();
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|e| Error::Connect(format!("{endpoint}: {e}")))?;
+            let bytes = bounded_body(response).await?;
             if status.is_success() {
                 return serde_json::from_slice(&bytes)
                     .map_err(|e| Error::Invalid(format!("{method} {path}: reply: {e}")));
@@ -504,8 +506,9 @@ pub async fn probe_instance(
     expected: &ComposeHash,
     time: TimeProvider,
 ) -> Result<Probe, Error> {
+    validate_https(url, false)?;
     let ca = tls::cert_from_pem(kms_ca_pem)?;
-    let http = reqwest::Client::builder()
+    let http = bounded_http()
         .tls_backend_preconfigured(tls::client_config(Some(Pin::Ca(ca)), None, time)?)
         .tls_info(true)
         .timeout(PROBE_TIMEOUT)
@@ -535,8 +538,9 @@ pub async fn fetch_node_evidence(
     endpoint: &str,
     nonce: &[u8; 32],
 ) -> Result<(NodeEvidence, Vec<u8>), Error> {
+    validate_https(endpoint, true)?;
     let endpoint = endpoint.trim_end_matches('/');
-    let http = reqwest::Client::builder()
+    let http = bounded_http()
         .tls_backend_preconfigured(tls::client_config(None, None, system_time_provider())?)
         .tls_info(true)
         .build()
@@ -556,10 +560,7 @@ pub async fn fetch_node_evidence(
         .ok_or_else(|| Error::Invalid("no server certificate on the connection".into()))?;
     let spki = tls::spki_of(&leaf)?;
     let status = response.status();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| Error::Connect(format!("{endpoint}: {e}")))?;
+    let bytes = bounded_body(response).await?;
     if !status.is_success() {
         return Err(api_error(endpoint, status, &bytes));
     }
@@ -568,9 +569,77 @@ pub async fn fetch_node_evidence(
     Ok((evidence, spki))
 }
 
+/// Validation happens before any connection or request body is constructed.
+pub fn validate_https(endpoint: &str, origin_only: bool) -> Result<(), Error> {
+    let url = reqwest::Url::parse(endpoint)
+        .map_err(|_| Error::Invalid("invalid HTTPS endpoint".into()))?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || (origin_only && (url.path() != "/" || url.query().is_some()))
+    {
+        return Err(Error::Invalid(
+            "HTTPS endpoint without userinfo, fragment or origin path required".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn bounded_http() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .read_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(15))
+}
+
+pub(crate) const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+
+pub(crate) async fn bounded_body(mut response: reqwest::Response) -> Result<Vec<u8>, Error> {
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_RESPONSE_BYTES as u64)
+    {
+        return Err(Error::Invalid("response exceeds size limit".into()));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| Error::Connect(e.to_string()))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+            return Err(Error::Invalid("response exceeds size limit".into()));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trust_endpoints_fail_before_network_io() {
+        for endpoint in [
+            "http://localhost",
+            "https://user:password@kms.example",
+            "https://kms.example/path",
+            "https://kms.example?x=1",
+            "https://kms.example/#fragment",
+            "file:///tmp/kms",
+        ] {
+            assert!(
+                Client::new(vec![endpoint.into()], Pin::Spki(vec![])).is_err(),
+                "{endpoint}"
+            );
+        }
+        assert!(validate_https("https://kms.example:8443/", true).is_ok());
+    }
 
     #[test]
     fn bootstrap_reply_is_typed_only_after_its_signature_verifies() {

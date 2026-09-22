@@ -82,12 +82,16 @@ pub async fn fetch(
     release_key: &VerifyingKey,
     now: SystemTime,
 ) -> Result<PlatformDocument, Error> {
-    let signed: SignedDocument = reqwest::get(url)
+    let response = crate::bounded_http()
+        .https_only(false)
+        .build()
+        .map_err(|e| Error::Invalid(e.to_string()))?
+        .get(url)
+        .send()
         .await
         .and_then(|r| r.error_for_status())
-        .map_err(|e| Error::Connect(format!("platform document fetch: {e}")))?
-        .json()
-        .await
+        .map_err(|e| Error::Connect(format!("platform document fetch: {e}")))?;
+    let signed: SignedDocument = serde_json::from_slice(&crate::bounded_body(response).await?)
         .map_err(|e| Error::Invalid(format!("platform document body: {e}")))?;
     verify(&signed, release_key, now)
 }
