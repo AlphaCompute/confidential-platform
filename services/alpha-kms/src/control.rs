@@ -346,7 +346,12 @@ pub async fn put_secret(
             None => SecretId::mint().into(),
         };
         let org_key = keys::org_key(&keys.tenant_kek_root, org_id.into(), &chain.anchor_spki)?;
-        let ciphertext = keys::aead_seal(&org_key, id.as_bytes(), &value)?;
+        let aad = keys::secret_aad(org_id.into(), id, &body.payload)?;
+        let ciphertext = [
+            b"AKS2".as_slice(),
+            &keys::aead_seal(&org_key, &aad, &value)?,
+        ]
+        .concat();
         sqlx::query!(
             "insert into secrets (id, org_id, name, app_ids, ciphertext, content_sha256, document, signed_by_key, signature, issued_at)
              values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)

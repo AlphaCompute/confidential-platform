@@ -54,6 +54,9 @@ pub fn env(name: &str) -> Result<String, String> {
 
 impl Config {
     pub fn from_env() -> Result<Self, String> {
+        if env("ALPHACOMPUTE_DATABASE_INTEGRITY")? != "trusted-operators-v1" {
+            return Err("ALPHACOMPUTE_DATABASE_INTEGRITY must acknowledge trusted-operators-v1; see docs/database-trust.md".into());
+        }
         Ok(Self {
             kms_endpoints: env("ALPHACOMPUTE_KMS_ENDPOINTS")?
                 .split(',')

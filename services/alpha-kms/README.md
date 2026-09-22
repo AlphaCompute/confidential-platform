@@ -7,6 +7,7 @@ The key broker of the trust plane: six tables, twelve `/v1` routes on one TLS po
 | Variable | Meaning |
 |---|---|
 | `ALPHACOMPUTE_DATABASE_URL` | Postgres 18; the service user is a member of the `alpha_kms` role the migration creates |
+| `ALPHACOMPUTE_DATABASE_INTEGRITY` | Required: `trusted-operators-v1`; see [database threat model](../../docs/database-trust.md) |
 | `ALPHACOMPUTE_KMS_ENDPOINTS` | comma-separated `https://…` of the KMS nodes; walked on a sealed start to `join` |
 | `ALPHACOMPUTE_PCCS_URL` | PCCS for DCAP collateral, fetched per attestation |
 | `ALPHACOMPUTE_PLATFORM_DOCUMENT_URL` | the release-signed platform document, fetched on start and every five minutes |

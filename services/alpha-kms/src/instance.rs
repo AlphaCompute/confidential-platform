@@ -376,8 +376,17 @@ async fn get_secret_inner(
         ));
     }
     let org_key = keys::org_key(tenant_kek_root, identity.org_id, &chain.anchor_spki)?;
-    let value = keys::aead_open(&org_key, secret.id.as_bytes(), &secret.ciphertext)
-        .ok_or_else(|| ApiError::internal("secret does not decrypt under org_key"))?;
+    let aad = keys::secret_aad(identity.org_id, secret.id, &secret.document)?;
+    let ciphertext = secret.ciphertext.strip_prefix(b"AKS2").ok_or_else(|| {
+        ApiError::signature_invalid("secret requires v2 re-upload by its signing authority")
+    })?;
+    let value = keys::aead_open(&org_key, &aad, ciphertext)
+        .ok_or_else(|| ApiError::signature_invalid("secret ciphertext binding is invalid"))?;
+    if format!("sha256:{}", keys::sha256_hex(&value)) != document.content_sha256 {
+        return Err(ApiError::signature_invalid(
+            "secret plaintext differs from its signed hash",
+        ));
+    }
     Ok(json!({
         "value": BASE64_URL_SAFE_NO_PAD.encode(&*value),
         "content_sha256": content_sha256,
