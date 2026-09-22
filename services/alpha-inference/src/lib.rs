@@ -17,6 +17,9 @@
 
 pub mod upstream;
 
+#[cfg(test)]
+mod test_support;
+
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -354,11 +357,10 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
     use std::time::{Duration, SystemTime};
 
     use axum::body::{Body, to_bytes};
-    use axum::extract::State as ExtractState;
     use axum::http::Request;
     use tower::ServiceExt;
 
@@ -447,51 +449,23 @@ mod tests {
         })
     }
 
-    /// A fake RedPill that counts requests to both routes it serves, answering the report
-    /// route with a fixed status and body.
-    async fn spawn_fake_upstream(
+    fn fake_upstream_behavior(
         status: StatusCode,
         body: &str,
-    ) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
-        #[derive(Clone)]
-        struct FakeState {
-            status: StatusCode,
-            body: String,
-            report_hits: Arc<AtomicUsize>,
-            completions_hits: Arc<AtomicUsize>,
-        }
-        async fn report(ExtractState(s): ExtractState<FakeState>) -> Response {
-            s.report_hits.fetch_add(1, Ordering::SeqCst);
-            (s.status, s.body.clone()).into_response()
-        }
-        async fn completions(ExtractState(s): ExtractState<FakeState>) -> StatusCode {
-            s.completions_hits.fetch_add(1, Ordering::SeqCst);
-            StatusCode::OK
-        }
-        let state = FakeState {
+    ) -> crate::test_support::ReportBehavior {
+        crate::test_support::ReportBehavior {
             status,
             body: body.to_string(),
-            report_hits: Arc::new(AtomicUsize::new(0)),
-            completions_hits: Arc::new(AtomicUsize::new(0)),
-        };
-        let report_hits = state.report_hits.clone();
-        let completions_hits = state.completions_hits.clone();
-        let app = Router::new()
-            .route("/attestation/report", get(report))
-            .route("/chat/completions", post(completions))
-            .with_state(state);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        (format!("http://{addr}"), report_hits, completions_hits)
+            delay: None,
+        }
     }
 
     #[tokio::test]
     async fn every_v1_route_requires_the_bearer_before_any_upstream_contact() {
-        let (base, report_hits, completions_hits) =
-            spawn_fake_upstream(StatusCode::INTERNAL_SERVER_ERROR, "").await;
+        let (base, report_hits, completions_hits) = crate::test_support::spawn_fake_upstream(
+            fake_upstream_behavior(StatusCode::INTERNAL_SERVER_ERROR, ""),
+        )
+        .await;
         let state = test_state(&base, &["m1"], b"right-bearer", "provider-key");
         let app = router(state);
 
@@ -521,7 +495,8 @@ mod tests {
     #[tokio::test]
     async fn a_model_outside_the_allowlist_answers_404_before_any_upstream_contact() {
         let (base, report_hits, _completions_hits) =
-            spawn_fake_upstream(StatusCode::OK, "{}").await;
+            crate::test_support::spawn_fake_upstream(fake_upstream_behavior(StatusCode::OK, "{}"))
+                .await;
         let state = test_state(&base, &["m1"], b"right-bearer", "provider-key");
         let app = router(state);
 
@@ -562,8 +537,10 @@ mod tests {
 
     #[tokio::test]
     async fn chat_completions_answers_upstream_unverified_and_never_reaches_the_fake_upstream() {
-        let (base, _report_hits, completions_hits) =
-            spawn_fake_upstream(StatusCode::INTERNAL_SERVER_ERROR, "").await;
+        let (base, _report_hits, completions_hits) = crate::test_support::spawn_fake_upstream(
+            fake_upstream_behavior(StatusCode::INTERNAL_SERVER_ERROR, ""),
+        )
+        .await;
         let state = test_state(&base, &["m1"], b"right-bearer", "provider-key");
         let app = router(state);
 

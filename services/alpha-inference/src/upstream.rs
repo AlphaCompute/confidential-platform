@@ -307,11 +307,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::UNIX_EPOCH;
 
-    use axum::Router;
-    use axum::extract::State;
     use axum::http::StatusCode;
-    use axum::response::{IntoResponse, Response};
-    use axum::routing::{get, post};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
     use super::*;
@@ -459,56 +455,7 @@ mod tests {
         Upstream::build(&test_config(upstream_url, models), clock, report_timeout).unwrap()
     }
 
-    #[derive(Clone)]
-    struct ReportBehavior {
-        status: StatusCode,
-        body: String,
-        delay: Option<Duration>,
-    }
-
-    #[derive(Clone)]
-    struct ReportServerState {
-        behavior: ReportBehavior,
-        report_hits: Arc<AtomicUsize>,
-        completions_hits: Arc<AtomicUsize>,
-    }
-
-    async fn report_route(State(state): State<ReportServerState>) -> Response {
-        state.report_hits.fetch_add(1, Ordering::SeqCst);
-        if let Some(delay) = state.behavior.delay {
-            tokio::time::sleep(delay).await;
-        }
-        (state.behavior.status, state.behavior.body.clone()).into_response()
-    }
-
-    async fn completions_route(State(state): State<ReportServerState>) -> StatusCode {
-        state.completions_hits.fetch_add(1, Ordering::SeqCst);
-        StatusCode::OK
-    }
-
-    /// A plain-HTTP fake RedPill: the report route answers `behavior`, and counts hits on both
-    /// routes so a test can prove the completions route was never reached.
-    async fn spawn_report_server(
-        behavior: ReportBehavior,
-    ) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
-        let state = ReportServerState {
-            behavior,
-            report_hits: Arc::new(AtomicUsize::new(0)),
-            completions_hits: Arc::new(AtomicUsize::new(0)),
-        };
-        let report_hits = state.report_hits.clone();
-        let completions_hits = state.completions_hits.clone();
-        let app = Router::new()
-            .route("/attestation/report", get(report_route))
-            .route("/chat/completions", post(completions_route))
-            .with_state(state);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        (format!("http://{addr}"), report_hits, completions_hits)
-    }
+    use crate::test_support::{ReportBehavior, spawn_fake_upstream as spawn_report_server};
 
     #[tokio::test]
     async fn verified_fails_with_fetch_when_the_report_endpoint_refuses_the_connection() {
