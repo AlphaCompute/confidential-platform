@@ -19,7 +19,7 @@ use std::time::SystemTime;
 use alpha_cli::call::Route;
 use alpha_cli::{call, deploy, node as cli_node, sign};
 use alpha_client::{Client, Pin, tls};
-use alpha_core::{AppId, KeyId, OrgId, PrincipalId};
+use alpha_core::{AppId, KeyId, PrincipalId};
 use alpha_kms::{certs, platform};
 use common::*;
 use ed25519_dalek::SigningKey;
@@ -96,8 +96,8 @@ async fn an_organization_registers_its_root_key_and_the_root_key_registers_a_sig
         return;
     };
     let client = pinned(&h, ca_pin(&h));
-    let org = OrgId::mint();
     let root_key = SigningKey::from_bytes(&[42u8; 32]);
+    let org = trust_org(&root_key);
     let now = h.now();
     let register = |key: SigningKey| {
         let client = &client;

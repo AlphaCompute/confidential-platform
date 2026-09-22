@@ -482,9 +482,8 @@ async fn register_endorsed_key(
     }))
 }
 
-/// Nobody authorizes this: the organization claims its identifier once, and afterwards the only
-/// question the route answers is whose key is stored against it — its own document back means
-/// its own key, `already_exists` means somebody else claimed it first.
+/// New identities are derived from the root SPKI. An existing legacy binding may
+/// only be replayed by the same root; it is never renamed or rebound implicitly.
 async fn register_root_key(
     node: &Node,
     keys: &Intermediates,
@@ -529,6 +528,11 @@ async fn register_root_key(
             org_id,
             &row.public_key,
             row.created_at,
+        ));
+    }
+    if p.org_id != OrgId::from_root_spki(&spki) {
+        return Err(ApiError::signature_invalid(
+            "org_id must be derived from the root public key",
         ));
     }
     let id: Uuid = KeyId::mint().into();

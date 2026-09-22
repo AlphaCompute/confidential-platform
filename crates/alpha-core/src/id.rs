@@ -65,6 +65,21 @@ id!(KeyId);
 id!(SecretId);
 id!(RequestId);
 
+impl OrgId {
+    /// UUIDv8, first 128 bits of SHA-256(domain || canonical Ed25519 SPKI),
+    /// with RFC 9562 version/variant bits set (122 fingerprint bits retained).
+    /// The full SPKI remains the immutable root binding in the KMS.
+    pub fn from_root_spki(spki: &[u8]) -> Self {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest([b"alphacompute/trust-org/v1\0".as_slice(), spki].concat());
+        let mut bytes = [0u8; 16];
+        for (out, input) in bytes.iter_mut().zip(digest.iter()) {
+            *out = *input;
+        }
+        Self(uuid::Builder::from_custom_bytes(bytes).into_uuid())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

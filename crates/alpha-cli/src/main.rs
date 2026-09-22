@@ -15,6 +15,7 @@ use alpha_crypto::PublicKey;
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use clap::{Args, Parser, Subcommand};
+use ed25519_dalek::pkcs8::EncodePublicKey;
 use serde_json::{Value, json};
 
 /// The alphacompute CLI: keys, Control calls, the platform document, deploys, and the
@@ -103,9 +104,9 @@ enum Command {
         /// The key to register; it signs its own registration.
         #[arg(long)]
         key: PathBuf,
-        /// The organization's identifier, as the console shows it.
+        /// Existing legacy trust ID only; new registrations derive the ID from the root key.
         #[arg(long)]
-        org_id: OrgId,
+        org_id: Option<OrgId>,
         /// The Principal the key acts for.
         #[arg(long)]
         principal_id: PrincipalId,
@@ -284,6 +285,11 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             label,
         } => {
             let key = read_ed25519(&key)?;
+            let spki = key
+                .verifying_key()
+                .to_public_key_der()
+                .map_err(|e| Exit::Refused(e.to_string()))?;
+            let org_id = org_id.unwrap_or_else(|| OrgId::from_root_spki(spki.as_bytes()));
             let client = admin_client(config, now).await?;
             Ok(alpha_cli::call::root_key(&client, org_id, principal_id, &label, &key, now).await?)
         }

@@ -151,8 +151,8 @@ async fn two_organizations_live_side_by_side() {
     assert_eq!(status, StatusCode::OK, "{reply}");
 
     // The second organization claims its own identifier and endorses its own key.
-    let org_b = OrgId::mint();
     let root_b_key = SigningKey::from_bytes(&[52u8; 32]);
+    let org_b = trust_org(&root_b_key);
     let (status, reply) = h
         .post(
             "/v1/keys",
@@ -261,8 +261,8 @@ async fn a_root_key_claims_its_organization_once() {
         "genesis names no organization"
     );
 
-    let org = OrgId::mint();
     let key = SigningKey::from_bytes(&[31u8; 32]);
+    let org = trust_org(&key);
     let document = root_key_registration(org, &key, h.now());
     let (status, first) = h.post("/v1/keys", document.clone()).await;
     assert_eq!(status, StatusCode::OK, "{first}");
@@ -292,8 +292,8 @@ async fn a_root_key_claims_its_organization_once() {
         .await;
     assert_eq!(
         (status, code(&reply)),
-        (StatusCode::CONFLICT, "already_exists"),
-        "one key, one organization"
+        (StatusCode::BAD_REQUEST, "signature_invalid"),
+        "new organizations must derive their identity from the key"
     );
 
     // The signature is checked against the key inside the document, so naming another key fails.
@@ -320,8 +320,8 @@ async fn a_root_key_claims_its_organization_once() {
 
     // An identifier spelled in uppercase is the same identifier: the row keeps the parsed value,
     // so a claim made that way must go on signing rather than burning the identifier.
-    let shouty = OrgId::mint();
     let shouty_key = SigningKey::from_bytes(&[35u8; 32]);
+    let shouty = trust_org(&shouty_key);
     let (status, reply) = h
         .post(
             "/v1/keys",
