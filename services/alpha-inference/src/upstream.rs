@@ -73,11 +73,13 @@ struct Report {
     intel_quote: String,
 }
 
-/// A model's last passing check: when, and a client that will only ever complete a handshake
-/// against the exact SPKI that check's report bound.
-struct Verified {
-    checked_at: SystemTime,
-    client: reqwest::Client,
+/// A model's last recipe-A check: when, and what it found — a client that will only ever
+/// complete a handshake against the attested SPKI, or why it refused to trust one. Caching the
+/// failure too (not just the success) is what makes the per-model lock a true single flight:
+/// two callers racing a cold model share the one fetch's outcome, not just its happy path.
+struct Checked {
+    at: SystemTime,
+    outcome: Result<reqwest::Client, Reason>,
 }
 
 /// Recipe A over the allowlisted models. One `Mutex` per model, built once at startup —
@@ -86,7 +88,7 @@ pub struct Upstream {
     upstream_url: String,
     pccs_url: String,
     policy: Policy,
-    slots: HashMap<String, Mutex<Option<Verified>>>,
+    slots: HashMap<String, Mutex<Option<Checked>>>,
     /// Never pinned, never given the provider key: it only reads the report that says which
     /// key to pin to next.
     report_client: reqwest::Client,
@@ -197,38 +199,35 @@ impl Upstream {
         })
     }
 
-    /// A client pinned to `model`'s attested key, verified within the last minute — refetching
-    /// recipe A first if the last check is older than that, or there was none yet.
+    /// A client pinned to `model`'s attested key, checked within the last minute — refetching
+    /// recipe A first if the last check is older than that, or there was none yet. Whatever
+    /// that fetch finds — success or failure — is what every caller waiting on the same
+    /// model's lock gets back; nothing here starts a second fetch while one is in flight.
     pub async fn verified(&self, model: &str) -> Result<reqwest::Client, VerifyOutcome> {
         let Some(slot) = self.slots.get(model) else {
             return Err(VerifyOutcome::UnknownModel);
         };
         let mut guard = slot.lock().await;
         let now = (self.now)();
-        if let Some(verified) = guard.as_ref()
-            && now
-                .duration_since(verified.checked_at)
-                .unwrap_or(Duration::MAX)
-                < VERIFIED_TTL
+        if let Some(checked) = guard.as_ref()
+            && now.duration_since(checked.at).unwrap_or(Duration::MAX) < VERIFIED_TTL
         {
-            return Ok(verified.client.clone());
+            return checked.outcome.clone().map_err(VerifyOutcome::Unverified);
         }
-        match self.check(model, now).await {
-            Ok(verified) => {
-                let client = verified.client.clone();
-                *guard = Some(verified);
-                Ok(client)
-            }
-            Err(reason) => {
-                // A failed refetch is final, even if the slot held a good result a moment ago.
-                *guard = None;
-                eprintln!(
-                    "alpha-inference: verification failed for {model}: {}",
-                    reason.code()
-                );
-                Err(VerifyOutcome::Unverified(reason))
-            }
+        let outcome = self.check(model, now).await;
+        if let Err(reason) = &outcome {
+            eprintln!(
+                "alpha-inference: verification failed for {model}: {}",
+                reason.code()
+            );
         }
+        // Replaces whatever was cached before, good or bad — a fresh failure past the TTL
+        // must not go on serving a stale-but-formerly-good client.
+        *guard = Some(Checked {
+            at: now,
+            outcome: outcome.clone(),
+        });
+        outcome.map_err(VerifyOutcome::Unverified)
     }
 
     /// The pinned connection for `model` failed after a passing check; the next call to
@@ -239,7 +238,7 @@ impl Upstream {
         }
     }
 
-    async fn check(&self, model: &str, now: SystemTime) -> Result<Verified, Reason> {
+    async fn check(&self, model: &str, now: SystemTime) -> Result<reqwest::Client, Reason> {
         let mut nonce = [0u8; 32];
         getrandom::fill(&mut nonce).map_err(|_| Reason::Fetch)?;
 
@@ -256,12 +255,13 @@ impl Upstream {
             .await
             .map_err(|_| Reason::Fetch)?;
 
+        // The connection's leaf is read now (extensions borrow the response) but not required
+        // yet — a failing status or an unparseable body must classify as Status/Shape even
+        // over a fake that never terminates TLS at all, not as a generic Fetch.
         let leaf = response
             .extensions()
             .get::<reqwest::tls::TlsInfo>()
-            .and_then(|info| info.peer_certificate().map(<[u8]>::to_vec))
-            .ok_or(Reason::Fetch)?;
-        let spki = alpha_client::tls::spki_of(&leaf).map_err(|_| Reason::Fetch)?;
+            .and_then(|info| info.peer_certificate().map(<[u8]>::to_vec));
 
         let status = response.status();
         let bytes = response.bytes().await.map_err(|_| Reason::Fetch)?;
@@ -270,6 +270,8 @@ impl Upstream {
         }
         let report: Report = serde_json::from_slice(&bytes).map_err(|_| Reason::Shape)?;
         let quote = hex::decode(&report.intel_quote).map_err(|_| Reason::Shape)?;
+        let spki =
+            alpha_client::tls::spki_of(&leaf.ok_or(Reason::Shape)?).map_err(|_| Reason::Shape)?;
 
         let collateral = alpha_attest::fetch_collateral(&self.pccs_url, &quote)
             .await
@@ -277,10 +279,7 @@ impl Upstream {
 
         check_report(&report, &spki, &nonce, &collateral, &self.policy, now)?;
 
-        Ok(Verified {
-            client: pinned_client(&spki).map_err(|_| Reason::Binding)?,
-            checked_at: now,
-        })
+        pinned_client(&spki).map_err(|_| Reason::Binding)
     }
 
     /// RedPill's public model listing, over the report client, without the provider key — it
@@ -614,9 +613,9 @@ mod tests {
         };
         let upstream =
             Upstream::build(&test_config(&base, &["m1"]), clock, Duration::from_secs(5)).unwrap();
-        *upstream.slots.get("m1").unwrap().lock().await = Some(Verified {
-            checked_at: start,
-            client: pinned_client(&[7u8; 32]).unwrap(),
+        *upstream.slots.get("m1").unwrap().lock().await = Some(Checked {
+            at: start,
+            outcome: Ok(pinned_client(&[7u8; 32]).unwrap()),
         });
 
         assert!(upstream.verified("m1").await.is_ok());
