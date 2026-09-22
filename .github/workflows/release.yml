@@ -38,7 +38,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir candidate
-          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
           docker build --no-cache --platform linux/amd64 --provenance=false \
             --build-arg SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
             ${FEATURES:+--build-arg FEATURES=$FEATURES} \
