@@ -1,4 +1,4 @@
-name: release
+name: release-candidates
 
 on:
   push:
@@ -7,79 +7,78 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
-  image:
-    runs-on: ubuntu-latest
+  checks:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: checks
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: alpha-runtime
-            dockerfile: images/manager/Dockerfile
-          # The KMS App: two CVMs, one Revision; the compose rendered below is that Revision.
-          - name: alpha-kms
-            dockerfile: images/kms/Dockerfile
-            app_id: 01a09f07-8d09-7640-94c1-bbdb74200a1e
-          # The dev KMS App with the root KEK from env; a distinct image, never a switch.
-          - name: alpha-kms-dev
-            dockerfile: images/kms/Dockerfile
-            features: dev-root
-            app_id: 01a09f07-8d09-7aff-b257-83dbd9e6e641
+        replica: [a, b]
+        image:
+          - {name: alpha-runtime, dockerfile: images/manager/Dockerfile, features: ""}
+          - {name: alpha-kms, dockerfile: images/kms/Dockerfile, features: ""}
+          - {name: alpha-kms-dev, dockerfile: images/kms/Dockerfile, features: dev-root}
+          - {name: alpha-cpu-app, dockerfile: images/cpu-app/Dockerfile, features: ""}
     env:
-      FEATURES: ${{ matrix.features }}
+      IMAGE_NAME: ${{ matrix.image.name }}
+      DOCKERFILE: ${{ matrix.image.dockerfile }}
+      FEATURES: ${{ matrix.image.features }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Build ${{ matrix.name }} twice, the second time from nothing
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build independently on this runner and retain materials
         run: |
-          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
-          build() {
-            docker build --platform linux/amd64 --provenance=false \
-              --build-arg SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
-              ${FEATURES:+--build-arg FEATURES=$FEATURES} \
-              -f "${{ matrix.dockerfile }}" -t "${{ matrix.name }}:$1" "${@:2}" .
-          }
-          build first
-          build second --no-cache
-          first=$(docker image inspect --format '{{.Id}} {{.RootFS.Layers}}' "${{ matrix.name }}:first")
-          second=$(docker image inspect --format '{{.Id}} {{.RootFS.Layers}}' "${{ matrix.name }}:second")
-          echo "first:  $first"
-          echo "second: $second"
-          if [ "$first" != "$second" ]; then
-            echo "the two builds of ${{ matrix.dockerfile }} differ; the image is not reproducible" >&2
-            exit 1
-          fi
-          echo "${{ matrix.name }} image (SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH): $first" >> "$GITHUB_STEP_SUMMARY"
-      - name: Push
-        id: push
-        if: startsWith(github.ref, 'refs/tags/')
-        run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          image="ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/${{ matrix.name }}:${GITHUB_REF_NAME}"
-          docker tag "${{ matrix.name }}:first" "$image"
-          docker push "$image"
-          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$image")
-          echo "pushed $digest" >> "$GITHUB_STEP_SUMMARY"
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
-      # The unsigned release manifest: the compose of the KMS node with this image, in the bytes
-      # Phala measures, and its compose_hash for the release-key holder to sign into kms_revisions.
-      - name: Render the KMS compose from the pushed digest
-        if: matrix.app_id && startsWith(github.ref, 'refs/tags/')
-        run: |
-          {
-            echo '```json'
-            cargo run -q -p alpha-cli --example kms_compose -- ${FEATURES:+--dev-root} \
-              "${{ matrix.app_id }}" "${{ steps.push.outputs.digest }}" "release/${{ matrix.name }}"
-            echo '```'
-            echo '```json'
-            cat "release/${{ matrix.name }}/app-compose.json"
-            echo
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
-        if: matrix.app_id && startsWith(github.ref, 'refs/tags/')
+          set -euo pipefail
+          mkdir candidate
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
+          docker build --no-cache --platform linux/amd64 --provenance=false \
+            --build-arg SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+            ${FEATURES:+--build-arg FEATURES=$FEATURES} \
+            -f "$DOCKERFILE" -t "$IMAGE_NAME:candidate" .
+          docker image inspect --format '{{.Id}} {{.RootFS.Layers}}' "$IMAGE_NAME:candidate" > candidate/fingerprint.txt
+          docker image inspect "$IMAGE_NAME:candidate" > candidate/image-inspect.json
+          docker save "$IMAGE_NAME:candidate" > candidate/image.tar
+          git rev-parse HEAD > candidate/source-commit.txt
+          sha256sum Cargo.lock rust-toolchain.toml "$DOCKERFILE" > candidate/materials.sha256
+          cp Cargo.lock candidate/
+          cargo metadata --locked --format-version 1 > candidate/cargo-dependencies.json
+          docker version > candidate/builder.txt
+          printf 'Unqualified candidate: complete OS/native SBOM and acceptance are required before publication.\n' > candidate/STATUS.txt
+      - name: Attest candidate archive provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
-          name: ${{ matrix.name }}-release-manifest
-          path: release/${{ matrix.name }}
+          subject-path: candidate/image.tar
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.image.name }}-${{ matrix.replica }}
+          path: candidate/
           if-no-files-found: error
+          retention-days: 30
+
+  compare:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: candidates
+      - name: Require identical image configurations and layers from separate runners
+        run: |
+          set -euo pipefail
+          for name in alpha-runtime alpha-kms alpha-kms-dev alpha-cpu-app; do
+            cmp "candidates/$name-a/fingerprint.txt" "candidates/$name-b/fingerprint.txt"
+            cmp "candidates/$name-a/source-commit.txt" "candidates/$name-b/source-commit.txt"
+            cmp "candidates/$name-a/materials.sha256" "candidates/$name-b/materials.sha256"
+            printf '%s: independent fingerprints match; publication remains gated.\n' "$name" >> "$GITHUB_STEP_SUMMARY"
+          done
+      # Intentionally no registry push. A separately authorized publisher must
+      # verify candidate attestations, SBOM, customer approvals and acceptance.

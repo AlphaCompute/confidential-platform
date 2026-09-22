@@ -24,8 +24,8 @@ provider that writes them into the CVM.
   API would otherwise fill in, no `key_provider`), already in Phala's form; `expected.json` holds its `compose_hash`. Produced by the generator itself, so it
   pins the generator's output; Phala's serialization is what `01` proves.
 - `06-kms-node` — the KMS node's own compose as `kms_compose` renders it for the `app_id` and
-  image in `expected.json` (a placeholder digest; the release workflow renders the real one from
-  the pushed image): the same envelope with one service, the four configuration variables as `allowed_envs`, port 8443
+  image in `expected.json` (a placeholder digest; operators render the real one after image
+  publication is approved): the same envelope with one service, five operational variables as `allowed_envs`, port 8443
   published, the three evidence mounts. `expected.json` holds its `compose_hash`; the dev image's
   compose differs only by `ALPHACOMPUTE_KMS_DEV_ROOT_KEK` and is not pinned.
 - `07-deploy-docker` — `app.yaml` is `05`'s with `docker: true` added to the service that already
