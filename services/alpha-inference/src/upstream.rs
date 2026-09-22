@@ -422,7 +422,8 @@ mod tests {
     }
 
     use crate::test_support::{
-        ReportBehavior, spawn_fake_upstream as spawn_report_server, test_config,
+        ReportBehavior, answering, spawn_fake_upstream as spawn_report_server, test_config,
+        test_state,
     };
 
     async fn build_upstream(
@@ -455,12 +456,8 @@ mod tests {
 
     #[tokio::test]
     async fn verified_fails_with_status_when_the_report_endpoint_answers_500() {
-        let (base, hits, completions) = spawn_report_server(ReportBehavior {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            body: String::new(),
-            delay: None,
-        })
-        .await;
+        let (base, hits, completions) =
+            spawn_report_server(answering(StatusCode::INTERNAL_SERVER_ERROR, "")).await;
         let upstream =
             build_upstream(&base, &["m1"], Duration::from_secs(5), SystemTime::now()).await;
         assert!(matches!(
@@ -489,12 +486,8 @@ mod tests {
 
     #[tokio::test]
     async fn verified_fails_with_shape_when_the_report_is_not_json() {
-        let (base, _hits, _completions) = spawn_report_server(ReportBehavior {
-            status: StatusCode::OK,
-            body: "not json".into(),
-            delay: None,
-        })
-        .await;
+        let (base, _hits, _completions) =
+            spawn_report_server(answering(StatusCode::OK, "not json")).await;
         let upstream =
             build_upstream(&base, &["m1"], Duration::from_secs(5), SystemTime::now()).await;
         assert!(matches!(
@@ -506,12 +499,8 @@ mod tests {
     #[tokio::test]
     async fn verified_fails_with_shape_when_the_report_omits_a_field() {
         for body in [r#"{"signing_address":"0x00"}"#, r#"{"intel_quote":"00"}"#] {
-            let (base, _hits, _completions) = spawn_report_server(ReportBehavior {
-                status: StatusCode::OK,
-                body: body.into(),
-                delay: None,
-            })
-            .await;
+            let (base, _hits, _completions) =
+                spawn_report_server(answering(StatusCode::OK, body)).await;
             let upstream =
                 build_upstream(&base, &["m1"], Duration::from_secs(5), SystemTime::now()).await;
             assert!(
@@ -527,12 +516,8 @@ mod tests {
     #[tokio::test]
     async fn a_verification_younger_than_the_ttl_is_reused_without_a_fetch_and_a_failed_refetch_clears_a_good_slot()
      {
-        let (base, hits, _completions) = spawn_report_server(ReportBehavior {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            body: String::new(),
-            delay: None,
-        })
-        .await;
+        let (base, hits, _completions) =
+            spawn_report_server(answering(StatusCode::INTERNAL_SERVER_ERROR, "")).await;
         let start = UNIX_EPOCH + Duration::from_secs(1_000_000);
         let clock_cell = Arc::new(parking_lot::Mutex::new(start));
         let clock: Clock = {
@@ -725,20 +710,14 @@ mod tests {
         let (cert, key, spki) = self_signed_leaf();
         let (base, hits, last_auth) = spawn_tls_fake(cert, key).await;
 
-        let config = test_config(&base, &["m1"]);
-        let upstream =
-            Upstream::build(&config, Arc::new(SystemTime::now), Duration::from_secs(5)).unwrap();
-        *upstream.slots.get("m1").unwrap().lock().await = Some(Checked {
+        let state = test_state(
+            test_config(&base, &["m1"]),
+            b"the-callers-bearer",
+            "the-provider-key",
+        );
+        *state.upstream.slots.get("m1").unwrap().lock().await = Some(Checked {
             at: SystemTime::now(),
             outcome: Ok(pinned_client(&spki).unwrap()),
-        });
-        let state = Arc::new(crate::AppState {
-            config,
-            secrets: parking_lot::RwLock::new(crate::Secrets {
-                provider_key: zeroize::Zeroizing::new("the-provider-key".to_string()),
-                caller_bearer: zeroize::Zeroizing::new(b"the-callers-bearer".to_vec()),
-            }),
-            upstream,
         });
         let base = spawn_router(crate::router(state)).await;
 
@@ -779,16 +758,7 @@ mod tests {
             std::env::var("REDPILL_API_KEY").expect("REDPILL_API_KEY is not set for the live test");
         let bearer = b"test-bearer".to_vec();
 
-        let config = live_config();
-        let upstream = Upstream::new(&config).unwrap();
-        let state = Arc::new(crate::AppState {
-            config,
-            secrets: parking_lot::RwLock::new(crate::Secrets {
-                provider_key: zeroize::Zeroizing::new(provider_key),
-                caller_bearer: zeroize::Zeroizing::new(bearer.clone()),
-            }),
-            upstream,
-        });
+        let state = test_state(live_config(), &bearer, &provider_key);
         let base = spawn_router(crate::router(state)).await;
 
         let http = reqwest::Client::new();

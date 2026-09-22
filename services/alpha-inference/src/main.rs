@@ -89,26 +89,16 @@ async fn run() -> Result<(), Error> {
         .await
         .map_err(|e| Error::internal(format!("bind :{PORT}: {e}")))?;
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
-        let mut term =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(term) => term,
-                Err(_) => return,
-            };
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|e| Error::internal(format!("sigterm: {e}")))?;
+    let renew = tokio::spawn(renew_forever(runtime, cert, state.clone()));
+    serve_tls(listener, tls_config, app, async move {
         tokio::select! {
             _ = term.recv() => {}
             _ = tokio::signal::ctrl_c() => {}
         }
-        let _ = shutdown_tx.send(());
-    });
-
-    let renew = tokio::spawn(renew_forever(runtime, cert, state.clone()));
-
-    serve_tls(listener, tls_config, app, async {
-        let _ = shutdown_rx.await;
     })
-    .await?;
+    .await;
     renew.abort();
     Ok(())
 }
@@ -132,7 +122,7 @@ async fn serve_tls(
     tls_config: Arc<rustls::ServerConfig>,
     app: axum::Router,
     shutdown: impl Future<Output = ()>,
-) -> Result<(), Error> {
+) {
     let acceptor = TlsAcceptor::from(tls_config);
     let graceful = GracefulShutdown::new();
     let mut shutdown = std::pin::pin!(shutdown);
@@ -158,5 +148,4 @@ async fn serve_tls(
         });
     }
     graceful.shutdown().await;
-    Ok(())
 }

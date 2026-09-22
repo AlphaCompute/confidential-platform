@@ -19,6 +19,30 @@ pub(crate) struct ReportBehavior {
     pub delay: Option<Duration>,
 }
 
+pub(crate) fn answering(status: StatusCode, body: &str) -> ReportBehavior {
+    ReportBehavior {
+        status,
+        body: body.to_string(),
+        delay: None,
+    }
+}
+
+pub(crate) fn test_state(
+    config: crate::Config,
+    caller_bearer: &[u8],
+    provider_key: &str,
+) -> Arc<crate::AppState> {
+    let upstream = crate::Upstream::new(&config).unwrap();
+    Arc::new(crate::AppState {
+        config,
+        secrets: parking_lot::RwLock::new(crate::Secrets {
+            provider_key: zeroize::Zeroizing::new(provider_key.to_string()),
+            caller_bearer: zeroize::Zeroizing::new(caller_bearer.to_vec()),
+        }),
+        upstream,
+    })
+}
+
 /// A `Config` pointing at `upstream_url` with `models` allowlisted — everything both test
 /// modules need for a config that never has to pass the `https://` check `Config::build` runs.
 pub(crate) fn test_config(upstream_url: &str, models: &[&str]) -> crate::Config {

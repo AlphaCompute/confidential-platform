@@ -357,15 +357,13 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::Ordering;
-    use std::time::{Duration, SystemTime};
-
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
+    use std::sync::atomic::Ordering;
     use tower::ServiceExt;
 
     use super::*;
-    use crate::test_support::{ReportBehavior, spawn_fake_upstream, test_config};
+    use crate::test_support::{answering, spawn_fake_upstream, test_config, test_state};
 
     fn valid_env(name: &str) -> Option<String> {
         match name {
@@ -423,41 +421,11 @@ mod tests {
         assert!(err.to_string().contains("UPSTREAM_POLICY"), "{err}");
     }
 
-    fn test_state(
-        upstream_url: &str,
-        models: &[&str],
-        caller_bearer: &[u8],
-        provider_key: &str,
-    ) -> Arc<AppState> {
-        let config = test_config(upstream_url, models);
-        let clock: upstream::Clock = Arc::new(SystemTime::now);
-        let upstream = Upstream::build(&config, clock, Duration::from_secs(5)).unwrap();
-        Arc::new(AppState {
-            config,
-            secrets: parking_lot::RwLock::new(Secrets {
-                provider_key: Zeroizing::new(provider_key.to_string()),
-                caller_bearer: Zeroizing::new(caller_bearer.to_vec()),
-            }),
-            upstream,
-        })
-    }
-
-    fn fake_upstream_behavior(status: StatusCode, body: &str) -> ReportBehavior {
-        ReportBehavior {
-            status,
-            body: body.to_string(),
-            delay: None,
-        }
-    }
-
     #[tokio::test]
     async fn every_v1_route_requires_the_bearer_before_any_upstream_contact() {
-        let (base, report_hits, completions_hits) = spawn_fake_upstream(fake_upstream_behavior(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "",
-        ))
-        .await;
-        let state = test_state(&base, &["m1"], b"right-bearer", "provider-key");
+        let (base, report_hits, completions_hits) =
+            spawn_fake_upstream(answering(StatusCode::INTERNAL_SERVER_ERROR, "")).await;
+        let state = test_state(test_config(&base, &["m1"]), b"right-bearer", "provider-key");
         let app = router(state);
 
         let cases: [(&str, &str, Option<&str>); 4] = [
@@ -486,8 +454,8 @@ mod tests {
     #[tokio::test]
     async fn a_model_outside_the_allowlist_answers_404_before_any_upstream_contact() {
         let (base, report_hits, _completions_hits) =
-            spawn_fake_upstream(fake_upstream_behavior(StatusCode::OK, "{}")).await;
-        let state = test_state(&base, &["m1"], b"right-bearer", "provider-key");
+            spawn_fake_upstream(answering(StatusCode::OK, "{}")).await;
+        let state = test_state(test_config(&base, &["m1"]), b"right-bearer", "provider-key");
         let app = router(state);
 
         let request = Request::builder()
@@ -515,7 +483,11 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_needs_no_bearer() {
-        let state = test_state("https://example.invalid", &["m1"], b"bearer", "key");
+        let state = test_state(
+            test_config("https://example.invalid", &["m1"]),
+            b"bearer",
+            "key",
+        );
         let app = router(state);
         let request = Request::builder()
             .uri("/healthz")
@@ -527,12 +499,9 @@ mod tests {
 
     #[tokio::test]
     async fn chat_completions_answers_upstream_unverified_and_never_reaches_the_fake_upstream() {
-        let (base, _report_hits, completions_hits) = spawn_fake_upstream(fake_upstream_behavior(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "",
-        ))
-        .await;
-        let state = test_state(&base, &["m1"], b"right-bearer", "provider-key");
+        let (base, _report_hits, completions_hits) =
+            spawn_fake_upstream(answering(StatusCode::INTERNAL_SERVER_ERROR, "")).await;
+        let state = test_state(test_config(&base, &["m1"]), b"right-bearer", "provider-key");
         let app = router(state);
 
         let body = json!({ "model": "m1" }).to_string();
