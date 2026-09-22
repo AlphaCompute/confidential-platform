@@ -1,0 +1,3 @@
+# Install this reviewed source before installing alpha-dstack-tee.
+# Authenticated access to the dependency repository may be required.
+dstack-sdk @ git+https://github.com/AlphaCompute/dstack-tee.git@c12e96adaeea51d1c79608123d41a6f521db46cd#subdirectory=sdk/python

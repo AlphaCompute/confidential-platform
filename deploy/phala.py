@@ -15,14 +15,14 @@ wait returns once every container has been running for three checks in a row.
 import hashlib
 import json
 import os
-import secrets
 import sys
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import quote
 
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from alpha_dstack_tee import AlphaDstackTEEPlugin
+
 
 API = "https://cloud-api.phala.network/api/v1"
 # The edge in front of the API refuses urllib's default user agent with a bare 403.
@@ -41,24 +41,27 @@ def call(method, path, body=None):
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=180) as reply:
-            raw = reply.read()
+        with urllib.request.build_opener(NoRedirect()).open(request, timeout=180) as reply:
+            raw = reply.read(2 * 1024 * 1024 + 1)
+            if len(raw) > 2 * 1024 * 1024:
+                raise ValueError("provider response exceeds size limit")
             return json.loads(raw) if raw else None
     except urllib.error.HTTPError as refused:
-        sys.exit(f"{method} {path}: {refused.code} {refused.read().decode()[:600]}")
+        sys.exit(f"provider request refused: HTTP {refused.code}")
 
 
-def seal(values, pubkey_hex):
-    """dstack's scheme: an ephemeral X25519 agreement, the raw shared secret as the AES-256-GCM
-    key, hex(ephemeral public key || nonce || ciphertext)."""
-    plaintext = json.dumps({"env": [{"key": k, "value": v} for k, v in values.items()]}).encode()
-    ephemeral = X25519PrivateKey.generate()
-    shared = ephemeral.exchange(
-        X25519PublicKey.from_public_bytes(bytes.fromhex(pubkey_hex.removeprefix("0x")))
-    )
-    nonce = secrets.token_bytes(12)
-    sealed = AESGCM(shared).encrypt(nonce, plaintext, None)
-    return (ephemeral.public_key().public_bytes_raw() + nonce + sealed).hex()
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise ValueError("provider redirect refused")
+
+
+def verified_seal(adapter, values, prepared, *, app_id, offered):
+    kms = prepared.get("kms_contract_id") or prepared.get("kms_id") or prepared.get("kms_type")
+    if not kms:
+        raise ValueError("provider KMS identifier required")
+    signed = call("GET", f"/kms/{quote(str(kms), safe='')}/pubkey/{quote(app_id, safe='')}")
+    return adapter.encrypt_environment(values, expected_app_id=app_id,
+                                      offered_public_key=offered, signed_key=signed)
 
 
 def sha256_hex(compose_bytes):
@@ -129,6 +132,7 @@ def main():
     if len(sys.argv) != 4 or sys.argv[1] not in ("create", "update"):
         sys.exit(__doc__)
     action = sys.argv[1]
+    adapter = AlphaDstackTEEPlugin(os.environ.get("PHALA_KMS_SIGNER", ""))
     path = sys.argv[2] if action == "create" else sys.argv[3]
     with open(path, "rb") as f:
         compose_bytes = f.read()
@@ -151,7 +155,9 @@ def main():
         made = call("POST", "/cvms", {
             "app_id": prepared["app_id"],
             "compose_hash": prepared["compose_hash"],
-            "encrypted_env": seal(values, prepared["app_env_encrypt_pubkey"]),
+            "encrypted_env": verified_seal(adapter, values, prepared,
+                                          app_id=prepared["app_id"],
+                                          offered=prepared["app_env_encrypt_pubkey"]),
             "env_keys": list(values),
         })
         check_stored(made["id"], compose_bytes)
@@ -161,8 +167,9 @@ def main():
     cvm_id = sys.argv[2]
     prepared = call("POST", f"/cvms/{cvm_id}/compose_file/provision", compose)
     check(prepared["compose_hash"], compose_bytes)
-    pubkey = call("GET", f"/cvms/{cvm_id}")["kms_info"]["encrypted_env_pubkey"]
-    sealed = seal(values, pubkey)
+    info = call("GET", f"/cvms/{cvm_id}")
+    sealed = verified_seal(adapter, values, {**info, **prepared},
+                          app_id=info["app_id"], offered=info["kms_info"]["encrypted_env_pubkey"])
     if prepared.get("compose_unchanged"):
         call("PATCH", f"/cvms/{cvm_id}/envs", {"encrypted_env": sealed, "env_keys": list(values)})
     else:

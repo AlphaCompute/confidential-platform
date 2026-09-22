@@ -29,7 +29,7 @@ jobs:
       CVM_ID: ${{ inputs.cvm_id }}
       CVM_NAME: ${{ inputs.name }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Render the node compose from the image
         run: |
           digest=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{json .Manifest}}' | jq -r .digest)
@@ -41,6 +41,8 @@ jobs:
       - name: Create or update the CVM
         env:
           PHALA_API_KEY: ${{ secrets.PHALA_API_KEY }}
+          PHALA_KMS_SIGNER: ${{ vars.PHALA_KMS_SIGNER }}
+          ALPHACOMPUTE_DATABASE_INTEGRITY: trusted-operators-v1
           PHALA_IMAGE: dstack-0.5.9
           ALPHACOMPUTE_DATABASE_URL: ${{ secrets.ALPHACOMPUTE_DATABASE_URL }}
           ALPHACOMPUTE_KMS_DEV_ROOT_KEK: ${{ secrets.ALPHACOMPUTE_KMS_DEV_ROOT_KEK }}
@@ -48,7 +50,7 @@ jobs:
           ALPHACOMPUTE_PCCS_URL: ${{ vars.ALPHACOMPUTE_PCCS_URL }}
           ALPHACOMPUTE_PLATFORM_DOCUMENT_URL: ${{ vars.ALPHACOMPUTE_PLATFORM_DOCUMENT_URL }}
         run: |
-          pip install --quiet cryptography
+          pip install --quiet ./integrations/dstack-tee
           if [ -n "$CVM_ID" ]; then
             python3 deploy/phala.py update "$CVM_ID" out/app-compose.json > cvm.json
           else
