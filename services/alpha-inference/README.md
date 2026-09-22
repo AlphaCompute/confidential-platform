@@ -1,6 +1,6 @@
 # alpha-inference
 
-The platform's inference front: an App of its own, whose provider is RedPill. Every `/v1` route forwards to RedPill only after recipe A — a live check of RedPill's gateway attestation, run in this service's own measured code — has passed for that model within the last minute; any error, timeout or mismatch answers `upstream_unverified` and sends nothing.
+The platform's inference front: an App of its own, whose provider is RedPill. Every `/v1` route forwards to RedPill only after a live check of RedPill's gateway attestation, run in this service's own measured code, has passed for that model within the last minute; any error, timeout or mismatch answers `upstream_unverified` and sends nothing.
 
 ## Configuration (environment only)
 
@@ -15,14 +15,14 @@ Two Secrets, released only to this App's Revision: `redpill-api-key` (RedPill's 
 
 ## Routes
 
-- `GET /v1/models` — the allowlisted entries of RedPill's public listing (bare `{id, object}` when RedPill lists none of them). No recipe A check: it carries no conversation.
-- `GET /v1/models/{model}` — `200 {"id","object":"model","owned_by":"redpill"}` once recipe A has passed for that model within the last minute; `404 model_not_found` outside the allowlist; `502 upstream_unverified` otherwise.
-- `POST /v1/chat/completions` — the body forwarded unchanged over the connection recipe A pinned, the caller's bearer replaced by the RedPill key, status/content-type/stream relayed; `404 model_not_found` outside the allowlist, checked before any upstream contact; `502 upstream_unverified` when recipe A fails; `502 upstream` when the pinned connection itself fails.
+- `GET /v1/models` — the allowlisted entries of RedPill's public listing (bare `{id, object}` when RedPill lists none of them). No gateway check: it carries no conversation.
+- `GET /v1/models/{model}` — `200 {"id","object":"model","owned_by":"redpill"}` once the gateway check has passed for that model within the last minute; `404 model_not_found` outside the allowlist; `502 upstream_unverified` otherwise.
+- `POST /v1/chat/completions` — the body forwarded unchanged over the connection the gateway check pinned, the caller's bearer replaced by the RedPill key, status/content-type/stream relayed; `404 model_not_found` outside the allowlist, checked before any upstream contact; `502 upstream_unverified` when the gateway check fails; `502 upstream` when the pinned connection itself fails.
 - `GET /healthz` (process only) and `GET /ready` (200 once the default model verifies) need no bearer.
 
 Errors are OpenAI-shaped: `{"error":{"message","type","code"}}`; the `upstream_unverified` message is always "The model provider did not pass verification, so nothing was sent."
 
-## Recipe A
+## The gateway check
 
 Before forwarding any request for a model, and at most once a minute per model: a fresh 32-byte nonce; `GET {UPSTREAM_URL}/attestation/report?model=<m>&nonce=<nonce>&signing_algo=ecdsa&version=2`, read over an unpinned connection that never carries the RedPill key; the returned TDX quote verified with `alpha_attest::verify_quote` against PCCS collateral and `UPSTREAM_POLICY`; and a check that `report_data` equals `SHA-256(signing address ‖ SHA-256(the connection's own observed TLS key)) ‖ nonce` — binding the quote to the actual connection this process made, not to anything the report claims about itself. A pass pins every forwarding connection for that model to that exact key until the check expires; a failed refetch clears even a previously good result.
 

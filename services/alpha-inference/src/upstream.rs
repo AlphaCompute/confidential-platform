@@ -1,4 +1,4 @@
-//! Recipe A: before any request for a model is forwarded, fetch RedPill's attestation report
+//! The gateway check: before any request for a model is forwarded, fetch RedPill's attestation report
 //! for it over an unpinned connection, verify the TDX quote with `alpha_attest::verify_quote`
 //! and that its `report_data` binds the fresh nonce to the signing address RedPill returned
 //! and the SPKI our own connection observed, then pin all forwarding for that model to that
@@ -16,13 +16,13 @@ use tokio::sync::Mutex;
 
 use crate::{Config, Error};
 
-/// A verification is trusted for one minute; older than that, recipe A runs again.
+/// A verification is trusted for one minute; older than that, the check runs again.
 const VERIFIED_TTL: Duration = Duration::from_secs(60);
 const REPORT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub type Clock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 
-/// Why a model failed recipe A. Logged by code and model only — never the report body.
+/// Why a model failed the gateway check. Logged by code and model only — never the report body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reason {
     /// The report endpoint could not be reached at all (refused, timed out, or the OS RNG
@@ -66,14 +66,14 @@ pub enum VerifyOutcome {
     UnknownModel,
 }
 
-/// The two fields recipe A reads from RedPill's `GET /v1/attestation/report?version=2` body.
+/// The two fields the check reads from RedPill's `GET /v1/attestation/report?version=2` body.
 #[derive(Debug, Deserialize)]
 struct Report {
     signing_address: String,
     intel_quote: String,
 }
 
-/// A model's last recipe-A check: when, and what it found — a client that will only ever
+/// A model's last gateway check: when, and what it found — a client that will only ever
 /// complete a handshake against the attested SPKI, or why it refused to trust one. Caching the
 /// failure too (not just the success) is what makes the per-model lock a true single flight:
 /// two callers racing a cold model share the one fetch's outcome, not just its happy path.
@@ -82,7 +82,7 @@ struct Checked {
     outcome: Result<reqwest::Client, Reason>,
 }
 
-/// Recipe A over the allowlisted models. One `Mutex` per model, built once at startup —
+/// The gateway check over the allowlisted models. One `Mutex` per model, built once at startup —
 /// nothing is inserted at runtime, so the mutex is the single flight for that model's check.
 pub struct Upstream {
     upstream_url: String,
@@ -199,8 +199,8 @@ impl Upstream {
         })
     }
 
-    /// A client pinned to `model`'s attested key, checked within the last minute — refetching
-    /// recipe A first if the last check is older than that, or there was none yet. Whatever
+    /// A client pinned to `model`'s attested key, checked within the last minute — running
+    /// the check again first if the last one is older than that, or there was none yet. Whatever
     /// that fetch finds — success or failure — is what every caller waiting on the same
     /// model's lock gets back; nothing here starts a second fetch while one is in flight.
     pub async fn verified(&self, model: &str) -> Result<reqwest::Client, VerifyOutcome> {
@@ -231,7 +231,7 @@ impl Upstream {
     }
 
     /// The pinned connection for `model` failed after a passing check; the next call to
-    /// `verified` runs recipe A again instead of reusing a client that just proved stale.
+    /// `verified` runs the check again instead of reusing a client that just proved stale.
     pub async fn forget(&self, model: &str) {
         if let Some(slot) = self.slots.get(model) {
             *slot.lock().await = None;
@@ -750,7 +750,7 @@ mod tests {
     }
 
     /// Proves the whole front end to end against the live RedPill gateway: a caller with its
-    /// bearer only gets an answer after recipe A verified RedPill's gateway for real.
+    /// bearer only gets an answer after the gateway check verified RedPill for real.
     #[tokio::test]
     #[ignore = "hits the live RedPill API; run with REDPILL_API_KEY set, via --include-ignored"]
     async fn a_caller_with_its_bearer_gets_a_streamed_answer_after_live_verification() {
