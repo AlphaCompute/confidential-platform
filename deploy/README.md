@@ -95,12 +95,16 @@ the platform-document URL are served; the signed document lists the Revision.
    object in `app-compose.json` (the API serializes it itself; the `compose_hash` in the provision
    reply must equal `manifest.json`'s — if it does not, stop: the bytes Phala would measure are
    not the signed Revision), the dstack image and instance type the document has reference values
-   for, and a region. Encrypt the environment to the reply's `app_env_encrypt_pubkey` and commit:
+   for, and a region. Install `integrations/dstack-tee` and provision `PHALA_KMS_SIGNER`
+   independently. Verify the fresh app-bound v1 signed key matches `app_env_encrypt_pubkey`
+   before encrypting or committing. Unsigned keys and legacy-only signatures are refused:
    `ALPHACOMPUTE_DATABASE_URL` (as the service user), `ALPHACOMPUTE_KMS_ENDPOINTS` (both nodes'
    URLs, `https://<app id>-8443s.<gateway base>`, so provision the second CVM first to learn its
    app id: the values are not measured, but a later env update rewrites the stored
    `allowed_envs` and changes what the CVM measures, see "Deploying the dev node"),
-   `ALPHACOMPUTE_PCCS_URL`, `ALPHACOMPUTE_PLATFORM_DOCUMENT_URL`, and after the commit check that
+   `ALPHACOMPUTE_PCCS_URL`, `ALPHACOMPUTE_PLATFORM_DOCUMENT_URL`,
+   `ALPHACOMPUTE_DATABASE_INTEGRITY=trusted-operators-v1` (see `docs/database-trust.md`),
+   and after the commit check that
    the stored compose still hashes to `manifest.json`'s `compose_hash`. The node comes up
    `sealed`: `GET /ready` answers 503 `{"sealed": true}`.
 3. **Bootstrap** on the first node: `alpha bootstrap --custodians c1.pub c2.pub c3.pub
