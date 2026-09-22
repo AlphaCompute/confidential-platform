@@ -20,3 +20,9 @@ The grammar cannot establish whether an approved image downloads executable code
 
 
 The guest Docker socket option introduced in the CLI is incompatible with this profile and is rejected, even for a service with the runtime socket. The historical `07-deploy-docker` fixture remains a hash vector but cannot be generated or registered as an approved workload.
+
+## Platform document freshness
+
+Customers provision an empty journal at an absolute customer-owned path and obtain a positive minimum version independently. The CLI requires `--platform-state` / `ALPHACOMPUTE_PLATFORM_STATE` and `--platform-min-version` / `ALPHACOMPUTE_PLATFORM_MIN_VERSION`. `--platform-max-age-seconds` must be positive and at most 86400, including for CA rotation. New versions are locked, appended and fsynced before pins are used. Lower versions, same-version different contents, future/stale documents, torn journals and missing journals fail closed.
+
+Preserve the journal across reinstalls/hosts, protect it against rollback and trust the local clock. Recover lost journals from customer checkpoints and an independent minimum; never silently re-create them. This does not solve database rollback. KMS endpoints are HTTPS origins only, one to four, without redirects, credentials, query, fragment or path. Connect/read/total deadlines are 5/10/15 seconds per endpoint; response bodies are at most 2 MiB.
