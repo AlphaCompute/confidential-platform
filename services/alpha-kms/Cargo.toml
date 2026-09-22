@@ -44,6 +44,7 @@ vsss-rs = "6"
 zeroize = "1"
 
 [dev-dependencies]
+alpha-cpu-app = { path = "../alpha-cpu-app" }
 alpha-cli = { path = "../../crates/alpha-cli" }
 alpha-runtime = { path = "../alpha-runtime" }
 tokio = { version = "1", features = ["io-util"] }
