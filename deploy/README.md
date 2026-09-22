@@ -3,37 +3,33 @@
 Two CVMs in two regions run one Revision of `alpha-kms` over one trust-zone Postgres. The
 production nodes are deployed neither by CI nor by shroud-go's deploy route: the operator creates
 and upgrades the two CVMs by hand through the Phala Cloud API (or the `phala` CLI), one at a
-time, with the compose the release workflow rendered. Only the dev node is deployed by a
-workflow (below). This directory is the runbook; the compose itself is a
-release artifact, because it names the image by digest and the digest exists only after the
-build.
+time, with an operator-rendered compose bound to an approved published image digest.
+Only the dev node is deployed by a workflow (below). This directory is the runbook;
+release candidates must pass acceptance before their images can be published and
+used to render a production compose.
 
-## What a release produces
+## What a release candidate produces
 
-A tag `v*` runs `.github/workflows/release.yml`: every image (`alpha-runtime`, `alpha-kms`,
-`alpha-kms-dev`) is built twice, the second time with `--no-cache`, and the job fails unless
-both builds give one image id and one layer set; the images are pushed as
-`ghcr.io/<owner>/<name>:<tag>`. For the two KMS images the workflow then renders the node's
-`app-compose.json` from the pushed digest (`cargo run -p alpha-cli --example kms_compose`,
-which is `alpha_cli::deploy::kms_compose` over `alpha_core::phala::canonicalize`, the same
-serializer Phala's API applies) and publishes the unsigned release manifest as the artifact
-`<name>-release-manifest` and in the job summary:
+A `v*` tag or explicit dispatch runs `.github/workflows/release.yml` after
+mandatory CI. Separate runners build each runtime, KMS, development KMS and
+CPU application candidate without shared build caches. The comparison job
+requires identical image fingerprints, source commits and recorded materials.
+Artifacts contain the image archive, inspection data, Cargo dependency
+inventory and a provenance attestation. They remain unqualified candidates.
 
-- `app-compose.json` — the exact bytes Phala measures into RTMR3: the envelope, one service
-  `alpha-kms` with the image by digest, port 8443 published for the gateway's TLS passthrough,
-  the three evidence mounts, `restart: always`, and the four configuration variables as
-  `allowed_envs` (`alpha-kms-dev` adds `ALPHACOMPUTE_KMS_DEV_ROOT_KEK`);
-- `manifest.json` — `image` (`ghcr.io/…@sha256:…`) and `compose_hash` (`sha256:` of the bytes
-  above).
+The workflow does not push a registry image or render a published release
+manifest. A separately authorized release process must verify the candidate
+attestations, complete OS/native/Python dependency locks and SBOM, customer
+approvals and offering acceptance before publishing any digest. See
+[release provenance](../docs/release-provenance.md).
 
-Anyone can reproduce it: `cargo run -p alpha-cli --example kms_compose -- <app_id>
-<image@sha256:…> out/` gives the same bytes and hash (`sha256sum out/app-compose.json`). The
-App ids are constants of the workflow matrix (production `01a09f07-8d09-7640-94c1-bbdb74200a1e`,
-dev `01a09f07-8d09-7aff-b257-83dbd9e6e641`); `testdata/manifest/06-kms-node` pins the shape.
-
-`alpha-kms-dev` is the image of the dev KMS App: the `dev-root` cargo feature, compiled in, takes
-the root KEK from `ALPHACOMPUTE_KMS_DEV_ROOT_KEK` instead of the custodians' shares. It is a
-different image with a different `compose_hash`; a production platform document never lists it.
+After an approved image digest exists, the operator can render a node compose:
+`cargo run -p alpha-cli --example kms_compose -- <app_id> <image@sha256:...> out/`.
+The output binds the image and five operational variables, including
+`ALPHACOMPUTE_DATABASE_INTEGRITY`; the development variant also carries
+`ALPHACOMPUTE_KMS_DEV_ROOT_KEK`. The `06-kms-node` fixture pins this shape.
+Production and development Apps remain distinct, and production platform
+documents must never admit the development root-KEK feature.
 
 ## Pulling from ghcr
 
