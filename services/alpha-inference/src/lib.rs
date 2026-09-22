@@ -351,3 +351,239 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/ready", get(ready))
         .with_state(state)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, SystemTime};
+
+    use axum::body::{Body, to_bytes};
+    use axum::extract::State as ExtractState;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    fn valid_env(name: &str) -> Option<String> {
+        match name {
+            "UPSTREAM_URL" => Some("https://api.redpill.ai/v1".to_string()),
+            "MODELS" => Some("m1,m2".to_string()),
+            "PCCS_URL" => Some("https://pccs.example".to_string()),
+            "UPSTREAM_POLICY" => {
+                Some(r#"{"tcb_statuses":["UpToDate"],"tolerated_advisories":[]}"#.to_string())
+            }
+            _ => None,
+        }
+    }
+
+    fn with_override(name: &'static str, value: &'static str) -> impl Fn(&str) -> Option<String> {
+        move |n| {
+            if n == name {
+                Some(value.to_string())
+            } else {
+                valid_env(n)
+            }
+        }
+    }
+
+    #[test]
+    fn config_build_accepts_the_valid_baseline() {
+        assert!(Config::build(valid_env).is_ok());
+    }
+
+    #[test]
+    fn config_build_refuses_an_http_upstream_url_naming_it() {
+        let err =
+            Config::build(with_override("UPSTREAM_URL", "http://api.redpill.ai/v1")).unwrap_err();
+        assert!(err.to_string().contains("UPSTREAM_URL"), "{err}");
+    }
+
+    #[test]
+    fn config_build_refuses_an_empty_models_naming_it() {
+        let err = Config::build(with_override("MODELS", " , ,")).unwrap_err();
+        assert!(err.to_string().contains("MODELS"), "{err}");
+    }
+
+    #[test]
+    fn config_build_refuses_a_missing_pccs_url_naming_it() {
+        let err = Config::build(|n| if n == "PCCS_URL" { None } else { valid_env(n) }).unwrap_err();
+        assert!(err.to_string().contains("PCCS_URL"), "{err}");
+    }
+
+    #[test]
+    fn config_build_refuses_an_upstream_policy_with_no_tcb_status_naming_it() {
+        let err = Config::build(with_override(
+            "UPSTREAM_POLICY",
+            r#"{"tcb_statuses":[],"tolerated_advisories":[]}"#,
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("UPSTREAM_POLICY"), "{err}");
+    }
+
+    fn test_state(
+        upstream_url: &str,
+        models: &[&str],
+        caller_bearer: &[u8],
+        provider_key: &str,
+    ) -> Arc<AppState> {
+        let config = Config {
+            upstream_url: upstream_url.to_string(),
+            models: models.iter().map(|s| (*s).to_string()).collect(),
+            pccs_url: "https://pccs.example".to_string(),
+            upstream_policy: alpha_attest::Policy {
+                tcb_statuses: vec!["UpToDate".into()],
+                tolerated_advisories: vec![],
+            },
+        };
+        let clock: upstream::Clock = Arc::new(SystemTime::now);
+        let upstream = Upstream::build(&config, clock, Duration::from_secs(5)).unwrap();
+        Arc::new(AppState {
+            config,
+            secrets: parking_lot::RwLock::new(Secrets {
+                provider_key: Zeroizing::new(provider_key.to_string()),
+                caller_bearer: Zeroizing::new(caller_bearer.to_vec()),
+            }),
+            upstream,
+        })
+    }
+
+    /// A fake RedPill that counts requests to both routes it serves, answering the report
+    /// route with a fixed status and body.
+    async fn spawn_fake_upstream(
+        status: StatusCode,
+        body: &str,
+    ) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        #[derive(Clone)]
+        struct FakeState {
+            status: StatusCode,
+            body: String,
+            report_hits: Arc<AtomicUsize>,
+            completions_hits: Arc<AtomicUsize>,
+        }
+        async fn report(ExtractState(s): ExtractState<FakeState>) -> Response {
+            s.report_hits.fetch_add(1, Ordering::SeqCst);
+            (s.status, s.body.clone()).into_response()
+        }
+        async fn completions(ExtractState(s): ExtractState<FakeState>) -> StatusCode {
+            s.completions_hits.fetch_add(1, Ordering::SeqCst);
+            StatusCode::OK
+        }
+        let state = FakeState {
+            status,
+            body: body.to_string(),
+            report_hits: Arc::new(AtomicUsize::new(0)),
+            completions_hits: Arc::new(AtomicUsize::new(0)),
+        };
+        let report_hits = state.report_hits.clone();
+        let completions_hits = state.completions_hits.clone();
+        let app = Router::new()
+            .route("/attestation/report", get(report))
+            .route("/chat/completions", post(completions))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}"), report_hits, completions_hits)
+    }
+
+    #[tokio::test]
+    async fn every_v1_route_requires_the_bearer_before_any_upstream_contact() {
+        let (base, report_hits, completions_hits) =
+            spawn_fake_upstream(StatusCode::INTERNAL_SERVER_ERROR, "").await;
+        let state = test_state(&base, &["m1"], b"right-bearer", "provider-key");
+        let app = router(state);
+
+        let cases: [(&str, &str, Option<&str>); 4] = [
+            ("GET", "/v1/models", None),
+            ("GET", "/v1/models", Some("Bearer wrong")),
+            ("GET", "/v1/models/m1", None),
+            ("POST", "/v1/chat/completions", None),
+        ];
+        for (method, path, auth) in cases {
+            let mut builder = Request::builder().method(method).uri(path);
+            if let Some(value) = auth {
+                builder = builder.header(header::AUTHORIZATION, value);
+            }
+            let request = builder.body(Body::empty()).unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}"
+            );
+        }
+        assert_eq!(report_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(completions_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_model_outside_the_allowlist_answers_404_before_any_upstream_contact() {
+        let (base, report_hits, _completions_hits) =
+            spawn_fake_upstream(StatusCode::OK, "{}").await;
+        let state = test_state(&base, &["m1"], b"right-bearer", "provider-key");
+        let app = router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/v1/models/not-allowed")
+            .header(header::AUTHORIZATION, "Bearer right-bearer")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let body = json!({ "model": "not-allowed" }).to_string();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::AUTHORIZATION, "Bearer right-bearer")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        assert_eq!(report_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn healthz_needs_no_bearer() {
+        let state = test_state("https://example.invalid", &["m1"], b"bearer", "key");
+        let app = router(state);
+        let request = Request::builder()
+            .uri("/healthz")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn chat_completions_answers_upstream_unverified_and_never_reaches_the_fake_upstream() {
+        let (base, _report_hits, completions_hits) =
+            spawn_fake_upstream(StatusCode::INTERNAL_SERVER_ERROR, "").await;
+        let state = test_state(&base, &["m1"], b"right-bearer", "provider-key");
+        let app = router(state);
+
+        let body = json!({ "model": "m1" }).to_string();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::AUTHORIZATION, "Bearer right-bearer")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["error"]["code"], "upstream_unverified");
+        assert_eq!(
+            parsed["error"]["message"],
+            "The model provider did not pass verification, so nothing was sent."
+        );
+        assert_eq!(completions_hits.load(Ordering::SeqCst), 0);
+    }
+}

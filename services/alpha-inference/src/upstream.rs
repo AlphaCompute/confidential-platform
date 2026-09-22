@@ -780,6 +780,49 @@ mod tests {
         assert_eq!(hits_a.load(Ordering::SeqCst), 0);
     }
 
+    /// The full round trip through the router: a caller's own bearer authenticates the
+    /// request, but only the provider key ever reaches the (attested-key-pinned) upstream.
+    #[tokio::test]
+    async fn chat_completions_forwards_the_provider_key_never_the_callers_bearer() {
+        let (cert, key, spki) = self_signed_leaf();
+        let (base, hits, last_auth) = spawn_tls_fake(cert, key).await;
+
+        let config = test_config(&base, &["m1"]);
+        let upstream =
+            Upstream::build(&config, Arc::new(SystemTime::now), Duration::from_secs(5)).unwrap();
+        *upstream.slots.get("m1").unwrap().lock().await = Some(Checked {
+            at: SystemTime::now(),
+            outcome: Ok(pinned_client(&spki).unwrap()),
+        });
+        let state = Arc::new(crate::AppState {
+            config,
+            secrets: parking_lot::RwLock::new(crate::Secrets {
+                provider_key: zeroize::Zeroizing::new("the-provider-key".to_string()),
+                caller_bearer: zeroize::Zeroizing::new(b"the-callers-bearer".to_vec()),
+            }),
+            upstream,
+        });
+        let app = crate::router(state);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let http = reqwest::Client::new();
+        let response = http
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header(reqwest::header::AUTHORIZATION, "Bearer the-callers-bearer")
+            .json(&serde_json::json!({ "model": "m1" }))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(last_auth.lock().as_deref(), Some("Bearer the-provider-key"));
+    }
+
     fn live_config() -> crate::Config {
         crate::Config::build(|name| match name {
             "UPSTREAM_URL" => Some("https://api.redpill.ai/v1".to_string()),

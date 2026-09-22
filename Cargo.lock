@@ -167,6 +167,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-rustls",
+ "tower",
  "zeroize",
 ]
 
