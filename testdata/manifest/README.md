@@ -32,3 +32,7 @@ provider that writes them into the CVM.
   has `socket: true`; the compose carries the guest daemon's socket bind-mounted on that one
   service, after the socket volume, nowhere else and never on `alpha-runtime`. `expected.json`
   holds its `compose_hash`. Produced by the generator itself, like `05`.
+
+## Closed workload approval
+
+Fixtures `01` and `04` remain canonicalization/hash vectors; the closed profile rejects their executable overrides. `07` remains a historical hash vector, but guest Docker socket access is refused by both CLI generation and KMS registration. `05` is the accepted application profile. `06` now carries five operational variables, including the explicit database-integrity acknowledgement.

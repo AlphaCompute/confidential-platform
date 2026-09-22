@@ -12,3 +12,11 @@ Hash `alphacompute/trust-org/v1\0 || canonical_Ed25519_SPKI_DER` with SHA-256, t
 
 Existing UUID/root pairs remain anchored to the exact old root and allow idempotent replay. No automatic rename or root substitution occurs. Registration's optional `--org-id` supports legacy replay. Billing organization UUIDs are distinct from trust IDs and need an authorized mapping. Migration to a derived ID is new enrollment: the customer signs new key/revision/secret records, applications adopt the new public identity, then old approvals are revoked and archived. Never move certificates, KDF inputs or ciphertext by editing an organization column.
 
+## Closed workload profile
+
+Registration admits one Compose document with explicit services using literal SHA-256 image digests and supported image, port, restart, literal environment and approved volume fields. Build, include, extends, env files, command/entrypoint overrides, unknown loader fields and arbitrary host mounts are rejected. The outer pre-launch script is absent or exactly `:\n`. Interpolation is restricted to named operational configuration of `alpha-runtime`/`alpha-kms`. Approval covers exact serialized compose bytes.
+
+The grammar cannot establish whether an approved image downloads executable code after boot. Image acceptance must establish reviewed entrypoints, no runtime code/model/plugin download, a complete dependency inventory and pinned release provenance. Images requiring dynamic code loading are not qualified by this profile. The historical open fixture remains a hash/signature vector but cannot be registered.
+
+
+The guest Docker socket option introduced in the CLI is incompatible with this profile and is rejected, even for a service with the runtime socket. The historical `07-deploy-docker` fixture remains a hash vector but cannot be generated or registered as an approved workload.

