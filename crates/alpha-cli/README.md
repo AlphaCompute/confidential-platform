@@ -1,5 +1,7 @@
 # alpha
 
+Platform-document use now requires customer-owned freshness state. See [trust and identity migration](../../docs/trust-migration.md) before upgrading. Signing and unseal authority stay outside Rafay.
+
 The command line of the trust plane: keys, signed Control calls, the platform document, deploys, and the custodians' `bootstrap` and `unseal`. Every command prints one JSON document on success; exit code 1 means a check refused (the message names it), 2 means usage.
 
 ## Configuration

@@ -14,6 +14,7 @@
 )]
 pub mod call;
 pub mod deploy;
+pub mod freshness;
 pub mod keyfile;
 pub mod node;
 pub mod sign;
