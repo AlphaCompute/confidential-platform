@@ -597,6 +597,16 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
+    /// Serves `app` on a loopback port and returns its base URL.
+    async fn spawn_router(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}")
+    }
+
     fn self_signed_leaf() -> (
         CertificateDer<'static>,
         PrivatePkcs8KeyDer<'static>,
@@ -730,17 +740,11 @@ mod tests {
             }),
             upstream,
         });
-        let app = crate::router(state);
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
+        let base = spawn_router(crate::router(state)).await;
 
         let http = reqwest::Client::new();
         let response = http
-            .post(format!("http://{addr}/v1/chat/completions"))
+            .post(format!("{base}/v1/chat/completions"))
             .header(reqwest::header::AUTHORIZATION, "Bearer the-callers-bearer")
             .json(&serde_json::json!({ "model": "m1" }))
             .send()
@@ -785,21 +789,13 @@ mod tests {
             }),
             upstream,
         });
-        let app = crate::router(state);
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
+        let base = spawn_router(crate::router(state)).await;
 
         let http = reqwest::Client::new();
         let auth = format!("Bearer {}", String::from_utf8(bearer).unwrap());
 
         let model_response = http
-            .get(format!(
-                "http://{addr}/v1/models/nvidia/nemotron-3.5-lightning"
-            ))
+            .get(format!("{base}/v1/models/nvidia/nemotron-3.5-lightning"))
             .header(reqwest::header::AUTHORIZATION, &auth)
             .send()
             .await
@@ -813,7 +809,7 @@ mod tests {
         );
 
         let completion_response = http
-            .post(format!("http://{addr}/v1/chat/completions"))
+            .post(format!("{base}/v1/chat/completions"))
             .header(reqwest::header::AUTHORIZATION, &auth)
             .json(&serde_json::json!({
                 "model": "nvidia/nemotron-3.5-lightning",
