@@ -139,7 +139,7 @@ pub async fn finish(
     )
     .await?;
     Ok(Json(
-        json!({ "id": id, "provider": provider.name, "account": account }),
+        json!({ "id": id, "provider": provider.name, "account": account.email }),
     ))
 }
 

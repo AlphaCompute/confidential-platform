@@ -21,8 +21,8 @@ pub struct Provider {
     pub scopes: &'static [&'static str],
 }
 
-/// `openid` and `email` grant no data; they let `account` read the address the member sees in
-/// the Sources menu.
+/// `openid` and `email` grant no data; they let `account` read the account's subject and the
+/// address the member sees in the Sources menu.
 pub const GOOGLE: Provider = Provider {
     name: "google",
     authorization: "https://accounts.google.com/o/oauth2/v2/auth",
@@ -129,15 +129,20 @@ pub async fn exchange(
     })
 }
 
+/// The provider's stable subject identifies the account; the email is only what the member
+/// sees, and it can be renamed or given to another account.
+#[derive(Deserialize)]
+pub struct Account {
+    #[serde(rename = "sub")]
+    pub subject: String,
+    pub email: String,
+}
+
 pub async fn account(
     http: &reqwest::Client,
     provider: &Provider,
     access_token: &str,
-) -> Result<String, &'static str> {
-    #[derive(Deserialize)]
-    struct Account {
-        email: String,
-    }
+) -> Result<Account, &'static str> {
     let response = http
         .get(provider.account)
         .bearer_auth(access_token)
@@ -147,8 +152,7 @@ pub async fn account(
     if !response.status().is_success() {
         return Err("account_refused");
     }
-    let account: Account = response.json().await.map_err(|_| "account_malformed")?;
-    Ok(account.email)
+    response.json().await.map_err(|_| "account_malformed")
 }
 
 /// Best effort: the caller revokes locally whatever the provider answers.

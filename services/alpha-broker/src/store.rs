@@ -9,7 +9,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::Error;
+use crate::{Error, oauth};
 
 /// `nonce(12) ‖ AES-256-GCM(key, plaintext, aad)`.
 pub fn seal(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
@@ -85,44 +85,51 @@ pub async fn take_pending(pool: &PgPool, state: &str) -> Result<Option<Pending>,
 }
 
 /// A member connecting the same account again keeps the connection's id, so a chat that
-/// already holds it keeps working; the token is re-sealed and the dead mark cleared.
+/// already holds it keeps working; the token is re-sealed, the email refreshed and the dead
+/// mark cleared.
 pub async fn save_connection(
     pool: &PgPool,
     key: &[u8; 32],
     member: &[u8; 32],
     provider: &str,
-    account: &str,
+    account: &oauth::Account,
     refresh_token: &str,
     scopes: &str,
 ) -> Result<Uuid, Error> {
     let mut tx = pool.begin().await?;
     sqlx::query("select pg_advisory_xact_lock(hashtext($1))")
-        .bind(format!("{}/{provider}/{account}", hex::encode(member)))
+        .bind(format!(
+            "{}/{provider}/{}",
+            hex::encode(member),
+            account.subject
+        ))
         .execute(&mut *tx)
         .await?;
     let existing: Option<Uuid> = sqlx::query_scalar(
         "select id from connections
-         where member_key_sha256 = $1 and provider = $2 and account = $3 and revoked_at is null
+         where member_key_sha256 = $1 and provider = $2 and subject = $3 and revoked_at is null
          for update",
     )
     .bind(member.as_slice())
     .bind(provider)
-    .bind(account)
+    .bind(&account.subject)
     .fetch_optional(&mut *tx)
     .await?;
     let (id, new) = existing.map_or((Uuid::now_v7(), true), |id| (id, false));
     let sealed = seal(key, id.as_bytes(), refresh_token.as_bytes())?;
     let statement = if new {
-        "insert into connections (id, member_key_sha256, provider, account, enc_refresh_token, scopes)
-         values ($1, $2, $3, $4, $5, $6)"
+        "insert into connections (id, member_key_sha256, provider, subject, account, enc_refresh_token, scopes)
+         values ($1, $2, $3, $4, $5, $6, $7)"
     } else {
-        "update connections set enc_refresh_token = $5, scopes = $6, dead_at = null where id = $1"
+        "update connections set account = $5, enc_refresh_token = $6, scopes = $7, dead_at = null
+         where id = $1"
     };
     sqlx::query(statement)
         .bind(id)
         .bind(member.as_slice())
         .bind(provider)
-        .bind(account)
+        .bind(&account.subject)
+        .bind(&account.email)
         .bind(sealed)
         .bind(scopes)
         .execute(&mut *tx)

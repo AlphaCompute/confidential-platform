@@ -436,3 +436,31 @@ async fn a_reconnect_that_waits_on_a_disconnect_makes_a_new_connection() {
     assert_ne!(id_of(&second), id);
     assert_eq!(h.stored_token(id).await, None);
 }
+
+#[tokio::test]
+async fn a_connection_follows_the_google_account_not_its_email() {
+    let Some(h) = harness().await else { return };
+    let h = &h;
+    let connect_as = |subject: &'static str, email: &'static str| async move {
+        let query = h.start(MEMBER).await;
+        let consent = h
+            .google
+            .consent_as(&query["code_challenge"], subject, email);
+        let reply = h.finish(MEMBER, &consent.code, &query["state"]).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        id_of(&reply)
+    };
+
+    let first = connect_as("account-1", "old@example.com").await;
+    let renamed = connect_as("account-1", "new@example.com").await;
+    assert_eq!(renamed, first);
+    let listed = h
+        .call("GET", &format!("/connections?member={MEMBER}"), None)
+        .await;
+    assert_eq!(listed.body["connections"][0]["account"], "new@example.com");
+    assert_eq!(listed.body["connections"].as_array().unwrap().len(), 1);
+
+    let reassigned = connect_as("account-2", "new@example.com").await;
+    assert_ne!(reassigned, first);
+    assert_eq!(count(h, "connections").await, 2);
+}

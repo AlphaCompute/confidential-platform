@@ -84,6 +84,7 @@ pub struct Consent {
     pub access_token: String,
     pub refresh_token: String,
     challenge: String,
+    subject: String,
     email: String,
     used: bool,
 }
@@ -177,9 +178,8 @@ async fn userinfo(State(fake): State<Shared>, headers: HeaderMap) -> Response {
         return fake.account_status.into_response();
     }
     match fake.consents.iter().find(|c| c.access_token == presented) {
-        Some(c) => {
-            Json(json!({ "sub": "1", "email": c.email, "email_verified": true })).into_response()
-        }
+        Some(c) => Json(json!({ "sub": c.subject, "email": c.email, "email_verified": true }))
+            .into_response(),
         None => StatusCode::UNAUTHORIZED.into_response(),
     }
 }
@@ -269,6 +269,11 @@ impl FakeGoogle {
 
     /// Stands in for the member consenting as `email` on the page the authorization URL opens.
     pub fn consent(&self, challenge: &str, email: &str) -> Consent {
+        self.consent_as(challenge, &format!("subject-of-{email}"), email)
+    }
+
+    /// The same, as the Google account `subject` whose address is currently `email`.
+    pub fn consent_as(&self, challenge: &str, subject: &str, email: &str) -> Consent {
         let mut fake = self.state.lock().unwrap();
         let n = fake.consents.len() + 1;
         let consent = Consent {
@@ -276,6 +281,7 @@ impl FakeGoogle {
             access_token: format!("ya29.fake-access-{n}"),
             refresh_token: format!("1//fake-refresh-{n}"),
             challenge: challenge.to_string(),
+            subject: subject.to_string(),
             email: email.to_string(),
             used: false,
         };
