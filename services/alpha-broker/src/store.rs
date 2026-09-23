@@ -180,17 +180,11 @@ pub async fn revoke_connection(
     .await?)
 }
 
-#[derive(sqlx::FromRow)]
-pub struct Live {
-    pub provider: String,
-    pub dead: bool,
-}
-
 pub async fn load_connection(
     pool: &PgPool,
     id: Uuid,
     member: &[u8; 32],
-) -> Result<Option<Live>, Error> {
+) -> Result<Option<(String, bool)>, Error> {
     Ok(sqlx::query_as(
         "select provider, dead_at is not null as dead from connections
          where id = $1 and member_key_sha256 = $2 and revoked_at is null",

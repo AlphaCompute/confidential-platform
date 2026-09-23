@@ -11,7 +11,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::Response;
-use reqwest::{Method, Url};
+use reqwest::Url;
 use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
@@ -21,25 +21,18 @@ use crate::connect::{parse_body, parse_member};
 use crate::oauth::{self, Provider, RefreshError};
 use crate::{AppState, AuthedInstance, Error, store};
 
-/// Every read the agent may make through a Google connection: `(method, host, path)`, where a
-/// `{id}` segment matches one identifier. Nothing here writes, uploads or reaches the Docs,
-/// Sheets or Slides APIs; those files are read through Drive's export.
-const GOOGLE_READS: &[(&str, &str, &str)] = &[
-    ("GET", "www.googleapis.com", "/drive/v3/drives"),
-    ("GET", "www.googleapis.com", "/drive/v3/files"),
-    ("GET", "www.googleapis.com", "/drive/v3/files/{id}"),
-    ("GET", "www.googleapis.com", "/drive/v3/files/{id}/export"),
-    ("GET", "www.googleapis.com", "/gmail/v1/users/me/messages"),
-    (
-        "GET",
-        "www.googleapis.com",
-        "/gmail/v1/users/me/messages/{id}",
-    ),
-    (
-        "GET",
-        "www.googleapis.com",
-        "/calendar/v3/calendars/primary/events",
-    ),
+/// Every read the agent may make through a Google connection, all `GET` on
+/// `https://www.googleapis.com`, where a `{id}` segment matches one identifier. Nothing here
+/// writes, uploads or reaches the Docs, Sheets or Slides APIs; those files are read through
+/// Drive's export.
+const GOOGLE_READS: &[&str] = &[
+    "/drive/v3/drives",
+    "/drive/v3/files",
+    "/drive/v3/files/{id}",
+    "/drive/v3/files/{id}/export",
+    "/gmail/v1/users/me/messages",
+    "/gmail/v1/users/me/messages/{id}",
+    "/calendar/v3/calendars/primary/events",
 ];
 
 // ponytail: the provider's whole body is buffered, so a Drive file larger than this cannot be
@@ -65,11 +58,10 @@ fn is_id(segment: &str) -> bool {
 /// Judged on the parsed URL, whose `.` and `..` segments are already resolved, so the path
 /// checked is the path sent.
 pub fn allowed(provider: &Provider, method: &str, url: &Url) -> bool {
-    let reads = match provider.name {
-        "google" => GOOGLE_READS,
-        _ => return false,
-    };
-    if url.scheme() != "https"
+    if provider.name != "google"
+        || method != "GET"
+        || url.scheme() != "https"
+        || url.host_str() != Some("www.googleapis.com")
         || url.port().is_some()
         || !url.username().is_empty()
         || url.password().is_some()
@@ -77,15 +69,13 @@ pub fn allowed(provider: &Provider, method: &str, url: &Url) -> bool {
     {
         return false;
     }
-    let (Some(host), Some(segments)) = (url.host_str(), url.path_segments()) else {
+    let Some(segments) = url.path_segments() else {
         return false;
     };
     let segments: Vec<&str> = segments.collect();
-    reads.iter().any(|(m, h, template)| {
+    GOOGLE_READS.iter().any(|template| {
         let template: Vec<&str> = template.split('/').skip(1).collect();
-        *m == method
-            && *h == host
-            && template.len() == segments.len()
+        template.len() == segments.len()
             && template
                 .iter()
                 .zip(&segments)
@@ -115,26 +105,23 @@ pub async fn proxy(
     let url = Url::parse(&request.url)
         .map_err(|_| Error::Malformed("url must be an absolute URL".into()))?;
 
-    let live = store::load_connection(&state.pool, id, &member)
+    let (provider, dead) = store::load_connection(&state.pool, id, &member)
         .await?
         .ok_or(Error::NotFound)?;
-    let provider = oauth::provider(&live.provider)
+    let provider = oauth::provider(&provider)
         .ok_or_else(|| Error::internal("a connection names an unknown provider"))?;
     if !allowed(provider, &request.method, &url) {
         return Err(Error::NotAllowed);
     }
-    if live.dead {
+    if dead {
         return Err(Error::ReconnectRequired);
     }
-    let method = Method::from_bytes(request.method.as_bytes())
-        .map_err(|_| Error::internal("an allowed method does not parse"))?;
-
     let mut retried = false;
     loop {
         let token = access_token(&state, id, provider).await?;
         let mut outgoing = state
             .http
-            .request(method.clone(), url.clone())
+            .get(url.clone())
             .bearer_auth(token.as_str())
             .timeout(SEND_TIMEOUT);
         if let Some(body) = &request.body {
