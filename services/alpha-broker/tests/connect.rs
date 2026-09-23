@@ -297,6 +297,51 @@ async fn disconnect_leaves_google_alone_while_another_member_holds_the_same_acco
 }
 
 #[tokio::test]
+async fn the_last_of_two_concurrent_disconnects_of_one_account_revokes_at_google() {
+    let Some(h) = harness().await else { return };
+    let (mine, my_consent) = h.connect(MEMBER, EMAIL).await;
+    let (theirs, _) = h.connect(OTHER_MEMBER, EMAIL).await;
+
+    let mut their_disconnect = h.pool.begin().await.unwrap();
+    sqlx::query(
+        "update connections set revoked_at = now(), enc_refresh_token = null where id = $1",
+    )
+    .bind(id_of(&theirs))
+    .execute(&mut *their_disconnect)
+    .await
+    .unwrap();
+    let path = format!("/connections/{}?member={MEMBER}", id_of(&mine));
+    let my_disconnect = h.call("DELETE", &path, None);
+    let commit_theirs_while_mine_waits = async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "select count(*) from pg_stat_activity
+                 where datname = current_database() and wait_event_type = 'Lock'",
+            )
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        their_disconnect.commit().await.unwrap();
+    };
+    let (reply, ()) = tokio::join!(my_disconnect, commit_theirs_while_mine_waits);
+
+    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    let revokes: Vec<String> = h.google.with(|f| {
+        f.requests
+            .iter()
+            .filter(|(p, _)| p == "/revoke")
+            .map(|(_, form)| form["token"].clone())
+            .collect()
+    });
+    assert_eq!(revokes, [my_consent.refresh_token]);
+}
+
+#[tokio::test]
 async fn disconnect_answers_204_even_when_google_refuses_the_revoke() {
     let Some(h) = harness().await else { return };
     let (reply, _) = h.connect(MEMBER, EMAIL).await;
