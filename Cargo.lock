@@ -60,6 +60,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "alpha-broker"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "alpha-client",
+ "axum",
+ "base64 0.23.1",
+ "getrandom 0.4.3",
+ "hex",
+ "hyper-util",
+ "parking_lot",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tower",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "alpha-cli"
 version = "0.1.0"
 dependencies = [

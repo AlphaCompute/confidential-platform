@@ -1,0 +1,172 @@
+//! Sealing under the connectors key, and every query on `pending_connects` and `connections`.
+//! Queries are checked at run time by the db tests; the broker's migrations live in their own
+//! database and never meet the KMS's.
+
+use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::{Aes256Gcm, Nonce};
+use serde::Serialize;
+use sqlx::PgPool;
+use uuid::Uuid;
+use zeroize::Zeroizing;
+
+use crate::Error;
+
+/// `nonce(12) ‖ AES-256-GCM(key, plaintext, aad)`.
+pub fn seal(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
+    let nonce = crate::random::<12>()?;
+    let ct = Aes256Gcm::new(key.into())
+        .encrypt(
+            &Nonce::from(nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|_| Error::internal("aead: encryption failed"))?;
+    Ok([nonce.as_slice(), &ct].concat())
+}
+
+pub fn open(key: &[u8; 32], aad: &[u8], blob: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+    let (nonce, ct) = blob.split_at_checked(12)?;
+    Aes256Gcm::new(key.into())
+        .decrypt(&Nonce::try_from(nonce).ok()?, Payload { msg: ct, aad })
+        .ok()
+        .map(Zeroizing::new)
+}
+
+pub async fn migrate(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
+    sqlx::migrate!("./migrations").run(pool).await
+}
+
+pub async fn purge_expired(pool: &PgPool) -> Result<(), Error> {
+    sqlx::query("delete from pending_connects where exp < now()")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn insert_pending(
+    pool: &PgPool,
+    state: &str,
+    member: &[u8; 32],
+    provider: &str,
+    enc_pkce_verifier: &[u8],
+) -> Result<(), Error> {
+    sqlx::query(
+        "insert into pending_connects (state, member_key_sha256, provider, enc_pkce_verifier, exp)
+         values ($1, $2, $3, $4, now() + interval '10 minutes')",
+    )
+    .bind(state)
+    .bind(member.as_slice())
+    .bind(provider)
+    .bind(enc_pkce_verifier)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub struct Pending {
+    pub member: Vec<u8>,
+    pub provider: String,
+    pub enc_pkce_verifier: Vec<u8>,
+    pub live: bool,
+}
+
+/// Consumes the state whatever it turns out to be, so a state is never used twice.
+pub async fn take_pending(pool: &PgPool, state: &str) -> Result<Option<Pending>, Error> {
+    let row: Option<(Vec<u8>, String, Vec<u8>, bool)> = sqlx::query_as(
+        "delete from pending_connects where state = $1
+         returning member_key_sha256, provider, enc_pkce_verifier, exp > now()",
+    )
+    .bind(state)
+    .fetch_optional(pool)
+    .await?;
+    Ok(
+        row.map(|(member, provider, enc_pkce_verifier, live)| Pending {
+            member,
+            provider,
+            enc_pkce_verifier,
+            live,
+        }),
+    )
+}
+
+/// A member connecting the same account again keeps the connection's id, so a chat that
+/// already holds it keeps working; the token is re-sealed and the dead mark cleared.
+pub async fn save_connection(
+    pool: &PgPool,
+    key: &[u8; 32],
+    member: &[u8; 32],
+    provider: &str,
+    account: &str,
+    refresh_token: &str,
+    scopes: &str,
+) -> Result<Uuid, Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("select pg_advisory_xact_lock(hashtext($1))")
+        .bind(format!("{}/{provider}/{account}", hex::encode(member)))
+        .execute(&mut *tx)
+        .await?;
+    let existing: Option<Uuid> = sqlx::query_scalar(
+        "select id from connections
+         where member_key_sha256 = $1 and provider = $2 and account = $3 and revoked_at is null",
+    )
+    .bind(member.as_slice())
+    .bind(provider)
+    .bind(account)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let id = match existing {
+        Some(id) => {
+            let sealed = seal(key, id.as_bytes(), refresh_token.as_bytes())?;
+            sqlx::query(
+                "update connections set enc_refresh_token = $2, scopes = $3, dead_at = null
+                 where id = $1",
+            )
+            .bind(id)
+            .bind(sealed)
+            .bind(scopes)
+            .execute(&mut *tx)
+            .await?;
+            id
+        }
+        None => {
+            let id = Uuid::now_v7();
+            let sealed = seal(key, id.as_bytes(), refresh_token.as_bytes())?;
+            sqlx::query(
+                "insert into connections (id, member_key_sha256, provider, account, enc_refresh_token, scopes)
+                 values ($1, $2, $3, $4, $5, $6)",
+            )
+            .bind(id)
+            .bind(member.as_slice())
+            .bind(provider)
+            .bind(account)
+            .bind(sealed)
+            .bind(scopes)
+            .execute(&mut *tx)
+            .await?;
+            id
+        }
+    };
+    tx.commit().await?;
+    Ok(id)
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct Connection {
+    pub id: Uuid,
+    pub provider: String,
+    pub account: String,
+    pub dead: bool,
+}
+
+pub async fn list_connections(pool: &PgPool, member: &[u8; 32]) -> Result<Vec<Connection>, Error> {
+    Ok(sqlx::query_as(
+        "select id, provider, account, dead_at is not null as dead from connections
+         where member_key_sha256 = $1 and revoked_at is null
+         order by created_at, id",
+    )
+    .bind(member.as_slice())
+    .fetch_all(pool)
+    .await?)
+}
