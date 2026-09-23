@@ -11,7 +11,7 @@ build.
 ## What a release produces
 
 A tag `v*` runs `.github/workflows/release.yml`: every image (`alpha-runtime`, `alpha-kms`,
-`alpha-kms-dev`) is built twice, the second time with `--no-cache`, and the job fails unless
+`alpha-kms-dev`, `alpha-inference`, `alpha-broker`) is built twice, the second time with `--no-cache`, and the job fails unless
 both builds give one image id and one layer set; the images are pushed as
 `ghcr.io/<owner>/<name>:<tag>`. For the two KMS images the workflow then renders the node's
 `app-compose.json` from the pushed digest (`cargo run -p alpha-cli --example kms_compose`,
@@ -129,6 +129,33 @@ the platform-document URL are served; the signed document lists the Revision.
 
 Both nodes now serve; a restart of either is a `join` from the other; losing both means
 `alpha unseal` with two of the three shares.
+
+## The broker's database
+
+`alpha-broker` keeps its connections in its own database on the same trust-zone Postgres, and no
+one opens a database connection to create it. The Postgres compose carries a one-shot service,
+`alpha-broker-init`, on the same pinned image: on every start of the CVM it waits for Postgres,
+creates the login role `alpha_broker` and the database `alpha_broker` owned by it when they are
+absent, and exits 0. Rerunning it changes nothing, so the password it set the first time stays
+the role's password. It grants nothing else; the role has no access to the KMS's tables.
+
+The Postgres CVM's encrypted env holds `ALPHA_BROKER_PASSWORD` (`openssl rand -hex 32`) beside
+`POSTGRES_PASSWORD`, and its `allowed_envs` lists both. An empty `ALPHA_BROKER_PASSWORD` makes
+the service exit 1 naming it; Postgres itself is unaffected.
+
+To add the broker to a running Postgres CVM, update that CVM through the Phala API: its
+`app-compose.json` with `docker_compose_file` set to this compose and `allowed_envs` set to
+`["POSTGRES_PASSWORD", "ALPHA_BROKER_PASSWORD"]`, then `deploy/phala.py update <pg cvm id>
+<app-compose.json>` with both variables in the environment. A commit that carries env rewrites
+the stored `allowed_envs`, so every name goes out, and `POSTGRES_PASSWORD` must be the value the
+volume was created with. The update restarts Postgres; the KMS nodes reconnect. `deploy/phala.py
+wait` does not apply to this CVM, because the init container exits by design.
+
+The broker's Secret `database-url` is
+`postgres://alpha_broker:<ALPHA_BROKER_PASSWORD>@<pg app id>-5432s.<gateway base>:443/alpha_broker?sslmode=require&sslnegotiation=direct`,
+put for the broker's App with
+`alpha call put-secret`. The broker applies its own migrations when it starts, and its `/ready`
+answers 200 only once it reaches that database.
 
 ## Upgrade
 

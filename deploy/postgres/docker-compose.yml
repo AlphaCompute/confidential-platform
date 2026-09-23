@@ -27,5 +27,37 @@ services:
         fi
         exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file="$$tls/server.crt" -c ssl_key_file="$$tls/server.key"
 
+  # The broker's role and database are created inside this CVM from its encrypted env, so no one
+  # opens a database connection to make them; rerunning on every start changes nothing.
+  alpha-broker-init:
+    image: postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+    restart: "no"
+    depends_on: [postgres]
+    environment:
+      PGHOST: postgres
+      PGUSER: postgres
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      BROKER_PASSWORD: ${ALPHA_BROKER_PASSWORD}
+    entrypoint:
+      - bash
+      - -c
+      - |
+        set -e
+        if [ -z "$$BROKER_PASSWORD" ]; then
+          echo "ALPHA_BROKER_PASSWORD is empty" >&2
+          exit 1
+        fi
+        for _ in $$(seq 60); do
+          pg_isready -q && break
+          sleep 2
+        done
+        psql -X -v ON_ERROR_STOP=1 -d postgres <<'SQL'
+        \getenv pw BROKER_PASSWORD
+        select format('create role alpha_broker login password %L', :'pw')
+          where not exists (select from pg_roles where rolname = 'alpha_broker') \gexec
+        select 'create database alpha_broker owner alpha_broker'
+          where not exists (select from pg_database where datname = 'alpha_broker') \gexec
+        SQL
+
 volumes:
   pgdata:
