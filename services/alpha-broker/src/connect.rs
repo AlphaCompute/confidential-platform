@@ -165,6 +165,7 @@ pub async fn disconnect(
     let (provider, sealed) = store::revoke_connection(&state.pool, id, &member)
         .await?
         .ok_or(Error::NotFound)?;
+    state.tokens.lock().remove(&id);
     let key = state.secrets.read().connectors_key.clone();
     let token = store::open(&key, id.as_bytes(), &sealed);
     let token = token.as_deref().and_then(|t| std::str::from_utf8(t).ok());

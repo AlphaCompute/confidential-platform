@@ -527,6 +527,7 @@ async fn start_broker(ca: &Ca, app: Router) -> SocketAddr {
 }
 
 pub struct Harness {
+    pub state: Arc<AppState>,
     pub pool: PgPool,
     pub google: FakeGoogle,
     pub app: Router,
@@ -554,11 +555,12 @@ pub async fn harness() -> Option<Harness> {
         http: google.client(),
         tokens: Default::default(),
     });
-    let app = router(state);
+    let app = router(state.clone());
     let ca = Ca::new();
     let broker = start_broker(&ca, app.clone()).await;
     let instance = instance_client(&ca, Some(ca.instance()));
     Some(Harness {
+        state,
         pool,
         app,
         google,

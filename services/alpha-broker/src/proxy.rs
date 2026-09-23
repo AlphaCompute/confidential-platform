@@ -45,7 +45,8 @@ const EXPIRY_MARGIN: Duration = Duration::from_secs(60);
 /// A 16 MiB export can take longer than the client's default timeout.
 const SEND_TIMEOUT: Duration = Duration::from_secs(100);
 
-/// Access tokens by connection id, kept only in this process.
+/// Access tokens by connection id, kept only in this process; expired ones are dropped whenever
+/// a new one is stored.
 pub type TokenCache = parking_lot::Mutex<HashMap<Uuid, (Zeroizing<String>, Instant)>>;
 
 fn is_id(segment: &str) -> bool {
@@ -226,11 +227,11 @@ async fn access_token(
     let until = Duration::from_secs(refreshed.expires_in)
         .checked_sub(EXPIRY_MARGIN)
         .and_then(|d| Instant::now().checked_add(d));
+    let mut cache = state.tokens.lock();
+    let now = Instant::now();
+    cache.retain(|_, (_, until)| *until > now);
     if let Some(until) = until {
-        state
-            .tokens
-            .lock()
-            .insert(id, (refreshed.access_token.clone(), until));
+        cache.insert(id, (refreshed.access_token.clone(), until));
     }
     Ok(refreshed.access_token)
 }

@@ -400,3 +400,29 @@ async fn drive_gmail_and_calendar_answer_with_the_callers_query_and_googles_cont
         assert_eq!(seen.query[key], value, "{path}");
     }
 }
+
+#[tokio::test]
+async fn a_disconnect_drops_the_cached_token_and_a_refresh_drops_expired_ones() {
+    let Some(h) = harness().await else { return };
+    let (id, _) = h.connected().await;
+    let idle = uuid::Uuid::now_v7();
+    h.state.tokens.lock().insert(
+        idle,
+        ("ya29.expired".to_string().into(), std::time::Instant::now()),
+    );
+    assert_eq!(h.proxy(&read(id, FILES)).await.status, StatusCode::OK);
+    assert_eq!(
+        h.state.tokens.lock().keys().copied().collect::<Vec<_>>(),
+        [id]
+    );
+
+    let gone = h
+        .call(
+            "DELETE",
+            &format!("/connections/{id}?member={MEMBER}"),
+            None,
+        )
+        .await;
+    assert_eq!(gone.status, StatusCode::NO_CONTENT);
+    assert!(h.state.tokens.lock().is_empty());
+}
