@@ -65,6 +65,10 @@ def sha256_hex(compose_bytes):
     return hashlib.sha256(compose_bytes).hexdigest()
 
 
+def canonical(compose):
+    return json.dumps(compose, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
 def check(phala_hash, compose_bytes):
     want = sha256_hex(compose_bytes)
     got = phala_hash.removeprefix("sha256:").removeprefix("0x")
@@ -84,8 +88,7 @@ def check_stored(cvm_id, compose_bytes, timeout_s=5 * 60, interval_s=10):
     deadline = time.monotonic() + timeout_s
     while True:
         stored = call("GET", f"/cvms/{cvm_id}/compose_file")
-        form = json.dumps(stored, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        got = hashlib.sha256(form.encode()).hexdigest()
+        got = sha256_hex(canonical(stored))
         if got == want:
             return
         if time.monotonic() >= deadline:
@@ -159,8 +162,12 @@ def main():
         return
 
     cvm_id = sys.argv[2]
-    prepared = call("POST", f"/cvms/{cvm_id}/compose_file/provision", compose)
-    check(prepared["compose_hash"], compose_bytes)
+    # Provision measures the stored allowed_envs whatever the body says; only the commit's
+    # env_keys change them, and check_stored below holds the result to the file.
+    stored = call("GET", f"/cvms/{cvm_id}/compose_file")
+    staged = dict(compose, allowed_envs=stored.get("allowed_envs"))
+    prepared = call("POST", f"/cvms/{cvm_id}/compose_file/provision", staged)
+    check(prepared["compose_hash"], canonical(staged))
     pubkey = call("GET", f"/cvms/{cvm_id}")["kms_info"]["encrypted_env_pubkey"]
     sealed = seal(values, pubkey)
     if prepared.get("compose_unchanged"):
