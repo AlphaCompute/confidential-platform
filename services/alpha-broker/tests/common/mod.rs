@@ -21,7 +21,7 @@ use alpha_broker::{AppState, Config, Secrets, oauth, router, tls};
 use alpha_client::tls::{Identity, Pin};
 use axum::body::{Body, to_bytes};
 use axum::extract::{Form, State};
-use axum::http::{HeaderMap, Method, Request, StatusCode, Uri, header};
+use axum::http::{HeaderMap, Request, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -270,12 +270,7 @@ async fn revoke(State(fake): State<Shared>, Form(form): Form<HashMap<String, Str
 }
 
 /// Drive, Gmail and Calendar reads, answered only to an access token the stand-in issued.
-async fn data(
-    State(fake): State<Shared>,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-) -> Response {
+async fn data(State(fake): State<Shared>, uri: Uri, headers: HeaderMap) -> Response {
     let mut fake = fake.lock().unwrap();
     let authorization = headers
         .get(header::AUTHORIZATION)
@@ -298,9 +293,6 @@ async fn data(
             Json(json!({ "error": { "code": 401, "message": "Invalid Credentials" } })),
         )
             .into_response();
-    }
-    if method != Method::GET {
-        return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
     let segments: Vec<&str> = uri.path().split('/').skip(1).collect();
     let json_body = |body: String| ([(header::CONTENT_TYPE, "application/json")], body);
