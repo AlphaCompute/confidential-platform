@@ -136,6 +136,14 @@ impl Fake {
         self.requests.iter().filter(|(p, _)| p == path).count()
     }
 
+    pub fn revoked_tokens(&self) -> Vec<String> {
+        self.requests
+            .iter()
+            .filter(|(p, _)| p == "/revoke")
+            .map(|(_, form)| form["token"].clone())
+            .collect()
+    }
+
     pub fn refreshes(&self) -> usize {
         self.requests
             .iter()

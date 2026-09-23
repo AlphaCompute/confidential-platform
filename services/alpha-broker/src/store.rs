@@ -185,7 +185,6 @@ pub async fn revoke_connection(
         "with prior as (
            select id, provider, subject, enc_refresh_token from connections
            where id = $1 and member_key_sha256 = $2 and revoked_at is null
-           for update
          )
          update connections c set revoked_at = now(), enc_refresh_token = null
          from prior where c.id = prior.id

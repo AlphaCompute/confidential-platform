@@ -246,14 +246,10 @@ async fn disconnect_revokes_locally_and_at_google() {
             .unwrap();
     assert!(revoked);
     assert_eq!(h.stored_token(id).await, None);
-    let revokes: Vec<String> = h.google.with(|f| {
-        f.requests
-            .iter()
-            .filter(|(p, _)| p == "/revoke")
-            .map(|(_, form)| form["token"].clone())
-            .collect()
-    });
-    assert_eq!(revokes, [consent.refresh_token]);
+    assert_eq!(
+        h.google.with(|f| f.revoked_tokens()),
+        [consent.refresh_token]
+    );
 
     let listed = h
         .call("GET", &format!("/connections?member={MEMBER}"), None)
@@ -286,14 +282,10 @@ async fn disconnect_leaves_google_alone_while_another_member_holds_the_same_acco
         )
         .await;
     assert_eq!(reply.status, StatusCode::NO_CONTENT);
-    let revokes: Vec<String> = h.google.with(|f| {
-        f.requests
-            .iter()
-            .filter(|(p, _)| p == "/revoke")
-            .map(|(_, form)| form["token"].clone())
-            .collect()
-    });
-    assert_eq!(revokes, [their_consent.refresh_token]);
+    assert_eq!(
+        h.google.with(|f| f.revoked_tokens()),
+        [their_consent.refresh_token]
+    );
 }
 
 #[tokio::test]
@@ -331,14 +323,10 @@ async fn the_last_of_two_concurrent_disconnects_of_one_account_revokes_at_google
     let (reply, ()) = tokio::join!(my_disconnect, commit_theirs_while_mine_waits);
 
     assert_eq!(reply.status, StatusCode::NO_CONTENT);
-    let revokes: Vec<String> = h.google.with(|f| {
-        f.requests
-            .iter()
-            .filter(|(p, _)| p == "/revoke")
-            .map(|(_, form)| form["token"].clone())
-            .collect()
-    });
-    assert_eq!(revokes, [my_consent.refresh_token]);
+    assert_eq!(
+        h.google.with(|f| f.revoked_tokens()),
+        [my_consent.refresh_token]
+    );
 }
 
 #[tokio::test]
