@@ -131,7 +131,7 @@ pub async fn proxy(
 
     let mut retried = false;
     loop {
-        let (token, cached) = access_token(&state, id, provider).await?;
+        let token = access_token(&state, id, provider).await?;
         let mut outgoing = state
             .http
             .request(method.clone(), url.clone())
@@ -141,7 +141,7 @@ pub async fn proxy(
             outgoing = outgoing.json(body);
         }
         let response = outgoing.send().await.map_err(|_| Error::Upstream)?;
-        if response.status() == StatusCode::UNAUTHORIZED && cached && !retried {
+        if response.status() == StatusCode::UNAUTHORIZED && !retried {
             let mut cache = state.tokens.lock();
             if cache.get(&id).is_some_and(|(t, _)| *t == token) {
                 cache.remove(&id);
@@ -182,14 +182,14 @@ fn cached(state: &AppState, id: Uuid) -> Option<Zeroizing<String>> {
         .map(|(token, _)| token.clone())
 }
 
-/// The cached access token, or a new one from the sealed refresh token; the flag says which.
+/// The cached access token, or a new one from the sealed refresh token.
 async fn access_token(
     state: &AppState,
     id: Uuid,
     provider: &Provider,
-) -> Result<(Zeroizing<String>, bool), Error> {
+) -> Result<Zeroizing<String>, Error> {
     if let Some(token) = cached(state, id) {
-        return Ok((token, true));
+        return Ok(token);
     }
     let mut tx = state.pool.begin().await?;
     let (sealed, dead) = store::lock_token(&mut tx, id)
@@ -199,7 +199,7 @@ async fn access_token(
         return Err(Error::ReconnectRequired);
     }
     if let Some(token) = cached(state, id) {
-        return Ok((token, true));
+        return Ok(token);
     }
     let (key, client_secret) = {
         let secrets = state.secrets.read();
@@ -248,7 +248,7 @@ async fn access_token(
             .lock()
             .insert(id, (refreshed.access_token.clone(), until));
     }
-    Ok((refreshed.access_token, false))
+    Ok(refreshed.access_token)
 }
 
 #[cfg(test)]
