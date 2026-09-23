@@ -373,7 +373,17 @@ impl Harness {
         app_id: AppId,
         signer: &(KeyId, SigningKey),
     ) -> alpha_core::ComposeHash {
-        let compose = text(KEYED, "app-compose.json");
+        self.insert_revision(app_id, text(KEYED, "app-compose.json"), signer)
+            .await
+    }
+
+    /// `compose` as a Revision of `app_id`, signed by `signer`, straight into the table.
+    pub async fn insert_revision(
+        &self,
+        app_id: AppId,
+        compose: String,
+        signer: &(KeyId, SigningKey),
+    ) -> alpha_core::ComposeHash {
         let hash = alpha_core::compose_hash(&compose);
         let document = json!({ "app_id": app_id, "compose": compose });
         let sig = self.signed(context::REVISION, document, signer)["signature"].clone();
@@ -414,6 +424,17 @@ impl Harness {
         assert_eq!(status, StatusCode::OK, "{reply}");
         let leaf = reply["certificate_chain"][0].as_str().unwrap();
         client_with(&format!("{}{leaf}", text(KEYED, "runtime.key.pem")))
+    }
+
+    /// The key the KMS derives for `app` of this organization, from the node's intermediates
+    /// and the organization's root key.
+    pub fn app_key(&self, app: AppId, purpose: &str) -> [u8; 32] {
+        let intermediates = self.node.intermediates().unwrap();
+        let anchor = self.root.1.verifying_key().to_public_key_der().unwrap();
+        let org_key =
+            alpha_kms::keys::org_key(&intermediates.tenant_kek_root, self.org, anchor.as_bytes())
+                .unwrap();
+        *alpha_kms::keys::app_key(&org_key, app, purpose).unwrap()
     }
 
     pub async fn audit(&self, action: &str) -> Vec<(i64, String, Value)> {

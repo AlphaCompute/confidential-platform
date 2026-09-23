@@ -1,4 +1,4 @@
-//! The three routes on the unix socket: HTTP/1.1, JSON, no authentication — access is the
+//! The four routes on the unix socket: HTTP/1.1, JSON, no authentication — access is the
 //! right to the socket. KMS errors pass through in their own envelope with their status.
 
 use std::sync::Arc;
@@ -19,6 +19,7 @@ pub fn router(runtime: Arc<Runtime>) -> Router {
     Router::new()
         .route("/v1/identity", get(identity))
         .route("/v1/secrets/{name}", get(secret))
+        .route("/v1/keys/{purpose}", get(key))
         .route("/healthz", get(healthz))
         .fallback(|| async { envelope(StatusCode::NOT_FOUND, "not_found", "no such route") })
         .with_state(runtime)
@@ -80,6 +81,13 @@ async fn secret(
     Path(name): Path<String>,
 ) -> Result<Json<Value>, Error> {
     runtime.secret(&name).await.map(|s| Json(json!(s)))
+}
+
+async fn key(
+    State(runtime): State<Arc<Runtime>>,
+    Path(purpose): Path<String>,
+) -> Result<Json<Value>, Error> {
+    runtime.key(&purpose).await.map(|k| Json(json!(k)))
 }
 
 pub fn healthz_json(runtime: &Runtime) -> Value {

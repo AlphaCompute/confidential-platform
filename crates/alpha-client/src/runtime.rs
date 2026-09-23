@@ -1,6 +1,7 @@
-//! Client for the three routes `alpha-runtime` serves on `/run/alpha/runtime.sock`: the
-//! Instance's identity, a named Secret's bytes, and a liveness probe. No route needs a header —
-//! access is the right to open the socket, over plain HTTP/1.1.
+//! Client for the four routes `alpha-runtime` serves on `/run/alpha/runtime.sock`: the
+//! Instance's identity, a named Secret's bytes, the App's derived key for a purpose, and a
+//! liveness probe. No route needs a header — access is the right to open the socket, over plain
+//! HTTP/1.1.
 
 use std::path::PathBuf;
 
@@ -105,6 +106,28 @@ impl RuntimeSocket {
         let secret: crate::Secret =
             serde_json::from_slice(&body).map_err(|e| Error::Invalid(format!("secret: {e}")))?;
         decode("value", &secret.value).map(Zeroizing::new)
+    }
+
+    /// The App's 32-byte key for `purpose`, the same for every Revision of the App. `purpose`
+    /// becomes a path segment, so it is checked before any request is made.
+    pub async fn key(&self, purpose: &str) -> Result<Zeroizing<[u8; 32]>, Error> {
+        if !alpha_core::is_key_purpose(purpose) {
+            return Err(Error::Invalid(format!(
+                "key purpose {purpose:?} is invalid"
+            )));
+        }
+        let (status, body) = self.get(&format!("/v1/keys/{purpose}")).await?;
+        if !status.is_success() {
+            return Err(crate::api_error("runtime", status, &body));
+        }
+        let key: crate::DerivedKey =
+            serde_json::from_slice(&body).map_err(|e| Error::Invalid(format!("key: {e}")))?;
+        let bytes = Zeroizing::new(decode("key", &key.key)?);
+        bytes
+            .as_slice()
+            .try_into()
+            .map(Zeroizing::new)
+            .map_err(|_| Error::Invalid("key is not 32 bytes".into()))
     }
 
     pub async fn healthz(&self) -> Result<RuntimeHealth, Error> {
@@ -236,6 +259,37 @@ mod tests {
             Err(Error::Invalid(_)) => {}
             other => panic!("expected Error::Invalid, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn a_malformed_key_purpose_is_refused_before_any_request() {
+        let client = RuntimeSocket::at(socket_path());
+        for purpose in ["../x", "", "A"] {
+            match client.key(purpose).await {
+                Err(Error::Invalid(_)) => {}
+                other => panic!("{purpose:?}: expected Error::Invalid, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_key_of_any_length_but_32_bytes_is_refused() {
+        let path = canned(
+            200,
+            r#"{"key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+        );
+        match RuntimeSocket::at(path).key("connectors").await {
+            Err(Error::Invalid(_)) => {}
+            other => panic!("expected Error::Invalid, got {other:?}"),
+        }
+        let path = canned(
+            200,
+            r#"{"key":"BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU"}"#,
+        );
+        assert_eq!(
+            *RuntimeSocket::at(path).key("connectors").await.unwrap(),
+            [5u8; 32]
+        );
     }
 
     #[tokio::test]

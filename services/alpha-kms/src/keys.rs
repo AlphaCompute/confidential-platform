@@ -1,9 +1,9 @@
-//! `org_key` and `anchor_check`, the two AES-256-GCM shapes, Ed25519 signature
+//! `org_key`, `anchor_check` and `app_key`, the two AES-256-GCM shapes, Ed25519 signature
 //! objects, and the chain walk from a key to its organization's anchor.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
-use alpha_core::{OrgId, signing_digest};
+use alpha_core::{AppId, OrgId, signing_digest};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
@@ -53,6 +53,18 @@ pub fn anchor_check(
         org,
         anchor_spki,
     )
+}
+
+/// A key only Instances of `app` receive. The Revision is not an input, so a new Revision of
+/// the App opens what an earlier one sealed; the purpose goes last in `info` because the App
+/// id before it has a fixed length.
+pub fn app_key(org_key: &[u8; 32], app: AppId, purpose: &str) -> Result<Key32, ApiError> {
+    let info = [app.as_bytes().as_slice(), purpose.as_bytes()].concat();
+    let mut out = Zeroizing::new([0u8; 32]);
+    Hkdf::<Sha256>::new(Some(b"alphacompute-kms/app-key/v1"), org_key)
+        .expand(&info, out.as_mut())
+        .map_err(|e| ApiError::internal(format!("hkdf: {e}")))?;
+    Ok(out)
 }
 
 /// `nonce(12) ‖ AES-256-GCM(key, plaintext, aad)`.
@@ -302,6 +314,25 @@ mod tests {
         assert_ne!(*a, *org_key(&root, OrgId::mint(), b"anchor").unwrap());
         assert_ne!(*a, *org_key(&root, org, b"other").unwrap());
         assert_eq!(*a, *org_key(&root, org, b"anchor").unwrap());
+    }
+
+    #[test]
+    fn app_key_matches_an_independent_rfc5869_computation() {
+        let app = AppId::from(Uuid::parse_str("01920000-0000-7000-8000-000000000001").unwrap());
+        assert_eq!(
+            hex::encode(*app_key(&[7; 32], app, "connectors").unwrap()),
+            "503b90f56c674229db2bf6427a36675c6f25271025d31d67768c65f71b14690d"
+        );
+    }
+
+    #[test]
+    fn app_key_changes_with_the_app_the_purpose_and_the_org_key() {
+        let (org_key, app) = ([7u8; 32], AppId::mint());
+        let a = app_key(&org_key, app, "connectors").unwrap();
+        assert_eq!(*a, *app_key(&org_key, app, "connectors").unwrap());
+        assert_ne!(*a, *app_key(&org_key, AppId::mint(), "connectors").unwrap());
+        assert_ne!(*a, *app_key(&org_key, app, "connector").unwrap());
+        assert_ne!(*a, *app_key(&[8; 32], app, "connectors").unwrap());
     }
 
     #[test]
