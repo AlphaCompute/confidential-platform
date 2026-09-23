@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alpha_attest::{AttestationResult, Evidence, RESULT_FORMAT, Revision, Verdict, appraise};
 use alpha_client::DerivedKey;
+use alpha_client::tls::PeerCerts;
 use alpha_core::{ComposeHash, context};
 use axum::Json;
 use axum::body::Bytes;
@@ -26,7 +27,6 @@ use crate::body::Body;
 use crate::control::SecretPayload;
 use crate::error::ApiError;
 use crate::keys::{self, SignatureObject};
-use crate::tls::PeerCerts;
 use crate::{CollateralSource, Node, certs, rfc3339};
 
 pub const NONCE_MAX_AGE: Duration = Duration::from_secs(300);

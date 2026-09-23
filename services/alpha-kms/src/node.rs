@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use alpha_attest::{Evidence, appraise, report_data};
+use alpha_client::tls::PeerCerts;
 use alpha_client::{Client, Identity, JoinRequest, Pin, UnsealRequest};
 use alpha_core::{context, signing_digest};
 use alpha_crypto::{INFO_NODE_BOOTSTRAP, INFO_UNSEAL_SHARE, Sealed};
@@ -23,7 +24,6 @@ use crate::body::Body;
 use crate::error::ApiError;
 use crate::instance::{check_nonce, collateral, decode32};
 use crate::keys::{self, aead_open, aead_seal};
-use crate::tls::PeerCerts;
 use crate::{Intermediates, Node, Phase, certs, random};
 
 fn runtime_spki_sha256(node: &Node) -> [u8; 32] {

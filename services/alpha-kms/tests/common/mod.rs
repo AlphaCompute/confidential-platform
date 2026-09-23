@@ -244,7 +244,7 @@ pub async fn start_node(
     let app = alpha_kms::router(node.clone());
     let cert = node.server_cert.clone();
     tokio::spawn(async move {
-        tls::serve(listener, cert, app, async {
+        alpha_client::tls::serve(listener, tls::server_config(cert).unwrap(), app, async {
             let _ = rx.await;
         })
         .await

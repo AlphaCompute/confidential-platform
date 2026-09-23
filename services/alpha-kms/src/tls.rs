@@ -7,7 +7,6 @@ use parking_lot::RwLock;
 use std::time::SystemTime;
 
 use alpha_client::tls::provider;
-use axum::Router;
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, UnixTime};
@@ -15,12 +14,9 @@ use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::{DigitallySignedStruct, DistinguishedName, ServerConfig, SignatureScheme};
-use tokio::net::TcpListener;
 
 use crate::certs;
 use crate::error::ApiError;
-
-pub use alpha_client::tls::PeerCerts;
 
 fn certified(pkcs8: &[u8], chain: Vec<Vec<u8>>) -> Result<Arc<CertifiedKey>, ApiError> {
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8.to_vec()));
@@ -122,15 +118,4 @@ pub fn server_config(server_cert: Arc<ServerCert>) -> Result<Arc<ServerConfig>, 
         .with_cert_resolver(server_cert);
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Arc::new(config))
-}
-
-/// Accepts until `shutdown` resolves, then drains the open connections.
-pub async fn serve(
-    listener: TcpListener,
-    server_cert: Arc<ServerCert>,
-    app: Router,
-    shutdown: impl Future<Output = ()>,
-) -> Result<(), ApiError> {
-    alpha_client::tls::serve(listener, server_config(server_cert)?, app, shutdown).await;
-    Ok(())
 }
