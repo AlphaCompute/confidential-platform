@@ -162,6 +162,8 @@ def main():
         return
 
     cvm_id = sys.argv[2]
+    if canonical(compose) != compose_bytes:
+        sys.exit(f"{path} is not in the canonical form Phala measures; nothing was committed")
     # Provision measures the stored allowed_envs whatever the body says; only the commit's
     # env_keys change them, and check_stored below holds the result to the file.
     stored = call("GET", f"/cvms/{cvm_id}/compose_file")
