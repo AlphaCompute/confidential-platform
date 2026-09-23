@@ -11,7 +11,7 @@ use std::time::Duration;
 use alpha_client::runtime::RuntimeSocket;
 use alpha_client::tls::{InstanceCert, server_config};
 use alpha_inference::{AppState, Config, Error, Secrets, Upstream, router};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
@@ -20,6 +20,7 @@ use tokio_rustls::TlsAcceptor;
 use zeroize::Zeroizing;
 
 const PORT: u16 = 8443;
+const HANDSHAKE: Duration = Duration::from_secs(10);
 /// Every five minutes: a renewed leaf is served and rotated Secrets take effect, without a
 /// restart.
 const RENEW_INTERVAL: Duration = Duration::from_secs(300);
@@ -138,7 +139,11 @@ async fn serve_tls(
         let (stream, _) = tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok(accepted) => accepted,
-                Err(_) => continue,
+                // Out of descriptors, accept fails at once until one frees up.
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
             },
             () = &mut shutdown => break,
         };
@@ -146,11 +151,13 @@ async fn serve_tls(
         let app = app.clone();
         let watcher = graceful.watcher();
         tokio::spawn(async move {
-            let Ok(tls) = acceptor.accept(stream).await else {
+            let Ok(Ok(tls)) = tokio::time::timeout(HANDSHAKE, acceptor.accept(stream)).await else {
                 return;
             };
             let service = TowerToHyperService::new(app);
-            let builder = Builder::new(TokioExecutor::new());
+            let mut builder = Builder::new(TokioExecutor::new());
+            // hyper's header-read timeout only runs once it has a timer.
+            builder.http1().timer(TokioTimer::new());
             let conn = builder.serve_connection(TokioIo::new(tls), service);
             let _ = watcher.watch(conn).await;
         });

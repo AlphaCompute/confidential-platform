@@ -5,10 +5,11 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use alpha_client::tls::provider;
 use axum::Router;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
@@ -19,6 +20,8 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use crate::Error;
+
+const HANDSHAKE: Duration = Duration::from_secs(10);
 
 /// The leaf the peer presented, if any; the handshake already chained it to the KMS CA.
 #[derive(Clone)]
@@ -59,7 +62,11 @@ pub async fn serve(
         let (stream, _) = tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok(accepted) => accepted,
-                Err(_) => continue,
+                // Out of descriptors, accept fails at once until one frees up.
+                Err(_) => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
             },
             () = &mut shutdown => break,
         };
@@ -67,7 +74,7 @@ pub async fn serve(
         let app = app.clone();
         let watcher = graceful.watcher();
         tokio::spawn(async move {
-            let Ok(tls) = acceptor.accept(stream).await else {
+            let Ok(Ok(tls)) = tokio::time::timeout(HANDSHAKE, acceptor.accept(stream)).await else {
                 return;
             };
             let peer = PeerLeaf(
@@ -77,7 +84,9 @@ pub async fn serve(
                     .and_then(|chain| chain.first().cloned()),
             );
             let service = TowerToHyperService::new(app.layer(axum::Extension(peer)));
-            let builder = Builder::new(TokioExecutor::new());
+            let mut builder = Builder::new(TokioExecutor::new());
+            // hyper's header-read timeout only runs once it has a timer.
+            builder.http1().timer(TokioTimer::new());
             let conn = builder.serve_connection(TokioIo::new(tls), service);
             let _ = watcher.watch(conn).await;
         });
