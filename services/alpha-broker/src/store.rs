@@ -197,12 +197,9 @@ pub async fn load_connection(
 
 /// Locks a live connection's row until `tx` ends, so one refresh at a time uses its token: a
 /// provider that rotates refresh tokens refuses the old one once the new one is issued.
-pub async fn lock_token(
-    tx: &mut sqlx::PgConnection,
-    id: Uuid,
-) -> Result<Option<(Vec<u8>, bool)>, Error> {
-    Ok(sqlx::query_as(
-        "select enc_refresh_token, dead_at is not null from connections
+pub async fn lock_token(tx: &mut sqlx::PgConnection, id: Uuid) -> Result<Option<Vec<u8>>, Error> {
+    Ok(sqlx::query_scalar(
+        "select enc_refresh_token from connections
          where id = $1 and revoked_at is null
          for update",
     )

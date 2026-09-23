@@ -179,12 +179,9 @@ async fn access_token(
         return Ok(token);
     }
     let mut tx = state.pool.begin().await?;
-    let (sealed, dead) = store::lock_token(&mut tx, id)
+    let sealed = store::lock_token(&mut tx, id)
         .await?
         .ok_or(Error::NotFound)?;
-    if dead {
-        return Err(Error::ReconnectRequired);
-    }
     if let Some(token) = cached(state, id) {
         return Ok(token);
     }
