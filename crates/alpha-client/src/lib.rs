@@ -171,7 +171,7 @@ pub struct Secret {
 /// `POST /v1/keys/derive`: 32 bytes, base64url.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct DerivedKey {
-    pub key: String,
+    pub key: zeroize::Zeroizing<String>,
 }
 
 impl std::fmt::Debug for DerivedKey {
