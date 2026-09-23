@@ -1,6 +1,8 @@
 # alpha-kms
 
-The key broker of the trust plane: six tables, twelve `/v1` routes on one TLS port (`:8443`, TLS 1.3, `X25519MLKEM768`), plus `GET /healthz` (process only) and `GET /ready` (database checked, `{"sealed": …}`).
+The key broker of the trust plane: six tables, thirteen `/v1` routes on one TLS port (`:8443`, TLS 1.3, `X25519MLKEM768`), plus `GET /healthz` (process only) and `GET /ready` (database checked, `{"sealed": …}`).
+
+The Instance API is `POST /v1/attest/nonce`, `POST /v1/attest`, and two routes that need the Instance's leaf as a client certificate: `GET /v1/secrets/{name}` and `POST /v1/keys/derive`. The last answers `{"key"}`, 32 bytes derived from the organization's `org_key` and the leaf's App id for the requested `purpose`, the same for every Revision of the App; it is how an App holds a key no person ever sees, and nothing but an attested Instance reaches it.
 
 ## Configuration (environment only)
 
@@ -20,7 +22,7 @@ The image is `images/kms/Dockerfile` (`alpha-kms`, or `alpha-kms-dev` with `--bu
 
 ## Tests
 
-`cargo test -p alpha-kms` runs the unit tests always and `tests/db.rs` when `DATABASE_URL` points at a Postgres the tests may `create database` in (each test makes its own). The db tests attest with real Phala quotes from `testdata/attest/*-keyed`, pinned to the capture's time, nonce key and collateral, and cover the server side of every route: bootstrap once, unseal with one and two shares, join only for an attested, listed, requesting node; the Control API's checks and idempotency; attestation, release, revocation on the next call, re-verification of a tampered row, the anchor and chain rules, `cert_invalid` for a self-signed client certificate; the monotone platform document; and the append-only audit role.
+`cargo test -p alpha-kms` runs the unit tests always and `tests/db.rs` when `DATABASE_URL` points at a Postgres the tests may `create database` in (each test makes its own). The db tests attest with real Phala quotes from `testdata/attest/*-keyed`, pinned to the capture's time, nonce key and collateral, and cover the server side of every route: bootstrap once, unseal with one and two shares, join only for an attested, listed, requesting node; the Control API's checks and idempotency; attestation, release, revocation on the next call, the derived key's stability across Revisions and separation across Apps with an audit row for every refusal, re-verification of a tampered row, the anchor and chain rules, `cert_invalid` for a self-signed client certificate; the monotone platform document; and the append-only audit role.
 
 `tests/cli.rs` drives `alpha-cli`'s library functions against the same in-process node (`crates/alpha-cli/README.md`).
 
