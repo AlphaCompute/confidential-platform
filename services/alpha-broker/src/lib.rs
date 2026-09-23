@@ -96,17 +96,6 @@ impl Error {
     pub fn internal(message: impl Into<String>) -> Self {
         Error::Internal(message.into())
     }
-
-    fn parts(&self) -> (StatusCode, &'static str) {
-        match self {
-            Error::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
-            Error::Malformed(_) => (StatusCode::BAD_REQUEST, "malformed"),
-            Error::NotFound => (StatusCode::NOT_FOUND, "not_found"),
-            Error::StateInvalid => (StatusCode::BAD_REQUEST, "state_invalid"),
-            Error::ExchangeFailed => (StatusCode::BAD_GATEWAY, "exchange_failed"),
-            Error::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
-        }
-    }
 }
 
 impl From<sqlx::Error> for Error {
@@ -117,7 +106,14 @@ impl From<sqlx::Error> for Error {
 
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        let (status, code) = self.parts();
+        let (status, code) = match &self {
+            Error::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
+            Error::Malformed(_) => (StatusCode::BAD_REQUEST, "malformed"),
+            Error::NotFound => (StatusCode::NOT_FOUND, "not_found"),
+            Error::StateInvalid => (StatusCode::BAD_REQUEST, "state_invalid"),
+            Error::ExchangeFailed => (StatusCode::BAD_GATEWAY, "exchange_failed"),
+            Error::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+        };
         let message = match &self {
             Error::Internal(detail) => {
                 eprintln!("alpha-broker: internal: {detail}");
