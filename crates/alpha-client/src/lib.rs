@@ -168,6 +168,20 @@ pub struct Secret {
     pub issued_at: String,
 }
 
+/// `POST /v1/keys/derive`: 32 bytes, base64url.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct DerivedKey {
+    pub key: String,
+}
+
+impl std::fmt::Debug for DerivedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DerivedKey")
+            .field("key", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RevisionRegistered {
     pub compose_hash: ComposeHash,
@@ -428,6 +442,11 @@ impl Client {
 
     pub async fn get_secret(&self, name: &str) -> Result<Secret, Error> {
         self.request(Method::GET, &format!("/v1/secrets/{name}"), None)
+            .await
+    }
+
+    pub async fn derive_key(&self, purpose: &str) -> Result<DerivedKey, Error> {
+        self.post("/v1/keys/derive", &json!({ "purpose": purpose }))
             .await
     }
 

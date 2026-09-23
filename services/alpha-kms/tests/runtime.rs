@@ -503,6 +503,33 @@ async fn a_tenant_serves_its_endpoint_with_the_runtime_identity() {
     socket.stop().await;
 }
 
+/// The App's key comes from the KMS through the socket, one derivation per purpose while the
+/// leaf lasts, and it is the key the KMS derives from the organization's anchor and the App.
+#[tokio::test]
+async fn a_tenant_receives_its_app_key_through_the_runtime() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    let (app, _, _) = app_with_secret(&h, b"v1").await;
+    let (runtime, _) = start_runtime(&h, config(&h, vec![h.url.clone()]));
+    runtime.attest().await.unwrap();
+    let socket = Socket::start(runtime.clone());
+
+    let client = RuntimeSocket::at(&socket.path);
+    let first = client.key("connectors").await.unwrap();
+    let second = client.key("connectors").await.unwrap();
+    assert_eq!(*first, *second);
+    assert_eq!(*first, h.app_key(app, "connectors"));
+    let other = client.key("other").await.unwrap();
+    assert_ne!(*other, *first);
+    assert_eq!(*other, h.app_key(app, "other"));
+    let derived = h.audit("key.derive").await;
+    assert_eq!(derived.len(), 2, "the second read is served from the cache");
+    assert!(derived.iter().all(|(_, outcome, _)| outcome == "ok"));
+
+    socket.stop().await;
+}
+
 #[tokio::test]
 async fn runtime_refuses_another_ca_or_an_unlisted_revision_and_tries_the_next_endpoint() {
     let Some(h) = nonce_clock_harness().await else {

@@ -1,4 +1,5 @@
-//! The Instance API: the stateless nonce, attestation into a one-hour leaf, and secrets over mTLS.
+//! The Instance API: the stateless nonce, attestation into a one-hour leaf, and secrets and derived
+//! keys over mTLS.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -383,6 +384,80 @@ async fn get_secret_inner(
         "content_sha256": content_sha256,
         "issued_at": rfc3339(document.issued_at),
     }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeriveRequest {
+    pub purpose: String,
+}
+
+pub async fn derive_key(
+    State(node): State<Arc<Node>>,
+    Extension(peer): Extension<PeerCerts>,
+    Body(request): Body<DeriveRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let keys = node.intermediates()?;
+    let identity = certs::ca_verifier(&keys.ca_cert_der).and_then(|verifier| {
+        let sans = certs::verify_to_ca(verifier.as_ref(), &peer.0, node.now())?;
+        certs::parse_instance_sans(&sans)
+    });
+    let purpose = request.purpose;
+    let (actor, org_id, result) = match identity {
+        Ok(identity) => (
+            identity.runtime_pubkey_sha256_hex.clone(),
+            Some(Uuid::from(identity.org_id)),
+            derive_key_inner(&node, &keys.tenant_kek_root, &identity, &purpose).await,
+        ),
+        Err(e) => ("unauthenticated".to_owned(), None, Err(e)),
+    };
+    let (outcome, details) = match &result {
+        Ok(_) => ("ok", json!({})),
+        Err(e) => (e.outcome(), e.details()),
+    };
+    Audit {
+        actor_kind: "instance",
+        actor: &actor,
+        action: "key.derive",
+        org_id,
+        // A refused purpose is unbounded text from the peer; the error names the rule instead.
+        object: alpha_core::is_key_purpose(&purpose).then(|| format!("key:{purpose}")),
+        outcome,
+        details,
+        evidence_sha256: None,
+    }
+    .insert(&node.pool)
+    .await?;
+    result.map(Json)
+}
+
+async fn derive_key_inner(
+    node: &Node,
+    tenant_kek_root: &[u8; 32],
+    identity: &certs::InstanceIdentity,
+    purpose: &str,
+) -> Result<Value, ApiError> {
+    if !alpha_core::is_key_purpose(purpose) {
+        return Err(ApiError::malformed(
+            "purpose: 1 to 64 of a-z, 0-9, '.', '_', '-', starting with a letter or digit",
+        ));
+    }
+    let revision = load_revision(&node.pool, identity.compose_hash)
+        .await?
+        .filter(|r| {
+            r.org_id == Uuid::from(identity.org_id) && r.app_id == Uuid::from(identity.app_id)
+        })
+        .ok_or_else(|| ApiError::not_found("no such revision"))?;
+    let chain = verify_revision(
+        &node.pool,
+        tenant_kek_root,
+        identity.compose_hash,
+        &revision,
+    )
+    .await?;
+    let org_key = keys::org_key(tenant_kek_root, identity.org_id, &chain.anchor_spki)?;
+    let key = keys::app_key(&org_key, identity.app_id, purpose)?;
+    Ok(json!({ "key": BASE64_URL_SAFE_NO_PAD.encode(key.as_slice()) }))
 }
 
 #[cfg(test)]

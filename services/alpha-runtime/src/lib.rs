@@ -1,6 +1,6 @@
 //! The in-CVM sidecar: one P-256 key for the life of the Instance, attested to the KMS into a
 //! one-hour leaf renewed ten minutes before it expires, handed to the tenant's containers over
-//! a unix socket with three routes. Trust comes from the measured compose (the KMS CA's SPKI
+//! a unix socket with four routes. Trust comes from the measured compose (the KMS CA's SPKI
 //! hash and the allowed KMS Revisions); the KMS endpoints are only where to look.
 
 #![cfg_attr(
@@ -22,7 +22,9 @@ use std::time::{Duration, SystemTime};
 
 use alpha_attest::{AttestationResult, EVIDENCE_FORMAT, Evidence};
 use alpha_client::tls::{self, InstanceSans};
-use alpha_client::{AttestReply, AttestRequest, Client, Identity, Pin, Secret, TimeProvider};
+use alpha_client::{
+    AttestReply, AttestRequest, Client, DerivedKey, Identity, Pin, Secret, TimeProvider,
+};
 use alpha_core::ComposeHash;
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
@@ -185,6 +187,7 @@ pub struct Attested {
     pub result: AttestationResult,
     client: Client,
     secrets: Mutex<HashMap<String, Secret>>,
+    keys: Mutex<HashMap<String, DerivedKey>>,
 }
 
 pub struct Runtime {
@@ -332,6 +335,7 @@ impl Runtime {
             result: reply.attestation_result,
             client,
             secrets: Mutex::new(HashMap::new()),
+            keys: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -351,6 +355,22 @@ impl Runtime {
             .lock()
             .insert(name.to_owned(), secret.clone());
         Ok(secret)
+    }
+
+    /// The App's key for `purpose`, derived by the KMS over mTLS with the current leaf, cached
+    /// with it.
+    pub async fn key(&self, purpose: &str) -> Result<DerivedKey, Error> {
+        let attested = self.attested().ok_or(Error::NotAttested)?;
+        if let Some(key) = attested.keys.lock().get(purpose) {
+            return Ok(key.clone());
+        }
+        let key = attested
+            .client
+            .derive_key(purpose)
+            .await
+            .map_err(|e| self.note(e.into()))?;
+        attested.keys.lock().insert(purpose.to_owned(), key.clone());
+        Ok(key)
     }
 
     async fn renew_forever(&self) {

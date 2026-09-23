@@ -1,9 +1,9 @@
-//! `org_key` and `anchor_check`, the two AES-256-GCM shapes, Ed25519 signature
+//! `org_key`, `anchor_check` and `app_key`, the two AES-256-GCM shapes, Ed25519 signature
 //! objects, and the chain walk from a key to its organization's anchor.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
-use alpha_core::{OrgId, signing_digest};
+use alpha_core::{AppId, OrgId, signing_digest};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
@@ -53,6 +53,18 @@ pub fn anchor_check(
         org,
         anchor_spki,
     )
+}
+
+/// A key only Instances of `app` receive. The Revision is not an input, so a new Revision of
+/// the App opens what an earlier one sealed; the purpose goes last in `info` because the App
+/// id before it has a fixed length.
+pub fn app_key(org_key: &[u8; 32], app: AppId, purpose: &str) -> Result<Key32, ApiError> {
+    let info = [app.as_bytes().as_slice(), purpose.as_bytes()].concat();
+    let mut out = Zeroizing::new([0u8; 32]);
+    Hkdf::<Sha256>::new(Some(b"alphacompute-kms/app-key/v1"), org_key)
+        .expand(&info, out.as_mut())
+        .map_err(|e| ApiError::internal(format!("hkdf: {e}")))?;
+    Ok(out)
 }
 
 /// `nonce(12) ‖ AES-256-GCM(key, plaintext, aad)`.

@@ -416,6 +416,17 @@ impl Harness {
         client_with(&format!("{}{leaf}", text(KEYED, "runtime.key.pem")))
     }
 
+    /// The key the KMS derives for `app` of this organization, from the node's intermediates
+    /// and the organization's root key.
+    pub fn app_key(&self, app: AppId, purpose: &str) -> [u8; 32] {
+        let intermediates = self.node.intermediates().unwrap();
+        let anchor = self.root.1.verifying_key().to_public_key_der().unwrap();
+        let org_key =
+            alpha_kms::keys::org_key(&intermediates.tenant_kek_root, self.org, anchor.as_bytes())
+                .unwrap();
+        *alpha_kms::keys::app_key(&org_key, app, purpose).unwrap()
+    }
+
     pub async fn audit(&self, action: &str) -> Vec<(i64, String, Value)> {
         sqlx::query!(
             "select seq, outcome, details from audit_log where action = $1 order by seq",

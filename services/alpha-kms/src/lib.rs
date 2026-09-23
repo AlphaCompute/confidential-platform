@@ -252,6 +252,7 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/v1/attest/nonce", post(instance::nonce))
         .route("/v1/attest", post(instance::attest))
         .route("/v1/secrets/{name}", get(instance::get_secret))
+        .route("/v1/keys/derive", post(instance::derive_key))
         .route("/v1/revisions", post(control::register_revision))
         .route(
             "/v1/revisions/{compose_hash}/revoke",
