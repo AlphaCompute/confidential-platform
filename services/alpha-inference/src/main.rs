@@ -1,7 +1,8 @@
 //! Thin entrypoint: attest, read this Instance's identity and both Secrets, then serve the
 //! `/v1` routes over TLS on `:8443` until SIGTERM, refreshing the leaf and both Secrets every
-//! five minutes. All logic lives in `run`, which maps every error to a non-zero exit and
-//! never panics.
+//! five minutes. A refresh that fails ends the process: the runtime removes its socket when the
+//! Revision is revoked, and the front must not go on serving with what it read before. All
+//! logic lives in `run`, which maps every error to a non-zero exit and never panics.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -91,26 +92,33 @@ async fn run() -> Result<(), Error> {
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| Error::internal(format!("sigterm: {e}")))?;
-    let renew = tokio::spawn(renew_forever(runtime, cert, state.clone()));
-    serve_tls(listener, tls_config, app, async move {
+    let mut outcome = Ok(());
+    serve_tls(listener, tls_config, app, async {
         tokio::select! {
             _ = term.recv() => {}
             _ = tokio::signal::ctrl_c() => {}
+            failed = renew_forever(&runtime, &cert, &state) => outcome = Err(failed),
         }
     })
     .await;
-    renew.abort();
-    Ok(())
+    outcome
 }
 
-async fn renew_forever(runtime: RuntimeSocket, cert: Arc<InstanceCert>, state: Arc<AppState>) {
+async fn renew_forever(runtime: &RuntimeSocket, cert: &InstanceCert, state: &AppState) -> Error {
     loop {
         tokio::time::sleep(RENEW_INTERVAL).await;
-        if let Ok(identity) = runtime.identity().await {
-            let _ = cert.replace(&identity);
-        }
-        if let Ok(secrets) = read_secrets(&runtime).await {
-            *state.secrets.write() = secrets;
+        let renewed = async {
+            let identity = runtime
+                .identity()
+                .await
+                .map_err(|e| Error::internal(format!("renew identity: {e}")))?;
+            cert.replace(&identity)
+                .map_err(|e| Error::internal(format!("renew tls: {e}")))?;
+            *state.secrets.write() = read_secrets(runtime).await?;
+            Ok::<(), Error>(())
+        };
+        if let Err(e) = renewed.await {
+            return e;
         }
     }
 }
