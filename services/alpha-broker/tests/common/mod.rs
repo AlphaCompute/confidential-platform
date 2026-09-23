@@ -43,11 +43,10 @@ pub const KEY: [u8; 32] = [9; 32];
 pub const EMAIL: &str = "member@example.com";
 pub const MEMBER: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 pub const OTHER_MEMBER: &str = "2222222222222222222222222222222222222222222222222222222222222222";
-const HOSTS: [&str; 4] = [
+const HOSTS: [&str; 3] = [
     "accounts.google.com",
     "oauth2.googleapis.com",
     "openidconnect.googleapis.com",
-    "www.googleapis.com",
 ];
 
 /// A fresh database per test, migrated; `None` when `DATABASE_URL` is unset.
