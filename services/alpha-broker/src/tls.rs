@@ -20,9 +20,9 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::Error;
 
-/// The chain the peer presented, leaf first; empty when it presented none.
-#[derive(Clone, Debug, Default)]
-pub struct PeerCerts(pub Vec<CertificateDer<'static>>);
+/// The leaf the peer presented, if any; the handshake already chained it to the KMS CA.
+#[derive(Clone)]
+pub struct PeerLeaf(pub Option<CertificateDer<'static>>);
 
 pub fn server_config(
     cert: Arc<dyn ResolvesServerCert>,
@@ -70,12 +70,11 @@ pub async fn serve(
             let Ok(tls) = acceptor.accept(stream).await else {
                 return;
             };
-            let peer = PeerCerts(
+            let peer = PeerLeaf(
                 tls.get_ref()
                     .1
                     .peer_certificates()
-                    .map(<[_]>::to_vec)
-                    .unwrap_or_default(),
+                    .and_then(|chain| chain.first().cloned()),
             );
             let service = TowerToHyperService::new(app.layer(axum::Extension(peer)));
             let builder = Builder::new(TokioExecutor::new());
