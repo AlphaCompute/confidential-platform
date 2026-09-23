@@ -30,7 +30,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 pub use upstream::Upstream;
@@ -184,24 +183,6 @@ impl IntoResponse for Error {
     }
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
-fn bearer_matches(presented: &[u8], expected: &[u8]) -> bool {
-    constant_time_eq(
-        Sha256::digest(presented).as_slice(),
-        Sha256::digest(expected).as_slice(),
-    )
-}
-
 /// Proof of the caller's bearer, extracted before any handler runs.
 pub struct AuthedCaller;
 
@@ -218,7 +199,7 @@ impl FromRequestParts<Arc<AppState>> for AuthedCaller {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
             .ok_or(Error::Unauthorized)?;
-        if bearer_matches(presented.as_bytes(), &state.secrets.read().caller_bearer) {
+        if alpha_client::bearer_matches(presented.as_bytes(), &state.secrets.read().caller_bearer) {
             Ok(AuthedCaller)
         } else {
             Err(Error::Unauthorized)

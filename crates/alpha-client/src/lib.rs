@@ -248,6 +248,17 @@ impl NodeEvidence {
     }
 }
 
+/// A presented bearer against the expected one, compared by SHA-256 digest in constant time so
+/// neither the value nor its length shows in the timing.
+pub fn bearer_matches(presented: &[u8], expected: &[u8]) -> bool {
+    use sha2::{Digest, Sha256};
+    let (a, b) = (Sha256::digest(presented), Sha256::digest(expected));
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |diff, (x, y)| diff | (x ^ y))
+        == 0
+}
+
 pub fn decode(field: &str, text: &str) -> Result<Vec<u8>, Error> {
     BASE64_URL_SAFE_NO_PAD
         .decode(text)
@@ -589,6 +600,14 @@ pub async fn fetch_node_evidence(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_bearer_matches_only_itself() {
+        assert!(super::bearer_matches(b"right", b"right"));
+        assert!(!super::bearer_matches(b"right", b"wrong"));
+        assert!(!super::bearer_matches(b"right", b"right-longer"));
+        assert!(!super::bearer_matches(b"", b"right"));
+    }
+
     use super::*;
 
     #[test]
