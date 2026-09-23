@@ -262,6 +262,41 @@ async fn disconnect_revokes_locally_and_at_google() {
 }
 
 #[tokio::test]
+async fn disconnect_leaves_google_alone_while_another_member_holds_the_same_account() {
+    let Some(h) = harness().await else { return };
+    let (mine, _) = h.connect(MEMBER, EMAIL).await;
+    let (theirs, their_consent) = h.connect(OTHER_MEMBER, EMAIL).await;
+
+    let reply = h
+        .call(
+            "DELETE",
+            &format!("/connections/{}?member={MEMBER}", id_of(&mine)),
+            None,
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    assert_eq!(h.stored_token(id_of(&mine)).await, None);
+    assert_eq!(h.google.with(|f| f.hits("/revoke")), 0);
+
+    let reply = h
+        .call(
+            "DELETE",
+            &format!("/connections/{}?member={OTHER_MEMBER}", id_of(&theirs)),
+            None,
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    let revokes: Vec<String> = h.google.with(|f| {
+        f.requests
+            .iter()
+            .filter(|(p, _)| p == "/revoke")
+            .map(|(_, form)| form["token"].clone())
+            .collect()
+    });
+    assert_eq!(revokes, [their_consent.refresh_token]);
+}
+
+#[tokio::test]
 async fn disconnect_answers_204_even_when_google_refuses_the_revoke() {
     let Some(h) = harness().await else { return };
     let (reply, _) = h.connect(MEMBER, EMAIL).await;
