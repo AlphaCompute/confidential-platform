@@ -426,3 +426,14 @@ async fn a_disconnect_drops_the_cached_token_and_a_refresh_drops_expired_ones() 
     assert_eq!(gone.status, StatusCode::NO_CONTENT);
     assert!(h.state.tokens.lock().is_empty());
 }
+
+#[tokio::test]
+async fn a_request_body_over_two_mib_is_refused_before_google() {
+    let Some(h) = harness().await else { return };
+    let (id, _) = h.connected().await;
+    let mut body = read(id, FILES);
+    body["body"] = serde_json::json!("A".repeat(2 << 20));
+    let reply = h.proxy(&body).await;
+    assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(nothing_reached_google(&h));
+}
