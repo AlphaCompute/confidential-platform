@@ -125,7 +125,7 @@ async fn run() -> Result<(), Error> {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| Error::internal(format!("sigterm: {e}")))?;
     let mut outcome = Ok(());
-    tls::serve(listener, tls_config, app, async {
+    alpha_client::tls::serve(listener, tls_config, app, async {
         tokio::select! {
             _ = term.recv() => {}
             _ = tokio::signal::ctrl_c() => {}

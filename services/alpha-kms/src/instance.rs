@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alpha_attest::{AttestationResult, Evidence, RESULT_FORMAT, Revision, Verdict, appraise};
+use alpha_client::DerivedKey;
+use alpha_client::tls::PeerCerts;
 use alpha_core::{ComposeHash, context};
 use axum::Json;
 use axum::body::Bytes;
@@ -18,13 +20,13 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::audit::Audit;
 use crate::body::Body;
 use crate::control::SecretPayload;
 use crate::error::ApiError;
 use crate::keys::{self, SignatureObject};
-use crate::tls::PeerCerts;
 use crate::{CollateralSource, Node, certs, rfc3339};
 
 pub const NONCE_MAX_AGE: Duration = Duration::from_secs(300);
@@ -398,7 +400,7 @@ pub async fn derive_key(
     State(node): State<Arc<Node>>,
     Extension(peer): Extension<PeerCerts>,
     body: Bytes,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<DerivedKey>, ApiError> {
     let keys = node.intermediates()?;
     let identity = certs::ca_verifier(&keys.ca_cert_der).and_then(|verifier| {
         let sans = certs::verify_to_ca(verifier.as_ref(), &peer.0, node.now())?;
@@ -453,7 +455,7 @@ async fn derive_key_inner(
     tenant_kek_root: &[u8; 32],
     identity: &certs::InstanceIdentity,
     purpose: &str,
-) -> Result<Value, ApiError> {
+) -> Result<DerivedKey, ApiError> {
     if !alpha_core::is_key_purpose(purpose) {
         return Err(ApiError::malformed(
             "purpose: 1 to 64 of a-z, 0-9, '.', '_', '-', starting with a letter or digit",
@@ -474,7 +476,9 @@ async fn derive_key_inner(
     .await?;
     let org_key = keys::org_key(tenant_kek_root, identity.org_id, &chain.anchor_spki)?;
     let key = keys::app_key(&org_key, identity.app_id, purpose)?;
-    Ok(json!({ "key": BASE64_URL_SAFE_NO_PAD.encode(key.as_slice()) }))
+    Ok(DerivedKey {
+        key: Zeroizing::new(BASE64_URL_SAFE_NO_PAD.encode(key.as_slice())),
+    })
 }
 
 #[cfg(test)]

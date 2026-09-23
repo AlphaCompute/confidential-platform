@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use alpha_client::DerivedKey;
 use alpha_core::RequestId;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -86,8 +87,8 @@ async fn secret(
 async fn key(
     State(runtime): State<Arc<Runtime>>,
     Path(purpose): Path<String>,
-) -> Result<Json<Value>, Error> {
-    runtime.key(&purpose).await.map(|k| Json(json!(k)))
+) -> Result<Json<DerivedKey>, Error> {
+    runtime.key(&purpose).await.map(Json)
 }
 
 pub fn healthz_json(runtime: &Runtime) -> Value {

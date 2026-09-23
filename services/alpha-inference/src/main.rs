@@ -4,19 +4,13 @@
 //! Revision is revoked, and the front must not go on serving with what it read before. All
 //! logic lives in `run`, which maps every error to a non-zero exit and never panics.
 
-use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use alpha_client::runtime::RuntimeSocket;
-use alpha_client::tls::{InstanceCert, server_config};
+use alpha_client::tls::{InstanceCert, serve, server_config};
 use alpha_inference::{AppState, Config, Error, Secrets, Upstream, router};
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder;
-use hyper_util::server::graceful::GracefulShutdown;
-use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
-use tokio_rustls::TlsAcceptor;
 use zeroize::Zeroizing;
 
 const PORT: u16 = 8443;
@@ -93,7 +87,7 @@ async fn run() -> Result<(), Error> {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| Error::internal(format!("sigterm: {e}")))?;
     let mut outcome = Ok(());
-    serve_tls(listener, tls_config, app, async {
+    serve(listener, tls_config, app, async {
         tokio::select! {
             _ = term.recv() => {}
             _ = tokio::signal::ctrl_c() => {}
@@ -121,39 +115,4 @@ async fn renew_forever(runtime: &RuntimeSocket, cert: &InstanceCert, state: &App
             return e;
         }
     }
-}
-
-/// Accepts TLS connections until `shutdown` resolves, then drains the ones already open — the
-/// same shape `alpha-kms` serves its own Endpoint with.
-async fn serve_tls(
-    listener: TcpListener,
-    tls_config: Arc<rustls::ServerConfig>,
-    app: axum::Router,
-    shutdown: impl Future<Output = ()>,
-) {
-    let acceptor = TlsAcceptor::from(tls_config);
-    let graceful = GracefulShutdown::new();
-    let mut shutdown = std::pin::pin!(shutdown);
-    loop {
-        let (stream, _) = tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok(accepted) => accepted,
-                Err(_) => continue,
-            },
-            () = &mut shutdown => break,
-        };
-        let acceptor = acceptor.clone();
-        let app = app.clone();
-        let watcher = graceful.watcher();
-        tokio::spawn(async move {
-            let Ok(tls) = acceptor.accept(stream).await else {
-                return;
-            };
-            let service = TowerToHyperService::new(app);
-            let builder = Builder::new(TokioExecutor::new());
-            let conn = builder.serve_connection(TokioIo::new(tls), service);
-            let _ = watcher.watch(conn).await;
-        });
-    }
-    graceful.shutdown().await;
 }

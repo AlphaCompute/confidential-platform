@@ -119,6 +119,7 @@ dependencies = [
  "alpha-attest",
  "alpha-core",
  "alpha-crypto",
+ "axum",
  "base64 0.23.1",
  "chrono",
  "ed25519-dalek 3.0.0",
@@ -218,7 +219,6 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac 0.13.0",
- "hyper-util",
  "p256 0.14.0",
  "parking_lot",
  "pem 3.0.6",
@@ -4871,6 +4871,7 @@ version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
 dependencies = [
+ "serde",
  "zeroize_derive",
 ]
 

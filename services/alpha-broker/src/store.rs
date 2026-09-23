@@ -159,25 +159,47 @@ pub async fn list_connections(pool: &PgPool, member: &[u8; 32]) -> Result<Vec<Co
 
 /// Revokes a live connection of `member` and hands back its provider and the sealed token it
 /// held, so the caller can revoke at the provider too.
+/// Also answers whether another live connection holds the same provider account: revoking at
+/// the provider ends every token it issued to this client for that account, theirs included.
 pub async fn revoke_connection(
     pool: &PgPool,
     id: Uuid,
     member: &[u8; 32],
-) -> Result<Option<(String, Vec<u8>)>, Error> {
-    Ok(sqlx::query_as(
-        "with prior as (
-           select id, provider, enc_refresh_token from connections
-           where id = $1 and member_key_sha256 = $2 and revoked_at is null
-           for update
-         )
-         update connections c set revoked_at = now(), enc_refresh_token = null
-         from prior where c.id = prior.id
-         returning prior.provider, prior.enc_refresh_token",
+) -> Result<Option<(String, Vec<u8>, bool)>, Error> {
+    let mut tx = pool.begin().await?;
+    // Two members disconnecting one account at once would each see the other still live and
+    // both skip the provider's revoke; locking the account's rows first orders them.
+    sqlx::query(
+        "select o.id from connections o
+         join connections c on c.provider = o.provider and c.subject = o.subject
+         where c.id = $1 and c.member_key_sha256 = $2 and c.revoked_at is null
+           and o.revoked_at is null
+         order by o.id
+         for update of o",
     )
     .bind(id)
     .bind(member.as_slice())
-    .fetch_optional(pool)
-    .await?)
+    .execute(&mut *tx)
+    .await?;
+    let revoked = sqlx::query_as(
+        "with prior as (
+           select id, provider, subject, enc_refresh_token from connections
+           where id = $1 and member_key_sha256 = $2 and revoked_at is null
+         )
+         update connections c set revoked_at = now(), enc_refresh_token = null
+         from prior where c.id = prior.id
+         returning prior.provider, prior.enc_refresh_token, exists (
+           select 1 from connections o
+           where o.provider = prior.provider and o.subject = prior.subject
+             and o.id <> prior.id and o.revoked_at is null and o.dead_at is null
+         )",
+    )
+    .bind(id)
+    .bind(member.as_slice())
+    .fetch_optional(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(revoked)
 }
 
 pub async fn load_connection(

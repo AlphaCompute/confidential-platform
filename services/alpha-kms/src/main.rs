@@ -61,9 +61,9 @@ async fn run() -> Result<(), String> {
             _ = tokio::signal::ctrl_c() => {}
         }
     };
-    tls::serve(listener, node.server_cert.clone(), app, shutdown)
-        .await
-        .map_err(|e| e.message)
+    let config = tls::server_config(node.server_cert.clone()).map_err(|e| e.message)?;
+    alpha_client::tls::serve(listener, config, app, shutdown).await;
+    Ok(())
 }
 
 async fn start_phase(node: &Arc<Node>) {

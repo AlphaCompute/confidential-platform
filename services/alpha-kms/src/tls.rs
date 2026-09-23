@@ -7,11 +7,6 @@ use parking_lot::RwLock;
 use std::time::SystemTime;
 
 use alpha_client::tls::provider;
-use axum::Router;
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder;
-use hyper_util::server::graceful::GracefulShutdown;
-use hyper_util::service::TowerToHyperService;
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, UnixTime};
@@ -19,15 +14,9 @@ use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use rustls::{DigitallySignedStruct, DistinguishedName, ServerConfig, SignatureScheme};
-use tokio::net::TcpListener;
-use tokio_rustls::TlsAcceptor;
 
 use crate::certs;
 use crate::error::ApiError;
-
-/// The certificate chain the peer presented, if any; routes that need one verify it.
-#[derive(Clone, Debug, Default)]
-pub struct PeerCerts(pub Vec<CertificateDer<'static>>);
 
 fn certified(pkcs8: &[u8], chain: Vec<Vec<u8>>) -> Result<Arc<CertifiedKey>, ApiError> {
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8.to_vec()));
@@ -129,46 +118,4 @@ pub fn server_config(server_cert: Arc<ServerCert>) -> Result<Arc<ServerConfig>, 
         .with_cert_resolver(server_cert);
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Arc::new(config))
-}
-
-/// Accepts until `shutdown` resolves, then drains the open connections.
-pub async fn serve(
-    listener: TcpListener,
-    server_cert: Arc<ServerCert>,
-    app: Router,
-    shutdown: impl Future<Output = ()>,
-) -> Result<(), ApiError> {
-    let acceptor = TlsAcceptor::from(server_config(server_cert)?);
-    let graceful = GracefulShutdown::new();
-    let mut shutdown = std::pin::pin!(shutdown);
-    loop {
-        let (stream, _) = tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok(accepted) => accepted,
-                Err(_) => continue,
-            },
-            () = &mut shutdown => break,
-        };
-        let acceptor = acceptor.clone();
-        let app = app.clone();
-        let watcher = graceful.watcher();
-        tokio::spawn(async move {
-            let Ok(tls) = acceptor.accept(stream).await else {
-                return;
-            };
-            let peer = PeerCerts(
-                tls.get_ref()
-                    .1
-                    .peer_certificates()
-                    .map(|c| c.to_vec())
-                    .unwrap_or_default(),
-            );
-            let service = TowerToHyperService::new(app.layer(axum::Extension(peer)));
-            let builder = Builder::new(TokioExecutor::new());
-            let conn = builder.serve_connection(TokioIo::new(tls), service);
-            let _ = watcher.watch(conn).await;
-        });
-    }
-    graceful.shutdown().await;
-    Ok(())
 }
