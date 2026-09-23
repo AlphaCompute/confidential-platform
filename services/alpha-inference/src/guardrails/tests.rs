@@ -118,6 +118,7 @@ struct Fixture {
     provider: (StatusCode, String),
     seen: Arc<Mutex<Vec<(String, HeaderMap, Value)>>>,
     output_gate: Option<Arc<Semaphore>>,
+    readiness_gate: Option<Arc<Semaphore>>,
     delay: Duration,
 }
 
@@ -129,6 +130,7 @@ impl Default for Fixture {
             provider: (StatusCode::OK, completion().to_string()),
             seen: Arc::new(Mutex::new(Vec::new())),
             output_gate: None,
+            readiness_gate: None,
             delay: Duration::ZERO,
         }
     }
@@ -140,11 +142,15 @@ async fn checker(
     Json(body): Json<Value>,
 ) -> Response {
     let is_output = body["messages"].as_array().unwrap().len() == 2;
+    let is_readiness = body["messages"][0]["content"] == "readiness probe";
     f.seen.lock().push((
         if is_output { "output" } else { "input" }.into(),
         headers,
         body,
     ));
+    if is_readiness && let Some(gate) = &f.readiness_gate {
+        let _permit = gate.acquire().await.unwrap();
+    }
     tokio::time::sleep(f.delay).await;
     if is_output && let Some(gate) = &f.output_gate {
         let _permit = gate.acquire().await.unwrap();
@@ -497,6 +503,71 @@ async fn checker_deadline_and_capacity_are_fail_closed() {
 }
 
 #[tokio::test]
+async fn unauthenticated_readiness_cannot_starve_authenticated_completions() {
+    // Hold readiness checks indefinitely while ordinary completion checks can succeed.
+    // Before the fix, eight public probes consume every completion permit.
+    let f = Fixture {
+        readiness_gate: Some(Arc::new(Semaphore::new(0))),
+        ..Fixture::default()
+    };
+    let (_, app) = setup(f.clone(), true).await;
+    let mut probes = Vec::new();
+    for index in 0..8 {
+        let mut builder = Request::builder().uri("/ready");
+        if index % 2 == 0 {
+            builder = builder.header(header::AUTHORIZATION, "Bearer wrong");
+        }
+        probes.push(tokio::spawn(
+            app.clone().oneshot(builder.body(Body::empty()).unwrap()),
+        ));
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if probes.iter().all(|probe| probe.is_finished()) || f.seen.lock().len() == 8 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("probes must either be rejected or reach the stalled checker");
+
+    let (status, _, body) =
+        tokio::time::timeout(Duration::from_secs(2), call(app.clone(), request(false)))
+            .await
+            .expect("completion must proceed while readiness checks are stalled");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "readiness probes denied the authenticated completion: {body}"
+    );
+    assert_eq!(
+        f.seen
+            .lock()
+            .iter()
+            .map(|seen| seen.0.clone())
+            .collect::<Vec<_>>(),
+        ["input", "provider", "output"]
+    );
+    for probe in probes {
+        assert_eq!(
+            probe.await.unwrap().unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let health = app
+        .oneshot(
+            Request::builder()
+                .uri("/healthz")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn readiness_requires_both_rails_as_well_as_provider_verification() {
     for blocked in [false, true] {
         let mut f = Fixture::default();
@@ -508,6 +579,7 @@ async fn readiness_requires_both_rails_as_well_as_provider_verification() {
             .oneshot(
                 Request::builder()
                     .uri("/ready")
+                    .header(header::AUTHORIZATION, "Bearer caller-secret")
                     .body(Body::empty())
                     .unwrap(),
             )

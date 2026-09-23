@@ -428,7 +428,7 @@ async fn healthz() -> StatusCode {
     StatusCode::OK
 }
 
-async fn ready(State(state): State<Arc<AppState>>) -> StatusCode {
+async fn ready(State(state): State<Arc<AppState>>, _: AuthedCaller) -> StatusCode {
     if let Some(guardrails) = &state.guardrails {
         let Ok(_permit) = guardrails.acquire() else {
             return StatusCode::SERVICE_UNAVAILABLE;
