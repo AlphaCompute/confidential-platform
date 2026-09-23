@@ -40,6 +40,10 @@ pub use alpha_client::runtime::SOCKET_PATH;
 pub const RENEW_BEFORE: Duration = Duration::from_secs(600);
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 
+/// Distinct purposes cached per leaf; beyond it a key is still served, derived again on every
+/// read, so a caller naming ever new purposes cannot grow the process.
+pub const CACHED_KEYS: usize = 64;
+
 pub const EXIT_REFUSED: i32 = 1;
 pub const EXIT_REVOKED: i32 = 78;
 
@@ -369,7 +373,10 @@ impl Runtime {
             .derive_key(purpose)
             .await
             .map_err(|e| self.note(e.into()))?;
-        attested.keys.lock().insert(purpose.to_owned(), key.clone());
+        let mut keys = attested.keys.lock();
+        if keys.len() < CACHED_KEYS {
+            keys.insert(purpose.to_owned(), key.clone());
+        }
         Ok(key)
     }
 

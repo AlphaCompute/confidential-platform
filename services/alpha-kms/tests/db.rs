@@ -1060,14 +1060,13 @@ async fn derive_refuses_and_audits_without_ever_recording_the_key() {
     let (status, reply) = derive(&h, &instance, body).await;
     refused(status, (StatusCode::CONFLICT, "revision_revoked"), &reply);
 
-    // An unknown field is refused before the route runs.
-    let (status, reply) = derive(
-        &h,
-        &instance,
+    for body in [
         json!({ "purpose": "connectors", "app": app }),
-    )
-    .await;
-    refused(status, (StatusCode::BAD_REQUEST, "malformed"), &reply);
+        json!("connectors"),
+    ] {
+        let (status, reply) = derive(&h, &instance, body).await;
+        refused(status, (StatusCode::BAD_REQUEST, "malformed"), &reply);
+    }
 
     let rows = h.audit("key.derive").await;
     let codes: Vec<&str> = rows
@@ -1087,7 +1086,9 @@ async fn derive_refuses_and_audits_without_ever_recording_the_key() {
             "malformed",
             "not_found",
             "signature_invalid",
-            "revision_revoked"
+            "revision_revoked",
+            "malformed",
+            "malformed"
         ]
     );
     let everything: String = sqlx::query_scalar(

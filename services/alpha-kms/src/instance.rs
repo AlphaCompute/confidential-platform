@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alpha_attest::{AttestationResult, Evidence, RESULT_FORMAT, Revision, Verdict, appraise};
 use alpha_core::{ComposeHash, context};
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::{Extension, Path, State};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
@@ -392,23 +393,40 @@ pub struct DeriveRequest {
     pub purpose: String,
 }
 
+/// The body is parsed here rather than by an extractor so that a malformed one is audited too.
 pub async fn derive_key(
     State(node): State<Arc<Node>>,
     Extension(peer): Extension<PeerCerts>,
-    Body(request): Body<DeriveRequest>,
+    body: Bytes,
 ) -> Result<Json<Value>, ApiError> {
     let keys = node.intermediates()?;
     let identity = certs::ca_verifier(&keys.ca_cert_der).and_then(|verifier| {
         let sans = certs::verify_to_ca(verifier.as_ref(), &peer.0, node.now())?;
         certs::parse_instance_sans(&sans)
     });
-    let purpose = request.purpose;
+    let request = serde_json::from_slice::<DeriveRequest>(&body)
+        .map_err(|e| ApiError::malformed(format!("body: {e}")));
+    // A refused purpose is unbounded text from the peer; the error names the rule instead.
+    let object = request
+        .as_ref()
+        .ok()
+        .filter(|r| alpha_core::is_key_purpose(&r.purpose))
+        .map(|r| format!("key:{}", r.purpose));
     let (actor, org_id, result) = match identity {
-        Ok(identity) => (
-            identity.runtime_pubkey_sha256_hex.clone(),
-            Some(Uuid::from(identity.org_id)),
-            derive_key_inner(&node, &keys.tenant_kek_root, &identity, &purpose).await,
-        ),
+        Ok(identity) => {
+            let result = match request {
+                Ok(request) => {
+                    derive_key_inner(&node, &keys.tenant_kek_root, &identity, &request.purpose)
+                        .await
+                }
+                Err(e) => Err(e),
+            };
+            (
+                identity.runtime_pubkey_sha256_hex.clone(),
+                Some(Uuid::from(identity.org_id)),
+                result,
+            )
+        }
         Err(e) => ("unauthenticated".to_owned(), None, Err(e)),
     };
     let (outcome, details) = match &result {
@@ -420,8 +438,7 @@ pub async fn derive_key(
         actor: &actor,
         action: "key.derive",
         org_id,
-        // A refused purpose is unbounded text from the peer; the error names the rule instead.
-        object: alpha_core::is_key_purpose(&purpose).then(|| format!("key:{purpose}")),
+        object,
         outcome,
         details,
         evidence_sha256: None,

@@ -527,6 +527,17 @@ async fn a_tenant_receives_its_app_key_through_the_runtime() {
     assert_eq!(derived.len(), 2, "the second read is served from the cache");
     assert!(derived.iter().all(|(_, outcome, _)| outcome == "ok"));
 
+    // Past the cache's bound a key is derived again on every read instead of kept.
+    for i in 2..=alpha_runtime::CACHED_KEYS {
+        client.key(&format!("p{i}")).await.unwrap();
+    }
+    let beyond = format!("p{}", alpha_runtime::CACHED_KEYS + 1);
+    let reads = h.audit("key.derive").await.len();
+    assert_eq!(*client.key(&beyond).await.unwrap(), h.app_key(app, &beyond));
+    client.key(&beyond).await.unwrap();
+    client.key("connectors").await.unwrap();
+    assert_eq!(h.audit("key.derive").await.len(), reads + 2);
+
     socket.stop().await;
 }
 

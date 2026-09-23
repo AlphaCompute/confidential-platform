@@ -22,7 +22,7 @@ to the socket), and comes up only after the first attestation succeeded:
 |---|---|
 | `GET /v1/identity` | `{app_id, org_id, compose_hash, certificate_chain, tls_private_key, attestation_result}` — the ids and the hash are read from the leaf's SANs; `tls_private_key` is the PKCS#8 DER, base64url |
 | `GET /v1/secrets/{name}` | the KMS reply, fetched over mTLS with the leaf and cached until the leaf expires; a KMS error passes through in its envelope with its status |
-| `GET /v1/keys/{purpose}` | the KMS reply to `POST /v1/keys/derive` for that purpose, `{key}`, 32 bytes base64url: the App's own key, the same for every Revision of the App; fetched and cached like a secret |
+| `GET /v1/keys/{purpose}` | the KMS reply to `POST /v1/keys/derive` for that purpose, `{key}`, 32 bytes base64url: the App's own key, the same for every Revision of the App; fetched and cached like a secret, up to 64 purposes per leaf, beyond which a key is derived again on every read |
 | `GET /healthz` | `{attested, cert_not_after}` |
 
 With no valid leaf (the last renewal failed and the hour is over) the first three answer
