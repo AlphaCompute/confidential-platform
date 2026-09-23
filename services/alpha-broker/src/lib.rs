@@ -193,8 +193,8 @@ impl FromRequestParts<Arc<AppState>> for AuthedInstance {
     ) -> Result<Self, Self::Rejection> {
         let leaf = parts
             .extensions
-            .get::<tls::PeerLeaf>()
-            .and_then(|peer| peer.0.as_ref())
+            .get::<alpha_client::tls::PeerCerts>()
+            .and_then(|peer| peer.0.first())
             .ok_or(Error::CertInvalid)?;
         alpha_client::tls::uri_sans(leaf)
             .and_then(|sans| alpha_client::tls::parse_instance_sans(&sans))

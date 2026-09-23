@@ -522,7 +522,12 @@ async fn start_broker(ca: &Ca, app: Router) -> SocketAddr {
     let config = tls::server_config(Arc::new(SingleCertAndKey::from(certified)), ca.der()).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(tls::serve(listener, config, app, std::future::pending()));
+    tokio::spawn(alpha_client::tls::serve(
+        listener,
+        config,
+        app,
+        std::future::pending(),
+    ));
     addr
 }
 

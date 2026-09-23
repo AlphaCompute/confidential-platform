@@ -4,23 +4,16 @@
 //! Revision is revoked, and the front must not go on serving with what it read before. All
 //! logic lives in `run`, which maps every error to a non-zero exit and never panics.
 
-use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use alpha_client::runtime::RuntimeSocket;
-use alpha_client::tls::{InstanceCert, server_config};
+use alpha_client::tls::{InstanceCert, serve, server_config};
 use alpha_inference::{AppState, Config, Error, Secrets, Upstream, router};
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use hyper_util::server::conn::auto::Builder;
-use hyper_util::server::graceful::GracefulShutdown;
-use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
-use tokio_rustls::TlsAcceptor;
 use zeroize::Zeroizing;
 
 const PORT: u16 = 8443;
-const HANDSHAKE: Duration = Duration::from_secs(10);
 /// Every five minutes: a renewed leaf is served and rotated Secrets take effect, without a
 /// restart.
 const RENEW_INTERVAL: Duration = Duration::from_secs(300);
@@ -94,7 +87,7 @@ async fn run() -> Result<(), Error> {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| Error::internal(format!("sigterm: {e}")))?;
     let mut outcome = Ok(());
-    serve_tls(listener, tls_config, app, async {
+    serve(listener, tls_config, app, async {
         tokio::select! {
             _ = term.recv() => {}
             _ = tokio::signal::ctrl_c() => {}
@@ -122,45 +115,4 @@ async fn renew_forever(runtime: &RuntimeSocket, cert: &InstanceCert, state: &App
             return e;
         }
     }
-}
-
-/// Accepts TLS connections until `shutdown` resolves, then drains the ones already open — the
-/// same shape `alpha-kms` serves its own Endpoint with.
-async fn serve_tls(
-    listener: TcpListener,
-    tls_config: Arc<rustls::ServerConfig>,
-    app: axum::Router,
-    shutdown: impl Future<Output = ()>,
-) {
-    let acceptor = TlsAcceptor::from(tls_config);
-    let graceful = GracefulShutdown::new();
-    let mut shutdown = std::pin::pin!(shutdown);
-    loop {
-        let (stream, _) = tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok(accepted) => accepted,
-                // Out of descriptors, accept fails at once until one frees up.
-                Err(_) => {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-            },
-            () = &mut shutdown => break,
-        };
-        let acceptor = acceptor.clone();
-        let app = app.clone();
-        let watcher = graceful.watcher();
-        tokio::spawn(async move {
-            let Ok(Ok(tls)) = tokio::time::timeout(HANDSHAKE, acceptor.accept(stream)).await else {
-                return;
-            };
-            let service = TowerToHyperService::new(app);
-            let mut builder = Builder::new(TokioExecutor::new());
-            // hyper's header-read timeout only runs once it has a timer.
-            builder.http1().timer(TokioTimer::new());
-            let conn = builder.serve_connection(TokioIo::new(tls), service);
-            let _ = watcher.watch(conn).await;
-        });
-    }
-    graceful.shutdown().await;
 }
