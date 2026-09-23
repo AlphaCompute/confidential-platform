@@ -170,3 +170,48 @@ pub async fn list_connections(pool: &PgPool, member: &[u8; 32]) -> Result<Vec<Co
     .fetch_all(pool)
     .await?)
 }
+
+/// Revokes a live connection of `member` and hands back its provider and the sealed token it
+/// held, so the caller can revoke at the provider too.
+pub async fn revoke_connection(
+    pool: &PgPool,
+    id: Uuid,
+    member: &[u8; 32],
+) -> Result<Option<(String, Vec<u8>)>, Error> {
+    Ok(sqlx::query_as(
+        "with prior as (
+           select id, provider, enc_refresh_token from connections
+           where id = $1 and member_key_sha256 = $2 and revoked_at is null
+           for update
+         )
+         update connections c set revoked_at = now(), enc_refresh_token = null
+         from prior where c.id = prior.id
+         returning prior.provider, prior.enc_refresh_token",
+    )
+    .bind(id)
+    .bind(member.as_slice())
+    .fetch_optional(pool)
+    .await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_refuses_another_key_another_aad_and_a_short_blob() {
+        let blob = seal(&[1; 32], b"aad", b"token").unwrap();
+        assert_eq!(open(&[1; 32], b"aad", &blob).unwrap().as_slice(), b"token");
+        assert!(open(&[2; 32], b"aad", &blob).is_none());
+        assert!(open(&[1; 32], b"other", &blob).is_none());
+        assert!(open(&[1; 32], b"aad", &blob[..11]).is_none());
+    }
+
+    #[test]
+    fn two_seals_of_one_plaintext_differ() {
+        assert_ne!(
+            seal(&[1; 32], b"aad", b"token").unwrap(),
+            seal(&[1; 32], b"aad", b"token").unwrap()
+        );
+    }
+}

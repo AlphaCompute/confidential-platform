@@ -24,7 +24,7 @@ use axum::extract::{FromRequestParts, State};
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -208,6 +208,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/connect/finish", post(connect::finish))
         .route("/connect/{provider}", post(connect::start))
         .route("/connections", get(connect::list))
+        .route("/connections/{id}", delete(connect::disconnect))
         .route("/healthz", get(healthz))
         .route("/ready", get(ready))
         .with_state(state)

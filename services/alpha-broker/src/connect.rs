@@ -1,5 +1,5 @@
 //! The routes the tenant's backend calls with its connect bearer: start a connect, finish it
-//! with the provider's code, list a member's connections.
+//! with the provider's code, list a member's connections, disconnect one.
 
 use std::sync::Arc;
 
@@ -7,11 +7,13 @@ use axum::Json;
 use axum::body::Bytes;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::{AppState, AuthedCorpus, Error, oauth, store};
 
@@ -154,4 +156,25 @@ pub async fn list(
     let member = query_member(query)?;
     let connections = store::list_connections(&state.pool, &member).await?;
     Ok(Json(json!({ "connections": connections })))
+}
+
+/// Local revocation always happens; the provider's revoke is best effort.
+pub async fn disconnect(
+    State(state): State<Arc<AppState>>,
+    _: AuthedCorpus,
+    Path(id): Path<String>,
+    query: Result<Query<MemberQuery>, QueryRejection>,
+) -> Result<StatusCode, Error> {
+    let member = query_member(query)?;
+    let id = Uuid::parse_str(&id).map_err(|_| Error::NotFound)?;
+    let (provider, sealed) = store::revoke_connection(&state.pool, id, &member)
+        .await?
+        .ok_or(Error::NotFound)?;
+    let key = state.secrets.read().connectors_key.clone();
+    let token = store::open(&key, id.as_bytes(), &sealed);
+    let token = token.as_deref().and_then(|t| std::str::from_utf8(t).ok());
+    if let (Some(provider), Some(token)) = (oauth::provider(&provider), token) {
+        oauth::revoke(&state.http, provider, token).await;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
