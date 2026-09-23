@@ -486,20 +486,16 @@ impl Ca {
     }
 
     pub fn instance(&self) -> Identity {
-        self.leaf(&instance_sans())
+        self.leaf(&[
+            format!(
+                "alphacompute://{}/{}/{}",
+                Uuid::now_v7(),
+                Uuid::now_v7(),
+                "a".repeat(64)
+            ),
+            format!("urn:alphacompute:revision:sha256:{}", "1".repeat(64)),
+        ])
     }
-}
-
-pub fn instance_sans() -> Vec<String> {
-    vec![
-        format!(
-            "alphacompute://{}/{}/{}",
-            Uuid::now_v7(),
-            Uuid::now_v7(),
-            "a".repeat(64)
-        ),
-        format!("urn:alphacompute:revision:sha256:{}", "1".repeat(64)),
-    ]
 }
 
 /// A client presenting `identity` (or no certificate) and trusting only `ca` for the broker.
