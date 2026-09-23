@@ -685,3 +685,33 @@ async fn revoked_revision_ends_the_runtime_with_78() {
     assert_eq!(err.exit_code(), 78);
     assert!(runtime.is_revoked());
 }
+
+#[tokio::test]
+async fn a_revoked_revision_is_refused_its_key_and_ends_the_runtime_with_78() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    let (_, hash, admin) = app_with_secret(&h, b"v1").await;
+    let (runtime, _) = start_runtime(&h, config(&h, vec![h.url.clone()]));
+    runtime.attest().await.unwrap();
+    let mut socket = Socket::start(runtime.clone());
+    let (status, _) = socket.get("/v1/keys/connectors").await;
+    assert_eq!(status, 200);
+
+    let payload = json!({ "compose_hash": hash, "issued_at": rfc3339(h.now()) });
+    let (status, reply) = h
+        .post(
+            &format!("/v1/revisions/{hash}/revoke"),
+            h.signed(context::CONTROL, payload, &admin),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+
+    let (status, _) = socket.get("/v1/keys/connectors").await;
+    assert_eq!(status, 200, "the cached key is still served");
+    let (status, reply) = socket.get("/v1/keys/other").await;
+    assert_eq!((status, code(&reply)), (409, "revision_revoked"), "{reply}");
+    assert!(runtime.is_revoked());
+    let exit = (&mut socket.task).await.unwrap();
+    assert_eq!(exit.code(), 78);
+}

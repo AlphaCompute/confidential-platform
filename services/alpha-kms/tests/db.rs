@@ -13,7 +13,7 @@ mod common;
 use std::fs;
 use std::time::Duration;
 
-use alpha_core::{AppId, KeyId, OrgId, PrincipalId, context};
+use alpha_core::{AppId, ComposeHash, KeyId, OrgId, PrincipalId, context};
 use alpha_crypto::{INFO_NODE_BOOTSTRAP, INFO_UNSEAL_SHARE};
 use alpha_kms::{certs, instance, platform, rfc3339};
 use base64::Engine;
@@ -931,6 +931,175 @@ fn forged_client(h: &Harness, sans: &[String]) -> reqwest::Client {
     params.not_after = (h.now() + Duration::from_secs(3600)).into();
     let cert = params.self_signed(&key).unwrap();
     client_with(&format!("{}{}", key.serialize_pem(), cert.pem()))
+}
+
+/// An mTLS client holding a leaf the node's CA issues over the capture's key for `app` at
+/// `hash`, as attestation would for an Instance of that Revision.
+fn leaf_client(h: &Harness, app: AppId, hash: ComposeHash) -> reqwest::Client {
+    let keys = h.node.intermediates().unwrap();
+    let spki = read(KEYED, "runtime_spki.der");
+    let sans = certs::instance_sans(h.org, app, &hex::encode(Sha256::digest(&spki)), hash);
+    let leaf = certs::issue_leaf(
+        &keys.ca_key().unwrap(),
+        &keys.ca_cert_der,
+        &spki,
+        sans,
+        h.now(),
+    )
+    .unwrap();
+    client_with(&format!(
+        "{}{}",
+        text(KEYED, "runtime.key.pem"),
+        certs::pem(&leaf)
+    ))
+}
+
+async fn derive(h: &Harness, client: &reqwest::Client, body: Value) -> (StatusCode, Value) {
+    send(client.post(format!("{}/v1/keys/derive", h.url)).json(&body)).await
+}
+
+fn derived(reply: &Value) -> Vec<u8> {
+    BASE64_URL_SAFE_NO_PAD
+        .decode(reply["key"].as_str().unwrap())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn derive_gives_every_revision_of_an_app_the_same_key() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let admin = h.register_key(&h.root, 21).await;
+    let app = AppId::mint();
+    h.insert_capture_revision(app, &admin).await;
+    let instance = h.instance_client().await;
+    let body = json!({ "purpose": "connectors" });
+    let (status, first) = derive(&h, &instance, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(derived(&first), h.app_key(app, "connectors"));
+    let (_, again) = derive(&h, &instance, body.clone()).await;
+    assert_eq!(again, first);
+
+    let next = h
+        .insert_revision(app, "the next revision".into(), &admin)
+        .await;
+    let (status, reply) = derive(&h, &leaf_client(&h, app, next), body).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(
+        reply, first,
+        "a new Revision opens what the last one sealed"
+    );
+}
+
+#[tokio::test]
+async fn derive_gives_another_app_of_the_organization_another_key() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let admin = h.register_key(&h.root, 21).await;
+    let (app_a, app_b) = (AppId::mint(), AppId::mint());
+    h.insert_capture_revision(app_a, &admin).await;
+    let hash_b = h.insert_revision(app_b, "app b".into(), &admin).await;
+    let body = json!({ "purpose": "connectors" });
+    let (status, a) = derive(&h, &h.instance_client().await, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{a}");
+    let (status, b) = derive(&h, &leaf_client(&h, app_b, hash_b), body).await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert_ne!(derived(&a), derived(&b));
+    assert_eq!(derived(&b), h.app_key(app_b, "connectors"));
+}
+
+#[tokio::test]
+async fn derive_refuses_and_audits_without_ever_recording_the_key() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let admin = h.register_key(&h.root, 21).await;
+    let app = AppId::mint();
+    let hash = h.insert_capture_revision(app, &admin).await;
+    let instance = h.instance_client().await;
+    let body = json!({ "purpose": "connectors" });
+    let (status, reply) = derive(&h, &instance, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let key_text = reply["key"].as_str().unwrap().to_owned();
+
+    let refused = |status: StatusCode, want: (StatusCode, &str), reply: &Value| {
+        assert_eq!((status, code(reply)), want, "{reply}");
+    };
+    let (status, reply) = derive(&h, &client(), body.clone()).await;
+    refused(status, (StatusCode::UNAUTHORIZED, "cert_invalid"), &reply);
+    for purpose in ["..".to_owned(), "A".to_owned(), "a".repeat(65)] {
+        let (status, reply) = derive(&h, &instance, json!({ "purpose": purpose })).await;
+        refused(status, (StatusCode::BAD_REQUEST, "malformed"), &reply);
+    }
+    let unregistered = leaf_client(&h, app, alpha_core::compose_hash("unregistered"));
+    let (status, reply) = derive(&h, &unregistered, body.clone()).await;
+    refused(status, (StatusCode::NOT_FOUND, "not_found"), &reply);
+    sqlx::query!("update revisions set compose = compose || ' '")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let (status, reply) = derive(&h, &instance, body.clone()).await;
+    refused(
+        status,
+        (StatusCode::BAD_REQUEST, "signature_invalid"),
+        &reply,
+    );
+    sqlx::query!("update revisions set compose = left(compose, length(compose) - 1)")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let payload = json!({ "compose_hash": hash, "issued_at": rfc3339(h.now()) });
+    let (status, reply) = h
+        .post(
+            &format!("/v1/revisions/{hash}/revoke"),
+            h.signed(context::CONTROL, payload, &admin),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let (status, reply) = derive(&h, &instance, body).await;
+    refused(status, (StatusCode::CONFLICT, "revision_revoked"), &reply);
+
+    // An unknown field is refused before the route runs.
+    let (status, reply) = derive(
+        &h,
+        &instance,
+        json!({ "purpose": "connectors", "app": app }),
+    )
+    .await;
+    refused(status, (StatusCode::BAD_REQUEST, "malformed"), &reply);
+
+    let rows = h.audit("key.derive").await;
+    let codes: Vec<&str> = rows
+        .iter()
+        .map(|(_, outcome, details)| match outcome.as_str() {
+            "ok" => "ok",
+            _ => details["code"].as_str().unwrap(),
+        })
+        .collect();
+    assert_eq!(
+        codes,
+        [
+            "ok",
+            "cert_invalid",
+            "malformed",
+            "malformed",
+            "malformed",
+            "not_found",
+            "signature_invalid",
+            "revision_revoked"
+        ]
+    );
+    let everything: String = sqlx::query_scalar(
+        "select coalesce(string_agg(to_jsonb(a)::text, ' '), '') from audit_log a",
+    )
+    .fetch_one(&h.pool)
+    .await
+    .unwrap();
+    assert!(
+        !everything.contains(&key_text),
+        "the key is in the audit log"
+    );
 }
 
 #[tokio::test]

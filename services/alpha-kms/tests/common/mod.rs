@@ -373,7 +373,17 @@ impl Harness {
         app_id: AppId,
         signer: &(KeyId, SigningKey),
     ) -> alpha_core::ComposeHash {
-        let compose = text(KEYED, "app-compose.json");
+        self.insert_revision(app_id, text(KEYED, "app-compose.json"), signer)
+            .await
+    }
+
+    /// `compose` as a Revision of `app_id`, signed by `signer`, straight into the table.
+    pub async fn insert_revision(
+        &self,
+        app_id: AppId,
+        compose: String,
+        signer: &(KeyId, SigningKey),
+    ) -> alpha_core::ComposeHash {
         let hash = alpha_core::compose_hash(&compose);
         let document = json!({ "app_id": app_id, "compose": compose });
         let sig = self.signed(context::REVISION, document, signer)["signature"].clone();

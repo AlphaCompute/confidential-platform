@@ -262,6 +262,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_malformed_key_purpose_is_refused_before_any_request() {
+        let client = RuntimeSocket::at(socket_path());
+        for purpose in ["../x", "", "A"] {
+            match client.key(purpose).await {
+                Err(Error::Invalid(_)) => {}
+                other => panic!("{purpose:?}: expected Error::Invalid, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_key_of_any_length_but_32_bytes_is_refused() {
+        let path = canned(
+            200,
+            r#"{"key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}"#,
+        );
+        match RuntimeSocket::at(path).key("connectors").await {
+            Err(Error::Invalid(_)) => {}
+            other => panic!("expected Error::Invalid, got {other:?}"),
+        }
+        let path = canned(
+            200,
+            r#"{"key":"BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU"}"#,
+        );
+        assert_eq!(
+            *RuntimeSocket::at(path).key("connectors").await.unwrap(),
+            [5u8; 32]
+        );
+    }
+
+    #[tokio::test]
     async fn an_empty_secret_name_is_refused_before_any_request() {
         let client = RuntimeSocket::at(socket_path());
         match client.secret("").await {

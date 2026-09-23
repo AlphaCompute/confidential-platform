@@ -317,6 +317,25 @@ mod tests {
     }
 
     #[test]
+    fn app_key_matches_an_independent_rfc5869_computation() {
+        let app = AppId::from(Uuid::parse_str("01920000-0000-7000-8000-000000000001").unwrap());
+        assert_eq!(
+            hex::encode(*app_key(&[7; 32], app, "connectors").unwrap()),
+            "503b90f56c674229db2bf6427a36675c6f25271025d31d67768c65f71b14690d"
+        );
+    }
+
+    #[test]
+    fn app_key_changes_with_the_app_the_purpose_and_the_org_key() {
+        let (org_key, app) = ([7u8; 32], AppId::mint());
+        let a = app_key(&org_key, app, "connectors").unwrap();
+        assert_eq!(*a, *app_key(&org_key, app, "connectors").unwrap());
+        assert_ne!(*a, *app_key(&org_key, AppId::mint(), "connectors").unwrap());
+        assert_ne!(*a, *app_key(&org_key, app, "connector").unwrap());
+        assert_ne!(*a, *app_key(&[8; 32], app, "connectors").unwrap());
+    }
+
+    #[test]
     fn aead_round_trip_binds_aad() {
         let key = [9u8; 32];
         let blob = aead_seal(&key, b"aad", b"value").unwrap();
