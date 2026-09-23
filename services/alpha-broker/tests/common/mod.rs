@@ -20,7 +20,7 @@ use std::time::Duration;
 use alpha_broker::{AppState, Config, Secrets, oauth, router, tls};
 use alpha_client::tls::{Identity, Pin};
 use axum::body::{Body, to_bytes};
-use axum::extract::{Form, State};
+use axum::extract::{Form, Query, State};
 use axum::http::{HeaderMap, Request, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -270,13 +270,17 @@ async fn revoke(State(fake): State<Shared>, Form(form): Form<HashMap<String, Str
 }
 
 /// Drive, Gmail and Calendar reads, answered only to an access token the stand-in issued.
-async fn data(State(fake): State<Shared>, uri: Uri, headers: HeaderMap) -> Response {
+async fn data(
+    State(fake): State<Shared>,
+    uri: Uri,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
     let mut fake = fake.lock().unwrap();
     let authorization = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
-    let query: HashMap<String, String> = uri.query().map(url_pairs).unwrap_or_default();
     fake.data.push(DataRequest {
         path: uri.path().to_string(),
         query: query.clone(),
@@ -321,14 +325,6 @@ async fn data(State(fake): State<Shared>, uri: Uri, headers: HeaderMap) -> Respo
         }
         _ => StatusCode::NOT_FOUND.into_response(),
     }
-}
-
-fn url_pairs(query: &str) -> HashMap<String, String> {
-    reqwest::Url::parse(&format!("https://x/?{query}"))
-        .unwrap()
-        .query_pairs()
-        .into_owned()
-        .collect()
 }
 
 pub struct FakeGoogle {

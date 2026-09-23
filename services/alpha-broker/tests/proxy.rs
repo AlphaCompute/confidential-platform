@@ -344,50 +344,59 @@ async fn two_calls_on_an_expired_token_share_one_refresh() {
 async fn drive_gmail_and_calendar_answer_with_the_callers_query_and_googles_content_type() {
     let Some(h) = harness().await else { return };
     let (id, _) = h.connected().await;
+    let json = "application/json";
     let reads = [
-        ("/drive/v3/drives", "pageSize=100", "application/json"),
-        ("/drive/v3/files/file-1", "fields=id", "application/json"),
+        (
+            "/drive/v3/drives",
+            "pageSize",
+            "100",
+            json,
+            r#"{"drives":[]}"#,
+        ),
+        (
+            "/drive/v3/files/file-1",
+            "fields",
+            "id",
+            json,
+            r#"{"id":"file-1","name":"Notes"}"#,
+        ),
         (
             "/drive/v3/files/file-1/export",
-            "mimeType=text%2Fcsv",
+            "mimeType",
             "text/csv",
+            "text/csv",
+            "a,b\n1,2\n",
         ),
         (
             "/gmail/v1/users/me/messages",
-            "q=from%3Ax",
-            "application/json",
+            "q",
+            "from:x",
+            json,
+            r#"{"messages":[{"id":"m1"}]}"#,
         ),
         (
             "/gmail/v1/users/me/messages/m1",
-            "format=full",
-            "application/json",
+            "format",
+            "full",
+            json,
+            r#"{"id":"m1","snippet":"hello"}"#,
         ),
         (
             "/calendar/v3/calendars/primary/events",
-            "singleEvents=true",
-            "application/json",
+            "singleEvents",
+            "true",
+            json,
+            r#"{"items":[]}"#,
         ),
     ];
-    for (path, query, content_type) in reads {
-        let reply = h
-            .proxy(&read(
-                id,
-                &format!("https://www.googleapis.com{path}?{query}"),
-            ))
-            .await;
+    for (path, key, value, content_type, body) in reads {
+        let url = format!("https://www.googleapis.com{path}?{key}={value}");
+        let reply = h.proxy(&read(id, &url)).await;
         assert_eq!(reply.status, StatusCode::OK, "{path}");
         assert_eq!(reply.content_type.as_deref(), Some(content_type), "{path}");
+        assert_eq!(reply.bytes, body.as_bytes(), "{path}");
         let seen = h.google.with(|f| f.data.last().cloned().unwrap());
         assert_eq!(seen.path, path);
-        let (k, v) = query.split_once('=').unwrap();
-        let v = v.replace("%2F", "/").replace("%3A", ":");
-        assert_eq!(seen.query[k], v, "{path}");
+        assert_eq!(seen.query[key], value, "{path}");
     }
-    let export = h
-        .proxy(&read(
-            id,
-            "https://www.googleapis.com/drive/v3/files/file-1/export?mimeType=text/csv",
-        ))
-        .await;
-    assert_eq!(export.bytes, b"a,b\n1,2\n");
 }
