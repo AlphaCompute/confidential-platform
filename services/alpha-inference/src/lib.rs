@@ -15,6 +15,7 @@
     )
 )]
 
+pub mod guardrails;
 pub mod upstream;
 
 #[cfg(test)]
@@ -36,7 +37,7 @@ pub use upstream::Upstream;
 
 const COMPLETIONS_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
-/// The four measured environment variables, read once at startup and never mutated.
+/// Startup configuration, fixed by the measured Compose and never mutated.
 #[derive(Clone, Debug)]
 pub struct Config {
     /// RedPill's OpenAI-compatible base, `/v1` included, trailing slash trimmed.
@@ -45,10 +46,17 @@ pub struct Config {
     pub models: Vec<String>,
     pub pccs_url: String,
     pub upstream_policy: alpha_attest::Policy,
+    pub guardrails: Option<guardrails::Config>,
 }
 
 impl Config {
     pub fn from_env() -> Result<Self, Error> {
+        if matches!(
+            std::env::var("GUARDRAILS_CONFIG"),
+            Err(std::env::VarError::NotUnicode(_))
+        ) {
+            return Err(Error::internal("GUARDRAILS_CONFIG is not utf8"));
+        }
         Self::build(|name| std::env::var(name).ok())
     }
 
@@ -86,6 +94,9 @@ impl Config {
             models,
             pccs_url: pccs_url.trim_end_matches('/').to_owned(),
             upstream_policy,
+            guardrails: get("GUARDRAILS_CONFIG")
+                .map(|raw| guardrails::Config::parse(&raw))
+                .transpose()?,
         })
     }
 
@@ -119,6 +130,7 @@ pub struct AppState {
     pub config: Config,
     pub secrets: parking_lot::RwLock<Secrets>,
     pub upstream: Upstream,
+    pub guardrails: Option<guardrails::Guardrails>,
 }
 
 /// Every error this service answers with, OpenAI-shaped on the wire. Messages never carry a
@@ -133,6 +145,14 @@ pub enum Error {
     UpstreamUnverified,
     #[error("the model provider could not be reached")]
     Upstream,
+    #[error("the content was blocked by the guardrail policy")]
+    GuardrailsBlocked,
+    #[error("guardrail checks are unavailable; no completion was released")]
+    GuardrailsUnavailable,
+    #[error(
+        "the request exceeds the guarded text/function-tool API limits or uses unsupported fields"
+    )]
+    GuardrailsUnsupported,
     #[error("{0}")]
     Internal(String),
 }
@@ -160,6 +180,21 @@ impl Error {
                 "upstream_unverified",
             ),
             Error::Upstream => (StatusCode::BAD_GATEWAY, "upstream_error", "upstream"),
+            Error::GuardrailsBlocked => (
+                StatusCode::FORBIDDEN,
+                "content_policy_error",
+                "guardrails_blocked",
+            ),
+            Error::GuardrailsUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "guardrail_error",
+                "guardrails_unavailable",
+            ),
+            Error::GuardrailsUnsupported => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "guardrails_unsupported",
+            ),
             Error::Internal(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
@@ -276,6 +311,9 @@ async fn chat_completions(
     if !state.config.allows(&model) {
         return Err(Error::ModelNotFound(model));
     }
+    if let Some(guardrails) = &state.guardrails {
+        return guarded_completion(&state, guardrails, parsed, body.len()).await;
+    }
     let client = state
         .upstream
         .verified(&model)
@@ -312,11 +350,98 @@ async fn chat_completions(
         .map_err(|e| Error::internal(format!("response: {e}")))
 }
 
+async fn guarded_completion(
+    state: &AppState,
+    guardrails: &guardrails::Guardrails,
+    mut request: Value,
+    body_len: usize,
+) -> Result<Response, Error> {
+    let _permit = guardrails.acquire()?;
+    if body_len > guardrails::CONTENT_LIMIT {
+        return Err(Error::GuardrailsUnsupported);
+    }
+    guardrails::validate_request(&request)?;
+    let checked_request = request.to_string();
+    if checked_request.len() > guardrails::CONTENT_LIMIT {
+        return Err(Error::GuardrailsUnsupported);
+    }
+    guardrails.check(&checked_request, None).await?;
+
+    let stream = request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let include_usage = request
+        .pointer("/stream_options/include_usage")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let object = request
+        .as_object_mut()
+        .ok_or(Error::GuardrailsUnsupported)?;
+    object.insert("stream".into(), json!(false));
+    object.remove("stream_options");
+    let model = request
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or(Error::GuardrailsUnsupported)?;
+    let client = state
+        .upstream
+        .verified(model)
+        .await
+        .map_err(|outcome| verify_error(outcome, model))?;
+    let provider_key = state.secrets.read().provider_key.clone();
+    // No upstream body, including an error body, is released before successful checks.
+    let received = tokio::time::timeout(guardrails::COMPLETION_TIMEOUT, async {
+        let response = client
+            .post(format!("{}/chat/completions", state.config.upstream_url))
+            .bearer_auth(provider_key.as_str())
+            .json(&request)
+            .send()
+            .await
+            .map_err(|_| Error::Upstream)?;
+        if !response.status().is_success() {
+            return Err(Error::Upstream);
+        }
+        guardrails::read_bounded(response, guardrails::CONTENT_LIMIT).await
+    })
+    .await;
+    let bytes = match received {
+        Ok(Ok(bytes)) => bytes,
+        _ => {
+            state.upstream.forget(model).await;
+            return Err(Error::Upstream);
+        }
+    };
+    let completion: Value = serde_json::from_slice(&bytes).map_err(|_| Error::Upstream)?;
+    guardrails::validate_completion(&completion)?;
+    let checked_output = completion.to_string();
+    if checked_output.len() > guardrails::CONTENT_LIMIT {
+        return Err(Error::Upstream);
+    }
+    guardrails
+        .check(&checked_request, Some(&checked_output))
+        .await?;
+    guardrails::completion_response(completion, stream, include_usage)
+}
+
 async fn healthz() -> StatusCode {
     StatusCode::OK
 }
 
 async fn ready(State(state): State<Arc<AppState>>) -> StatusCode {
+    if let Some(guardrails) = &state.guardrails {
+        let Ok(_permit) = guardrails.acquire() else {
+            return StatusCode::SERVICE_UNAVAILABLE;
+        };
+        if guardrails.check("readiness probe", None).await.is_err()
+            || guardrails
+                .check("readiness probe", Some("ready"))
+                .await
+                .is_err()
+        {
+            return StatusCode::SERVICE_UNAVAILABLE;
+        }
+    }
     match state.upstream.verified(state.config.default_model()).await {
         Ok(_) => StatusCode::OK,
         Err(_) => StatusCode::SERVICE_UNAVAILABLE,

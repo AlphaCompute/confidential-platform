@@ -100,6 +100,8 @@ fn unpinned_client(timeout: Duration) -> Result<reqwest::Client, Error> {
         .map_err(|e| Error::internal(format!("report client tls: {e}")))?;
     reqwest::Client::builder()
         .tls_backend_preconfigured(tls)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .tls_info(true)
         .timeout(timeout)
         .build()
@@ -115,6 +117,8 @@ fn pinned_client(spki: &[u8]) -> Result<reqwest::Client, Error> {
     .map_err(|e| Error::internal(format!("forwarding client tls: {e}")))?;
     reqwest::Client::builder()
         .tls_backend_preconfigured(tls)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| Error::internal(format!("forwarding client: {e}")))
 }
@@ -177,6 +181,15 @@ fn check_report(
 }
 
 impl Upstream {
+    /// Router fixtures exercise enforcement after an independently tested gateway check.
+    #[cfg(test)]
+    pub(crate) async fn trust_test_client(&self, model: &str, client: reqwest::Client) {
+        *self.slots.get(model).unwrap().lock().await = Some(Checked {
+            at: (self.now)(),
+            outcome: Ok(client),
+        });
+    }
+
     pub fn new(config: &Config) -> Result<Self, Error> {
         Self::build(config, Arc::new(SystemTime::now), REPORT_TIMEOUT)
     }

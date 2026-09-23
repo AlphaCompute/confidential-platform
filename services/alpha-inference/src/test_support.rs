@@ -33,6 +33,12 @@ pub(crate) fn test_state(
     provider_key: &str,
 ) -> Arc<crate::AppState> {
     let upstream = crate::Upstream::new(&config).unwrap();
+    let guardrails = config
+        .guardrails
+        .clone()
+        .map(crate::guardrails::Guardrails::new)
+        .transpose()
+        .unwrap();
     Arc::new(crate::AppState {
         config,
         secrets: parking_lot::RwLock::new(crate::Secrets {
@@ -40,6 +46,7 @@ pub(crate) fn test_state(
             caller_bearer: zeroize::Zeroizing::new(caller_bearer.to_vec()),
         }),
         upstream,
+        guardrails,
     })
 }
 
@@ -54,6 +61,7 @@ pub(crate) fn test_config(upstream_url: &str, models: &[&str]) -> crate::Config 
             tcb_statuses: vec!["UpToDate".into()],
             tolerated_advisories: vec![],
         },
+        guardrails: None,
     }
 }
 
