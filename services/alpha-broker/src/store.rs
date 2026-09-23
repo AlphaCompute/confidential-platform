@@ -180,6 +180,55 @@ pub async fn revoke_connection(
     .await?)
 }
 
+pub async fn load_connection(
+    pool: &PgPool,
+    id: Uuid,
+    member: &[u8; 32],
+) -> Result<Option<(String, bool)>, Error> {
+    Ok(sqlx::query_as(
+        "select provider, dead_at is not null as dead from connections
+         where id = $1 and member_key_sha256 = $2 and revoked_at is null",
+    )
+    .bind(id)
+    .bind(member.as_slice())
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Locks a live connection's row until `tx` ends, so one refresh at a time uses its token: a
+/// provider that rotates refresh tokens refuses the old one once the new one is issued.
+pub async fn lock_token(tx: &mut sqlx::PgConnection, id: Uuid) -> Result<Option<Vec<u8>>, Error> {
+    Ok(sqlx::query_scalar(
+        "select enc_refresh_token from connections
+         where id = $1 and revoked_at is null
+         for update",
+    )
+    .bind(id)
+    .fetch_optional(tx)
+    .await?)
+}
+
+pub async fn mark_dead(tx: &mut sqlx::PgConnection, id: Uuid) -> Result<(), Error> {
+    sqlx::query("update connections set dead_at = now() where id = $1")
+        .bind(id)
+        .execute(tx)
+        .await?;
+    Ok(())
+}
+
+pub async fn replace_refresh_token(
+    tx: &mut sqlx::PgConnection,
+    id: Uuid,
+    sealed: &[u8],
+) -> Result<(), Error> {
+    sqlx::query("update connections set enc_refresh_token = $2 where id = $1")
+        .bind(id)
+        .bind(sealed)
+        .execute(tx)
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

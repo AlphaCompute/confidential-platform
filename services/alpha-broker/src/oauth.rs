@@ -129,6 +129,60 @@ pub async fn exchange(
     })
 }
 
+pub struct Refreshed {
+    pub access_token: Zeroizing<String>,
+    pub expires_in: u64,
+    /// Present only when the provider rotated the refresh token.
+    pub refresh_token: Option<Zeroizing<String>>,
+}
+
+pub enum RefreshError {
+    /// The provider will never accept this refresh token again; the member must reconnect.
+    InvalidGrant,
+    Other(&'static str),
+}
+
+pub async fn refresh(
+    http: &reqwest::Client,
+    provider: &Provider,
+    client_id: &str,
+    client_secret: &str,
+    refresh_token: &str,
+) -> Result<Refreshed, RefreshError> {
+    #[derive(Deserialize)]
+    struct Reply {
+        access_token: Option<String>,
+        expires_in: Option<u64>,
+        refresh_token: Option<String>,
+        error: Option<String>,
+    }
+    let response = http
+        .post(provider.token)
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+        ])
+        .send()
+        .await
+        .map_err(|_| RefreshError::Other("token_unreachable"))?;
+    let success = response.status().is_success();
+    let reply: Reply = response
+        .json()
+        .await
+        .map_err(|_| RefreshError::Other("token_malformed"))?;
+    match (success, reply.access_token) {
+        (true, Some(access_token)) => Ok(Refreshed {
+            access_token: Zeroizing::new(access_token),
+            expires_in: reply.expires_in.unwrap_or_default(),
+            refresh_token: reply.refresh_token.map(Zeroizing::new),
+        }),
+        _ if reply.error.as_deref() == Some("invalid_grant") => Err(RefreshError::InvalidGrant),
+        _ => Err(RefreshError::Other("token_refused")),
+    }
+}
+
 /// The provider's stable subject identifies the account; the email is only what the member
 /// sees, and it can be renamed or given to another account.
 #[derive(Deserialize)]

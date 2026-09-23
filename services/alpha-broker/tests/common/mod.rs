@@ -1,7 +1,8 @@
 //! A fresh database per test migrated with the broker's own migrations, a TLS stand-in for
 //! Google's OAuth endpoints that the router's HTTP client reaches through its real host names,
 //! and a request helper that fails any test whose reply leaks a token, code, verifier or the
-//! client secret.
+//! client secret. The broker itself listens over mTLS on a real port, with a stand-in KMS CA
+//! issuing both its own leaf and the callers'.
 #![allow(
     dead_code,
     clippy::unwrap_used,
@@ -14,19 +15,25 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use alpha_broker::{AppState, Config, Secrets, oauth, router};
+use alpha_broker::{AppState, Config, Secrets, oauth, router, tls};
+use alpha_client::tls::{Identity, Pin};
 use axum::body::{Body, to_bytes};
-use axum::extract::{Form, State};
-use axum::http::{HeaderMap, Request, StatusCode, header};
+use axum::extract::{Form, Query, State};
+use axum::http::{HeaderMap, Request, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::service::TowerToHyperService;
-use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
-use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+use rcgen::string::Ia5String;
+use rcgen::{
+    BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, SanType,
+};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::sign::SingleCertAndKey;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
@@ -36,6 +43,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 pub const BEARER: &str = "connect-bearer-for-tests";
+pub const PROXY_BEARER: &str = "proxy-bearer-for-tests";
 pub const CLIENT_ID: &str = "corpus-test.apps.googleusercontent.com";
 pub const CLIENT_SECRET: &str = "client-secret-for-tests";
 pub const REDIRECT_URI: &str = "https://corpus.example/oauth/google/callback";
@@ -43,11 +51,14 @@ pub const KEY: [u8; 32] = [9; 32];
 pub const EMAIL: &str = "member@example.com";
 pub const MEMBER: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 pub const OTHER_MEMBER: &str = "2222222222222222222222222222222222222222222222222222222222222222";
-const HOSTS: [&str; 3] = [
+const HOSTS: [&str; 4] = [
     "accounts.google.com",
     "oauth2.googleapis.com",
     "openidconnect.googleapis.com",
+    "www.googleapis.com",
 ];
+pub const MEDIA: &str = "https://www.googleapis.com/drive/v3/files/file-1?alt=media";
+pub const LISTING: &str = r#"{"files":[{"id":"file-1","name":"Notes"}]}"#;
 
 /// A fresh database per test, migrated; `None` when `DATABASE_URL` is unset.
 pub async fn fresh_database() -> Option<PgPool> {
@@ -89,19 +100,47 @@ pub struct Consent {
     used: bool,
 }
 
+/// One request that reached Google's data API.
+#[derive(Clone, Debug)]
+pub struct DataRequest {
+    pub path: String,
+    pub query: HashMap<String, String>,
+    pub authorization: Option<String>,
+}
+
 pub struct Fake {
     consents: Vec<Consent>,
-    /// Every request that reached the stand-in: path and form or query fields.
+    /// Every request that reached the stand-in's OAuth endpoints: path and form or query fields.
     pub requests: Vec<(String, HashMap<String, String>)>,
+    pub data: Vec<DataRequest>,
+    /// A status other than 200 refuses every token request; 400 with `invalid_grant`.
     pub token_status: StatusCode,
     pub omit_refresh_token: bool,
     pub account_status: StatusCode,
     pub revoke_status: StatusCode,
+    /// Refreshes issue a new refresh token and stop accepting the one presented.
+    pub rotate: bool,
+    /// How long a refresh takes to answer.
+    pub refresh_delay: Duration,
+    /// The next this many data requests answer 401 whatever token they carry.
+    pub unauthorized: usize,
+    pub media_size: usize,
+    /// Access tokens the data API accepts, and refresh tokens the token endpoint accepts.
+    pub access: Vec<String>,
+    pub refresh: Vec<String>,
+    issued: Vec<String>,
 }
 
 impl Fake {
     pub fn hits(&self, path: &str) -> usize {
         self.requests.iter().filter(|(p, _)| p == path).count()
+    }
+
+    pub fn refreshes(&self) -> usize {
+        self.requests
+            .iter()
+            .filter(|(_, form)| form.get("grant_type").map(String::as_str) == Some("refresh_token"))
+            .count()
     }
 
     /// Every value that must never appear in a reply to the tenant.
@@ -119,20 +158,64 @@ impl Fake {
                 .iter()
                 .filter_map(|(_, form)| form.get("code_verifier").cloned()),
         );
+        out.extend(self.issued.iter().cloned());
         out
     }
 }
 
 type Shared = Arc<Mutex<Fake>>;
 
+fn invalid_grant() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({ "error": "invalid_grant" })),
+    )
+        .into_response()
+}
+
 async fn token(State(fake): State<Shared>, Form(form): Form<HashMap<String, String>>) -> Response {
+    let delay = {
+        let mut fake = fake.lock().unwrap();
+        fake.requests.push(("/token".into(), form.clone()));
+        fake.refresh_delay
+    };
+    let field = |k: &str| form.get(k).map(String::as_str).unwrap_or_default();
+    if field("grant_type") == "refresh_token" {
+        tokio::time::sleep(delay).await;
+    }
     let mut fake = fake.lock().unwrap();
-    fake.requests.push(("/token".into(), form.clone()));
     if fake.token_status != StatusCode::OK {
         let status = fake.token_status;
-        return (status, Json(json!({ "error": "invalid_grant" }))).into_response();
+        let error = if status == StatusCode::BAD_REQUEST {
+            "invalid_grant"
+        } else {
+            "server_error"
+        };
+        return (status, Json(json!({ "error": error }))).into_response();
     }
-    let field = |k: &str| form.get(k).map(String::as_str).unwrap_or_default();
+    if field("grant_type") == "refresh_token" {
+        let presented = field("refresh_token").to_string();
+        if field("client_id") != CLIENT_ID
+            || field("client_secret") != CLIENT_SECRET
+            || !fake.refresh.contains(&presented)
+        {
+            return invalid_grant();
+        }
+        let n = fake.refreshes();
+        let access = format!("ya29.fake-refreshed-{n}");
+        fake.access.push(access.clone());
+        fake.issued.push(access.clone());
+        let mut reply =
+            json!({ "access_token": access, "expires_in": 3599, "token_type": "Bearer" });
+        if fake.rotate {
+            let rotated = format!("1//fake-rotated-{n}");
+            fake.refresh.retain(|t| *t != presented);
+            fake.refresh.push(rotated.clone());
+            fake.issued.push(rotated.clone());
+            reply["refresh_token"] = json!(rotated);
+        }
+        return Json(reply).into_response();
+    }
     let ok_client = field("grant_type") == "authorization_code"
         && field("client_id") == CLIENT_ID
         && field("client_secret") == CLIENT_SECRET
@@ -146,11 +229,7 @@ async fn token(State(fake): State<Shared>, Form(form): Form<HashMap<String, Stri
         .find(|c| c.code == code && !c.used && c.challenge == verifier_challenge)
         .filter(|_| ok_client)
     else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "invalid_grant" })),
-        )
-            .into_response();
+        return invalid_grant();
     };
     consent.used = true;
     let mut reply = json!({
@@ -190,6 +269,64 @@ async fn revoke(State(fake): State<Shared>, Form(form): Form<HashMap<String, Str
     fake.revoke_status.into_response()
 }
 
+/// Drive, Gmail and Calendar reads, answered only to an access token the stand-in issued.
+async fn data(
+    State(fake): State<Shared>,
+    uri: Uri,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let mut fake = fake.lock().unwrap();
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    fake.data.push(DataRequest {
+        path: uri.path().to_string(),
+        query: query.clone(),
+        authorization: authorization.clone(),
+    });
+    let token = authorization
+        .as_deref()
+        .and_then(|a| a.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    if fake.unauthorized > 0 || !fake.access.iter().any(|t| t == token) {
+        fake.unauthorized = fake.unauthorized.saturating_sub(1);
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": { "code": 401, "message": "Invalid Credentials" } })),
+        )
+            .into_response();
+    }
+    let segments: Vec<&str> = uri.path().split('/').skip(1).collect();
+    let json_body = |body: String| ([(header::CONTENT_TYPE, "application/json")], body);
+    match segments[..] {
+        ["drive", "v3", "drives"] => json_body(r#"{"drives":[]}"#.into()).into_response(),
+        ["drive", "v3", "files"] => json_body(LISTING.into()).into_response(),
+        ["drive", "v3", "files", _] if query.get("alt").map(String::as_str) == Some("media") => (
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            vec![b'x'; fake.media_size],
+        )
+            .into_response(),
+        ["drive", "v3", "files", id] => {
+            json_body(json!({ "id": id, "name": "Notes" }).to_string()).into_response()
+        }
+        ["drive", "v3", "files", _, "export"] => {
+            ([(header::CONTENT_TYPE, "text/csv")], "a,b\n1,2\n").into_response()
+        }
+        ["gmail", "v1", "users", "me", "messages"] => {
+            json_body(r#"{"messages":[{"id":"m1"}]}"#.into()).into_response()
+        }
+        ["gmail", "v1", "users", "me", "messages", id] => {
+            json_body(json!({ "id": id, "snippet": "hello" }).to_string()).into_response()
+        }
+        ["calendar", "v3", "calendars", "primary", "events"] => {
+            json_body(r#"{"items":[]}"#.into()).into_response()
+        }
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 pub struct FakeGoogle {
     pub state: Shared,
     pub addr: SocketAddr,
@@ -225,11 +362,20 @@ impl FakeGoogle {
             omit_refresh_token: false,
             account_status: StatusCode::OK,
             revoke_status: StatusCode::OK,
+            data: vec![],
+            rotate: false,
+            refresh_delay: Duration::ZERO,
+            unauthorized: 0,
+            media_size: 0,
+            access: vec![],
+            refresh: vec![],
+            issued: vec![],
         }));
         let app = Router::new()
             .route("/token", post(token))
             .route("/v1/userinfo", get(userinfo))
             .route("/revoke", post(revoke))
+            .fallback(data)
             .with_state(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -286,6 +432,8 @@ impl FakeGoogle {
             used: false,
         };
         fake.consents.push(consent.clone());
+        fake.access.push(consent.access_token.clone());
+        fake.refresh.push(consent.refresh_token.clone());
         consent
     }
 
@@ -294,10 +442,99 @@ impl FakeGoogle {
     }
 }
 
+/// A CA standing in for the KMS's, and the leaves it issues.
+pub struct Ca {
+    key: KeyPair,
+    pub cert: rcgen::Certificate,
+}
+
+impl Ca {
+    pub fn new() -> Self {
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&key).unwrap();
+        Ca { key, cert }
+    }
+
+    pub fn der(&self) -> CertificateDer<'static> {
+        self.cert.der().clone()
+    }
+
+    /// A leaf carrying exactly `sans` as URI SANs, usable as a client and as a server.
+    pub fn leaf(&self, sans: &[String]) -> Identity {
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = CertificateParams::default();
+        params.subject_alt_names = sans
+            .iter()
+            .map(|s| SanType::URI(Ia5String::try_from(s.as_str()).unwrap()))
+            .collect();
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ClientAuth,
+            ExtendedKeyUsagePurpose::ServerAuth,
+        ];
+        let issuer = Issuer::from_ca_cert_der(self.cert.der(), &self.key).unwrap();
+        let leaf = params.signed_by(&key, &issuer).unwrap();
+        Identity {
+            chain: vec![leaf.der().to_vec(), self.cert.der().to_vec()],
+            pkcs8: key.serialize_der(),
+        }
+    }
+
+    pub fn instance(&self) -> Identity {
+        self.leaf(&[
+            format!(
+                "alphacompute://{}/{}/{}",
+                Uuid::now_v7(),
+                Uuid::now_v7(),
+                "a".repeat(64)
+            ),
+            format!("urn:alphacompute:revision:sha256:{}", "1".repeat(64)),
+        ])
+    }
+}
+
+/// A client presenting `identity` (or no certificate) and trusting only `ca` for the broker.
+pub fn instance_client(ca: &Ca, identity: Option<Identity>) -> reqwest::Client {
+    let config = alpha_client::tls::client_config(
+        Some(Pin::Ca(ca.der())),
+        identity,
+        Arc::new(rustls::time_provider::DefaultTimeProvider),
+    )
+    .unwrap();
+    reqwest::Client::builder()
+        .tls_backend_preconfigured(config)
+        .build()
+        .unwrap()
+}
+
+/// Serves the router over the broker's own listener on an ephemeral port.
+async fn start_broker(ca: &Ca, app: Router) -> SocketAddr {
+    let own = ca.instance();
+    let key = rustls::crypto::aws_lc_rs::default_provider()
+        .key_provider
+        .load_private_key(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(own.pkcs8)))
+        .unwrap();
+    let certified = rustls::sign::CertifiedKey::new(
+        own.chain.into_iter().map(CertificateDer::from).collect(),
+        key,
+    );
+    let config = tls::server_config(Arc::new(SingleCertAndKey::from(certified)), ca.der()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(tls::serve(listener, config, app, std::future::pending()));
+    addr
+}
+
 pub struct Harness {
+    pub state: Arc<AppState>,
     pub pool: PgPool,
     pub google: FakeGoogle,
     pub app: Router,
+    pub ca: Ca,
+    pub broker: SocketAddr,
+    /// An attested Instance's client: a leaf from the broker's CA.
+    pub instance: reqwest::Client,
 }
 
 pub async fn harness() -> Option<Harness> {
@@ -311,21 +548,52 @@ pub async fn harness() -> Option<Harness> {
         secrets: parking_lot::RwLock::new(Secrets {
             google_client_secret: CLIENT_SECRET.to_string().into(),
             connect_bearer: BEARER.as_bytes().to_vec().into(),
+            proxy_bearer: PROXY_BEARER.as_bytes().to_vec().into(),
             connectors_key: KEY.into(),
         }),
         pool: pool.clone(),
         http: google.client(),
+        tokens: Default::default(),
     });
+    let app = router(state.clone());
+    let ca = Ca::new();
+    let broker = start_broker(&ca, app.clone()).await;
+    let instance = instance_client(&ca, Some(ca.instance()));
     Some(Harness {
+        state,
         pool,
-        app: router(state),
+        app,
         google,
+        ca,
+        broker,
+        instance,
     })
 }
 
 pub struct Reply {
     pub status: StatusCode,
     pub body: Value,
+}
+
+/// A `/proxy` reply: the provider's bytes are not always JSON.
+pub struct Raw {
+    pub status: StatusCode,
+    pub content_type: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
+impl Raw {
+    pub fn json(&self) -> Value {
+        serde_json::from_slice(&self.bytes).unwrap()
+    }
+
+    pub fn code(&self) -> Value {
+        self.json()["error"]["code"].clone()
+    }
+}
+
+pub fn read(connection: Uuid, url: &str) -> Value {
+    json!({ "member": MEMBER, "connection_id": connection, "method": "GET", "url": url })
 }
 
 impl Harness {
@@ -395,6 +663,58 @@ impl Harness {
         let consent = self.google.consent(&query["code_challenge"], email);
         let reply = self.finish(member, &consent.code, &query["state"]).await;
         (reply, consent)
+    }
+
+    /// `POST /proxy` over the real listener from `client`; fails the test if anything in the
+    /// reply, headers included, carries a token or secret. `Err` when the request itself failed.
+    pub async fn proxy_with(
+        &self,
+        client: &reqwest::Client,
+        bearer: Option<&str>,
+        body: &Value,
+    ) -> Result<Raw, reqwest::Error> {
+        let mut request = client
+            .post(format!("https://{}/proxy", self.broker))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.to_string());
+        if let Some(bearer) = bearer {
+            request = request.bearer_auth(bearer);
+        }
+        let response = request.send().await?;
+        let status = response.status();
+        let headers = format!("{:?}", response.headers());
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .map(|v| v.to_str().unwrap().to_string());
+        let bytes = response.bytes().await?.to_vec();
+        let text = String::from_utf8_lossy(&bytes);
+        for secret in self.google.with(|f| f.secrets()) {
+            assert!(!text.contains(&secret), "/proxy answered a secret: {text}");
+            assert!(
+                !headers.contains(&secret),
+                "/proxy answered a secret: {headers}"
+            );
+        }
+        Ok(Raw {
+            status,
+            content_type,
+            bytes,
+        })
+    }
+
+    /// From the attested Instance with the proxy bearer.
+    pub async fn proxy(&self, body: &Value) -> Raw {
+        self.proxy_with(&self.instance, Some(PROXY_BEARER), body)
+            .await
+            .unwrap()
+    }
+
+    /// A connection of `MEMBER` to Google, made through the connect routes.
+    pub async fn connected(&self) -> (Uuid, Consent) {
+        let (reply, consent) = self.connect(MEMBER, EMAIL).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        (id_of(&reply), consent)
     }
 
     pub async fn stored_token(&self, id: Uuid) -> Option<Vec<u8>> {

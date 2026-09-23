@@ -30,6 +30,8 @@ jobs:
           # No app_id: the release workflow renders a compose only for the KMS.
           - name: alpha-inference
             dockerfile: images/inference/Dockerfile
+          - name: alpha-broker
+            dockerfile: images/broker/Dockerfile
     env:
       FEATURES: ${{ matrix.features }}
     steps:

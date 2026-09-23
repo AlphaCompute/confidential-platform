@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::{AppState, AuthedCorpus, Error, oauth, store};
 
 /// The member reference is the lowercase hex SHA-256 of the tenant's user id.
-fn parse_member(hex_member: &str) -> Result<[u8; 32], Error> {
+pub(crate) fn parse_member(hex_member: &str) -> Result<[u8; 32], Error> {
     let malformed = || Error::Malformed("member must be 64 lowercase hex characters".into());
     if hex_member.bytes().any(|b| b.is_ascii_uppercase()) {
         return Err(malformed());
@@ -27,7 +27,7 @@ fn parse_member(hex_member: &str) -> Result<[u8; 32], Error> {
     <[u8; 32]>::from_hex(hex_member).map_err(|_| malformed())
 }
 
-fn parse_body<T: DeserializeOwned>(body: &Bytes) -> Result<T, Error> {
+pub(crate) fn parse_body<T: DeserializeOwned>(body: &Bytes) -> Result<T, Error> {
     serde_json::from_slice(body).map_err(|e| Error::Malformed(format!("body: {e}")))
 }
 
@@ -165,6 +165,7 @@ pub async fn disconnect(
     let (provider, sealed) = store::revoke_connection(&state.pool, id, &member)
         .await?
         .ok_or(Error::NotFound)?;
+    state.tokens.lock().remove(&id);
     let key = state.secrets.read().connectors_key.clone();
     let token = store::open(&key, id.as_bytes(), &sealed);
     let token = token.as_deref().and_then(|t| std::str::from_utf8(t).ok());

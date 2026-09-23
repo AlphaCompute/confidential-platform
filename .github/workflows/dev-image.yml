@@ -25,6 +25,8 @@ jobs:
             features: dev-root
           - name: alpha-inference
             dockerfile: images/inference/Dockerfile
+          - name: alpha-broker
+            dockerfile: images/broker/Dockerfile
     steps:
       - uses: actions/checkout@v4
       - id: meta
