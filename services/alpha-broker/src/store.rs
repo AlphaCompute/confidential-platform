@@ -109,38 +109,23 @@ pub async fn save_connection(
     .bind(account)
     .fetch_optional(&mut *tx)
     .await?;
-    let id = match existing {
-        Some(id) => {
-            let sealed = seal(key, id.as_bytes(), refresh_token.as_bytes())?;
-            sqlx::query(
-                "update connections set enc_refresh_token = $2, scopes = $3, dead_at = null
-                 where id = $1",
-            )
-            .bind(id)
-            .bind(sealed)
-            .bind(scopes)
-            .execute(&mut *tx)
-            .await?;
-            id
-        }
-        None => {
-            let id = Uuid::now_v7();
-            let sealed = seal(key, id.as_bytes(), refresh_token.as_bytes())?;
-            sqlx::query(
-                "insert into connections (id, member_key_sha256, provider, account, enc_refresh_token, scopes)
-                 values ($1, $2, $3, $4, $5, $6)",
-            )
-            .bind(id)
-            .bind(member.as_slice())
-            .bind(provider)
-            .bind(account)
-            .bind(sealed)
-            .bind(scopes)
-            .execute(&mut *tx)
-            .await?;
-            id
-        }
+    let (id, new) = existing.map_or((Uuid::now_v7(), true), |id| (id, false));
+    let sealed = seal(key, id.as_bytes(), refresh_token.as_bytes())?;
+    let statement = if new {
+        "insert into connections (id, member_key_sha256, provider, account, enc_refresh_token, scopes)
+         values ($1, $2, $3, $4, $5, $6)"
+    } else {
+        "update connections set enc_refresh_token = $5, scopes = $6, dead_at = null where id = $1"
     };
+    sqlx::query(statement)
+        .bind(id)
+        .bind(member.as_slice())
+        .bind(provider)
+        .bind(account)
+        .bind(sealed)
+        .bind(scopes)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(id)
 }
