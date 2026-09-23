@@ -1,24 +1,20 @@
 //! Thin entrypoint: attest, read this Instance's identity, its Secrets and the connectors key
-//! from the runtime socket, migrate the broker's own database, then serve over TLS on `:8443`
-//! until SIGTERM, refreshing the leaf, the Secrets and the key every five minutes. A refresh
+//! from the runtime socket, migrate the broker's own database, then serve over TLS on `:8443`,
+//! accepting client certificates that chain to the KMS CA, until SIGTERM, refreshing the leaf, the Secrets and the key every five minutes. A refresh
 //! that fails ends the process: the runtime removes its socket when the Revision is revoked,
 //! and the broker must not go on serving with what it read before.
 //! `alpha-broker migrate` stops after the migration. Every error is a non-zero exit.
 
-use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alpha_broker::{AppState, Config, Error, Secrets, router, store};
+use alpha_broker::{AppState, Config, Error, Secrets, router, store, tls};
 use alpha_client::runtime::RuntimeSocket;
-use alpha_client::tls::{InstanceCert, server_config};
-use hyper_util::rt::{TokioExecutor, TokioIo};
-use hyper_util::server::conn::auto::Builder;
-use hyper_util::server::graceful::GracefulShutdown;
-use hyper_util::service::TowerToHyperService;
+use alpha_client::tls::InstanceCert;
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
-use tokio_rustls::TlsAcceptor;
 use zeroize::Zeroizing;
 
 const PORT: u16 = 8443;
@@ -55,6 +51,7 @@ async fn read_secrets(runtime: &RuntimeSocket) -> Result<Secrets, Error> {
         &secret(runtime, "google-client-secret").await?,
     )?;
     let connect_bearer = secret(runtime, "connect-bearer").await?;
+    let proxy_bearer = secret(runtime, "proxy-bearer").await?;
     let connectors_key = runtime
         .key("connectors")
         .await
@@ -62,6 +59,7 @@ async fn read_secrets(runtime: &RuntimeSocket) -> Result<Secrets, Error> {
     Ok(Secrets {
         google_client_secret,
         connect_bearer,
+        proxy_bearer,
         connectors_key,
     })
 }
@@ -100,8 +98,13 @@ async fn run() -> Result<(), Error> {
 
     let cert =
         Arc::new(InstanceCert::new(&identity).map_err(|e| Error::internal(format!("tls: {e}")))?);
-    let tls_config =
-        server_config(cert.clone()).map_err(|e| Error::internal(format!("tls: {e}")))?;
+    // The last certificate of this Instance's own chain is the KMS CA that alpha-runtime
+    // already checked against the measured one, so a CA rotation needs only a restart.
+    let kms_ca = CertificateDer::pem_slice_iter(identity.certificate_chain.as_bytes())
+        .last()
+        .ok_or_else(|| Error::internal("certificate chain is empty"))?
+        .map_err(|e| Error::internal(format!("certificate chain: {e}")))?;
+    let tls_config = tls::server_config(cert.clone(), kms_ca)?;
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
@@ -112,6 +115,7 @@ async fn run() -> Result<(), Error> {
         secrets: parking_lot::RwLock::new(read_secrets(&runtime).await?),
         pool,
         http,
+        tokens: Default::default(),
     });
     let app = router(state.clone());
 
@@ -121,7 +125,7 @@ async fn run() -> Result<(), Error> {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| Error::internal(format!("sigterm: {e}")))?;
     let mut outcome = Ok(());
-    serve_tls(listener, tls_config, app, async {
+    tls::serve(listener, tls_config, app, async {
         tokio::select! {
             _ = term.recv() => {}
             _ = tokio::signal::ctrl_c() => {}
@@ -149,38 +153,4 @@ async fn renew_forever(runtime: &RuntimeSocket, cert: &InstanceCert, state: &App
             return e;
         }
     }
-}
-
-/// Accepts TLS connections until `shutdown` resolves, then drains the ones already open.
-async fn serve_tls(
-    listener: TcpListener,
-    tls_config: Arc<rustls::ServerConfig>,
-    app: axum::Router,
-    shutdown: impl Future<Output = ()>,
-) {
-    let acceptor = TlsAcceptor::from(tls_config);
-    let graceful = GracefulShutdown::new();
-    let mut shutdown = std::pin::pin!(shutdown);
-    loop {
-        let (stream, _) = tokio::select! {
-            accepted = listener.accept() => match accepted {
-                Ok(accepted) => accepted,
-                Err(_) => continue,
-            },
-            () = &mut shutdown => break,
-        };
-        let acceptor = acceptor.clone();
-        let app = app.clone();
-        let watcher = graceful.watcher();
-        tokio::spawn(async move {
-            let Ok(tls) = acceptor.accept(stream).await else {
-                return;
-            };
-            let service = TowerToHyperService::new(app);
-            let builder = Builder::new(TokioExecutor::new());
-            let conn = builder.serve_connection(TokioIo::new(tls), service);
-            let _ = watcher.watch(conn).await;
-        });
-    }
-    graceful.shutdown().await;
 }

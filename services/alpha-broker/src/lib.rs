@@ -1,7 +1,9 @@
 //! The connectors broker: an App of its own that exchanges a provider's authorization code
 //! with a PKCE verifier only it holds, and keeps the refresh token sealed under a key only
 //! Instances of this App receive from the KMS. The tenant's backend starts and finishes a
-//! connect with its bearer and relays an opaque code; it never sees a token.
+//! connect with its bearer and relays an opaque code; it never sees a token. An attested
+//! Instance holding the proxy bearer reads through `/proxy` inside a fixed allowlist, with the
+//! member's access token attached here.
 
 #![cfg_attr(
     test,
@@ -16,7 +18,9 @@
 
 pub mod connect;
 pub mod oauth;
+pub mod proxy;
 pub mod store;
+pub mod tls;
 
 use std::sync::Arc;
 
@@ -63,6 +67,7 @@ impl Config {
 pub struct Secrets {
     pub google_client_secret: Zeroizing<String>,
     pub connect_bearer: Zeroizing<Vec<u8>>,
+    pub proxy_bearer: Zeroizing<Vec<u8>>,
     pub connectors_key: Zeroizing<[u8; 32]>,
 }
 
@@ -71,6 +76,7 @@ pub struct AppState {
     pub secrets: parking_lot::RwLock<Secrets>,
     pub pool: PgPool,
     pub http: reqwest::Client,
+    pub tokens: proxy::TokenCache,
 }
 
 /// Every error this service answers with. No message ever carries a token, code, verifier or
@@ -87,6 +93,16 @@ pub enum Error {
     StateInvalid,
     #[error("the provider did not complete the connection")]
     ExchangeFailed,
+    #[error("a client certificate of an attested Instance is required")]
+    CertInvalid,
+    #[error("the request is outside what this connection may read")]
+    NotAllowed,
+    #[error("the provider no longer accepts this connection; the member must reconnect")]
+    ReconnectRequired,
+    #[error("the provider could not be reached")]
+    Upstream,
+    #[error("the provider's response is larger than the broker relays")]
+    TooLarge,
     #[error("{0}")]
     Internal(String),
 }
@@ -111,6 +127,11 @@ impl IntoResponse for Error {
             Error::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             Error::StateInvalid => (StatusCode::BAD_REQUEST, "state_invalid"),
             Error::ExchangeFailed => (StatusCode::BAD_GATEWAY, "exchange_failed"),
+            Error::CertInvalid => (StatusCode::UNAUTHORIZED, "cert_invalid"),
+            Error::NotAllowed => (StatusCode::FORBIDDEN, "not_allowed"),
+            Error::ReconnectRequired => (StatusCode::CONFLICT, "reconnect_required"),
+            Error::Upstream => (StatusCode::BAD_GATEWAY, "upstream"),
+            Error::TooLarge => (StatusCode::BAD_GATEWAY, "too_large"),
             Error::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         };
         let message = match &self {
@@ -131,6 +152,20 @@ pub fn random<const N: usize>() -> Result<[u8; N], Error> {
     Ok(out)
 }
 
+fn bearer(parts: &Parts, expected: &[u8]) -> Result<(), Error> {
+    let presented = parts
+        .headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(Error::Unauthorized)?;
+    if alpha_client::bearer_matches(presented.as_bytes(), expected) {
+        Ok(())
+    } else {
+        Err(Error::Unauthorized)
+    }
+}
+
 /// Proof of the tenant backend's connect bearer, extracted before any handler runs.
 pub struct AuthedCorpus;
 
@@ -141,18 +176,30 @@ impl FromRequestParts<Arc<AppState>> for AuthedCorpus {
         parts: &mut Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
-        let presented = parts
-            .headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .ok_or(Error::Unauthorized)?;
-        if alpha_client::bearer_matches(presented.as_bytes(), &state.secrets.read().connect_bearer)
-        {
-            Ok(AuthedCorpus)
-        } else {
-            Err(Error::Unauthorized)
-        }
+        bearer(parts, &state.secrets.read().connect_bearer).map(|()| AuthedCorpus)
+    }
+}
+
+/// An Instance's leaf, already chained to the KMS CA in the handshake, then the proxy bearer.
+/// A KMS node's leaf chains to the same CA but does not carry an Instance's SANs.
+pub struct AuthedInstance;
+
+impl FromRequestParts<Arc<AppState>> for AuthedInstance {
+    type Rejection = Error;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        let leaf = parts
+            .extensions
+            .get::<tls::PeerCerts>()
+            .and_then(|peer| peer.0.first())
+            .ok_or(Error::CertInvalid)?;
+        alpha_client::tls::uri_sans(leaf)
+            .and_then(|sans| alpha_client::tls::parse_instance_sans(&sans))
+            .map_err(|_| Error::CertInvalid)?;
+        bearer(parts, &state.secrets.read().proxy_bearer).map(|()| AuthedInstance)
     }
 }
 
@@ -177,6 +224,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/connect/{provider}", post(connect::start))
         .route("/connections", get(connect::list))
         .route("/connections/{id}", delete(connect::disconnect))
+        .route("/proxy", post(proxy::proxy))
         .route("/healthz", get(healthz))
         .route("/ready", get(ready))
         .with_state(state)
