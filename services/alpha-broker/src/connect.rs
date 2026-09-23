@@ -10,6 +10,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
+use hex::FromHex;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -20,16 +21,10 @@ use crate::{AppState, AuthedCorpus, Error, oauth, store};
 /// The member reference is the lowercase hex SHA-256 of the tenant's user id.
 fn parse_member(hex_member: &str) -> Result<[u8; 32], Error> {
     let malformed = || Error::Malformed("member must be 64 lowercase hex characters".into());
-    if !hex_member
-        .bytes()
-        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    {
+    if hex_member.bytes().any(|b| b.is_ascii_uppercase()) {
         return Err(malformed());
     }
-    hex::decode(hex_member)
-        .ok()
-        .and_then(|bytes| bytes.try_into().ok())
-        .ok_or_else(malformed)
+    <[u8; 32]>::from_hex(hex_member).map_err(|_| malformed())
 }
 
 fn parse_body<T: DeserializeOwned>(body: &Bytes) -> Result<T, Error> {

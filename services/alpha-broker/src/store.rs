@@ -65,6 +65,7 @@ pub async fn insert_pending(
     Ok(())
 }
 
+#[derive(sqlx::FromRow)]
 pub struct Pending {
     pub member: Vec<u8>,
     pub provider: String,
@@ -74,21 +75,13 @@ pub struct Pending {
 
 /// Consumes the state whatever it turns out to be, so a state is never used twice.
 pub async fn take_pending(pool: &PgPool, state: &str) -> Result<Option<Pending>, Error> {
-    let row: Option<(Vec<u8>, String, Vec<u8>, bool)> = sqlx::query_as(
+    Ok(sqlx::query_as(
         "delete from pending_connects where state = $1
-         returning member_key_sha256, provider, enc_pkce_verifier, exp > now()",
+         returning member_key_sha256 as member, provider, enc_pkce_verifier, exp > now() as live",
     )
     .bind(state)
     .fetch_optional(pool)
-    .await?;
-    Ok(
-        row.map(|(member, provider, enc_pkce_verifier, live)| Pending {
-            member,
-            provider,
-            enc_pkce_verifier,
-            live,
-        }),
-    )
+    .await?)
 }
 
 /// A member connecting the same account again keeps the connection's id, so a chat that

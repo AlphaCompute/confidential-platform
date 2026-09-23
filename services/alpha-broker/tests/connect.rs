@@ -45,18 +45,7 @@ async fn a_member_connects_google_and_the_stored_token_is_sealed() {
     );
     assert!(store::open(&KEY, uuid::Uuid::now_v7().as_bytes(), &blob).is_none());
 
-    let pending: i64 = sqlx::query_scalar("select count(*) from pending_connects")
-        .fetch_one(&h.pool)
-        .await
-        .unwrap();
-    assert_eq!(pending, 0);
-}
-
-async fn connections(h: &Harness) -> i64 {
-    sqlx::query_scalar("select count(*) from connections")
-        .fetch_one(&h.pool)
-        .await
-        .unwrap()
+    assert_eq!(count(&h, "pending_connects").await, 0);
 }
 
 #[tokio::test]
@@ -123,11 +112,7 @@ async fn an_unknown_provider_is_not_found_and_a_malformed_member_is_refused() {
             assert_eq!(reply.body["error"]["code"], "malformed");
         }
     }
-    let pending: i64 = sqlx::query_scalar("select count(*) from pending_connects")
-        .fetch_one(&h.pool)
-        .await
-        .unwrap();
-    assert_eq!(pending, 0);
+    assert_eq!(count(&h, "pending_connects").await, 0);
 }
 
 #[tokio::test]
@@ -213,7 +198,7 @@ async fn two_concurrent_finishes_with_one_state_connect_exactly_once() {
     let mut statuses = [a.status, b.status];
     statuses.sort();
     assert_eq!(statuses, [StatusCode::OK, StatusCode::BAD_REQUEST]);
-    assert_eq!(connections(&h).await, 1);
+    assert_eq!(count(&h, "connections").await, 1);
     assert_eq!(h.google.with(|f| f.hits("/token")), 1);
 }
 
@@ -236,7 +221,7 @@ async fn a_failed_exchange_or_account_lookup_answers_exchange_failed_and_writes_
         assert_eq!(reply.status, StatusCode::BAD_GATEWAY, "{}", reply.body);
         assert_eq!(reply.body["error"]["code"], "exchange_failed");
     }
-    assert_eq!(connections(&h).await, 0);
+    assert_eq!(count(&h, "connections").await, 0);
 }
 
 #[tokio::test]

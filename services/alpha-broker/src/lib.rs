@@ -60,21 +60,11 @@ impl Config {
     }
 }
 
-/// Held only in zeroizing buffers; `Debug` never shows the bytes.
+/// Held only in zeroizing buffers, and deliberately not `Debug`.
 pub struct Secrets {
     pub google_client_secret: Zeroizing<String>,
     pub connect_bearer: Zeroizing<Vec<u8>>,
     pub connectors_key: Zeroizing<[u8; 32]>,
-}
-
-impl std::fmt::Debug for Secrets {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Secrets")
-            .field("google_client_secret", &"<redacted>")
-            .field("connect_bearer", &"<redacted>")
-            .field("connectors_key", &"<redacted>")
-            .finish()
-    }
 }
 
 pub struct AppState {

@@ -93,7 +93,6 @@ pub struct Fake {
     consents: Vec<Consent>,
     /// Every request that reached the stand-in: path and form or query fields.
     pub requests: Vec<(String, HashMap<String, String>)>,
-    pub verifiers: Vec<String>,
     pub token_status: StatusCode,
     pub omit_refresh_token: bool,
     pub account_status: StatusCode,
@@ -115,7 +114,11 @@ impl Fake {
                 c.refresh_token.clone(),
             ]);
         }
-        out.extend(self.verifiers.iter().cloned());
+        out.extend(
+            self.requests
+                .iter()
+                .filter_map(|(_, form)| form.get("code_verifier").cloned()),
+        );
         out
     }
 }
@@ -125,9 +128,6 @@ type Shared = Arc<Mutex<Fake>>;
 async fn token(State(fake): State<Shared>, Form(form): Form<HashMap<String, String>>) -> Response {
     let mut fake = fake.lock().unwrap();
     fake.requests.push(("/token".into(), form.clone()));
-    if let Some(v) = form.get("code_verifier") {
-        fake.verifiers.push(v.clone());
-    }
     if fake.token_status != StatusCode::OK {
         let status = fake.token_status;
         return (status, Json(json!({ "error": "invalid_grant" }))).into_response();
@@ -195,7 +195,6 @@ pub struct FakeGoogle {
     pub state: Shared,
     pub addr: SocketAddr,
     ca_der: Vec<u8>,
-    minted: Mutex<u32>,
 }
 
 impl FakeGoogle {
@@ -223,7 +222,6 @@ impl FakeGoogle {
         let state: Shared = Arc::new(Mutex::new(Fake {
             consents: vec![],
             requests: vec![],
-            verifiers: vec![],
             token_status: StatusCode::OK,
             omit_refresh_token: false,
             account_status: StatusCode::OK,
@@ -256,7 +254,6 @@ impl FakeGoogle {
             state,
             addr,
             ca_der: ca.der().to_vec(),
-            minted: Mutex::new(0),
         }
     }
 
@@ -273,11 +270,8 @@ impl FakeGoogle {
 
     /// Stands in for the member consenting as `email` on the page the authorization URL opens.
     pub fn consent(&self, challenge: &str, email: &str) -> Consent {
-        let n = {
-            let mut minted = self.minted.lock().unwrap();
-            *minted += 1;
-            *minted
-        };
+        let mut fake = self.state.lock().unwrap();
+        let n = fake.consents.len() + 1;
         let consent = Consent {
             code: format!("4/fake-code-{n}"),
             access_token: format!("ya29.fake-access-{n}"),
@@ -286,7 +280,7 @@ impl FakeGoogle {
             email: email.to_string(),
             used: false,
         };
-        self.state.lock().unwrap().consents.push(consent.clone());
+        fake.consents.push(consent.clone());
         consent
     }
 
@@ -405,6 +399,13 @@ impl Harness {
             .await
             .unwrap()
     }
+}
+
+pub async fn count(h: &Harness, table: &str) -> i64 {
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!("select count(*) from {table}")))
+        .fetch_one(&h.pool)
+        .await
+        .unwrap()
 }
 
 pub fn id_of(reply: &Reply) -> Uuid {
