@@ -27,7 +27,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use zeroize::Zeroizing;
 
@@ -132,24 +131,6 @@ pub fn random<const N: usize>() -> Result<[u8; N], Error> {
     Ok(out)
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
-fn bearer_matches(presented: &[u8], expected: &[u8]) -> bool {
-    constant_time_eq(
-        Sha256::digest(presented).as_slice(),
-        Sha256::digest(expected).as_slice(),
-    )
-}
-
 /// Proof of the tenant backend's connect bearer, extracted before any handler runs.
 pub struct AuthedCorpus;
 
@@ -166,7 +147,8 @@ impl FromRequestParts<Arc<AppState>> for AuthedCorpus {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
             .ok_or(Error::Unauthorized)?;
-        if bearer_matches(presented.as_bytes(), &state.secrets.read().connect_bearer) {
+        if alpha_client::bearer_matches(presented.as_bytes(), &state.secrets.read().connect_bearer)
+        {
             Ok(AuthedCorpus)
         } else {
             Err(Error::Unauthorized)
