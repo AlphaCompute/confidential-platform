@@ -393,3 +393,46 @@ async fn healthz_and_ready_need_no_bearer() {
         assert_eq!(reply.body, json!({ "ok": true }));
     }
 }
+
+#[tokio::test]
+async fn a_reconnect_that_waits_on_a_disconnect_makes_a_new_connection() {
+    let Some(h) = harness().await else { return };
+    let (first, _) = h.connect(MEMBER, EMAIL).await;
+    let id = id_of(&first);
+
+    let mut disconnect = h.pool.begin().await.unwrap();
+    sqlx::query("select id from connections where id = $1 for update")
+        .bind(id)
+        .execute(&mut *disconnect)
+        .await
+        .unwrap();
+    let reconnect = h.connect(MEMBER, EMAIL);
+    let revoke_while_reconnect_waits = async {
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "select count(*) from pg_stat_activity
+                 where datname = current_database() and wait_event_type = 'Lock'",
+            )
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        sqlx::query(
+            "update connections set revoked_at = now(), enc_refresh_token = null where id = $1",
+        )
+        .bind(id)
+        .execute(&mut *disconnect)
+        .await
+        .unwrap();
+        disconnect.commit().await.unwrap();
+    };
+    let ((second, _), ()) = tokio::join!(reconnect, revoke_while_reconnect_waits);
+
+    assert_eq!(second.status, StatusCode::OK, "{}", second.body);
+    assert_ne!(id_of(&second), id);
+    assert_eq!(h.stored_token(id).await, None);
+}

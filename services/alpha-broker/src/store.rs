@@ -102,7 +102,8 @@ pub async fn save_connection(
         .await?;
     let existing: Option<Uuid> = sqlx::query_scalar(
         "select id from connections
-         where member_key_sha256 = $1 and provider = $2 and account = $3 and revoked_at is null",
+         where member_key_sha256 = $1 and provider = $2 and account = $3 and revoked_at is null
+         for update",
     )
     .bind(member.as_slice())
     .bind(provider)
