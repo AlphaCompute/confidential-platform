@@ -100,6 +100,8 @@ fn unpinned_client(timeout: Duration) -> Result<reqwest::Client, Error> {
         .map_err(|e| Error::internal(format!("report client tls: {e}")))?;
     reqwest::Client::builder()
         .tls_backend_preconfigured(tls)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .tls_info(true)
         .timeout(timeout)
         .build()
@@ -115,6 +117,8 @@ fn pinned_client(spki: &[u8]) -> Result<reqwest::Client, Error> {
     .map_err(|e| Error::internal(format!("forwarding client tls: {e}")))?;
     reqwest::Client::builder()
         .tls_backend_preconfigured(tls)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| Error::internal(format!("forwarding client: {e}")))
 }

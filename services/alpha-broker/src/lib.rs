@@ -20,7 +20,6 @@ pub mod connect;
 pub mod oauth;
 pub mod proxy;
 pub mod store;
-pub mod tls;
 
 use std::sync::Arc;
 

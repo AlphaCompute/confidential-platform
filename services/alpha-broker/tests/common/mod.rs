@@ -17,7 +17,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use alpha_broker::{AppState, Config, Secrets, oauth, router, tls};
+use alpha_broker::{AppState, Config, Secrets, oauth, router};
 use alpha_client::tls::{Identity, Pin};
 use axum::body::{Body, to_bytes};
 use axum::extract::{Form, Query, State};
@@ -527,7 +527,11 @@ async fn start_broker(ca: &Ca, app: Router) -> SocketAddr {
         own.chain.into_iter().map(CertificateDer::from).collect(),
         key,
     );
-    let config = tls::server_config(Arc::new(SingleCertAndKey::from(certified)), ca.der()).unwrap();
+    let config = alpha_client::tls::mtls_server_config(
+        Arc::new(SingleCertAndKey::from(certified)),
+        ca.der(),
+    )
+    .unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(alpha_client::tls::serve(

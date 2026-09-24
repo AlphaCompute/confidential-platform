@@ -32,6 +32,8 @@ jobs:
             dockerfile: images/inference/Dockerfile
           - name: alpha-broker
             dockerfile: images/broker/Dockerfile
+          - name: alpha-guard
+            dockerfile: images/guard/Dockerfile
     env:
       FEATURES: ${{ matrix.features }}
     steps:

@@ -1,21 +1,19 @@
-//! Thin entrypoint: attest, read this Instance's identity and both Secrets, then serve the
-//! `/v1` routes over TLS on `:8443` until SIGTERM, refreshing the leaf and both Secrets every
-//! five minutes. A refresh that fails ends the process: the runtime removes its socket when the
-//! Revision is revoked, and the front must not go on serving with what it read before. All
-//! logic lives in `run`, which maps every error to a non-zero exit and never panics.
+//! Thin entrypoint: attest, read this Instance's identity and its Secret, then serve over TLS on
+//! `:8443`, accepting client certificates that chain to the KMS CA, until SIGTERM, refreshing
+//! the leaf and the bearer every five minutes. A refresh that fails ends the process: the
+//! runtime removes its socket when the Revision is revoked, and the judge must not go on serving
+//! with what it read before. Every error is a non-zero exit.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use alpha_client::runtime::RuntimeSocket;
-use alpha_client::tls::{InstanceCert, serve, server_config};
-use alpha_inference::{AppState, Config, Error, Secrets, Upstream, router};
+use alpha_client::tls::InstanceCert;
+use alpha_guard::{AppState, Config, Error, front_client, router};
 use tokio::net::TcpListener;
 use zeroize::Zeroizing;
 
 const PORT: u16 = 8443;
-/// Every five minutes: a renewed leaf is served and rotated Secrets take effect, without a
-/// restart.
 const RENEW_INTERVAL: Duration = Duration::from_secs(300);
 
 #[tokio::main]
@@ -23,29 +21,21 @@ async fn main() {
     let code = match run().await {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("alpha-inference: {e}");
+            eprintln!("alpha-guard: {e}");
             1
         }
     };
     std::process::exit(code);
 }
 
-async fn read_secrets(runtime: &RuntimeSocket) -> Result<Secrets, Error> {
-    let provider_key = runtime
-        .secret("redpill-api-key")
+async fn read_bearer(runtime: &RuntimeSocket) -> Result<Zeroizing<String>, Error> {
+    let bearer = runtime
+        .secret("inference-bearer")
         .await
-        .map_err(|e| Error::internal(format!("secret redpill-api-key: {e}")))?;
-    let caller_bearer = runtime
-        .secret("caller-bearer")
-        .await
-        .map_err(|e| Error::internal(format!("secret caller-bearer: {e}")))?;
-    Ok(Secrets {
-        provider_key: Zeroizing::new(
-            String::from_utf8(provider_key.to_vec())
-                .map_err(|_| Error::internal("redpill-api-key is not utf8"))?,
-        ),
-        caller_bearer: Zeroizing::new(caller_bearer.to_vec()),
-    })
+        .map_err(|e| Error::internal(format!("secret inference-bearer: {e}")))?;
+    String::from_utf8(bearer.to_vec())
+        .map(Zeroizing::new)
+        .map_err(|_| Error::internal("inference-bearer is not utf8"))
 }
 
 async fn run() -> Result<(), Error> {
@@ -58,31 +48,31 @@ async fn run() -> Result<(), Error> {
         .await
         .map_err(|e| Error::internal(format!("identity: {e}")))?;
     eprintln!(
-        "alpha-inference: attested as app {} revision {}",
+        "alpha-guard: attested as app {} revision {}",
         identity.app_id, identity.compose_hash
     );
     let cert =
         Arc::new(InstanceCert::new(&identity).map_err(|e| Error::internal(format!("tls: {e}")))?);
-    let tls_config =
-        server_config(cert.clone()).map_err(|e| Error::internal(format!("tls: {e}")))?;
+    let kms_ca =
+        alpha_client::tls::kms_ca(&identity).map_err(|e| Error::internal(format!("tls: {e}")))?;
+    let tls_config = alpha_client::tls::mtls_server_config(cert.clone(), kms_ca.clone())
+        .map_err(|e| Error::internal(format!("tls: {e}")))?;
+    let front = front_client(kms_ca, config.inference_revisions.clone())?;
 
-    let secrets = read_secrets(&runtime).await?;
-    let upstream = Upstream::new(&config)?;
     let state = Arc::new(AppState {
         config,
-        secrets: parking_lot::RwLock::new(secrets),
-        upstream,
+        inference_bearer: parking_lot::RwLock::new(read_bearer(&runtime).await?),
+        front,
     });
     let app = router(state.clone());
 
     let listener = TcpListener::bind(("0.0.0.0", PORT))
         .await
         .map_err(|e| Error::internal(format!("bind :{PORT}: {e}")))?;
-
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| Error::internal(format!("sigterm: {e}")))?;
     let mut outcome = Ok(());
-    serve(listener, tls_config, app, async {
+    alpha_client::tls::serve(listener, tls_config, app, async {
         tokio::select! {
             _ = term.recv() => {}
             _ = tokio::signal::ctrl_c() => {}
@@ -103,7 +93,7 @@ async fn renew_forever(runtime: &RuntimeSocket, cert: &InstanceCert, state: &App
                 .map_err(|e| Error::internal(format!("renew identity: {e}")))?;
             cert.replace(&identity)
                 .map_err(|e| Error::internal(format!("renew tls: {e}")))?;
-            *state.secrets.write() = read_secrets(runtime).await?;
+            *state.inference_bearer.write() = read_bearer(runtime).await?;
             Ok::<(), Error>(())
         };
         if let Err(e) = renewed.await {
