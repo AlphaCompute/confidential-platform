@@ -373,7 +373,7 @@ async fn token(
         if !fake.omit_expires_in {
             reply["expires_in"] = json!(3599);
         }
-        if (fake.rotate || provider == "slack") && provider != "figma" {
+        if fake.rotate || provider == "slack" {
             let rotated = format!("{}fake-rotated-{n}", client.refresh);
             fake.refresh.retain(|t| *t != presented);
             fake.refresh.push(rotated.clone());
