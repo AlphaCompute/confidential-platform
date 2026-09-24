@@ -112,6 +112,12 @@ async fn every_listed_notion_tool_is_forwarded_and_acting_tools_are_refused_befo
             "params": { "name": "notion-update-page" } }]),
         );
         assert_eq!(h.proxy(&batch).await.status, StatusCode::FORBIDDEN);
+        let resources = mcp_rpc(
+            id,
+            MCP,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "resources/read" }),
+        );
+        assert_eq!(h.proxy(&resources).await.status, StatusCode::FORBIDDEN);
         let elsewhere = mcp_rpc(
             id,
             "https://mcp.notion.com/",

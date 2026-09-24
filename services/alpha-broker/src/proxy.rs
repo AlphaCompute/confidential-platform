@@ -101,20 +101,30 @@ fn check_headers(
     Ok(out)
 }
 
-/// An MCP request the broker forwards: one JSON-RPC object, never a batch, and a `tools/call`
-/// only of a tool named exactly on `tools`. Every other method passes as it is.
+/// Besides `tools/call`, the handshake and the tool listing. Resources, prompts and completions
+/// are refused: nothing has classified what they reach.
+const MCP_METHODS: &[&str] = &[
+    "initialize",
+    "notifications/initialized",
+    "ping",
+    "tools/list",
+];
+
+/// An MCP request the broker forwards: one JSON-RPC object, never a batch, whose method is on
+/// `MCP_METHODS` or is a `tools/call` of a tool named exactly on `tools`.
 pub fn mcp_call_allowed(tools: &[&str], body: Option<&Value>) -> bool {
     let Some(Value::Object(request)) = body else {
         return false;
     };
-    if request.get("method").and_then(Value::as_str) != Some("tools/call") {
-        return true;
+    match request.get("method").and_then(Value::as_str) {
+        Some("tools/call") => request
+            .get("params")
+            .and_then(|params| params.get("name"))
+            .and_then(Value::as_str)
+            .is_some_and(|name| tools.contains(&name)),
+        Some(method) => MCP_METHODS.contains(&method),
+        None => false,
     }
-    request
-        .get("params")
-        .and_then(|params| params.get("name"))
-        .and_then(Value::as_str)
-        .is_some_and(|name| tools.contains(&name))
 }
 
 /// The live connection of the member, its provider, the entry of `list` the request matches,
@@ -387,9 +397,14 @@ mod tests {
     }
 
     #[test]
-    fn mcp_a_listed_tool_passes_and_any_other_method_passes_unread() {
+    fn mcp_a_listed_tool_the_handshake_and_the_tool_listing_pass() {
         assert!(mcp_allowed(&mcp_call(json!("search_crm_objects"))));
-        for method in ["tools/list", "initialize", "notifications/initialized"] {
+        for method in [
+            "tools/list",
+            "initialize",
+            "notifications/initialized",
+            "ping",
+        ] {
             assert!(
                 mcp_allowed(&json!({ "jsonrpc": "2.0", "method": method })),
                 "{method}"
@@ -420,6 +435,22 @@ mod tests {
             "search_crm_objects"
         ))])));
         assert!(!mcp_allowed(&json!("tools/list")));
+        for method in [
+            json!("resources/read"),
+            json!("resources/list"),
+            json!("prompts/get"),
+            json!("completion/complete"),
+            json!("Tools/list"),
+            json!(1),
+        ] {
+            assert!(
+                !mcp_allowed(&json!({ "jsonrpc": "2.0", "id": 1, "method": method })),
+                "{method}"
+            );
+        }
+        assert!(!mcp_allowed(
+            &json!({ "jsonrpc": "2.0", "id": 1, "result": {} })
+        ));
         assert!(!mcp_call_allowed(HUBSPOT_READ_TOOLS, None));
     }
 

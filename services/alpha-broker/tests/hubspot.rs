@@ -115,6 +115,9 @@ async fn a_body_that_is_not_one_well_formed_tool_call_is_refused_before_hubspot(
             json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "" } }),
             json!([listed, write]),
             json!("tools/list"),
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "resources/read",
+                "params": { "uri": "hubspot://contacts" } }),
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "prompts/get" }),
             Value::Null,
         ] {
             let reply = h.proxy(&mcp_rpc(id, MCP, body.clone())).await;
