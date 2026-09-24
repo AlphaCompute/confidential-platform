@@ -441,7 +441,9 @@ pub async fn refresh(
 
 /// The provider's stable subject identifies the account; the email is only what the member
 /// sees, and it can be renamed or given to another account.
+#[derive(Deserialize)]
 pub struct Account {
+    #[serde(rename = "sub", alias = "account_id", alias = "id")]
     pub subject: String,
     pub email: String,
 }
@@ -451,11 +453,7 @@ pub struct Account {
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum AccountReply {
-    Email {
-        #[serde(alias = "account_id", alias = "id")]
-        sub: String,
-        email: String,
-    },
+    Email(Account),
     Team {
         team_id: String,
         user_id: String,
@@ -481,10 +479,7 @@ pub async fn account(
     }
     Ok(
         match response.json().await.map_err(|_| "account_malformed")? {
-            AccountReply::Email { sub, email } => Account {
-                subject: sub,
-                email,
-            },
+            AccountReply::Email(account) => account,
             AccountReply::Team {
                 team_id,
                 user_id,

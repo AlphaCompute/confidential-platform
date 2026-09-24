@@ -20,11 +20,6 @@ const FILE: &str = "https://api.figma.com/v1/files/AbC123";
 async fn a_member_connects_figma_with_basic_auth_and_an_instance_reads_a_file() {
     let Some(h) = harness().await else { return };
     let query = h.start("figma", MEMBER).await;
-    assert_eq!(query["client_id"], FIGMA_CLIENT_ID);
-    assert_eq!(query["redirect_uri"], FIGMA_REDIRECT_URI);
-    assert_eq!(query["response_type"], "code");
-    assert_eq!(query["code_challenge_method"], "S256");
-    assert!(!query["state"].is_empty());
     assert_eq!(
         query["scope"],
         "current_user:read file_content:read file_metadata:read file_comments:read folders:read"

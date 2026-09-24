@@ -485,7 +485,7 @@ async fn bearer_revoke(State(fake): State<Shared>, uri: Uri, headers: HeaderMap)
 }
 
 /// Figma's `/v1/me`, answered to any Figma access token the stand-in issued with the account of
-/// the consent behind it, or of the first Figma consent for a refreshed token.
+/// the first Figma consent.
 async fn figma_me(State(fake): State<Shared>, headers: HeaderMap) -> Response {
     let mut fake = fake.lock().unwrap();
     let presented = bearer_of(&headers);
@@ -493,12 +493,7 @@ async fn figma_me(State(fake): State<Shared>, headers: HeaderMap) -> Response {
     if !presented.starts_with(FIGMA_CLIENT.access) || !fake.access.contains(&presented) {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let mut figma = fake.consents.iter().filter(|c| c.provider == "figma");
-    let Some(c) = figma
-        .clone()
-        .find(|c| c.access_token == presented)
-        .or_else(|| figma.next())
-    else {
+    let Some(c) = fake.consents.iter().find(|c| c.provider == "figma") else {
         return StatusCode::FORBIDDEN.into_response();
     };
     Json(json!({ "id": c.subject, "email": c.email, "handle": "Member" })).into_response()

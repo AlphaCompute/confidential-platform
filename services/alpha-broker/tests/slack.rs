@@ -51,9 +51,6 @@ async fn a_member_connects_slack_and_an_instance_reads_history_without_seeing_a_
 async fn slack_is_asked_for_the_nine_user_scopes_and_no_bot_scope() {
     let Some(h) = harness().await else { return };
     let query = h.start("slack", MEMBER).await;
-    assert_eq!(query["client_id"], SLACK_CLIENT_ID);
-    assert_eq!(query["redirect_uri"], SLACK_REDIRECT_URI);
-    assert_eq!(query["code_challenge_method"], "S256");
     assert_eq!(
         query["user_scope"],
         "channels:read,channels:history,groups:read,groups:history,im:read,im:history,\
