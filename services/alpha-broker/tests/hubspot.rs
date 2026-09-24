@@ -83,13 +83,6 @@ async fn a_member_connects_hubspot_and_an_instance_calls_a_listed_tool_without_s
     assert_eq!(sent, request["body"]);
 }
 
-/// Nothing reached HubSpot, its OAuth endpoints included, while `f` ran.
-async fn nothing_reaches_hubspot<F: Future<Output = ()>>(h: &Harness, f: F) {
-    let before = h.fake.with(|f| (f.data.len(), f.requests.len()));
-    f.await;
-    assert_eq!(h.fake.with(|f| (f.data.len(), f.requests.len())), before);
-}
-
 #[tokio::test]
 async fn every_listed_hubspot_tool_is_forwarded_and_every_other_is_refused_before_hubspot() {
     let Some(h) = harness().await else { return };
@@ -98,7 +91,7 @@ async fn every_listed_hubspot_tool_is_forwarded_and_every_other_is_refused_befor
         let reply = h.proxy(&call(id, tool)).await;
         assert_eq!(reply.status, StatusCode::OK, "{tool}");
     }
-    nothing_reaches_hubspot(&h, async {
+    nothing_reaches(&h, async {
         for tool in [
             "manage_crm_objects",
             "manage_campaign_objects",
@@ -137,7 +130,7 @@ async fn a_body_that_is_not_one_well_formed_tool_call_is_refused_before_hubspot(
         "params": { "name": "search_crm_objects" } });
     let write = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
         "params": { "name": "manage_crm_objects" } });
-    nothing_reaches_hubspot(&h, async {
+    nothing_reaches(&h, async {
         for body in [
             json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call" }),
             json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {} }),
@@ -169,7 +162,7 @@ async fn a_duplicated_tool_name_is_judged_and_sent_by_its_last_value() {
         )
     };
     let proxy = |body: String| h.post_text(&h.instance, Some(PROXY_BEARER), "/proxy", body);
-    nothing_reaches_hubspot(&h, async {
+    nothing_reaches(&h, async {
         let reply = proxy(raw("search_crm_objects", "manage_crm_objects"))
             .await
             .unwrap();
@@ -239,7 +232,7 @@ async fn a_hubspot_refresh_stores_whatever_refresh_token_comes_back() {
 async fn disconnecting_hubspot_revokes_only_locally() {
     let Some(h) = harness().await else { return };
     let (id, _) = h.connected_to("hubspot").await;
-    nothing_reaches_hubspot(&h, async {
+    nothing_reaches(&h, async {
         let reply = h
             .call(
                 "DELETE",

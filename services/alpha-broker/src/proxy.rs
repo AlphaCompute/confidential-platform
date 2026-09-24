@@ -252,7 +252,7 @@ async fn forward(
             .http
             .request(entry.method.clone(), url.clone())
             .headers(headers.clone());
-        let mut outgoing = oauth::with_fixed_headers(outgoing, provider)
+        let mut outgoing = oauth::with_mcp_accept(outgoing, provider)
             .bearer_auth(token.as_str())
             .timeout(SEND_TIMEOUT);
         if let Some((content_type, bytes)) = &payload {

@@ -41,12 +41,6 @@ fn call(connection: Uuid, tool: &str) -> Value {
     )
 }
 
-fn notion_tools() -> &'static [&'static str] {
-    alpha_broker::oauth::provider("notion")
-        .and_then(|p| p.mcp_tools)
-        .unwrap()
-}
-
 #[tokio::test]
 async fn a_member_connects_notion_as_a_public_client_and_an_instance_searches_it() {
     let Some(h) = harness().await else { return };
@@ -110,45 +104,46 @@ async fn a_notion_member_without_an_email_is_named_by_name() {
 async fn every_listed_notion_tool_is_forwarded_and_acting_tools_are_refused_before_notion() {
     let Some(h) = harness().await else { return };
     let (id, _) = h.connected_to("notion").await;
-    for tool in notion_tools() {
+    for tool in alpha_broker::oauth::NOTION_READ_TOOLS {
         assert_eq!(
             h.proxy(&call(id, tool)).await.status,
             StatusCode::OK,
             "{tool}"
         );
     }
-    let before = h.fake.with(|f| (f.data.len(), f.requests.len()));
-    for tool in [
-        "notion-ai-search",
-        "notion-spawn-session",
-        "notion-send-message-to-session",
-        "notion-update-page",
-        "notion-create-pages",
-        "notion-create-comment",
-        "notion-search-skills",
-        "notion-create-view",
-        "notion-search-v2",
-        "Notion-search",
-        "search_crm_objects",
-    ] {
-        let reply = h.proxy(&call(id, tool)).await;
-        assert_eq!(reply.status, StatusCode::FORBIDDEN, "{tool}");
-        assert_eq!(reply.code(), "not_allowed");
-    }
-    let batch = rpc(
-        id,
-        MCP,
-        json!([{ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+    nothing_reaches(&h, async {
+        for tool in [
+            "notion-ai-search",
+            "notion-spawn-session",
+            "notion-send-message-to-session",
+            "notion-update-page",
+            "notion-create-pages",
+            "notion-create-comment",
+            "notion-search-skills",
+            "notion-create-view",
+            "notion-search-v2",
+            "Notion-search",
+            "search_crm_objects",
+        ] {
+            let reply = h.proxy(&call(id, tool)).await;
+            assert_eq!(reply.status, StatusCode::FORBIDDEN, "{tool}");
+            assert_eq!(reply.code(), "not_allowed");
+        }
+        let batch = rpc(
+            id,
+            MCP,
+            json!([{ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": { "name": "notion-update-page" } }]),
-    );
-    assert_eq!(h.proxy(&batch).await.status, StatusCode::FORBIDDEN);
-    let elsewhere = rpc(
-        id,
-        "https://mcp.notion.com/",
-        json!({ "method": "tools/list" }),
-    );
-    assert_eq!(h.proxy(&elsewhere).await.status, StatusCode::FORBIDDEN);
-    assert_eq!(h.fake.with(|f| (f.data.len(), f.requests.len())), before);
+        );
+        assert_eq!(h.proxy(&batch).await.status, StatusCode::FORBIDDEN);
+        let elsewhere = rpc(
+            id,
+            "https://mcp.notion.com/",
+            json!({ "method": "tools/list" }),
+        );
+        assert_eq!(h.proxy(&elsewhere).await.status, StatusCode::FORBIDDEN);
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -177,18 +172,19 @@ async fn neither_mcp_row_takes_an_accept_or_session_header_from_the_caller() {
     let Some(h) = harness().await else { return };
     for (provider, url) in [("hubspot", "https://mcp.hubspot.com/"), ("notion", MCP)] {
         let (id, _) = h.connected_to(provider).await;
-        let before = h.fake.with(|f| (f.data.len(), f.requests.len()));
-        for name in ["accept", "Accept", MCP_SESSION] {
-            let mut body = rpc(
-                id,
-                url,
-                json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
-            );
-            body["headers"] = json!(BTreeMap::from([(name, "text/html")]));
-            let reply = h.proxy(&body).await;
-            assert_eq!(reply.status, StatusCode::FORBIDDEN, "{provider} {name}");
-        }
-        assert_eq!(h.fake.with(|f| (f.data.len(), f.requests.len())), before);
+        nothing_reaches(&h, async {
+            for name in ["accept", "Accept", MCP_SESSION] {
+                let mut body = rpc(
+                    id,
+                    url,
+                    json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+                );
+                body["headers"] = json!(BTreeMap::from([(name, "text/html")]));
+                let reply = h.proxy(&body).await;
+                assert_eq!(reply.status, StatusCode::FORBIDDEN, "{provider} {name}");
+            }
+        })
+        .await;
     }
 }
 

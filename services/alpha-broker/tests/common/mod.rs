@@ -1336,6 +1336,13 @@ impl Harness {
     }
 }
 
+/// Nothing reached a provider, its OAuth endpoints included, while `f` ran.
+pub async fn nothing_reaches<F: Future<Output = ()>>(h: &Harness, f: F) {
+    let before = h.fake.with(|f| (f.data.len(), f.requests.len()));
+    f.await;
+    assert_eq!(h.fake.with(|f| (f.data.len(), f.requests.len())), before);
+}
+
 pub async fn count(h: &Harness, table: &str) -> i64 {
     sqlx::query_scalar(sqlx::AssertSqlSafe(format!("select count(*) from {table}")))
         .fetch_one(&h.pool)

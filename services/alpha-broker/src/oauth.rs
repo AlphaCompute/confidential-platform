@@ -8,6 +8,7 @@ use std::time::Duration;
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use reqwest::Method;
+use reqwest::header::ACCEPT;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -69,8 +70,6 @@ pub struct Provider {
     pub writes: &'static [Entry],
     /// Names of the request headers a caller may set.
     pub headers: &'static [&'static str],
-    /// Request headers the broker sets on every forwarded call, over any the caller sent.
-    pub fixed_headers: &'static [(&'static str, &'static str)],
     /// For an MCP server: the only tools a `tools/call` may name.
     pub mcp_tools: Option<&'static [&'static str]>,
 }
@@ -90,8 +89,6 @@ pub enum Identity {
         name: &'static [&'static str],
     },
 }
-
-const MCP_ACCEPT: &[(&str, &str)] = &[("accept", "application/json, text/event-stream")];
 
 const fn get(host: &'static str, path: &'static str) -> Entry {
     Entry {
@@ -153,7 +150,6 @@ pub const GOOGLE: Provider = Provider {
         post("www.googleapis.com", "/drive/v3/files"),
     ],
     headers: &[],
-    fixed_headers: &[],
     mcp_tools: None,
 };
 
@@ -200,7 +196,6 @@ pub const DROPBOX: Provider = Provider {
         post("api.dropboxapi.com", "/2/files/create_folder_v2"),
     ],
     headers: &["dropbox-api-arg", "dropbox-api-path-root"],
-    fixed_headers: &[],
     mcp_tools: None,
 };
 
@@ -238,7 +233,6 @@ pub const SLACK: Provider = Provider {
     ],
     writes: &[],
     headers: &[],
-    fixed_headers: &[],
     mcp_tools: None,
 };
 
@@ -275,7 +269,6 @@ pub const FIGMA: Provider = Provider {
     ],
     writes: &[],
     headers: &[],
-    fixed_headers: &[],
     mcp_tools: None,
 };
 
@@ -326,7 +319,6 @@ pub const HUBSPOT: Provider = Provider {
     reads: &[post("mcp.hubspot.com", "/")],
     writes: &[],
     headers: &[],
-    fixed_headers: MCP_ACCEPT,
     mcp_tools: Some(HUBSPOT_READ_TOOLS),
 };
 
@@ -376,7 +368,6 @@ pub const NOTION: Provider = Provider {
     reads: &[post("mcp.notion.com", "/mcp")],
     writes: &[],
     headers: &[],
-    fixed_headers: MCP_ACCEPT,
     mcp_tools: Some(NOTION_READ_TOOLS),
 };
 
@@ -620,7 +611,7 @@ pub async fn account(
                 "method": "tools/call",
                 "params": { "name": tool, "arguments": arguments },
             });
-            with_fixed_headers(http.post(*url), provider).json(&call)
+            with_mcp_accept(http.post(*url), provider).json(&call)
         }
     };
     let response = request
@@ -664,14 +655,16 @@ pub async fn account(
     Ok(Account { subject, email })
 }
 
-pub fn with_fixed_headers(
-    mut request: reqwest::RequestBuilder,
+/// An MCP server needs both content types in `Accept`; the broker sets it, never the caller.
+pub fn with_mcp_accept(
+    request: reqwest::RequestBuilder,
     provider: &Provider,
 ) -> reqwest::RequestBuilder {
-    for (name, value) in provider.fixed_headers {
-        request = request.header(*name, *value);
+    if provider.mcp_tools.is_some() {
+        request.header(ACCEPT, "application/json, text/event-stream")
+    } else {
+        request
     }
-    request
 }
 
 /// The JSON object in the text content of a successful `tools/call` reply, which an MCP server
