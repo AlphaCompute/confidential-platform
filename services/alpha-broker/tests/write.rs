@@ -155,12 +155,10 @@ async fn every_read_entry_is_refused_on_write() {
 #[tokio::test]
 async fn no_write_entry_of_any_provider_reaches_proxy_and_destructive_calls_reach_neither_route() {
     let Some(h) = harness().await else { return };
-    let (google, _) = h.connected().await;
-    let (dropbox, _) = h.connected_to("dropbox").await;
-    let id_of_provider = |name: &str| if name == "google" { google } else { dropbox };
     for provider in oauth::PROVIDERS {
+        let (id, _) = h.connected_to(provider.name).await;
         for entry in provider.writes {
-            let mut body = read(id_of_provider(provider.name), &url_of(entry));
+            let mut body = read(id, &url_of(entry));
             body["method"] = json!(entry.method.as_str());
             body["body"] = json!({ "path": "/x" });
             let reply = h.proxy(&body).await;
@@ -168,6 +166,8 @@ async fn no_write_entry_of_any_provider_reaches_proxy_and_destructive_calls_reac
             assert_eq!(reply.code(), "not_allowed");
         }
     }
+    let (google, _) = h.connected().await;
+    let (dropbox, _) = h.connected_to("dropbox").await;
     let destructive = [
         (
             dropbox,

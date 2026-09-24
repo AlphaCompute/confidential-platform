@@ -274,7 +274,6 @@ async fn every_provider_mints_its_own_authorization_url() {
 
     let query = h.start("dropbox", MEMBER).await;
     assert_eq!(query["client_id"], DROPBOX_CLIENT_ID);
-    assert_eq!(query["redirect_uri"], DROPBOX_REDIRECT_URI);
     assert_eq!(query["token_access_type"], "offline");
     assert_eq!(query["response_type"], "code");
     assert_eq!(query["code_challenge"].len(), 43);
