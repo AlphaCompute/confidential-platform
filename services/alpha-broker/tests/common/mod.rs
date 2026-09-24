@@ -111,7 +111,7 @@ fn provider_of_host(host: &str) -> &'static str {
     }
 }
 
-fn bearer_of(headers: &HeaderMap) -> String {
+pub fn bearer_of(headers: &HeaderMap) -> String {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -168,7 +168,6 @@ pub struct DataRequest {
     pub host: String,
     pub path: String,
     pub query: HashMap<String, String>,
-    pub authorization: Option<String>,
     pub headers: HeaderMap,
     pub body: Vec<u8>,
 }
@@ -411,10 +410,6 @@ async fn data(
     body: Bytes,
 ) -> Response {
     let mut fake = fake.lock().unwrap();
-    let authorization = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
     let host = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
@@ -425,7 +420,6 @@ async fn data(
         host: host.clone(),
         path: uri.path().to_string(),
         query: query.clone(),
-        authorization: authorization.clone(),
         headers: headers.clone(),
         body: body.to_vec(),
     });

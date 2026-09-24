@@ -61,13 +61,8 @@ async fn a_member_connects_dropbox_and_an_instance_lists_a_folder_without_seeing
         json!({ "path": "" })
     );
     assert_eq!(seen.headers["dropbox-api-path-root"], PATH_ROOT);
-    let token = seen
-        .authorization
-        .as_deref()
-        .unwrap()
-        .strip_prefix("Bearer ")
-        .unwrap();
-    assert!(token.starts_with("sl.") && issued.iter().any(|t| t == token));
+    let token = bearer_of(&seen.headers);
+    assert!(token.starts_with("sl.") && issued.contains(&token));
     assert_ne!(token, consent.access_token);
 }
 

@@ -32,13 +32,8 @@ async fn an_instance_reads_drive_through_the_proxy_and_never_sees_a_token() {
     };
     assert_eq!(seen.path, "/drive/v3/files");
     assert_eq!(seen.query["pageSize"], "10");
-    let token = seen
-        .authorization
-        .as_deref()
-        .unwrap()
-        .strip_prefix("Bearer ")
-        .unwrap();
-    assert!(access.iter().any(|t| t == token));
+    let token = bearer_of(&seen.headers);
+    assert!(access.contains(&token));
 }
 
 const FILES: &str = "https://www.googleapis.com/drive/v3/files";
