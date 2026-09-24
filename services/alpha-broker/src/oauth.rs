@@ -30,12 +30,18 @@ pub enum Revoke {
     /// A `POST` carrying a fresh access token as bearer; the provider ends the refresh token
     /// behind it too.
     Bearer(&'static str),
+    // ponytail: the provider offers no revoke, so the grant stays valid there until the member
+    // removes the app in the provider's settings or it expires; the broker's row is revoked and
+    // its token never used again. No upgrade exists until the provider adds a revoke.
+    Local,
 }
 
 /// How the broker proves it is the tenant's client at the token endpoint.
 pub enum ClientAuth {
     /// `client_id` and `client_secret` in the form.
     Form,
+    /// `client_id` and `client_secret` only in HTTP Basic, never in the form.
+    Basic,
     /// A public client: only `client_id`; the PKCE verifier stands in for a secret.
     Public,
 }
@@ -44,6 +50,7 @@ pub struct Provider {
     pub name: &'static str,
     pub authorization: &'static str,
     pub token: &'static str,
+    pub refresh: &'static str,
     pub client_auth: ClientAuth,
     pub scopes: &'static [&'static str],
     /// The authorization parameter carrying the scopes, and what joins them.
@@ -86,6 +93,7 @@ pub const GOOGLE: Provider = Provider {
     name: "google",
     authorization: "https://accounts.google.com/o/oauth2/v2/auth",
     token: "https://oauth2.googleapis.com/token",
+    refresh: "https://oauth2.googleapis.com/token",
     client_auth: ClientAuth::Form,
     scopes: &[
         "https://www.googleapis.com/auth/drive.readonly",
@@ -131,6 +139,7 @@ pub const DROPBOX: Provider = Provider {
     name: "dropbox",
     authorization: "https://www.dropbox.com/oauth2/authorize",
     token: "https://api.dropboxapi.com/oauth2/token",
+    refresh: "https://api.dropboxapi.com/oauth2/token",
     client_auth: ClientAuth::Form,
     scopes: &[
         "account_info.read",
@@ -174,6 +183,7 @@ pub const SLACK: Provider = Provider {
     name: "slack",
     authorization: "https://slack.com/oauth/v2/authorize",
     token: "https://slack.com/api/oauth.v2.access",
+    refresh: "https://slack.com/api/oauth.v2.access",
     client_auth: ClientAuth::Public,
     scopes: &[
         "channels:read",
@@ -201,7 +211,42 @@ pub const SLACK: Provider = Provider {
     headers: &[],
 };
 
-pub const PROVIDERS: [&Provider; 3] = [&GOOGLE, &DROPBOX, &SLACK];
+/// `current_user:read` names the account; `file_metadata:read` and `folders:read` reach the team
+/// folders a member browses before opening a file. Nothing reached writes.
+pub const FIGMA: Provider = Provider {
+    name: "figma",
+    authorization: "https://www.figma.com/oauth",
+    token: "https://api.figma.com/v1/oauth/token",
+    refresh: "https://api.figma.com/v1/oauth/refresh",
+    client_auth: ClientAuth::Basic,
+    scopes: &[
+        "current_user:read",
+        "file_content:read",
+        "file_metadata:read",
+        "file_comments:read",
+        "folders:read",
+    ],
+    scope_param: ("scope", " "),
+    tokens_at: None,
+    dead: &["invalid_grant"],
+    extra_authorize: &[],
+    identity: (Method::GET, "https://api.figma.com/v1/me"),
+    revoke: Revoke::Local,
+    reads: &[
+        get("api.figma.com", "/v1/me"),
+        get("api.figma.com", "/v2/teams/{id}/folders"),
+        get("api.figma.com", "/v2/folders/{id}/folders"),
+        get("api.figma.com", "/v2/folders/{id}/files"),
+        get("api.figma.com", "/v1/files/{id}"),
+        get("api.figma.com", "/v1/files/{id}/nodes"),
+        get("api.figma.com", "/v1/images/{id}"),
+        get("api.figma.com", "/v1/files/{id}/comments"),
+    ],
+    writes: &[],
+    headers: &[],
+};
+
+pub const PROVIDERS: [&Provider; 4] = [&GOOGLE, &DROPBOX, &SLACK, &FIGMA];
 
 pub fn provider(name: &str) -> Option<&'static Provider> {
     PROVIDERS.into_iter().find(|p| p.name == name)
@@ -270,12 +315,19 @@ fn token_request<'a>(
     client_secret: Option<&'a str>,
     mut form: Vec<(&'a str, &'a str)>,
 ) -> Option<reqwest::RequestBuilder> {
-    form.push(("client_id", client_id));
-    match provider.client_auth {
-        ClientAuth::Form => form.push(("client_secret", client_secret?)),
-        ClientAuth::Public => {}
-    }
-    Some(http.post(url).form(&form))
+    let request = http.post(url);
+    let request = match provider.client_auth {
+        ClientAuth::Basic => request.basic_auth(client_id, Some(client_secret?)),
+        ClientAuth::Form => {
+            form.extend([("client_id", client_id), ("client_secret", client_secret?)]);
+            request
+        }
+        ClientAuth::Public => {
+            form.push(("client_id", client_id));
+            request
+        }
+    };
+    Some(request.form(&form))
 }
 
 pub async fn exchange(
@@ -357,7 +409,7 @@ pub async fn refresh(
     let response = token_request(
         http,
         provider,
-        provider.token,
+        provider.refresh,
         client_id,
         client_secret,
         form,
@@ -474,6 +526,7 @@ pub async fn revoke(
                         .await;
                 }
             }
+            Revoke::Local => {}
         }
     };
     let _ = tokio::time::timeout(Duration::from_secs(5), attempt).await;

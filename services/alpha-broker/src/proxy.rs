@@ -322,18 +322,21 @@ async fn access_token(
         let sealed = store::seal(&key, id.as_bytes(), rotated.as_bytes())?;
         store::replace_refresh_token(&mut tx, id, &sealed).await?;
     }
-    tx.commit().await?;
     let until = refreshed
         .expires_in
         .map_or(DEFAULT_LIFETIME, Duration::from_secs)
         .checked_sub(EXPIRY_MARGIN)
         .and_then(|d| Instant::now().checked_add(d));
-    let mut cache = state.tokens.lock();
-    let now = Instant::now();
-    cache.retain(|_, (_, until)| *until > now);
-    if let Some(until) = until {
-        cache.insert(id, (refreshed.access_token.clone(), until));
+    // Cached before the row lock is released, so a call waiting on it finds the token.
+    {
+        let mut cache = state.tokens.lock();
+        let now = Instant::now();
+        cache.retain(|_, (_, until)| *until > now);
+        if let Some(until) = until {
+            cache.insert(id, (refreshed.access_token.clone(), until));
+        }
     }
+    tx.commit().await?;
     Ok(refreshed.access_token)
 }
 
