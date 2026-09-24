@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use alpha_broker::{AppState, Config, Error, Secrets, router, store, tls};
+use alpha_broker::{AppState, Config, Error, Secrets, router, store};
 use alpha_client::runtime::RuntimeSocket;
 use alpha_client::tls::InstanceCert;
 use rustls::pki_types::CertificateDer;
@@ -104,7 +104,8 @@ async fn run() -> Result<(), Error> {
         .last()
         .ok_or_else(|| Error::internal("certificate chain is empty"))?
         .map_err(|e| Error::internal(format!("certificate chain: {e}")))?;
-    let tls_config = tls::server_config(cert.clone(), kms_ca)?;
+    let tls_config = alpha_client::tls::mtls_server_config(cert.clone(), kms_ca)
+        .map_err(|e| Error::internal(format!("tls: {e}")))?;
     let http = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())

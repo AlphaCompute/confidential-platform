@@ -19,10 +19,10 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, TrustAnchor, UnixTime,
 };
-use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
 use rustls::time_provider::TimeProvider;
-use rustls::{ClientConfig, DigitallySignedStruct, ServerConfig, SignatureScheme};
+use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -48,6 +48,9 @@ pub enum Pin {
     Ca(CertificateDer<'static>),
     /// The chain ends at this CA and the leaf carries one of these Revisions.
     CaAndRevisions(CertificateDer<'static>, Vec<ComposeHash>),
+    /// The chain ends at this CA and the leaf is an App Instance's carrying one of these
+    /// Revisions; an empty list matches nothing.
+    CaAndInstanceRevisions(CertificateDer<'static>, Vec<ComposeHash>),
     /// The chain ends at a CA the server presents whose SPKI SHA-256 is these bytes, and the
     /// leaf carries one of these Revisions; an empty list matches nothing.
     CaSpkiAndRevisions([u8; 32], Vec<ComposeHash>),
@@ -78,11 +81,13 @@ struct PinnedServer {
 impl PinnedServer {
     fn new(pin: Option<Pin>) -> Result<Self, Error> {
         let anchor = match &pin {
-            Some(Pin::Ca(ca) | Pin::CaAndRevisions(ca, _)) => Some(
-                webpki::anchor_from_trusted_cert(ca)
-                    .map_err(|e| Error::Invalid(format!("pinned ca: {e}")))?
-                    .to_owned(),
-            ),
+            Some(Pin::Ca(ca) | Pin::CaAndRevisions(ca, _) | Pin::CaAndInstanceRevisions(ca, _)) => {
+                Some(
+                    webpki::anchor_from_trusted_cert(ca)
+                        .map_err(|e| Error::Invalid(format!("pinned ca: {e}")))?
+                        .to_owned(),
+                )
+            }
             Some(Pin::CaSpkiAndRevisions(..) | Pin::Spki(_)) | None => None,
         };
         Ok(Self {
@@ -108,7 +113,7 @@ impl ServerCertVerifier for PinnedServer {
         };
         let presented;
         let anchor = match pin {
-            Pin::Ca(_) | Pin::CaAndRevisions(..) => Some(
+            Pin::Ca(_) | Pin::CaAndRevisions(..) | Pin::CaAndInstanceRevisions(..) => Some(
                 self.anchor
                     .as_ref()
                     .ok_or_else(|| refuse("pinned ca is not an anchor".into()))?,
@@ -158,6 +163,15 @@ impl ServerCertVerifier for PinnedServer {
                 if !allowed {
                     return Err(refuse(
                         "server certificate carries no allowed KMS revision".into(),
+                    ));
+                }
+            }
+            Pin::CaAndInstanceRevisions(_, revisions) => {
+                let sans = uri_sans(end_entity).map_err(|e| refuse(e.to_string()))?;
+                let instance = parse_instance_sans(&sans).map_err(|e| refuse(e.to_string()))?;
+                if !revisions.contains(&instance.compose_hash) {
+                    return Err(refuse(
+                        "server certificate carries no allowed App revision".into(),
                     ));
                 }
             }
@@ -346,6 +360,30 @@ pub fn server_config(cert: Arc<InstanceCert>) -> Result<Arc<ServerConfig>, Error
     Ok(Arc::new(config))
 }
 
+/// As [`server_config`], but a client certificate is requested, not required: one that is
+/// presented must chain to `kms_ca` or the handshake fails, and each route decides from
+/// [`PeerCerts`] whether it needs one.
+pub fn mtls_server_config(
+    cert: Arc<dyn ResolvesServerCert>,
+    kms_ca: CertificateDer<'static>,
+) -> Result<Arc<ServerConfig>, Error> {
+    let tls = |e: &dyn std::fmt::Display| Error::Invalid(format!("tls: {e}"));
+    let mut roots = RootCertStore::empty();
+    roots.add(kms_ca).map_err(|e| tls(&e))?;
+    let provider = provider();
+    let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+        .allow_unauthenticated()
+        .build()
+        .map_err(|e| tls(&e))?;
+    let mut config = ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| tls(&e))?
+        .with_client_cert_verifier(verifier)
+        .with_cert_resolver(cert);
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+}
+
 /// The certificate chain the peer presented, if any; each route decides what it needs of it.
 #[derive(Clone, Debug, Default)]
 pub struct PeerCerts(pub Vec<CertificateDer<'static>>);
@@ -504,6 +542,70 @@ mod tests {
             .await
             .unwrap();
         served_serial(tls.get_ref().1.peer_certificates().unwrap())
+    }
+
+    fn leaf_with_sans(
+        ca_key: &KeyPair,
+        ca_cert: &rcgen::Certificate,
+        sans: &[String],
+    ) -> RuntimeIdentity {
+        let mut identity = new_leaf(ca_key, ca_cert, 1);
+        let leaf_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let issuer = Issuer::from_ca_cert_der(ca_cert.der(), ca_key).unwrap();
+        let mut params = CertificateParams::default();
+        params.subject_alt_names = sans
+            .iter()
+            .map(|s| SanType::URI(Ia5String::try_from(s.as_str()).unwrap()))
+            .collect();
+        params.not_before = (SystemTime::now() - Duration::from_secs(3600)).into();
+        params.not_after = (SystemTime::now() + Duration::from_secs(3600)).into();
+        let cert = params.signed_by(&leaf_key, &issuer).unwrap();
+        identity.certificate_chain = format!("{}\n{}", cert.pem(), ca_cert.pem());
+        identity.tls_private_key = Zeroizing::new(leaf_key.serialize_der());
+        identity
+    }
+
+    async fn pinned_handshake(identity: &RuntimeIdentity, pin: Pin) -> bool {
+        let cert = Arc::new(InstanceCert::new(identity).unwrap());
+        let acceptor = TlsAcceptor::from(server_config(cert).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((tcp, _)) = listener.accept().await {
+                let _ = acceptor.accept(tcp).await;
+            }
+        });
+        let config = client_config(Some(pin), None, crate::system_time_provider()).unwrap();
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        TlsConnector::from(Arc::new(config))
+            .connect(ServerName::try_from("app.example").unwrap(), tcp)
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn an_instance_revision_pin_accepts_only_an_app_leaf_carrying_a_listed_revision() {
+        let (ca_key, ca_cert) = new_ca();
+        let ca = CertificateDer::from(ca_cert.der().to_vec());
+        let revision = alpha_core::compose_hash("front");
+        let instance = format!(
+            "alphacompute://{}/{}/{}",
+            OrgId::mint(),
+            AppId::mint(),
+            "a".repeat(64)
+        );
+        let revision_san = format!("urn:alphacompute:revision:{revision}");
+        let app = leaf_with_sans(&ca_key, &ca_cert, &[instance, revision_san.clone()]);
+        let node = leaf_with_sans(&ca_key, &ca_cert, &[KMS_SAN.into(), revision_san]);
+        let pin = |revisions| Pin::CaAndInstanceRevisions(ca.clone(), revisions);
+
+        assert!(pinned_handshake(&app, pin(vec![revision])).await);
+        assert!(!pinned_handshake(&app, pin(vec![alpha_core::compose_hash("other")])).await);
+        assert!(!pinned_handshake(&app, pin(vec![])).await);
+        assert!(!pinned_handshake(&node, pin(vec![revision])).await);
+        let (_, other_ca) = new_ca();
+        let foreign = Pin::CaAndInstanceRevisions(other_ca.der().clone(), vec![revision]);
+        assert!(!pinned_handshake(&app, foreign).await);
     }
 
     #[tokio::test]
