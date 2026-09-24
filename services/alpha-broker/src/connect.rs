@@ -112,7 +112,7 @@ pub async fn finish(
         &state.http,
         provider,
         client_id,
-        &client_secret,
+        client_secret.as_deref().map(String::as_str),
         &state.config.redirect_uri(provider),
         &body.code,
         verifier,
@@ -170,7 +170,8 @@ pub async fn disconnect(
     if let (Some(provider), Some(token)) = (oauth::provider(&provider), token)
         && let Ok((client_id, client_secret)) = state.client(provider)
     {
-        oauth::revoke(&state.http, provider, client_id, &client_secret, token).await;
+        let client_secret = client_secret.as_deref().map(String::as_str);
+        oauth::revoke(&state.http, provider, client_id, client_secret, token).await;
     }
     Ok(StatusCode::NO_CONTENT)
 }

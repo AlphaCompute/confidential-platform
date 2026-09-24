@@ -47,6 +47,9 @@ fn utf8(name: &str, bytes: &[u8]) -> Result<Zeroizing<String>, Error> {
 async fn read_secrets(runtime: &RuntimeSocket) -> Result<Secrets, Error> {
     let mut client_secrets = HashMap::new();
     for provider in oauth::PROVIDERS {
+        if let oauth::ClientAuth::Public = provider.client_auth {
+            continue;
+        }
         let name = format!("{}-client-secret", provider.name);
         let value = utf8(&name, &secret(runtime, &name).await?)?;
         client_secrets.insert(provider.name, value);

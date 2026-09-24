@@ -85,7 +85,7 @@ impl Config {
 
 /// Held only in zeroizing buffers, and deliberately not `Debug`.
 pub struct Secrets {
-    /// The tenant's OAuth client secret per provider name.
+    /// The tenant's OAuth client secret per provider name, for rows that use one.
     pub client_secrets: HashMap<&'static str, Zeroizing<String>>,
     pub connect_bearer: Zeroizing<Vec<u8>>,
     pub proxy_bearer: Zeroizing<Vec<u8>>,
@@ -101,15 +101,14 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// The provider's client id and a copy of its client secret.
-    pub fn client(&self, provider: &Provider) -> Result<(&str, Zeroizing<String>), Error> {
+    /// The provider's client id and a copy of its client secret, if its row uses one.
+    pub fn client(&self, provider: &Provider) -> Result<(&str, Option<Zeroizing<String>>), Error> {
         let secret = self
             .secrets
             .read()
             .client_secrets
             .get(provider.name)
-            .cloned()
-            .ok_or_else(|| Error::internal(format!("no client secret for {}", provider.name)))?;
+            .cloned();
         Ok((self.config.client_id(provider)?, secret))
     }
 }
@@ -277,6 +276,8 @@ mod tests {
         match name {
             "GOOGLE_CLIENT_ID" => Some("client.apps.googleusercontent.com".into()),
             "DROPBOX_CLIENT_ID" => Some("dropbox-app-key".into()),
+            "SLACK_CLIENT_ID" => Some("1234.5678".into()),
+            "FIGMA_CLIENT_ID" => Some("figma-client-id".into()),
             "OAUTH_REDIRECT_BASE" => Some("https://corpus.example/oauth/".into()),
             _ => None,
         }
@@ -301,7 +302,12 @@ mod tests {
 
     #[test]
     fn config_build_refuses_a_missing_or_blank_client_id_naming_it() {
-        for variable in ["GOOGLE_CLIENT_ID", "DROPBOX_CLIENT_ID"] {
+        for variable in [
+            "GOOGLE_CLIENT_ID",
+            "DROPBOX_CLIENT_ID",
+            "SLACK_CLIENT_ID",
+            "FIGMA_CLIENT_ID",
+        ] {
             for value in [None, Some(" ")] {
                 let err = Config::build(|n| {
                     if n == variable {

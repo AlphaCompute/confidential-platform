@@ -50,20 +50,28 @@ pub const REDIRECT_URI: &str = "https://corpus.example/oauth/google/callback";
 pub const DROPBOX_CLIENT_ID: &str = "dropbox-app-key-for-tests";
 pub const DROPBOX_CLIENT_SECRET: &str = "dropbox-app-secret-for-tests";
 pub const DROPBOX_REDIRECT_URI: &str = "https://corpus.example/oauth/dropbox/callback";
+pub const SLACK_CLIENT_ID: &str = "1234.5678";
+pub const FIGMA_CLIENT_ID: &str = "figma-client-id-for-tests";
+pub const FIGMA_CLIENT_SECRET: &str = "figma-client-secret-for-tests";
+pub const FIGMA_REDIRECT_URI: &str = "https://corpus.example/oauth/figma/callback";
+pub const SLACK_REDIRECT_URI: &str = "https://corpus.example/oauth/slack/callback";
 pub const KEY: [u8; 32] = [9; 32];
 pub const EMAIL: &str = "member@example.com";
 pub const MEMBER: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 pub const OTHER_MEMBER: &str = "2222222222222222222222222222222222222222222222222222222222222222";
-const HOSTS: [&str; 6] = [
+const HOSTS: [&str; 8] = [
     "accounts.google.com",
     "oauth2.googleapis.com",
     "openidconnect.googleapis.com",
     "www.googleapis.com",
     "api.dropboxapi.com",
     "content.dropboxapi.com",
+    "slack.com",
+    "api.figma.com",
 ];
 pub const MEDIA: &str = "https://www.googleapis.com/drive/v3/files/file-1?alt=media";
 pub const LISTING: &str = r#"{"files":[{"id":"file-1","name":"Notes"}]}"#;
+pub const SLACK_HISTORY: &str = r#"{"ok":true,"messages":[{"type":"message","user":"U2","text":"hello","ts":"1.2"}],"has_more":false}"#;
 pub const DROPBOX_LISTING: &str = r#"{"entries":[{".tag":"file","name":"Notes.txt","id":"id:a1"}],"cursor":"c1","has_more":false}"#;
 
 /// What the stand-in expects of one provider's client and how its tokens look.
@@ -94,11 +102,31 @@ const DROPBOX_CLIENT: Client = Client {
     scope: "account_info.read files.content.read files.content.write",
 };
 
+/// A public client: it has no secret.
+const SLACK_CLIENT: Client = Client {
+    id: SLACK_CLIENT_ID,
+    secret: "",
+    redirect: SLACK_REDIRECT_URI,
+    access: "xoxp-",
+    refresh: "xoxe-1-",
+    scope: "channels:history,users:read",
+};
+
+const FIGMA_CLIENT: Client = Client {
+    id: FIGMA_CLIENT_ID,
+    secret: FIGMA_CLIENT_SECRET,
+    redirect: FIGMA_REDIRECT_URI,
+    access: "figu_",
+    refresh: "figr_",
+    scope: "",
+};
+
 fn client_of(provider: &str) -> &'static Client {
-    if provider == "dropbox" {
-        &DROPBOX_CLIENT
-    } else {
-        &GOOGLE_CLIENT
+    match provider {
+        "dropbox" => &DROPBOX_CLIENT,
+        "slack" => &SLACK_CLIENT,
+        "figma" => &FIGMA_CLIENT,
+        _ => &GOOGLE_CLIENT,
     }
 }
 
@@ -173,8 +201,13 @@ pub struct Fake {
     pub omit_refresh_token: bool,
     pub account_status: StatusCode,
     pub revoke_status: StatusCode,
-    /// Refreshes issue a new refresh token and stop accepting the one presented.
+    /// Refreshes issue a new refresh token and stop accepting the one presented; Slack's always
+    /// do.
     pub rotate: bool,
+    /// Refresh replies leave out `expires_in`.
+    pub omit_expires_in: bool,
+    /// When set, every refresh is answered with exactly this status and body.
+    pub refresh_reply: Option<(StatusCode, Value)>,
     /// How long a refresh takes to answer.
     pub refresh_delay: Duration,
     /// The next this many data requests answer 401 whatever token they carry.
@@ -193,10 +226,20 @@ impl Fake {
         self.requests.iter().filter(|(p, _)| p == path).count()
     }
 
+    /// The fields of the first request that reached `path`.
+    pub fn form(&self, path: &str) -> HashMap<String, String> {
+        self.requests
+            .iter()
+            .find(|(p, _)| p == path)
+            .unwrap()
+            .1
+            .clone()
+    }
+
     pub fn revoked_tokens(&self) -> Vec<String> {
         self.requests
             .iter()
-            .filter(|(p, _)| p == "/revoke" || p == DROPBOX_REVOKE)
+            .filter(|(p, _)| p == "/revoke" || p == DROPBOX_REVOKE || p == SLACK_REVOKE)
             .map(|(_, form)| form["token"].clone())
             .collect()
     }
@@ -210,7 +253,11 @@ impl Fake {
 
     /// Every value that must never appear in a reply to the tenant.
     fn secrets(&self) -> Vec<String> {
-        let mut out = vec![CLIENT_SECRET.to_string(), DROPBOX_CLIENT_SECRET.to_string()];
+        let mut out = vec![
+            CLIENT_SECRET.to_string(),
+            DROPBOX_CLIENT_SECRET.to_string(),
+            FIGMA_CLIENT_SECRET.to_string(),
+        ];
         for c in &self.consents {
             out.extend([
                 c.code.clone(),
@@ -233,6 +280,24 @@ type Shared = Arc<Mutex<Fake>>;
 pub const DROPBOX_TOKEN: &str = "/oauth2/token";
 pub const DROPBOX_ACCOUNT: &str = "/2/users/get_current_account";
 pub const DROPBOX_REVOKE: &str = "/2/auth/token/revoke";
+pub const SLACK_TOKEN: &str = "/api/oauth.v2.access";
+pub const SLACK_IDENTITY: &str = "/api/auth.test";
+pub const SLACK_REVOKE: &str = "/api/auth.revoke";
+pub const FIGMA_TOKEN: &str = "/v1/oauth/token";
+pub const FIGMA_REFRESH: &str = "/v1/oauth/refresh";
+pub const FIGMA_ME: &str = "/v1/me";
+
+/// The `id:secret` of an HTTP Basic authorization header.
+fn basic_of(headers: &HeaderMap) -> Option<String> {
+    use base64::Engine;
+    let encoded = headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Basic ")?;
+    let decoded = base64::prelude::BASE64_STANDARD.decode(encoded).ok()?;
+    String::from_utf8(decoded).ok()
+}
 
 fn invalid_grant() -> Response {
     (
@@ -242,16 +307,21 @@ fn invalid_grant() -> Response {
         .into_response()
 }
 
-/// Google's `/token` and Dropbox's `/oauth2/token`, each accepting only its own client.
+/// Google's `/token`, Dropbox's `/oauth2/token`, Slack's `oauth.v2.access` and Figma's token and
+/// refresh URLs, each accepting only its own client: Google and Dropbox with the secret in the
+/// form, Slack as a public client that must send no secret at all, Figma only in HTTP Basic and
+/// refreshing only at its own URL.
 async fn token(
     State(fake): State<Shared>,
     uri: Uri,
+    headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
-    let provider = if uri.path() == DROPBOX_TOKEN {
-        "dropbox"
-    } else {
-        "google"
+    let provider = match uri.path() {
+        DROPBOX_TOKEN => "dropbox",
+        SLACK_TOKEN => "slack",
+        FIGMA_TOKEN | FIGMA_REFRESH => "figma",
+        _ => "google",
     };
     let client = client_of(provider);
     let delay = {
@@ -260,10 +330,14 @@ async fn token(
         fake.refresh_delay
     };
     let field = |k: &str| form.get(k).map(String::as_str).unwrap_or_default();
-    if field("grant_type") == "refresh_token" {
+    let refreshing = field("grant_type") == "refresh_token";
+    if refreshing {
         tokio::time::sleep(delay).await;
     }
     let mut fake = fake.lock().unwrap();
+    if let Some((status, body)) = fake.refresh_reply.clone().filter(|_| refreshing) {
+        return (status, Json(body)).into_response();
+    }
     if fake.token_status != StatusCode::OK {
         let status = fake.token_status;
         let error = if status == StatusCode::BAD_REQUEST {
@@ -273,10 +347,19 @@ async fn token(
         };
         return (status, Json(json!({ "error": error }))).into_response();
     }
-    if field("grant_type") == "refresh_token" {
+    let authenticated = match provider {
+        "figma" => {
+            basic_of(&headers) == Some(format!("{}:{}", client.id, client.secret))
+                && !form.contains_key("client_id")
+                && !form.contains_key("client_secret")
+                && (uri.path() == FIGMA_REFRESH) == refreshing
+        }
+        "slack" => field("client_id") == client.id && !form.contains_key("client_secret"),
+        _ => field("client_id") == client.id && field("client_secret") == client.secret,
+    };
+    if refreshing {
         let presented = field("refresh_token").to_string();
-        if field("client_id") != client.id
-            || field("client_secret") != client.secret
+        if !authenticated
             || !presented.starts_with(client.refresh)
             || !fake.refresh.contains(&presented)
         {
@@ -286,20 +369,24 @@ async fn token(
         let access = format!("{}fake-refreshed-{n}", client.access);
         fake.access.push(access.clone());
         fake.issued.push(access.clone());
-        let mut reply =
-            json!({ "access_token": access, "expires_in": 3599, "token_type": "Bearer" });
-        if fake.rotate {
+        let mut reply = json!({ "access_token": access, "token_type": "Bearer" });
+        if !fake.omit_expires_in {
+            reply["expires_in"] = json!(3599);
+        }
+        if fake.rotate || provider == "slack" {
             let rotated = format!("{}fake-rotated-{n}", client.refresh);
             fake.refresh.retain(|t| *t != presented);
             fake.refresh.push(rotated.clone());
             fake.issued.push(rotated.clone());
             reply["refresh_token"] = json!(rotated);
         }
+        if provider == "slack" {
+            reply["ok"] = json!(true);
+        }
         return Json(reply).into_response();
     }
     let ok_client = field("grant_type") == "authorization_code"
-        && field("client_id") == client.id
-        && field("client_secret") == client.secret
+        && authenticated
         && field("redirect_uri") == client.redirect;
     let verifier_challenge = oauth::challenge(field("code_verifier"));
     let code = field("code").to_string();
@@ -323,6 +410,15 @@ async fn token(
     });
     if !omit {
         reply["refresh_token"] = json!(consent.refresh_token);
+    }
+    if provider == "slack" {
+        reply = json!({
+            "ok": true,
+            "app_id": "A1",
+            "authed_user": reply,
+            "team": { "id": "T1", "name": "Team" },
+            "is_enterprise_install": false,
+        });
     }
     Json(reply).into_response()
 }
@@ -379,15 +475,54 @@ async fn current_account(State(fake): State<Shared>, headers: HeaderMap, body: B
     }
 }
 
-/// Dropbox's revoke: the access token is the bearer; recorded as the token it ended.
-async fn dropbox_revoke(State(fake): State<Shared>, headers: HeaderMap) -> Response {
+/// Dropbox's and Slack's revoke: the access token is the bearer; recorded as the token it ended.
+async fn bearer_revoke(State(fake): State<Shared>, uri: Uri, headers: HeaderMap) -> Response {
     let mut fake = fake.lock().unwrap();
     let token = bearer_of(&headers);
-    fake.requests.push((
-        DROPBOX_REVOKE.into(),
-        HashMap::from([("token".into(), token)]),
-    ));
+    fake.requests
+        .push((uri.path().into(), HashMap::from([("token".into(), token)])));
     fake.revoke_status.into_response()
+}
+
+/// Figma's `/v1/me`, answered to any Figma access token the stand-in issued with the account of
+/// the first Figma consent.
+async fn figma_me(State(fake): State<Shared>, headers: HeaderMap) -> Response {
+    let mut fake = fake.lock().unwrap();
+    let presented = bearer_of(&headers);
+    fake.requests.push((FIGMA_ME.into(), HashMap::new()));
+    if !presented.starts_with(FIGMA_CLIENT.access) || !fake.access.contains(&presented) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(c) = fake.consents.iter().find(|c| c.provider == "figma") else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    Json(json!({ "id": c.subject, "email": c.email, "handle": "Member" })).into_response()
+}
+
+/// Slack's `auth.test`, answered only to the access token a Slack consent issued. A consent's
+/// subject reads `<team_id>:<user_id>` and its email `<user> @ <team>`.
+async fn slack_identity(State(fake): State<Shared>, headers: HeaderMap) -> Response {
+    let mut fake = fake.lock().unwrap();
+    let presented = bearer_of(&headers);
+    fake.requests.push((SLACK_IDENTITY.into(), HashMap::new()));
+    let Some(c) = fake
+        .consents
+        .iter()
+        .find(|c| c.provider == "slack" && c.access_token == presented)
+    else {
+        return Json(json!({ "ok": false, "error": "invalid_auth" })).into_response();
+    };
+    let (team_id, user_id) = c.subject.split_once(':').unwrap_or(("T1", &c.subject));
+    let (user, team) = c.email.split_once(" @ ").unwrap_or((&c.email, "Team"));
+    Json(json!({
+        "ok": true,
+        "url": "https://team.slack.com/",
+        "team": team,
+        "user": user,
+        "team_id": team_id,
+        "user_id": user_id,
+    }))
+    .into_response()
 }
 
 /// Google's and Dropbox's data APIs, told apart by host and answered only to an access token the
@@ -415,10 +550,11 @@ async fn data(
         body: body.to_vec(),
     });
     let token = bearer_of(&headers);
-    let provider = if host.ends_with(".dropboxapi.com") {
-        "dropbox"
-    } else {
-        "google"
+    let provider = match host.as_str() {
+        "slack.com" => "slack",
+        "api.figma.com" => "figma",
+        h if h.ends_with(".dropboxapi.com") => "dropbox",
+        _ => "google",
     };
     if fake.unauthorized > 0
         || !token.starts_with(client_of(provider).access)
@@ -500,6 +636,17 @@ async fn data(
             fake.folders.push(path.clone());
             json_body(json!({ "metadata": { "path_display": path } }).to_string()).into_response()
         }
+        ("figma", "GET", _) => json_body(json!({ "path": uri.path() }).to_string()).into_response(),
+        ("slack", "GET", ["api", "conversations.history"]) => {
+            json_body(SLACK_HISTORY.into()).into_response()
+        }
+        ("slack", "GET", ["api", "conversations.list"]) => {
+            json_body(r#"{"ok":true,"channels":[{"id":"C1","name":"general"}]}"#.into())
+                .into_response()
+        }
+        ("slack", "GET", ["api", "users.info"]) => {
+            json_body(r#"{"ok":true,"user":{"id":"U2","name":"ann"}}"#.into()).into_response()
+        }
         _ => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -541,6 +688,8 @@ impl FakeProviders {
             revoke_status: StatusCode::OK,
             data: vec![],
             rotate: false,
+            omit_expires_in: false,
+            refresh_reply: None,
             refresh_delay: Duration::ZERO,
             unauthorized: 0,
             media_size: 0,
@@ -552,10 +701,16 @@ impl FakeProviders {
         let app = Router::new()
             .route("/token", post(token))
             .route(DROPBOX_TOKEN, post(token))
+            .route(SLACK_TOKEN, post(token))
+            .route(SLACK_IDENTITY, post(slack_identity))
+            .route(SLACK_REVOKE, post(bearer_revoke))
+            .route(FIGMA_TOKEN, post(token))
+            .route(FIGMA_REFRESH, post(token))
+            .route(FIGMA_ME, get(figma_me))
             .route("/v1/userinfo", get(userinfo))
             .route(DROPBOX_ACCOUNT, post(current_account))
             .route("/revoke", post(revoke))
-            .route(DROPBOX_REVOKE, post(dropbox_revoke))
+            .route(DROPBOX_REVOKE, post(bearer_revoke))
             .fallback(data)
             .layer(DefaultBodyLimit::disable())
             .with_state(state.clone());
@@ -743,13 +898,17 @@ pub async fn harness() -> Option<Harness> {
     let config = Config::build(|name| match name {
         "GOOGLE_CLIENT_ID" => Some(CLIENT_ID.into()),
         "DROPBOX_CLIENT_ID" => Some(DROPBOX_CLIENT_ID.into()),
+        "SLACK_CLIENT_ID" => Some(SLACK_CLIENT_ID.into()),
+        "FIGMA_CLIENT_ID" => Some(FIGMA_CLIENT_ID.into()),
         "OAUTH_REDIRECT_BASE" => Some("https://corpus.example/oauth".into()),
         _ => None,
     })
     .unwrap();
     let client_secrets = oauth::PROVIDERS
+        .into_iter()
+        .filter(|p| !matches!(p.client_auth, oauth::ClientAuth::Public))
         .map(|p| (p.name, client_of(p.name).secret.to_string().into()))
-        .into();
+        .collect();
     let state = Arc::new(AppState {
         config,
         secrets: parking_lot::RwLock::new(Secrets {
@@ -896,11 +1055,22 @@ impl Harness {
         member: &str,
         email: &str,
     ) -> (Reply, Consent) {
+        self.connect_as(provider, member, &format!("subject-of-{email}"), email)
+            .await
+    }
+
+    /// A whole connect to `provider` as the account `subject` the provider names `name`.
+    pub async fn connect_as(
+        &self,
+        provider: &'static str,
+        member: &str,
+        subject: &str,
+        name: &str,
+    ) -> (Reply, Consent) {
         let query = self.start(provider, member).await;
-        let subject = format!("subject-of-{email}");
         let consent = self
             .fake
-            .consent_on(provider, &query["code_challenge"], &subject, email);
+            .consent_on(provider, &query["code_challenge"], subject, name);
         let reply = self.finish(member, &consent.code, &query["state"]).await;
         (reply, consent)
     }
