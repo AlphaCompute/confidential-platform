@@ -102,14 +102,6 @@ fn client_of(provider: &str) -> &'static Client {
     }
 }
 
-fn provider_of_host(host: &str) -> &'static str {
-    if host.ends_with(".dropboxapi.com") {
-        "dropbox"
-    } else {
-        "google"
-    }
-}
-
 pub fn bearer_of(headers: &HeaderMap) -> String {
     headers
         .get(header::AUTHORIZATION)
@@ -423,7 +415,11 @@ async fn data(
         body: body.to_vec(),
     });
     let token = bearer_of(&headers);
-    let provider = provider_of_host(&host);
+    let provider = if host.ends_with(".dropboxapi.com") {
+        "dropbox"
+    } else {
+        "google"
+    };
     if fake.unauthorized > 0
         || !token.starts_with(client_of(provider).access)
         || !fake.access.contains(&token)

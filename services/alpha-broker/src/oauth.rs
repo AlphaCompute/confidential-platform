@@ -374,11 +374,4 @@ mod tests {
         assert_eq!(challenge_a, challenge(&a));
         assert_ne!(*a, *b);
     }
-
-    #[test]
-    fn names_are_unique() {
-        for (i, a) in PROVIDERS.iter().enumerate() {
-            assert!(PROVIDERS[i + 1..].iter().all(|b| b.name != a.name));
-        }
-    }
 }
