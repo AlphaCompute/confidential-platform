@@ -910,16 +910,6 @@ impl Harness {
         (reply, consent)
     }
 
-    /// `POST /proxy` from `client` over the real listener.
-    pub async fn proxy_with(
-        &self,
-        client: &reqwest::Client,
-        bearer: Option<&str>,
-        body: &Value,
-    ) -> Result<Raw, reqwest::Error> {
-        self.post_with(client, bearer, "/proxy", body).await
-    }
-
     /// `POST path` over the real listener from `client`; fails the test if anything in the
     /// reply, headers included, carries a token or secret. `Err` when the request itself failed.
     pub async fn post_with(
@@ -961,7 +951,7 @@ impl Harness {
 
     /// From the attested Instance with the proxy bearer.
     pub async fn proxy(&self, body: &Value) -> Raw {
-        self.proxy_with(&self.instance, Some(PROXY_BEARER), body)
+        self.post_with(&self.instance, Some(PROXY_BEARER), "/proxy", body)
             .await
             .unwrap()
     }

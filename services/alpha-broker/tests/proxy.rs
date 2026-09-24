@@ -44,7 +44,7 @@ async fn a_caller_without_a_client_certificate_is_refused() {
     let (id, _) = h.connected().await;
     let anonymous = instance_client(&h.ca, None);
     let reply = h
-        .proxy_with(&anonymous, Some(PROXY_BEARER), &read(id, FILES))
+        .post_with(&anonymous, Some(PROXY_BEARER), "/proxy", &read(id, FILES))
         .await
         .unwrap();
     assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
@@ -58,7 +58,7 @@ async fn a_leaf_from_another_ca_fails_the_handshake() {
     let (id, _) = h.connected().await;
     let stranger = instance_client(&h.ca, Some(Ca::new().instance()));
     assert!(
-        h.proxy_with(&stranger, Some(PROXY_BEARER), &read(id, FILES))
+        h.post_with(&stranger, Some(PROXY_BEARER), "/proxy", &read(id, FILES))
             .await
             .is_err()
     );
@@ -74,9 +74,10 @@ async fn a_kms_node_leaf_is_refused() {
         format!("urn:alphacompute:revision:sha256:{}", "1".repeat(64)),
     ]);
     let reply = h
-        .proxy_with(
+        .post_with(
             &instance_client(&h.ca, Some(node)),
             Some(PROXY_BEARER),
+            "/proxy",
             &read(id, FILES),
         )
         .await
@@ -92,7 +93,7 @@ async fn each_bearer_opens_only_its_own_routes() {
     let (id, _) = h.connected().await;
     for bearer in [None, Some("wrong-bearer"), Some(BEARER)] {
         let reply = h
-            .proxy_with(&h.instance, bearer, &read(id, FILES))
+            .post_with(&h.instance, bearer, "/proxy", &read(id, FILES))
             .await
             .unwrap();
         assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{bearer:?}");

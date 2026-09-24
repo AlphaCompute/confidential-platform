@@ -79,18 +79,15 @@ fn check_headers(
     provider: &Provider,
     headers: Option<BTreeMap<String, String>>,
 ) -> Result<HeaderMap, Error> {
-    let headers = headers.unwrap_or_default();
-    let listed = |name: &String| {
-        provider
+    let mut out = HeaderMap::new();
+    for (name, value) in headers.unwrap_or_default() {
+        if !provider
             .headers
             .iter()
-            .any(|h| h.eq_ignore_ascii_case(name))
-    };
-    if !headers.keys().all(listed) {
-        return Err(Error::NotAllowed);
-    }
-    let mut out = HeaderMap::new();
-    for (name, value) in headers {
+            .any(|h| h.eq_ignore_ascii_case(&name))
+        {
+            return Err(Error::NotAllowed);
+        }
         let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| Error::NotAllowed)?;
         let value = HeaderValue::from_str(&value)
             .map_err(|_| Error::Malformed(format!("header {name} has an invalid value")))?;
