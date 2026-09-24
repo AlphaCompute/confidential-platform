@@ -51,15 +51,21 @@ pub const DROPBOX_CLIENT_ID: &str = "dropbox-app-key-for-tests";
 pub const DROPBOX_CLIENT_SECRET: &str = "dropbox-app-secret-for-tests";
 pub const DROPBOX_REDIRECT_URI: &str = "https://corpus.example/oauth/dropbox/callback";
 pub const SLACK_CLIENT_ID: &str = "1234.5678";
+pub const SLACK_CLIENT_SECRET: &str = "slack-client-secret-for-tests";
 pub const FIGMA_CLIENT_ID: &str = "figma-client-id-for-tests";
 pub const FIGMA_CLIENT_SECRET: &str = "figma-client-secret-for-tests";
 pub const FIGMA_REDIRECT_URI: &str = "https://corpus.example/oauth/figma/callback";
 pub const SLACK_REDIRECT_URI: &str = "https://corpus.example/oauth/slack/callback";
+pub const HUBSPOT_CLIENT_ID: &str = "hubspot-client-id-for-tests";
+pub const HUBSPOT_CLIENT_SECRET: &str = "hubspot-client-secret-for-tests";
+pub const HUBSPOT_REDIRECT_URI: &str = "https://corpus.example/oauth/hubspot/callback";
+pub const NOTION_CLIENT_ID: &str = "notion-client-id-for-tests";
+pub const NOTION_REDIRECT_URI: &str = "https://corpus.example/oauth/notion/callback";
 pub const KEY: [u8; 32] = [9; 32];
 pub const EMAIL: &str = "member@example.com";
 pub const MEMBER: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 pub const OTHER_MEMBER: &str = "2222222222222222222222222222222222222222222222222222222222222222";
-const HOSTS: [&str; 8] = [
+const HOSTS: [&str; 10] = [
     "accounts.google.com",
     "oauth2.googleapis.com",
     "openidconnect.googleapis.com",
@@ -68,10 +74,17 @@ const HOSTS: [&str; 8] = [
     "content.dropboxapi.com",
     "slack.com",
     "api.figma.com",
+    "mcp.hubspot.com",
+    "mcp.notion.com",
 ];
 pub const MEDIA: &str = "https://www.googleapis.com/drive/v3/files/file-1?alt=media";
 pub const LISTING: &str = r#"{"files":[{"id":"file-1","name":"Notes"}]}"#;
 pub const SLACK_HISTORY: &str = r#"{"ok":true,"messages":[{"type":"message","user":"U2","text":"hello","ts":"1.2"}],"has_more":false}"#;
+pub const MCP_ACCEPT: &str = "application/json, text/event-stream";
+pub const MCP_TOOLS: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"search_crm_objects","inputSchema":{}}]}}"#;
+/// A header Notion's stand-in sets on every MCP reply, which the broker must not relay.
+pub const MCP_SESSION: &str = "mcp-session-id";
+pub const MCP_RESULT: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"results\":[{\"id\":\"101\"}]}"}],"isError":false}}"#;
 pub const DROPBOX_LISTING: &str = r#"{"entries":[{".tag":"file","name":"Notes.txt","id":"id:a1"}],"cursor":"c1","has_more":false}"#;
 
 /// What the stand-in expects of one provider's client and how its tokens look.
@@ -102,10 +115,9 @@ const DROPBOX_CLIENT: Client = Client {
     scope: "account_info.read files.content.read files.content.write",
 };
 
-/// A public client: it has no secret.
 const SLACK_CLIENT: Client = Client {
     id: SLACK_CLIENT_ID,
-    secret: "",
+    secret: SLACK_CLIENT_SECRET,
     redirect: SLACK_REDIRECT_URI,
     access: "xoxp-",
     refresh: "xoxe-1-",
@@ -121,8 +133,29 @@ const FIGMA_CLIENT: Client = Client {
     scope: "",
 };
 
+const HUBSPOT_CLIENT: Client = Client {
+    id: HUBSPOT_CLIENT_ID,
+    secret: HUBSPOT_CLIENT_SECRET,
+    redirect: HUBSPOT_REDIRECT_URI,
+    access: "hsat-",
+    refresh: "hsrt-",
+    scope: "",
+};
+
+/// A public client: it has no secret.
+const NOTION_CLIENT: Client = Client {
+    id: NOTION_CLIENT_ID,
+    secret: "",
+    redirect: NOTION_REDIRECT_URI,
+    access: "ntn_",
+    refresh: "ntnr_",
+    scope: "default",
+};
+
 fn client_of(provider: &str) -> &'static Client {
     match provider {
+        "hubspot" => &HUBSPOT_CLIENT,
+        "notion" => &NOTION_CLIENT,
         "dropbox" => &DROPBOX_CLIENT,
         "slack" => &SLACK_CLIENT,
         "figma" => &FIGMA_CLIENT,
@@ -256,6 +289,8 @@ impl Fake {
         let mut out = vec![
             CLIENT_SECRET.to_string(),
             DROPBOX_CLIENT_SECRET.to_string(),
+            SLACK_CLIENT_SECRET.to_string(),
+            HUBSPOT_CLIENT_SECRET.to_string(),
             FIGMA_CLIENT_SECRET.to_string(),
         ];
         for c in &self.consents {
@@ -286,6 +321,7 @@ pub const SLACK_REVOKE: &str = "/api/auth.revoke";
 pub const FIGMA_TOKEN: &str = "/v1/oauth/token";
 pub const FIGMA_REFRESH: &str = "/v1/oauth/refresh";
 pub const FIGMA_ME: &str = "/v1/me";
+pub const HUBSPOT_TOKEN: &str = "/oauth/v3/token";
 
 /// The `id:secret` of an HTTP Basic authorization header.
 fn basic_of(headers: &HeaderMap) -> Option<String> {
@@ -307,10 +343,18 @@ fn invalid_grant() -> Response {
         .into_response()
 }
 
-/// Google's `/token`, Dropbox's `/oauth2/token`, Slack's `oauth.v2.access` and Figma's token and
-/// refresh URLs, each accepting only its own client: Google and Dropbox with the secret in the
-/// form, Slack as a public client that must send no secret at all, Figma only in HTTP Basic and
-/// refreshing only at its own URL.
+fn host_of(headers: &HeaderMap) -> String {
+    headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Every provider's token and refresh URLs, each accepting only its own client: Google, Dropbox,
+/// Slack and HubSpot with the secret in the form, Figma only in HTTP Basic and refreshing only at
+/// its own URL, Notion as a public client that must send no secret. Notion's `/token` also takes a
+/// revocation, a post without `grant_type`, recorded as `/revoke`.
 async fn token(
     State(fake): State<Shared>,
     uri: Uri,
@@ -321,8 +365,15 @@ async fn token(
         DROPBOX_TOKEN => "dropbox",
         SLACK_TOKEN => "slack",
         FIGMA_TOKEN | FIGMA_REFRESH => "figma",
+        HUBSPOT_TOKEN => "hubspot",
+        _ if host_of(&headers) == "mcp.notion.com" => "notion",
         _ => "google",
     };
+    if provider == "notion" && !form.contains_key("grant_type") {
+        let mut fake = fake.lock().unwrap();
+        fake.requests.push(("/revoke".into(), form));
+        return fake.revoke_status.into_response();
+    }
     let client = client_of(provider);
     let delay = {
         let mut fake = fake.lock().unwrap();
@@ -354,7 +405,7 @@ async fn token(
                 && !form.contains_key("client_secret")
                 && (uri.path() == FIGMA_REFRESH) == refreshing
         }
-        "slack" => field("client_id") == client.id && !form.contains_key("client_secret"),
+        "notion" => field("client_id") == client.id && !form.contains_key("client_secret"),
         _ => field("client_id") == client.id && field("client_secret") == client.secret,
     };
     if refreshing {
@@ -373,7 +424,7 @@ async fn token(
         if !fake.omit_expires_in {
             reply["expires_in"] = json!(3599);
         }
-        if fake.rotate || provider == "slack" {
+        if fake.rotate || provider == "slack" || provider == "notion" {
             let rotated = format!("{}fake-rotated-{n}", client.refresh);
             fake.refresh.retain(|t| *t != presented);
             fake.refresh.push(rotated.clone());
@@ -523,6 +574,115 @@ async fn slack_identity(State(fake): State<Shared>, headers: HeaderMap) -> Respo
         "user_id": user_id,
     }))
     .into_response()
+}
+
+/// The account an MCP server's identity tool names for consent `c`, whose subject reads
+/// `<hub>:<user>` or `<workspace>:<user>`. HubSpot's `get_user_details` gives numbers when they
+/// parse; Notion's `notion-fetch` of `self` gives an email only when the consent's name holds one.
+fn mcp_account(provider: &str, c: &Consent) -> Value {
+    let (outer, user) = c.subject.split_once(':').unwrap_or(("1", &c.subject));
+    if provider == "notion" {
+        let mut user = json!({ "id": user, "type": "person", "name": c.email });
+        if c.email.contains('@') {
+            user["name"] = json!("Member");
+            user["email"] = json!(c.email);
+        }
+        return json!({
+            "metadata": { "type": "self" },
+            "self": { "workspace": { "id": outer, "name": "Workspace" }, "user": user },
+        });
+    }
+    let number = |v: &str| v.parse::<u64>().map_or(json!(v), Value::from);
+    json!({
+        "accountId": number(outer),
+        "userId": number(user),
+        "userInformation": { "email": c.email, "type": "USER" },
+        "toolInformation": {},
+    })
+}
+
+/// HubSpot's and Notion's MCP servers, told apart by host; HubSpot replies in JSON, Notion in
+/// server-sent events with a session header. The identity call, which arrives with the access
+/// token a consent's exchange issued, is recorded as an OAuth request; every other call is data,
+/// answered only to a token the stand-in issued. Both need the Accept header the MCP transport
+/// requires.
+async fn mcp(State(fake): State<Shared>, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
+    let mut fake = fake.lock().unwrap();
+    let host = host_of(&headers);
+    let provider = if host == "mcp.notion.com" {
+        "notion"
+    } else {
+        "hubspot"
+    };
+    let token = bearer_of(&headers);
+    if headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()) != Some(MCP_ACCEPT) {
+        return StatusCode::NOT_ACCEPTABLE.into_response();
+    }
+    let request: Value = serde_json::from_slice(&body).unwrap_or_default();
+    let reply = |body: String| {
+        if provider == "notion" {
+            (
+                [
+                    (header::CONTENT_TYPE, "text/event-stream"),
+                    (header::HeaderName::from_static(MCP_SESSION), "stand-in"),
+                ],
+                sse(&body),
+            )
+                .into_response()
+        } else {
+            ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+        }
+    };
+    let identity = fake
+        .consents
+        .iter()
+        .find(|c| c.provider == provider && c.access_token == token)
+        .cloned();
+    if let Some(c) = identity {
+        fake.requests.push(("mcp-identity".into(), HashMap::new()));
+        let expected = match provider {
+            "notion" => json!({ "name": "notion-fetch", "arguments": { "id": "self" } }),
+            _ => json!({ "name": "get_user_details", "arguments": {} }),
+        };
+        if request["method"] != "tools/call" || request["params"] != expected {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        let text = mcp_account(provider, &c).to_string();
+        let result = json!({
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": { "content": [{ "type": "text", "text": text }], "isError": false },
+        });
+        return reply(result.to_string());
+    }
+    fake.data.push(DataRequest {
+        method: Method::POST,
+        host,
+        path: uri.path().to_string(),
+        query: HashMap::new(),
+        headers: headers.clone(),
+        body: body.to_vec(),
+    });
+    if fake.unauthorized > 0
+        || !token.starts_with(client_of(provider).access)
+        || !fake.access.contains(&token)
+    {
+        fake.unauthorized = fake.unauthorized.saturating_sub(1);
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    reply(
+        match request["method"].as_str() {
+            Some("tools/list") => MCP_TOOLS,
+            Some("tools/call") => MCP_RESULT,
+            _ => r#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+        }
+        .to_string(),
+    )
+}
+
+/// One JSON-RPC message as the one event of a server-sent event stream.
+pub fn sse(message: &str) -> String {
+    format!("event: message\ndata: {message}\n\n")
 }
 
 /// Google's and Dropbox's data APIs, told apart by host and answered only to an access token the
@@ -707,6 +867,9 @@ impl FakeProviders {
             .route(FIGMA_TOKEN, post(token))
             .route(FIGMA_REFRESH, post(token))
             .route(FIGMA_ME, get(figma_me))
+            .route(HUBSPOT_TOKEN, post(token))
+            .route("/", post(mcp))
+            .route("/mcp", post(mcp))
             .route("/v1/userinfo", get(userinfo))
             .route(DROPBOX_ACCOUNT, post(current_account))
             .route("/revoke", post(revoke))
@@ -900,6 +1063,8 @@ pub async fn harness() -> Option<Harness> {
         "DROPBOX_CLIENT_ID" => Some(DROPBOX_CLIENT_ID.into()),
         "SLACK_CLIENT_ID" => Some(SLACK_CLIENT_ID.into()),
         "FIGMA_CLIENT_ID" => Some(FIGMA_CLIENT_ID.into()),
+        "HUBSPOT_CLIENT_ID" => Some(HUBSPOT_CLIENT_ID.into()),
+        "NOTION_CLIENT_ID" => Some(NOTION_CLIENT_ID.into()),
         "OAUTH_REDIRECT_BASE" => Some("https://corpus.example/oauth".into()),
         _ => None,
     })
@@ -945,6 +1110,7 @@ pub struct Reply {
 pub struct Raw {
     pub status: StatusCode,
     pub content_type: Option<String>,
+    pub headers: HeaderMap,
     pub bytes: Vec<u8>,
 }
 
@@ -960,6 +1126,17 @@ impl Raw {
 
 pub fn read(connection: Uuid, url: &str) -> Value {
     json!({ "member": MEMBER, "connection_id": connection, "method": "GET", "url": url })
+}
+
+/// A `/proxy` body posting the JSON-RPC `body` to the MCP server at `url`.
+pub fn mcp_rpc(connection: Uuid, url: &str, body: Value) -> Value {
+    json!({ "member": MEMBER, "connection_id": connection, "method": "POST", "url": url, "body": body })
+}
+
+pub fn mcp_call(connection: Uuid, url: &str, tool: &str) -> Value {
+    let call = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": tool, "arguments": {} } });
+    mcp_rpc(connection, url, call)
 }
 
 pub fn dropbox_read(connection: Uuid, url: &str) -> Value {
@@ -1084,16 +1261,28 @@ impl Harness {
         path: &str,
         body: &Value,
     ) -> Result<Raw, reqwest::Error> {
+        self.post_text(client, bearer, path, body.to_string()).await
+    }
+
+    /// As `post_with`, with the request body sent exactly as given.
+    pub async fn post_text(
+        &self,
+        client: &reqwest::Client,
+        bearer: Option<&str>,
+        path: &str,
+        body: String,
+    ) -> Result<Raw, reqwest::Error> {
         let mut request = client
             .post(format!("https://{}{path}", self.broker))
             .header(header::CONTENT_TYPE, "application/json")
-            .body(body.to_string());
+            .body(body);
         if let Some(bearer) = bearer {
             request = request.bearer_auth(bearer);
         }
         let response = request.send().await?;
         let status = response.status();
-        let headers = format!("{:?}", response.headers());
+        let header_map = response.headers().clone();
+        let headers = format!("{header_map:?}");
         let content_type = response
             .headers()
             .get(header::CONTENT_TYPE)
@@ -1110,6 +1299,7 @@ impl Harness {
         Ok(Raw {
             status,
             content_type,
+            headers: header_map,
             bytes,
         })
     }
@@ -1153,6 +1343,13 @@ impl Harness {
             .await
             .unwrap()
     }
+}
+
+/// Nothing reached a provider, its OAuth endpoints included, while `f` ran.
+pub async fn nothing_reaches<F: Future<Output = ()>>(h: &Harness, f: F) {
+    let before = h.fake.with(|f| (f.data.len(), f.requests.len()));
+    f.await;
+    assert_eq!(h.fake.with(|f| (f.data.len(), f.requests.len())), before);
 }
 
 pub async fn count(h: &Harness, table: &str) -> i64 {

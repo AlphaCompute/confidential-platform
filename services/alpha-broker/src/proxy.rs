@@ -101,8 +101,36 @@ fn check_headers(
     Ok(out)
 }
 
-/// The live connection of the member, its provider, the entry of `list` the request matches
-/// and the caller's headers, checked in that order; a dead connection is refused last.
+/// Besides `tools/call`, the handshake and the tool listing. Resources, prompts and completions
+/// are refused: nothing has classified what they reach.
+const MCP_METHODS: &[&str] = &[
+    "initialize",
+    "notifications/initialized",
+    "ping",
+    "tools/list",
+];
+
+/// An MCP request the broker forwards: one JSON-RPC object, never a batch, whose method is on
+/// `MCP_METHODS` or is a `tools/call` of a tool named exactly on `tools`.
+pub fn mcp_call_allowed(tools: &[&str], body: Option<&Value>) -> bool {
+    let Some(Value::Object(request)) = body else {
+        return false;
+    };
+    match request.get("method").and_then(Value::as_str) {
+        Some("tools/call") => request
+            .get("params")
+            .and_then(|params| params.get("name"))
+            .and_then(Value::as_str)
+            .is_some_and(|name| tools.contains(&name)),
+        Some(method) => MCP_METHODS.contains(&method),
+        None => false,
+    }
+}
+
+/// The live connection of the member, its provider, the entry of `list` the request matches,
+/// the caller's headers and, for an MCP server, the tool called, checked in that order; a dead
+/// connection is refused last.
+#[allow(clippy::too_many_arguments)]
 async fn target(
     state: &AppState,
     member: &str,
@@ -110,6 +138,7 @@ async fn target(
     method: &str,
     url: &Url,
     headers: Option<BTreeMap<String, String>>,
+    body: Option<&Value>,
     list: fn(&Provider) -> &'static [Entry],
 ) -> Result<(Uuid, &'static Provider, &'static Entry, HeaderMap), Error> {
     let member = parse_member(member)?;
@@ -122,6 +151,12 @@ async fn target(
         .ok_or_else(|| Error::internal("a connection names an unknown provider"))?;
     let entry = allowed(list(provider), method, url).ok_or(Error::NotAllowed)?;
     let headers = check_headers(provider, headers)?;
+    if provider
+        .mcp_tools
+        .is_some_and(|tools| !mcp_call_allowed(tools, body))
+    {
+        return Err(Error::NotAllowed);
+    }
     if dead {
         return Err(Error::ReconnectRequired);
     }
@@ -157,6 +192,7 @@ pub async fn proxy(
         &request.method,
         &url,
         request.headers,
+        request.body.as_ref(),
         |p| p.reads,
     )
     .await?;
@@ -200,6 +236,7 @@ pub async fn write(
         &request.method,
         &url,
         request.headers,
+        None,
         |p| p.writes,
     )
     .await?;
@@ -221,10 +258,11 @@ async fn forward(
     let mut retried = false;
     loop {
         let token = access_token(state, id, provider).await?;
-        let mut outgoing = state
+        let outgoing = state
             .http
             .request(entry.method.clone(), url.clone())
-            .headers(headers.clone())
+            .headers(headers.clone());
+        let mut outgoing = oauth::with_mcp_accept(outgoing, provider)
             .bearer_auth(token.as_str())
             .timeout(SEND_TIMEOUT);
         if let Some((content_type, bytes)) = &payload {
@@ -346,7 +384,96 @@ async fn access_token(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oauth::{DROPBOX, GOOGLE};
+    use serde_json::json;
+
+    use crate::oauth::{DROPBOX, GOOGLE, HUBSPOT, HUBSPOT_READ_TOOLS};
+
+    fn mcp_call(name: Value) -> Value {
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": name } })
+    }
+
+    fn mcp_allowed(body: &Value) -> bool {
+        mcp_call_allowed(HUBSPOT_READ_TOOLS, Some(body))
+    }
+
+    #[test]
+    fn mcp_a_listed_tool_the_handshake_and_the_tool_listing_pass() {
+        assert!(mcp_allowed(&mcp_call(json!("search_crm_objects"))));
+        for method in [
+            "tools/list",
+            "initialize",
+            "notifications/initialized",
+            "ping",
+        ] {
+            assert!(
+                mcp_allowed(&json!({ "jsonrpc": "2.0", "method": method })),
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_an_unlisted_near_or_malformed_call_is_refused() {
+        for name in [
+            "manage_crm_objects",
+            "search_crm_objects_v2",
+            "search_crm_object",
+            "Search_crm_objects",
+            " search_crm_objects",
+            "",
+        ] {
+            assert!(!mcp_allowed(&mcp_call(json!(name))), "{name:?}");
+        }
+        assert!(!mcp_allowed(&mcp_call(json!(7))));
+        assert!(!mcp_allowed(
+            &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call" })
+        ));
+        assert!(!mcp_allowed(
+            &json!({ "method": "tools/call", "params": { "arguments": {} } })
+        ));
+        assert!(!mcp_allowed(&json!([mcp_call(json!(
+            "search_crm_objects"
+        ))])));
+        assert!(!mcp_allowed(&json!("tools/list")));
+        for method in [
+            json!("resources/read"),
+            json!("resources/list"),
+            json!("prompts/get"),
+            json!("completion/complete"),
+            json!("Tools/list"),
+            json!(1),
+        ] {
+            assert!(
+                !mcp_allowed(&json!({ "jsonrpc": "2.0", "id": 1, "method": method })),
+                "{method}"
+            );
+        }
+        assert!(!mcp_allowed(
+            &json!({ "jsonrpc": "2.0", "id": 1, "result": {} })
+        ));
+        assert!(!mcp_call_allowed(HUBSPOT_READ_TOOLS, None));
+    }
+
+    #[test]
+    fn mcp_hubspot_is_reached_with_or_without_a_trailing_slash() {
+        for url in ["https://mcp.hubspot.com", "https://mcp.hubspot.com/"] {
+            assert!(
+                allowed(HUBSPOT.reads, "POST", &Url::parse(url).unwrap()).is_some(),
+                "{url}"
+            );
+        }
+        for url in ["https://mcp.hubspot.com/mcp", "https://mcp.hubspot.com//"] {
+            assert!(allowed(HUBSPOT.reads, "POST", &Url::parse(url).unwrap()).is_none());
+        }
+        assert!(
+            allowed(
+                HUBSPOT.reads,
+                "GET",
+                &Url::parse("https://mcp.hubspot.com/").unwrap()
+            )
+            .is_none()
+        );
+    }
 
     fn google(method: &str, url: &str) -> bool {
         allowed(GOOGLE.reads, method, &Url::parse(url).unwrap()).is_some()

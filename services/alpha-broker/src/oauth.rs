@@ -8,8 +8,9 @@ use std::time::Duration;
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use reqwest::Method;
+use reqwest::header::ACCEPT;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -30,6 +31,9 @@ pub enum Revoke {
     /// A `POST` carrying a fresh access token as bearer; the provider ends the refresh token
     /// behind it too.
     Bearer(&'static str),
+    /// A form post of a fresh access token and the client id, as a public client revokes. The
+    /// refresh that minted it rotates the refresh token, and the broker keeps neither.
+    AccessForm(&'static str),
     // ponytail: the provider offers no revoke, so the grant stays valid there until the member
     // removes the app in the provider's settings or it expires; the broker's row is revoked and
     // its token never used again. No upgrade exists until the provider adds a revoke.
@@ -60,13 +64,30 @@ pub struct Provider {
     /// The refresh reply's `error` codes that mean the member must reconnect.
     pub dead: &'static [&'static str],
     pub extra_authorize: &'static [(&'static str, &'static str)],
-    /// The account lookup, sent with the bearer and no body.
-    pub identity: (Method, &'static str),
+    pub identity: Identity,
     pub revoke: Revoke,
     pub reads: &'static [Entry],
     pub writes: &'static [Entry],
     /// Names of the request headers a caller may set.
     pub headers: &'static [&'static str],
+    /// For an MCP server: the only tools a `tools/call` may name.
+    pub mcp_tools: Option<&'static [&'static str]>,
+}
+
+/// How the broker names the account behind a fresh access token.
+pub enum Identity {
+    /// A request with the bearer and no body, whose JSON reply names the account.
+    Bearer(Method, &'static str),
+    /// A `tools/call` on the provider's MCP server whose text content is a JSON object: the
+    /// subject joins the values at the `subject` pointers with `:`, and the name is the first
+    /// value found at a `name` pointer.
+    Mcp {
+        url: &'static str,
+        tool: &'static str,
+        arguments: &'static [(&'static str, &'static str)],
+        subject: &'static [&'static str],
+        name: &'static [&'static str],
+    },
 }
 
 const fn get(host: &'static str, path: &'static str) -> Entry {
@@ -107,7 +128,7 @@ pub const GOOGLE: Provider = Provider {
     tokens_at: None,
     dead: &["invalid_grant"],
     extra_authorize: &[("access_type", "offline"), ("prompt", "consent")],
-    identity: (
+    identity: Identity::Bearer(
         Method::GET,
         "https://openidconnect.googleapis.com/v1/userinfo",
     ),
@@ -129,6 +150,7 @@ pub const GOOGLE: Provider = Provider {
         post("www.googleapis.com", "/drive/v3/files"),
     ],
     headers: &[],
+    mcp_tools: None,
 };
 
 /// `account_info.read` names the account (the lookup must carry no content type: Dropbox refuses
@@ -152,7 +174,7 @@ pub const DROPBOX: Provider = Provider {
     tokens_at: None,
     dead: &["invalid_grant"],
     extra_authorize: &[("token_access_type", "offline")],
-    identity: (
+    identity: Identity::Bearer(
         Method::POST,
         "https://api.dropboxapi.com/2/users/get_current_account",
     ),
@@ -174,17 +196,19 @@ pub const DROPBOX: Provider = Provider {
         post("api.dropboxapi.com", "/2/files/create_folder_v2"),
     ],
     headers: &["dropbox-api-arg", "dropbox-api-path-root"],
+    mcp_tools: None,
 };
 
 /// A user token, never a bot's: the connection reads as the member, in every channel and direct
-/// message the member sees. A public client, so no Slack secret exists to leak. Every Slack
-/// failure is HTTP 200 with `ok: false`; the exchange's user token sits under `authed_user`.
+/// message the member sees. Slack refuses a refresh without the client secret even when the
+/// code was exchanged with PKCE, so the secret goes on both. Every Slack failure is HTTP 200
+/// with `ok: false`; the exchange's user token sits under `authed_user`.
 pub const SLACK: Provider = Provider {
     name: "slack",
     authorization: "https://slack.com/oauth/v2/authorize",
     token: "https://slack.com/api/oauth.v2.access",
     refresh: "https://slack.com/api/oauth.v2.access",
-    client_auth: ClientAuth::Public,
+    client_auth: ClientAuth::Form,
     scopes: &[
         "channels:read",
         "channels:history",
@@ -200,7 +224,7 @@ pub const SLACK: Provider = Provider {
     tokens_at: Some("authed_user"),
     dead: &["invalid_refresh_token"],
     extra_authorize: &[],
-    identity: (Method::POST, "https://slack.com/api/auth.test"),
+    identity: Identity::Bearer(Method::POST, "https://slack.com/api/auth.test"),
     revoke: Revoke::Bearer("https://slack.com/api/auth.revoke"),
     reads: &[
         get("slack.com", "/api/conversations.list"),
@@ -209,6 +233,7 @@ pub const SLACK: Provider = Provider {
     ],
     writes: &[],
     headers: &[],
+    mcp_tools: None,
 };
 
 /// `current_user:read` names the account; `file_metadata:read` and `folders:read` reach the team
@@ -230,7 +255,7 @@ pub const FIGMA: Provider = Provider {
     tokens_at: None,
     dead: &["invalid_grant"],
     extra_authorize: &[],
-    identity: (Method::GET, "https://api.figma.com/v1/me"),
+    identity: Identity::Bearer(Method::GET, "https://api.figma.com/v1/me"),
     revoke: Revoke::Local,
     reads: &[
         get("api.figma.com", "/v1/me"),
@@ -244,9 +269,109 @@ pub const FIGMA: Provider = Provider {
     ],
     writes: &[],
     headers: &[],
+    mcp_tools: None,
 };
 
-pub const PROVIDERS: [&Provider; 4] = [&GOOGLE, &DROPBOX, &SLACK, &FIGMA];
+/// A tool HubSpot renames or adds is refused until this list changes.
+pub const HUBSPOT_READ_TOOLS: &[&str] = &[
+    "get_campaign_attribution_reports",
+    "get_aeo_metrics",
+    "get_conversation_channel_metadata",
+    "search_intent_signals",
+    "discover_hubspot_schema",
+    "get_content_analytics_report",
+    "get_properties",
+    "get_crm_objects",
+    "search_conversations",
+    "get_user_details",
+    "search_crm_objects",
+    "get_marketing_email_analytics",
+    "search_owners",
+    "query_crm_data",
+    "read_campaign_data",
+    "get_organization_details",
+    "search_properties",
+    "tool_guidance",
+];
+
+/// HubSpot's MCP server offers no scope choice (the member picks a preset at consent), and its
+/// scopes include writes, so the tool list is the only fence. Its introspection names no
+/// account, so `get_user_details` does: the hub (`accountId`) and the user within it.
+pub const HUBSPOT: Provider = Provider {
+    name: "hubspot",
+    authorization: "https://mcp.hubspot.com/oauth/authorize/user",
+    token: "https://mcp.hubspot.com/oauth/v3/token",
+    refresh: "https://mcp.hubspot.com/oauth/v3/token",
+    client_auth: ClientAuth::Form,
+    scopes: &[],
+    scope_param: ("scope", " "),
+    tokens_at: None,
+    dead: &["invalid_grant"],
+    extra_authorize: &[],
+    identity: Identity::Mcp {
+        url: "https://mcp.hubspot.com/",
+        tool: "get_user_details",
+        arguments: &[],
+        subject: &["/accountId", "/userId"],
+        name: &["/userInformation/email"],
+    },
+    revoke: Revoke::Local,
+    reads: &[post("mcp.hubspot.com", "/")],
+    writes: &[],
+    headers: &[],
+    mcp_tools: Some(HUBSPOT_READ_TOOLS),
+};
+
+/// A tool Notion renames or adds is refused until this list changes. `notion-ai-search` stays
+/// off: it reaches the member's other apps connected to Notion. So do the custom-agent tools,
+/// which start or read an agent acting in the workspace.
+pub const NOTION_READ_TOOLS: &[&str] = &[
+    "notion-search",
+    "notion-get-tool-access",
+    "notion-fetch",
+    "notion-download-attachment",
+    "notion-get-comments",
+    "notion-get-async-task",
+    "notion-get-teams",
+    "notion-get-users",
+    "notion-query-data-sources",
+    "notion-query-multiple-data-sources",
+    "notion-query-meeting-notes",
+    "notion-list-private-pages",
+    "notion-list-shared-pages",
+    "notion-list-favorite-pages",
+    "notion-list-recent-pages",
+];
+
+/// Notion's hosted MCP server, not its REST API: the REST OAuth has no PKCE, so whoever held
+/// the client secret could redeem a member's code. Here Corpus is a public client registered
+/// once per redirect URI, and no secret exists. Every reply is server-sent events.
+pub const NOTION: Provider = Provider {
+    name: "notion",
+    authorization: "https://mcp.notion.com/authorize",
+    token: "https://mcp.notion.com/token",
+    refresh: "https://mcp.notion.com/token",
+    client_auth: ClientAuth::Public,
+    scopes: &["default"],
+    scope_param: ("scope", " "),
+    tokens_at: None,
+    dead: &["invalid_grant", "invalid_token"],
+    extra_authorize: &[],
+    identity: Identity::Mcp {
+        url: "https://mcp.notion.com/mcp",
+        tool: "notion-fetch",
+        arguments: &[("id", "self")],
+        subject: &["/self/workspace/id", "/self/user/id"],
+        name: &["/self/user/email", "/self/user/name"],
+    },
+    revoke: Revoke::AccessForm("https://mcp.notion.com/token"),
+    reads: &[post("mcp.notion.com", "/mcp")],
+    writes: &[],
+    headers: &[],
+    mcp_tools: Some(NOTION_READ_TOOLS),
+};
+
+pub const PROVIDERS: [&Provider; 6] = [&GOOGLE, &DROPBOX, &SLACK, &FIGMA, &HUBSPOT, &NOTION];
 
 pub fn provider(name: &str) -> Option<&'static Provider> {
     PROVIDERS.into_iter().find(|p| p.name == name)
@@ -286,6 +411,7 @@ pub fn authorization_url(
         provider.authorization,
         params
             .into_iter()
+            .filter(|(_, value)| !value.is_empty())
             .chain(provider.extra_authorize.iter().copied()),
     )
     .map(String::from)
@@ -467,9 +593,28 @@ pub async fn account(
     provider: &Provider,
     access_token: &str,
 ) -> Result<Account, &'static str> {
-    let (method, url) = &provider.identity;
-    let response = http
-        .request(method.clone(), *url)
+    let request = match &provider.identity {
+        Identity::Bearer(method, url) => http.request(method.clone(), *url),
+        Identity::Mcp {
+            url,
+            tool,
+            arguments,
+            ..
+        } => {
+            let arguments: serde_json::Map<String, Value> = arguments
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), Value::from(*v)))
+                .collect();
+            let call = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": tool, "arguments": arguments },
+            });
+            with_mcp_accept(http.post(*url), provider).json(&call)
+        }
+    };
+    let response = request
         .bearer_auth(access_token)
         .send()
         .await
@@ -477,20 +622,69 @@ pub async fn account(
     if !response.status().is_success() {
         return Err("account_refused");
     }
-    Ok(
-        match response.json().await.map_err(|_| "account_malformed")? {
-            AccountReply::Email(account) => account,
-            AccountReply::Team {
-                team_id,
-                user_id,
-                user,
-                team,
-            } => Account {
-                subject: format!("{team_id}:{user_id}"),
-                email: format!("{user} @ {team}"),
+    let Identity::Mcp { subject, name, .. } = &provider.identity else {
+        return Ok(
+            match response.json().await.map_err(|_| "account_malformed")? {
+                AccountReply::Email(account) => account,
+                AccountReply::Team {
+                    team_id,
+                    user_id,
+                    user,
+                    team,
+                } => Account {
+                    subject: format!("{team_id}:{user_id}"),
+                    email: format!("{user} @ {team}"),
+                },
             },
-        },
-    )
+        );
+    };
+    let text = response.text().await.map_err(|_| "account_unreachable")?;
+    let content = tool_content(&text).ok_or("account_malformed")?;
+    let at = |pointer: &str| match content.pointer(pointer)? {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    };
+    let subject = subject
+        .iter()
+        .map(|p| at(p))
+        .collect::<Option<Vec<_>>>()
+        .ok_or("account_malformed")?
+        .join(":");
+    let email = name.iter().find_map(|p| at(p)).ok_or("account_malformed")?;
+    Ok(Account { subject, email })
+}
+
+/// An MCP server needs both content types in `Accept`; the broker sets it, never the caller.
+pub fn with_mcp_accept(
+    request: reqwest::RequestBuilder,
+    provider: &Provider,
+) -> reqwest::RequestBuilder {
+    if provider.mcp_tools.is_some() {
+        request.header(ACCEPT, "application/json, text/event-stream")
+    } else {
+        request
+    }
+}
+
+/// The JSON object in the text content of a successful `tools/call` reply, which an MCP server
+/// sends either as JSON or as server-sent events.
+fn tool_content(reply: &str) -> Option<Value> {
+    let result = std::iter::once(reply)
+        .chain(reply.lines().filter_map(|l| l.strip_prefix("data:")))
+        .filter_map(|r| serde_json::from_str::<Value>(r.trim()).ok())
+        .find_map(|mut r| r.get_mut("result").map(Value::take))?;
+    if result.get("isError") == Some(&Value::Bool(true)) {
+        return None;
+    }
+    let text = result
+        .get("content")?
+        .as_array()?
+        .iter()
+        .find(|c| c.get("type").and_then(Value::as_str) == Some("text"))?
+        .get("text")?
+        .as_str()?;
+    serde_json::from_str(text).ok()
 }
 
 /// Best effort: the caller revokes locally whatever the provider answers.
@@ -510,15 +704,20 @@ pub async fn revoke(
                     .send()
                     .await;
             }
-            Revoke::Bearer(url) => {
+            Revoke::Bearer(url) | Revoke::AccessForm(url) => {
                 if let Ok(fresh) =
                     refresh(http, provider, client_id, client_secret, refresh_token).await
                 {
-                    let _ = http
-                        .post(url)
-                        .bearer_auth(fresh.access_token.as_str())
-                        .send()
-                        .await;
+                    let access = fresh.access_token.as_str();
+                    let request = match provider.revoke {
+                        Revoke::AccessForm(_) => http.post(url).form(&[
+                            ("token", access),
+                            ("token_type_hint", "access_token"),
+                            ("client_id", client_id),
+                        ]),
+                        _ => http.post(url).bearer_auth(access),
+                    };
+                    let _ = request.send().await;
                 }
             }
             Revoke::Local => {}

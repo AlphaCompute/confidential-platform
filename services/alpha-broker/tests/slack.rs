@@ -26,7 +26,7 @@ async fn a_member_connects_slack_and_an_instance_reads_history_without_seeing_a_
     );
     let exchange = h.fake.with(|f| f.form(SLACK_TOKEN));
     assert_eq!(exchange["client_id"], SLACK_CLIENT_ID);
-    assert!(!exchange.contains_key("client_secret"), "{exchange:?}");
+    assert_eq!(exchange["client_secret"], SLACK_CLIENT_SECRET);
     assert_eq!(exchange["code_verifier"].len(), 43);
 
     let reply = h.proxy(&read(id, HISTORY)).await;
@@ -177,18 +177,17 @@ async fn one_slack_user_keeps_one_connection_and_a_second_workspace_makes_anothe
 }
 
 #[tokio::test]
-async fn slack_needs_no_client_secret_and_figma_refreshes_only_with_one() {
-    let Some(h) = harness().await else { return };
-    let slack = alpha_broker::oauth::provider("slack").unwrap();
-    let (client_id, secret) = h.state.client(slack).unwrap();
-    assert_eq!((client_id, secret), (SLACK_CLIENT_ID, None));
-
-    let (id, _) = h.connected_to("figma").await;
-    h.state.secrets.write().client_secrets.remove("figma");
-    let reply = h
-        .proxy(&read(id, "https://api.figma.com/v1/files/AbC123"))
-        .await;
-    assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
-    assert_eq!(reply.code(), "upstream");
-    assert_eq!(h.fake.with(|f| f.hits(FIGMA_REFRESH)), 0);
+async fn slack_and_figma_refresh_only_with_their_client_secret() {
+    for (provider, url) in [
+        ("slack", HISTORY),
+        ("figma", "https://api.figma.com/v1/files/AbC123"),
+    ] {
+        let Some(h) = harness().await else { return };
+        let (id, _) = h.connected_to(provider).await;
+        h.state.secrets.write().client_secrets.remove(provider);
+        let reply = h.proxy(&read(id, url)).await;
+        assert_eq!(reply.status, StatusCode::BAD_GATEWAY, "{provider}");
+        assert_eq!(reply.code(), "upstream");
+        assert_eq!(h.fake.with(|f| f.refreshes()), 0, "{provider}");
+    }
 }

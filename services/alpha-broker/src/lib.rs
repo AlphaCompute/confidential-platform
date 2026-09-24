@@ -278,6 +278,8 @@ mod tests {
             "DROPBOX_CLIENT_ID" => Some("dropbox-app-key".into()),
             "SLACK_CLIENT_ID" => Some("1234.5678".into()),
             "FIGMA_CLIENT_ID" => Some("figma-client-id".into()),
+            "HUBSPOT_CLIENT_ID" => Some("hubspot-client-id".into()),
+            "NOTION_CLIENT_ID" => Some("notion-client-id".into()),
             "OAUTH_REDIRECT_BASE" => Some("https://corpus.example/oauth/".into()),
             _ => None,
         }
@@ -307,6 +309,8 @@ mod tests {
             "DROPBOX_CLIENT_ID",
             "SLACK_CLIENT_ID",
             "FIGMA_CLIENT_ID",
+            "HUBSPOT_CLIENT_ID",
+            "NOTION_CLIENT_ID",
         ] {
             for value in [None, Some(" ")] {
                 let err = Config::build(|n| {
