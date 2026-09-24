@@ -5,10 +5,11 @@
 //! and the broker must not go on serving with what it read before.
 //! `alpha-broker migrate` stops after the migration. Every error is a non-zero exit.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alpha_broker::{AppState, Config, Error, Secrets, router, store};
+use alpha_broker::{AppState, Config, Error, Secrets, oauth, router, store};
 use alpha_client::runtime::RuntimeSocket;
 use alpha_client::tls::InstanceCert;
 use sqlx::postgres::PgPoolOptions;
@@ -44,10 +45,12 @@ fn utf8(name: &str, bytes: &[u8]) -> Result<Zeroizing<String>, Error> {
 }
 
 async fn read_secrets(runtime: &RuntimeSocket) -> Result<Secrets, Error> {
-    let google_client_secret = utf8(
-        "google-client-secret",
-        &secret(runtime, "google-client-secret").await?,
-    )?;
+    let mut client_secrets = HashMap::new();
+    for provider in oauth::PROVIDERS {
+        let name = format!("{}-client-secret", provider.name);
+        let value = utf8(&name, &secret(runtime, &name).await?)?;
+        client_secrets.insert(provider.name, value);
+    }
     let connect_bearer = secret(runtime, "connect-bearer").await?;
     let proxy_bearer = secret(runtime, "proxy-bearer").await?;
     let connectors_key = runtime
@@ -55,7 +58,7 @@ async fn read_secrets(runtime: &RuntimeSocket) -> Result<Secrets, Error> {
         .await
         .map_err(|e| Error::internal(format!("key connectors: {e}")))?;
     Ok(Secrets {
-        google_client_secret,
+        client_secrets,
         connect_bearer,
         proxy_bearer,
         connectors_key,

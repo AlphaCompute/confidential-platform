@@ -2,7 +2,8 @@
 //! with a PKCE verifier only it holds, and keeps the refresh token sealed under a key only
 //! Instances of this App receive from the KMS. The tenant's backend starts and finishes a
 //! connect with its bearer and relays an opaque code; it never sees a token. An attested
-//! Instance holding the proxy bearer reads through `/proxy` inside a fixed allowlist, with the
+//! Instance holding the proxy bearer reads through `/proxy` inside its provider's read list, and
+//! the tenant's backend writes an export through `/write` inside the write list, with the
 //! member's access token attached here.
 
 #![cfg_attr(
@@ -21,9 +22,10 @@ pub mod oauth;
 pub mod proxy;
 pub mod store;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::{FromRequestParts, State};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, State};
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -33,11 +35,14 @@ use serde_json::json;
 use sqlx::PgPool;
 use zeroize::Zeroizing;
 
-/// The measured environment, read once at startup.
+use crate::oauth::Provider;
+
+/// The measured environment, read once at startup: one `<NAME>_CLIENT_ID` per provider in the
+/// table, and the base every provider's redirect URI hangs from.
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub google_client_id: String,
-    pub google_redirect_uri: String,
+    client_ids: HashMap<&'static str, String>,
+    redirect_base: String,
 }
 
 impl Config {
@@ -46,25 +51,42 @@ impl Config {
     }
 
     pub fn build(get: impl Fn(&str) -> Option<String>) -> Result<Self, Error> {
-        let google_client_id = get("GOOGLE_CLIENT_ID")
-            .map(|v| v.trim().to_owned())
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| Error::internal("GOOGLE_CLIENT_ID is required"))?;
-        let google_redirect_uri = get("GOOGLE_REDIRECT_URI")
-            .ok_or_else(|| Error::internal("GOOGLE_REDIRECT_URI is required"))?;
-        if !google_redirect_uri.starts_with("https://") {
-            return Err(Error::internal("GOOGLE_REDIRECT_URI must be https"));
+        let mut client_ids = HashMap::new();
+        for provider in oauth::PROVIDERS {
+            let variable = format!("{}_CLIENT_ID", provider.name.to_ascii_uppercase());
+            let client_id = get(&variable)
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| Error::internal(format!("{variable} is required")))?;
+            client_ids.insert(provider.name, client_id);
+        }
+        let redirect_base = get("OAUTH_REDIRECT_BASE")
+            .ok_or_else(|| Error::internal("OAUTH_REDIRECT_BASE is required"))?;
+        if !redirect_base.starts_with("https://") {
+            return Err(Error::internal("OAUTH_REDIRECT_BASE must be https"));
         }
         Ok(Config {
-            google_client_id,
-            google_redirect_uri,
+            client_ids,
+            redirect_base: redirect_base.trim_end_matches('/').to_owned(),
         })
+    }
+
+    pub fn client_id(&self, provider: &Provider) -> Result<&str, Error> {
+        self.client_ids
+            .get(provider.name)
+            .map(String::as_str)
+            .ok_or_else(|| Error::internal(format!("no client id for {}", provider.name)))
+    }
+
+    pub fn redirect_uri(&self, provider: &Provider) -> String {
+        format!("{}/{}/callback", self.redirect_base, provider.name)
     }
 }
 
 /// Held only in zeroizing buffers, and deliberately not `Debug`.
 pub struct Secrets {
-    pub google_client_secret: Zeroizing<String>,
+    /// The tenant's OAuth client secret per provider name.
+    pub client_secrets: HashMap<&'static str, Zeroizing<String>>,
     pub connect_bearer: Zeroizing<Vec<u8>>,
     pub proxy_bearer: Zeroizing<Vec<u8>>,
     pub connectors_key: Zeroizing<[u8; 32]>,
@@ -76,6 +98,20 @@ pub struct AppState {
     pub pool: PgPool,
     pub http: reqwest::Client,
     pub tokens: proxy::TokenCache,
+}
+
+impl AppState {
+    /// The provider's client id and a copy of its client secret.
+    pub fn client(&self, provider: &Provider) -> Result<(&str, Zeroizing<String>), Error> {
+        let secret = self
+            .secrets
+            .read()
+            .client_secrets
+            .get(provider.name)
+            .cloned()
+            .ok_or_else(|| Error::internal(format!("no client secret for {}", provider.name)))?;
+        Ok((self.config.client_id(provider)?, secret))
+    }
 }
 
 /// Every error this service answers with. No message ever carries a token, code, verifier or
@@ -94,7 +130,7 @@ pub enum Error {
     ExchangeFailed,
     #[error("a client certificate of an attested Instance is required")]
     CertInvalid,
-    #[error("the request is outside what this connection may read")]
+    #[error("the request is outside what this route may send on this connection")]
     NotAllowed,
     #[error("the provider no longer accepts this connection; the member must reconnect")]
     ReconnectRequired,
@@ -224,6 +260,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/connections", get(connect::list))
         .route("/connections/{id}", delete(connect::disconnect))
         .route("/proxy", post(proxy::proxy))
+        .route(
+            "/write",
+            post(proxy::write).layer(DefaultBodyLimit::max(proxy::WRITE_BODY_LIMIT)),
+        )
         .route("/healthz", get(healthz))
         .route("/ready", get(ready))
         .with_state(state)
@@ -236,7 +276,8 @@ mod tests {
     fn valid_env(name: &str) -> Option<String> {
         match name {
             "GOOGLE_CLIENT_ID" => Some("client.apps.googleusercontent.com".into()),
-            "GOOGLE_REDIRECT_URI" => Some("https://corpus.example/oauth/google/callback".into()),
+            "DROPBOX_CLIENT_ID" => Some("dropbox-app-key".into()),
+            "OAUTH_REDIRECT_BASE" => Some("https://corpus.example/oauth/".into()),
             _ => None,
         }
     }
@@ -244,34 +285,49 @@ mod tests {
     #[test]
     fn config_build_accepts_the_valid_baseline() {
         let config = Config::build(valid_env).unwrap();
-        assert_eq!(config.google_client_id, "client.apps.googleusercontent.com");
+        assert_eq!(
+            config.client_id(&oauth::GOOGLE).unwrap(),
+            "client.apps.googleusercontent.com"
+        );
+        assert_eq!(
+            config.client_id(&oauth::DROPBOX).unwrap(),
+            "dropbox-app-key"
+        );
+        assert_eq!(
+            config.redirect_uri(&oauth::DROPBOX),
+            "https://corpus.example/oauth/dropbox/callback"
+        );
     }
 
     #[test]
     fn config_build_refuses_a_missing_or_blank_client_id_naming_it() {
-        for value in [None, Some(" ")] {
+        for variable in ["GOOGLE_CLIENT_ID", "DROPBOX_CLIENT_ID"] {
+            for value in [None, Some(" ")] {
+                let err = Config::build(|n| {
+                    if n == variable {
+                        value.map(str::to_owned)
+                    } else {
+                        valid_env(n)
+                    }
+                })
+                .unwrap_err();
+                assert!(err.to_string().contains(variable), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn config_build_refuses_a_missing_or_http_redirect_base_naming_it() {
+        for value in [None, Some("http://corpus.example/oauth")] {
             let err = Config::build(|n| {
-                if n == "GOOGLE_CLIENT_ID" {
+                if n == "OAUTH_REDIRECT_BASE" {
                     value.map(str::to_owned)
                 } else {
                     valid_env(n)
                 }
             })
             .unwrap_err();
-            assert!(err.to_string().contains("GOOGLE_CLIENT_ID"), "{err}");
+            assert!(err.to_string().contains("OAUTH_REDIRECT_BASE"), "{err}");
         }
-    }
-
-    #[test]
-    fn config_build_refuses_an_http_redirect_uri_naming_it() {
-        let err = Config::build(|n| {
-            if n == "GOOGLE_REDIRECT_URI" {
-                Some("http://corpus.example/oauth/google/callback".into())
-            } else {
-                valid_env(n)
-            }
-        })
-        .unwrap_err();
-        assert!(err.to_string().contains("GOOGLE_REDIRECT_URI"), "{err}");
     }
 }

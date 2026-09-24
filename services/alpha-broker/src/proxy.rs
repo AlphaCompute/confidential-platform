@@ -1,16 +1,20 @@
 //! `POST /proxy`: an attested Instance names a member, one of that member's connections and a
-//! read inside the provider's allowlist; the broker attaches the member's access token and
-//! answers with the provider's status, content type and body. Nothing outside the allowlist
-//! reaches the provider, and no token leaves the broker.
+//! read on the connection's provider's read list. `POST /write`: the tenant's backend, with its
+//! connect bearer, sends one export on the provider's write list. The broker attaches the
+//! member's access token and answers with the provider's status, content type and body. Neither
+//! route reaches the other's list, nothing outside them reaches the provider, and no token
+//! leaves the broker.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::Response;
+use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use reqwest::Url;
 use serde::Deserialize;
 use serde_json::Value;
@@ -18,26 +22,15 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::connect::{parse_body, parse_member};
-use crate::oauth::{self, Provider, RefreshError};
-use crate::{AppState, AuthedInstance, Error, store};
+use crate::oauth::{self, Entry, Provider, RefreshError};
+use crate::{AppState, AuthedCorpus, AuthedInstance, Error, store};
 
-/// Every read the agent may make through a Google connection, all `GET` on
-/// `https://www.googleapis.com`, where a `{id}` segment matches one identifier. Nothing here
-/// writes, uploads or reaches the Docs, Sheets or Slides APIs; those files are read through
-/// Drive's export.
-const GOOGLE_READS: &[&str] = &[
-    "/drive/v3/drives",
-    "/drive/v3/files",
-    "/drive/v3/files/{id}",
-    "/drive/v3/files/{id}/export",
-    "/gmail/v1/users/me/messages",
-    "/gmail/v1/users/me/messages/{id}",
-    "/calendar/v3/calendars/primary/events",
-];
-
-// ponytail: the provider's whole body is buffered, so a Drive file larger than this cannot be
-// read through the proxy. The upgrade is a ranged or streamed download.
+// ponytail: the provider's whole body is buffered, so a file larger than this cannot be read
+// through the proxy. The upgrade is a ranged or streamed download.
 pub const MAX_RESPONSE: usize = 16 << 20;
+
+/// Fits a delivered file of 8 MiB once base64-encoded inside its JSON envelope.
+pub const WRITE_BODY_LIMIT: usize = 12 << 20;
 
 /// An access token is used until this long before the provider says it expires.
 const EXPIRY_MARGIN: Duration = Duration::from_secs(60);
@@ -57,31 +50,81 @@ fn is_id(segment: &str) -> bool {
 }
 
 /// Judged on the parsed URL, whose `.` and `..` segments are already resolved, so the path
-/// checked is the path sent.
-pub fn allowed(provider: &Provider, method: &str, url: &Url) -> bool {
-    if provider.name != "google"
-        || method != "GET"
-        || url.scheme() != "https"
-        || url.host_str() != Some("www.googleapis.com")
+/// checked is the path sent. Method, host and path match one entry together.
+pub fn allowed(entries: &'static [Entry], method: &str, url: &Url) -> Option<&'static Entry> {
+    if url.scheme() != "https"
         || url.port().is_some()
         || !url.username().is_empty()
         || url.password().is_some()
         || url.fragment().is_some()
     {
-        return false;
+        return None;
     }
-    let Some(segments) = url.path_segments() else {
-        return false;
-    };
-    let segments: Vec<&str> = segments.collect();
-    GOOGLE_READS.iter().any(|template| {
-        let template: Vec<&str> = template.split('/').skip(1).collect();
-        template.len() == segments.len()
+    let host = url.host_str()?;
+    let segments: Vec<&str> = url.path_segments()?.collect();
+    entries.iter().find(|entry| {
+        let template: Vec<&str> = entry.path.split('/').skip(1).collect();
+        entry.method.as_str() == method
+            && entry.host == host
+            && template.len() == segments.len()
             && template
                 .iter()
                 .zip(&segments)
                 .all(|(t, s)| if *t == "{id}" { is_id(s) } else { t == s })
     })
+}
+
+/// The caller's headers, each name on the provider's list and each value a valid header value.
+fn check_headers(
+    provider: &Provider,
+    headers: Option<BTreeMap<String, String>>,
+) -> Result<HeaderMap, Error> {
+    let mut out = HeaderMap::new();
+    for (name, value) in headers.unwrap_or_default() {
+        if !provider
+            .headers
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(&name))
+        {
+            return Err(Error::NotAllowed);
+        }
+        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| Error::NotAllowed)?;
+        let value = HeaderValue::from_str(&value)
+            .map_err(|_| Error::Malformed(format!("header {name} has an invalid value")))?;
+        out.insert(name, value);
+    }
+    Ok(out)
+}
+
+/// The live connection of the member, its provider, the entry of `list` the request matches
+/// and the caller's headers, checked in that order; a dead connection is refused last.
+async fn target(
+    state: &AppState,
+    member: &str,
+    connection_id: &str,
+    method: &str,
+    url: &Url,
+    headers: Option<BTreeMap<String, String>>,
+    list: fn(&Provider) -> &'static [Entry],
+) -> Result<(Uuid, &'static Provider, &'static Entry, HeaderMap), Error> {
+    let member = parse_member(member)?;
+    let id = Uuid::parse_str(connection_id)
+        .map_err(|_| Error::Malformed("connection_id must be a UUID".into()))?;
+    let (provider, dead) = store::load_connection(&state.pool, id, &member)
+        .await?
+        .ok_or(Error::NotFound)?;
+    let provider = oauth::provider(&provider)
+        .ok_or_else(|| Error::internal("a connection names an unknown provider"))?;
+    let entry = allowed(list(provider), method, url).ok_or(Error::NotAllowed)?;
+    let headers = check_headers(provider, headers)?;
+    if dead {
+        return Err(Error::ReconnectRequired);
+    }
+    Ok((id, provider, entry, headers))
+}
+
+fn parse_url(url: &str) -> Result<Url, Error> {
+    Url::parse(url).map_err(|_| Error::Malformed("url must be an absolute URL".into()))
 }
 
 #[derive(Deserialize)]
@@ -92,6 +135,7 @@ struct ProxyRequest {
     method: String,
     url: String,
     body: Option<Value>,
+    headers: Option<BTreeMap<String, String>>,
 }
 
 pub async fn proxy(
@@ -100,33 +144,88 @@ pub async fn proxy(
     body: Bytes,
 ) -> Result<Response, Error> {
     let request: ProxyRequest = parse_body(&body)?;
-    let member = parse_member(&request.member)?;
-    let id = Uuid::parse_str(&request.connection_id)
-        .map_err(|_| Error::Malformed("connection_id must be a UUID".into()))?;
-    let url = Url::parse(&request.url)
-        .map_err(|_| Error::Malformed("url must be an absolute URL".into()))?;
+    let url = parse_url(&request.url)?;
+    let (id, provider, entry, headers) = target(
+        &state,
+        &request.member,
+        &request.connection_id,
+        &request.method,
+        &url,
+        request.headers,
+        |p| p.reads,
+    )
+    .await?;
+    let payload = request
+        .body
+        .map(|b| serde_json::to_vec(&b))
+        .transpose()
+        .map_err(|e| Error::internal(format!("body: {e}")))?
+        .map(|v| (HeaderValue::from_static("application/json"), Bytes::from(v)));
+    forward(&state, id, provider, entry, url, headers, payload).await
+}
 
-    let (provider, dead) = store::load_connection(&state.pool, id, &member)
-        .await?
-        .ok_or(Error::NotFound)?;
-    let provider = oauth::provider(&provider)
-        .ok_or_else(|| Error::internal("a connection names an unknown provider"))?;
-    if !allowed(provider, &request.method, &url) {
-        return Err(Error::NotAllowed);
-    }
-    if dead {
-        return Err(Error::ReconnectRequired);
-    }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WriteRequest {
+    member: String,
+    connection_id: String,
+    method: String,
+    url: String,
+    content_type: String,
+    body_base64: String,
+    headers: Option<BTreeMap<String, String>>,
+}
+
+pub async fn write(
+    State(state): State<Arc<AppState>>,
+    _: AuthedCorpus,
+    body: Bytes,
+) -> Result<Response, Error> {
+    let request: WriteRequest = parse_body(&body)?;
+    let url = parse_url(&request.url)?;
+    let content_type = HeaderValue::from_str(&request.content_type)
+        .map_err(|_| Error::Malformed("content_type is not a valid header value".into()))?;
+    let bytes = BASE64_STANDARD
+        .decode(&request.body_base64)
+        .map_err(|_| Error::Malformed("body_base64 must be standard base64".into()))?;
+    let (id, provider, entry, headers) = target(
+        &state,
+        &request.member,
+        &request.connection_id,
+        &request.method,
+        &url,
+        request.headers,
+        |p| p.writes,
+    )
+    .await?;
+    let payload = Some((content_type, Bytes::from(bytes)));
+    forward(&state, id, provider, entry, url, headers, payload).await
+}
+
+/// Sends the entry's method to `url` with the member's access token; a 401 on a cached token
+/// drops it, refreshes once and retries once.
+async fn forward(
+    state: &AppState,
+    id: Uuid,
+    provider: &Provider,
+    entry: &Entry,
+    url: Url,
+    headers: HeaderMap,
+    payload: Option<(HeaderValue, Bytes)>,
+) -> Result<Response, Error> {
     let mut retried = false;
     loop {
-        let token = access_token(&state, id, provider).await?;
+        let token = access_token(state, id, provider).await?;
         let mut outgoing = state
             .http
-            .get(url.clone())
+            .request(entry.method.clone(), url.clone())
+            .headers(headers.clone())
             .bearer_auth(token.as_str())
             .timeout(SEND_TIMEOUT);
-        if let Some(body) = &request.body {
-            outgoing = outgoing.json(body);
+        if let Some((content_type, bytes)) = &payload {
+            outgoing = outgoing
+                .header(header::CONTENT_TYPE, content_type.clone())
+                .body(bytes.clone());
         }
         let response = outgoing.send().await.map_err(|_| Error::Upstream)?;
         if response.status() == StatusCode::UNAUTHORIZED && !retried {
@@ -186,13 +285,8 @@ async fn access_token(
     if let Some(token) = cached(state, id) {
         return Ok(token);
     }
-    let (key, client_secret) = {
-        let secrets = state.secrets.read();
-        (
-            secrets.connectors_key.clone(),
-            secrets.google_client_secret.clone(),
-        )
-    };
+    let key = state.secrets.read().connectors_key.clone();
+    let (client_id, client_secret) = state.client(provider)?;
     let refresh_token = store::open(&key, id.as_bytes(), &sealed)
         .ok_or_else(|| Error::internal("a stored refresh token does not open"))?;
     let refresh_token = std::str::from_utf8(&refresh_token)
@@ -201,7 +295,7 @@ async fn access_token(
     let refreshed = match oauth::refresh(
         &state.http,
         provider,
-        &state.config.google_client_id,
+        client_id,
         &client_secret,
         refresh_token,
     )
@@ -239,10 +333,54 @@ async fn access_token(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oauth::GOOGLE;
+    use crate::oauth::{DROPBOX, GOOGLE};
 
     fn google(method: &str, url: &str) -> bool {
-        allowed(&GOOGLE, method, &Url::parse(url).unwrap())
+        allowed(GOOGLE.reads, method, &Url::parse(url).unwrap()).is_some()
+    }
+
+    fn dropbox(method: &str, url: &str) -> bool {
+        allowed(DROPBOX.reads, method, &Url::parse(url).unwrap()).is_some()
+    }
+
+    #[test]
+    fn each_dropbox_read_is_allowed_as_a_post_on_its_own_host() {
+        for url in [
+            "https://api.dropboxapi.com/2/files/list_folder",
+            "https://api.dropboxapi.com/2/files/list_folder/continue",
+            "https://api.dropboxapi.com/2/files/get_metadata",
+            "https://api.dropboxapi.com/2/files/search_v2",
+            "https://api.dropboxapi.com/2/files/search/continue_v2",
+            "https://api.dropboxapi.com/2/sharing/list_folders",
+            "https://api.dropboxapi.com/2/sharing/list_folders/continue",
+            "https://api.dropboxapi.com/2/users/get_current_account",
+            "https://content.dropboxapi.com/2/files/download",
+            "https://content.dropboxapi.com/2/files/export",
+        ] {
+            assert!(dropbox("POST", url), "{url}");
+            assert!(!dropbox("GET", url), "{url}");
+        }
+    }
+
+    #[test]
+    fn anything_else_on_dropbox_is_refused() {
+        for url in [
+            "https://content.dropboxapi.com/2/files/list_folder",
+            "https://api.dropboxapi.com/2/files/download",
+            "https://notify.dropboxapi.com/2/files/list_folder/longpoll",
+            "https://api.dropboxapi.com:8443/2/files/list_folder",
+            "https://user@api.dropboxapi.com/2/files/list_folder",
+            "http://api.dropboxapi.com/2/files/list_folder",
+            "https://api.dropboxapi.com/2/files/list_folder#x",
+            "https://api.dropboxapi.com/2/files/list_folder/../../files/delete_v2",
+            "https://api.dropboxapi.com/2/files/list_folder/%2e%2e/delete_v2",
+            "https://api.dropboxapi.com/2/files/delete_v2",
+            "https://content.dropboxapi.com/2/files/upload",
+            "https://api.dropboxapi.com/2/files/create_folder_v2",
+            "https://www.googleapis.com/drive/v3/files",
+        ] {
+            assert!(!dropbox("POST", url), "{url}");
+        }
     }
 
     #[test]
@@ -294,6 +432,7 @@ mod tests {
             "https://www.googleapis.com./drive/v3/files",
             "https://www.googleapis.com/calendar/v3/calendars/other/events",
             "https://www.googleapis.com/gmail/v1/users/other/messages",
+            "https://api.dropboxapi.com/2/files/list_folder",
         ] {
             assert!(!google("GET", url), "{url}");
         }
