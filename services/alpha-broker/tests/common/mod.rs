@@ -603,12 +603,7 @@ impl FakeProviders {
     /// Stands in for the member consenting at Google as `email` on the page the authorization
     /// URL opens.
     pub fn consent(&self, challenge: &str, email: &str) -> Consent {
-        self.consent_as(challenge, &format!("subject-of-{email}"), email)
-    }
-
-    /// The same, as the Google account `subject` whose address is currently `email`.
-    pub fn consent_as(&self, challenge: &str, subject: &str, email: &str) -> Consent {
-        self.consent_on("google", challenge, subject, email)
+        self.consent_on("google", challenge, &format!("subject-of-{email}"), email)
     }
 
     /// The member consenting at `provider` as the account `subject` named `email`.

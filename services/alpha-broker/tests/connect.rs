@@ -508,7 +508,9 @@ async fn a_connection_follows_the_google_account_not_its_email() {
     let h = &h;
     let connect_as = |subject: &'static str, email: &'static str| async move {
         let query = h.start("google", MEMBER).await;
-        let consent = h.fake.consent_as(&query["code_challenge"], subject, email);
+        let consent = h
+            .fake
+            .consent_on("google", &query["code_challenge"], subject, email);
         let reply = h.finish(MEMBER, &consent.code, &query["state"]).await;
         assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
         id_of(&reply)

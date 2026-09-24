@@ -22,15 +22,6 @@ pub struct Entry {
     pub path: &'static str,
 }
 
-/// How the account behind a fresh access token is named.
-pub enum Identity {
-    /// OpenID userinfo: `GET` with the bearer, the account in `sub` and `email`.
-    UserInfo(&'static str),
-    /// `POST` with the bearer and no body or content type, the account in `account_id` and
-    /// `email`. Dropbox refuses a JSON `null` body here.
-    CurrentAccount(&'static str),
-}
-
 /// How a disconnect ends the grant at the provider.
 pub enum Revoke {
     /// A form post of the refresh token.
@@ -46,7 +37,9 @@ pub struct Provider {
     pub token: &'static str,
     pub scopes: &'static [&'static str],
     pub extra_authorize: &'static [(&'static str, &'static str)],
-    pub identity: Identity,
+    /// The account lookup, sent with the bearer and no body; it answers the account's subject
+    /// and email.
+    pub identity: (Method, &'static str),
     pub revoke: Revoke,
     pub reads: &'static [Entry],
     pub writes: &'static [Entry],
@@ -87,7 +80,10 @@ pub const GOOGLE: Provider = Provider {
         "email",
     ],
     extra_authorize: &[("access_type", "offline"), ("prompt", "consent")],
-    identity: Identity::UserInfo("https://openidconnect.googleapis.com/v1/userinfo"),
+    identity: (
+        Method::GET,
+        "https://openidconnect.googleapis.com/v1/userinfo",
+    ),
     revoke: Revoke::Form("https://oauth2.googleapis.com/revoke"),
     reads: &[
         get("www.googleapis.com", "/drive/v3/drives"),
@@ -108,7 +104,8 @@ pub const GOOGLE: Provider = Provider {
     headers: &[],
 };
 
-/// `account_info.read` names the account; `sharing.read` lists the shared folders a member
+/// `account_info.read` names the account (the lookup must carry no content type: Dropbox refuses
+/// a JSON `null` there); `sharing.read` lists the shared folders a member
 /// reads through. `dropbox-api-path-root` reaches a team space, and `dropbox-api-arg` carries
 /// the arguments of a content-host call.
 pub const DROPBOX: Provider = Provider {
@@ -123,7 +120,10 @@ pub const DROPBOX: Provider = Provider {
         "sharing.read",
     ],
     extra_authorize: &[("token_access_type", "offline")],
-    identity: Identity::CurrentAccount("https://api.dropboxapi.com/2/users/get_current_account"),
+    identity: (
+        Method::POST,
+        "https://api.dropboxapi.com/2/users/get_current_account",
+    ),
     revoke: Revoke::Bearer("https://api.dropboxapi.com/2/auth/token/revoke"),
     reads: &[
         post("api.dropboxapi.com", "/2/files/list_folder"),
@@ -304,11 +304,9 @@ pub async fn account(
     provider: &Provider,
     access_token: &str,
 ) -> Result<Account, &'static str> {
-    let request = match provider.identity {
-        Identity::UserInfo(url) => http.get(url),
-        Identity::CurrentAccount(url) => http.post(url),
-    };
-    let response = request
+    let (method, url) = &provider.identity;
+    let response = http
+        .request(method.clone(), *url)
         .bearer_auth(access_token)
         .send()
         .await
