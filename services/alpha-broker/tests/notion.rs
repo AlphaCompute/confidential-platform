@@ -14,32 +14,8 @@ use std::time::{Duration, Instant};
 use axum::http::StatusCode;
 use common::*;
 use serde_json::{Value, json};
-use uuid::Uuid;
 
 const MCP: &str = "https://mcp.notion.com/mcp";
-
-fn rpc(connection: Uuid, url: &str, body: Value) -> Value {
-    json!({
-        "member": MEMBER,
-        "connection_id": connection,
-        "method": "POST",
-        "url": url,
-        "body": body,
-    })
-}
-
-fn call(connection: Uuid, tool: &str) -> Value {
-    rpc(
-        connection,
-        MCP,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": { "name": tool, "arguments": { "query": "roadmap" } },
-        }),
-    )
-}
 
 #[tokio::test]
 async fn a_member_connects_notion_as_a_public_client_and_an_instance_searches_it() {
@@ -70,7 +46,7 @@ async fn a_member_connects_notion_as_a_public_client_and_an_instance_searches_it
     assert_eq!(exchange["code_verifier"].len(), 43);
     assert!(!exchange.contains_key("client_secret"), "{exchange:?}");
 
-    let request = call(id, "notion-search");
+    let request = mcp_call(id, MCP, "notion-search");
     let reply = h.proxy(&request).await;
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.content_type.as_deref(), Some("text/event-stream"));
@@ -106,7 +82,7 @@ async fn every_listed_notion_tool_is_forwarded_and_acting_tools_are_refused_befo
     let (id, _) = h.connected_to("notion").await;
     for tool in alpha_broker::oauth::NOTION_READ_TOOLS {
         assert_eq!(
-            h.proxy(&call(id, tool)).await.status,
+            h.proxy(&mcp_call(id, MCP, tool)).await.status,
             StatusCode::OK,
             "{tool}"
         );
@@ -125,18 +101,18 @@ async fn every_listed_notion_tool_is_forwarded_and_acting_tools_are_refused_befo
             "Notion-search",
             "search_crm_objects",
         ] {
-            let reply = h.proxy(&call(id, tool)).await;
+            let reply = h.proxy(&mcp_call(id, MCP, tool)).await;
             assert_eq!(reply.status, StatusCode::FORBIDDEN, "{tool}");
             assert_eq!(reply.code(), "not_allowed");
         }
-        let batch = rpc(
+        let batch = mcp_rpc(
             id,
             MCP,
             json!([{ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": { "name": "notion-update-page" } }]),
         );
         assert_eq!(h.proxy(&batch).await.status, StatusCode::FORBIDDEN);
-        let elsewhere = rpc(
+        let elsewhere = mcp_rpc(
             id,
             "https://mcp.notion.com/",
             json!({ "method": "tools/list" }),
@@ -151,7 +127,7 @@ async fn notion_tools_list_comes_back_as_the_same_event_stream_without_its_sessi
     let Some(h) = harness().await else { return };
     let (id, _) = h.connected_to("notion").await;
     let reply = h
-        .proxy(&rpc(
+        .proxy(&mcp_rpc(
             id,
             MCP,
             json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
@@ -174,7 +150,7 @@ async fn neither_mcp_row_takes_an_accept_or_session_header_from_the_caller() {
         let (id, _) = h.connected_to(provider).await;
         nothing_reaches(&h, async {
             for name in ["accept", "Accept", MCP_SESSION] {
-                let mut body = rpc(
+                let mut body = mcp_rpc(
                     id,
                     url,
                     json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
@@ -195,7 +171,7 @@ async fn a_notion_refresh_answered_invalid_grant_or_invalid_token_marks_the_conn
         let (id, _) = h.connected_to("notion").await;
         h.fake
             .with(|f| f.refresh_reply = Some((StatusCode::BAD_REQUEST, json!({ "error": code }))));
-        let reply = h.proxy(&call(id, "notion-search")).await;
+        let reply = h.proxy(&mcp_call(id, MCP, "notion-search")).await;
         assert_eq!(reply.status, StatusCode::CONFLICT, "{code}");
         assert_eq!(reply.code(), "reconnect_required");
         let listed = h
@@ -213,7 +189,7 @@ async fn a_notion_refresh_without_expires_in_is_used_for_the_default_hour() {
     h.fake.with(|f| f.omit_expires_in = true);
     for _ in 0..2 {
         assert_eq!(
-            h.proxy(&call(id, "notion-search")).await.status,
+            h.proxy(&mcp_call(id, MCP, "notion-search")).await.status,
             StatusCode::OK
         );
     }

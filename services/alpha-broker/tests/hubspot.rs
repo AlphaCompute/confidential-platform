@@ -11,31 +11,8 @@ mod common;
 use axum::http::StatusCode;
 use common::*;
 use serde_json::{Value, json};
-use uuid::Uuid;
 
 const MCP: &str = "https://mcp.hubspot.com/";
-
-fn rpc(connection: Uuid, body: Value) -> Value {
-    json!({
-        "member": MEMBER,
-        "connection_id": connection,
-        "method": "POST",
-        "url": MCP,
-        "body": body,
-    })
-}
-
-fn call(connection: Uuid, tool: &str) -> Value {
-    rpc(
-        connection,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": { "name": tool, "arguments": { "objectType": "contacts" } },
-        }),
-    )
-}
 
 #[tokio::test]
 async fn a_member_connects_hubspot_and_an_instance_calls_a_listed_tool_without_seeing_a_token() {
@@ -62,7 +39,7 @@ async fn a_member_connects_hubspot_and_an_instance_calls_a_listed_tool_without_s
     let exchange = h.fake.with(|f| f.form(HUBSPOT_TOKEN));
     assert_eq!(exchange["client_secret"], HUBSPOT_CLIENT_SECRET);
 
-    let request = call(id, "search_crm_objects");
+    let request = mcp_call(id, MCP, "search_crm_objects");
     let reply = h.proxy(&request).await;
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.bytes, MCP_RESULT.as_bytes());
@@ -88,7 +65,7 @@ async fn every_listed_hubspot_tool_is_forwarded_and_every_other_is_refused_befor
     let Some(h) = harness().await else { return };
     let (id, _) = h.connected_to("hubspot").await;
     for tool in alpha_broker::oauth::HUBSPOT_READ_TOOLS {
-        let reply = h.proxy(&call(id, tool)).await;
+        let reply = h.proxy(&mcp_call(id, MCP, tool)).await;
         assert_eq!(reply.status, StatusCode::OK, "{tool}");
     }
     nothing_reaches(&h, async {
@@ -114,7 +91,7 @@ async fn every_listed_hubspot_tool_is_forwarded_and_every_other_is_refused_befor
             " search_crm_objects",
             "notion-search",
         ] {
-            let reply = h.proxy(&call(id, tool)).await;
+            let reply = h.proxy(&mcp_call(id, MCP, tool)).await;
             assert_eq!(reply.status, StatusCode::FORBIDDEN, "{tool}");
             assert_eq!(reply.code(), "not_allowed");
         }
@@ -140,10 +117,10 @@ async fn a_body_that_is_not_one_well_formed_tool_call_is_refused_before_hubspot(
             json!("tools/list"),
             Value::Null,
         ] {
-            let reply = h.proxy(&rpc(id, body.clone())).await;
+            let reply = h.proxy(&mcp_rpc(id, MCP, body.clone())).await;
             assert_eq!(reply.status, StatusCode::FORBIDDEN, "{body}");
         }
-        let mut bare = rpc(id, Value::Null);
+        let mut bare = mcp_rpc(id, MCP, Value::Null);
         bare.as_object_mut().unwrap().remove("body");
         assert_eq!(h.proxy(&bare).await.status, StatusCode::FORBIDDEN);
     })
@@ -183,8 +160,9 @@ async fn tools_list_and_initialize_pass_and_come_back_byte_for_byte() {
     let Some(h) = harness().await else { return };
     let (id, _) = h.connected_to("hubspot").await;
     let list = h
-        .proxy(&rpc(
+        .proxy(&mcp_rpc(
             id,
+            MCP,
             json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
         ))
         .await;
@@ -192,8 +170,9 @@ async fn tools_list_and_initialize_pass_and_come_back_byte_for_byte() {
     assert_eq!(list.content_type.as_deref(), Some("application/json"));
     assert_eq!(list.bytes, MCP_TOOLS.as_bytes());
     let init = h
-        .proxy(&rpc(
+        .proxy(&mcp_rpc(
             id,
+            MCP,
             json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }),
         ))
         .await;
@@ -215,7 +194,7 @@ async fn a_hubspot_refresh_stores_whatever_refresh_token_comes_back() {
     for round in 0..2 {
         h.state.tokens.lock().clear();
         assert_eq!(
-            h.proxy(&call(id, "get_user_details")).await.status,
+            h.proxy(&mcp_call(id, MCP, "get_user_details")).await.status,
             StatusCode::OK
         );
         let sealed = h.stored_token(id).await.unwrap();

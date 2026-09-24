@@ -322,8 +322,6 @@ pub const FIGMA_TOKEN: &str = "/v1/oauth/token";
 pub const FIGMA_REFRESH: &str = "/v1/oauth/refresh";
 pub const FIGMA_ME: &str = "/v1/me";
 pub const HUBSPOT_TOKEN: &str = "/oauth/v3/token";
-/// Where the stand-in records an MCP server's identity call.
-pub const MCP_IDENTITY: &str = "mcp-identity";
 
 /// The `id:secret` of an HTTP Basic authorization header.
 fn basic_of(headers: &HeaderMap) -> Option<String> {
@@ -641,7 +639,7 @@ async fn mcp(State(fake): State<Shared>, uri: Uri, headers: HeaderMap, body: Byt
         .find(|c| c.provider == provider && c.access_token == token)
         .cloned();
     if let Some(c) = identity {
-        fake.requests.push((MCP_IDENTITY.into(), HashMap::new()));
+        fake.requests.push(("mcp-identity".into(), HashMap::new()));
         let expected = match provider {
             "notion" => json!({ "name": "notion-fetch", "arguments": { "id": "self" } }),
             _ => json!({ "name": "get_user_details", "arguments": {} }),
@@ -1128,6 +1126,17 @@ impl Raw {
 
 pub fn read(connection: Uuid, url: &str) -> Value {
     json!({ "member": MEMBER, "connection_id": connection, "method": "GET", "url": url })
+}
+
+/// A `/proxy` body posting the JSON-RPC `body` to the MCP server at `url`.
+pub fn mcp_rpc(connection: Uuid, url: &str, body: Value) -> Value {
+    json!({ "member": MEMBER, "connection_id": connection, "method": "POST", "url": url, "body": body })
+}
+
+pub fn mcp_call(connection: Uuid, url: &str, tool: &str) -> Value {
+    let call = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": tool, "arguments": {} } });
+    mcp_rpc(connection, url, call)
 }
 
 pub fn dropbox_read(connection: Uuid, url: &str) -> Value {
