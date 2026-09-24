@@ -190,6 +190,8 @@ pub struct Fake {
     /// The next this many data requests answer 401 whatever token they carry.
     pub unauthorized: usize,
     pub media_size: usize,
+    /// Dropbox folders created so far; creating one again answers 409.
+    pub folders: Vec<String>,
     /// Access tokens the data API accepts, and refresh tokens the token endpoint accepts.
     pub access: Vec<String>,
     pub refresh: Vec<String>,
@@ -471,8 +473,43 @@ async fn data(
         ("google", "GET", ["calendar", "v3", "calendars", "primary", "events"]) => {
             json_body(r#"{"items":[]}"#.into()).into_response()
         }
+        ("google", "POST", ["upload", "drive", "v3", "files"]) => {
+            json_body(r#"{"id":"uploaded-1","name":"report.pdf"}"#.into()).into_response()
+        }
+        ("google", "POST", ["drive", "v3", "files"]) => {
+            json_body(r#"{"id":"folder-1","name":"Corpus"}"#.into()).into_response()
+        }
         ("dropbox", "POST", ["2", "files", "list_folder"]) => {
             json_body(DROPBOX_LISTING.into()).into_response()
+        }
+        ("dropbox", "POST", ["2", "files", "download"]) => (
+            [(header::CONTENT_TYPE, "application/octet-stream")],
+            vec![b'x'; fake.media_size],
+        )
+            .into_response(),
+        ("dropbox", "POST", ["2", "files", "upload"]) => {
+            json_body(r#"{"id":"id:up1","name":"report.pdf"}"#.into()).into_response()
+        }
+        ("dropbox", "POST", ["2", "files", "create_folder_v2"]) => {
+            let path = serde_json::from_slice::<Value>(&body).unwrap()["path"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            if fake.folders.contains(&path) {
+                return (
+                    StatusCode::CONFLICT,
+                    json_body(
+                        json!({
+                            "error_summary": "path/conflict/folder/..",
+                            "error": { ".tag": "path", "path": { ".tag": "conflict" } },
+                        })
+                        .to_string(),
+                    ),
+                )
+                    .into_response();
+            }
+            fake.folders.push(path.clone());
+            json_body(json!({ "metadata": { "path_display": path } }).to_string()).into_response()
         }
         _ => StatusCode::NOT_FOUND.into_response(),
     }
@@ -518,6 +555,7 @@ impl FakeProviders {
             refresh_delay: Duration::ZERO,
             unauthorized: 0,
             media_size: 0,
+            folders: vec![],
             access: vec![],
             refresh: vec![],
             issued: vec![],
@@ -780,6 +818,23 @@ pub fn read(connection: Uuid, url: &str) -> Value {
     json!({ "member": MEMBER, "connection_id": connection, "method": "GET", "url": url })
 }
 
+pub fn dropbox_read(connection: Uuid, url: &str) -> Value {
+    json!({ "member": MEMBER, "connection_id": connection, "method": "POST", "url": url })
+}
+
+/// A `/write` body carrying `bytes` base64-encoded.
+pub fn upload(connection: Uuid, url: &str, content_type: &str, bytes: &[u8]) -> Value {
+    use base64::Engine;
+    json!({
+        "member": MEMBER,
+        "connection_id": connection,
+        "method": "POST",
+        "url": url,
+        "content_type": content_type,
+        "body_base64": base64::prelude::BASE64_STANDARD.encode(bytes),
+    })
+}
+
 impl Harness {
     /// One request through the router, with the connect bearer unless `bearer` says otherwise.
     pub async fn call_as(
@@ -865,16 +920,27 @@ impl Harness {
         (reply, consent)
     }
 
-    /// `POST /proxy` over the real listener from `client`; fails the test if anything in the
-    /// reply, headers included, carries a token or secret. `Err` when the request itself failed.
+    /// `POST /proxy` from `client` over the real listener.
     pub async fn proxy_with(
         &self,
         client: &reqwest::Client,
         bearer: Option<&str>,
         body: &Value,
     ) -> Result<Raw, reqwest::Error> {
+        self.post_with(client, bearer, "/proxy", body).await
+    }
+
+    /// `POST path` over the real listener from `client`; fails the test if anything in the
+    /// reply, headers included, carries a token or secret. `Err` when the request itself failed.
+    pub async fn post_with(
+        &self,
+        client: &reqwest::Client,
+        bearer: Option<&str>,
+        path: &str,
+        body: &Value,
+    ) -> Result<Raw, reqwest::Error> {
         let mut request = client
-            .post(format!("https://{}/proxy", self.broker))
+            .post(format!("https://{}{path}", self.broker))
             .header(header::CONTENT_TYPE, "application/json")
             .body(body.to_string());
         if let Some(bearer) = bearer {
@@ -890,10 +956,10 @@ impl Harness {
         let bytes = response.bytes().await?.to_vec();
         let text = String::from_utf8_lossy(&bytes);
         for secret in self.fake.with(|f| f.secrets()) {
-            assert!(!text.contains(&secret), "/proxy answered a secret: {text}");
+            assert!(!text.contains(&secret), "{path} answered a secret: {text}");
             assert!(
                 !headers.contains(&secret),
-                "/proxy answered a secret: {headers}"
+                "{path} answered a secret: {headers}"
             );
         }
         Ok(Raw {
@@ -908,6 +974,20 @@ impl Harness {
         self.proxy_with(&self.instance, Some(PROXY_BEARER), body)
             .await
             .unwrap()
+    }
+
+    /// `POST /write` over the real listener with the connect bearer and no client certificate,
+    /// as the tenant's backend calls it.
+    pub async fn write(&self, body: &Value) -> Raw {
+        let backend = instance_client(&self.ca, None);
+        self.post_with(&backend, Some(BEARER), "/write", body)
+            .await
+            .unwrap()
+    }
+
+    /// Nothing reached a provider's data API and no token was refreshed.
+    pub fn untouched(&self) -> bool {
+        self.fake.with(|f| f.data.is_empty() && f.refreshes() == 0)
     }
 
     /// A connection of `MEMBER` to Google, made through the connect routes.

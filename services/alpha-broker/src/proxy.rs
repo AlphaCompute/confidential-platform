@@ -268,10 +268,54 @@ async fn access_token(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oauth::GOOGLE;
+    use crate::oauth::{DROPBOX, GOOGLE};
 
     fn google(method: &str, url: &str) -> bool {
         allowed(GOOGLE.reads, method, &Url::parse(url).unwrap()).is_some()
+    }
+
+    fn dropbox(method: &str, url: &str) -> bool {
+        allowed(DROPBOX.reads, method, &Url::parse(url).unwrap()).is_some()
+    }
+
+    #[test]
+    fn each_dropbox_read_is_allowed_as_a_post_on_its_own_host() {
+        for url in [
+            "https://api.dropboxapi.com/2/files/list_folder",
+            "https://api.dropboxapi.com/2/files/list_folder/continue",
+            "https://api.dropboxapi.com/2/files/get_metadata",
+            "https://api.dropboxapi.com/2/files/search_v2",
+            "https://api.dropboxapi.com/2/files/search/continue_v2",
+            "https://api.dropboxapi.com/2/sharing/list_folders",
+            "https://api.dropboxapi.com/2/sharing/list_folders/continue",
+            "https://api.dropboxapi.com/2/users/get_current_account",
+            "https://content.dropboxapi.com/2/files/download",
+            "https://content.dropboxapi.com/2/files/export",
+        ] {
+            assert!(dropbox("POST", url), "{url}");
+            assert!(!dropbox("GET", url), "{url}");
+        }
+    }
+
+    #[test]
+    fn anything_else_on_dropbox_is_refused() {
+        for url in [
+            "https://content.dropboxapi.com/2/files/list_folder",
+            "https://api.dropboxapi.com/2/files/download",
+            "https://notify.dropboxapi.com/2/files/list_folder/longpoll",
+            "https://api.dropboxapi.com:8443/2/files/list_folder",
+            "https://user@api.dropboxapi.com/2/files/list_folder",
+            "http://api.dropboxapi.com/2/files/list_folder",
+            "https://api.dropboxapi.com/2/files/list_folder#x",
+            "https://api.dropboxapi.com/2/files/list_folder/../../files/delete_v2",
+            "https://api.dropboxapi.com/2/files/list_folder/%2e%2e/delete_v2",
+            "https://api.dropboxapi.com/2/files/delete_v2",
+            "https://content.dropboxapi.com/2/files/upload",
+            "https://api.dropboxapi.com/2/files/create_folder_v2",
+            "https://www.googleapis.com/drive/v3/files",
+        ] {
+            assert!(!dropbox("POST", url), "{url}");
+        }
     }
 
     #[test]
