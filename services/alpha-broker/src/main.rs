@@ -11,8 +11,6 @@ use std::time::Duration;
 use alpha_broker::{AppState, Config, Error, Secrets, router, store};
 use alpha_client::runtime::RuntimeSocket;
 use alpha_client::tls::InstanceCert;
-use rustls::pki_types::CertificateDer;
-use rustls::pki_types::pem::PemObject;
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 use zeroize::Zeroizing;
@@ -68,12 +66,7 @@ async fn run() -> Result<(), Error> {
     let config = Config::from_env()?;
     let runtime = RuntimeSocket::default();
 
-    loop {
-        match runtime.healthz().await {
-            Ok(health) if health.attested => break,
-            _ => tokio::time::sleep(Duration::from_secs(2)).await,
-        }
-    }
+    runtime.wait_attested().await;
     let identity = runtime
         .identity()
         .await
@@ -98,12 +91,8 @@ async fn run() -> Result<(), Error> {
 
     let cert =
         Arc::new(InstanceCert::new(&identity).map_err(|e| Error::internal(format!("tls: {e}")))?);
-    // The last certificate of this Instance's own chain is the KMS CA that alpha-runtime
-    // already checked against the measured one, so a CA rotation needs only a restart.
-    let kms_ca = CertificateDer::pem_slice_iter(identity.certificate_chain.as_bytes())
-        .last()
-        .ok_or_else(|| Error::internal("certificate chain is empty"))?
-        .map_err(|e| Error::internal(format!("certificate chain: {e}")))?;
+    let kms_ca =
+        alpha_client::tls::kms_ca(&identity).map_err(|e| Error::internal(format!("tls: {e}")))?;
     let tls_config = alpha_client::tls::mtls_server_config(cert.clone(), kms_ca)
         .map_err(|e| Error::internal(format!("tls: {e}")))?;
     let http = reqwest::Client::builder()

@@ -19,6 +19,7 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, TrustAnchor, UnixTime,
 };
+use rustls::server::danger::ClientCertVerifier;
 use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
 use rustls::time_provider::TimeProvider;
@@ -349,15 +350,32 @@ impl ResolvesServerCert for InstanceCert {
     }
 }
 
-/// TLS 1.3 only, no client auth, `http/1.1` — an Endpoint listener over `cert`.
-pub fn server_config(cert: Arc<InstanceCert>) -> Result<Arc<ServerConfig>, Error> {
+/// The KMS CA: the last certificate of this Instance's own chain, which `alpha-runtime` already
+/// checked against the measured one, so a CA rotation needs only a restart.
+pub fn kms_ca(identity: &RuntimeIdentity) -> Result<CertificateDer<'static>, Error> {
+    CertificateDer::pem_slice_iter(identity.certificate_chain.as_bytes())
+        .last()
+        .ok_or_else(|| Error::Invalid("certificate chain is empty".into()))?
+        .map_err(|e| Error::Invalid(format!("certificate chain: {e}")))
+}
+
+/// TLS 1.3 only, `http/1.1`, the client judged by `verifier`, the server's chain from `cert`.
+fn listener(
+    cert: Arc<dyn ResolvesServerCert>,
+    verifier: Arc<dyn ClientCertVerifier>,
+) -> Result<Arc<ServerConfig>, Error> {
     let mut config = ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| Error::Invalid(format!("tls: {e}")))?
-        .with_no_client_auth()
+        .with_client_cert_verifier(verifier)
         .with_cert_resolver(cert);
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Arc::new(config))
+}
+
+/// An Endpoint listener over `cert` with no client auth.
+pub fn server_config(cert: Arc<InstanceCert>) -> Result<Arc<ServerConfig>, Error> {
+    listener(cert, WebPkiClientVerifier::no_client_auth())
 }
 
 /// As [`server_config`], but a client certificate is requested, not required: one that is
@@ -370,18 +388,11 @@ pub fn mtls_server_config(
     let tls = |e: &dyn std::fmt::Display| Error::Invalid(format!("tls: {e}"));
     let mut roots = RootCertStore::empty();
     roots.add(kms_ca).map_err(|e| tls(&e))?;
-    let provider = provider();
-    let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+    let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider())
         .allow_unauthenticated()
         .build()
         .map_err(|e| tls(&e))?;
-    let mut config = ServerConfig::builder_with_provider(provider)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|e| tls(&e))?
-        .with_client_cert_verifier(verifier)
-        .with_cert_resolver(cert);
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(Arc::new(config))
+    listener(cert, verifier)
 }
 
 /// The certificate chain the peer presented, if any; each route decides what it needs of it.

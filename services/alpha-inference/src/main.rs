@@ -52,12 +52,7 @@ async fn run() -> Result<(), Error> {
     let config = Config::from_env()?;
     let runtime = RuntimeSocket::default();
 
-    loop {
-        match runtime.healthz().await {
-            Ok(health) if health.attested => break,
-            _ => tokio::time::sleep(Duration::from_secs(2)).await,
-        }
-    }
+    runtime.wait_attested().await;
     let identity = runtime
         .identity()
         .await

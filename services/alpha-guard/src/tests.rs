@@ -79,9 +79,7 @@ async fn setup(front: Front, caller: AppId) -> Router {
             inference_revisions: vec![alpha_core::compose_hash("front")],
             caller_apps: vec![caller],
         },
-        secrets: parking_lot::RwLock::new(Secrets {
-            inference_bearer: Zeroizing::new("front-bearer".into()),
-        }),
+        inference_bearer: parking_lot::RwLock::new(Zeroizing::new("front-bearer".into())),
         // The pin itself is tested in alpha-client; here the front is a plain local fake.
         front: reqwest::Client::new(),
     }))
@@ -95,9 +93,7 @@ fn unreachable_front(caller: AppId) -> Router {
             inference_revisions: vec![],
             caller_apps: vec![caller],
         },
-        secrets: parking_lot::RwLock::new(Secrets {
-            inference_bearer: Zeroizing::new("b".into()),
-        }),
+        inference_bearer: parking_lot::RwLock::new(Zeroizing::new("b".into())),
         front: reqwest::Client::new(),
     }))
 }

@@ -93,14 +93,11 @@ impl Config {
     }
 }
 
-/// Held only in a zeroizing buffer, and deliberately not `Debug`.
-pub struct Secrets {
-    pub inference_bearer: Zeroizing<String>,
-}
-
 pub struct AppState {
     pub config: Config,
-    pub secrets: parking_lot::RwLock<Secrets>,
+    /// The bearer the front expects; behind a lock so a rotated one takes effect without a
+    /// restart.
+    pub inference_bearer: parking_lot::RwLock<Zeroizing<String>>,
     /// Pinned to the front: the KMS CA and one of `inference_revisions`, inside the handshake.
     pub front: reqwest::Client,
 }
@@ -203,7 +200,7 @@ struct CheckRequest {
 
 async fn ask_judge(state: &AppState, request: &CheckRequest) -> Result<judge::Verdict, Error> {
     let prompt = judge::prompt(&request.policy, &request.user, request.response.as_deref());
-    let bearer = state.secrets.read().inference_bearer.clone();
+    let bearer = state.inference_bearer.read().clone();
     let answer = state
         .front
         .post(format!(
@@ -277,10 +274,6 @@ async fn check(
     })))
 }
 
-async fn healthz() -> StatusCode {
-    StatusCode::OK
-}
-
 /// Ready when the front answers its own `/healthz` over the pinned connection.
 async fn ready(State(state): State<Arc<AppState>>) -> StatusCode {
     match state
@@ -297,7 +290,7 @@ async fn ready(State(state): State<Arc<AppState>>) -> StatusCode {
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/check", post(check))
-        .route("/healthz", get(healthz))
+        .route("/healthz", get(|| async { StatusCode::OK }))
         .route("/ready", get(ready))
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(state)

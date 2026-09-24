@@ -130,6 +130,16 @@ impl RuntimeSocket {
             .map_err(|_| Error::Invalid("key is not 32 bytes".into()))
     }
 
+    /// Polls `/healthz` every two seconds until the runtime reports this Instance attested.
+    pub async fn wait_attested(&self) {
+        loop {
+            if matches!(self.healthz().await, Ok(health) if health.attested) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    }
+
     pub async fn healthz(&self) -> Result<RuntimeHealth, Error> {
         let (status, body) = self.get("/healthz").await?;
         if !status.is_success() {

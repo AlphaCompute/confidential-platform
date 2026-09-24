@@ -1,6 +1,6 @@
 //! Thin entrypoint: attest, read this Instance's identity and its Secret, then serve over TLS on
 //! `:8443`, accepting client certificates that chain to the KMS CA, until SIGTERM, refreshing
-//! the leaf and the Secret every five minutes. A refresh that fails ends the process: the
+//! the leaf and the bearer every five minutes. A refresh that fails ends the process: the
 //! runtime removes its socket when the Revision is revoked, and the judge must not go on serving
 //! with what it read before. Every error is a non-zero exit.
 
@@ -9,9 +9,7 @@ use std::time::Duration;
 
 use alpha_client::runtime::RuntimeSocket;
 use alpha_client::tls::InstanceCert;
-use alpha_guard::{AppState, Config, Error, Secrets, front_client, router};
-use rustls::pki_types::CertificateDer;
-use rustls::pki_types::pem::PemObject;
+use alpha_guard::{AppState, Config, Error, front_client, router};
 use tokio::net::TcpListener;
 use zeroize::Zeroizing;
 
@@ -30,29 +28,21 @@ async fn main() {
     std::process::exit(code);
 }
 
-async fn read_secrets(runtime: &RuntimeSocket) -> Result<Secrets, Error> {
+async fn read_bearer(runtime: &RuntimeSocket) -> Result<Zeroizing<String>, Error> {
     let bearer = runtime
         .secret("inference-bearer")
         .await
         .map_err(|e| Error::internal(format!("secret inference-bearer: {e}")))?;
-    Ok(Secrets {
-        inference_bearer: Zeroizing::new(
-            String::from_utf8(bearer.to_vec())
-                .map_err(|_| Error::internal("inference-bearer is not utf8"))?,
-        ),
-    })
+    String::from_utf8(bearer.to_vec())
+        .map(Zeroizing::new)
+        .map_err(|_| Error::internal("inference-bearer is not utf8"))
 }
 
 async fn run() -> Result<(), Error> {
     let config = Config::from_env()?;
     let runtime = RuntimeSocket::default();
 
-    loop {
-        match runtime.healthz().await {
-            Ok(health) if health.attested => break,
-            _ => tokio::time::sleep(Duration::from_secs(2)).await,
-        }
-    }
+    runtime.wait_attested().await;
     let identity = runtime
         .identity()
         .await
@@ -63,19 +53,15 @@ async fn run() -> Result<(), Error> {
     );
     let cert =
         Arc::new(InstanceCert::new(&identity).map_err(|e| Error::internal(format!("tls: {e}")))?);
-    // The last certificate of this Instance's own chain is the KMS CA that alpha-runtime
-    // already checked against the measured one, so a CA rotation needs only a restart.
-    let kms_ca = CertificateDer::pem_slice_iter(identity.certificate_chain.as_bytes())
-        .last()
-        .ok_or_else(|| Error::internal("certificate chain is empty"))?
-        .map_err(|e| Error::internal(format!("certificate chain: {e}")))?;
+    let kms_ca =
+        alpha_client::tls::kms_ca(&identity).map_err(|e| Error::internal(format!("tls: {e}")))?;
     let tls_config = alpha_client::tls::mtls_server_config(cert.clone(), kms_ca.clone())
         .map_err(|e| Error::internal(format!("tls: {e}")))?;
     let front = front_client(kms_ca, config.inference_revisions.clone())?;
 
     let state = Arc::new(AppState {
         config,
-        secrets: parking_lot::RwLock::new(read_secrets(&runtime).await?),
+        inference_bearer: parking_lot::RwLock::new(read_bearer(&runtime).await?),
         front,
     });
     let app = router(state.clone());
@@ -107,7 +93,7 @@ async fn renew_forever(runtime: &RuntimeSocket, cert: &InstanceCert, state: &App
                 .map_err(|e| Error::internal(format!("renew identity: {e}")))?;
             cert.replace(&identity)
                 .map_err(|e| Error::internal(format!("renew tls: {e}")))?;
-            *state.secrets.write() = read_secrets(runtime).await?;
+            *state.inference_bearer.write() = read_bearer(runtime).await?;
             Ok::<(), Error>(())
         };
         if let Err(e) = renewed.await {
