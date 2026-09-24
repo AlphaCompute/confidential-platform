@@ -35,6 +35,11 @@ pub const WRITE_BODY_LIMIT: usize = 12 << 20;
 /// An access token is used until this long before the provider says it expires.
 const EXPIRY_MARGIN: Duration = Duration::from_secs(60);
 
+// ponytail: a refresh reply without `expires_in` is trusted for an hour, so a token revoked or
+// shorter-lived than that is noticed only when the provider answers 401, which drops it and
+// retries once. The upgrade is each row naming its provider's documented lifetime.
+const DEFAULT_LIFETIME: Duration = Duration::from_secs(3600);
+
 /// A 16 MiB export can take longer than the client's default timeout.
 const SEND_TIMEOUT: Duration = Duration::from_secs(100);
 
@@ -296,13 +301,13 @@ async fn access_token(
         &state.http,
         provider,
         client_id,
-        &client_secret,
+        client_secret.as_deref().map(String::as_str),
         refresh_token,
     )
     .await
     {
         Ok(refreshed) => refreshed,
-        Err(RefreshError::InvalidGrant) => {
+        Err(RefreshError::Dead) => {
             store::mark_dead(&mut tx, id).await?;
             tx.commit().await?;
             state.tokens.lock().remove(&id);
@@ -318,7 +323,9 @@ async fn access_token(
         store::replace_refresh_token(&mut tx, id, &sealed).await?;
     }
     tx.commit().await?;
-    let until = Duration::from_secs(refreshed.expires_in)
+    let until = refreshed
+        .expires_in
+        .map_or(DEFAULT_LIFETIME, Duration::from_secs)
         .checked_sub(EXPIRY_MARGIN)
         .and_then(|d| Instant::now().checked_add(d));
     let mut cache = state.tokens.lock();

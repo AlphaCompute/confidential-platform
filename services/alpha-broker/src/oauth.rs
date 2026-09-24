@@ -9,6 +9,7 @@ use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use reqwest::Method;
 use serde::Deserialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -31,14 +32,28 @@ pub enum Revoke {
     Bearer(&'static str),
 }
 
+/// How the broker proves it is the tenant's client at the token endpoint.
+pub enum ClientAuth {
+    /// `client_id` and `client_secret` in the form.
+    Form,
+    /// A public client: only `client_id`; the PKCE verifier stands in for a secret.
+    Public,
+}
+
 pub struct Provider {
     pub name: &'static str,
     pub authorization: &'static str,
     pub token: &'static str,
+    pub client_auth: ClientAuth,
     pub scopes: &'static [&'static str],
+    /// The authorization parameter carrying the scopes, and what joins them.
+    pub scope_param: (&'static str, &'static str),
+    /// The object of the exchange reply holding the tokens, when not its root.
+    pub tokens_at: Option<&'static str>,
+    /// The refresh reply's `error` codes that mean the member must reconnect.
+    pub dead: &'static [&'static str],
     pub extra_authorize: &'static [(&'static str, &'static str)],
-    /// The account lookup, sent with the bearer and no body; it answers the account's subject
-    /// and email.
+    /// The account lookup, sent with the bearer and no body.
     pub identity: (Method, &'static str),
     pub revoke: Revoke,
     pub reads: &'static [Entry],
@@ -71,6 +86,7 @@ pub const GOOGLE: Provider = Provider {
     name: "google",
     authorization: "https://accounts.google.com/o/oauth2/v2/auth",
     token: "https://oauth2.googleapis.com/token",
+    client_auth: ClientAuth::Form,
     scopes: &[
         "https://www.googleapis.com/auth/drive.readonly",
         "https://www.googleapis.com/auth/gmail.readonly",
@@ -79,6 +95,9 @@ pub const GOOGLE: Provider = Provider {
         "openid",
         "email",
     ],
+    scope_param: ("scope", " "),
+    tokens_at: None,
+    dead: &["invalid_grant"],
     extra_authorize: &[("access_type", "offline"), ("prompt", "consent")],
     identity: (
         Method::GET,
@@ -112,6 +131,7 @@ pub const DROPBOX: Provider = Provider {
     name: "dropbox",
     authorization: "https://www.dropbox.com/oauth2/authorize",
     token: "https://api.dropboxapi.com/oauth2/token",
+    client_auth: ClientAuth::Form,
     scopes: &[
         "account_info.read",
         "files.metadata.read",
@@ -119,6 +139,9 @@ pub const DROPBOX: Provider = Provider {
         "files.content.write",
         "sharing.read",
     ],
+    scope_param: ("scope", " "),
+    tokens_at: None,
+    dead: &["invalid_grant"],
     extra_authorize: &[("token_access_type", "offline")],
     identity: (
         Method::POST,
@@ -144,7 +167,41 @@ pub const DROPBOX: Provider = Provider {
     headers: &["dropbox-api-arg", "dropbox-api-path-root"],
 };
 
-pub const PROVIDERS: [&Provider; 2] = [&GOOGLE, &DROPBOX];
+/// A user token, never a bot's: the connection reads as the member, in every channel and direct
+/// message the member sees. A public client, so no Slack secret exists to leak. Every Slack
+/// failure is HTTP 200 with `ok: false`; the exchange's user token sits under `authed_user`.
+pub const SLACK: Provider = Provider {
+    name: "slack",
+    authorization: "https://slack.com/oauth/v2/authorize",
+    token: "https://slack.com/api/oauth.v2.access",
+    client_auth: ClientAuth::Public,
+    scopes: &[
+        "channels:read",
+        "channels:history",
+        "groups:read",
+        "groups:history",
+        "im:read",
+        "im:history",
+        "mpim:read",
+        "mpim:history",
+        "users:read",
+    ],
+    scope_param: ("user_scope", ","),
+    tokens_at: Some("authed_user"),
+    dead: &["invalid_refresh_token"],
+    extra_authorize: &[],
+    identity: (Method::POST, "https://slack.com/api/auth.test"),
+    revoke: Revoke::Bearer("https://slack.com/api/auth.revoke"),
+    reads: &[
+        get("slack.com", "/api/conversations.list"),
+        get("slack.com", "/api/conversations.history"),
+        get("slack.com", "/api/users.info"),
+    ],
+    writes: &[],
+    headers: &[],
+};
+
+pub const PROVIDERS: [&Provider; 3] = [&GOOGLE, &DROPBOX, &SLACK];
 
 pub fn provider(name: &str) -> Option<&'static Provider> {
     PROVIDERS.into_iter().find(|p| p.name == name)
@@ -169,12 +226,13 @@ pub fn authorization_url(
     state: &str,
     challenge: &str,
 ) -> Result<String, Error> {
-    let scope = provider.scopes.join(" ");
+    let (scope_param, separator) = provider.scope_param;
+    let scope = provider.scopes.join(separator);
     let params = [
         ("client_id", client_id),
         ("redirect_uri", redirect_uri),
         ("response_type", "code"),
-        ("scope", scope.as_str()),
+        (scope_param, scope.as_str()),
         ("state", state),
         ("code_challenge", challenge),
         ("code_challenge_method", "S256"),
@@ -202,32 +260,59 @@ struct TokenReply {
     scope: String,
 }
 
+/// A form post to `url` carrying `form` and the row's client authentication; `None` when the
+/// row needs a secret and none was given.
+fn token_request<'a>(
+    http: &reqwest::Client,
+    provider: &Provider,
+    url: &str,
+    client_id: &'a str,
+    client_secret: Option<&'a str>,
+    mut form: Vec<(&'a str, &'a str)>,
+) -> Option<reqwest::RequestBuilder> {
+    form.push(("client_id", client_id));
+    match provider.client_auth {
+        ClientAuth::Form => form.push(("client_secret", client_secret?)),
+        ClientAuth::Public => {}
+    }
+    Some(http.post(url).form(&form))
+}
+
 pub async fn exchange(
     http: &reqwest::Client,
     provider: &Provider,
     client_id: &str,
-    client_secret: &str,
+    client_secret: Option<&str>,
     redirect_uri: &str,
     code: &str,
     verifier: &str,
 ) -> Result<Tokens, &'static str> {
-    let response = http
-        .post(provider.token)
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("code_verifier", verifier),
-            ("client_id", client_id),
-            ("client_secret", client_secret),
-            ("redirect_uri", redirect_uri),
-        ])
-        .send()
-        .await
-        .map_err(|_| "token_unreachable")?;
+    let form = vec![
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("code_verifier", verifier),
+        ("redirect_uri", redirect_uri),
+    ];
+    let response = token_request(
+        http,
+        provider,
+        provider.token,
+        client_id,
+        client_secret,
+        form,
+    )
+    .ok_or("no_client_secret")?
+    .send()
+    .await
+    .map_err(|_| "token_unreachable")?;
     if !response.status().is_success() {
         return Err("token_refused");
     }
-    let reply: TokenReply = response.json().await.map_err(|_| "token_malformed")?;
+    let mut reply: Value = response.json().await.map_err(|_| "token_malformed")?;
+    if let Some(key) = provider.tokens_at {
+        reply = reply.get_mut(key).map(Value::take).unwrap_or_default();
+    }
+    let reply: TokenReply = serde_json::from_value(reply).map_err(|_| "token_malformed")?;
     let refresh_token = reply.refresh_token.ok_or("no_refresh_token")?;
     Ok(Tokens {
         access_token: Zeroizing::new(reply.access_token),
@@ -238,22 +323,24 @@ pub async fn exchange(
 
 pub struct Refreshed {
     pub access_token: Zeroizing<String>,
-    pub expires_in: u64,
+    pub expires_in: Option<u64>,
     /// Present only when the provider rotated the refresh token.
     pub refresh_token: Option<Zeroizing<String>>,
 }
 
 pub enum RefreshError {
     /// The provider will never accept this refresh token again; the member must reconnect.
-    InvalidGrant,
+    Dead,
     Other(&'static str),
 }
 
+/// The provider's `error` is checked against the row's dead codes whatever the HTTP status:
+/// some providers answer every failure with 200.
 pub async fn refresh(
     http: &reqwest::Client,
     provider: &Provider,
     client_id: &str,
-    client_secret: &str,
+    client_secret: Option<&str>,
     refresh_token: &str,
 ) -> Result<Refreshed, RefreshError> {
     #[derive(Deserialize)]
@@ -261,42 +348,68 @@ pub async fn refresh(
         access_token: Option<String>,
         expires_in: Option<u64>,
         refresh_token: Option<String>,
-        error: Option<String>,
+        error: Option<Value>,
     }
-    let response = http
-        .post(provider.token)
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-            ("client_id", client_id),
-            ("client_secret", client_secret),
-        ])
-        .send()
-        .await
-        .map_err(|_| RefreshError::Other("token_unreachable"))?;
+    let form = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+    ];
+    let response = token_request(
+        http,
+        provider,
+        provider.token,
+        client_id,
+        client_secret,
+        form,
+    )
+    .ok_or(RefreshError::Other("no_client_secret"))?
+    .send()
+    .await
+    .map_err(|_| RefreshError::Other("token_unreachable"))?;
     let success = response.status().is_success();
     let reply: Reply = response
         .json()
         .await
         .map_err(|_| RefreshError::Other("token_malformed"))?;
+    let dead = reply
+        .error
+        .as_ref()
+        .and_then(Value::as_str)
+        .is_some_and(|e| provider.dead.contains(&e));
     match (success, reply.access_token) {
+        _ if dead => Err(RefreshError::Dead),
         (true, Some(access_token)) => Ok(Refreshed {
             access_token: Zeroizing::new(access_token),
-            expires_in: reply.expires_in.unwrap_or_default(),
+            expires_in: reply.expires_in,
             refresh_token: reply.refresh_token.map(Zeroizing::new),
         }),
-        _ if reply.error.as_deref() == Some("invalid_grant") => Err(RefreshError::InvalidGrant),
         _ => Err(RefreshError::Other("token_refused")),
     }
 }
 
 /// The provider's stable subject identifies the account; the email is only what the member
 /// sees, and it can be renamed or given to another account.
-#[derive(Deserialize)]
 pub struct Account {
-    #[serde(rename = "sub", alias = "account_id")]
     pub subject: String,
     pub email: String,
+}
+
+/// The account lookup's reply: a subject and an email, or Slack's user within its team, whose
+/// subject is `<team_id>:<user_id>` since one member can be in several workspaces.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AccountReply {
+    Email {
+        #[serde(alias = "account_id", alias = "id")]
+        sub: String,
+        email: String,
+    },
+    Team {
+        team_id: String,
+        user_id: String,
+        user: String,
+        team: String,
+    },
 }
 
 pub async fn account(
@@ -314,7 +427,23 @@ pub async fn account(
     if !response.status().is_success() {
         return Err("account_refused");
     }
-    response.json().await.map_err(|_| "account_malformed")
+    Ok(
+        match response.json().await.map_err(|_| "account_malformed")? {
+            AccountReply::Email { sub, email } => Account {
+                subject: sub,
+                email,
+            },
+            AccountReply::Team {
+                team_id,
+                user_id,
+                user,
+                team,
+            } => Account {
+                subject: format!("{team_id}:{user_id}"),
+                email: format!("{user} @ {team}"),
+            },
+        },
+    )
 }
 
 /// Best effort: the caller revokes locally whatever the provider answers.
@@ -322,7 +451,7 @@ pub async fn revoke(
     http: &reqwest::Client,
     provider: &Provider,
     client_id: &str,
-    client_secret: &str,
+    client_secret: Option<&str>,
     refresh_token: &str,
 ) {
     let attempt = async {
