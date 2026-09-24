@@ -43,10 +43,6 @@ async fn an_instance_reads_drive_through_the_proxy_and_never_sees_a_token() {
 
 const FILES: &str = "https://www.googleapis.com/drive/v3/files";
 
-fn nothing_reached_google(h: &Harness) -> bool {
-    h.fake.with(|f| f.data.is_empty() && f.refreshes() == 0)
-}
-
 #[tokio::test]
 async fn a_caller_without_a_client_certificate_is_refused() {
     let Some(h) = harness().await else { return };
@@ -58,7 +54,7 @@ async fn a_caller_without_a_client_certificate_is_refused() {
         .unwrap();
     assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
     assert_eq!(reply.code(), "cert_invalid");
-    assert!(nothing_reached_google(&h));
+    assert!(h.untouched());
 }
 
 #[tokio::test]
@@ -71,7 +67,7 @@ async fn a_leaf_from_another_ca_fails_the_handshake() {
             .await
             .is_err()
     );
-    assert!(nothing_reached_google(&h));
+    assert!(h.untouched());
 }
 
 #[tokio::test]
@@ -92,7 +88,7 @@ async fn a_kms_node_leaf_is_refused() {
         .unwrap();
     assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
     assert_eq!(reply.code(), "cert_invalid");
-    assert!(nothing_reached_google(&h));
+    assert!(h.untouched());
 }
 
 #[tokio::test]
@@ -116,7 +112,7 @@ async fn each_bearer_opens_only_its_own_routes() {
         )
         .await;
     assert_eq!(listed.status, StatusCode::UNAUTHORIZED);
-    assert!(nothing_reached_google(&h));
+    assert!(h.untouched());
 }
 
 #[tokio::test]
@@ -140,7 +136,7 @@ async fn a_malformed_body_is_refused() {
         assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{body}");
         assert_eq!(reply.code(), "malformed");
     }
-    assert!(nothing_reached_google(&h));
+    assert!(h.untouched());
 }
 
 #[tokio::test]
@@ -163,7 +159,7 @@ async fn an_unknown_revoked_or_foreign_connection_is_not_found() {
         assert_eq!(reply.status, StatusCode::NOT_FOUND, "{connection}");
         assert_eq!(reply.code(), "not_found");
     }
-    assert!(nothing_reached_google(&h));
+    assert!(h.untouched());
     assert_eq!(h.proxy(&read(id, FILES)).await.status, StatusCode::OK);
 }
 
@@ -195,7 +191,7 @@ async fn a_request_outside_the_allowlist_is_refused_before_google() {
         assert_eq!(reply.status, StatusCode::FORBIDDEN, "{body}");
         assert_eq!(reply.code(), "not_allowed");
     }
-    assert!(nothing_reached_google(&h));
+    assert!(h.untouched());
 }
 
 #[tokio::test]
@@ -435,5 +431,5 @@ async fn a_request_body_over_two_mib_is_refused_before_google() {
     body["body"] = serde_json::json!("A".repeat(2 << 20));
     let reply = h.proxy(&body).await;
     assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
-    assert!(nothing_reached_google(&h));
+    assert!(h.untouched());
 }

@@ -292,8 +292,11 @@ pub async fn refresh(
 
 /// The provider's stable subject identifies the account; the name is only what the member
 /// sees (an email), and it can be renamed or given to another account.
+#[derive(Deserialize)]
 pub struct Account {
+    #[serde(rename = "sub", alias = "account_id")]
     pub subject: String,
+    #[serde(rename = "email")]
     pub name: String,
 }
 
@@ -302,12 +305,6 @@ pub async fn account(
     provider: &Provider,
     access_token: &str,
 ) -> Result<Account, &'static str> {
-    #[derive(Deserialize)]
-    struct Reply {
-        #[serde(alias = "sub", alias = "account_id")]
-        subject: String,
-        email: String,
-    }
     let request = match provider.identity {
         Identity::UserInfo(url) => http.get(url),
         Identity::CurrentAccount(url) => http.post(url),
@@ -320,11 +317,7 @@ pub async fn account(
     if !response.status().is_success() {
         return Err("account_refused");
     }
-    let reply: Reply = response.json().await.map_err(|_| "account_malformed")?;
-    Ok(Account {
-        subject: reply.subject,
-        name: reply.email,
-    })
+    response.json().await.map_err(|_| "account_malformed")
 }
 
 /// Best effort: the caller revokes locally whatever the provider answers.

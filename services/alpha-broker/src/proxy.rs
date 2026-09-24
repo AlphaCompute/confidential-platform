@@ -157,7 +157,15 @@ pub async fn proxy(
         |p| p.reads,
     )
     .await?;
-    let payload = Payload::Json(request.body);
+    let payload = match request.body {
+        Some(body) => Some((
+            HeaderValue::from_static("application/json"),
+            Bytes::from(
+                serde_json::to_vec(&body).map_err(|e| Error::internal(format!("body: {e}")))?,
+            ),
+        )),
+        None => None,
+    };
     forward(&state, id, provider, entry, url, headers, payload).await
 }
 
@@ -195,13 +203,8 @@ pub async fn write(
         |p| p.writes,
     )
     .await?;
-    let payload = Payload::Raw(content_type, Bytes::from(bytes));
+    let payload = Some((content_type, Bytes::from(bytes)));
     forward(&state, id, provider, entry, url, headers, payload).await
-}
-
-enum Payload {
-    Json(Option<Value>),
-    Raw(HeaderValue, Bytes),
 }
 
 /// Sends the entry's method to `url` with the member's access token; a 401 on a cached token
@@ -213,24 +216,22 @@ async fn forward(
     entry: &Entry,
     url: Url,
     headers: HeaderMap,
-    payload: Payload,
+    payload: Option<(HeaderValue, Bytes)>,
 ) -> Result<Response, Error> {
     let mut retried = false;
     loop {
         let token = access_token(state, id, provider).await?;
-        let outgoing = state
+        let mut outgoing = state
             .http
             .request(entry.method.clone(), url.clone())
             .headers(headers.clone())
             .bearer_auth(token.as_str())
             .timeout(SEND_TIMEOUT);
-        let outgoing = match &payload {
-            Payload::Json(None) => outgoing,
-            Payload::Json(Some(body)) => outgoing.json(body),
-            Payload::Raw(content_type, bytes) => outgoing
+        if let Some((content_type, bytes)) = &payload {
+            outgoing = outgoing
                 .header(header::CONTENT_TYPE, content_type.clone())
-                .body(bytes.clone()),
-        };
+                .body(bytes.clone());
+        }
         let response = outgoing.send().await.map_err(|_| Error::Upstream)?;
         if response.status() == StatusCode::UNAUTHORIZED && !retried {
             let mut cache = state.tokens.lock();

@@ -257,7 +257,6 @@ async fn a_dropbox_revoke_that_fails_leaves_the_local_revocation_in_place() {
 async fn every_provider_mints_its_own_authorization_url() {
     let Some(h) = harness().await else { return };
     for provider in alpha_broker::oauth::PROVIDERS {
-        let query = h.start(provider.name, MEMBER).await;
         let reply = h
             .call(
                 "POST",
@@ -266,6 +265,8 @@ async fn every_provider_mints_its_own_authorization_url() {
             )
             .await;
         let url = reqwest::Url::parse(reply.body["url"].as_str().unwrap()).unwrap();
+        let query: std::collections::HashMap<String, String> =
+            url.query_pairs().into_owned().collect();
         let expected = reqwest::Url::parse(provider.authorization).unwrap();
         assert_eq!(url.host_str(), expected.host_str(), "{}", provider.name);
         assert_eq!(url.path(), expected.path());
