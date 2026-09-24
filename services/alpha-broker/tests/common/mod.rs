@@ -56,11 +56,14 @@ pub const FIGMA_CLIENT_ID: &str = "figma-client-id-for-tests";
 pub const FIGMA_CLIENT_SECRET: &str = "figma-client-secret-for-tests";
 pub const FIGMA_REDIRECT_URI: &str = "https://corpus.example/oauth/figma/callback";
 pub const SLACK_REDIRECT_URI: &str = "https://corpus.example/oauth/slack/callback";
+pub const HUBSPOT_CLIENT_ID: &str = "hubspot-client-id-for-tests";
+pub const HUBSPOT_CLIENT_SECRET: &str = "hubspot-client-secret-for-tests";
+pub const HUBSPOT_REDIRECT_URI: &str = "https://corpus.example/oauth/hubspot/callback";
 pub const KEY: [u8; 32] = [9; 32];
 pub const EMAIL: &str = "member@example.com";
 pub const MEMBER: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 pub const OTHER_MEMBER: &str = "2222222222222222222222222222222222222222222222222222222222222222";
-const HOSTS: [&str; 8] = [
+const HOSTS: [&str; 9] = [
     "accounts.google.com",
     "oauth2.googleapis.com",
     "openidconnect.googleapis.com",
@@ -69,10 +72,14 @@ const HOSTS: [&str; 8] = [
     "content.dropboxapi.com",
     "slack.com",
     "api.figma.com",
+    "mcp.hubspot.com",
 ];
 pub const MEDIA: &str = "https://www.googleapis.com/drive/v3/files/file-1?alt=media";
 pub const LISTING: &str = r#"{"files":[{"id":"file-1","name":"Notes"}]}"#;
 pub const SLACK_HISTORY: &str = r#"{"ok":true,"messages":[{"type":"message","user":"U2","text":"hello","ts":"1.2"}],"has_more":false}"#;
+pub const MCP_ACCEPT: &str = "application/json, text/event-stream";
+pub const MCP_TOOLS: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"search_crm_objects","inputSchema":{}}]}}"#;
+pub const MCP_RESULT: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"results\":[{\"id\":\"101\"}]}"}],"isError":false}}"#;
 pub const DROPBOX_LISTING: &str = r#"{"entries":[{".tag":"file","name":"Notes.txt","id":"id:a1"}],"cursor":"c1","has_more":false}"#;
 
 /// What the stand-in expects of one provider's client and how its tokens look.
@@ -121,8 +128,18 @@ const FIGMA_CLIENT: Client = Client {
     scope: "",
 };
 
+const HUBSPOT_CLIENT: Client = Client {
+    id: HUBSPOT_CLIENT_ID,
+    secret: HUBSPOT_CLIENT_SECRET,
+    redirect: HUBSPOT_REDIRECT_URI,
+    access: "hsat-",
+    refresh: "hsrt-",
+    scope: "",
+};
+
 fn client_of(provider: &str) -> &'static Client {
     match provider {
+        "hubspot" => &HUBSPOT_CLIENT,
         "dropbox" => &DROPBOX_CLIENT,
         "slack" => &SLACK_CLIENT,
         "figma" => &FIGMA_CLIENT,
@@ -257,6 +274,7 @@ impl Fake {
             CLIENT_SECRET.to_string(),
             DROPBOX_CLIENT_SECRET.to_string(),
             SLACK_CLIENT_SECRET.to_string(),
+            HUBSPOT_CLIENT_SECRET.to_string(),
             FIGMA_CLIENT_SECRET.to_string(),
         ];
         for c in &self.consents {
@@ -287,6 +305,9 @@ pub const SLACK_REVOKE: &str = "/api/auth.revoke";
 pub const FIGMA_TOKEN: &str = "/v1/oauth/token";
 pub const FIGMA_REFRESH: &str = "/v1/oauth/refresh";
 pub const FIGMA_ME: &str = "/v1/me";
+pub const HUBSPOT_TOKEN: &str = "/oauth/v3/token";
+/// Where the stand-in records an MCP server's identity call.
+pub const MCP_IDENTITY: &str = "mcp-identity";
 
 /// The `id:secret` of an HTTP Basic authorization header.
 fn basic_of(headers: &HeaderMap) -> Option<String> {
@@ -321,6 +342,7 @@ async fn token(
         DROPBOX_TOKEN => "dropbox",
         SLACK_TOKEN => "slack",
         FIGMA_TOKEN | FIGMA_REFRESH => "figma",
+        HUBSPOT_TOKEN => "hubspot",
         _ => "google",
     };
     let client = client_of(provider);
@@ -524,6 +546,76 @@ async fn slack_identity(State(fake): State<Shared>, headers: HeaderMap) -> Respo
     .into_response()
 }
 
+/// The account an MCP server's identity tool names for consent `c`: HubSpot's hub and user
+/// within it, numbers when the consent's `<hub>:<user>` subject holds numbers.
+fn mcp_account(c: &Consent) -> Value {
+    let (hub, user) = c.subject.split_once(':').unwrap_or(("1", &c.subject));
+    let number = |v: &str| v.parse::<u64>().map_or(json!(v), Value::from);
+    json!({
+        "accountId": number(hub),
+        "userId": number(user),
+        "userInformation": { "email": c.email, "type": "USER" },
+        "toolInformation": {},
+    })
+}
+
+/// HubSpot's MCP server. The identity call, which arrives with the access token a consent's
+/// exchange issued, is recorded as an OAuth request; every other call is data, answered only to a
+/// token the stand-in issued. Both need the Accept header the MCP transport requires.
+async fn mcp(State(fake): State<Shared>, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
+    let mut fake = fake.lock().unwrap();
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let token = bearer_of(&headers);
+    if headers.get(header::ACCEPT).and_then(|v| v.to_str().ok()) != Some(MCP_ACCEPT) {
+        return StatusCode::NOT_ACCEPTABLE.into_response();
+    }
+    let request: Value = serde_json::from_slice(&body).unwrap_or_default();
+    let json_reply = |body: String| ([(header::CONTENT_TYPE, "application/json")], body);
+    let identity = fake
+        .consents
+        .iter()
+        .find(|c| c.access_token == token)
+        .cloned();
+    if let Some(c) = identity {
+        fake.requests.push((MCP_IDENTITY.into(), HashMap::new()));
+        if request["method"] != "tools/call" || request["params"]["name"] != "get_user_details" {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        let text = mcp_account(&c).to_string();
+        let reply = json!({
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": { "content": [{ "type": "text", "text": text }], "isError": false },
+        });
+        return json_reply(reply.to_string()).into_response();
+    }
+    fake.data.push(DataRequest {
+        method: Method::POST,
+        host,
+        path: uri.path().to_string(),
+        query: HashMap::new(),
+        headers: headers.clone(),
+        body: body.to_vec(),
+    });
+    if fake.unauthorized > 0
+        || !token.starts_with(HUBSPOT_CLIENT.access)
+        || !fake.access.contains(&token)
+    {
+        fake.unauthorized = fake.unauthorized.saturating_sub(1);
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let reply = match request["method"].as_str() {
+        Some("tools/list") => MCP_TOOLS.to_string(),
+        Some("tools/call") => MCP_RESULT.to_string(),
+        _ => r#"{"jsonrpc":"2.0","id":1,"result":{}}"#.to_string(),
+    };
+    json_reply(reply).into_response()
+}
+
 /// Google's and Dropbox's data APIs, told apart by host and answered only to an access token the
 /// stand-in issued for that provider.
 async fn data(
@@ -706,6 +798,8 @@ impl FakeProviders {
             .route(FIGMA_TOKEN, post(token))
             .route(FIGMA_REFRESH, post(token))
             .route(FIGMA_ME, get(figma_me))
+            .route(HUBSPOT_TOKEN, post(token))
+            .route("/", post(mcp))
             .route("/v1/userinfo", get(userinfo))
             .route(DROPBOX_ACCOUNT, post(current_account))
             .route("/revoke", post(revoke))
@@ -899,6 +993,7 @@ pub async fn harness() -> Option<Harness> {
         "DROPBOX_CLIENT_ID" => Some(DROPBOX_CLIENT_ID.into()),
         "SLACK_CLIENT_ID" => Some(SLACK_CLIENT_ID.into()),
         "FIGMA_CLIENT_ID" => Some(FIGMA_CLIENT_ID.into()),
+        "HUBSPOT_CLIENT_ID" => Some(HUBSPOT_CLIENT_ID.into()),
         "OAUTH_REDIRECT_BASE" => Some("https://corpus.example/oauth".into()),
         _ => None,
     })
