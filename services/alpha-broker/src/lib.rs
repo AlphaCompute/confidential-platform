@@ -103,19 +103,12 @@ pub struct AppState {
 impl AppState {
     /// The provider's client id and a copy of its client secret, if its row uses one.
     pub fn client(&self, provider: &Provider) -> Result<(&str, Option<Zeroizing<String>>), Error> {
-        let secret = match provider.client_auth {
-            oauth::ClientAuth::Public => None,
-            _ => Some(
-                self.secrets
-                    .read()
-                    .client_secrets
-                    .get(provider.name)
-                    .cloned()
-                    .ok_or_else(|| {
-                        Error::internal(format!("no client secret for {}", provider.name))
-                    })?,
-            ),
-        };
+        let secret = self
+            .secrets
+            .read()
+            .client_secrets
+            .get(provider.name)
+            .cloned();
         Ok((self.config.client_id(provider)?, secret))
     }
 }

@@ -177,14 +177,18 @@ async fn one_slack_user_keeps_one_connection_and_a_second_workspace_makes_anothe
 }
 
 #[tokio::test]
-async fn slack_needs_no_client_secret_and_figma_needs_one() {
+async fn slack_needs_no_client_secret_and_figma_refreshes_only_with_one() {
     let Some(h) = harness().await else { return };
     let slack = alpha_broker::oauth::provider("slack").unwrap();
-    let figma = alpha_broker::oauth::provider("figma").unwrap();
     let (client_id, secret) = h.state.client(slack).unwrap();
     assert_eq!((client_id, secret), (SLACK_CLIENT_ID, None));
-    assert!(h.state.client(figma).unwrap().1.is_some());
+
+    let (id, _) = h.connected_to("figma").await;
     h.state.secrets.write().client_secrets.remove("figma");
-    let err = h.state.client(figma).unwrap_err();
-    assert!(err.to_string().contains("figma"), "{err}");
+    let reply = h
+        .proxy(&read(id, "https://api.figma.com/v1/files/AbC123"))
+        .await;
+    assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(reply.code(), "upstream");
+    assert_eq!(h.fake.with(|f| f.hits(FIGMA_REFRESH)), 0);
 }
