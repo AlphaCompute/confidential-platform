@@ -73,24 +73,10 @@ async fn run() -> Result<(), Error> {
 
     let secrets = read_secrets(&runtime).await?;
     let upstream = Upstream::new(&config)?;
-    let guardrails = config
-        .guardrails
-        .clone()
-        .map(alpha_inference::guardrails::Guardrails::new)
-        .transpose()?;
-    if let Some(guardrails) = &guardrails {
-        eprintln!(
-            "alpha-inference: guardrails enabled policy_sha256={}",
-            guardrails.policy_digest()
-        );
-    } else {
-        eprintln!("alpha-inference: guardrails disabled (GUARDRAILS_CONFIG absent)");
-    }
     let state = Arc::new(AppState {
         config,
         secrets: parking_lot::RwLock::new(secrets),
         upstream,
-        guardrails,
     });
     let app = router(state.clone());
 
