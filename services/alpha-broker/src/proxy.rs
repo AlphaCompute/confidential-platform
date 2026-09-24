@@ -80,12 +80,13 @@ fn check_headers(
     headers: Option<BTreeMap<String, String>>,
 ) -> Result<HeaderMap, Error> {
     let headers = headers.unwrap_or_default();
-    let listed = |name: &str| {
+    let listed = |name: &String| {
         provider
             .headers
-            .contains(&name.to_ascii_lowercase().as_str())
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(name))
     };
-    if !headers.keys().all(|name| listed(name)) {
+    if !headers.keys().all(listed) {
         return Err(Error::NotAllowed);
     }
     let mut out = HeaderMap::new();
@@ -157,15 +158,12 @@ pub async fn proxy(
         |p| p.reads,
     )
     .await?;
-    let payload = match request.body {
-        Some(body) => Some((
-            HeaderValue::from_static("application/json"),
-            Bytes::from(
-                serde_json::to_vec(&body).map_err(|e| Error::internal(format!("body: {e}")))?,
-            ),
-        )),
-        None => None,
-    };
+    let payload = request
+        .body
+        .map(|b| serde_json::to_vec(&b))
+        .transpose()
+        .map_err(|e| Error::internal(format!("body: {e}")))?
+        .map(|v| (HeaderValue::from_static("application/json"), Bytes::from(v)));
     forward(&state, id, provider, entry, url, headers, payload).await
 }
 

@@ -50,7 +50,7 @@ pub struct Provider {
     pub revoke: Revoke,
     pub reads: &'static [Entry],
     pub writes: &'static [Entry],
-    /// Lowercase names of the request headers a caller may set.
+    /// Names of the request headers a caller may set.
     pub headers: &'static [&'static str],
 }
 
@@ -290,14 +290,13 @@ pub async fn refresh(
     }
 }
 
-/// The provider's stable subject identifies the account; the name is only what the member
-/// sees (an email), and it can be renamed or given to another account.
+/// The provider's stable subject identifies the account; the email is only what the member
+/// sees, and it can be renamed or given to another account.
 #[derive(Deserialize)]
 pub struct Account {
     #[serde(rename = "sub", alias = "account_id")]
     pub subject: String,
-    #[serde(rename = "email")]
-    pub name: String,
+    pub email: String,
 }
 
 pub async fn account(
@@ -379,10 +378,9 @@ mod tests {
     }
 
     #[test]
-    fn names_are_unique_and_header_names_lowercase() {
+    fn names_are_unique() {
         for (i, a) in PROVIDERS.iter().enumerate() {
             assert!(PROVIDERS[i + 1..].iter().all(|b| b.name != a.name));
-            assert!(a.headers.iter().all(|h| *h == h.to_ascii_lowercase()));
         }
     }
 }
