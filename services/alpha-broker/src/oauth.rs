@@ -177,14 +177,15 @@ pub const DROPBOX: Provider = Provider {
 };
 
 /// A user token, never a bot's: the connection reads as the member, in every channel and direct
-/// message the member sees. A public client, so no Slack secret exists to leak. Every Slack
-/// failure is HTTP 200 with `ok: false`; the exchange's user token sits under `authed_user`.
+/// message the member sees. Slack refuses a refresh without the client secret even when the
+/// code was exchanged with PKCE, so the secret goes on both. Every Slack failure is HTTP 200
+/// with `ok: false`; the exchange's user token sits under `authed_user`.
 pub const SLACK: Provider = Provider {
     name: "slack",
     authorization: "https://slack.com/oauth/v2/authorize",
     token: "https://slack.com/api/oauth.v2.access",
     refresh: "https://slack.com/api/oauth.v2.access",
-    client_auth: ClientAuth::Public,
+    client_auth: ClientAuth::Form,
     scopes: &[
         "channels:read",
         "channels:history",

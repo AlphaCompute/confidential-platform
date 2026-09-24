@@ -51,6 +51,7 @@ pub const DROPBOX_CLIENT_ID: &str = "dropbox-app-key-for-tests";
 pub const DROPBOX_CLIENT_SECRET: &str = "dropbox-app-secret-for-tests";
 pub const DROPBOX_REDIRECT_URI: &str = "https://corpus.example/oauth/dropbox/callback";
 pub const SLACK_CLIENT_ID: &str = "1234.5678";
+pub const SLACK_CLIENT_SECRET: &str = "slack-client-secret-for-tests";
 pub const FIGMA_CLIENT_ID: &str = "figma-client-id-for-tests";
 pub const FIGMA_CLIENT_SECRET: &str = "figma-client-secret-for-tests";
 pub const FIGMA_REDIRECT_URI: &str = "https://corpus.example/oauth/figma/callback";
@@ -102,10 +103,9 @@ const DROPBOX_CLIENT: Client = Client {
     scope: "account_info.read files.content.read files.content.write",
 };
 
-/// A public client: it has no secret.
 const SLACK_CLIENT: Client = Client {
     id: SLACK_CLIENT_ID,
-    secret: "",
+    secret: SLACK_CLIENT_SECRET,
     redirect: SLACK_REDIRECT_URI,
     access: "xoxp-",
     refresh: "xoxe-1-",
@@ -256,6 +256,7 @@ impl Fake {
         let mut out = vec![
             CLIENT_SECRET.to_string(),
             DROPBOX_CLIENT_SECRET.to_string(),
+            SLACK_CLIENT_SECRET.to_string(),
             FIGMA_CLIENT_SECRET.to_string(),
         ];
         for c in &self.consents {
@@ -308,9 +309,8 @@ fn invalid_grant() -> Response {
 }
 
 /// Google's `/token`, Dropbox's `/oauth2/token`, Slack's `oauth.v2.access` and Figma's token and
-/// refresh URLs, each accepting only its own client: Google and Dropbox with the secret in the
-/// form, Slack as a public client that must send no secret at all, Figma only in HTTP Basic and
-/// refreshing only at its own URL.
+/// refresh URLs, each accepting only its own client: Google, Dropbox and Slack with the secret in
+/// the form, Figma only in HTTP Basic and refreshing only at its own URL.
 async fn token(
     State(fake): State<Shared>,
     uri: Uri,
@@ -354,7 +354,6 @@ async fn token(
                 && !form.contains_key("client_secret")
                 && (uri.path() == FIGMA_REFRESH) == refreshing
         }
-        "slack" => field("client_id") == client.id && !form.contains_key("client_secret"),
         _ => field("client_id") == client.id && field("client_secret") == client.secret,
     };
     if refreshing {
