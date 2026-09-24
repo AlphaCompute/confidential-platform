@@ -336,7 +336,10 @@ async fn access_token(
             cache.insert(id, (refreshed.access_token.clone(), until));
         }
     }
-    tx.commit().await?;
+    if let Err(e) = tx.commit().await {
+        state.tokens.lock().remove(&id);
+        return Err(e.into());
+    }
     Ok(refreshed.access_token)
 }
 
