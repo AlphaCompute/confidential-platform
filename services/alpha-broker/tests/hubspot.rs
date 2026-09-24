@@ -82,3 +82,173 @@ async fn a_member_connects_hubspot_and_an_instance_calls_a_listed_tool_without_s
     let sent: Value = serde_json::from_slice(&seen.body).unwrap();
     assert_eq!(sent, request["body"]);
 }
+
+/// Nothing reached HubSpot, its OAuth endpoints included, while `f` ran.
+async fn nothing_reaches_hubspot<F: Future<Output = ()>>(h: &Harness, f: F) {
+    let before = h.fake.with(|f| (f.data.len(), f.requests.len()));
+    f.await;
+    assert_eq!(h.fake.with(|f| (f.data.len(), f.requests.len())), before);
+}
+
+#[tokio::test]
+async fn every_listed_hubspot_tool_is_forwarded_and_every_other_is_refused_before_hubspot() {
+    let Some(h) = harness().await else { return };
+    let (id, _) = h.connected_to("hubspot").await;
+    for tool in alpha_broker::oauth::HUBSPOT_READ_TOOLS {
+        let reply = h.proxy(&call(id, tool)).await;
+        assert_eq!(reply.status, StatusCode::OK, "{tool}");
+    }
+    nothing_reaches_hubspot(&h, async {
+        for tool in [
+            "manage_crm_objects",
+            "manage_campaign_objects",
+            "manage_segment",
+            "manage_landing_page",
+            "manage_aeo_recommendations",
+            "manage_aeo_prompts",
+            "manage_marketing_email",
+            "manage_onboarding",
+            "manage_custom_properties",
+            "manage_custom_pipelines",
+            "manage_website_page",
+            "manage_blog_post",
+            "submit_feedback",
+            "render_asset",
+            "render_landing_page_ui",
+            "search_crm_objects_v2",
+            "search_crm_object",
+            "Search_crm_objects",
+            " search_crm_objects",
+            "notion-search",
+        ] {
+            let reply = h.proxy(&call(id, tool)).await;
+            assert_eq!(reply.status, StatusCode::FORBIDDEN, "{tool}");
+            assert_eq!(reply.code(), "not_allowed");
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_body_that_is_not_one_well_formed_tool_call_is_refused_before_hubspot() {
+    let Some(h) = harness().await else { return };
+    let (id, _) = h.connected_to("hubspot").await;
+    let listed = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "search_crm_objects" } });
+    let write = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": { "name": "manage_crm_objects" } });
+    nothing_reaches_hubspot(&h, async {
+        for body in [
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call" }),
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {} }),
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": 7 } }),
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "" } }),
+            json!([listed, write]),
+            json!("tools/list"),
+            Value::Null,
+        ] {
+            let reply = h.proxy(&rpc(id, body.clone())).await;
+            assert_eq!(reply.status, StatusCode::FORBIDDEN, "{body}");
+        }
+        let mut bare = rpc(id, Value::Null);
+        bare.as_object_mut().unwrap().remove("body");
+        assert_eq!(h.proxy(&bare).await.status, StatusCode::FORBIDDEN);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_duplicated_tool_name_is_judged_and_sent_by_its_last_value() {
+    let Some(h) = harness().await else { return };
+    let (id, _) = h.connected_to("hubspot").await;
+    let raw = |first: &str, last: &str| {
+        format!(
+            r#"{{"member":"{MEMBER}","connection_id":"{id}","method":"POST","url":"{MCP}",
+            "body":{{"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{{"name":"{first}","name":"{last}"}}}}}}"#
+        )
+    };
+    let proxy = |body: String| h.post_text(&h.instance, Some(PROXY_BEARER), "/proxy", body);
+    nothing_reaches_hubspot(&h, async {
+        let reply = proxy(raw("search_crm_objects", "manage_crm_objects"))
+            .await
+            .unwrap();
+        assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    })
+    .await;
+    let reply = proxy(raw("manage_crm_objects", "search_crm_objects"))
+        .await
+        .unwrap();
+    assert_eq!(reply.status, StatusCode::OK);
+    let sent = h.fake.with(|f| f.data.last().unwrap().body.clone());
+    let sent: Value = serde_json::from_slice(&sent).unwrap();
+    assert_eq!(sent["params"], json!({ "name": "search_crm_objects" }));
+}
+
+#[tokio::test]
+async fn tools_list_and_initialize_pass_and_come_back_byte_for_byte() {
+    let Some(h) = harness().await else { return };
+    let (id, _) = h.connected_to("hubspot").await;
+    let list = h
+        .proxy(&rpc(
+            id,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+        ))
+        .await;
+    assert_eq!(list.status, StatusCode::OK);
+    assert_eq!(list.content_type.as_deref(), Some("application/json"));
+    assert_eq!(list.bytes, MCP_TOOLS.as_bytes());
+    let init = h
+        .proxy(&rpc(
+            id,
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }),
+        ))
+        .await;
+    assert_eq!(init.status, StatusCode::OK);
+    let methods: Vec<Value> = h.fake.with(|f| {
+        f.data
+            .iter()
+            .map(|d| serde_json::from_slice::<Value>(&d.body).unwrap()["method"].clone())
+            .collect()
+    });
+    assert_eq!(methods, [json!("tools/list"), json!("initialize")]);
+}
+
+#[tokio::test]
+async fn a_hubspot_refresh_stores_whatever_refresh_token_comes_back() {
+    let Some(h) = harness().await else { return };
+    let (id, consent) = h.connected_to("hubspot").await;
+    h.fake.with(|f| f.rotate = true);
+    for round in 0..2 {
+        h.state.tokens.lock().clear();
+        assert_eq!(
+            h.proxy(&call(id, "get_user_details")).await.status,
+            StatusCode::OK
+        );
+        let sealed = h.stored_token(id).await.unwrap();
+        let stored = alpha_broker::store::open(&KEY, id.as_bytes(), &sealed).unwrap();
+        let newest = h.fake.with(|f| f.refresh.last().cloned().unwrap());
+        assert_eq!(stored.as_slice(), newest.as_bytes(), "round {round}");
+        assert_ne!(newest, consent.refresh_token);
+    }
+    let refresh = h.fake.with(|f| f.form(HUBSPOT_TOKEN));
+    assert_eq!(refresh["client_secret"], HUBSPOT_CLIENT_SECRET);
+}
+
+#[tokio::test]
+async fn disconnecting_hubspot_revokes_only_locally() {
+    let Some(h) = harness().await else { return };
+    let (id, _) = h.connected_to("hubspot").await;
+    nothing_reaches_hubspot(&h, async {
+        let reply = h
+            .call(
+                "DELETE",
+                &format!("/connections/{id}?member={MEMBER}"),
+                None,
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    })
+    .await;
+    assert_eq!(h.stored_token(id).await, None);
+}
