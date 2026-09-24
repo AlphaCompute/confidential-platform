@@ -172,6 +172,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "alpha-guard"
+version = "0.1.0"
+dependencies = [
+ "alpha-client",
+ "alpha-core",
+ "axum",
+ "hex",
+ "parking_lot",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "tokio",
+ "tower",
+ "zeroize",
+]
+
+[[package]]
 name = "alpha-inference"
 version = "0.1.0"
 dependencies = [
