@@ -25,15 +25,9 @@ async fn a_member_connects_dropbox_and_an_instance_lists_a_folder_without_seeing
         reply.body,
         json!({ "id": id.to_string(), "provider": "dropbox", "account": EMAIL })
     );
-    let lookup = h.fake.with(|f| {
-        f.requests
-            .iter()
-            .find(|(p, _)| p == DROPBOX_ACCOUNT)
-            .cloned()
-            .unwrap()
-    });
-    assert_eq!(lookup.1.get("content_type"), None);
-    assert_eq!(lookup.1["body"], "");
+    let lookup = h.fake.with(|f| f.form(DROPBOX_ACCOUNT));
+    assert_eq!(lookup.get("content_type"), None);
+    assert_eq!(lookup["body"], "");
 
     let reply = h
         .proxy(&json!({

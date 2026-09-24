@@ -40,14 +40,7 @@ async fn a_member_connects_figma_with_basic_auth_and_an_instance_reads_a_file() 
         .await
         .unwrap();
     assert_eq!(subject, "1234567");
-    let exchange = h.fake.with(|f| {
-        f.requests
-            .iter()
-            .find(|(p, _)| p == FIGMA_TOKEN)
-            .cloned()
-            .unwrap()
-            .1
-    });
+    let exchange = h.fake.with(|f| f.form(FIGMA_TOKEN));
     assert!(!exchange.contains_key("client_id") && !exchange.contains_key("client_secret"));
 
     let stored = h.stored_token(id).await;

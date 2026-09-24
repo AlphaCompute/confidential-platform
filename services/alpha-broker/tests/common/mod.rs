@@ -226,6 +226,16 @@ impl Fake {
         self.requests.iter().filter(|(p, _)| p == path).count()
     }
 
+    /// The fields of the first request that reached `path`.
+    pub fn form(&self, path: &str) -> HashMap<String, String> {
+        self.requests
+            .iter()
+            .find(|(p, _)| p == path)
+            .unwrap()
+            .1
+            .clone()
+    }
+
     pub fn revoked_tokens(&self) -> Vec<String> {
         self.requests
             .iter()

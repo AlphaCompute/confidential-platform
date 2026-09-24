@@ -24,14 +24,7 @@ async fn a_member_connects_slack_and_an_instance_reads_history_without_seeing_a_
         reply.body,
         json!({ "id": id.to_string(), "provider": "slack", "account": "ann @ Acme" })
     );
-    let exchange = h.fake.with(|f| {
-        f.requests
-            .iter()
-            .find(|(p, _)| p == SLACK_TOKEN)
-            .cloned()
-            .unwrap()
-            .1
-    });
+    let exchange = h.fake.with(|f| f.form(SLACK_TOKEN));
     assert_eq!(exchange["client_id"], SLACK_CLIENT_ID);
     assert!(!exchange.contains_key("client_secret"), "{exchange:?}");
     assert_eq!(exchange["code_verifier"].len(), 43);
