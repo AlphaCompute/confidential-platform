@@ -2,7 +2,8 @@
 //! with a PKCE verifier only it holds, and keeps the refresh token sealed under a key only
 //! Instances of this App receive from the KMS. The tenant's backend starts and finishes a
 //! connect with its bearer and relays an opaque code; it never sees a token. An attested
-//! Instance holding the proxy bearer reads through `/proxy` inside a fixed allowlist, with the
+//! Instance holding the proxy bearer reads through `/proxy` inside its provider's read list, and
+//! the tenant's backend writes an export through `/write` inside the write list, with the
 //! member's access token attached here.
 
 #![cfg_attr(
@@ -24,7 +25,7 @@ pub mod store;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::extract::{FromRequestParts, State};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, State};
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -129,7 +130,7 @@ pub enum Error {
     ExchangeFailed,
     #[error("a client certificate of an attested Instance is required")]
     CertInvalid,
-    #[error("the request is outside what this connection may read")]
+    #[error("the request is outside what this route may send on this connection")]
     NotAllowed,
     #[error("the provider no longer accepts this connection; the member must reconnect")]
     ReconnectRequired,
@@ -259,6 +260,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/connections", get(connect::list))
         .route("/connections/{id}", delete(connect::disconnect))
         .route("/proxy", post(proxy::proxy))
+        .route(
+            "/write",
+            post(proxy::write).layer(DefaultBodyLimit::max(proxy::WRITE_BODY_LIMIT)),
+        )
         .route("/healthz", get(healthz))
         .route("/ready", get(ready))
         .with_state(state)

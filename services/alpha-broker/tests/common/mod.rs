@@ -21,7 +21,7 @@ use alpha_broker::{AppState, Config, Secrets, oauth, router};
 use alpha_client::tls::{Identity, Pin};
 use axum::body::Bytes;
 use axum::body::{Body, to_bytes};
-use axum::extract::{Form, Query, State};
+use axum::extract::{DefaultBodyLimit, Form, Query, State};
 use axum::http::{HeaderMap, Method, Request, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -568,6 +568,7 @@ impl FakeProviders {
             .route("/revoke", post(revoke))
             .route(DROPBOX_REVOKE, post(dropbox_revoke))
             .fallback(data)
+            .layer(DefaultBodyLimit::disable())
             .with_state(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

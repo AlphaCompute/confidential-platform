@@ -1,7 +1,9 @@
 //! `POST /proxy`: an attested Instance names a member, one of that member's connections and a
-//! read on the connection's provider's read list; the broker attaches the member's access token
-//! and answers with the provider's status, content type and body. Nothing outside the list
-//! reaches the provider, and no token leaves the broker.
+//! read on the connection's provider's read list. `POST /write`: the tenant's backend, with its
+//! connect bearer, sends one export on the provider's write list. The broker attaches the
+//! member's access token and answers with the provider's status, content type and body. Neither
+//! route reaches the other's list, nothing outside them reaches the provider, and no token
+//! leaves the broker.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -11,6 +13,8 @@ use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::Response;
+use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use reqwest::Url;
 use serde::Deserialize;
 use serde_json::Value;
@@ -19,11 +23,14 @@ use zeroize::Zeroizing;
 
 use crate::connect::{parse_body, parse_member};
 use crate::oauth::{self, Entry, Provider, RefreshError};
-use crate::{AppState, AuthedInstance, Error, store};
+use crate::{AppState, AuthedCorpus, AuthedInstance, Error, store};
 
 // ponytail: the provider's whole body is buffered, so a file larger than this cannot be read
 // through the proxy. The upgrade is a ranged or streamed download.
 pub const MAX_RESPONSE: usize = 16 << 20;
+
+/// Fits a delivered file of 8 MiB once base64-encoded inside its JSON envelope.
+pub const WRITE_BODY_LIMIT: usize = 12 << 20;
 
 /// An access token is used until this long before the provider says it expires.
 const EXPIRY_MARGIN: Duration = Duration::from_secs(60);
@@ -91,12 +98,17 @@ fn check_headers(
     Ok(out)
 }
 
-/// A live connection of the member, its provider and whether it is dead.
-async fn load(
+/// The live connection of the member, its provider, the entry of `list` the request matches
+/// and the caller's headers, checked in that order; a dead connection is refused last.
+async fn target(
     state: &AppState,
     member: &str,
     connection_id: &str,
-) -> Result<(Uuid, &'static Provider, bool), Error> {
+    method: &str,
+    url: &Url,
+    headers: Option<BTreeMap<String, String>>,
+    list: fn(&Provider) -> &'static [Entry],
+) -> Result<(Uuid, &'static Provider, &'static Entry, HeaderMap), Error> {
     let member = parse_member(member)?;
     let id = Uuid::parse_str(connection_id)
         .map_err(|_| Error::Malformed("connection_id must be a UUID".into()))?;
@@ -105,7 +117,12 @@ async fn load(
         .ok_or(Error::NotFound)?;
     let provider = oauth::provider(&provider)
         .ok_or_else(|| Error::internal("a connection names an unknown provider"))?;
-    Ok((id, provider, dead))
+    let entry = allowed(list(provider), method, url).ok_or(Error::NotAllowed)?;
+    let headers = check_headers(provider, headers)?;
+    if dead {
+        return Err(Error::ReconnectRequired);
+    }
+    Ok((id, provider, entry, headers))
 }
 
 fn parse_url(url: &str) -> Result<Url, Error> {
@@ -130,13 +147,61 @@ pub async fn proxy(
 ) -> Result<Response, Error> {
     let request: ProxyRequest = parse_body(&body)?;
     let url = parse_url(&request.url)?;
-    let (id, provider, dead) = load(&state, &request.member, &request.connection_id).await?;
-    let entry = allowed(provider.reads, &request.method, &url).ok_or(Error::NotAllowed)?;
-    let headers = check_headers(provider, request.headers)?;
-    if dead {
-        return Err(Error::ReconnectRequired);
-    }
-    forward(&state, id, provider, entry, url, headers, request.body).await
+    let (id, provider, entry, headers) = target(
+        &state,
+        &request.member,
+        &request.connection_id,
+        &request.method,
+        &url,
+        request.headers,
+        |p| p.reads,
+    )
+    .await?;
+    let payload = Payload::Json(request.body);
+    forward(&state, id, provider, entry, url, headers, payload).await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WriteRequest {
+    member: String,
+    connection_id: String,
+    method: String,
+    url: String,
+    content_type: String,
+    body_base64: String,
+    headers: Option<BTreeMap<String, String>>,
+}
+
+pub async fn write(
+    State(state): State<Arc<AppState>>,
+    _: AuthedCorpus,
+    body: Bytes,
+) -> Result<Response, Error> {
+    let request: WriteRequest = parse_body(&body)?;
+    let url = parse_url(&request.url)?;
+    let content_type = HeaderValue::from_str(&request.content_type)
+        .map_err(|_| Error::Malformed("content_type is not a valid header value".into()))?;
+    let bytes = BASE64_STANDARD
+        .decode(&request.body_base64)
+        .map_err(|_| Error::Malformed("body_base64 must be standard base64".into()))?;
+    let (id, provider, entry, headers) = target(
+        &state,
+        &request.member,
+        &request.connection_id,
+        &request.method,
+        &url,
+        request.headers,
+        |p| p.writes,
+    )
+    .await?;
+    let payload = Payload::Raw(content_type, Bytes::from(bytes));
+    forward(&state, id, provider, entry, url, headers, payload).await
+}
+
+enum Payload {
+    Json(Option<Value>),
+    Raw(HeaderValue, Bytes),
 }
 
 /// Sends the entry's method to `url` with the member's access token; a 401 on a cached token
@@ -148,20 +213,24 @@ async fn forward(
     entry: &Entry,
     url: Url,
     headers: HeaderMap,
-    body: Option<Value>,
+    payload: Payload,
 ) -> Result<Response, Error> {
     let mut retried = false;
     loop {
         let token = access_token(state, id, provider).await?;
-        let mut outgoing = state
+        let outgoing = state
             .http
             .request(entry.method.clone(), url.clone())
             .headers(headers.clone())
             .bearer_auth(token.as_str())
             .timeout(SEND_TIMEOUT);
-        if let Some(body) = &body {
-            outgoing = outgoing.json(body);
-        }
+        let outgoing = match &payload {
+            Payload::Json(None) => outgoing,
+            Payload::Json(Some(body)) => outgoing.json(body),
+            Payload::Raw(content_type, bytes) => outgoing
+                .header(header::CONTENT_TYPE, content_type.clone())
+                .body(bytes.clone()),
+        };
         let response = outgoing.send().await.map_err(|_| Error::Upstream)?;
         if response.status() == StatusCode::UNAUTHORIZED && !retried {
             let mut cache = state.tokens.lock();
