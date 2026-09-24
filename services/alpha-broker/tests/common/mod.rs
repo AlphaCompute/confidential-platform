@@ -1,7 +1,7 @@
 //! A fresh database per test migrated with the broker's own migrations, a TLS stand-in for
-//! Google's OAuth endpoints that the router's HTTP client reaches through its real host names,
-//! and a request helper that fails any test whose reply leaks a token, code, verifier or the
-//! client secret. The broker itself listens over mTLS on a real port, with a stand-in KMS CA
+//! every provider's OAuth and data endpoints that the router's HTTP client reaches through their
+//! real host names, and a request helper that fails any test whose reply leaks a token, code,
+//! verifier or a client secret. The broker itself listens over mTLS on a real port, with a stand-in KMS CA
 //! issuing both its own leaf and the callers'.
 #![allow(
     dead_code,
@@ -19,9 +19,10 @@ use std::time::Duration;
 
 use alpha_broker::{AppState, Config, Secrets, oauth, router};
 use alpha_client::tls::{Identity, Pin};
+use axum::body::Bytes;
 use axum::body::{Body, to_bytes};
 use axum::extract::{Form, Query, State};
-use axum::http::{HeaderMap, Request, StatusCode, Uri, header};
+use axum::http::{HeaderMap, Method, Request, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -47,18 +48,77 @@ pub const PROXY_BEARER: &str = "proxy-bearer-for-tests";
 pub const CLIENT_ID: &str = "corpus-test.apps.googleusercontent.com";
 pub const CLIENT_SECRET: &str = "client-secret-for-tests";
 pub const REDIRECT_URI: &str = "https://corpus.example/oauth/google/callback";
+pub const DROPBOX_CLIENT_ID: &str = "dropbox-app-key-for-tests";
+pub const DROPBOX_CLIENT_SECRET: &str = "dropbox-app-secret-for-tests";
+pub const DROPBOX_REDIRECT_URI: &str = "https://corpus.example/oauth/dropbox/callback";
 pub const KEY: [u8; 32] = [9; 32];
 pub const EMAIL: &str = "member@example.com";
 pub const MEMBER: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 pub const OTHER_MEMBER: &str = "2222222222222222222222222222222222222222222222222222222222222222";
-const HOSTS: [&str; 4] = [
+const HOSTS: [&str; 6] = [
     "accounts.google.com",
     "oauth2.googleapis.com",
     "openidconnect.googleapis.com",
     "www.googleapis.com",
+    "api.dropboxapi.com",
+    "content.dropboxapi.com",
 ];
 pub const MEDIA: &str = "https://www.googleapis.com/drive/v3/files/file-1?alt=media";
 pub const LISTING: &str = r#"{"files":[{"id":"file-1","name":"Notes"}]}"#;
+pub const DROPBOX_LISTING: &str = r#"{"entries":[{".tag":"file","name":"Notes.txt","id":"id:a1"}],"cursor":"c1","has_more":false}"#;
+
+/// What the stand-in expects of one provider's client and how its tokens look.
+struct Client {
+    id: &'static str,
+    secret: &'static str,
+    redirect: &'static str,
+    access: &'static str,
+    refresh: &'static str,
+    scope: &'static str,
+}
+
+const GOOGLE_CLIENT: Client = Client {
+    id: CLIENT_ID,
+    secret: CLIENT_SECRET,
+    redirect: REDIRECT_URI,
+    access: "ya29.",
+    refresh: "1//",
+    scope: "openid https://www.googleapis.com/auth/drive.readonly email",
+};
+
+const DROPBOX_CLIENT: Client = Client {
+    id: DROPBOX_CLIENT_ID,
+    secret: DROPBOX_CLIENT_SECRET,
+    redirect: DROPBOX_REDIRECT_URI,
+    access: "sl.",
+    refresh: "dbx-refresh.",
+    scope: "account_info.read files.content.read files.content.write",
+};
+
+fn client_of(provider: &str) -> &'static Client {
+    if provider == "dropbox" {
+        &DROPBOX_CLIENT
+    } else {
+        &GOOGLE_CLIENT
+    }
+}
+
+fn provider_of_host(host: &str) -> &'static str {
+    if host.ends_with(".dropboxapi.com") {
+        "dropbox"
+    } else {
+        "google"
+    }
+}
+
+fn bearer_of(headers: &HeaderMap) -> String {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or_default()
+        .to_string()
+}
 
 /// A fresh database per test, migrated; `None` when `DATABASE_URL` is unset.
 pub async fn fresh_database() -> Option<PgPool> {
@@ -87,10 +147,11 @@ pub async fn fresh_database() -> Option<PgPool> {
     Some(pool)
 }
 
-/// What the member's consent at Google produced: the code the popup relays, and the tokens the
-/// token endpoint will issue for it.
+/// What the member's consent at a provider produced: the code the popup relays, and the tokens
+/// the token endpoint will issue for it.
 #[derive(Clone)]
 pub struct Consent {
+    pub provider: &'static str,
     pub code: String,
     pub access_token: String,
     pub refresh_token: String,
@@ -100,12 +161,16 @@ pub struct Consent {
     used: bool,
 }
 
-/// One request that reached Google's data API.
+/// One request that reached a provider's data API.
 #[derive(Clone, Debug)]
 pub struct DataRequest {
+    pub method: Method,
+    pub host: String,
     pub path: String,
     pub query: HashMap<String, String>,
     pub authorization: Option<String>,
+    pub headers: HeaderMap,
+    pub body: Vec<u8>,
 }
 
 pub struct Fake {
@@ -139,7 +204,7 @@ impl Fake {
     pub fn revoked_tokens(&self) -> Vec<String> {
         self.requests
             .iter()
-            .filter(|(p, _)| p == "/revoke")
+            .filter(|(p, _)| p == "/revoke" || p == DROPBOX_REVOKE)
             .map(|(_, form)| form["token"].clone())
             .collect()
     }
@@ -153,7 +218,7 @@ impl Fake {
 
     /// Every value that must never appear in a reply to the tenant.
     fn secrets(&self) -> Vec<String> {
-        let mut out = vec![CLIENT_SECRET.to_string()];
+        let mut out = vec![CLIENT_SECRET.to_string(), DROPBOX_CLIENT_SECRET.to_string()];
         for c in &self.consents {
             out.extend([
                 c.code.clone(),
@@ -173,6 +238,10 @@ impl Fake {
 
 type Shared = Arc<Mutex<Fake>>;
 
+pub const DROPBOX_TOKEN: &str = "/oauth2/token";
+pub const DROPBOX_ACCOUNT: &str = "/2/users/get_current_account";
+pub const DROPBOX_REVOKE: &str = "/2/auth/token/revoke";
+
 fn invalid_grant() -> Response {
     (
         StatusCode::BAD_REQUEST,
@@ -181,10 +250,21 @@ fn invalid_grant() -> Response {
         .into_response()
 }
 
-async fn token(State(fake): State<Shared>, Form(form): Form<HashMap<String, String>>) -> Response {
+/// Google's `/token` and Dropbox's `/oauth2/token`, each accepting only its own client.
+async fn token(
+    State(fake): State<Shared>,
+    uri: Uri,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    let provider = if uri.path() == DROPBOX_TOKEN {
+        "dropbox"
+    } else {
+        "google"
+    };
+    let client = client_of(provider);
     let delay = {
         let mut fake = fake.lock().unwrap();
-        fake.requests.push(("/token".into(), form.clone()));
+        fake.requests.push((uri.path().into(), form.clone()));
         fake.refresh_delay
     };
     let field = |k: &str| form.get(k).map(String::as_str).unwrap_or_default();
@@ -203,20 +283,21 @@ async fn token(State(fake): State<Shared>, Form(form): Form<HashMap<String, Stri
     }
     if field("grant_type") == "refresh_token" {
         let presented = field("refresh_token").to_string();
-        if field("client_id") != CLIENT_ID
-            || field("client_secret") != CLIENT_SECRET
+        if field("client_id") != client.id
+            || field("client_secret") != client.secret
+            || !presented.starts_with(client.refresh)
             || !fake.refresh.contains(&presented)
         {
             return invalid_grant();
         }
         let n = fake.refreshes();
-        let access = format!("ya29.fake-refreshed-{n}");
+        let access = format!("{}fake-refreshed-{n}", client.access);
         fake.access.push(access.clone());
         fake.issued.push(access.clone());
         let mut reply =
             json!({ "access_token": access, "expires_in": 3599, "token_type": "Bearer" });
         if fake.rotate {
-            let rotated = format!("1//fake-rotated-{n}");
+            let rotated = format!("{}fake-rotated-{n}", client.refresh);
             fake.refresh.retain(|t| *t != presented);
             fake.refresh.push(rotated.clone());
             fake.issued.push(rotated.clone());
@@ -225,16 +306,18 @@ async fn token(State(fake): State<Shared>, Form(form): Form<HashMap<String, Stri
         return Json(reply).into_response();
     }
     let ok_client = field("grant_type") == "authorization_code"
-        && field("client_id") == CLIENT_ID
-        && field("client_secret") == CLIENT_SECRET
-        && field("redirect_uri") == REDIRECT_URI;
+        && field("client_id") == client.id
+        && field("client_secret") == client.secret
+        && field("redirect_uri") == client.redirect;
     let verifier_challenge = oauth::challenge(field("code_verifier"));
     let code = field("code").to_string();
     let omit = fake.omit_refresh_token;
     let Some(consent) = fake
         .consents
         .iter_mut()
-        .find(|c| c.code == code && !c.used && c.challenge == verifier_challenge)
+        .find(|c| {
+            c.provider == provider && c.code == code && !c.used && c.challenge == verifier_challenge
+        })
         .filter(|_| ok_client)
     else {
         return invalid_grant();
@@ -244,7 +327,7 @@ async fn token(State(fake): State<Shared>, Form(form): Form<HashMap<String, Stri
         "access_token": consent.access_token,
         "expires_in": 3599,
         "token_type": "Bearer",
-        "scope": "openid https://www.googleapis.com/auth/drive.readonly email",
+        "scope": client.scope,
     });
     if !omit {
         reply["refresh_token"] = json!(consent.refresh_token);
@@ -254,17 +337,16 @@ async fn token(State(fake): State<Shared>, Form(form): Form<HashMap<String, Stri
 
 async fn userinfo(State(fake): State<Shared>, headers: HeaderMap) -> Response {
     let mut fake = fake.lock().unwrap();
-    let presented = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .unwrap_or_default()
-        .to_string();
+    let presented = bearer_of(&headers);
     fake.requests.push(("/v1/userinfo".into(), HashMap::new()));
     if fake.account_status != StatusCode::OK {
         return fake.account_status.into_response();
     }
-    match fake.consents.iter().find(|c| c.access_token == presented) {
+    let consent = fake
+        .consents
+        .iter()
+        .find(|c| c.provider == "google" && c.access_token == presented);
+    match consent {
         Some(c) => Json(json!({ "sub": c.subject, "email": c.email, "email_verified": true }))
             .into_response(),
         None => StatusCode::UNAUTHORIZED.into_response(),
@@ -277,28 +359,80 @@ async fn revoke(State(fake): State<Shared>, Form(form): Form<HashMap<String, Str
     fake.revoke_status.into_response()
 }
 
-/// Drive, Gmail and Calendar reads, answered only to an access token the stand-in issued.
+/// Dropbox's account lookup: recorded with the content type and body it arrived with, answered
+/// only to the access token a Dropbox consent issued.
+async fn current_account(State(fake): State<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+    let mut fake = fake.lock().unwrap();
+    let presented = bearer_of(&headers);
+    let mut seen = HashMap::from([("body".to_string(), String::from_utf8_lossy(&body).into())]);
+    if let Some(content_type) = headers.get(header::CONTENT_TYPE) {
+        seen.insert("content_type".into(), content_type.to_str().unwrap().into());
+    }
+    fake.requests.push((DROPBOX_ACCOUNT.into(), seen));
+    if fake.account_status != StatusCode::OK {
+        return fake.account_status.into_response();
+    }
+    let consent = fake
+        .consents
+        .iter()
+        .find(|c| c.provider == "dropbox" && c.access_token == presented);
+    match consent {
+        Some(c) => Json(json!({
+            "account_id": c.subject,
+            "email": c.email,
+            "name": { "display_name": "Member" },
+        }))
+        .into_response(),
+        None => StatusCode::UNAUTHORIZED.into_response(),
+    }
+}
+
+/// Dropbox's revoke: the access token is the bearer; recorded as the token it ended.
+async fn dropbox_revoke(State(fake): State<Shared>, headers: HeaderMap) -> Response {
+    let mut fake = fake.lock().unwrap();
+    let token = bearer_of(&headers);
+    fake.requests.push((
+        DROPBOX_REVOKE.into(),
+        HashMap::from([("token".into(), token)]),
+    ));
+    fake.revoke_status.into_response()
+}
+
+/// Google's and Dropbox's data APIs, told apart by host and answered only to an access token the
+/// stand-in issued for that provider.
 async fn data(
     State(fake): State<Shared>,
+    method: Method,
     uri: Uri,
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
     let mut fake = fake.lock().unwrap();
     let authorization = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
     fake.data.push(DataRequest {
+        method: method.clone(),
+        host: host.clone(),
         path: uri.path().to_string(),
         query: query.clone(),
         authorization: authorization.clone(),
+        headers: headers.clone(),
+        body: body.to_vec(),
     });
-    let token = authorization
-        .as_deref()
-        .and_then(|a| a.strip_prefix("Bearer "))
-        .unwrap_or_default();
-    if fake.unauthorized > 0 || !fake.access.iter().any(|t| t == token) {
+    let token = bearer_of(&headers);
+    let provider = provider_of_host(&host);
+    if fake.unauthorized > 0
+        || !token.starts_with(client_of(provider).access)
+        || !fake.access.contains(&token)
+    {
         fake.unauthorized = fake.unauthorized.saturating_sub(1);
         return (
             StatusCode::UNAUTHORIZED,
@@ -308,40 +442,49 @@ async fn data(
     }
     let segments: Vec<&str> = uri.path().split('/').skip(1).collect();
     let json_body = |body: String| ([(header::CONTENT_TYPE, "application/json")], body);
-    match segments[..] {
-        ["drive", "v3", "drives"] => json_body(r#"{"drives":[]}"#.into()).into_response(),
-        ["drive", "v3", "files"] => json_body(LISTING.into()).into_response(),
-        ["drive", "v3", "files", _] if query.get("alt").map(String::as_str) == Some("media") => (
-            [(header::CONTENT_TYPE, "application/octet-stream")],
-            vec![b'x'; fake.media_size],
-        )
-            .into_response(),
-        ["drive", "v3", "files", id] => {
+    match (provider, method.as_str(), &segments[..]) {
+        ("google", "GET", ["drive", "v3", "drives"]) => {
+            json_body(r#"{"drives":[]}"#.into()).into_response()
+        }
+        ("google", "GET", ["drive", "v3", "files"]) => json_body(LISTING.into()).into_response(),
+        ("google", "GET", ["drive", "v3", "files", _])
+            if query.get("alt").map(String::as_str) == Some("media") =>
+        {
+            (
+                [(header::CONTENT_TYPE, "application/octet-stream")],
+                vec![b'x'; fake.media_size],
+            )
+                .into_response()
+        }
+        ("google", "GET", ["drive", "v3", "files", id]) => {
             json_body(json!({ "id": id, "name": "Notes" }).to_string()).into_response()
         }
-        ["drive", "v3", "files", _, "export"] => {
+        ("google", "GET", ["drive", "v3", "files", _, "export"]) => {
             ([(header::CONTENT_TYPE, "text/csv")], "a,b\n1,2\n").into_response()
         }
-        ["gmail", "v1", "users", "me", "messages"] => {
+        ("google", "GET", ["gmail", "v1", "users", "me", "messages"]) => {
             json_body(r#"{"messages":[{"id":"m1"}]}"#.into()).into_response()
         }
-        ["gmail", "v1", "users", "me", "messages", id] => {
+        ("google", "GET", ["gmail", "v1", "users", "me", "messages", id]) => {
             json_body(json!({ "id": id, "snippet": "hello" }).to_string()).into_response()
         }
-        ["calendar", "v3", "calendars", "primary", "events"] => {
+        ("google", "GET", ["calendar", "v3", "calendars", "primary", "events"]) => {
             json_body(r#"{"items":[]}"#.into()).into_response()
+        }
+        ("dropbox", "POST", ["2", "files", "list_folder"]) => {
+            json_body(DROPBOX_LISTING.into()).into_response()
         }
         _ => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
-pub struct FakeGoogle {
+pub struct FakeProviders {
     pub state: Shared,
     pub addr: SocketAddr,
     ca_der: Vec<u8>,
 }
 
-impl FakeGoogle {
+impl FakeProviders {
     pub async fn start() -> Self {
         let ca_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         let mut ca_params = CertificateParams::default();
@@ -381,8 +524,11 @@ impl FakeGoogle {
         }));
         let app = Router::new()
             .route("/token", post(token))
+            .route(DROPBOX_TOKEN, post(token))
             .route("/v1/userinfo", get(userinfo))
+            .route(DROPBOX_ACCOUNT, post(current_account))
             .route("/revoke", post(revoke))
+            .route(DROPBOX_REVOKE, post(dropbox_revoke))
             .fallback(data)
             .with_state(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -403,14 +549,14 @@ impl FakeGoogle {
                 });
             }
         });
-        FakeGoogle {
+        FakeProviders {
             state,
             addr,
             ca_der: ca.der().to_vec(),
         }
     }
 
-    /// A client that reaches Google's host names at the stand-in and trusts only its CA.
+    /// A client that reaches the providers' host names at the stand-in and trusts only its CA.
     pub fn client(&self) -> reqwest::Client {
         let mut builder = reqwest::Client::builder()
             .tls_certs_only([reqwest::Certificate::from_der(&self.ca_der).unwrap()])
@@ -421,19 +567,33 @@ impl FakeGoogle {
         builder.build().unwrap()
     }
 
-    /// Stands in for the member consenting as `email` on the page the authorization URL opens.
+    /// Stands in for the member consenting at Google as `email` on the page the authorization
+    /// URL opens.
     pub fn consent(&self, challenge: &str, email: &str) -> Consent {
         self.consent_as(challenge, &format!("subject-of-{email}"), email)
     }
 
     /// The same, as the Google account `subject` whose address is currently `email`.
     pub fn consent_as(&self, challenge: &str, subject: &str, email: &str) -> Consent {
+        self.consent_on("google", challenge, subject, email)
+    }
+
+    /// The member consenting at `provider` as the account `subject` named `email`.
+    pub fn consent_on(
+        &self,
+        provider: &'static str,
+        challenge: &str,
+        subject: &str,
+        email: &str,
+    ) -> Consent {
+        let client = client_of(provider);
         let mut fake = self.state.lock().unwrap();
         let n = fake.consents.len() + 1;
         let consent = Consent {
+            provider,
             code: format!("4/fake-code-{n}"),
-            access_token: format!("ya29.fake-access-{n}"),
-            refresh_token: format!("1//fake-refresh-{n}"),
+            access_token: format!("{}fake-access-{n}", client.access),
+            refresh_token: format!("{}fake-refresh-{n}", client.refresh),
             challenge: challenge.to_string(),
             subject: subject.to_string(),
             email: email.to_string(),
@@ -546,7 +706,7 @@ async fn start_broker(ca: &Ca, app: Router) -> SocketAddr {
 pub struct Harness {
     pub state: Arc<AppState>,
     pub pool: PgPool,
-    pub google: FakeGoogle,
+    pub fake: FakeProviders,
     pub app: Router,
     pub ca: Ca,
     pub broker: SocketAddr,
@@ -556,20 +716,27 @@ pub struct Harness {
 
 pub async fn harness() -> Option<Harness> {
     let pool = fresh_database().await?;
-    let google = FakeGoogle::start().await;
+    let fake = FakeProviders::start().await;
+    let config = Config::build(|name| match name {
+        "GOOGLE_CLIENT_ID" => Some(CLIENT_ID.into()),
+        "DROPBOX_CLIENT_ID" => Some(DROPBOX_CLIENT_ID.into()),
+        "OAUTH_REDIRECT_BASE" => Some("https://corpus.example/oauth".into()),
+        _ => None,
+    })
+    .unwrap();
+    let client_secrets = oauth::PROVIDERS
+        .map(|p| (p.name, client_of(p.name).secret.to_string().into()))
+        .into();
     let state = Arc::new(AppState {
-        config: Config {
-            google_client_id: CLIENT_ID.into(),
-            google_redirect_uri: REDIRECT_URI.into(),
-        },
+        config,
         secrets: parking_lot::RwLock::new(Secrets {
-            google_client_secret: CLIENT_SECRET.to_string().into(),
+            client_secrets,
             connect_bearer: BEARER.as_bytes().to_vec().into(),
             proxy_bearer: PROXY_BEARER.as_bytes().to_vec().into(),
             connectors_key: KEY.into(),
         }),
         pool: pool.clone(),
-        http: google.client(),
+        http: fake.client(),
         tokens: Default::default(),
     });
     let app = router(state.clone());
@@ -580,7 +747,7 @@ pub async fn harness() -> Option<Harness> {
         state,
         pool,
         app,
-        google,
+        fake,
         ca,
         broker,
         instance,
@@ -637,7 +804,7 @@ impl Harness {
         let status = response.status();
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let text = String::from_utf8_lossy(&bytes).to_string();
-        for secret in self.google.with(|f| f.secrets()) {
+        for secret in self.fake.with(|f| f.secrets()) {
             assert!(
                 !text.contains(&secret),
                 "{method} {uri} answered a secret: {text}"
@@ -655,10 +822,14 @@ impl Harness {
         self.call_as(Some(BEARER), method, uri, body).await
     }
 
-    /// Starts a connect for `member` and returns the authorization URL's query.
-    pub async fn start(&self, member: &str) -> HashMap<String, String> {
+    /// Starts a connect to `provider` for `member` and returns the authorization URL's query.
+    pub async fn start(&self, provider: &str, member: &str) -> HashMap<String, String> {
         let reply = self
-            .call("POST", "/connect/google", Some(json!({ "member": member })))
+            .call(
+                "POST",
+                &format!("/connect/{provider}"),
+                Some(json!({ "member": member })),
+            )
             .await;
         assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
         let url = reqwest::Url::parse(reply.body["url"].as_str().unwrap()).unwrap();
@@ -674,10 +845,22 @@ impl Harness {
         .await
     }
 
-    /// A whole connect as `email`; returns the finish reply and the consent behind it.
+    /// A whole connect to Google as `email`; returns the finish reply and the consent behind it.
     pub async fn connect(&self, member: &str, email: &str) -> (Reply, Consent) {
-        let query = self.start(member).await;
-        let consent = self.google.consent(&query["code_challenge"], email);
+        self.connect_to("google", member, email).await
+    }
+
+    pub async fn connect_to(
+        &self,
+        provider: &'static str,
+        member: &str,
+        email: &str,
+    ) -> (Reply, Consent) {
+        let query = self.start(provider, member).await;
+        let subject = format!("subject-of-{email}");
+        let consent = self
+            .fake
+            .consent_on(provider, &query["code_challenge"], &subject, email);
         let reply = self.finish(member, &consent.code, &query["state"]).await;
         (reply, consent)
     }
@@ -706,7 +889,7 @@ impl Harness {
             .map(|v| v.to_str().unwrap().to_string());
         let bytes = response.bytes().await?.to_vec();
         let text = String::from_utf8_lossy(&bytes);
-        for secret in self.google.with(|f| f.secrets()) {
+        for secret in self.fake.with(|f| f.secrets()) {
             assert!(!text.contains(&secret), "/proxy answered a secret: {text}");
             assert!(
                 !headers.contains(&secret),
@@ -729,7 +912,11 @@ impl Harness {
 
     /// A connection of `MEMBER` to Google, made through the connect routes.
     pub async fn connected(&self) -> (Uuid, Consent) {
-        let (reply, consent) = self.connect(MEMBER, EMAIL).await;
+        self.connected_to("google").await
+    }
+
+    pub async fn connected_to(&self, provider: &'static str) -> (Uuid, Consent) {
+        let (reply, consent) = self.connect_to(provider, MEMBER, EMAIL).await;
         assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
         (id_of(&reply), consent)
     }

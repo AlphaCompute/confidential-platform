@@ -71,8 +71,8 @@ pub async fn start(
 
     let url = oauth::authorization_url(
         provider,
-        &state.config.google_client_id,
-        &state.config.google_redirect_uri,
+        state.config.client_id(provider)?,
+        &state.config.redirect_uri(provider),
         &connect_state,
         &challenge,
     )?;
@@ -101,13 +101,8 @@ pub async fn finish(
     let provider = oauth::provider(&pending.provider)
         .ok_or_else(|| Error::internal("a pending connect names an unknown provider"))?;
 
-    let (key, client_secret) = {
-        let secrets = state.secrets.read();
-        (
-            secrets.connectors_key.clone(),
-            secrets.google_client_secret.clone(),
-        )
-    };
+    let key = state.secrets.read().connectors_key.clone();
+    let (client_id, client_secret) = state.client(provider)?;
     let verifier = store::open(&key, body.state.as_bytes(), &pending.enc_pkce_verifier)
         .ok_or_else(|| Error::internal("a pending verifier does not open"))?;
     let verifier = std::str::from_utf8(&verifier)
@@ -116,9 +111,9 @@ pub async fn finish(
     let tokens = oauth::exchange(
         &state.http,
         provider,
-        &state.config.google_client_id,
+        client_id,
         &client_secret,
-        &state.config.google_redirect_uri,
+        &state.config.redirect_uri(provider),
         &body.code,
         verifier,
     )
@@ -139,7 +134,7 @@ pub async fn finish(
     )
     .await?;
     Ok(Json(
-        json!({ "id": id, "provider": provider.name, "account": account.email }),
+        json!({ "id": id, "provider": provider.name, "account": account.name }),
     ))
 }
 
@@ -172,8 +167,10 @@ pub async fn disconnect(
     let key = state.secrets.read().connectors_key.clone();
     let token = store::open(&key, id.as_bytes(), &sealed);
     let token = token.as_deref().and_then(|t| std::str::from_utf8(t).ok());
-    if let (Some(provider), Some(token)) = (oauth::provider(&provider), token) {
-        oauth::revoke(&state.http, provider, token).await;
+    if let (Some(provider), Some(token)) = (oauth::provider(&provider), token)
+        && let Ok((client_id, client_secret)) = state.client(provider)
+    {
+        oauth::revoke(&state.http, provider, client_id, &client_secret, token).await;
     }
     Ok(StatusCode::NO_CONTENT)
 }

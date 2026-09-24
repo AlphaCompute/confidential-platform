@@ -73,7 +73,7 @@ async fn every_route_refuses_a_missing_or_wrong_bearer_before_any_google_contact
             assert_eq!(reply.body["error"]["code"], "unauthorized");
         }
     }
-    assert!(h.google.with(|f| f.requests.is_empty()));
+    assert!(h.fake.with(|f| f.requests.is_empty()));
 }
 
 #[tokio::test]
@@ -82,7 +82,7 @@ async fn an_unknown_provider_is_not_found_and_a_malformed_member_is_refused() {
     let reply = h
         .call(
             "POST",
-            "/connect/dropbox",
+            "/connect/unknown",
             Some(json!({ "member": MEMBER })),
         )
         .await;
@@ -159,38 +159,38 @@ async fn a_state_that_is_unknown_used_expired_or_another_members_never_reaches_g
 
     refused(&h.finish(MEMBER, "4/any", "no-such-state").await);
 
-    let query = h.start(MEMBER).await;
-    let consent = h.google.consent(&query["code_challenge"], EMAIL);
+    let query = h.start("google", MEMBER).await;
+    let consent = h.fake.consent(&query["code_challenge"], EMAIL);
     assert_eq!(
         h.finish(MEMBER, &consent.code, &query["state"])
             .await
             .status,
         StatusCode::OK
     );
-    let again = h.google.consent(&query["code_challenge"], EMAIL);
+    let again = h.fake.consent(&query["code_challenge"], EMAIL);
     refused(&h.finish(MEMBER, &again.code, &query["state"]).await);
 
-    let query = h.start(MEMBER).await;
+    let query = h.start("google", MEMBER).await;
     sqlx::query("update pending_connects set exp = now() - interval '1 second'")
         .execute(&h.pool)
         .await
         .unwrap();
-    let consent = h.google.consent(&query["code_challenge"], EMAIL);
+    let consent = h.fake.consent(&query["code_challenge"], EMAIL);
     refused(&h.finish(MEMBER, &consent.code, &query["state"]).await);
 
-    let query = h.start(MEMBER).await;
-    let consent = h.google.consent(&query["code_challenge"], EMAIL);
+    let query = h.start("google", MEMBER).await;
+    let consent = h.fake.consent(&query["code_challenge"], EMAIL);
     refused(&h.finish(OTHER_MEMBER, &consent.code, &query["state"]).await);
     refused(&h.finish(MEMBER, &consent.code, &query["state"]).await);
 
-    assert_eq!(h.google.with(|f| f.hits("/token")), 1);
+    assert_eq!(h.fake.with(|f| f.hits("/token")), 1);
 }
 
 #[tokio::test]
 async fn two_concurrent_finishes_with_one_state_connect_exactly_once() {
     let Some(h) = harness().await else { return };
-    let query = h.start(MEMBER).await;
-    let consent = h.google.consent(&query["code_challenge"], EMAIL);
+    let query = h.start("google", MEMBER).await;
+    let consent = h.fake.consent(&query["code_challenge"], EMAIL);
     let (a, b) = tokio::join!(
         h.finish(MEMBER, &consent.code, &query["state"]),
         h.finish(MEMBER, &consent.code, &query["state"]),
@@ -199,7 +199,7 @@ async fn two_concurrent_finishes_with_one_state_connect_exactly_once() {
     statuses.sort();
     assert_eq!(statuses, [StatusCode::OK, StatusCode::BAD_REQUEST]);
     assert_eq!(count(&h, "connections").await, 1);
-    assert_eq!(h.google.with(|f| f.hits("/token")), 1);
+    assert_eq!(h.fake.with(|f| f.hits("/token")), 1);
 }
 
 #[tokio::test]
@@ -211,7 +211,7 @@ async fn a_failed_exchange_or_account_lookup_answers_exchange_failed_and_writes_
         |f| f.account_status = StatusCode::UNAUTHORIZED,
     ];
     for fail in failures {
-        h.google.with(|f| {
+        h.fake.with(|f| {
             f.token_status = StatusCode::OK;
             f.omit_refresh_token = false;
             f.account_status = StatusCode::OK;
@@ -246,10 +246,7 @@ async fn disconnect_revokes_locally_and_at_google() {
             .unwrap();
     assert!(revoked);
     assert_eq!(h.stored_token(id).await, None);
-    assert_eq!(
-        h.google.with(|f| f.revoked_tokens()),
-        [consent.refresh_token]
-    );
+    assert_eq!(h.fake.with(|f| f.revoked_tokens()), [consent.refresh_token]);
 
     let listed = h
         .call("GET", &format!("/connections?member={MEMBER}"), None)
@@ -272,7 +269,7 @@ async fn disconnect_leaves_google_alone_while_another_member_holds_the_same_acco
         .await;
     assert_eq!(reply.status, StatusCode::NO_CONTENT);
     assert_eq!(h.stored_token(id_of(&mine)).await, None);
-    assert_eq!(h.google.with(|f| f.hits("/revoke")), 0);
+    assert_eq!(h.fake.with(|f| f.hits("/revoke")), 0);
 
     let reply = h
         .call(
@@ -283,7 +280,7 @@ async fn disconnect_leaves_google_alone_while_another_member_holds_the_same_acco
         .await;
     assert_eq!(reply.status, StatusCode::NO_CONTENT);
     assert_eq!(
-        h.google.with(|f| f.revoked_tokens()),
+        h.fake.with(|f| f.revoked_tokens()),
         [their_consent.refresh_token]
     );
 }
@@ -324,7 +321,7 @@ async fn the_last_of_two_concurrent_disconnects_of_one_account_revokes_at_google
 
     assert_eq!(reply.status, StatusCode::NO_CONTENT);
     assert_eq!(
-        h.google.with(|f| f.revoked_tokens()),
+        h.fake.with(|f| f.revoked_tokens()),
         [my_consent.refresh_token]
     );
 }
@@ -334,7 +331,7 @@ async fn disconnect_answers_204_even_when_google_refuses_the_revoke() {
     let Some(h) = harness().await else { return };
     let (reply, _) = h.connect(MEMBER, EMAIL).await;
     let id = id_of(&reply);
-    h.google
+    h.fake
         .with(|f| f.revoke_status = StatusCode::INTERNAL_SERVER_ERROR);
 
     let reply = h
@@ -346,7 +343,7 @@ async fn disconnect_answers_204_even_when_google_refuses_the_revoke() {
         .await;
     assert_eq!(reply.status, StatusCode::NO_CONTENT);
     assert_eq!(h.stored_token(id).await, None);
-    assert_eq!(h.google.with(|f| f.hits("/revoke")), 1);
+    assert_eq!(h.fake.with(|f| f.hits("/revoke")), 1);
 }
 
 #[tokio::test]
@@ -391,7 +388,7 @@ async fn disconnect_of_a_foreign_unknown_or_revoked_connection_is_not_found() {
         StatusCode::NO_CONTENT
     );
     not_found(h.call("DELETE", &path, None).await);
-    assert_eq!(h.google.with(|f| f.hits("/revoke")), 1);
+    assert_eq!(h.fake.with(|f| f.hits("/revoke")), 1);
 }
 
 #[tokio::test]
@@ -510,10 +507,8 @@ async fn a_connection_follows_the_google_account_not_its_email() {
     let Some(h) = harness().await else { return };
     let h = &h;
     let connect_as = |subject: &'static str, email: &'static str| async move {
-        let query = h.start(MEMBER).await;
-        let consent = h
-            .google
-            .consent_as(&query["code_challenge"], subject, email);
+        let query = h.start("google", MEMBER).await;
+        let consent = h.fake.consent_as(&query["code_challenge"], subject, email);
         let reply = h.finish(MEMBER, &consent.code, &query["state"]).await;
         assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
         id_of(&reply)

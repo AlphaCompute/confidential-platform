@@ -26,7 +26,7 @@ async fn an_instance_reads_drive_through_the_proxy_and_never_sees_a_token() {
     assert_eq!(reply.bytes, LISTING.as_bytes());
     assert_eq!(reply.content_type.as_deref(), Some("application/json"));
 
-    let (seen, access) = h.google.with(|f| (f.data.clone(), f.access.clone()));
+    let (seen, access) = h.fake.with(|f| (f.data.clone(), f.access.clone()));
     let [seen] = &seen[..] else {
         panic!("{seen:?}")
     };
@@ -44,7 +44,7 @@ async fn an_instance_reads_drive_through_the_proxy_and_never_sees_a_token() {
 const FILES: &str = "https://www.googleapis.com/drive/v3/files";
 
 fn nothing_reached_google(h: &Harness) -> bool {
-    h.google.with(|f| f.data.is_empty() && f.refreshes() == 0)
+    h.fake.with(|f| f.data.is_empty() && f.refreshes() == 0)
 }
 
 #[tokio::test]
@@ -124,7 +124,7 @@ async fn a_malformed_body_is_refused() {
     let Some(h) = harness().await else { return };
     let (id, _) = h.connected().await;
     let mut unknown = read(id, FILES);
-    unknown["headers"] = serde_json::json!({});
+    unknown["extra"] = serde_json::json!({});
     let mut short_member = read(id, FILES);
     short_member["member"] = serde_json::json!(&MEMBER[1..]);
     let mut bad_id = read(id, FILES);
@@ -202,7 +202,7 @@ async fn a_request_outside_the_allowlist_is_refused_before_google() {
 async fn an_invalid_grant_marks_the_connection_dead_and_asks_for_a_reconnect() {
     let Some(h) = harness().await else { return };
     let (id, _) = h.connected().await;
-    h.google.with(|f| f.token_status = StatusCode::BAD_REQUEST);
+    h.fake.with(|f| f.token_status = StatusCode::BAD_REQUEST);
 
     let reply = h.proxy(&read(id, FILES)).await;
     assert_eq!(reply.status, StatusCode::CONFLICT);
@@ -222,8 +222,8 @@ async fn an_invalid_grant_marks_the_connection_dead_and_asks_for_a_reconnect() {
     let again = h.proxy(&read(id, FILES)).await;
     assert_eq!(again.status, StatusCode::CONFLICT);
     assert_eq!(again.code(), "reconnect_required");
-    assert_eq!(h.google.with(|f| f.refreshes()), 1);
-    assert!(h.google.with(|f| f.data.is_empty()));
+    assert_eq!(h.fake.with(|f| f.refreshes()), 1);
+    assert!(h.fake.with(|f| f.data.is_empty()));
 }
 
 #[tokio::test]
@@ -239,20 +239,20 @@ async fn a_connection_marked_dead_is_refused_even_with_a_cached_token() {
     let reply = h.proxy(&read(id, FILES)).await;
     assert_eq!(reply.status, StatusCode::CONFLICT);
     assert_eq!(reply.code(), "reconnect_required");
-    assert_eq!(h.google.with(|f| f.data.len()), 1);
+    assert_eq!(h.fake.with(|f| f.data.len()), 1);
 }
 
 #[tokio::test]
 async fn any_other_refresh_failure_answers_upstream_and_keeps_the_connection() {
     let Some(h) = harness().await else { return };
     let (id, _) = h.connected().await;
-    h.google
+    h.fake
         .with(|f| f.token_status = StatusCode::INTERNAL_SERVER_ERROR);
     let reply = h.proxy(&read(id, FILES)).await;
     assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
     assert_eq!(reply.code(), "upstream");
 
-    h.google.with(|f| f.token_status = StatusCode::OK);
+    h.fake.with(|f| f.token_status = StatusCode::OK);
     assert_eq!(h.proxy(&read(id, FILES)).await.status, StatusCode::OK);
 }
 
@@ -260,10 +260,10 @@ async fn any_other_refresh_failure_answers_upstream_and_keeps_the_connection() {
 async fn a_rotated_refresh_token_is_sealed_and_stored() {
     let Some(h) = harness().await else { return };
     let (id, consent) = h.connected().await;
-    h.google.with(|f| f.rotate = true);
+    h.fake.with(|f| f.rotate = true);
 
     assert_eq!(h.proxy(&read(id, FILES)).await.status, StatusCode::OK);
-    let live = h.google.with(|f| f.refresh.clone());
+    let live = h.fake.with(|f| f.refresh.clone());
     assert!(!live.contains(&consent.refresh_token));
     let blob = h.stored_token(id).await.unwrap();
     let stored = alpha_broker::store::open(&KEY, id.as_bytes(), &blob).unwrap();
@@ -276,13 +276,13 @@ async fn a_401_on_a_cached_token_is_retried_once_with_a_fresh_one() {
     let (id, _) = h.connected().await;
     assert_eq!(h.proxy(&read(id, FILES)).await.status, StatusCode::OK);
     assert_eq!(h.proxy(&read(id, FILES)).await.status, StatusCode::OK);
-    assert_eq!(h.google.with(|f| f.refreshes()), 1, "the token is cached");
+    assert_eq!(h.fake.with(|f| f.refreshes()), 1, "the token is cached");
 
-    h.google.with(|f| f.unauthorized = 1);
+    h.fake.with(|f| f.unauthorized = 1);
     let reply = h.proxy(&read(id, FILES)).await;
     assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(reply.bytes, LISTING.as_bytes());
-    assert_eq!(h.google.with(|f| (f.refreshes(), f.data.len())), (2, 4));
+    assert_eq!(h.fake.with(|f| (f.refreshes(), f.data.len())), (2, 4));
 }
 
 #[tokio::test]
@@ -291,11 +291,11 @@ async fn a_second_401_is_relayed() {
     let (id, _) = h.connected().await;
     assert_eq!(h.proxy(&read(id, FILES)).await.status, StatusCode::OK);
 
-    h.google.with(|f| f.unauthorized = 2);
+    h.fake.with(|f| f.unauthorized = 2);
     let reply = h.proxy(&read(id, FILES)).await;
     assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
     assert_eq!(reply.json()["error"]["message"], "Invalid Credentials");
-    assert_eq!(h.google.with(|f| (f.refreshes(), f.data.len())), (2, 3));
+    assert_eq!(h.fake.with(|f| (f.refreshes(), f.data.len())), (2, 3));
 }
 
 #[tokio::test]
@@ -305,7 +305,7 @@ async fn a_body_of_exactly_the_cap_is_relayed_and_one_byte_more_is_too_large() {
     let cap = alpha_broker::proxy::MAX_RESPONSE;
     assert_eq!(cap, 16 << 20);
 
-    h.google.with(|f| f.media_size = cap);
+    h.fake.with(|f| f.media_size = cap);
     let whole = h.proxy(&read(id, MEDIA)).await;
     assert_eq!(whole.status, StatusCode::OK);
     assert_eq!(whole.bytes.len(), cap);
@@ -314,7 +314,7 @@ async fn a_body_of_exactly_the_cap_is_relayed_and_one_byte_more_is_too_large() {
         Some("application/octet-stream")
     );
 
-    h.google.with(|f| f.media_size = cap + 1);
+    h.fake.with(|f| f.media_size = cap + 1);
     let over = h.proxy(&read(id, MEDIA)).await;
     assert_eq!(over.status, StatusCode::BAD_GATEWAY);
     assert_eq!(over.code(), "too_large");
@@ -324,7 +324,7 @@ async fn a_body_of_exactly_the_cap_is_relayed_and_one_byte_more_is_too_large() {
 async fn two_calls_on_an_expired_token_share_one_refresh() {
     let Some(h) = harness().await else { return };
     let (id, _) = h.connected().await;
-    h.google.with(|f| {
+    h.fake.with(|f| {
         f.rotate = true;
         f.refresh_delay = std::time::Duration::from_millis(300);
     });
@@ -332,9 +332,9 @@ async fn two_calls_on_an_expired_token_share_one_refresh() {
     let body = read(id, FILES);
     let (a, b) = tokio::join!(h.proxy(&body), h.proxy(&body));
     assert_eq!((a.status, b.status), (StatusCode::OK, StatusCode::OK));
-    assert_eq!(h.google.with(|f| f.refreshes()), 1);
+    assert_eq!(h.fake.with(|f| f.refreshes()), 1);
 
-    let live = h.google.with(|f| f.refresh.clone());
+    let live = h.fake.with(|f| f.refresh.clone());
     let blob = h.stored_token(id).await.unwrap();
     let stored = alpha_broker::store::open(&KEY, id.as_bytes(), &blob).unwrap();
     assert_eq!(live, [String::from_utf8(stored.to_vec()).unwrap()]);
@@ -395,7 +395,7 @@ async fn drive_gmail_and_calendar_answer_with_the_callers_query_and_googles_cont
         assert_eq!(reply.status, StatusCode::OK, "{path}");
         assert_eq!(reply.content_type.as_deref(), Some(content_type), "{path}");
         assert_eq!(reply.bytes, body.as_bytes(), "{path}");
-        let seen = h.google.with(|f| f.data.last().cloned().unwrap());
+        let seen = h.fake.with(|f| f.data.last().cloned().unwrap());
         assert_eq!(seen.path, path);
         assert_eq!(seen.query[key], value, "{path}");
     }

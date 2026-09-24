@@ -1,15 +1,15 @@
 //! `POST /proxy`: an attested Instance names a member, one of that member's connections and a
-//! read inside the provider's allowlist; the broker attaches the member's access token and
-//! answers with the provider's status, content type and body. Nothing outside the allowlist
+//! read on the connection's provider's read list; the broker attaches the member's access token
+//! and answers with the provider's status, content type and body. Nothing outside the list
 //! reaches the provider, and no token leaves the broker.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use reqwest::Url;
 use serde::Deserialize;
@@ -18,25 +18,11 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::connect::{parse_body, parse_member};
-use crate::oauth::{self, Provider, RefreshError};
+use crate::oauth::{self, Entry, Provider, RefreshError};
 use crate::{AppState, AuthedInstance, Error, store};
 
-/// Every read the agent may make through a Google connection, all `GET` on
-/// `https://www.googleapis.com`, where a `{id}` segment matches one identifier. Nothing here
-/// writes, uploads or reaches the Docs, Sheets or Slides APIs; those files are read through
-/// Drive's export.
-const GOOGLE_READS: &[&str] = &[
-    "/drive/v3/drives",
-    "/drive/v3/files",
-    "/drive/v3/files/{id}",
-    "/drive/v3/files/{id}/export",
-    "/gmail/v1/users/me/messages",
-    "/gmail/v1/users/me/messages/{id}",
-    "/calendar/v3/calendars/primary/events",
-];
-
-// ponytail: the provider's whole body is buffered, so a Drive file larger than this cannot be
-// read through the proxy. The upgrade is a ranged or streamed download.
+// ponytail: the provider's whole body is buffered, so a file larger than this cannot be read
+// through the proxy. The upgrade is a ranged or streamed download.
 pub const MAX_RESPONSE: usize = 16 << 20;
 
 /// An access token is used until this long before the provider says it expires.
@@ -57,31 +43,73 @@ fn is_id(segment: &str) -> bool {
 }
 
 /// Judged on the parsed URL, whose `.` and `..` segments are already resolved, so the path
-/// checked is the path sent.
-pub fn allowed(provider: &Provider, method: &str, url: &Url) -> bool {
-    if provider.name != "google"
-        || method != "GET"
-        || url.scheme() != "https"
-        || url.host_str() != Some("www.googleapis.com")
+/// checked is the path sent. Method, host and path match one entry together.
+pub fn allowed(entries: &'static [Entry], method: &str, url: &Url) -> Option<&'static Entry> {
+    if url.scheme() != "https"
         || url.port().is_some()
         || !url.username().is_empty()
         || url.password().is_some()
         || url.fragment().is_some()
     {
-        return false;
+        return None;
     }
-    let Some(segments) = url.path_segments() else {
-        return false;
-    };
-    let segments: Vec<&str> = segments.collect();
-    GOOGLE_READS.iter().any(|template| {
-        let template: Vec<&str> = template.split('/').skip(1).collect();
-        template.len() == segments.len()
+    let host = url.host_str()?;
+    let segments: Vec<&str> = url.path_segments()?.collect();
+    entries.iter().find(|entry| {
+        let template: Vec<&str> = entry.path.split('/').skip(1).collect();
+        entry.method.as_str() == method
+            && entry.host == host
+            && template.len() == segments.len()
             && template
                 .iter()
                 .zip(&segments)
                 .all(|(t, s)| if *t == "{id}" { is_id(s) } else { t == s })
     })
+}
+
+/// The caller's headers, each name on the provider's list and each value a valid header value.
+fn check_headers(
+    provider: &Provider,
+    headers: Option<BTreeMap<String, String>>,
+) -> Result<HeaderMap, Error> {
+    let headers = headers.unwrap_or_default();
+    let listed = |name: &str| {
+        provider
+            .headers
+            .contains(&name.to_ascii_lowercase().as_str())
+    };
+    if !headers.keys().all(|name| listed(name)) {
+        return Err(Error::NotAllowed);
+    }
+    let mut out = HeaderMap::new();
+    for (name, value) in headers {
+        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| Error::NotAllowed)?;
+        let value = HeaderValue::from_str(&value)
+            .map_err(|_| Error::Malformed(format!("header {name} has an invalid value")))?;
+        out.insert(name, value);
+    }
+    Ok(out)
+}
+
+/// A live connection of the member, its provider and whether it is dead.
+async fn load(
+    state: &AppState,
+    member: &str,
+    connection_id: &str,
+) -> Result<(Uuid, &'static Provider, bool), Error> {
+    let member = parse_member(member)?;
+    let id = Uuid::parse_str(connection_id)
+        .map_err(|_| Error::Malformed("connection_id must be a UUID".into()))?;
+    let (provider, dead) = store::load_connection(&state.pool, id, &member)
+        .await?
+        .ok_or(Error::NotFound)?;
+    let provider = oauth::provider(&provider)
+        .ok_or_else(|| Error::internal("a connection names an unknown provider"))?;
+    Ok((id, provider, dead))
+}
+
+fn parse_url(url: &str) -> Result<Url, Error> {
+    Url::parse(url).map_err(|_| Error::Malformed("url must be an absolute URL".into()))
 }
 
 #[derive(Deserialize)]
@@ -92,6 +120,7 @@ struct ProxyRequest {
     method: String,
     url: String,
     body: Option<Value>,
+    headers: Option<BTreeMap<String, String>>,
 }
 
 pub async fn proxy(
@@ -100,32 +129,37 @@ pub async fn proxy(
     body: Bytes,
 ) -> Result<Response, Error> {
     let request: ProxyRequest = parse_body(&body)?;
-    let member = parse_member(&request.member)?;
-    let id = Uuid::parse_str(&request.connection_id)
-        .map_err(|_| Error::Malformed("connection_id must be a UUID".into()))?;
-    let url = Url::parse(&request.url)
-        .map_err(|_| Error::Malformed("url must be an absolute URL".into()))?;
-
-    let (provider, dead) = store::load_connection(&state.pool, id, &member)
-        .await?
-        .ok_or(Error::NotFound)?;
-    let provider = oauth::provider(&provider)
-        .ok_or_else(|| Error::internal("a connection names an unknown provider"))?;
-    if !allowed(provider, &request.method, &url) {
-        return Err(Error::NotAllowed);
-    }
+    let url = parse_url(&request.url)?;
+    let (id, provider, dead) = load(&state, &request.member, &request.connection_id).await?;
+    let entry = allowed(provider.reads, &request.method, &url).ok_or(Error::NotAllowed)?;
+    let headers = check_headers(provider, request.headers)?;
     if dead {
         return Err(Error::ReconnectRequired);
     }
+    forward(&state, id, provider, entry, url, headers, request.body).await
+}
+
+/// Sends the entry's method to `url` with the member's access token; a 401 on a cached token
+/// drops it, refreshes once and retries once.
+async fn forward(
+    state: &AppState,
+    id: Uuid,
+    provider: &Provider,
+    entry: &Entry,
+    url: Url,
+    headers: HeaderMap,
+    body: Option<Value>,
+) -> Result<Response, Error> {
     let mut retried = false;
     loop {
-        let token = access_token(&state, id, provider).await?;
+        let token = access_token(state, id, provider).await?;
         let mut outgoing = state
             .http
-            .get(url.clone())
+            .request(entry.method.clone(), url.clone())
+            .headers(headers.clone())
             .bearer_auth(token.as_str())
             .timeout(SEND_TIMEOUT);
-        if let Some(body) = &request.body {
+        if let Some(body) = &body {
             outgoing = outgoing.json(body);
         }
         let response = outgoing.send().await.map_err(|_| Error::Upstream)?;
@@ -186,13 +220,8 @@ async fn access_token(
     if let Some(token) = cached(state, id) {
         return Ok(token);
     }
-    let (key, client_secret) = {
-        let secrets = state.secrets.read();
-        (
-            secrets.connectors_key.clone(),
-            secrets.google_client_secret.clone(),
-        )
-    };
+    let key = state.secrets.read().connectors_key.clone();
+    let (client_id, client_secret) = state.client(provider)?;
     let refresh_token = store::open(&key, id.as_bytes(), &sealed)
         .ok_or_else(|| Error::internal("a stored refresh token does not open"))?;
     let refresh_token = std::str::from_utf8(&refresh_token)
@@ -201,7 +230,7 @@ async fn access_token(
     let refreshed = match oauth::refresh(
         &state.http,
         provider,
-        &state.config.google_client_id,
+        client_id,
         &client_secret,
         refresh_token,
     )
@@ -242,7 +271,7 @@ mod tests {
     use crate::oauth::GOOGLE;
 
     fn google(method: &str, url: &str) -> bool {
-        allowed(&GOOGLE, method, &Url::parse(url).unwrap())
+        allowed(GOOGLE.reads, method, &Url::parse(url).unwrap()).is_some()
     }
 
     #[test]
@@ -294,6 +323,7 @@ mod tests {
             "https://www.googleapis.com./drive/v3/files",
             "https://www.googleapis.com/calendar/v3/calendars/other/events",
             "https://www.googleapis.com/gmail/v1/users/other/messages",
+            "https://api.dropboxapi.com/2/files/list_folder",
         ] {
             assert!(!google("GET", url), "{url}");
         }

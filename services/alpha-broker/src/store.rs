@@ -85,7 +85,7 @@ pub async fn take_pending(pool: &PgPool, state: &str) -> Result<Option<Pending>,
 }
 
 /// A member connecting the same account again keeps the connection's id, so a chat that
-/// already holds it keeps working; the token is re-sealed, the email refreshed and the dead
+/// already holds it keeps working; the token is re-sealed, the account name refreshed and the dead
 /// mark cleared.
 pub async fn save_connection(
     pool: &PgPool,
@@ -129,7 +129,7 @@ pub async fn save_connection(
         .bind(member.as_slice())
         .bind(provider)
         .bind(&account.subject)
-        .bind(&account.email)
+        .bind(&account.name)
         .bind(sealed)
         .bind(scopes)
         .execute(&mut *tx)
