@@ -23,8 +23,6 @@ The prompt is Nemotron Safety Guard's content-safety template with the policy's 
 
 ## Tests
 
-`cargo test -p alpha-guard` covers the prompt and the verdict parser (every answer shape the allowlisted models were seen to give, and every non-answer refused), `Config::build`'s refusals, and the router against a local fake front: no Instance leaf, a KMS node's leaf or an unlisted App never reaches the judge, a malformed or oversized body never reaches it, a missing or unclear rating is never an allow, and the policy, text and bearer reach the front as sent.
-
 The live test runs the template and the parser against RedPill's allowlisted models directly and is `#[ignore]`d unless a key is present:
 
 ```sh
