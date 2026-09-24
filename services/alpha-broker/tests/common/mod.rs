@@ -51,12 +51,15 @@ pub const DROPBOX_CLIENT_ID: &str = "dropbox-app-key-for-tests";
 pub const DROPBOX_CLIENT_SECRET: &str = "dropbox-app-secret-for-tests";
 pub const DROPBOX_REDIRECT_URI: &str = "https://corpus.example/oauth/dropbox/callback";
 pub const SLACK_CLIENT_ID: &str = "1234.5678";
+pub const FIGMA_CLIENT_ID: &str = "figma-client-id-for-tests";
+pub const FIGMA_CLIENT_SECRET: &str = "figma-client-secret-for-tests";
+pub const FIGMA_REDIRECT_URI: &str = "https://corpus.example/oauth/figma/callback";
 pub const SLACK_REDIRECT_URI: &str = "https://corpus.example/oauth/slack/callback";
 pub const KEY: [u8; 32] = [9; 32];
 pub const EMAIL: &str = "member@example.com";
 pub const MEMBER: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 pub const OTHER_MEMBER: &str = "2222222222222222222222222222222222222222222222222222222222222222";
-const HOSTS: [&str; 7] = [
+const HOSTS: [&str; 8] = [
     "accounts.google.com",
     "oauth2.googleapis.com",
     "openidconnect.googleapis.com",
@@ -64,6 +67,7 @@ const HOSTS: [&str; 7] = [
     "api.dropboxapi.com",
     "content.dropboxapi.com",
     "slack.com",
+    "api.figma.com",
 ];
 pub const MEDIA: &str = "https://www.googleapis.com/drive/v3/files/file-1?alt=media";
 pub const LISTING: &str = r#"{"files":[{"id":"file-1","name":"Notes"}]}"#;
@@ -108,10 +112,20 @@ const SLACK_CLIENT: Client = Client {
     scope: "channels:history,users:read",
 };
 
+const FIGMA_CLIENT: Client = Client {
+    id: FIGMA_CLIENT_ID,
+    secret: FIGMA_CLIENT_SECRET,
+    redirect: FIGMA_REDIRECT_URI,
+    access: "figu_",
+    refresh: "figr_",
+    scope: "",
+};
+
 fn client_of(provider: &str) -> &'static Client {
     match provider {
         "dropbox" => &DROPBOX_CLIENT,
         "slack" => &SLACK_CLIENT,
+        "figma" => &FIGMA_CLIENT,
         _ => &GOOGLE_CLIENT,
     }
 }
@@ -229,7 +243,11 @@ impl Fake {
 
     /// Every value that must never appear in a reply to the tenant.
     fn secrets(&self) -> Vec<String> {
-        let mut out = vec![CLIENT_SECRET.to_string(), DROPBOX_CLIENT_SECRET.to_string()];
+        let mut out = vec![
+            CLIENT_SECRET.to_string(),
+            DROPBOX_CLIENT_SECRET.to_string(),
+            FIGMA_CLIENT_SECRET.to_string(),
+        ];
         for c in &self.consents {
             out.extend([
                 c.code.clone(),
@@ -255,6 +273,21 @@ pub const DROPBOX_REVOKE: &str = "/2/auth/token/revoke";
 pub const SLACK_TOKEN: &str = "/api/oauth.v2.access";
 pub const SLACK_IDENTITY: &str = "/api/auth.test";
 pub const SLACK_REVOKE: &str = "/api/auth.revoke";
+pub const FIGMA_TOKEN: &str = "/v1/oauth/token";
+pub const FIGMA_REFRESH: &str = "/v1/oauth/refresh";
+pub const FIGMA_ME: &str = "/v1/me";
+
+/// The `id:secret` of an HTTP Basic authorization header.
+fn basic_of(headers: &HeaderMap) -> Option<String> {
+    use base64::Engine;
+    let encoded = headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Basic ")?;
+    let decoded = base64::prelude::BASE64_STANDARD.decode(encoded).ok()?;
+    String::from_utf8(decoded).ok()
+}
 
 fn invalid_grant() -> Response {
     (
@@ -264,17 +297,20 @@ fn invalid_grant() -> Response {
         .into_response()
 }
 
-/// Google's `/token`, Dropbox's `/oauth2/token` and Slack's `oauth.v2.access`, each accepting
-/// only its own client: Google and Dropbox with the secret in the form, Slack as a public client
-/// that must send no secret at all.
+/// Google's `/token`, Dropbox's `/oauth2/token`, Slack's `oauth.v2.access` and Figma's token and
+/// refresh URLs, each accepting only its own client: Google and Dropbox with the secret in the
+/// form, Slack as a public client that must send no secret at all, Figma only in HTTP Basic and
+/// refreshing only at its own URL.
 async fn token(
     State(fake): State<Shared>,
     uri: Uri,
+    headers: HeaderMap,
     Form(form): Form<HashMap<String, String>>,
 ) -> Response {
     let provider = match uri.path() {
         DROPBOX_TOKEN => "dropbox",
         SLACK_TOKEN => "slack",
+        FIGMA_TOKEN | FIGMA_REFRESH => "figma",
         _ => "google",
     };
     let client = client_of(provider);
@@ -301,12 +337,16 @@ async fn token(
         };
         return (status, Json(json!({ "error": error }))).into_response();
     }
-    let authenticated = field("client_id") == client.id
-        && if provider == "slack" {
-            !form.contains_key("client_secret")
-        } else {
-            field("client_secret") == client.secret
-        };
+    let authenticated = match provider {
+        "figma" => {
+            basic_of(&headers) == Some(format!("{}:{}", client.id, client.secret))
+                && !form.contains_key("client_id")
+                && !form.contains_key("client_secret")
+                && (uri.path() == FIGMA_REFRESH) == refreshing
+        }
+        "slack" => field("client_id") == client.id && !form.contains_key("client_secret"),
+        _ => field("client_id") == client.id && field("client_secret") == client.secret,
+    };
     if refreshing {
         let presented = field("refresh_token").to_string();
         if !authenticated
@@ -323,7 +363,7 @@ async fn token(
         if !fake.omit_expires_in {
             reply["expires_in"] = json!(3599);
         }
-        if fake.rotate || provider == "slack" {
+        if (fake.rotate || provider == "slack") && provider != "figma" {
             let rotated = format!("{}fake-rotated-{n}", client.refresh);
             fake.refresh.retain(|t| *t != presented);
             fake.refresh.push(rotated.clone());
@@ -434,6 +474,26 @@ async fn bearer_revoke(State(fake): State<Shared>, uri: Uri, headers: HeaderMap)
     fake.revoke_status.into_response()
 }
 
+/// Figma's `/v1/me`, answered to any Figma access token the stand-in issued with the account of
+/// the consent behind it, or of the first Figma consent for a refreshed token.
+async fn figma_me(State(fake): State<Shared>, headers: HeaderMap) -> Response {
+    let mut fake = fake.lock().unwrap();
+    let presented = bearer_of(&headers);
+    fake.requests.push((FIGMA_ME.into(), HashMap::new()));
+    if !presented.starts_with(FIGMA_CLIENT.access) || !fake.access.contains(&presented) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let mut figma = fake.consents.iter().filter(|c| c.provider == "figma");
+    let Some(c) = figma
+        .clone()
+        .find(|c| c.access_token == presented)
+        .or_else(|| figma.next())
+    else {
+        return StatusCode::FORBIDDEN.into_response();
+    };
+    Json(json!({ "id": c.subject, "email": c.email, "handle": "Member" })).into_response()
+}
+
 /// Slack's `auth.test`, answered only to the access token a Slack consent issued. A consent's
 /// subject reads `<team_id>:<user_id>` and its email `<user> @ <team>`.
 async fn slack_identity(State(fake): State<Shared>, headers: HeaderMap) -> Response {
@@ -487,6 +547,7 @@ async fn data(
     let token = bearer_of(&headers);
     let provider = match host.as_str() {
         "slack.com" => "slack",
+        "api.figma.com" => "figma",
         h if h.ends_with(".dropboxapi.com") => "dropbox",
         _ => "google",
     };
@@ -570,6 +631,7 @@ async fn data(
             fake.folders.push(path.clone());
             json_body(json!({ "metadata": { "path_display": path } }).to_string()).into_response()
         }
+        ("figma", "GET", _) => json_body(json!({ "path": uri.path() }).to_string()).into_response(),
         ("slack", "GET", ["api", "conversations.history"]) => {
             json_body(SLACK_HISTORY.into()).into_response()
         }
@@ -637,6 +699,9 @@ impl FakeProviders {
             .route(SLACK_TOKEN, post(token))
             .route(SLACK_IDENTITY, post(slack_identity))
             .route(SLACK_REVOKE, post(bearer_revoke))
+            .route(FIGMA_TOKEN, post(token))
+            .route(FIGMA_REFRESH, post(token))
+            .route(FIGMA_ME, get(figma_me))
             .route("/v1/userinfo", get(userinfo))
             .route(DROPBOX_ACCOUNT, post(current_account))
             .route("/revoke", post(revoke))
@@ -829,6 +894,7 @@ pub async fn harness() -> Option<Harness> {
         "GOOGLE_CLIENT_ID" => Some(CLIENT_ID.into()),
         "DROPBOX_CLIENT_ID" => Some(DROPBOX_CLIENT_ID.into()),
         "SLACK_CLIENT_ID" => Some(SLACK_CLIENT_ID.into()),
+        "FIGMA_CLIENT_ID" => Some(FIGMA_CLIENT_ID.into()),
         "OAUTH_REDIRECT_BASE" => Some("https://corpus.example/oauth".into()),
         _ => None,
     })

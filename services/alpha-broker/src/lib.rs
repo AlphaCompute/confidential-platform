@@ -284,6 +284,7 @@ mod tests {
             "GOOGLE_CLIENT_ID" => Some("client.apps.googleusercontent.com".into()),
             "DROPBOX_CLIENT_ID" => Some("dropbox-app-key".into()),
             "SLACK_CLIENT_ID" => Some("1234.5678".into()),
+            "FIGMA_CLIENT_ID" => Some("figma-client-id".into()),
             "OAUTH_REDIRECT_BASE" => Some("https://corpus.example/oauth/".into()),
             _ => None,
         }
@@ -308,7 +309,12 @@ mod tests {
 
     #[test]
     fn config_build_refuses_a_missing_or_blank_client_id_naming_it() {
-        for variable in ["GOOGLE_CLIENT_ID", "DROPBOX_CLIENT_ID", "SLACK_CLIENT_ID"] {
+        for variable in [
+            "GOOGLE_CLIENT_ID",
+            "DROPBOX_CLIENT_ID",
+            "SLACK_CLIENT_ID",
+            "FIGMA_CLIENT_ID",
+        ] {
             for value in [None, Some(" ")] {
                 let err = Config::build(|n| {
                     if n == variable {
