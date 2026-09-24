@@ -30,6 +30,9 @@ pub enum Revoke {
     /// A `POST` carrying a fresh access token as bearer; the provider ends the refresh token
     /// behind it too.
     Bearer(&'static str),
+    /// A form post of a fresh access token and the client id, as a public client revokes. The
+    /// refresh that minted it rotates the refresh token, and the broker keeps neither.
+    AccessForm(&'static str),
     // ponytail: the provider offers no revoke, so the grant stays valid there until the member
     // removes the app in the provider's settings or it expires; the broker's row is revoked and
     // its token never used again. No upgrade exists until the provider adds a revoke.
@@ -327,7 +330,57 @@ pub const HUBSPOT: Provider = Provider {
     mcp_tools: Some(HUBSPOT_READ_TOOLS),
 };
 
-pub const PROVIDERS: [&Provider; 5] = [&GOOGLE, &DROPBOX, &SLACK, &FIGMA, &HUBSPOT];
+/// A tool Notion renames or adds is refused until this list changes. `notion-ai-search` stays
+/// off: it reaches the member's other apps connected to Notion. So do the custom-agent tools,
+/// which start or read an agent acting in the workspace.
+pub const NOTION_READ_TOOLS: &[&str] = &[
+    "notion-search",
+    "notion-get-tool-access",
+    "notion-fetch",
+    "notion-download-attachment",
+    "notion-get-comments",
+    "notion-get-async-task",
+    "notion-get-teams",
+    "notion-get-users",
+    "notion-query-data-sources",
+    "notion-query-multiple-data-sources",
+    "notion-query-meeting-notes",
+    "notion-list-private-pages",
+    "notion-list-shared-pages",
+    "notion-list-favorite-pages",
+    "notion-list-recent-pages",
+];
+
+/// Notion's hosted MCP server, not its REST API: the REST OAuth has no PKCE, so whoever held
+/// the client secret could redeem a member's code. Here Corpus is a public client registered
+/// once per redirect URI, and no secret exists. Every reply is server-sent events.
+pub const NOTION: Provider = Provider {
+    name: "notion",
+    authorization: "https://mcp.notion.com/authorize",
+    token: "https://mcp.notion.com/token",
+    refresh: "https://mcp.notion.com/token",
+    client_auth: ClientAuth::Public,
+    scopes: &["default"],
+    scope_param: ("scope", " "),
+    tokens_at: None,
+    dead: &["invalid_grant", "invalid_token"],
+    extra_authorize: &[],
+    identity: Identity::Mcp {
+        url: "https://mcp.notion.com/mcp",
+        tool: "notion-fetch",
+        arguments: &[("id", "self")],
+        subject: &["/self/workspace/id", "/self/user/id"],
+        name: &["/self/user/email", "/self/user/name"],
+    },
+    revoke: Revoke::AccessForm("https://mcp.notion.com/token"),
+    reads: &[post("mcp.notion.com", "/mcp")],
+    writes: &[],
+    headers: &[],
+    fixed_headers: MCP_ACCEPT,
+    mcp_tools: Some(NOTION_READ_TOOLS),
+};
+
+pub const PROVIDERS: [&Provider; 6] = [&GOOGLE, &DROPBOX, &SLACK, &FIGMA, &HUBSPOT, &NOTION];
 
 pub fn provider(name: &str) -> Option<&'static Provider> {
     PROVIDERS.into_iter().find(|p| p.name == name)
@@ -658,15 +711,20 @@ pub async fn revoke(
                     .send()
                     .await;
             }
-            Revoke::Bearer(url) => {
+            Revoke::Bearer(url) | Revoke::AccessForm(url) => {
                 if let Ok(fresh) =
                     refresh(http, provider, client_id, client_secret, refresh_token).await
                 {
-                    let _ = http
-                        .post(url)
-                        .bearer_auth(fresh.access_token.as_str())
-                        .send()
-                        .await;
+                    let access = fresh.access_token.as_str();
+                    let request = match provider.revoke {
+                        Revoke::AccessForm(_) => http.post(url).form(&[
+                            ("token", access),
+                            ("token_type_hint", "access_token"),
+                            ("client_id", client_id),
+                        ]),
+                        _ => http.post(url).bearer_auth(access),
+                    };
+                    let _ = request.send().await;
                 }
             }
             Revoke::Local => {}
