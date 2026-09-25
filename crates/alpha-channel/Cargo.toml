@@ -1,0 +1,45 @@
+[package]
+name = "alpha-channel"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+aes-gcm = "0.11"
+alpha-core = { path = "../alpha-core" }
+alpha-crypto = { path = "../alpha-crypto" }
+base64 = "0.23"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+ed25519-dalek = { version = "3", features = ["pkcs8", "alloc"] }
+getrandom = "0.4"
+hex = "0.4"
+hpke = { version = "0.14", default-features = false, features = ["alloc", "getrandom", "mlkem", "x25519", "aes"] }
+p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+thiserror = "2"
+uuid = { version = "1", features = ["serde"] }
+x509-parser = "0.18"
+yaml-rust2 = "0.13"
+zeroize = "1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+uuid = { version = "1", features = ["js"] }
+wasm-bindgen = "=0.2.128"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+js-sys = "0.3"
+
+[dev-dependencies]
+wasm-bindgen-test = "=0.3.78"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }

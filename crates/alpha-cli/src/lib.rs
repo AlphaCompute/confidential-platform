@@ -24,12 +24,8 @@ use std::time::SystemTime;
 
 use ed25519_dalek::VerifyingKey;
 
-/// The release key's public half, the same file `alpha-kms` compiles in; replaced at the
-/// ceremony, never in CI.
 pub fn release_key() -> Result<VerifyingKey, String> {
-    alpha_core::hex_bytes::<32>(include_str!("../../../services/alpha-kms/release-key.pub").trim())
-        .and_then(|b| VerifyingKey::from_bytes(&b).ok())
-        .ok_or_else(|| "release-key.pub is not an Ed25519 public key".to_owned())
+    alpha_channel::platform::release_key().map_err(|e| e.to_string())
 }
 
 pub fn rfc3339(t: SystemTime) -> String {
@@ -40,11 +36,6 @@ pub fn random<const N: usize>() -> Result<[u8; N], String> {
     let mut out = [0u8; N];
     getrandom::fill(&mut out).map_err(|e| format!("rng: {e}"))?;
     Ok(out)
-}
-
-pub fn sha256_prefixed(bytes: &[u8]) -> String {
-    use sha2::Digest;
-    format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
 }
 
 #[cfg(test)]

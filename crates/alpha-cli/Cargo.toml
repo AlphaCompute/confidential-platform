@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 aes-gcm = "0.11"
 alpha-attest = { path = "../alpha-attest" }
+alpha-channel = { path = "../alpha-channel" }
 alpha-client = { path = "../alpha-client" }
 alpha-core = { path = "../alpha-core" }
 alpha-crypto = { path = "../alpha-crypto" }

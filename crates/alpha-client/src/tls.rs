@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use alpha_core::{AppId, ComposeHash, OrgId};
+use alpha_core::ComposeHash;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::server::graceful::GracefulShutdown;
@@ -24,10 +24,8 @@ use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
 use rustls::time_provider::TimeProvider;
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme};
-use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-use x509_parser::prelude::{FromDer, GeneralName, ParsedExtension, X509Certificate};
 
 use crate::Error;
 use crate::runtime::RuntimeIdentity;
@@ -246,70 +244,7 @@ pub fn client_config(
     })
 }
 
-pub fn uri_sans(cert: &[u8]) -> Result<Vec<String>, Error> {
-    let (_, cert) =
-        X509Certificate::from_der(cert).map_err(|e| Error::Invalid(format!("certificate: {e}")))?;
-    Ok(cert
-        .extensions()
-        .iter()
-        .filter_map(|ext| match ext.parsed_extension() {
-            ParsedExtension::SubjectAlternativeName(san) => Some(&san.general_names),
-            _ => None,
-        })
-        .flatten()
-        .filter_map(|name| match name {
-            GeneralName::URI(uri) => Some((*uri).to_owned()),
-            _ => None,
-        })
-        .collect())
-}
-
-pub fn spki_of(cert: &[u8]) -> Result<Vec<u8>, Error> {
-    let (_, cert) =
-        X509Certificate::from_der(cert).map_err(|e| Error::Invalid(format!("certificate: {e}")))?;
-    Ok(cert.public_key().raw.to_vec())
-}
-
-pub fn spki_sha256(cert: &[u8]) -> Option<[u8; 32]> {
-    spki_of(cert).ok().map(|spki| Sha256::digest(spki).into())
-}
-
-/// The identity an Instance certificate carries: `alphacompute://<org>/<app>/<key sha256>`
-/// then `urn:alphacompute:revision:sha256:<hex>`, in the order the KMS issues them.
-#[derive(Clone, Debug)]
-pub struct InstanceSans {
-    pub org_id: OrgId,
-    pub app_id: AppId,
-    pub runtime_pubkey_sha256_hex: String,
-    pub compose_hash: ComposeHash,
-}
-
-pub fn parse_instance_sans(sans: &[String]) -> Result<InstanceSans, Error> {
-    let invalid = || Error::Invalid("certificate SANs are not an Instance's".into());
-    let [identity, revision] = sans else {
-        return Err(invalid());
-    };
-    let parts: Vec<&str> = identity
-        .strip_prefix("alphacompute://")
-        .ok_or_else(invalid)?
-        .split('/')
-        .collect();
-    let [org, app, key] = parts[..] else {
-        return Err(invalid());
-    };
-    let compose_hash = revision
-        .strip_prefix("urn:alphacompute:revision:")
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(invalid)?;
-    Ok(InstanceSans {
-        org_id: org.parse().map_err(|_| invalid())?,
-        app_id: app.parse().map_err(|_| invalid())?,
-        runtime_pubkey_sha256_hex: alpha_core::hex_bytes::<32>(key)
-            .map(|_| key.to_owned())
-            .ok_or_else(invalid)?,
-        compose_hash,
-    })
-}
+pub use alpha_channel::cert::{InstanceSans, parse_instance_sans, spki_of, spki_sha256, uri_sans};
 
 fn certified_key(identity: &RuntimeIdentity) -> Result<Arc<CertifiedKey>, Error> {
     let chain: Vec<CertificateDer<'static>> =
@@ -454,12 +389,14 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     use alpha_attest::{AttestationResult, Measured, Measurement, Revision, Verdict};
+    use alpha_core::{AppId, OrgId};
     use rcgen::string::Ia5String;
     use rcgen::{
         BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, SanType, SerialNumber,
     };
     use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::{TlsAcceptor, TlsConnector};
+    use x509_parser::prelude::{FromDer, X509Certificate};
     use zeroize::Zeroizing;
 
     use super::*;

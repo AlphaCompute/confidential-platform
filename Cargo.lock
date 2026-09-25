@@ -87,11 +87,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "alpha-channel"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "alpha-core",
+ "alpha-crypto",
+ "base64 0.23.1",
+ "chrono",
+ "ed25519-dalek 3.0.0",
+ "getrandom 0.4.3",
+ "hex",
+ "hpke",
+ "js-sys",
+ "p256 0.14.0",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "uuid",
+ "wasm-bindgen",
+ "wasm-bindgen-test",
+ "x509-parser",
+ "yaml-rust2",
+ "zeroize",
+]
+
+[[package]]
 name = "alpha-cli"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "alpha-attest",
+ "alpha-channel",
  "alpha-client",
  "alpha-core",
  "alpha-crypto",
@@ -118,11 +147,11 @@ name = "alpha-client"
 version = "0.1.0"
 dependencies = [
  "alpha-attest",
+ "alpha-channel",
  "alpha-core",
  "alpha-crypto",
  "axum",
  "base64 0.23.1",
- "chrono",
  "ed25519-dalek 3.0.0",
  "http-body-util",
  "hyper",
@@ -654,6 +683,12 @@ name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+
+[[package]]
+name = "cast"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37b2a672a2cb129a2e41c10b1224bb368f9f37a2b16b612598138befd7b37eb5"
 
 [[package]]
 name = "cc"
@@ -2424,6 +2459,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
+name = "minicov"
+version = "0.3.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4869b6a491569605d66d3952bcdf03df789e5b536e5f0cf7758a7f08a55ae24d"
+dependencies = [
+ "cc",
+ "walkdir",
+]
+
+[[package]]
 name = "minimal-lexical"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2497,6 +2542,15 @@ checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
 dependencies = [
  "memchr",
  "minimal-lexical",
+]
+
+[[package]]
+name = "nu-ansi-term"
+version = "0.50.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2595,6 +2649,12 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "oorandom"
+version = "11.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
 name = "openssl-probe"
@@ -4487,6 +4547,45 @@ checksum = "81941cd78d0c92026c33e5e01312845a4cb1e9af3407f9134b100dd03144103e"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "wasm-bindgen-test"
+version = "0.3.78"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45863ef0bef521c12124eb39d9a38513c47db75f22e503c06beacd40afeb35db"
+dependencies = [
+ "async-trait",
+ "cast",
+ "js-sys",
+ "libm",
+ "minicov",
+ "nu-ansi-term",
+ "num-traits",
+ "oorandom",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test-macro",
+ "wasm-bindgen-test-shared",
+]
+
+[[package]]
+name = "wasm-bindgen-test-macro"
+version = "0.3.78"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c89dcab8b516b6b603baca9d550b7282d68fcc7f367e3956cff7ebf406a3f12"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.5",
+]
+
+[[package]]
+name = "wasm-bindgen-test-shared"
+version = "0.2.128"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f37b4f992cebe528ef34964ae69681ac0fe7080071e7298e46008f9d380302af"
 
 [[package]]
 name = "wasm-streams"
