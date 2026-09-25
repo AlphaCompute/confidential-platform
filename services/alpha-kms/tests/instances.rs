@@ -179,3 +179,85 @@ async fn list_prints_the_copies_and_sends_the_key() {
         [format!("GET /v1/apps/{app}/instances Bearer {API_KEY} ")]
     );
 }
+
+#[tokio::test]
+async fn stop_drains_by_default_and_forces_on_request() {
+    let app = AppId::mint();
+    let (shroud, seen) = shroud(copy(app, compose_hash("{}"), "https://copy.example")).await;
+    let iid = "0199a1b2-0000-7000-8000-000000000001";
+
+    instances::stop(&shroud, app, iid, false, None)
+        .await
+        .unwrap();
+    instances::stop(&shroud, app, iid, false, Some(60))
+        .await
+        .unwrap();
+    instances::stop(&shroud, app, iid, true, None)
+        .await
+        .unwrap();
+
+    let path = format!("/v1/apps/{app}/instances/{iid}");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [
+            format!("DELETE {path} Bearer {API_KEY} "),
+            format!("DELETE {path}?drain_seconds=60 Bearer {API_KEY} "),
+            format!("DELETE {path}?force=true Bearer {API_KEY} "),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_deploy_waits_for_every_copy_in_reply_order() {
+    let ca = Ca::new();
+    let app = AppId::mint();
+    let hash = compose_hash("{\"name\":\"worker\"}");
+    let first = ca.instance_serving(hash).await;
+    let second = ca.instance_serving(hash).await;
+    let reply = json!({ "instances": [copy(app, hash, &first), copy(app, hash, &second)] });
+
+    let attested =
+        alpha_cli::deploy::wait_for_every_copy(&reply, &ca.pem(), hash, Duration::from_secs(10))
+            .await
+            .unwrap();
+
+    assert_eq!(attested[0]["url"], first);
+    assert_eq!(attested[1]["url"], second);
+    assert_eq!(attested.as_array().unwrap().len(), 2);
+    assert_eq!(attested[1]["compose_hash"], hash.to_string());
+}
+
+#[tokio::test]
+async fn a_deploy_fails_when_one_copy_serves_another_revision() {
+    let ca = Ca::new();
+    let app = AppId::mint();
+    let hash = compose_hash("{\"name\":\"worker\"}");
+    let good = ca.instance_serving(hash).await;
+    let stale = ca
+        .instance_serving(compose_hash("{\"name\":\"previous\"}"))
+        .await;
+    let reply = json!({ "instances": [copy(app, hash, &good), copy(app, hash, &stale)] });
+
+    let message = alpha_cli::deploy::wait_for_every_copy(&reply, &ca.pem(), hash, Duration::ZERO)
+        .await
+        .unwrap_err();
+
+    assert!(message.contains(&stale), "{message}");
+    assert!(message.contains("did not attest"), "{message}");
+}
+
+#[tokio::test]
+async fn a_deploy_reply_without_copies_is_an_error() {
+    let hash = compose_hash("{}");
+    let pem = Ca::new().pem();
+    for reply in [
+        json!({ "url": "https://old-shape.example" }),
+        json!({ "instances": [] }),
+    ] {
+        let message =
+            alpha_cli::deploy::wait_for_every_copy(&reply, &pem, hash, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+        assert!(message.contains(&reply.to_string()), "{message}");
+    }
+}
