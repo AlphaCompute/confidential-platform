@@ -364,8 +364,7 @@ mod agent_tests {
     use super::*;
 
     /// A guest agent that answers one request with `response` and reports the request line.
-    fn fake_agent(response: impl Into<String>) -> (PathBuf, mpsc::Receiver<String>) {
-        let response = response.into();
+    fn fake_agent(response: &'static str) -> (PathBuf, mpsc::Receiver<String>) {
         let path = std::env::temp_dir().join(format!(
             "alpha-tsm-{}-{:?}.sock",
             std::process::id(),
