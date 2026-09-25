@@ -5,8 +5,7 @@ delete from connections;
 
 alter table pending_connects
   drop column member_key_sha256,
-  add column member_key bytea not null,
-  add column member_key_sha256 bytea not null generated always as (sha256(member_key)) stored;
+  add column member_key bytea not null;
 alter table connections
   drop column member_key_sha256,
   add column member_key bytea not null,

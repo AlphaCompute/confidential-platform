@@ -49,11 +49,11 @@ impl Channels {
 
     fn with<R>(&self, id: &str, f: impl FnOnce(&mut Channel) -> R) -> Option<R> {
         let mut table = self.0.lock();
-        if table.get(id)?.1.elapsed() >= IDLE {
+        let (channel, used) = table.get_mut(id)?;
+        if used.elapsed() >= IDLE {
             table.remove(id);
             return None;
         }
-        let (channel, used) = table.get_mut(id)?;
         *used = Instant::now();
         Some(f(channel))
     }

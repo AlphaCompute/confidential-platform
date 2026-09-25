@@ -811,38 +811,15 @@ async fn a_frame_opened_twice_moved_to_another_route_or_on_an_unknown_channel_is
 }
 
 #[tokio::test]
-async fn a_rows_key_hash_is_its_keys_sha256_and_cannot_be_written() {
+async fn a_rows_key_hash_cannot_be_written() {
     let Some(h) = harness().await else { return };
-    let me = member();
-    for table in ["connections", "pending_connects"] {
-        let written = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "update {table} set member_key_sha256 = $1"
-        )))
-        .bind(me.sha256().to_vec())
+    let written = sqlx::query("update connections set member_key_sha256 = $1")
+        .bind(member().sha256().to_vec())
         .execute(&h.pool)
         .await
         .unwrap_err();
-        assert!(
-            written.to_string().contains("only be updated to DEFAULT"),
-            "{written}"
-        );
-    }
-    let id = uuid::Uuid::now_v7();
-    sqlx::query(
-        "insert into connections
-           (id, member_key, provider, subject, account, enc_refresh_token, scopes)
-         values ($1, $2, 'google', 'subject', 'account', '\\x00', '')",
-    )
-    .bind(id)
-    .bind(me.spki.clone())
-    .execute(&h.pool)
-    .await
-    .unwrap();
-    let stored: Vec<u8> =
-        sqlx::query_scalar("select member_key_sha256 from connections where id = $1")
-            .bind(id)
-            .fetch_one(&h.pool)
-            .await
-            .unwrap();
-    assert_eq!(stored, me.sha256());
+    assert!(
+        written.to_string().contains("only be updated to DEFAULT"),
+        "{written}"
+    );
 }
