@@ -378,12 +378,12 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                         .zip(memory_mib)
                         .map(|(cpu, memory_mib)| json!({ "cpu": cpu, "memory_mib": memory_mib }));
                     let doc = match wait {
-                        Some(secs) => Some((secs, platform_document(config, now).await?)),
+                        Some(_) => Some(platform_document(config, now).await?),
                         None => None,
                     };
-                    let wait = doc
-                        .as_ref()
-                        .map(|(secs, doc)| (Duration::from_secs(*secs), doc.kms_ca_pem.as_str()));
+                    let wait = wait
+                        .zip(doc.as_ref())
+                        .map(|(s, d)| (Duration::from_secs(s), d.kms_ca_pem.as_str()));
                     Ok(instances::add(&shroud, app, resources, wait).await?)
                 }
                 InstancesCommand::Stop {

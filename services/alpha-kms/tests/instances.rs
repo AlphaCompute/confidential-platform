@@ -76,11 +76,6 @@ fn copy(app: AppId, hash: ComposeHash, url: &str) -> Value {
         "app_id": app.to_string(),
         "compose_hash": hash.to_string(),
         "url": url,
-        "resources": { "cpu": 2, "memory_mib": 4096 },
-        "state": "running",
-        "started_at": "2026-09-25T10:00:00Z",
-        "drain_deadline": null,
-        "stopped_at": null,
     })
 }
 

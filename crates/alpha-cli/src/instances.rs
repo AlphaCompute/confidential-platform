@@ -54,10 +54,7 @@ pub async fn add(
     resources: Option<Value>,
     wait: Option<(Duration, &str)>,
 ) -> Result<Value, String> {
-    let body = match resources {
-        Some(resources) => json!({ "resources": resources }),
-        None => json!({}),
-    };
+    let body = resources.map_or_else(|| json!({}), |r| json!({ "resources": r }));
     let path = format!("/v1/apps/{app}/instances");
     let instance = shroud_call(shroud, Method::POST, &path, Some(body)).await?;
     let Some((deadline, kms_ca_pem)) = wait else {
