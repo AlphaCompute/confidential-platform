@@ -125,8 +125,7 @@ pub async fn save_connection(
         .await?;
     let existing: Option<Uuid> = sqlx::query_scalar(
         "select id from connections
-         where member_key_sha256 = sha256($1) and provider = $2 and subject = $3
-           and revoked_at is null
+         where member_key = $1 and provider = $2 and subject = $3 and revoked_at is null
          for update",
     )
     .bind(member)
@@ -169,7 +168,7 @@ pub struct Connection {
 pub async fn list_connections(pool: &PgPool, member: &[u8]) -> Result<Vec<Connection>, Error> {
     Ok(sqlx::query_as(
         "select id, provider, account, dead_at is not null as dead from connections
-         where member_key_sha256 = sha256($1) and revoked_at is null
+         where member_key = $1 and revoked_at is null
          order by created_at, id",
     )
     .bind(member)

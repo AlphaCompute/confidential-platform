@@ -8,9 +8,8 @@ alter table pending_connects
   add column member_key bytea not null;
 alter table connections
   drop column member_key_sha256,
-  add column member_key bytea not null,
-  add column member_key_sha256 bytea not null generated always as (sha256(member_key)) stored;
-create unique index on connections (member_key_sha256, provider, subject) where revoked_at is null;
+  add column member_key bytea not null;
+create unique index on connections (member_key, provider, subject) where revoked_at is null;
 
 create table member_nonces (
   nonce bytea primary key check (length(nonce) = 32),

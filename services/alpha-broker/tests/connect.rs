@@ -37,13 +37,11 @@ async fn a_member_connects_google_over_the_sealed_channel() {
         ] })
     );
 
-    let (hash, key): (Vec<u8>, Vec<u8>) =
-        sqlx::query_as("select member_key_sha256, member_key from connections where id = $1")
-            .bind(id)
-            .fetch_one(&h.pool)
-            .await
-            .unwrap();
-    assert_eq!(hash, me.sha256());
+    let key: Vec<u8> = sqlx::query_scalar("select member_key from connections where id = $1")
+        .bind(id)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
     assert_eq!(key, me.spki);
 
     let blob = h.stored_token(id).await.unwrap();
@@ -808,18 +806,4 @@ async fn a_frame_opened_twice_moved_to_another_route_or_on_an_unknown_channel_is
     })
     .await;
     assert_eq!(count(&h, "member_nonces").await, 1);
-}
-
-#[tokio::test]
-async fn a_rows_key_hash_cannot_be_written() {
-    let Some(h) = harness().await else { return };
-    let written = sqlx::query("update connections set member_key_sha256 = $1")
-        .bind(member().sha256().to_vec())
-        .execute(&h.pool)
-        .await
-        .unwrap_err();
-    assert!(
-        written.to_string().contains("only be updated to DEFAULT"),
-        "{written}"
-    );
 }
