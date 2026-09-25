@@ -8,7 +8,7 @@ use std::fmt;
 use std::time::SystemTime;
 
 use alpha_core::{AppId, ComposeHash, OrgId, context, signing_digest};
-use alpha_crypto::{KEM_NAME, PrivateKey, PublicKey};
+use alpha_crypto::{KEM_NAME, PrivateKey};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use chrono::DateTime;
@@ -134,7 +134,6 @@ fn decode<const N: usize>(field: &str, text: &str) -> Result<[u8; N], Error> {
 
 pub struct Initiator {
     key: PrivateKey,
-    pk: PublicKey,
     nonce: [u8; 32],
 }
 
@@ -155,7 +154,7 @@ impl Initiator {
             pk: BASE64_URL_SAFE_NO_PAD.encode(pk.as_bytes()),
             nonce: BASE64_URL_SAFE_NO_PAD.encode(nonce),
         };
-        Ok((Self { key, pk, nonce }, hello))
+        Ok((Self { key, nonce }, hello))
     }
 
     /// `kms_ca_pem` is the verified platform document's; `now` is the initiator's own clock.
@@ -214,7 +213,7 @@ impl Initiator {
         let document = signed_document(
             &hello.channel,
             &BASE64_URL_SAFE_NO_PAD.encode(self.nonce),
-            self.pk.as_bytes(),
+            self.key.public().as_bytes(),
             &enc,
             &sans.compose_hash,
             &hello.now,
@@ -316,10 +315,8 @@ impl Responder {
         let pk_bytes = BASE64_URL_SAFE_NO_PAD
             .decode(&hello.pk)
             .map_err(|_| Error::Malformed("pk is not base64url".into()))?;
-        let pk = PublicKey::try_from(pk_bytes.as_slice())
-            .ok()
-            .and_then(|pk| <XWing as Kem>::PublicKey::from_bytes(pk.as_bytes()).ok())
-            .ok_or_else(|| Error::Malformed("pk is not an X-Wing public key".into()))?;
+        let pk = <XWing as Kem>::PublicKey::from_bytes(&pk_bytes)
+            .map_err(|_| Error::Malformed("pk is not an X-Wing public key".into()))?;
         let nonce = decode::<32>("nonce", &hello.nonce)?;
         let channel_id = random::<16>()?;
         let channel_b64 = BASE64_URL_SAFE_NO_PAD.encode(channel_id);

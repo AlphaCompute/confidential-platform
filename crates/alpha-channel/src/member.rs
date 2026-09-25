@@ -25,7 +25,7 @@ use uuid::Uuid;
 use crate::{ECDSA_P256, Error, NamedSignature, p256_signature, random, rfc3339, unix_seconds};
 
 /// How far a request's `issued_at` may be from the verifier's clock, either way.
-pub const FRESHNESS_SECONDS: u64 = 60;
+const FRESHNESS_SECONDS: u64 = 60;
 
 /// Under `alphacompute/connector-grant/v1`: lets the Instance whose leaf SPKI hashes to `aud` read
 /// through `connections` until `exp`.
