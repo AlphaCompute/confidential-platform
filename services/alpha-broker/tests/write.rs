@@ -29,13 +29,14 @@ fn url_of(entry: &oauth::Entry) -> String {
 }
 
 fn on(connection: Uuid, method: &str, url: &str) -> Value {
-    export(
+    export_at(
         &member(),
         connection,
         method,
         url,
         "application/json",
         b"{}",
+        SystemTime::now(),
     )
 }
 
@@ -222,13 +223,14 @@ async fn an_unknown_revoked_or_another_members_connection_is_not_found_on_write(
         .into_iter()
         .map(|connection| upload(connection, DRIVE_FILES, "application/json", b"{}"))
         .collect();
-    exports.push(export(
+    exports.push(export_at(
         &other_member(),
         mine,
         "POST",
         DRIVE_FILES,
         "application/json",
         b"{}",
+        SystemTime::now(),
     ));
     for body in exports {
         let reply = h.write(&body).await;

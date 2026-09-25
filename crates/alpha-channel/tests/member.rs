@@ -20,7 +20,6 @@ use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
 use p256::pkcs8::EncodePublicKey;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 const VECTORS: &str = include_str!("../../../testdata/member/webcrypto.json");
 
@@ -37,7 +36,7 @@ fn at(rfc3339: &str) -> SystemTime {
 /// The vectors' `issued_at`.
 const NOW: &str = "2026-09-25T12:00:00Z";
 
-fn verify(entry: &Value) -> Result<([u8; 32], MemberDocument), Error> {
+fn verify(entry: &Value) -> Result<(Vec<u8>, MemberDocument), Error> {
     let signature: NamedSignature = serde_json::from_value(entry["signature"].clone()).unwrap();
     verify_request(
         entry["context"].as_str().unwrap(),
@@ -90,10 +89,7 @@ fn every_webcrypto_signature_verifies_high_s_included() {
         let spki = BASE64_URL_SAFE_NO_PAD
             .decode(entry["member_key"].as_str().unwrap())
             .unwrap();
-        assert_eq!(
-            verify(entry).unwrap().0,
-            <[u8; 32]>::from(Sha256::digest(&spki))
-        );
+        assert_eq!(verify(entry).unwrap().0, spki);
     }
 }
 

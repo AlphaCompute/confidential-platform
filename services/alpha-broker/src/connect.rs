@@ -16,6 +16,7 @@ use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::channel::Sealed;
@@ -51,7 +52,7 @@ pub(crate) fn verify(
     document: &Value,
     member_key: &str,
     signature: &NamedSignature,
-) -> Result<([u8; 32], MemberDocument), Error> {
+) -> Result<(Vec<u8>, MemberDocument), Error> {
     verify_request(context, document, member_key, signature, SystemTime::now()).map_err(|e| match e
     {
         alpha_channel::Error::SignatureInvalid(m) => Error::SignatureInvalid(m),
@@ -62,15 +63,13 @@ pub(crate) fn verify(
 
 fn verified(plaintext: &[u8]) -> Result<(Member, MemberDocument), Error> {
     let signed: SignedRequest = parse_body(plaintext)?;
-    let (sha256, document) = verify(
+    let (spki, document) = verify(
         context::CONNECTOR_REQUEST,
         &signed.document,
         &signed.member_key,
         &signed.signature,
     )?;
-    let spki = BASE64_URL_SAFE_NO_PAD
-        .decode(&signed.member_key)
-        .map_err(|_| Error::Malformed("member_key is not base64url".into()))?;
+    let sha256 = Sha256::digest(&spki).into();
     Ok((Member { sha256, spki }, document))
 }
 

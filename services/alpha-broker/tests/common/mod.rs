@@ -150,13 +150,6 @@ pub fn signed(key: &Member, fields: Value) -> Value {
     signed_at(key, fields, SystemTime::now())
 }
 
-pub fn rfc3339(t: SystemTime) -> String {
-    let seconds = t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
-    chrono::DateTime::from_timestamp(seconds as i64, 0)
-        .unwrap()
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-}
-
 /// `sha256:<hex>` of the SPKI of `identity`'s leaf: the `aud` of a grant for it.
 pub fn aud_of(identity: &Identity) -> String {
     let spki = alpha_client::tls::spki_of(&identity.chain[0]).unwrap();
@@ -175,7 +168,12 @@ pub fn grant_at(
     use base64::Engine;
     let (document, digest) = alpha_channel::member::signable(
         alpha_core::context::CONNECTOR_GRANT,
-        json!({ "aud": aud, "connections": connections, "exp": rfc3339(exp) }),
+        json!({
+            "aud": aud,
+            "connections": connections,
+            "exp": chrono::DateTime::<chrono::Utc>::from(exp)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        }),
         issued_at,
     )
     .unwrap();
@@ -1324,28 +1322,17 @@ pub fn export_at(
     plaintext
 }
 
-pub fn export(
-    key: &Member,
-    connection: Uuid,
-    method: &str,
-    url: &str,
-    content_type: &str,
-    bytes: &[u8],
-) -> Value {
+/// A `POST` export by `member()`.
+pub fn upload(connection: Uuid, url: &str, content_type: &str, bytes: &[u8]) -> Value {
     export_at(
-        key,
+        &member(),
         connection,
-        method,
+        "POST",
         url,
         content_type,
         bytes,
         SystemTime::now(),
     )
-}
-
-/// A `POST` export by `member()`.
-pub fn upload(connection: Uuid, url: &str, content_type: &str, bytes: &[u8]) -> Value {
-    export(&member(), connection, "POST", url, content_type, bytes)
 }
 
 impl Harness {

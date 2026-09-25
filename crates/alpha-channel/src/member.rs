@@ -177,15 +177,15 @@ fn check(key: &VerifyingKey, digest: &[u8; 32], signature: &Signature) -> Result
 
 /// Checks `signature` over `document` under `context` by the key `member_key_b64` (base64url SPKI
 /// DER), then reads the document as that context's request or write and checks its freshness
-/// against `now`. Returns the SHA-256 of the SPKI and the document; whether its nonce was seen
-/// before is the caller's.
+/// against `now`. Returns the SPKI and the document; whether its nonce was seen before is the
+/// caller's.
 pub fn verify_request(
     context: &str,
     document: &Value,
     member_key_b64: &str,
     signature: &NamedSignature,
     now: SystemTime,
-) -> Result<([u8; 32], MemberDocument), Error> {
+) -> Result<(Vec<u8>, MemberDocument), Error> {
     if signature.algorithm != ECDSA_P256 {
         return Err(invalid("algorithm is not ecdsa-p256"));
     }
@@ -213,7 +213,7 @@ pub fn verify_request(
     }
     .map_err(|e| Error::Malformed(format!("document: {e}")))?;
     check_fresh(parsed.nonce_and_issued_at().1, now)?;
-    Ok((Sha256::digest(&spki).into(), parsed))
+    Ok((spki, parsed))
 }
 
 /// A grant as received: the JCS bytes that were signed, and the signature.
