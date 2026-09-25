@@ -144,9 +144,12 @@ A signed request travels inside the channel as:
 ```
 
 Requests and writes are fresh when `now − 60 s ≤ issued_at ≤ now + 60 s` by the verifier's
-clock. Each nonce is accepted once. A verifier reads the document as its context's request or
-write only after the signature checks out, and refuses one with `v` other than 1, a nonce that is
-not 32 bytes, an unknown `op` or an unknown field.
+clock. Each nonce is accepted once, and that is the verifier's own record: `verifyMemberRequest`
+and `verify_request` remember nothing, so a verifier stores each nonce atomically before it acts
+on the request and refuses one it has already stored. The channel's sequence numbers do not
+replace this, because the same signed document can arrive on another channel. A verifier reads
+the document as its context's request or write only after the signature checks out, and refuses
+one with `v` other than 1, a nonce that is not 32 bytes, an unknown `op` or an unknown field.
 
 | Context | Document |
 |---|---|
