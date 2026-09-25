@@ -1,10 +1,12 @@
 //! The connectors broker: an App of its own that exchanges a provider's authorization code
 //! with a PKCE verifier only it holds, and keeps the refresh token sealed under a key only
-//! Instances of this App receive from the KMS. The tenant's backend starts and finishes a
-//! connect with its bearer and relays an opaque code; it never sees a token. An attested
-//! Instance holding the proxy bearer reads through `/proxy` inside its provider's read list, and
-//! the tenant's backend writes an export through `/write` inside the write list, with the
-//! member's access token attached here.
+//! Instances of this App receive from the KMS. A member is the P-256 key its browser holds: the
+//! page opens an attested channel to this Instance through the tenant's backend and sends every
+//! connect, finish, list and disconnect sealed and signed by that key, so the backend relays
+//! ciphertext and cannot act for anyone. An attested Instance reads through `/proxy` inside its
+//! provider's read list only with a grant the member's key signed for that Instance's leaf, and
+//! an export goes through `/write` inside the write list only sealed and signed by the member for
+//! that one request. The member's access token is attached here and never leaves.
 
 #![cfg_attr(
     test,
@@ -17,6 +19,7 @@
     )
 )]
 
+pub mod channel;
 pub mod connect;
 pub mod oauth;
 pub mod proxy;
@@ -88,7 +91,6 @@ pub struct Secrets {
     /// The tenant's OAuth client secret per provider name, for rows that use one.
     pub client_secrets: HashMap<&'static str, Zeroizing<String>>,
     pub connect_bearer: Zeroizing<Vec<u8>>,
-    pub proxy_bearer: Zeroizing<Vec<u8>>,
     pub connectors_key: Zeroizing<[u8; 32]>,
 }
 
@@ -98,6 +100,9 @@ pub struct AppState {
     pub pool: PgPool,
     pub http: reqwest::Client,
     pub tokens: proxy::TokenCache,
+    /// Rebuilt from each renewed identity, so a handshake is always signed by the current leaf.
+    pub responder: parking_lot::RwLock<alpha_channel::handshake::Responder>,
+    pub channels: channel::Channels,
 }
 
 impl AppState {
@@ -137,6 +142,22 @@ pub enum Error {
     Upstream,
     #[error("the provider's response is larger than the broker relays")]
     TooLarge,
+    #[error("the channel is unknown or has expired; open a new one")]
+    ChannelUnknown,
+    #[error("the body is not a frame that opens on this channel and route")]
+    FrameInvalid,
+    #[error("this frame was already received")]
+    Replayed,
+    #[error("{0}")]
+    SignatureInvalid(String),
+    #[error("issued_at is more than a minute from the broker's clock")]
+    RequestStale,
+    #[error("this signed request was already used")]
+    NonceReplayed,
+    #[error("the grant is not the member's for this Instance and connection")]
+    GrantInvalid,
+    #[error("the grant has expired, is not yet valid or lasts longer than twelve hours")]
+    GrantExpired,
     #[error("{0}")]
     Internal(String),
 }
@@ -153,9 +174,10 @@ impl From<sqlx::Error> for Error {
     }
 }
 
-impl IntoResponse for Error {
-    fn into_response(self) -> Response {
-        let (status, code) = match &self {
+impl Error {
+    /// The status and `{"error":{"code","message"}}` body, plaintext or sealed alike.
+    pub fn envelope(&self) -> (StatusCode, serde_json::Value) {
+        let (status, code) = match self {
             Error::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Error::Malformed(_) => (StatusCode::BAD_REQUEST, "malformed"),
             Error::NotFound => (StatusCode::NOT_FOUND, "not_found"),
@@ -166,16 +188,33 @@ impl IntoResponse for Error {
             Error::ReconnectRequired => (StatusCode::CONFLICT, "reconnect_required"),
             Error::Upstream => (StatusCode::BAD_GATEWAY, "upstream"),
             Error::TooLarge => (StatusCode::BAD_GATEWAY, "too_large"),
+            Error::ChannelUnknown => (StatusCode::CONFLICT, "channel_unknown"),
+            Error::FrameInvalid => (StatusCode::BAD_REQUEST, "frame_invalid"),
+            Error::Replayed => (StatusCode::CONFLICT, "replayed"),
+            Error::SignatureInvalid(_) => (StatusCode::UNAUTHORIZED, "signature_invalid"),
+            Error::RequestStale => (StatusCode::UNAUTHORIZED, "request_stale"),
+            Error::NonceReplayed => (StatusCode::CONFLICT, "nonce_replayed"),
+            Error::GrantInvalid => (StatusCode::FORBIDDEN, "grant_invalid"),
+            Error::GrantExpired => (StatusCode::FORBIDDEN, "grant_expired"),
             Error::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         };
-        let message = match &self {
+        let message = match self {
             Error::Internal(detail) => {
                 eprintln!("alpha-broker: internal: {detail}");
                 "internal error".to_string()
             }
             other => other.to_string(),
         };
-        let body = json!({ "error": { "code": code, "message": message } });
+        (
+            status,
+            json!({ "error": { "code": code, "message": message } }),
+        )
+    }
+}
+
+impl IntoResponse for Error {
+    fn into_response(self) -> Response {
+        let (status, body) = self.envelope();
         (status, Json(body)).into_response()
     }
 }
@@ -200,7 +239,8 @@ fn bearer(parts: &Parts, expected: &[u8]) -> Result<(), Error> {
     }
 }
 
-/// Proof of the tenant backend's connect bearer, extracted before any handler runs.
+/// The tenant backend's connect bearer, extracted before any handler runs. It admits the relay
+/// and authorises nothing on a member's behalf.
 pub struct AuthedCorpus;
 
 impl FromRequestParts<Arc<AppState>> for AuthedCorpus {
@@ -214,17 +254,17 @@ impl FromRequestParts<Arc<AppState>> for AuthedCorpus {
     }
 }
 
-/// An Instance's leaf, already chained to the KMS CA in the handshake, then the proxy bearer.
-/// A KMS node's leaf chains to the same CA but does not carry an Instance's SANs.
-pub struct AuthedInstance;
+/// An Instance's leaf, already chained to the KMS CA in the handshake, and the SHA-256 of its
+/// SPKI, which a grant must name as its `aud`. A KMS node's leaf chains to the same CA but does
+/// not carry an Instance's SANs.
+pub struct AuthedInstance {
+    pub aud: [u8; 32],
+}
 
-impl FromRequestParts<Arc<AppState>> for AuthedInstance {
+impl<S: Sync> FromRequestParts<S> for AuthedInstance {
     type Rejection = Error;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &Arc<AppState>,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self, Self::Rejection> {
         let leaf = parts
             .extensions
             .get::<alpha_client::tls::PeerCerts>()
@@ -233,7 +273,8 @@ impl FromRequestParts<Arc<AppState>> for AuthedInstance {
         alpha_client::tls::uri_sans(leaf)
             .and_then(|sans| alpha_client::tls::parse_instance_sans(&sans))
             .map_err(|_| Error::CertInvalid)?;
-        bearer(parts, &state.secrets.read().proxy_bearer).map(|()| AuthedInstance)
+        let aud = alpha_client::tls::spki_sha256(leaf).ok_or(Error::CertInvalid)?;
+        Ok(AuthedInstance { aud })
     }
 }
 
@@ -254,9 +295,10 @@ async fn ready(State(state): State<Arc<AppState>>) -> Response {
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
+        .route("/channel", post(channel::open))
         .route("/connect/finish", post(connect::finish))
         .route("/connect/{provider}", post(connect::start))
-        .route("/connections", get(connect::list))
+        .route("/connections", post(connect::list))
         .route("/connections/{id}", delete(connect::disconnect))
         .route("/proxy", post(proxy::proxy))
         .route(

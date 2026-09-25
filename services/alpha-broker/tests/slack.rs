@@ -17,7 +17,9 @@ const HISTORY: &str = "https://slack.com/api/conversations.history?channel=C1&li
 #[tokio::test]
 async fn a_member_connects_slack_and_an_instance_reads_history_without_seeing_a_token() {
     let Some(h) = harness().await else { return };
-    let (reply, consent) = h.connect_as("slack", MEMBER, "T1:U1", "ann @ Acme").await;
+    let (reply, consent) = h
+        .connect_as("slack", &member(), "T1:U1", "ann @ Acme")
+        .await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
     let id = id_of(&reply);
     assert_eq!(
@@ -50,7 +52,7 @@ async fn a_member_connects_slack_and_an_instance_reads_history_without_seeing_a_
 #[tokio::test]
 async fn slack_is_asked_for_the_nine_user_scopes_and_no_bot_scope() {
     let Some(h) = harness().await else { return };
-    let query = h.start("slack", MEMBER).await;
+    let query = h.start("slack", &member()).await;
     assert_eq!(
         query["user_scope"],
         "channels:read,channels:history,groups:read,groups:history,im:read,im:history,\
@@ -108,9 +110,7 @@ async fn a_dead_slack_refresh_token_inside_http_200_marks_the_connection_dead() 
     let reply = h.proxy(&read(id, HISTORY)).await;
     assert_eq!(reply.status, StatusCode::CONFLICT);
     assert_eq!(reply.code(), "reconnect_required");
-    let listed = h
-        .call("GET", &format!("/connections?member={MEMBER}"), None)
-        .await;
+    let listed = h.list(&member()).await;
     assert_eq!(listed.body["connections"][0]["dead"], true);
 
     let again = h.proxy(&read(id, HISTORY)).await;
@@ -139,14 +139,8 @@ async fn every_slack_refresh_stores_the_rotated_refresh_token() {
 async fn disconnecting_slack_revokes_at_slack_with_an_access_token() {
     let Some(h) = harness().await else { return };
     let (id, _) = h.connected_to("slack").await;
-    let reply = h
-        .call(
-            "DELETE",
-            &format!("/connections/{id}?member={MEMBER}"),
-            None,
-        )
-        .await;
-    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    let reply = h.disconnect(&member(), id).await;
+    assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(h.stored_token(id).await, None);
     let (paths, revoked) = h.fake.with(|f| {
         let paths: Vec<String> = f.requests.iter().map(|(p, _)| p.clone()).collect();
@@ -165,14 +159,18 @@ async fn disconnecting_slack_revokes_at_slack_with_an_access_token() {
 #[tokio::test]
 async fn one_slack_user_keeps_one_connection_and_a_second_workspace_makes_another() {
     let Some(h) = harness().await else { return };
-    let (first, _) = h.connect_as("slack", MEMBER, "T1:U1", "ann @ Acme").await;
-    let (again, _) = h.connect_as("slack", MEMBER, "T1:U1", "ann @ Acme").await;
-    let (other, _) = h.connect_as("slack", MEMBER, "T2:U1", "ann @ Beta").await;
+    let (first, _) = h
+        .connect_as("slack", &member(), "T1:U1", "ann @ Acme")
+        .await;
+    let (again, _) = h
+        .connect_as("slack", &member(), "T1:U1", "ann @ Acme")
+        .await;
+    let (other, _) = h
+        .connect_as("slack", &member(), "T2:U1", "ann @ Beta")
+        .await;
     assert_eq!(id_of(&first), id_of(&again));
     assert_ne!(id_of(&first), id_of(&other));
-    let listed = h
-        .call("GET", &format!("/connections?member={MEMBER}"), None)
-        .await;
+    let listed = h.list(&member()).await;
     assert_eq!(listed.body["connections"].as_array().unwrap().len(), 2);
 }
 

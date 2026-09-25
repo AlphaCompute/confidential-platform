@@ -262,10 +262,11 @@ pub fn verify_member_request(
 ) -> Result<String, JsError> {
     let document: serde_json::Value = parse("document", document_json)?;
     let signature: crate::NamedSignature = parse("signature", signature_json)?;
-    let (key_sha256, _) =
+    use sha2::Digest;
+    let (spki, _) =
         member::verify_request(context, &document, member_key_b64, &signature, at(now_ms)?)
             .map_err(js)?;
-    Ok(hex::encode(key_sha256))
+    Ok(hex::encode(sha2::Sha256::digest(spki)))
 }
 
 /// The grant JSON, once `wire` verifies under the base64url SPKI `spki_b64`.

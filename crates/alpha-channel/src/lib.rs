@@ -66,6 +66,8 @@ pub enum Error {
     SignatureInvalid(String),
     #[error("issued_at is more than a minute from now")]
     RequestStale,
+    #[error("the grant has expired, is not yet valid or lasts longer than twelve hours")]
+    GrantExpired,
 }
 
 impl Error {
@@ -86,6 +88,7 @@ impl Error {
             Self::Truncated => "truncated",
             Self::SignatureInvalid(_) => "signature_invalid",
             Self::RequestStale => "request_stale",
+            Self::GrantExpired => "grant_expired",
         }
     }
 }

@@ -64,12 +64,16 @@ name = "alpha-broker"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "alpha-channel",
  "alpha-client",
+ "alpha-core",
  "axum",
  "base64 0.23.1",
+ "chrono",
  "getrandom 0.4.3",
  "hex",
  "hyper-util",
+ "p256 0.14.0",
  "parking_lot",
  "rcgen",
  "reqwest",

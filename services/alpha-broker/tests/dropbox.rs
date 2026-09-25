@@ -18,7 +18,7 @@ const PATH_ROOT: &str = r#"{".tag": "root", "root": "42"}"#;
 #[tokio::test]
 async fn a_member_connects_dropbox_and_an_instance_lists_a_folder_without_seeing_a_token() {
     let Some(h) = harness().await else { return };
-    let (reply, consent) = h.connect_to("dropbox", MEMBER, EMAIL).await;
+    let (reply, consent) = h.connect_to("dropbox", &member(), EMAIL).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
     let id = id_of(&reply);
     assert_eq!(
@@ -31,7 +31,6 @@ async fn a_member_connects_dropbox_and_an_instance_lists_a_folder_without_seeing
 
     let reply = h
         .proxy(&json!({
-            "member": MEMBER,
             "connection_id": id,
             "method": "POST",
             "url": LIST_FOLDER,
@@ -157,9 +156,7 @@ async fn an_invalid_grant_marks_a_dropbox_connection_dead() {
     let reply = h.proxy(&body).await;
     assert_eq!(reply.status, StatusCode::CONFLICT);
     assert_eq!(reply.code(), "reconnect_required");
-    let listed = h
-        .call("GET", &format!("/connections?member={MEMBER}"), None)
-        .await;
+    let listed = h.list(&member()).await;
     assert_eq!(listed.body["connections"][0]["dead"], true);
 
     let again = h.proxy(&body).await;
@@ -191,14 +188,8 @@ async fn a_download_of_exactly_the_cap_is_relayed_and_one_byte_more_is_too_large
 async fn disconnect_revokes_at_dropbox_with_a_fresh_access_token() {
     let Some(h) = harness().await else { return };
     let (id, consent) = h.connected_to("dropbox").await;
-    let reply = h
-        .call(
-            "DELETE",
-            &format!("/connections/{id}?member={MEMBER}"),
-            None,
-        )
-        .await;
-    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    let reply = h.disconnect(&member(), id).await;
+    assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(h.stored_token(id).await, None);
     let (paths, refreshed, revoked) = h.fake.with(|f| {
         let paths: Vec<String> = f.requests.iter().map(|(p, _)| p.clone()).collect();
@@ -226,14 +217,8 @@ async fn a_dropbox_revoke_that_fails_leaves_the_local_revocation_in_place() {
     let (id, _) = h.connected_to("dropbox").await;
     h.fake
         .with(|f| f.revoke_status = StatusCode::INTERNAL_SERVER_ERROR);
-    let reply = h
-        .call(
-            "DELETE",
-            &format!("/connections/{id}?member={MEMBER}"),
-            None,
-        )
-        .await;
-    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    let reply = h.disconnect(&member(), id).await;
+    assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(h.fake.with(|f| f.revoked_tokens().len()), 1);
     let mut body = dropbox_read(id, LIST_FOLDER);
     body["body"] = json!({ "path": "" });
@@ -247,10 +232,11 @@ async fn every_provider_mints_its_own_authorization_url() {
     let Some(h) = harness().await else { return };
     for provider in alpha_broker::oauth::PROVIDERS {
         let reply = h
-            .call(
+            .as_member(
+                &member(),
                 "POST",
                 &format!("/connect/{}", provider.name),
-                Some(json!({ "member": MEMBER })),
+                json!({ "op": "connect", "provider": provider.name }),
             )
             .await;
         let url = reqwest::Url::parse(reply.body["url"].as_str().unwrap()).unwrap();
@@ -266,7 +252,7 @@ async fn every_provider_mints_its_own_authorization_url() {
         assert_eq!(query["code_challenge_method"], "S256");
     }
 
-    let query = h.start("dropbox", MEMBER).await;
+    let query = h.start("dropbox", &member()).await;
     assert_eq!(query["client_id"], DROPBOX_CLIENT_ID);
     assert_eq!(query["token_access_type"], "offline");
     assert_eq!(query["response_type"], "code");

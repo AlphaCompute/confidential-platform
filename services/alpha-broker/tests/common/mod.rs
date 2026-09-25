@@ -2,7 +2,8 @@
 //! every provider's OAuth and data endpoints that the router's HTTP client reaches through their
 //! real host names, and a request helper that fails any test whose reply leaks a token, code,
 //! verifier or a client secret. The broker itself listens over mTLS on a real port, with a stand-in KMS CA
-//! issuing both its own leaf and the callers'.
+//! issuing both its own leaf and the callers'. Members are fixed P-256 keys that sign their
+//! requests as a page would and send them sealed on a channel opened against the broker's leaf.
 #![allow(
     dead_code,
     clippy::unwrap_used,
@@ -15,9 +16,11 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use alpha_broker::{AppState, Config, Secrets, oauth, router};
+use alpha_channel::frame::{Channel, RequestFrame};
+use alpha_channel::handshake::{Expected, Initiator, Responder, ServerHello};
 use alpha_client::tls::{Identity, Pin};
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::{DefaultBodyLimit, Form, Query, State};
@@ -28,6 +31,9 @@ use axum::{Json, Router};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::service::TowerToHyperService;
+use p256::ecdsa::SigningKey;
+use p256::ecdsa::signature::Signer;
+use p256::pkcs8::EncodePublicKey;
 use rcgen::string::Ia5String;
 use rcgen::{
     BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, SanType,
@@ -43,7 +49,6 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 pub const BEARER: &str = "connect-bearer-for-tests";
-pub const PROXY_BEARER: &str = "proxy-bearer-for-tests";
 pub const CLIENT_ID: &str = "corpus-test.apps.googleusercontent.com";
 pub const CLIENT_SECRET: &str = "client-secret-for-tests";
 pub const REDIRECT_URI: &str = "https://corpus.example/oauth/google/callback";
@@ -63,8 +68,8 @@ pub const NOTION_CLIENT_ID: &str = "notion-client-id-for-tests";
 pub const NOTION_REDIRECT_URI: &str = "https://corpus.example/oauth/notion/callback";
 pub const KEY: [u8; 32] = [9; 32];
 pub const EMAIL: &str = "member@example.com";
-pub const MEMBER: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-pub const OTHER_MEMBER: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+/// The compose the broker's leaf names as its Revision.
+pub const BROKER_COMPOSE: &str = r#"{"name":"alpha-broker"}"#;
 const HOSTS: [&str; 10] = [
     "accounts.google.com",
     "oauth2.googleapis.com",
@@ -86,6 +91,101 @@ pub const MCP_TOOLS: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name
 pub const MCP_SESSION: &str = "mcp-session-id";
 pub const MCP_RESULT: &str = r#"{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"results\":[{\"id\":\"101\"}]}"}],"isError":false}}"#;
 pub const DROPBOX_LISTING: &str = r#"{"entries":[{".tag":"file","name":"Notes.txt","id":"id:a1"}],"cursor":"c1","has_more":false}"#;
+
+/// A member: the P-256 key its browser holds.
+pub struct Member {
+    key: SigningKey,
+    pub spki: Vec<u8>,
+}
+
+impl Member {
+    fn from_seed(seed: u8) -> Self {
+        let key = SigningKey::from_slice(&[seed; 32]).unwrap();
+        let spki = key.verifying_key().to_public_key_der().unwrap().to_vec();
+        Member { key, spki }
+    }
+
+    pub fn key_b64(&self) -> String {
+        use base64::Engine;
+        base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(&self.spki)
+    }
+
+    pub fn sha256(&self) -> [u8; 32] {
+        use sha2::Digest;
+        sha2::Sha256::digest(&self.spki).into()
+    }
+
+    /// Signs a digest as WebCrypto does, `r‖s` in base64url.
+    pub fn sign(&self, digest: &[u8; 32]) -> String {
+        use base64::Engine;
+        let signature: p256::ecdsa::Signature = self.key.sign(digest);
+        base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(signature.to_bytes())
+    }
+}
+
+pub fn member() -> Member {
+    Member::from_seed(1)
+}
+
+pub fn other_member() -> Member {
+    Member::from_seed(2)
+}
+
+/// `{document, member_key, signature}` for `fields` under the connector request context, issued
+/// at `now`.
+pub fn signed_at(key: &Member, fields: Value, now: SystemTime) -> Value {
+    signed_under(alpha_core::context::CONNECTOR_REQUEST, key, fields, now)
+}
+
+fn signed_under(context: &str, key: &Member, fields: Value, now: SystemTime) -> Value {
+    let (document, digest) = alpha_channel::member::signable(context, fields, now).unwrap();
+    json!({
+        "document": serde_json::from_str::<Value>(&document).unwrap(),
+        "member_key": key.key_b64(),
+        "signature": { "algorithm": "ecdsa-p256", "signature": key.sign(&digest) },
+    })
+}
+
+pub fn signed(key: &Member, fields: Value) -> Value {
+    signed_at(key, fields, SystemTime::now())
+}
+
+/// `sha256:<hex>` of the SPKI of `identity`'s leaf: the `aud` of a grant for it.
+pub fn aud_of(identity: &Identity) -> String {
+    let spki = alpha_client::tls::spki_of(&identity.chain[0]).unwrap();
+    alpha_channel::sha256_label(&spki)
+}
+
+/// A grant's wire form, `base64url(JCS).base64url(r‖s)`, signed by `key` for the Instance `aud`
+/// over `connections`, issued at `issued_at` and ending at `exp`.
+pub fn grant_at(
+    key: &Member,
+    aud: &str,
+    connections: &[Uuid],
+    issued_at: SystemTime,
+    exp: SystemTime,
+) -> String {
+    use base64::Engine;
+    let (document, digest) = alpha_channel::member::signable(
+        alpha_core::context::CONNECTOR_GRANT,
+        json!({
+            "aud": aud,
+            "connections": connections,
+            "exp": chrono::DateTime::<chrono::Utc>::from(exp)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        }),
+        issued_at,
+    )
+    .unwrap();
+    let document = base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(document);
+    format!("{document}.{}", key.sign(&digest))
+}
+
+/// `grant_at` issued now for fifteen minutes.
+pub fn grant(key: &Member, aud: &str, connections: &[Uuid]) -> String {
+    let now = SystemTime::now();
+    grant_at(key, aud, connections, now, now + Duration::from_secs(900))
+}
 
 /// What the stand-in expects of one provider's client and how its tokens look.
 struct Client {
@@ -972,6 +1072,11 @@ impl Ca {
 
     /// A leaf carrying exactly `sans` as URI SANs, usable as a client and as a server.
     pub fn leaf(&self, sans: &[String]) -> Identity {
+        self.leaf_pem(sans).0
+    }
+
+    /// As `leaf`, with the leaf's PEM.
+    pub fn leaf_pem(&self, sans: &[String]) -> (Identity, String) {
         let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         let mut params = CertificateParams::default();
         params.subject_alt_names = sans
@@ -984,10 +1089,11 @@ impl Ca {
         ];
         let issuer = Issuer::from_ca_cert_der(self.cert.der(), &self.key).unwrap();
         let leaf = params.signed_by(&key, &issuer).unwrap();
-        Identity {
+        let identity = Identity {
             chain: vec![leaf.der().to_vec(), self.cert.der().to_vec()],
             pkcs8: key.serialize_der(),
-        }
+        };
+        (identity, leaf.pem())
     }
 
     pub fn instance(&self) -> Identity {
@@ -1018,8 +1124,7 @@ pub fn instance_client(ca: &Ca, identity: Option<Identity>) -> reqwest::Client {
 }
 
 /// Serves the router over the broker's own listener on an ephemeral port.
-async fn start_broker(ca: &Ca, app: Router) -> SocketAddr {
-    let own = ca.instance();
+async fn start_broker(ca: &Ca, own: Identity, app: Router) -> SocketAddr {
     let key = rustls::crypto::aws_lc_rs::default_provider()
         .key_provider
         .load_private_key(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(own.pkcs8)))
@@ -1053,12 +1158,16 @@ pub struct Harness {
     pub broker: SocketAddr,
     /// An attested Instance's client: a leaf from the broker's CA.
     pub instance: reqwest::Client,
+    /// The `aud` of a grant for that Instance.
+    pub aud: String,
+    /// Who a page expects the broker to be: its org, App and Revision.
+    pub expected: Expected,
+    own: Identity,
+    own_chain: Vec<String>,
 }
 
-pub async fn harness() -> Option<Harness> {
-    let pool = fresh_database().await?;
-    let fake = FakeProviders::start().await;
-    let config = Config::build(|name| match name {
+fn config() -> Config {
+    Config::build(|name| match name {
         "GOOGLE_CLIENT_ID" => Some(CLIENT_ID.into()),
         "DROPBOX_CLIENT_ID" => Some(DROPBOX_CLIENT_ID.into()),
         "SLACK_CLIENT_ID" => Some(SLACK_CLIENT_ID.into()),
@@ -1068,28 +1177,68 @@ pub async fn harness() -> Option<Harness> {
         "OAUTH_REDIRECT_BASE" => Some("https://corpus.example/oauth".into()),
         _ => None,
     })
-    .unwrap();
+    .unwrap()
+}
+
+/// The broker's state as it starts: no channels, nothing cached.
+fn app_state(
+    pool: &PgPool,
+    fake: &FakeProviders,
+    own: &Identity,
+    own_chain: &[String],
+) -> Arc<AppState> {
     let client_secrets = oauth::PROVIDERS
         .into_iter()
         .filter(|p| !matches!(p.client_auth, oauth::ClientAuth::Public))
         .map(|p| (p.name, client_of(p.name).secret.to_string().into()))
         .collect();
-    let state = Arc::new(AppState {
-        config,
+    let responder =
+        Responder::new(own_chain.to_vec(), &own.pkcs8, BROKER_COMPOSE.to_string()).unwrap();
+    Arc::new(AppState {
+        config: config(),
         secrets: parking_lot::RwLock::new(Secrets {
             client_secrets,
             connect_bearer: BEARER.as_bytes().to_vec().into(),
-            proxy_bearer: PROXY_BEARER.as_bytes().to_vec().into(),
             connectors_key: KEY.into(),
         }),
         pool: pool.clone(),
         http: fake.client(),
         tokens: Default::default(),
-    });
-    let app = router(state.clone());
+        responder: parking_lot::RwLock::new(responder),
+        channels: Default::default(),
+    })
+}
+
+pub async fn harness() -> Option<Harness> {
+    let pool = fresh_database().await?;
+    let fake = FakeProviders::start().await;
     let ca = Ca::new();
-    let broker = start_broker(&ca, app.clone()).await;
-    let instance = instance_client(&ca, Some(ca.instance()));
+    let (org_id, app_id) = (Uuid::now_v7(), Uuid::now_v7());
+    let revision = alpha_core::compose_hash(BROKER_COMPOSE);
+    let (own, leaf_pem) = ca.leaf_pem(&[
+        format!("alphacompute://{org_id}/{app_id}/{}", "b".repeat(64)),
+        format!("urn:alphacompute:revision:{revision}"),
+    ]);
+    let own_chain = vec![leaf_pem, ca.cert.pem()];
+    let expected = Expected {
+        org_id: org_id.to_string().parse().unwrap(),
+        app_id: app_id.to_string().parse().unwrap(),
+        revisions: vec![revision],
+    };
+    let state = app_state(&pool, &fake, &own, &own_chain);
+    let app = router(state.clone());
+    let broker = start_broker(
+        &ca,
+        Identity {
+            chain: own.chain.clone(),
+            pkcs8: own.pkcs8.clone(),
+        },
+        app.clone(),
+    )
+    .await;
+    let leaf = ca.instance();
+    let aud = aud_of(&leaf);
+    let instance = instance_client(&ca, Some(leaf));
     Some(Harness {
         state,
         pool,
@@ -1098,12 +1247,18 @@ pub async fn harness() -> Option<Harness> {
         ca,
         broker,
         instance,
+        aud,
+        expected,
+        own,
+        own_chain,
     })
 }
 
 pub struct Reply {
     pub status: StatusCode,
     pub body: Value,
+    /// Whether the body came sealed on the channel rather than as a plaintext refusal.
+    pub sealed: bool,
 }
 
 /// A `/proxy` reply: the provider's bytes are not always JSON.
@@ -1125,12 +1280,12 @@ impl Raw {
 }
 
 pub fn read(connection: Uuid, url: &str) -> Value {
-    json!({ "member": MEMBER, "connection_id": connection, "method": "GET", "url": url })
+    json!({ "connection_id": connection, "method": "GET", "url": url })
 }
 
 /// A `/proxy` body posting the JSON-RPC `body` to the MCP server at `url`.
 pub fn mcp_rpc(connection: Uuid, url: &str, body: Value) -> Value {
-    json!({ "member": MEMBER, "connection_id": connection, "method": "POST", "url": url, "body": body })
+    json!({ "connection_id": connection, "method": "POST", "url": url, "body": body })
 }
 
 pub fn mcp_call(connection: Uuid, url: &str, tool: &str) -> Value {
@@ -1140,31 +1295,61 @@ pub fn mcp_call(connection: Uuid, url: &str, tool: &str) -> Value {
 }
 
 pub fn dropbox_read(connection: Uuid, url: &str) -> Value {
-    json!({ "member": MEMBER, "connection_id": connection, "method": "POST", "url": url })
+    json!({ "connection_id": connection, "method": "POST", "url": url })
 }
 
-/// A `/write` body carrying `bytes` base64-encoded.
-pub fn upload(connection: Uuid, url: &str, content_type: &str, bytes: &[u8]) -> Value {
+/// The plaintext of a `/write`: `bytes` sent as `content_type` to `method url` on `connection`,
+/// in a document signed by `key` at `now`.
+pub fn export_at(
+    key: &Member,
+    connection: Uuid,
+    method: &str,
+    url: &str,
+    content_type: &str,
+    bytes: &[u8],
+    now: SystemTime,
+) -> Value {
     use base64::Engine;
-    json!({
-        "member": MEMBER,
+    let fields = json!({
         "connection_id": connection,
-        "method": "POST",
+        "method": method,
         "url": url,
-        "content_type": content_type,
-        "body_base64": base64::prelude::BASE64_STANDARD.encode(bytes),
-    })
+        "body_sha256": alpha_channel::sha256_label(bytes),
+    });
+    let mut plaintext = signed_under(alpha_core::context::CONNECTOR_WRITE, key, fields, now);
+    plaintext["content_type"] = json!(content_type);
+    plaintext["body_base64"] = json!(base64::prelude::BASE64_STANDARD.encode(bytes));
+    plaintext
+}
+
+/// A `POST` export by `member()`.
+pub fn upload(connection: Uuid, url: &str, content_type: &str, bytes: &[u8]) -> Value {
+    export_at(
+        &member(),
+        connection,
+        "POST",
+        url,
+        content_type,
+        bytes,
+        SystemTime::now(),
+    )
 }
 
 impl Harness {
-    /// One request through the router, with the connect bearer unless `bearer` says otherwise.
-    pub async fn call_as(
+    /// The broker as a restart leaves it: the same database, no channels.
+    pub fn restart(&mut self) {
+        self.state = app_state(&self.pool, &self.fake, &self.own, &self.own_chain);
+        self.app = router(self.state.clone());
+    }
+
+    /// One request through the router; fails the test if the reply carries a token or secret.
+    pub async fn send(
         &self,
         bearer: Option<&str>,
         method: &str,
         uri: &str,
-        body: Option<Value>,
-    ) -> Reply {
+        body: Option<String>,
+    ) -> (StatusCode, String) {
         let mut builder = Request::builder().method(method).uri(uri);
         if let Some(bearer) = bearer {
             builder = builder.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
@@ -1172,67 +1357,190 @@ impl Harness {
         let request = match body {
             Some(body) => builder
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(body.to_string())),
+                .body(Body::from(body)),
             None => builder.body(Body::empty()),
         }
         .unwrap();
         let response = self.app.clone().oneshot(request).await.unwrap();
         let status = response.status();
         let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-        let text = String::from_utf8_lossy(&bytes).to_string();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        self.assert_no_secret(&format!("{method} {uri}"), &text);
+        (status, text)
+    }
+
+    fn assert_no_secret(&self, what: &str, text: &str) {
         for secret in self.fake.with(|f| f.secrets()) {
-            assert!(
-                !text.contains(&secret),
-                "{method} {uri} answered a secret: {text}"
-            );
+            assert!(!text.contains(&secret), "{what} answered a secret: {text}");
         }
-        let body = if bytes.is_empty() {
+    }
+
+    /// One plaintext request, with the connect bearer unless `bearer` says otherwise.
+    pub async fn call_as(
+        &self,
+        bearer: Option<&str>,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> Reply {
+        let (status, text) = self
+            .send(bearer, method, uri, body.map(|b| b.to_string()))
+            .await;
+        let body = if text.is_empty() {
             Value::Null
         } else {
-            serde_json::from_slice(&bytes).unwrap()
+            serde_json::from_str(&text).unwrap()
         };
-        Reply { status, body }
+        Reply {
+            status,
+            body,
+            sealed: false,
+        }
     }
 
     pub async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Reply {
         self.call_as(Some(BEARER), method, uri, body).await
     }
 
-    /// Starts a connect to `provider` for `member` and returns the authorization URL's query.
-    pub async fn start(&self, provider: &str, member: &str) -> HashMap<String, String> {
+    /// A handshake through `POST /channel`, checked as a page checks it.
+    pub async fn channel(&self) -> Channel {
+        let (initiator, hello) = Initiator::new().unwrap();
         let reply = self
             .call(
                 "POST",
-                &format!("/connect/{provider}"),
-                Some(json!({ "member": member })),
+                "/channel",
+                Some(serde_json::to_value(&hello).unwrap()),
             )
             .await;
         assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        let hello: ServerHello = serde_json::from_value(reply.body).unwrap();
+        let (channel, _) = initiator
+            .finish(
+                &hello,
+                &self.ca.cert.pem(),
+                &self.expected,
+                SystemTime::now(),
+            )
+            .unwrap();
+        channel
+    }
+
+    /// Sends `frame` to `path` with the connect bearer and opens a sealed reply on `channel`;
+    /// a body starting with `{` is a plaintext refusal.
+    pub async fn send_frame(
+        &self,
+        channel: &Channel,
+        method: &str,
+        path: &str,
+        frame: &RequestFrame,
+    ) -> Reply {
+        let (status, text) = self
+            .send(
+                Some(BEARER),
+                method,
+                path,
+                Some(serde_json::to_string(frame).unwrap()),
+            )
+            .await;
+        if text.trim_start().starts_with('{') {
+            let body = serde_json::from_str(&text).unwrap();
+            return Reply {
+                status,
+                body,
+                sealed: false,
+            };
+        }
+        let mut reader = channel.response(frame.seq);
+        let mut opened = Vec::new();
+        for line in text.lines() {
+            if let Some(part) = reader.open_line(line).unwrap() {
+                opened.extend_from_slice(&part);
+            }
+        }
+        reader.finish().unwrap();
+        let opened = String::from_utf8(opened).unwrap();
+        self.assert_no_secret(&format!("{method} {path}"), &opened);
+        Reply {
+            status,
+            body: serde_json::from_str(&opened).unwrap(),
+            sealed: true,
+        }
+    }
+
+    /// `plaintext` sealed on `channel` for `method` and `path`, sent there.
+    pub async fn sealed(
+        &self,
+        channel: &mut Channel,
+        method: &str,
+        path: &str,
+        plaintext: &Value,
+    ) -> Reply {
+        let frame = channel
+            .seal_request(method, path, plaintext.to_string().as_bytes())
+            .unwrap();
+        self.send_frame(channel, method, path, &frame).await
+    }
+
+    /// `fields` signed by `key`, sealed on a new channel to `method path`.
+    pub async fn as_member(&self, key: &Member, method: &str, path: &str, fields: Value) -> Reply {
+        let mut channel = self.channel().await;
+        self.sealed(&mut channel, method, path, &signed(key, fields))
+            .await
+    }
+
+    /// Starts a connect to `provider` for `key` and returns the authorization URL's query.
+    pub async fn start(&self, provider: &str, key: &Member) -> HashMap<String, String> {
+        let reply = self
+            .as_member(
+                key,
+                "POST",
+                &format!("/connect/{provider}"),
+                json!({ "op": "connect", "provider": provider }),
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        assert!(reply.sealed);
         let url = reqwest::Url::parse(reply.body["url"].as_str().unwrap()).unwrap();
         url.query_pairs().into_owned().collect()
     }
 
-    pub async fn finish(&self, member: &str, code: &str, state: &str) -> Reply {
-        self.call(
+    pub async fn finish(&self, key: &Member, code: &str, state: &str) -> Reply {
+        self.as_member(
+            key,
             "POST",
             "/connect/finish",
-            Some(json!({ "member": member, "code": code, "state": state })),
+            json!({ "op": "finish", "state": state, "code": code }),
+        )
+        .await
+    }
+
+    pub async fn list(&self, key: &Member) -> Reply {
+        self.as_member(key, "POST", "/connections", json!({ "op": "list" }))
+            .await
+    }
+
+    pub async fn disconnect(&self, key: &Member, id: Uuid) -> Reply {
+        self.as_member(
+            key,
+            "DELETE",
+            &format!("/connections/{id}"),
+            json!({ "op": "disconnect", "connection_id": id }),
         )
         .await
     }
 
     /// A whole connect to Google as `email`; returns the finish reply and the consent behind it.
-    pub async fn connect(&self, member: &str, email: &str) -> (Reply, Consent) {
-        self.connect_to("google", member, email).await
+    pub async fn connect(&self, key: &Member, email: &str) -> (Reply, Consent) {
+        self.connect_to("google", key, email).await
     }
 
     pub async fn connect_to(
         &self,
         provider: &'static str,
-        member: &str,
+        key: &Member,
         email: &str,
     ) -> (Reply, Consent) {
-        self.connect_as(provider, member, &format!("subject-of-{email}"), email)
+        self.connect_as(provider, key, &format!("subject-of-{email}"), email)
             .await
     }
 
@@ -1240,15 +1548,15 @@ impl Harness {
     pub async fn connect_as(
         &self,
         provider: &'static str,
-        member: &str,
+        key: &Member,
         subject: &str,
         name: &str,
     ) -> (Reply, Consent) {
-        let query = self.start(provider, member).await;
+        let query = self.start(provider, key).await;
         let consent = self
             .fake
             .consent_on(provider, &query["code_challenge"], subject, name);
-        let reply = self.finish(member, &consent.code, &query["state"]).await;
+        let reply = self.finish(key, &consent.code, &query["state"]).await;
         (reply, consent)
     }
 
@@ -1304,20 +1612,50 @@ impl Harness {
         })
     }
 
-    /// From the attested Instance with the proxy bearer.
+    /// From the attested Instance, with a grant by `member()` for its leaf over the body's
+    /// connection unless the body carries a grant of its own.
     pub async fn proxy(&self, body: &Value) -> Raw {
-        self.post_with(&self.instance, Some(PROXY_BEARER), "/proxy", body)
+        let mut body = body.clone();
+        if let Some(fields) = body.as_object_mut()
+            && !fields.contains_key("grant")
+        {
+            let connection = fields
+                .get("connection_id")
+                .and_then(Value::as_str)
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .unwrap_or(Uuid::nil());
+            fields.insert("grant".into(), json!(self.grant(&[connection])));
+        }
+        self.post_with(&self.instance, None, "/proxy", &body)
             .await
             .unwrap()
     }
 
-    /// `POST /write` over the real listener with the connect bearer and no client certificate,
-    /// as the tenant's backend calls it.
-    pub async fn write(&self, body: &Value) -> Raw {
-        let backend = instance_client(&self.ca, None);
-        self.post_with(&backend, Some(BEARER), "/write", body)
-            .await
-            .unwrap()
+    /// A grant by `member()` for this harness's Instance over `connections`.
+    pub fn grant(&self, connections: &[Uuid]) -> String {
+        grant(&member(), &self.aud, connections)
+    }
+
+    /// `plaintext` sealed to `POST /write` on a new channel. A relayed answer comes back as the
+    /// provider's status, content type and bytes; a refusal as its status and error body.
+    pub async fn write(&self, plaintext: &Value) -> Raw {
+        use base64::Engine;
+        let mut channel = self.channel().await;
+        let reply = self.sealed(&mut channel, "POST", "/write", plaintext).await;
+        let (status, content_type, bytes) = match reply.body["body_base64"].as_str() {
+            Some(body) => (
+                StatusCode::from_u16(reply.body["status"].as_u64().unwrap() as u16).unwrap(),
+                reply.body["content_type"].as_str().map(str::to_owned),
+                base64::prelude::BASE64_STANDARD.decode(body).unwrap(),
+            ),
+            None => (reply.status, None, reply.body.to_string().into_bytes()),
+        };
+        Raw {
+            status,
+            content_type,
+            headers: HeaderMap::new(),
+            bytes,
+        }
     }
 
     /// Nothing reached a provider's data API and no token was refreshed.
@@ -1325,13 +1663,13 @@ impl Harness {
         self.fake.with(|f| f.data.is_empty() && f.refreshes() == 0)
     }
 
-    /// A connection of `MEMBER` to Google, made through the connect routes.
+    /// A connection of `member()` to Google, made through the connect routes.
     pub async fn connected(&self) -> (Uuid, Consent) {
         self.connected_to("google").await
     }
 
     pub async fn connected_to(&self, provider: &'static str) -> (Uuid, Consent) {
-        let (reply, consent) = self.connect_to(provider, MEMBER, EMAIL).await;
+        let (reply, consent) = self.connect_to(provider, &member(), EMAIL).await;
         assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
         (id_of(&reply), consent)
     }

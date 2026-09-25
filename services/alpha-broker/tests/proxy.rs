@@ -8,11 +8,13 @@
 
 mod common;
 
+use std::time::{Duration, SystemTime};
+
 use axum::http::StatusCode;
 use common::*;
 
 #[tokio::test]
-async fn an_instance_reads_drive_through_the_proxy_and_never_sees_a_token() {
+async fn a_chat_reads_drive_with_a_grant_for_its_own_leaf() {
     let Some(h) = harness().await else { return };
     let (id, _) = h.connected().await;
 
@@ -44,7 +46,7 @@ async fn a_caller_without_a_client_certificate_is_refused() {
     let (id, _) = h.connected().await;
     let anonymous = instance_client(&h.ca, None);
     let reply = h
-        .post_with(&anonymous, Some(PROXY_BEARER), "/proxy", &read(id, FILES))
+        .post_with(&anonymous, None, "/proxy", &read(id, FILES))
         .await
         .unwrap();
     assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
@@ -58,7 +60,7 @@ async fn a_leaf_from_another_ca_fails_the_handshake() {
     let (id, _) = h.connected().await;
     let stranger = instance_client(&h.ca, Some(Ca::new().instance()));
     assert!(
-        h.post_with(&stranger, Some(PROXY_BEARER), "/proxy", &read(id, FILES))
+        h.post_with(&stranger, None, "/proxy", &read(id, FILES))
             .await
             .is_err()
     );
@@ -76,7 +78,7 @@ async fn a_kms_node_leaf_is_refused() {
     let reply = h
         .post_with(
             &instance_client(&h.ca, Some(node)),
-            Some(PROXY_BEARER),
+            None,
             "/proxy",
             &read(id, FILES),
         )
@@ -88,26 +90,17 @@ async fn a_kms_node_leaf_is_refused() {
 }
 
 #[tokio::test]
-async fn each_bearer_opens_only_its_own_routes() {
+async fn a_bearer_without_a_grant_reads_nothing() {
     let Some(h) = harness().await else { return };
     let (id, _) = h.connected().await;
-    for bearer in [None, Some("wrong-bearer"), Some(BEARER)] {
+    for bearer in [None, Some("supervisor-bearer"), Some(BEARER)] {
         let reply = h
             .post_with(&h.instance, bearer, "/proxy", &read(id, FILES))
             .await
             .unwrap();
-        assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{bearer:?}");
-        assert_eq!(reply.code(), "unauthorized");
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{bearer:?}");
+        assert_eq!(reply.code(), "malformed");
     }
-    let listed = h
-        .call_as(
-            Some(PROXY_BEARER),
-            "GET",
-            &format!("/connections?member={MEMBER}"),
-            None,
-        )
-        .await;
-    assert_eq!(listed.status, StatusCode::UNAUTHORIZED);
     assert!(h.untouched());
 }
 
@@ -117,13 +110,16 @@ async fn a_malformed_body_is_refused() {
     let (id, _) = h.connected().await;
     let mut unknown = read(id, FILES);
     unknown["extra"] = serde_json::json!({});
-    let mut short_member = read(id, FILES);
-    short_member["member"] = serde_json::json!(&MEMBER[1..]);
+    let mut member_reference = read(id, FILES);
+    member_reference["member"] = serde_json::json!(hex::encode(member().sha256()));
+    let mut not_a_grant = read(id, FILES);
+    not_a_grant["grant"] = serde_json::json!("not-a-grant");
     let mut bad_id = read(id, FILES);
     bad_id["connection_id"] = serde_json::json!("not-a-uuid");
     for body in [
         unknown,
-        short_member,
+        member_reference,
+        not_a_grant,
         bad_id,
         read(id, "/drive/v3/files"),
         serde_json::json!("not an object"),
@@ -136,25 +132,22 @@ async fn a_malformed_body_is_refused() {
 }
 
 #[tokio::test]
-async fn an_unknown_revoked_or_foreign_connection_is_not_found() {
+async fn an_unknown_or_revoked_connection_is_not_found_and_a_foreign_one_is_not_granted() {
     let Some(h) = harness().await else { return };
     let (id, _) = h.connected().await;
-    let (foreign, _) = h.connect(OTHER_MEMBER, "other@example.com").await;
-    let (revoked, _) = h.connect(MEMBER, "second@example.com").await;
+    let (foreign, _) = h.connect(&other_member(), "other@example.com").await;
+    let (revoked, _) = h.connect(&member(), "second@example.com").await;
     let revoked = id_of(&revoked);
-    let gone = h
-        .call(
-            "DELETE",
-            &format!("/connections/{revoked}?member={MEMBER}"),
-            None,
-        )
-        .await;
-    assert_eq!(gone.status, StatusCode::NO_CONTENT);
-    for connection in [uuid::Uuid::now_v7(), revoked, id_of(&foreign)] {
+    let gone = h.disconnect(&member(), revoked).await;
+    assert_eq!(gone.status, StatusCode::OK);
+    for connection in [uuid::Uuid::now_v7(), revoked] {
         let reply = h.proxy(&read(connection, FILES)).await;
         assert_eq!(reply.status, StatusCode::NOT_FOUND, "{connection}");
         assert_eq!(reply.code(), "not_found");
     }
+    let reply = h.proxy(&read(id_of(&foreign), FILES)).await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    assert_eq!(reply.code(), "grant_invalid");
     assert!(h.untouched());
     assert_eq!(h.proxy(&read(id, FILES)).await.status, StatusCode::OK);
 }
@@ -206,9 +199,7 @@ async fn an_invalid_grant_marks_the_connection_dead_and_asks_for_a_reconnect() {
             .await
             .unwrap();
     assert!(dead);
-    let listed = h
-        .call("GET", &format!("/connections?member={MEMBER}"), None)
-        .await;
+    let listed = h.list(&member()).await;
     assert_eq!(listed.body["connections"][0]["dead"], true);
 
     let again = h.proxy(&read(id, FILES)).await;
@@ -408,14 +399,8 @@ async fn a_disconnect_drops_the_cached_token_and_a_refresh_drops_expired_ones() 
         [id]
     );
 
-    let gone = h
-        .call(
-            "DELETE",
-            &format!("/connections/{id}?member={MEMBER}"),
-            None,
-        )
-        .await;
-    assert_eq!(gone.status, StatusCode::NO_CONTENT);
+    let gone = h.disconnect(&member(), id).await;
+    assert_eq!(gone.status, StatusCode::OK);
     assert!(h.state.tokens.lock().is_empty());
 }
 
@@ -428,4 +413,189 @@ async fn a_request_body_over_two_mib_is_refused_before_google() {
     let reply = h.proxy(&body).await;
     assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
     assert!(h.untouched());
+}
+
+async fn refused(h: &Harness, body: serde_json::Value, status: StatusCode, code: &str) {
+    nothing_reaches(h, async {
+        let reply = h.proxy(&body).await;
+        assert_eq!(reply.status, status, "{body}");
+        assert_eq!(reply.code(), code, "{body}");
+    })
+    .await;
+}
+
+fn with_grant(id: uuid::Uuid, grant: String) -> serde_json::Value {
+    let mut body = read(id, FILES);
+    body["grant"] = serde_json::json!(grant);
+    body
+}
+
+#[tokio::test]
+async fn a_grant_signed_by_another_member_is_refused_before_google() {
+    let Some(h) = harness().await else { return };
+    let (id, _) = h.connected().await;
+    let foreign = grant(&other_member(), &h.aud, &[id]);
+    refused(
+        &h,
+        with_grant(id, foreign),
+        StatusCode::FORBIDDEN,
+        "grant_invalid",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_expired_grant_is_refused() {
+    let Some(h) = harness().await else { return };
+    let (id, _) = h.connected().await;
+    let now = SystemTime::now();
+    let expired = grant_at(
+        &member(),
+        &h.aud,
+        &[id],
+        now - Duration::from_secs(1200),
+        now - Duration::from_secs(1),
+    );
+    refused(
+        &h,
+        with_grant(id, expired),
+        StatusCode::FORBIDDEN,
+        "grant_expired",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_grant_longer_than_twelve_hours_issued_ahead_or_ending_before_issue_is_refused() {
+    let Some(h) = harness().await else { return };
+    let (id, _) = h.connected().await;
+    let now = SystemTime::now();
+    let twelve_hours = Duration::from_secs(12 * 3600);
+    let overlong = grant_at(
+        &member(),
+        &h.aud,
+        &[id],
+        now,
+        now + twelve_hours + Duration::from_secs(1),
+    );
+    let ahead = now + Duration::from_secs(120);
+    let early = grant_at(
+        &member(),
+        &h.aud,
+        &[id],
+        ahead,
+        ahead + Duration::from_secs(600),
+    );
+    let backwards = grant_at(
+        &member(),
+        &h.aud,
+        &[id],
+        now + Duration::from_secs(30),
+        now + Duration::from_secs(10),
+    );
+    for grant in [overlong, early, backwards] {
+        refused(
+            &h,
+            with_grant(id, grant),
+            StatusCode::FORBIDDEN,
+            "grant_expired",
+        )
+        .await;
+    }
+    let longest = grant_at(&member(), &h.aud, &[id], now, now + twelve_hours);
+    assert_eq!(
+        h.proxy(&with_grant(id, longest)).await.status,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn a_grant_presented_by_another_instance_is_refused() {
+    let Some(h) = harness().await else { return };
+    let (id, _) = h.connected().await;
+    let second = h.ca.instance();
+    let for_second = grant(&member(), &aud_of(&second), &[id]);
+    let other_client = instance_client(&h.ca, Some(second));
+    nothing_reaches(&h, async {
+        let reply = h
+            .post_with(
+                &other_client,
+                None,
+                "/proxy",
+                &with_grant(id, h.grant(&[id])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply.status, StatusCode::FORBIDDEN);
+        assert_eq!(reply.code(), "grant_invalid");
+    })
+    .await;
+    refused(
+        &h,
+        with_grant(id, for_second),
+        StatusCode::FORBIDDEN,
+        "grant_invalid",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_grant_for_another_connection_of_the_member_is_refused() {
+    let Some(h) = harness().await else { return };
+    let (named, _) = h.connected().await;
+    let (other, _) = h.connect(&member(), "second@example.com").await;
+    refused(
+        &h,
+        with_grant(id_of(&other), h.grant(&[named])),
+        StatusCode::FORBIDDEN,
+        "grant_invalid",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_grant_naming_a_disconnected_connection_is_not_found() {
+    let Some(h) = harness().await else { return };
+    let (id, _) = h.connected().await;
+    let (gone, _) = h.connect(&member(), "second@example.com").await;
+    let gone = id_of(&gone);
+    assert_eq!(h.disconnect(&member(), gone).await.status, StatusCode::OK);
+    refused(
+        &h,
+        with_grant(id, h.grant(&[id, gone])),
+        StatusCode::NOT_FOUND,
+        "not_found",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_grant_naming_two_members_connections_is_refused() {
+    let Some(h) = harness().await else { return };
+    let (mine, _) = h.connected().await;
+    let (theirs, _) = h.connect(&other_member(), "other@example.com").await;
+    refused(
+        &h,
+        with_grant(mine, h.grant(&[mine, id_of(&theirs)])),
+        StatusCode::FORBIDDEN,
+        "grant_invalid",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_grant_naming_no_or_more_than_sixteen_connections_is_malformed() {
+    let Some(h) = harness().await else { return };
+    let (id, _) = h.connected().await;
+    let mut seventeen = vec![id];
+    seventeen.extend((0..16).map(|_| uuid::Uuid::now_v7()));
+    for connections in [vec![], seventeen] {
+        refused(
+            &h,
+            with_grant(id, h.grant(&connections)),
+            StatusCode::BAD_REQUEST,
+            "malformed",
+        )
+        .await;
+    }
 }

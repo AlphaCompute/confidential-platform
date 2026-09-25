@@ -1,4 +1,5 @@
-//! Sealing under the connectors key, and every query on `pending_connects` and `connections`.
+//! Sealing under the connectors key, and every query on `pending_connects`, `connections` and
+//! `member_nonces`.
 //! Queries are checked at run time by the db tests; the broker's migrations live in their own
 //! database and never meet the KMS's.
 
@@ -42,22 +43,39 @@ pub async fn purge_expired(pool: &PgPool) -> Result<(), Error> {
     sqlx::query("delete from pending_connects where exp < now()")
         .execute(pool)
         .await?;
+    sqlx::query("delete from member_nonces where exp < now()")
+        .execute(pool)
+        .await?;
     Ok(())
+}
+
+/// Records a signed request's nonce; false when it was recorded before. It is kept for two
+/// minutes, past the last moment its document is fresh even with `issued_at` a minute ahead.
+pub async fn use_nonce(pool: &PgPool, nonce: &[u8]) -> Result<bool, Error> {
+    let inserted: Option<bool> = sqlx::query_scalar(
+        "insert into member_nonces (nonce, exp) values ($1, now() + interval '2 minutes')
+         on conflict do nothing
+         returning true",
+    )
+    .bind(nonce)
+    .fetch_optional(pool)
+    .await?;
+    Ok(inserted.is_some())
 }
 
 pub async fn insert_pending(
     pool: &PgPool,
     state: &str,
-    member: &[u8; 32],
+    member: &[u8],
     provider: &str,
     enc_pkce_verifier: &[u8],
 ) -> Result<(), Error> {
     sqlx::query(
-        "insert into pending_connects (state, member_key_sha256, provider, enc_pkce_verifier, exp)
+        "insert into pending_connects (state, member_key, provider, enc_pkce_verifier, exp)
          values ($1, $2, $3, $4, now() + interval '10 minutes')",
     )
     .bind(state)
-    .bind(member.as_slice())
+    .bind(member)
     .bind(provider)
     .bind(enc_pkce_verifier)
     .execute(pool)
@@ -77,7 +95,7 @@ pub struct Pending {
 pub async fn take_pending(pool: &PgPool, state: &str) -> Result<Option<Pending>, Error> {
     Ok(sqlx::query_as(
         "delete from pending_connects where state = $1
-         returning member_key_sha256 as member, provider, enc_pkce_verifier, exp > now() as live",
+         returning member_key as member, provider, enc_pkce_verifier, exp > now() as live",
     )
     .bind(state)
     .fetch_optional(pool)
@@ -90,7 +108,7 @@ pub async fn take_pending(pool: &PgPool, state: &str) -> Result<Option<Pending>,
 pub async fn save_connection(
     pool: &PgPool,
     key: &[u8; 32],
-    member: &[u8; 32],
+    member: &[u8],
     provider: &str,
     account: &oauth::Account,
     refresh_token: &str,
@@ -107,10 +125,10 @@ pub async fn save_connection(
         .await?;
     let existing: Option<Uuid> = sqlx::query_scalar(
         "select id from connections
-         where member_key_sha256 = $1 and provider = $2 and subject = $3 and revoked_at is null
+         where member_key = $1 and provider = $2 and subject = $3 and revoked_at is null
          for update",
     )
-    .bind(member.as_slice())
+    .bind(member)
     .bind(provider)
     .bind(&account.subject)
     .fetch_optional(&mut *tx)
@@ -118,20 +136,21 @@ pub async fn save_connection(
     let (id, new) = existing.map_or((Uuid::now_v7(), true), |id| (id, false));
     let sealed = seal(key, id.as_bytes(), refresh_token.as_bytes())?;
     let statement = if new {
-        "insert into connections (id, member_key_sha256, provider, subject, account, enc_refresh_token, scopes)
-         values ($1, $2, $3, $4, $5, $6, $7)"
+        "insert into connections
+           (id, member_key, provider, subject, account, enc_refresh_token, scopes)
+         values ($1, $7, $2, $3, $4, $5, $6)"
     } else {
-        "update connections set account = $5, enc_refresh_token = $6, scopes = $7, dead_at = null
+        "update connections set account = $4, enc_refresh_token = $5, scopes = $6, dead_at = null
          where id = $1"
     };
     sqlx::query(statement)
         .bind(id)
-        .bind(member.as_slice())
         .bind(provider)
         .bind(&account.subject)
         .bind(&account.email)
         .bind(sealed)
         .bind(scopes)
+        .bind(member)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -146,13 +165,13 @@ pub struct Connection {
     pub dead: bool,
 }
 
-pub async fn list_connections(pool: &PgPool, member: &[u8; 32]) -> Result<Vec<Connection>, Error> {
+pub async fn list_connections(pool: &PgPool, member: &[u8]) -> Result<Vec<Connection>, Error> {
     Ok(sqlx::query_as(
         "select id, provider, account, dead_at is not null as dead from connections
-         where member_key_sha256 = $1 and revoked_at is null
+         where member_key = $1 and revoked_at is null
          order by created_at, id",
     )
-    .bind(member.as_slice())
+    .bind(member)
     .fetch_all(pool)
     .await?)
 }
@@ -164,7 +183,7 @@ pub async fn list_connections(pool: &PgPool, member: &[u8; 32]) -> Result<Vec<Co
 pub async fn revoke_connection(
     pool: &PgPool,
     id: Uuid,
-    member: &[u8; 32],
+    member: &[u8],
 ) -> Result<Option<(String, Vec<u8>, bool)>, Error> {
     let mut tx = pool.begin().await?;
     // Two members disconnecting one account at once would each see the other still live and
@@ -172,19 +191,19 @@ pub async fn revoke_connection(
     sqlx::query(
         "select o.id from connections o
          join connections c on c.provider = o.provider and c.subject = o.subject
-         where c.id = $1 and c.member_key_sha256 = $2 and c.revoked_at is null
+         where c.id = $1 and c.member_key = $2 and c.revoked_at is null
            and o.revoked_at is null
          order by o.id
          for update of o",
     )
     .bind(id)
-    .bind(member.as_slice())
+    .bind(member)
     .execute(&mut *tx)
     .await?;
     let revoked = sqlx::query_as(
         "with prior as (
            select id, provider, subject, enc_refresh_token from connections
-           where id = $1 and member_key_sha256 = $2 and revoked_at is null
+           where id = $1 and member_key = $2 and revoked_at is null
          )
          update connections c set revoked_at = now(), enc_refresh_token = null
          from prior where c.id = prior.id
@@ -195,7 +214,7 @@ pub async fn revoke_connection(
          )",
     )
     .bind(id)
-    .bind(member.as_slice())
+    .bind(member)
     .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -205,15 +224,25 @@ pub async fn revoke_connection(
 pub async fn load_connection(
     pool: &PgPool,
     id: Uuid,
-    member: &[u8; 32],
+    member: &[u8],
 ) -> Result<Option<(String, bool)>, Error> {
     Ok(sqlx::query_as(
         "select provider, dead_at is not null as dead from connections
-         where id = $1 and member_key_sha256 = $2 and revoked_at is null",
+         where id = $1 and member_key = $2 and revoked_at is null",
     )
     .bind(id)
-    .bind(member.as_slice())
+    .bind(member)
     .fetch_optional(pool)
+    .await?)
+}
+
+/// The member key of each listed connection that is live; a missing id is revoked or unknown.
+pub async fn load_grant_keys(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<(Uuid, Vec<u8>)>, Error> {
+    Ok(sqlx::query_as(
+        "select id, member_key from connections where id = any($1) and revoked_at is null",
+    )
+    .bind(ids)
+    .fetch_all(pool)
     .await?)
 }
 

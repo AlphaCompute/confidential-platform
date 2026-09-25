@@ -25,7 +25,10 @@ use uuid::Uuid;
 use crate::{ECDSA_P256, Error, NamedSignature, p256_signature, random, rfc3339, unix_seconds};
 
 /// How far a request's `issued_at` may be from the verifier's clock, either way.
-const FRESHNESS_SECONDS: u64 = 60;
+const FRESHNESS_SECONDS: i64 = 60;
+
+/// The longest a grant may last from its `issued_at`.
+const MAX_GRANT_SECONDS: i64 = 12 * 3600;
 
 /// `v`: every document here is version 1, and any other value does not parse.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,15 +180,15 @@ fn check(key: &VerifyingKey, digest: &[u8; 32], signature: &Signature) -> Result
 
 /// Checks `signature` over `document` under `context` by the key `member_key_b64` (base64url SPKI
 /// DER), then reads the document as that context's request or write and checks its freshness
-/// against `now`. Returns the SHA-256 of the SPKI and the document; whether its nonce was seen
-/// before is the caller's.
+/// against `now`. Returns the SPKI and the document; whether its nonce was seen before is the
+/// caller's.
 pub fn verify_request(
     context: &str,
     document: &Value,
     member_key_b64: &str,
     signature: &NamedSignature,
     now: SystemTime,
-) -> Result<([u8; 32], MemberDocument), Error> {
+) -> Result<(Vec<u8>, MemberDocument), Error> {
     if signature.algorithm != ECDSA_P256 {
         return Err(invalid("algorithm is not ecdsa-p256"));
     }
@@ -213,7 +216,7 @@ pub fn verify_request(
     }
     .map_err(|e| Error::Malformed(format!("document: {e}")))?;
     check_fresh(parsed.nonce_and_issued_at().1, now)?;
-    Ok((Sha256::digest(&spki).into(), parsed))
+    Ok((spki, parsed))
 }
 
 /// A grant as received: the JCS bytes that were signed, and the signature.
@@ -251,14 +254,37 @@ impl SignedGrant {
     }
 }
 
+fn seconds(name: &str, text: &str) -> Result<i64, Error> {
+    DateTime::parse_from_rfc3339(text)
+        .map(|t| t.timestamp())
+        .map_err(|_| Error::Malformed(format!("{name} is not RFC 3339")))
+}
+
 /// Refuses an `issued_at` more than a minute away from `now`, the verifier's clock.
 pub fn check_fresh(issued_at: &str, now: SystemTime) -> Result<(), Error> {
-    let issued_at = DateTime::parse_from_rfc3339(issued_at)
-        .map_err(|_| Error::Malformed("issued_at is not RFC 3339".into()))?;
-    if issued_at.timestamp().abs_diff(unix_seconds(now)?) > FRESHNESS_SECONDS {
+    let issued_at = seconds("issued_at", issued_at)?;
+    if issued_at.abs_diff(unix_seconds(now)?) > FRESHNESS_SECONDS.unsigned_abs() {
         return Err(Error::RequestStale);
     }
     Ok(())
+}
+
+impl Grant {
+    /// Refuses a grant issued more than a minute after `now`, expired at `now`, ending before it
+    /// is issued, or lasting longer than twelve hours.
+    pub fn check_window(&self, now: SystemTime) -> Result<(), Error> {
+        let now = unix_seconds(now)?;
+        let issued_at = seconds("issued_at", &self.issued_at)?;
+        let exp = seconds("exp", &self.exp)?;
+        if issued_at > now.saturating_add(FRESHNESS_SECONDS)
+            || now >= exp
+            || exp <= issued_at
+            || exp > issued_at.saturating_add(MAX_GRANT_SECONDS)
+        {
+            return Err(Error::GrantExpired);
+        }
+        Ok(())
+    }
 }
 
 /// The document to sign under one of the member contexts, `fields` plus `v`, a fresh 32-byte
