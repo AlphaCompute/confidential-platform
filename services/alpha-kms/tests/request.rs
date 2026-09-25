@@ -12,12 +12,13 @@
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use alpha_cli::request::{Call, send_to};
+use alpha_cli::deploy::Shroud;
+use alpha_cli::request::{Call, Target, run, send_to};
 use alpha_core::{AppId, ComposeHash, OrgId, compose_hash};
 use alpha_kms::certs;
 use alpha_kms::tls::{self, ServerCert};
 use axum::http::HeaderMap;
-use axum::routing::put;
+use axum::routing::{get, put};
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, PublicKeyData};
 use reqwest::Method;
 use serde_json::{Value, json};
@@ -88,6 +89,27 @@ impl Ca {
     }
 }
 
+/// shroud-go listing `copies` as `(id, url)` of the App's one Revision.
+async fn shroud(app: AppId, hash: ComposeHash, copies: &[(&str, &str)]) -> Shroud {
+    let list = json!({ "instances": copies.iter().map(|(id, url)| json!({
+        "id": id,
+        "app_id": app.to_string(),
+        "compose_hash": hash.to_string(),
+        "url": url,
+    })).collect::<Vec<_>>() });
+    let router = axum::Router::new().route(
+        &format!("/v1/apps/{app}/instances"),
+        get(move || async move { axum::Json(list) }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await });
+    Shroud {
+        url,
+        api_key: "sk_test_organization".into(),
+    }
+}
+
 fn call(body: &Value) -> Call<'_> {
     Call {
         method: Method::PUT,
@@ -143,5 +165,65 @@ async fn a_leaf_from_another_ca_never_sees_the_bearer() {
         .unwrap_err();
 
     assert!(message.contains("no Instance leaf"), "{message}");
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+const FIRST: &str = "0199a1b2-0000-7000-8000-000000000001";
+const SECOND: &str = "0199a1b2-0000-7000-8000-000000000002";
+const FOREIGN: &str = "0199a1b2-0000-7000-8000-000000000003";
+
+#[tokio::test]
+async fn all_reaches_every_copy_and_reports_each() {
+    let ca = Ca::new();
+    let app = AppId::mint();
+    let hash = compose_hash("{\"name\":\"worker\"}");
+    let (first, first_seen) = ca.instance_serving(app, hash).await;
+    let (second, second_seen) = ca.instance_serving(app, hash).await;
+    let (foreign, foreign_seen) = ca.instance_serving(AppId::mint(), hash).await;
+    let shroud = shroud(
+        app,
+        hash,
+        &[(FIRST, &first), (FOREIGN, &foreign), (SECOND, &second)],
+    )
+    .await;
+    let body = json!({ "k": 2 });
+
+    let out = run(&shroud, app, Target::All, &ca.pem(), &call(&body))
+        .await
+        .unwrap();
+
+    let responses = out["responses"].as_array().unwrap();
+    assert_eq!(responses.len(), 3);
+    assert_eq!(responses[0]["instance"], FIRST);
+    assert_eq!(responses[0]["status"], 200);
+    assert_eq!(responses[1]["instance"], FOREIGN);
+    assert!(responses[1]["error"].is_string(), "{out}");
+    assert_eq!(responses[2]["instance"], SECOND);
+    assert_eq!(responses[2]["body"], json!({ "ok": true }));
+    let once = [format!("Bearer {BEARER} {body}")];
+    assert_eq!(*first_seen.lock().unwrap(), once);
+    assert_eq!(*second_seen.lock().unwrap(), once);
+    assert!(foreign_seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_unlisted_copy_is_refused_before_any_connection() {
+    let ca = Ca::new();
+    let app = AppId::mint();
+    let hash = compose_hash("{\"name\":\"worker\"}");
+    let (url, seen) = ca.instance_serving(app, hash).await;
+    let shroud = shroud(app, hash, &[(FIRST, &url)]).await;
+
+    let message = run(
+        &shroud,
+        app,
+        Target::One(SECOND.parse().unwrap()),
+        &ca.pem(),
+        &call(&json!({})),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(message.contains(SECOND), "{message}");
     assert!(seen.lock().unwrap().is_empty());
 }
