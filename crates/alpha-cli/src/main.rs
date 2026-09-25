@@ -7,10 +7,10 @@ use alpha_attest::PlatformDocument;
 use alpha_cli::call::Route;
 use alpha_cli::deploy::Shroud;
 use alpha_cli::keyfile::{self, Algorithm};
-use alpha_cli::{node, sign};
+use alpha_cli::{instances, node, sign};
 use alpha_client::platform::SignedDocument;
 use alpha_client::{Client, Pin};
-use alpha_core::{KeyId, OrgId, PrincipalId};
+use alpha_core::{AppId, KeyId, OrgId, PrincipalId};
 use alpha_crypto::PublicKey;
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
@@ -126,8 +126,8 @@ enum Command {
         /// Register the Revision and stop before shroud-go.
         #[arg(long)]
         register_only: bool,
-        /// After deploying, probe the App's Endpoint for this many seconds and fail unless an
-        /// Instance answers with a leaf from the KMS CA naming this Revision.
+        /// After deploying, probe every copy shroud-go returned, all within this many seconds,
+        /// and fail unless each answers with a leaf from the KMS CA naming this Revision.
         #[arg(long, value_name = "SECONDS")]
         wait: Option<u64>,
         #[arg(long)]
@@ -135,6 +135,13 @@ enum Command {
         #[arg(long)]
         key_id: KeyId,
         app: PathBuf,
+    },
+    /// An App's running copies through shroud-go.
+    Instances {
+        #[arg(long)]
+        app: AppId,
+        #[command(subcommand)]
+        command: InstancesCommand,
     },
     /// Hand one custodian's share to an attested sealed node.
     Unseal {
@@ -153,6 +160,35 @@ enum Command {
         custodians: Vec<PathBuf>,
         #[arg(long)]
         endpoint: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum InstancesCommand {
+    /// The App's live copies, running and draining.
+    List,
+    /// Start one more copy of the App's current Revision.
+    Add {
+        /// The copy's CPU count; defaults to the shape of the last deploy.
+        #[arg(long, requires = "memory_mib")]
+        cpu: Option<u64>,
+        #[arg(long, requires = "cpu")]
+        memory_mib: Option<u64>,
+        /// Probe the new copy's Endpoint for this many seconds and fail unless it answers with
+        /// a leaf from the KMS CA naming the App's Revision.
+        #[arg(long, value_name = "SECONDS")]
+        wait: Option<u64>,
+    },
+    /// Stop one copy: drain it by default, so its chats finish first.
+    Stop {
+        instance: uuid::Uuid,
+        /// Delete the copy now, ending its chats.
+        #[arg(long, conflicts_with = "drain_seconds")]
+        force: bool,
+        /// How long the copy may drain before shroud-go stops it; shroud-go's default is an
+        /// hour.
+        #[arg(long, value_name = "SECONDS")]
+        drain_seconds: Option<u64>,
     },
 }
 
@@ -326,6 +362,37 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let wait = wait.map(|secs| (Duration::from_secs(secs), doc.kms_ca_pem.as_str()));
             Ok(alpha_cli::deploy::run(&client, &spec, key_id, &key, shroud.as_ref(), wait).await?)
         }
+        Command::Instances { app, command } => {
+            let shroud = Shroud {
+                url: need(config.shroud_url.clone(), "shroud-url")?,
+                api_key: need(config.shroud_api_key.clone(), "shroud-api-key")?,
+            };
+            match command {
+                InstancesCommand::List => Ok(instances::list(&shroud, app).await?),
+                InstancesCommand::Add {
+                    cpu,
+                    memory_mib,
+                    wait,
+                } => {
+                    let resources = cpu
+                        .zip(memory_mib)
+                        .map(|(cpu, memory_mib)| json!({ "cpu": cpu, "memory_mib": memory_mib }));
+                    let doc = match wait {
+                        Some(_) => Some(platform_document(config, now).await?),
+                        None => None,
+                    };
+                    let wait = wait
+                        .zip(doc.as_ref())
+                        .map(|(s, d)| (Duration::from_secs(s), d.kms_ca_pem.as_str()));
+                    Ok(instances::add(&shroud, app, resources, wait).await?)
+                }
+                InstancesCommand::Stop {
+                    instance,
+                    force,
+                    drain_seconds,
+                } => Ok(instances::stop(&shroud, app, instance, force, drain_seconds).await?),
+            }
+        }
         Command::Unseal {
             share,
             key,
@@ -383,5 +450,34 @@ async fn main() {
             eprintln!("alpha: {message}");
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::Cli;
+
+    #[test]
+    fn stop_takes_force_or_a_drain_not_both() {
+        let stop = |flags: &[&str]| {
+            let args = [
+                "alpha",
+                "instances",
+                "--app",
+                "0199a1b2-0000-7000-8000-000000000001",
+            ];
+            Cli::try_parse_from(
+                args.iter()
+                    .chain(&["stop", "0199a1b2-0000-7000-8000-000000000002"])
+                    .chain(flags),
+            )
+            .is_ok()
+        };
+        assert!(stop(&[]));
+        assert!(stop(&["--force"]));
+        assert!(stop(&["--drain-seconds", "60"]));
+        assert!(!stop(&["--force", "--drain-seconds", "60"]));
     }
 }
