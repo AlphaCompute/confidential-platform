@@ -116,6 +116,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "alpha-attest",
+ "alpha-channel",
  "alpha-client",
  "alpha-core",
  "alpha-crypto",
@@ -142,11 +143,11 @@ name = "alpha-client"
 version = "0.1.0"
 dependencies = [
  "alpha-attest",
+ "alpha-channel",
  "alpha-core",
  "alpha-crypto",
  "axum",
  "base64 0.23.1",
- "chrono",
  "ed25519-dalek 3.0.0",
  "http-body-util",
  "hyper",

@@ -53,6 +53,12 @@ pub enum Error {
     Invalid(String),
 }
 
+impl From<alpha_channel::Error> for Error {
+    fn from(e: alpha_channel::Error) -> Self {
+        Error::Invalid(e.to_string())
+    }
+}
+
 #[derive(Debug, Deserialize, thiserror::Error)]
 #[error("{code}: {message} (request {request_id})")]
 pub struct ApiError {

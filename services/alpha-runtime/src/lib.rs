@@ -309,7 +309,7 @@ impl Runtime {
         let [leaf, ca] = chain.as_slice() else {
             return Err(Error::Certificate("chain is not [leaf, ca]".into()));
         };
-        if tls::spki_of(leaf)? != self.spki {
+        if tls::spki_of(leaf).map_err(alpha_client::Error::from)? != self.spki {
             return Err(Error::Certificate(
                 "leaf is not over the runtime key".into(),
             ));
@@ -319,7 +319,9 @@ impl Runtime {
                 "chain does not end at the pinned ca".into(),
             ));
         }
-        let identity = tls::parse_instance_sans(&tls::uri_sans(leaf)?)?;
+        let identity = tls::uri_sans(leaf)
+            .and_then(|sans| tls::parse_instance_sans(&sans))
+            .map_err(alpha_client::Error::from)?;
         let not_after = chrono::DateTime::parse_from_rfc3339(&reply.not_after)
             .map_err(|e| Error::Certificate(format!("not_after: {e}")))?
             .into();
