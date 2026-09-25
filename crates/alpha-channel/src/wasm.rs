@@ -98,10 +98,7 @@ impl Initiator {
             "compose": v.compose,
             "now": rfc3339(v.now).map_err(js)?,
         }))?);
-        Ok(Channel {
-            inner: channel,
-            last_seq: None,
-        })
+        Ok(Channel { inner: channel })
     }
 
     /// What `finish` verified, as JSON; `aud` and `kms_ca_sha256` are hex, times RFC 3339.
@@ -116,12 +113,11 @@ impl Initiator {
 #[wasm_bindgen]
 pub struct Channel {
     inner: frame::Channel,
-    last_seq: Option<u32>,
 }
 
 #[wasm_bindgen]
 impl Channel {
-    /// The request frame JSON for `body` on `method` and `path`.
+    /// The request frame JSON for `body` on `method` and `path`; its `seq` names the response.
     #[wasm_bindgen(js_name = sealRequest)]
     pub fn seal_request(
         &mut self,
@@ -129,15 +125,7 @@ impl Channel {
         path: &str,
         body: &[u8],
     ) -> Result<String, JsError> {
-        let frame = self.inner.seal_request(method, path, body).map_err(js)?;
-        self.last_seq = Some(u32::try_from(frame.seq).map_err(|_| js(Error::Exhausted))?);
-        to_json(&frame)
-    }
-
-    /// The sequence number of the last sealed request.
-    #[wasm_bindgen(js_name = lastSeq)]
-    pub fn last_seq(&self) -> Option<u32> {
-        self.last_seq
+        to_json(&self.inner.seal_request(method, path, body).map_err(js)?)
     }
 
     pub fn response(&self, seq: u32) -> ResponseReader {
@@ -279,14 +267,14 @@ pub fn verify_member_request(
 ) -> Result<String, JsError> {
     let document: serde_json::Value = parse("document", document_json)?;
     let signature: member::MemberSignature = parse("signature", signature_json)?;
-    let signer =
+    let key_sha256 =
         member::verify_request(context, &document, member_key_b64, &signature).map_err(js)?;
     let issued_at = document
         .get("issued_at")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| js(Error::Malformed("issued_at is missing".into())))?;
     member::check_fresh(issued_at, at(now_ms)?).map_err(js)?;
-    Ok(hex::encode(signer.key_sha256))
+    Ok(hex::encode(key_sha256))
 }
 
 /// The grant JSON, once `wire` verifies under the base64url SPKI `spki_b64`.

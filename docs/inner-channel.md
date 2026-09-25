@@ -191,8 +191,9 @@ Every export returns an error rather than trapping, and the error's message star
 `expectedJson` is `{org_id, app_id, revisions}`. After `finish`, `verified()` returns what was
 verified as JSON, with `aud` and `kms_ca_sha256` in hex and the times in RFC 3339.
 
-A `Channel` offers `sealRequest(method, path, body)`, `lastSeq()` and `response(seq)`. The
-`ResponseReader` that `response` returns offers `openLine(line)` and `finish()`.
+A `Channel` offers `sealRequest(method, path, body)`, whose frame's `seq` names the response,
+and `response(seq)`. The `ResponseReader` that `response` returns offers `openLine(line)` and
+`finish()`.
 
 A tenant's server uses `new Responder(chainPem, pkcs8, compose)`. Its `respond(clientHelloJson,
 nowMs)` returns the ServerHello, and `channel()` returns a `ServerChannel`, which offers

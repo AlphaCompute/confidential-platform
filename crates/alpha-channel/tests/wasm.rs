@@ -79,7 +79,9 @@ fn the_exported_initiator_and_responder_share_a_channel() {
         .seal_request("POST", "/sessions", b"{}")
         .map_err(message)
         .unwrap();
-    let seq = client.last_seq().unwrap();
+    let seq = serde_json::from_str::<Value>(&frame).unwrap()["seq"]
+        .as_u64()
+        .unwrap() as u32;
     let body = server
         .open_request(&frame, "POST", "/sessions")
         .map_err(message)

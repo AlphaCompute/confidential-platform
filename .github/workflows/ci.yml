@@ -19,7 +19,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p alpha-channel --target wasm32-unknown-unknown --all-targets -- -D warnings
       - run: cargo test --workspace
-      # The CLI must be the crate's exact wasm-bindgen version, or the glue refuses the module.
+      # The same CLI version build-web.sh requires, so the tests run the glue a page loads.
       - run: cargo install wasm-bindgen-cli --version 0.2.128 --locked
       - run: cargo test -p alpha-channel --target wasm32-unknown-unknown
         env:

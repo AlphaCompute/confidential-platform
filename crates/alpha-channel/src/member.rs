@@ -22,26 +22,14 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{Error, random, rfc3339, unix_seconds};
+use crate::{Error, p256_signature, random, rfc3339, unix_seconds};
 
 pub const SIGNATURE_ALGORITHM: &str = "ecdsa-p256";
 
 /// How far a request's `issued_at` may be from the verifier's clock, either way.
 pub const FRESHNESS_SECONDS: u64 = 60;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MemberSignature {
-    pub algorithm: String,
-    pub signature: String,
-}
-
-/// The key that signed: its SPKI DER and that SPKI's SHA-256.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Member {
-    pub spki: Vec<u8>,
-    pub key_sha256: [u8; 32],
-}
+pub use crate::NamedSignature as MemberSignature;
 
 /// Under `alphacompute/connector-request/v1`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -116,13 +104,13 @@ fn check(key: &VerifyingKey, digest: &[u8; 32], signature: &Signature) -> Result
 }
 
 /// Checks `signature` over `document` under `context` by the key `member_key_b64` (base64url SPKI
-/// DER). Freshness is the caller's, with `check_fresh`.
+/// DER), returning the SHA-256 of that SPKI. Freshness is the caller's, with `check_fresh`.
 pub fn verify_request(
     context: &str,
     document: &Value,
     member_key_b64: &str,
     signature: &MemberSignature,
-) -> Result<Member, Error> {
+) -> Result<[u8; 32], Error> {
     if signature.algorithm != SIGNATURE_ALGORITHM {
         return Err(invalid("algorithm is not ecdsa-p256"));
     }
@@ -130,18 +118,12 @@ pub fn verify_request(
         .decode(member_key_b64)
         .map_err(|_| Error::Malformed("member_key is not base64url".into()))?;
     let key = verifying_key(&spki)?;
-    let signature = BASE64_URL_SAFE_NO_PAD
-        .decode(&signature.signature)
-        .ok()
-        .and_then(|b| Signature::from_slice(&b).ok())
+    let signature = p256_signature(&signature.signature)
         .ok_or_else(|| invalid("signature is not base64url r‖s"))?;
     let digest = signing_digest(context, document)
         .map_err(|e| Error::Malformed(format!("document: {e}")))?;
     check(&key, &digest, &signature)?;
-    Ok(Member {
-        key_sha256: Sha256::digest(&spki).into(),
-        spki,
-    })
+    Ok(Sha256::digest(&spki).into())
 }
 
 /// A grant as received: the JCS bytes that were signed, and the signature.
@@ -159,11 +141,7 @@ pub fn parse_grant(wire: &str) -> Result<SignedGrant, Error> {
         document: BASE64_URL_SAFE_NO_PAD
             .decode(document)
             .map_err(|_| malformed())?,
-        signature: BASE64_URL_SAFE_NO_PAD
-            .decode(signature)
-            .ok()
-            .and_then(|b| Signature::from_slice(&b).ok())
-            .ok_or_else(malformed)?,
+        signature: p256_signature(signature).ok_or_else(malformed)?,
     })
 }
 

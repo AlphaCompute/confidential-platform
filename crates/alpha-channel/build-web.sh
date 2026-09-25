@@ -8,6 +8,8 @@ out=${1:?usage: build-web.sh <out-dir>}
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
 
+# The CLI refuses only a module of another schema; another version of the same schema writes
+# other glue, and so another hash.
 pin=$(sed -n 's/^wasm-bindgen = "=\(.*\)"$/\1/p' crates/alpha-channel/Cargo.toml)
 have=$(wasm-bindgen --version | cut -d' ' -f2)
 if [ "$pin" != "$have" ]; then

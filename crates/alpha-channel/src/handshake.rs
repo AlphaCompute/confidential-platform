@@ -26,7 +26,7 @@ use zeroize::Zeroizing;
 
 use crate::cert::{parse_instance_sans, pem_to_der, spki_of, spki_sha256, uri_sans, verify_leaf};
 use crate::frame::Channel;
-use crate::{Error, from_unix_seconds, random, rfc3339, sha256_label};
+use crate::{Error, from_unix_seconds, p256_signature, random, rfc3339, sha256_label};
 
 pub const VERSION: u8 = 1;
 pub const SIGNATURE_ALGORITHM: &str = "ecdsa-p256";
@@ -58,12 +58,7 @@ pub struct ServerHello {
     pub signature: LeafSignature,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LeafSignature {
-    pub algorithm: String,
-    pub signature: String,
-}
+pub use crate::NamedSignature as LeafSignature;
 
 /// Who the initiator means to reach: one App of one organization, at one of these Revisions.
 #[derive(Clone, Debug, Deserialize)]
@@ -214,10 +209,7 @@ impl Initiator {
         let leaf_spki = spki_of(&leaf)?;
         let key = VerifyingKey::from_public_key_der(&leaf_spki)
             .map_err(|_| refuse("the leaf key is not P-256"))?;
-        let signature = BASE64_URL_SAFE_NO_PAD
-            .decode(&hello.signature.signature)
-            .ok()
-            .and_then(|b| Signature::from_slice(&b).ok())
+        let signature = p256_signature(&hello.signature.signature)
             .ok_or_else(|| refuse("signature is not base64url r‖s"))?;
         let document = signed_document(
             &hello.channel,

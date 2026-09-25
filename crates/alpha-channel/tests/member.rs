@@ -42,7 +42,6 @@ fn verify(entry: &Value) -> Result<[u8; 32], Error> {
         entry["member_key"].as_str().unwrap(),
         &signature,
     )
-    .map(|member| member.key_sha256)
 }
 
 fn other_key() -> SigningKey {

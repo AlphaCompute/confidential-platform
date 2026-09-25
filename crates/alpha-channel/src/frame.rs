@@ -72,6 +72,10 @@ fn jcs(value: serde_json::Value) -> Result<Vec<u8>, Error> {
     alpha_core::jcs(&value).map_err(|e| Error::Malformed(format!("aad: {e}")))
 }
 
+fn response_aad(id: &str, seq: u64, index: u32) -> Result<Vec<u8>, Error> {
+    jcs(json!({ "channel": id, "seq": seq, "frame": index }))
+}
+
 impl Channel {
     pub(crate) fn new(id: &[u8; 16], c2s: Zeroizing<[u8; 32]>, s2c: Zeroizing<[u8; 32]>) -> Self {
         Self {
@@ -90,10 +94,6 @@ impl Channel {
 
     fn request_aad(&self, seq: u64, method: &str, path: &str) -> Result<Vec<u8>, Error> {
         jcs(json!({ "channel": self.id, "seq": seq, "method": method, "path": path }))
-    }
-
-    fn response_aad(&self, seq: u64, index: u32) -> Result<Vec<u8>, Error> {
-        jcs(json!({ "channel": self.id, "seq": seq, "frame": index }))
     }
 
     pub fn seal_request(
@@ -164,7 +164,7 @@ impl Channel {
         let ct = seal(
             &self.s2c,
             nonce(seq, index),
-            &self.response_aad(seq, index)?,
+            &response_aad(&self.id, seq, index)?,
             &framed,
         )?;
         Ok(BASE64_URL_SAFE_NO_PAD.encode(ct))
@@ -209,7 +209,7 @@ impl ResponseReader {
         let ct = BASE64_URL_SAFE_NO_PAD
             .decode(line)
             .map_err(|_| Error::Open)?;
-        let aad = jcs(json!({ "channel": self.id, "seq": self.seq, "frame": self.index }))?;
+        let aad = response_aad(&self.id, self.seq, self.index)?;
         let framed = Zeroizing::new(open(&self.s2c, nonce(self.seq, self.index), &aad, &ct)?);
         let (flag, body) = framed.split_first().ok_or(Error::Open)?;
         self.ended = match *flag {

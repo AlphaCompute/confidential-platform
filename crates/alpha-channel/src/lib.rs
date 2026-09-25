@@ -20,6 +20,9 @@
 use std::time::{Duration, SystemTime};
 
 use alpha_core::ComposeHash;
+use base64::Engine;
+use base64::prelude::BASE64_URL_SAFE_NO_PAD;
+use serde::{Deserialize, Serialize};
 
 pub mod cert;
 pub mod compose;
@@ -85,6 +88,22 @@ impl Error {
             Self::RequestStale => "request_stale",
         }
     }
+}
+
+/// `{algorithm, signature}`, the signature in base64url.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedSignature {
+    pub algorithm: String,
+    pub signature: String,
+}
+
+/// A P-256 signature as base64url `r‖s`.
+fn p256_signature(text: &str) -> Option<p256::ecdsa::Signature> {
+    BASE64_URL_SAFE_NO_PAD
+        .decode(text)
+        .ok()
+        .and_then(|b| p256::ecdsa::Signature::from_slice(&b).ok())
 }
 
 fn random<const N: usize>() -> Result<[u8; N], Error> {

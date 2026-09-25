@@ -22,12 +22,7 @@ pub struct SignedDocument {
     pub signature: ReleaseSignature,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReleaseSignature {
-    pub algorithm: String,
-    pub signature: String,
-}
+pub use crate::NamedSignature as ReleaseSignature;
 
 /// The fields a channel client reads. Unknown fields are allowed so a document that grows a
 /// field still verifies in a page built before it.
