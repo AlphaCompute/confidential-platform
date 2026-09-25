@@ -22,58 +22,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{Error, p256_signature, random, rfc3339, unix_seconds};
-
-pub const SIGNATURE_ALGORITHM: &str = "ecdsa-p256";
+use crate::{ECDSA_P256, Error, NamedSignature, p256_signature, random, rfc3339, unix_seconds};
 
 /// How far a request's `issued_at` may be from the verifier's clock, either way.
 pub const FRESHNESS_SECONDS: u64 = 60;
-
-pub use crate::NamedSignature as MemberSignature;
-
-/// Under `alphacompute/connector-request/v1`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "op", rename_all = "lowercase", deny_unknown_fields)]
-pub enum ConnectorRequest {
-    Connect {
-        v: u8,
-        provider: String,
-        nonce: String,
-        issued_at: String,
-    },
-    Finish {
-        v: u8,
-        state: String,
-        code: String,
-        nonce: String,
-        issued_at: String,
-    },
-    List {
-        v: u8,
-        nonce: String,
-        issued_at: String,
-    },
-    Disconnect {
-        v: u8,
-        connection_id: Uuid,
-        nonce: String,
-        issued_at: String,
-    },
-}
-
-/// Under `alphacompute/connector-write/v1`: one request the member sends to a provider.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WriteDocument {
-    pub v: u8,
-    pub connection_id: Uuid,
-    pub method: String,
-    pub url: String,
-    /// `sha256:<hex>` of the body sent beside the document.
-    pub body_sha256: String,
-    pub nonce: String,
-    pub issued_at: String,
-}
 
 /// Under `alphacompute/connector-grant/v1`: lets the Instance whose leaf SPKI hashes to `aud` read
 /// through `connections` until `exp`.
@@ -109,9 +61,9 @@ pub fn verify_request(
     context: &str,
     document: &Value,
     member_key_b64: &str,
-    signature: &MemberSignature,
+    signature: &NamedSignature,
 ) -> Result<[u8; 32], Error> {
-    if signature.algorithm != SIGNATURE_ALGORITHM {
+    if signature.algorithm != ECDSA_P256 {
         return Err(invalid("algorithm is not ecdsa-p256"));
     }
     let spki = BASE64_URL_SAFE_NO_PAD

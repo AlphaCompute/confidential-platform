@@ -26,10 +26,12 @@ use zeroize::Zeroizing;
 
 use crate::cert::{parse_instance_sans, pem_to_der, spki_of, spki_sha256, uri_sans, verify_leaf};
 use crate::frame::Channel;
-use crate::{Error, from_unix_seconds, p256_signature, random, rfc3339, sha256_label};
+use crate::{
+    ECDSA_P256, Error, NamedSignature, from_unix_seconds, p256_signature, random, rfc3339,
+    sha256_label,
+};
 
 pub const VERSION: u8 = 1;
-pub const SIGNATURE_ALGORITHM: &str = "ecdsa-p256";
 
 const C2S: &[u8] = b"alphacompute/inner-channel/v1 c2s";
 const S2C: &[u8] = b"alphacompute/inner-channel/v1 s2c";
@@ -55,10 +57,8 @@ pub struct ServerHello {
     pub certificate_chain: Vec<String>,
     /// `app-compose.json`, the exact bytes whose SHA-256 is the Revision.
     pub compose: String,
-    pub signature: LeafSignature,
+    pub signature: NamedSignature,
 }
-
-pub use crate::NamedSignature as LeafSignature;
 
 /// Who the initiator means to reach: one App of one organization, at one of these Revisions.
 #[derive(Clone, Debug, Deserialize)]
@@ -203,7 +203,7 @@ impl Initiator {
         }
 
         let refuse = |m: &str| Error::HandshakeSignature(format!("handshake: {m}"));
-        if hello.signature.algorithm != SIGNATURE_ALGORITHM {
+        if hello.signature.algorithm != ECDSA_P256 {
             return Err(refuse("algorithm is not ecdsa-p256"));
         }
         let leaf_spki = spki_of(&leaf)?;
@@ -351,8 +351,8 @@ impl Responder {
                 now,
                 certificate_chain: self.certificate_chain.clone(),
                 compose: self.compose.clone(),
-                signature: LeafSignature {
-                    algorithm: SIGNATURE_ALGORITHM.into(),
+                signature: NamedSignature {
+                    algorithm: ECDSA_P256.into(),
                     signature: BASE64_URL_SAFE_NO_PAD.encode(signature.to_bytes()),
                 },
             },

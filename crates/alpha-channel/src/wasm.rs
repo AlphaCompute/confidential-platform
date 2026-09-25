@@ -211,7 +211,7 @@ impl ServerChannel {
         path: &str,
     ) -> Result<Vec<u8>, JsError> {
         let frame: frame::RequestFrame = parse("request frame", frame_json)?;
-        let (_, body) = self.inner.open_request(&frame, method, path).map_err(js)?;
+        let body = self.inner.open_request(&frame, method, path).map_err(js)?;
         Ok(body.to_vec())
     }
 
@@ -266,7 +266,7 @@ pub fn verify_member_request(
     now_ms: f64,
 ) -> Result<String, JsError> {
     let document: serde_json::Value = parse("document", document_json)?;
-    let signature: member::MemberSignature = parse("signature", signature_json)?;
+    let signature: crate::NamedSignature = parse("signature", signature_json)?;
     let key_sha256 =
         member::verify_request(context, &document, member_key_b64, &signature).map_err(js)?;
     let issued_at = document

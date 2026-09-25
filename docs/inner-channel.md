@@ -215,10 +215,9 @@ crates/alpha-channel/build-web.sh <out-dir>
 
 The script writes `alpha_channel.js`, its typings and `alpha_channel_bg.wasm` for
 `wasm-bindgen --target web`. It then prints `sha256 <hex> alpha_channel_bg.wasm` and the commit
-it was built from. It needs the toolchain in `rust-toolchain.toml`, the `wasm-bindgen` CLI at the
-exact version the crate pins (the script refuses any other), and `wasm-opt` from binaryen if one
-is on `PATH`. Paths are remapped, so the same commit built with the same tool versions gives the
-same hash. A page calls `init()` from the glue; Node calls
+it was built from. It needs the toolchain in `rust-toolchain.toml` and the `wasm-bindgen` CLI at
+the exact version the crate pins (the script refuses any other). Paths are remapped, so the same
+commit built with those two gives the same hash. A page calls `init()` from the glue; Node calls
 `initSync({ module: readFileSync(".../alpha_channel_bg.wasm") })`.
 
 ## What this does not protect against

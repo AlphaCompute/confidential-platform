@@ -114,7 +114,8 @@ fn a_responder_and_an_initiator_share_a_channel() {
     let request = client
         .seal_request("POST", "/sessions", br#"{"hello":1}"#)
         .unwrap();
-    let (seq, body) = server.open_request(&request, "POST", "/sessions").unwrap();
+    let seq = request.seq;
+    let body = server.open_request(&request, "POST", "/sessions").unwrap();
     assert_eq!(body.as_slice(), br#"{"hello":1}"#);
 
     let first = server.seal_response(seq, 0, false, b"one").unwrap();

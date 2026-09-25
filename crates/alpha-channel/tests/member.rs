@@ -9,10 +9,8 @@
 use std::time::{Duration, SystemTime};
 
 use alpha_channel::Error;
-use alpha_channel::member::{
-    ConnectorRequest, MemberSignature, WriteDocument, check_fresh, parse_grant, signable,
-    verify_request,
-};
+use alpha_channel::NamedSignature;
+use alpha_channel::member::{check_fresh, parse_grant, signable, verify_request};
 use alpha_core::{context, signing_digest};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
@@ -35,7 +33,7 @@ fn at(rfc3339: &str) -> SystemTime {
 }
 
 fn verify(entry: &Value) -> Result<[u8; 32], Error> {
-    let signature: MemberSignature = serde_json::from_value(entry["signature"].clone()).unwrap();
+    let signature: NamedSignature = serde_json::from_value(entry["signature"].clone()).unwrap();
     verify_request(
         entry["context"].as_str().unwrap(),
         &entry["document"],
@@ -119,33 +117,6 @@ fn a_member_key_that_is_not_p256_is_malformed() {
 
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
-fn request_and_write_documents_parse_and_refuse_unknown_fields() {
-    let vectors = vectors();
-    let connect: ConnectorRequest =
-        serde_json::from_value(vectors["entries"][0]["document"].clone()).unwrap();
-    assert!(
-        matches!(connect, ConnectorRequest::Connect { ref provider, .. } if provider == "google")
-    );
-    let list: ConnectorRequest =
-        serde_json::from_value(vectors["entries"][1]["document"].clone()).unwrap();
-    assert!(matches!(list, ConnectorRequest::List { .. }));
-    let write: WriteDocument =
-        serde_json::from_value(vectors["entries"][2]["document"].clone()).unwrap();
-    assert_eq!(write.method, "POST");
-
-    let mut extra = vectors["entries"][1]["document"].clone();
-    extra["scope"] = json!("all");
-    assert!(serde_json::from_value::<ConnectorRequest>(extra).is_err());
-    let mut extra = vectors["entries"][2]["document"].clone();
-    extra["headers"] = json!({});
-    assert!(serde_json::from_value::<WriteDocument>(extra).is_err());
-    let mut unknown_op = vectors["entries"][1]["document"].clone();
-    unknown_op["op"] = json!("export");
-    assert!(serde_json::from_value::<ConnectorRequest>(unknown_op).is_err());
-}
-
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn the_webcrypto_grant_verifies_as_received_and_only_under_its_key() {
     let vectors = vectors();
     let member = BASE64_URL_SAFE_NO_PAD
@@ -175,6 +146,28 @@ fn a_grant_wire_without_a_dot_or_with_bad_base64url_is_malformed() {
     ] {
         assert_eq!(parse_grant(&bad).unwrap_err().code(), "malformed", "{bad}");
     }
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+fn a_grant_reencoded_on_the_way_no_longer_verifies() {
+    let vectors = vectors();
+    let member = BASE64_URL_SAFE_NO_PAD
+        .decode(vectors["entries"][3]["member_key"].as_str().unwrap())
+        .unwrap();
+    let wire = vectors["grant_wire"].as_str().unwrap();
+    let (document, signature) = wire.split_once('.').unwrap();
+    let pretty = serde_json::to_vec_pretty(
+        &serde_json::from_slice::<Value>(&BASE64_URL_SAFE_NO_PAD.decode(document).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    let reencoded = format!("{}.{signature}", b64(&pretty));
+    let err = parse_grant(&reencoded)
+        .unwrap()
+        .verify(&member)
+        .unwrap_err();
+    assert_eq!(err.code(), "signature_invalid");
 }
 
 /// A grant whose document is `fields` plus the filled `v`, `nonce` and `issued_at`, signed by `key`.

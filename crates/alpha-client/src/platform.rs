@@ -5,7 +5,8 @@
 use std::time::SystemTime;
 
 use alpha_attest::PlatformDocument;
-pub use alpha_channel::platform::{ReleaseSignature, SignedDocument, sign};
+pub use alpha_channel::NamedSignature;
+pub use alpha_channel::platform::{SignedDocument, sign};
 use ed25519_dalek::VerifyingKey;
 
 use crate::Error;

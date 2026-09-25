@@ -15,7 +15,7 @@ use crate::{Node, audit};
 
 pub const RELOAD_EVERY: Duration = Duration::from_secs(300);
 
-pub use alpha_client::platform::{ReleaseSignature, SignedDocument};
+pub use alpha_client::platform::{NamedSignature, SignedDocument};
 
 #[derive(Debug)]
 pub struct Verified {
@@ -51,7 +51,7 @@ pub async fn load_stored(node: &Node) -> Result<Option<Verified>, ApiError> {
     };
     let signed = SignedDocument {
         document: row.document,
-        signature: ReleaseSignature {
+        signature: NamedSignature {
             algorithm: "ed25519".into(),
             signature: BASE64_URL_SAFE_NO_PAD.encode(row.signature),
         },

@@ -55,8 +55,20 @@ fn requests_open_out_of_order_but_each_only_once() {
     let (mut client, mut server) = pair();
     let first = client.seal_request("POST", "/a", b"1").unwrap();
     let second = client.seal_request("POST", "/b", b"2").unwrap();
-    assert_eq!(server.open_request(&second, "POST", "/b").unwrap().0, 1);
-    assert_eq!(server.open_request(&first, "POST", "/a").unwrap().0, 0);
+    assert_eq!(
+        server
+            .open_request(&second, "POST", "/b")
+            .unwrap()
+            .as_slice(),
+        b"2"
+    );
+    assert_eq!(
+        server
+            .open_request(&first, "POST", "/a")
+            .unwrap()
+            .as_slice(),
+        b"1"
+    );
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), test)]

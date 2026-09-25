@@ -23,9 +23,6 @@ RUSTFLAGS="--remap-path-prefix=$root=/src --remap-path-prefix=${CARGO_HOME:-$HOM
   cargo build -p alpha-channel --release --target wasm32-unknown-unknown
 wasm-bindgen --target web --out-dir "$out" target/wasm32-unknown-unknown/release/alpha_channel.wasm
 wasm="$out/alpha_channel_bg.wasm"
-if command -v wasm-opt >/dev/null 2>&1; then
-  wasm-opt -Oz --all-features "$wasm" -o "$wasm"
-fi
 
 hash=$( (sha256sum "$wasm" 2>/dev/null || shasum -a 256 "$wasm") | cut -d' ' -f1)
 echo "sha256 $hash alpha_channel_bg.wasm"

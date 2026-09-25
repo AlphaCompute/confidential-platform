@@ -12,17 +12,15 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{Error, unix_seconds};
+use crate::{Error, NamedSignature, unix_seconds};
 
 /// `{ document, signature: { algorithm: "ed25519", signature } }`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignedDocument {
     pub document: Value,
-    pub signature: ReleaseSignature,
+    pub signature: NamedSignature,
 }
-
-pub use crate::NamedSignature as ReleaseSignature;
 
 /// The fields a channel client reads. Unknown fields are allowed so a document that grows a
 /// field still verifies in a page built before it.
@@ -45,7 +43,7 @@ pub fn sign(document: Value, key: &SigningKey) -> Result<SignedDocument, Error> 
     let digest = signing_digest(context::PLATFORM, &document).map_err(canonicalize)?;
     Ok(SignedDocument {
         document,
-        signature: ReleaseSignature {
+        signature: NamedSignature {
             algorithm: "ed25519".into(),
             signature: BASE64_URL_SAFE_NO_PAD.encode(key.sign(&digest).to_bytes()),
         },

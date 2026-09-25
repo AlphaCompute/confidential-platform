@@ -127,7 +127,7 @@ impl Channel {
         frame: &RequestFrame,
         method: &str,
         path: &str,
-    ) -> Result<(u64, Zeroizing<Vec<u8>>), Error> {
+    ) -> Result<Zeroizing<Vec<u8>>, Error> {
         if frame.channel != self.id {
             return Err(Error::Open);
         }
@@ -147,7 +147,7 @@ impl Channel {
             &ct,
         )?;
         self.used.insert(frame.seq);
-        Ok((frame.seq, Zeroizing::new(plaintext)))
+        Ok(Zeroizing::new(plaintext))
     }
 
     /// One line of the response to request `seq`, without its trailing newline.

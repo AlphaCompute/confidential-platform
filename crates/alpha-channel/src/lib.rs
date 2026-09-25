@@ -90,6 +90,8 @@ impl Error {
     }
 }
 
+pub const ECDSA_P256: &str = "ecdsa-p256";
+
 /// `{algorithm, signature}`, the signature in base64url.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
