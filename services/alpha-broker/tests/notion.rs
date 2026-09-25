@@ -20,14 +20,14 @@ const MCP: &str = "https://mcp.notion.com/mcp";
 #[tokio::test]
 async fn a_member_connects_notion_as_a_public_client_and_an_instance_searches_it() {
     let Some(h) = harness().await else { return };
-    let query = h.start("notion", MEMBER).await;
+    let query = h.start("notion", &member()).await;
     assert_eq!(query["client_id"], NOTION_CLIENT_ID);
     assert_eq!(query["scope"], "default");
     assert_eq!(query["redirect_uri"], NOTION_REDIRECT_URI);
     assert_eq!(query["code_challenge_method"], "S256");
 
     let (reply, consent) = h
-        .connect_as("notion", MEMBER, "ws-1:user-1", "ann@acme.example")
+        .connect_as("notion", &member(), "ws-1:user-1", "ann@acme.example")
         .await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
     let id = id_of(&reply);
@@ -70,7 +70,7 @@ async fn a_member_connects_notion_as_a_public_client_and_an_instance_searches_it
 async fn a_notion_member_without_an_email_is_named_by_name() {
     let Some(h) = harness().await else { return };
     let (reply, _) = h
-        .connect_as("notion", MEMBER, "ws-1:user-2", "Research Desk")
+        .connect_as("notion", &member(), "ws-1:user-2", "Research Desk")
         .await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
     assert_eq!(reply.body["account"], "Research Desk");
@@ -180,9 +180,7 @@ async fn a_notion_refresh_answered_invalid_grant_or_invalid_token_marks_the_conn
         let reply = h.proxy(&mcp_call(id, MCP, "notion-search")).await;
         assert_eq!(reply.status, StatusCode::CONFLICT, "{code}");
         assert_eq!(reply.code(), "reconnect_required");
-        let listed = h
-            .call("GET", &format!("/connections?member={MEMBER}"), None)
-            .await;
+        let listed = h.list(&member()).await;
         assert_eq!(listed.body["connections"][0]["dead"], true, "{code}");
         assert!(h.fake.with(|f| f.data.is_empty()));
     }
@@ -208,14 +206,8 @@ async fn a_notion_refresh_without_expires_in_is_used_for_the_default_hour() {
 async fn disconnecting_notion_revokes_a_fresh_access_token_at_notion() {
     let Some(h) = harness().await else { return };
     let (id, _) = h.connected_to("notion").await;
-    let reply = h
-        .call(
-            "DELETE",
-            &format!("/connections/{id}?member={MEMBER}"),
-            None,
-        )
-        .await;
-    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    let reply = h.disconnect(&member(), id).await;
+    assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(h.stored_token(id).await, None);
     let (paths, revoke) = h.fake.with(|f| {
         let paths: Vec<String> = f.requests.iter().map(|(p, _)| p.clone()).collect();

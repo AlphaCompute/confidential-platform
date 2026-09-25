@@ -19,13 +19,13 @@ const FILE: &str = "https://api.figma.com/v1/files/AbC123";
 #[tokio::test]
 async fn a_member_connects_figma_with_basic_auth_and_an_instance_reads_a_file() {
     let Some(h) = harness().await else { return };
-    let query = h.start("figma", MEMBER).await;
+    let query = h.start("figma", &member()).await;
     assert_eq!(
         query["scope"],
         "current_user:read file_content:read file_metadata:read file_comments:read folders:read"
     );
 
-    let (reply, _) = h.connect_as("figma", MEMBER, "1234567", EMAIL).await;
+    let (reply, _) = h.connect_as("figma", &member(), "1234567", EMAIL).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
     let id = id_of(&reply);
     assert_eq!(reply.body["account"], EMAIL);
@@ -134,9 +134,7 @@ async fn an_invalid_grant_marks_a_figma_connection_dead() {
     let reply = h.proxy(&read(id, FILE)).await;
     assert_eq!(reply.status, StatusCode::CONFLICT);
     assert_eq!(reply.code(), "reconnect_required");
-    let listed = h
-        .call("GET", &format!("/connections?member={MEMBER}"), None)
-        .await;
+    let listed = h.list(&member()).await;
     assert_eq!(listed.body["connections"][0]["dead"], true);
 }
 
@@ -153,9 +151,7 @@ async fn a_refresh_error_that_is_not_a_string_is_upstream_and_keeps_the_connecti
     let reply = h.proxy(&read(id, FILE)).await;
     assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
     assert_eq!(reply.code(), "upstream");
-    let listed = h
-        .call("GET", &format!("/connections?member={MEMBER}"), None)
-        .await;
+    let listed = h.list(&member()).await;
     assert_eq!(listed.body["connections"][0]["dead"], false);
 }
 
@@ -175,14 +171,8 @@ async fn disconnecting_figma_revokes_only_locally() {
     let Some(h) = harness().await else { return };
     let (id, _) = h.connected_to("figma").await;
     let before = h.fake.with(|f| f.requests.len());
-    let reply = h
-        .call(
-            "DELETE",
-            &format!("/connections/{id}?member={MEMBER}"),
-            None,
-        )
-        .await;
-    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    let reply = h.disconnect(&member(), id).await;
+    assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(h.fake.with(|f| f.requests.len()), before);
     assert_eq!(h.stored_token(id).await, None);
     let reply = h.proxy(&read(id, FILE)).await;

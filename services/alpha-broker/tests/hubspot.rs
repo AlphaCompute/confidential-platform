@@ -17,12 +17,12 @@ const MCP: &str = "https://mcp.hubspot.com/";
 #[tokio::test]
 async fn a_member_connects_hubspot_and_an_instance_calls_a_listed_tool_without_seeing_a_token() {
     let Some(h) = harness().await else { return };
-    let query = h.start("hubspot", MEMBER).await;
+    let query = h.start("hubspot", &member()).await;
     assert_eq!(query["client_id"], HUBSPOT_CLIENT_ID);
     assert!(!query.contains_key("scope"), "{query:?}");
 
     let (reply, consent) = h
-        .connect_as("hubspot", MEMBER, "247507114:77", "ann@acme.example")
+        .connect_as("hubspot", &member(), "247507114:77", "ann@acme.example")
         .await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
     let id = id_of(&reply);
@@ -134,9 +134,10 @@ async fn a_body_that_is_not_one_well_formed_tool_call_is_refused_before_hubspot(
 async fn a_duplicated_tool_name_is_judged_and_sent_by_its_last_value() {
     let Some(h) = harness().await else { return };
     let (id, _) = h.connected_to("hubspot").await;
+    let reference = member().reference();
     let raw = |first: &str, last: &str| {
         format!(
-            r#"{{"member":"{MEMBER}","connection_id":"{id}","method":"POST","url":"{MCP}",
+            r#"{{"member":"{reference}","connection_id":"{id}","method":"POST","url":"{MCP}",
             "body":{{"jsonrpc":"2.0","id":1,"method":"tools/call",
             "params":{{"name":"{first}","name":"{last}"}}}}}}"#
         )
@@ -215,14 +216,8 @@ async fn disconnecting_hubspot_revokes_only_locally() {
     let Some(h) = harness().await else { return };
     let (id, _) = h.connected_to("hubspot").await;
     nothing_reaches(&h, async {
-        let reply = h
-            .call(
-                "DELETE",
-                &format!("/connections/{id}?member={MEMBER}"),
-                None,
-            )
-            .await;
-        assert_eq!(reply.status, StatusCode::NO_CONTENT);
+        let reply = h.disconnect(&member(), id).await;
+        assert_eq!(reply.status, StatusCode::OK);
     })
     .await;
     assert_eq!(h.stored_token(id).await, None);

@@ -102,9 +102,9 @@ async fn each_bearer_opens_only_its_own_routes() {
     let listed = h
         .call_as(
             Some(PROXY_BEARER),
-            "GET",
-            &format!("/connections?member={MEMBER}"),
-            None,
+            "POST",
+            "/connections",
+            Some(serde_json::json!({})),
         )
         .await;
     assert_eq!(listed.status, StatusCode::UNAUTHORIZED);
@@ -118,7 +118,7 @@ async fn a_malformed_body_is_refused() {
     let mut unknown = read(id, FILES);
     unknown["extra"] = serde_json::json!({});
     let mut short_member = read(id, FILES);
-    short_member["member"] = serde_json::json!(&MEMBER[1..]);
+    short_member["member"] = serde_json::json!(&member().reference()[1..]);
     let mut bad_id = read(id, FILES);
     bad_id["connection_id"] = serde_json::json!("not-a-uuid");
     for body in [
@@ -139,17 +139,11 @@ async fn a_malformed_body_is_refused() {
 async fn an_unknown_revoked_or_foreign_connection_is_not_found() {
     let Some(h) = harness().await else { return };
     let (id, _) = h.connected().await;
-    let (foreign, _) = h.connect(OTHER_MEMBER, "other@example.com").await;
-    let (revoked, _) = h.connect(MEMBER, "second@example.com").await;
+    let (foreign, _) = h.connect(&other_member(), "other@example.com").await;
+    let (revoked, _) = h.connect(&member(), "second@example.com").await;
     let revoked = id_of(&revoked);
-    let gone = h
-        .call(
-            "DELETE",
-            &format!("/connections/{revoked}?member={MEMBER}"),
-            None,
-        )
-        .await;
-    assert_eq!(gone.status, StatusCode::NO_CONTENT);
+    let gone = h.disconnect(&member(), revoked).await;
+    assert_eq!(gone.status, StatusCode::OK);
     for connection in [uuid::Uuid::now_v7(), revoked, id_of(&foreign)] {
         let reply = h.proxy(&read(connection, FILES)).await;
         assert_eq!(reply.status, StatusCode::NOT_FOUND, "{connection}");
@@ -206,9 +200,7 @@ async fn an_invalid_grant_marks_the_connection_dead_and_asks_for_a_reconnect() {
             .await
             .unwrap();
     assert!(dead);
-    let listed = h
-        .call("GET", &format!("/connections?member={MEMBER}"), None)
-        .await;
+    let listed = h.list(&member()).await;
     assert_eq!(listed.body["connections"][0]["dead"], true);
 
     let again = h.proxy(&read(id, FILES)).await;
@@ -408,14 +400,8 @@ async fn a_disconnect_drops_the_cached_token_and_a_refresh_drops_expired_ones() 
         [id]
     );
 
-    let gone = h
-        .call(
-            "DELETE",
-            &format!("/connections/{id}?member={MEMBER}"),
-            None,
-        )
-        .await;
-    assert_eq!(gone.status, StatusCode::NO_CONTENT);
+    let gone = h.disconnect(&member(), id).await;
+    assert_eq!(gone.status, StatusCode::OK);
     assert!(h.state.tokens.lock().is_empty());
 }
 

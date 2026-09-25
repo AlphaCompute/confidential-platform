@@ -1,4 +1,5 @@
-//! Sealing under the connectors key, and every query on `pending_connects` and `connections`.
+//! Sealing under the connectors key, and every query on `pending_connects`, `connections` and
+//! `member_nonces`.
 //! Queries are checked at run time by the db tests; the broker's migrations live in their own
 //! database and never meet the KMS's.
 
@@ -9,6 +10,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use crate::connect::Member;
 use crate::{Error, oauth};
 
 /// `nonce(12) ‖ AES-256-GCM(key, plaintext, aad)`.
@@ -42,22 +44,41 @@ pub async fn purge_expired(pool: &PgPool) -> Result<(), Error> {
     sqlx::query("delete from pending_connects where exp < now()")
         .execute(pool)
         .await?;
+    sqlx::query("delete from member_nonces where exp < now()")
+        .execute(pool)
+        .await?;
     Ok(())
+}
+
+/// Records a signed request's nonce; false when it was recorded before. It is kept for two
+/// minutes, past the last moment its document is fresh even with `issued_at` a minute ahead.
+pub async fn use_nonce(pool: &PgPool, nonce: &[u8]) -> Result<bool, Error> {
+    let inserted: Option<bool> = sqlx::query_scalar(
+        "insert into member_nonces (nonce, exp) values ($1, now() + interval '2 minutes')
+         on conflict do nothing
+         returning true",
+    )
+    .bind(nonce)
+    .fetch_optional(pool)
+    .await?;
+    Ok(inserted.is_some())
 }
 
 pub async fn insert_pending(
     pool: &PgPool,
     state: &str,
-    member: &[u8; 32],
+    member: &Member,
     provider: &str,
     enc_pkce_verifier: &[u8],
 ) -> Result<(), Error> {
     sqlx::query(
-        "insert into pending_connects (state, member_key_sha256, provider, enc_pkce_verifier, exp)
-         values ($1, $2, $3, $4, now() + interval '10 minutes')",
+        "insert into pending_connects
+           (state, member_key_sha256, member_key, provider, enc_pkce_verifier, exp)
+         values ($1, $2, $3, $4, $5, now() + interval '10 minutes')",
     )
     .bind(state)
-    .bind(member.as_slice())
+    .bind(member.sha256.as_slice())
+    .bind(member.spki.as_slice())
     .bind(provider)
     .bind(enc_pkce_verifier)
     .execute(pool)
@@ -90,7 +111,7 @@ pub async fn take_pending(pool: &PgPool, state: &str) -> Result<Option<Pending>,
 pub async fn save_connection(
     pool: &PgPool,
     key: &[u8; 32],
-    member: &[u8; 32],
+    member: &Member,
     provider: &str,
     account: &oauth::Account,
     refresh_token: &str,
@@ -100,7 +121,7 @@ pub async fn save_connection(
     sqlx::query("select pg_advisory_xact_lock(hashtext($1))")
         .bind(format!(
             "{}/{provider}/{}",
-            hex::encode(member),
+            hex::encode(member.sha256),
             account.subject
         ))
         .execute(&mut *tx)
@@ -110,7 +131,7 @@ pub async fn save_connection(
          where member_key_sha256 = $1 and provider = $2 and subject = $3 and revoked_at is null
          for update",
     )
-    .bind(member.as_slice())
+    .bind(member.sha256.as_slice())
     .bind(provider)
     .bind(&account.subject)
     .fetch_optional(&mut *tx)
@@ -118,20 +139,22 @@ pub async fn save_connection(
     let (id, new) = existing.map_or((Uuid::now_v7(), true), |id| (id, false));
     let sealed = seal(key, id.as_bytes(), refresh_token.as_bytes())?;
     let statement = if new {
-        "insert into connections (id, member_key_sha256, provider, subject, account, enc_refresh_token, scopes)
-         values ($1, $2, $3, $4, $5, $6, $7)"
+        "insert into connections
+           (id, member_key_sha256, member_key, provider, subject, account, enc_refresh_token, scopes)
+         values ($1, $2, $8, $3, $4, $5, $6, $7)"
     } else {
         "update connections set account = $5, enc_refresh_token = $6, scopes = $7, dead_at = null
          where id = $1"
     };
     sqlx::query(statement)
         .bind(id)
-        .bind(member.as_slice())
+        .bind(member.sha256.as_slice())
         .bind(provider)
         .bind(&account.subject)
         .bind(&account.email)
         .bind(sealed)
         .bind(scopes)
+        .bind(member.spki.as_slice())
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;

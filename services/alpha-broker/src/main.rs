@@ -1,6 +1,7 @@
 //! Thin entrypoint: attest, read this Instance's identity, its Secrets and the connectors key
 //! from the runtime socket, migrate the broker's own database, then serve over TLS on `:8443`,
-//! accepting client certificates that chain to the KMS CA, until SIGTERM, refreshing the leaf, the Secrets and the key every five minutes. A refresh
+//! accepting client certificates that chain to the KMS CA, until SIGTERM, refreshing the leaf
+//! (for TLS and for the channel handshake), the Secrets and the key every five minutes. A refresh
 //! that fails ends the process: the runtime removes its socket when the Revision is revoked,
 //! and the broker must not go on serving with what it read before.
 //! `alpha-broker migrate` stops after the migration. Every error is a non-zero exit.
@@ -9,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alpha_broker::{AppState, Config, Error, Secrets, oauth, router, store};
+use alpha_broker::{AppState, Config, Error, Secrets, channel, oauth, router, store};
 use alpha_client::runtime::RuntimeSocket;
 use alpha_client::tls::InstanceCert;
 use sqlx::postgres::PgPoolOptions;
@@ -112,6 +113,8 @@ async fn run() -> Result<(), Error> {
         pool,
         http,
         tokens: Default::default(),
+        responder: parking_lot::RwLock::new(channel::responder(&identity)?),
+        channels: Default::default(),
     });
     let app = router(state.clone());
 
@@ -142,6 +145,7 @@ async fn renew_forever(runtime: &RuntimeSocket, cert: &InstanceCert, state: &App
                 .map_err(|e| Error::internal(format!("renew identity: {e}")))?;
             cert.replace(&identity)
                 .map_err(|e| Error::internal(format!("renew tls: {e}")))?;
+            *state.responder.write() = channel::responder(&identity)?;
             *state.secrets.write() = read_secrets(runtime).await?;
             Ok::<(), Error>(())
         };

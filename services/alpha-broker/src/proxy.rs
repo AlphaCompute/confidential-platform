@@ -15,13 +15,14 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
+use hex::FromHex;
 use reqwest::Url;
 use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::connect::{parse_body, parse_member};
+use crate::connect::parse_body;
 use crate::oauth::{self, Entry, Provider, RefreshError};
 use crate::{AppState, AuthedCorpus, AuthedInstance, Error, store};
 
@@ -133,7 +134,7 @@ pub fn mcp_call_allowed(tools: &[&str], body: Option<&Value>) -> bool {
 #[allow(clippy::too_many_arguments)]
 async fn target(
     state: &AppState,
-    member: &str,
+    member: &[u8; 32],
     connection_id: &str,
     method: &str,
     url: &Url,
@@ -141,10 +142,9 @@ async fn target(
     body: Option<&Value>,
     list: fn(&Provider) -> &'static [Entry],
 ) -> Result<(Uuid, &'static Provider, &'static Entry, HeaderMap), Error> {
-    let member = parse_member(member)?;
     let id = Uuid::parse_str(connection_id)
         .map_err(|_| Error::Malformed("connection_id must be a UUID".into()))?;
-    let (provider, dead) = store::load_connection(&state.pool, id, &member)
+    let (provider, dead) = store::load_connection(&state.pool, id, member)
         .await?
         .ok_or(Error::NotFound)?;
     let provider = oauth::provider(&provider)
@@ -161,6 +161,15 @@ async fn target(
         return Err(Error::ReconnectRequired);
     }
     Ok((id, provider, entry, headers))
+}
+
+/// The lowercase hex SHA-256 of the member's key.
+fn parse_member(hex_member: &str) -> Result<[u8; 32], Error> {
+    let malformed = || Error::Malformed("member must be 64 lowercase hex characters".into());
+    if hex_member.bytes().any(|b| b.is_ascii_uppercase()) {
+        return Err(malformed());
+    }
+    <[u8; 32]>::from_hex(hex_member).map_err(|_| malformed())
 }
 
 fn parse_url(url: &str) -> Result<Url, Error> {
@@ -187,7 +196,7 @@ pub async fn proxy(
     let url = parse_url(&request.url)?;
     let (id, provider, entry, headers) = target(
         &state,
-        &request.member,
+        &parse_member(&request.member)?,
         &request.connection_id,
         &request.method,
         &url,
@@ -231,7 +240,7 @@ pub async fn write(
         .map_err(|_| Error::Malformed("body_base64 must be standard base64".into()))?;
     let (id, provider, entry, headers) = target(
         &state,
-        &request.member,
+        &parse_member(&request.member)?,
         &request.connection_id,
         &request.method,
         &url,

@@ -14,27 +14,37 @@ use common::*;
 use serde_json::json;
 
 #[tokio::test]
-async fn a_member_connects_google_and_the_stored_token_is_sealed() {
+async fn a_member_connects_google_over_the_sealed_channel() {
     let Some(h) = harness().await else { return };
+    let me = member();
 
-    let (reply, consent) = h.connect(MEMBER, EMAIL).await;
+    let (reply, consent) = h.connect(&me, EMAIL).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert!(reply.sealed);
     let id = id_of(&reply);
     assert_eq!(
         reply.body,
         json!({ "id": id.to_string(), "provider": "google", "account": EMAIL })
     );
 
-    let listed = h
-        .call("GET", &format!("/connections?member={MEMBER}"), None)
-        .await;
+    let listed = h.list(&me).await;
     assert_eq!(listed.status, StatusCode::OK);
+    assert!(listed.sealed);
     assert_eq!(
         listed.body,
         json!({ "connections": [
             { "id": id.to_string(), "provider": "google", "account": EMAIL, "dead": false }
         ] })
     );
+
+    let (hash, key): (Vec<u8>, Vec<u8>) =
+        sqlx::query_as("select member_key_sha256, member_key from connections where id = $1")
+            .bind(id)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(hash, me.sha256());
+    assert_eq!(key, me.spki);
 
     let blob = h.stored_token(id).await.unwrap();
     let token = consent.refresh_token.as_bytes();
@@ -51,66 +61,72 @@ async fn a_member_connects_google_and_the_stored_token_is_sealed() {
 #[tokio::test]
 async fn every_route_refuses_a_missing_or_wrong_bearer_before_any_google_contact() {
     let Some(h) = harness().await else { return };
-    let finish = json!({ "member": MEMBER, "code": "c", "state": "s" });
+    let me = member();
+    let mut channel = h.channel().await;
+    let id = uuid::Uuid::now_v7();
     let routes = [
-        (
-            "POST",
-            "/connect/google".to_string(),
-            Some(json!({ "member": MEMBER })),
-        ),
-        ("POST", "/connect/finish".to_string(), Some(finish)),
-        ("GET", format!("/connections?member={MEMBER}"), None),
-        (
-            "DELETE",
-            format!("/connections/{}?member={MEMBER}", uuid::Uuid::now_v7()),
-            None,
-        ),
+        ("POST", "/channel".to_string()),
+        ("POST", "/connect/google".to_string()),
+        ("POST", "/connect/finish".to_string()),
+        ("POST", "/connections".to_string()),
+        ("DELETE", format!("/connections/{id}")),
     ];
-    for (method, uri, body) in routes {
+    for (method, path) in routes {
+        let frame = channel
+            .seal_request(
+                method,
+                &path,
+                signed(&me, json!({ "op": "list" })).to_string().as_bytes(),
+            )
+            .unwrap();
         for bearer in [None, Some("wrong-bearer")] {
-            let reply = h.call_as(bearer, method, &uri, body.clone()).await;
-            assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{method} {uri}");
-            assert_eq!(reply.body["error"]["code"], "unauthorized");
+            let (status, text) = h
+                .send(
+                    bearer,
+                    method,
+                    &path,
+                    Some(serde_json::to_string(&frame).unwrap()),
+                )
+                .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {path}");
+            let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(body["error"]["code"], "unauthorized");
         }
     }
     assert!(h.fake.with(|f| f.requests.is_empty()));
+    assert_eq!(count(&h, "member_nonces").await, 0);
 }
 
 #[tokio::test]
-async fn an_unknown_provider_is_not_found_and_a_malformed_member_is_refused() {
+async fn an_unknown_provider_is_not_found_and_a_malformed_member_key_is_refused() {
     let Some(h) = harness().await else { return };
+    let me = member();
     let reply = h
-        .call(
+        .as_member(
+            &me,
             "POST",
             "/connect/unknown",
-            Some(json!({ "member": MEMBER })),
+            json!({ "op": "connect", "provider": "unknown" }),
         )
         .await;
+    assert!(reply.sealed);
     assert_eq!(reply.status, StatusCode::NOT_FOUND);
     assert_eq!(reply.body["error"]["code"], "not_found");
 
-    let id = uuid::Uuid::now_v7();
-    for member in [
-        &MEMBER[1..],
-        &MEMBER.to_uppercase().replace('1', "A"),
-        &"zz".repeat(32),
-    ] {
-        let replies = [
-            h.call("POST", "/connect/google", Some(json!({ "member": member })))
-                .await,
-            h.call("GET", &format!("/connections?member={member}"), None)
-                .await,
-            h.call(
-                "DELETE",
-                &format!("/connections/{id}?member={member}"),
-                None,
-            )
-            .await,
-        ];
-        for reply in replies {
-            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{member}");
-            assert_eq!(reply.body["error"]["code"], "malformed");
-        }
+    let not_p256 = {
+        use base64::Engine;
+        base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(b"not a key")
+    };
+    for member_key in ["not base64url!".to_string(), not_p256] {
+        let mut body = signed(&me, json!({ "op": "connect", "provider": "google" }));
+        body["member_key"] = json!(member_key);
+        let mut channel = h.channel().await;
+        let reply = h
+            .sealed(&mut channel, "POST", "/connect/google", &body)
+            .await;
+        assert!(reply.sealed);
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+        assert_eq!(reply.body["error"]["code"], "malformed");
     }
     assert_eq!(count(&h, "pending_connects").await, 0);
 }
@@ -118,8 +134,14 @@ async fn an_unknown_provider_is_not_found_and_a_malformed_member_is_refused() {
 #[tokio::test]
 async fn the_authorization_url_asks_google_for_exactly_six_scopes_with_s256_offline_and_consent() {
     let Some(h) = harness().await else { return };
+    let me = member();
     let reply = h
-        .call("POST", "/connect/google", Some(json!({ "member": MEMBER })))
+        .as_member(
+            &me,
+            "POST",
+            "/connect/google",
+            json!({ "op": "connect", "provider": "google" }),
+        )
         .await;
     let url = reqwest::Url::parse(reply.body["url"].as_str().unwrap()).unwrap();
     assert_eq!(url.scheme(), "https");
@@ -152,36 +174,38 @@ async fn the_authorization_url_asks_google_for_exactly_six_scopes_with_s256_offl
 #[tokio::test]
 async fn a_state_that_is_unknown_used_expired_or_another_members_never_reaches_google() {
     let Some(h) = harness().await else { return };
+    let me = member();
     let refused = |reply: &Reply| {
         assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
         assert_eq!(reply.body["error"]["code"], "state_invalid");
     };
 
-    refused(&h.finish(MEMBER, "4/any", "no-such-state").await);
+    refused(&h.finish(&me, "4/any", "no-such-state").await);
 
-    let query = h.start("google", MEMBER).await;
+    let query = h.start("google", &me).await;
     let consent = h.fake.consent(&query["code_challenge"], EMAIL);
     assert_eq!(
-        h.finish(MEMBER, &consent.code, &query["state"])
-            .await
-            .status,
+        h.finish(&me, &consent.code, &query["state"]).await.status,
         StatusCode::OK
     );
     let again = h.fake.consent(&query["code_challenge"], EMAIL);
-    refused(&h.finish(MEMBER, &again.code, &query["state"]).await);
+    refused(&h.finish(&me, &again.code, &query["state"]).await);
 
-    let query = h.start("google", MEMBER).await;
+    let query = h.start("google", &me).await;
     sqlx::query("update pending_connects set exp = now() - interval '1 second'")
         .execute(&h.pool)
         .await
         .unwrap();
     let consent = h.fake.consent(&query["code_challenge"], EMAIL);
-    refused(&h.finish(MEMBER, &consent.code, &query["state"]).await);
+    refused(&h.finish(&me, &consent.code, &query["state"]).await);
 
-    let query = h.start("google", MEMBER).await;
+    let query = h.start("google", &me).await;
     let consent = h.fake.consent(&query["code_challenge"], EMAIL);
-    refused(&h.finish(OTHER_MEMBER, &consent.code, &query["state"]).await);
-    refused(&h.finish(MEMBER, &consent.code, &query["state"]).await);
+    refused(
+        &h.finish(&other_member(), &consent.code, &query["state"])
+            .await,
+    );
+    refused(&h.finish(&me, &consent.code, &query["state"]).await);
 
     assert_eq!(h.fake.with(|f| f.hits("/token")), 1);
 }
@@ -189,11 +213,12 @@ async fn a_state_that_is_unknown_used_expired_or_another_members_never_reaches_g
 #[tokio::test]
 async fn two_concurrent_finishes_with_one_state_connect_exactly_once() {
     let Some(h) = harness().await else { return };
-    let query = h.start("google", MEMBER).await;
+    let me = member();
+    let query = h.start("google", &me).await;
     let consent = h.fake.consent(&query["code_challenge"], EMAIL);
     let (a, b) = tokio::join!(
-        h.finish(MEMBER, &consent.code, &query["state"]),
-        h.finish(MEMBER, &consent.code, &query["state"]),
+        h.finish(&me, &consent.code, &query["state"]),
+        h.finish(&me, &consent.code, &query["state"]),
     );
     let mut statuses = [a.status, b.status];
     statuses.sort();
@@ -205,6 +230,7 @@ async fn two_concurrent_finishes_with_one_state_connect_exactly_once() {
 #[tokio::test]
 async fn a_failed_exchange_or_account_lookup_answers_exchange_failed_and_writes_nothing() {
     let Some(h) = harness().await else { return };
+    let me = member();
     let failures: [fn(&mut Fake); 3] = [
         |f| f.token_status = StatusCode::BAD_REQUEST,
         |f| f.omit_refresh_token = true,
@@ -217,7 +243,7 @@ async fn a_failed_exchange_or_account_lookup_answers_exchange_failed_and_writes_
             f.account_status = StatusCode::OK;
             fail(f);
         });
-        let (reply, _) = h.connect(MEMBER, EMAIL).await;
+        let (reply, _) = h.connect(&me, EMAIL).await;
         assert_eq!(reply.status, StatusCode::BAD_GATEWAY, "{}", reply.body);
         assert_eq!(reply.body["error"]["code"], "exchange_failed");
     }
@@ -227,17 +253,14 @@ async fn a_failed_exchange_or_account_lookup_answers_exchange_failed_and_writes_
 #[tokio::test]
 async fn disconnect_revokes_locally_and_at_google() {
     let Some(h) = harness().await else { return };
-    let (reply, consent) = h.connect(MEMBER, EMAIL).await;
+    let me = member();
+    let (reply, consent) = h.connect(&me, EMAIL).await;
     let id = id_of(&reply);
 
-    let reply = h
-        .call(
-            "DELETE",
-            &format!("/connections/{id}?member={MEMBER}"),
-            None,
-        )
-        .await;
-    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    let reply = h.disconnect(&me, id).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.sealed);
+    assert_eq!(reply.body, json!({}));
     let revoked: bool =
         sqlx::query_scalar("select revoked_at is not null from connections where id = $1")
             .bind(id)
@@ -248,37 +271,24 @@ async fn disconnect_revokes_locally_and_at_google() {
     assert_eq!(h.stored_token(id).await, None);
     assert_eq!(h.fake.with(|f| f.revoked_tokens()), [consent.refresh_token]);
 
-    let listed = h
-        .call("GET", &format!("/connections?member={MEMBER}"), None)
-        .await;
+    let listed = h.list(&me).await;
     assert_eq!(listed.body, json!({ "connections": [] }));
 }
 
 #[tokio::test]
 async fn disconnect_leaves_google_alone_while_another_member_holds_the_same_account() {
     let Some(h) = harness().await else { return };
-    let (mine, _) = h.connect(MEMBER, EMAIL).await;
-    let (theirs, their_consent) = h.connect(OTHER_MEMBER, EMAIL).await;
+    let me = member();
+    let (mine, _) = h.connect(&me, EMAIL).await;
+    let (theirs, their_consent) = h.connect(&other_member(), EMAIL).await;
 
-    let reply = h
-        .call(
-            "DELETE",
-            &format!("/connections/{}?member={MEMBER}", id_of(&mine)),
-            None,
-        )
-        .await;
-    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    let reply = h.disconnect(&me, id_of(&mine)).await;
+    assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(h.stored_token(id_of(&mine)).await, None);
     assert_eq!(h.fake.with(|f| f.hits("/revoke")), 0);
 
-    let reply = h
-        .call(
-            "DELETE",
-            &format!("/connections/{}?member={OTHER_MEMBER}", id_of(&theirs)),
-            None,
-        )
-        .await;
-    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    let reply = h.disconnect(&other_member(), id_of(&theirs)).await;
+    assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(
         h.fake.with(|f| f.revoked_tokens()),
         [their_consent.refresh_token]
@@ -288,8 +298,9 @@ async fn disconnect_leaves_google_alone_while_another_member_holds_the_same_acco
 #[tokio::test]
 async fn the_last_of_two_concurrent_disconnects_of_one_account_revokes_at_google() {
     let Some(h) = harness().await else { return };
-    let (mine, my_consent) = h.connect(MEMBER, EMAIL).await;
-    let (theirs, _) = h.connect(OTHER_MEMBER, EMAIL).await;
+    let me = member();
+    let (mine, my_consent) = h.connect(&me, EMAIL).await;
+    let (theirs, _) = h.connect(&other_member(), EMAIL).await;
 
     let mut their_disconnect = h.pool.begin().await.unwrap();
     sqlx::query(
@@ -299,8 +310,7 @@ async fn the_last_of_two_concurrent_disconnects_of_one_account_revokes_at_google
     .execute(&mut *their_disconnect)
     .await
     .unwrap();
-    let path = format!("/connections/{}?member={MEMBER}", id_of(&mine));
-    let my_disconnect = h.call("DELETE", &path, None);
+    let my_disconnect = h.disconnect(&me, id_of(&mine));
     let commit_theirs_while_mine_waits = async {
         loop {
             let waiting: i64 = sqlx::query_scalar(
@@ -319,7 +329,7 @@ async fn the_last_of_two_concurrent_disconnects_of_one_account_revokes_at_google
     };
     let (reply, ()) = tokio::join!(my_disconnect, commit_theirs_while_mine_waits);
 
-    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(
         h.fake.with(|f| f.revoked_tokens()),
         [my_consent.refresh_token]
@@ -327,21 +337,16 @@ async fn the_last_of_two_concurrent_disconnects_of_one_account_revokes_at_google
 }
 
 #[tokio::test]
-async fn disconnect_answers_204_even_when_google_refuses_the_revoke() {
+async fn disconnect_succeeds_even_when_google_refuses_the_revoke() {
     let Some(h) = harness().await else { return };
-    let (reply, _) = h.connect(MEMBER, EMAIL).await;
+    let me = member();
+    let (reply, _) = h.connect(&me, EMAIL).await;
     let id = id_of(&reply);
     h.fake
         .with(|f| f.revoke_status = StatusCode::INTERNAL_SERVER_ERROR);
 
-    let reply = h
-        .call(
-            "DELETE",
-            &format!("/connections/{id}?member={MEMBER}"),
-            None,
-        )
-        .await;
-    assert_eq!(reply.status, StatusCode::NO_CONTENT);
+    let reply = h.disconnect(&me, id).await;
+    assert_eq!(reply.status, StatusCode::OK);
     assert_eq!(h.stored_token(id).await, None);
     assert_eq!(h.fake.with(|f| f.hits("/revoke")), 1);
 }
@@ -349,69 +354,50 @@ async fn disconnect_answers_204_even_when_google_refuses_the_revoke() {
 #[tokio::test]
 async fn disconnect_of_a_foreign_unknown_or_revoked_connection_is_not_found() {
     let Some(h) = harness().await else { return };
-    let (reply, _) = h.connect(MEMBER, EMAIL).await;
+    let me = member();
+    let (reply, _) = h.connect(&me, EMAIL).await;
     let id = id_of(&reply);
     let not_found = |reply: Reply| {
         assert_eq!(reply.status, StatusCode::NOT_FOUND, "{}", reply.body);
         assert_eq!(reply.body["error"]["code"], "not_found");
     };
 
-    not_found(
-        h.call(
-            "DELETE",
-            &format!("/connections/{id}?member={OTHER_MEMBER}"),
-            None,
-        )
-        .await,
-    );
+    not_found(h.disconnect(&other_member(), id).await);
     assert!(h.stored_token(id).await.is_some());
+    not_found(h.disconnect(&me, uuid::Uuid::now_v7()).await);
     not_found(
-        h.call(
+        h.as_member(
+            &me,
             "DELETE",
-            &format!("/connections/{}?member={MEMBER}", uuid::Uuid::now_v7()),
-            None,
-        )
-        .await,
-    );
-    not_found(
-        h.call(
-            "DELETE",
-            &format!("/connections/not-a-uuid?member={MEMBER}"),
-            None,
+            "/connections/not-a-uuid",
+            json!({ "op": "disconnect", "connection_id": id }),
         )
         .await,
     );
 
-    let path = format!("/connections/{id}?member={MEMBER}");
-    assert_eq!(
-        h.call("DELETE", &path, None).await.status,
-        StatusCode::NO_CONTENT
-    );
-    not_found(h.call("DELETE", &path, None).await);
+    assert_eq!(h.disconnect(&me, id).await.status, StatusCode::OK);
+    not_found(h.disconnect(&me, id).await);
     assert_eq!(h.fake.with(|f| f.hits("/revoke")), 1);
 }
 
 #[tokio::test]
 async fn reconnecting_a_dead_account_keeps_its_id_and_seals_the_new_token() {
     let Some(h) = harness().await else { return };
-    let (first, _) = h.connect(MEMBER, EMAIL).await;
+    let me = member();
+    let (first, _) = h.connect(&me, EMAIL).await;
     let id = id_of(&first);
     sqlx::query("update connections set dead_at = now() where id = $1")
         .bind(id)
         .execute(&h.pool)
         .await
         .unwrap();
-    let listed = h
-        .call("GET", &format!("/connections?member={MEMBER}"), None)
-        .await;
+    let listed = h.list(&me).await;
     assert_eq!(listed.body["connections"][0]["dead"], true);
 
-    let (second, consent) = h.connect(MEMBER, EMAIL).await;
+    let (second, consent) = h.connect(&me, EMAIL).await;
     assert_eq!(second.status, StatusCode::OK);
     assert_eq!(id_of(&second), id);
-    let listed = h
-        .call("GET", &format!("/connections?member={MEMBER}"), None)
-        .await;
+    let listed = h.list(&me).await;
     assert_eq!(listed.body["connections"][0]["dead"], false);
     assert_eq!(listed.body["connections"].as_array().unwrap().len(), 1);
     let blob = h.stored_token(id).await.unwrap();
@@ -424,11 +410,10 @@ async fn reconnecting_a_dead_account_keeps_its_id_and_seals_the_new_token() {
 #[tokio::test]
 async fn two_accounts_are_listed_in_the_order_they_were_connected() {
     let Some(h) = harness().await else { return };
-    let (a, _) = h.connect(MEMBER, "b@example.com").await;
-    let (b, _) = h.connect(MEMBER, "a@example.com").await;
-    let listed = h
-        .call("GET", &format!("/connections?member={MEMBER}"), None)
-        .await;
+    let me = member();
+    let (a, _) = h.connect(&me, "b@example.com").await;
+    let (b, _) = h.connect(&me, "a@example.com").await;
+    let listed = h.list(&me).await;
     let ids: Vec<&str> = listed.body["connections"]
         .as_array()
         .unwrap()
@@ -443,9 +428,7 @@ async fn two_accounts_are_listed_in_the_order_they_were_connected() {
         ]
     );
 
-    let other = h
-        .call("GET", &format!("/connections?member={OTHER_MEMBER}"), None)
-        .await;
+    let other = h.list(&other_member()).await;
     assert_eq!(other.body, json!({ "connections": [] }));
 }
 
@@ -462,7 +445,8 @@ async fn healthz_and_ready_need_no_bearer() {
 #[tokio::test]
 async fn a_reconnect_that_waits_on_a_disconnect_makes_a_new_connection() {
     let Some(h) = harness().await else { return };
-    let (first, _) = h.connect(MEMBER, EMAIL).await;
+    let me = member();
+    let (first, _) = h.connect(&me, EMAIL).await;
     let id = id_of(&first);
 
     let mut disconnect = h.pool.begin().await.unwrap();
@@ -471,7 +455,7 @@ async fn a_reconnect_that_waits_on_a_disconnect_makes_a_new_connection() {
         .execute(&mut *disconnect)
         .await
         .unwrap();
-    let reconnect = h.connect(MEMBER, EMAIL);
+    let reconnect = h.connect(&me, EMAIL);
     let revoke_while_reconnect_waits = async {
         loop {
             let waiting: i64 = sqlx::query_scalar(
@@ -505,13 +489,14 @@ async fn a_reconnect_that_waits_on_a_disconnect_makes_a_new_connection() {
 #[tokio::test]
 async fn a_connection_follows_the_google_account_not_its_email() {
     let Some(h) = harness().await else { return };
+    let me = &member();
     let h = &h;
     let connect_as = |subject: &'static str, email: &'static str| async move {
-        let query = h.start("google", MEMBER).await;
+        let query = h.start("google", me).await;
         let consent = h
             .fake
             .consent_on("google", &query["code_challenge"], subject, email);
-        let reply = h.finish(MEMBER, &consent.code, &query["state"]).await;
+        let reply = h.finish(me, &consent.code, &query["state"]).await;
         assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
         id_of(&reply)
     };
@@ -519,9 +504,7 @@ async fn a_connection_follows_the_google_account_not_its_email() {
     let first = connect_as("account-1", "old@example.com").await;
     let renamed = connect_as("account-1", "new@example.com").await;
     assert_eq!(renamed, first);
-    let listed = h
-        .call("GET", &format!("/connections?member={MEMBER}"), None)
-        .await;
+    let listed = h.list(me).await;
     assert_eq!(listed.body["connections"][0]["account"], "new@example.com");
     assert_eq!(listed.body["connections"].as_array().unwrap().len(), 1);
 

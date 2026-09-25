@@ -204,17 +204,11 @@ async fn no_write_entry_of_any_provider_reaches_proxy_and_destructive_calls_reac
 #[tokio::test]
 async fn an_unknown_revoked_or_foreign_connection_is_not_found_on_write() {
     let Some(h) = harness().await else { return };
-    let (foreign, _) = h.connect(OTHER_MEMBER, "other@example.com").await;
-    let (revoked, _) = h.connect(MEMBER, "second@example.com").await;
+    let (foreign, _) = h.connect(&other_member(), "other@example.com").await;
+    let (revoked, _) = h.connect(&member(), "second@example.com").await;
     let revoked = id_of(&revoked);
-    let gone = h
-        .call(
-            "DELETE",
-            &format!("/connections/{revoked}?member={MEMBER}"),
-            None,
-        )
-        .await;
-    assert_eq!(gone.status, StatusCode::NO_CONTENT);
+    let gone = h.disconnect(&member(), revoked).await;
+    assert_eq!(gone.status, StatusCode::OK);
     for connection in [Uuid::now_v7(), revoked, id_of(&foreign)] {
         let reply = h
             .write(&upload(connection, DRIVE_FILES, "application/json", b"{}"))
