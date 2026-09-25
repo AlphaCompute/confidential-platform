@@ -87,6 +87,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "alpha-channel"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "alpha-core",
+ "alpha-crypto",
+ "base64 0.23.1",
+ "chrono",
+ "ed25519-dalek 3.0.0",
+ "getrandom 0.4.3",
+ "hex",
+ "hpke",
+ "p256 0.14.0",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "uuid",
+ "x509-parser",
+ "zeroize",
+]
+
+[[package]]
 name = "alpha-cli"
 version = "0.1.0"
 dependencies = [
