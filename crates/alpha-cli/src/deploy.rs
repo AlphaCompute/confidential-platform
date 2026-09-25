@@ -402,7 +402,16 @@ pub async fn wait_for_every_copy(
             .and_then(Value::as_str)
             .ok_or_else(|| format!("shroud-go deploy: a copy without a url: {copy}"))?;
         let left = deadline.saturating_sub(started.elapsed());
-        attested.push(wait_for_attestation(url, kms_ca_pem, expected, left).await?);
+        let copy = wait_for_attestation(url, kms_ca_pem, expected, left)
+            .await
+            .map_err(|e| {
+                let (done, all) = (attested.len(), copies.len());
+                format!(
+                    "{done} of {all} copies attested within {}s; {e}",
+                    deadline.as_secs()
+                )
+            })?;
+        attested.push(copy);
     }
     Ok(Value::Array(attested))
 }

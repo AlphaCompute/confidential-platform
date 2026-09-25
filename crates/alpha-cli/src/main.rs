@@ -181,7 +181,7 @@ enum InstancesCommand {
     },
     /// Stop one copy: drain it by default, so its chats finish first.
     Stop {
-        instance: String,
+        instance: uuid::Uuid,
         /// Delete the copy now, ending its chats.
         #[arg(long, conflicts_with = "drain_seconds")]
         force: bool,
@@ -390,7 +390,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                     instance,
                     force,
                     drain_seconds,
-                } => Ok(instances::stop(&shroud, app, &instance, force, drain_seconds).await?),
+                } => Ok(instances::stop(&shroud, app, instance, force, drain_seconds).await?),
             }
         }
         Command::Unseal {
@@ -468,7 +468,12 @@ mod tests {
                 "--app",
                 "0199a1b2-0000-7000-8000-000000000001",
             ];
-            Cli::try_parse_from(args.iter().chain(&["stop", "some-copy"]).chain(flags)).is_ok()
+            Cli::try_parse_from(
+                args.iter()
+                    .chain(&["stop", "0199a1b2-0000-7000-8000-000000000002"])
+                    .chain(flags),
+            )
+            .is_ok()
         };
         assert!(stop(&[]));
         assert!(stop(&["--force"]));

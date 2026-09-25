@@ -38,13 +38,13 @@ impl Ca {
         pem::encode(&pem::Pem::new("CERTIFICATE", self.cert.clone()))
     }
 
-    /// A listener presenting a one-hour Instance leaf for `hash` issued by this CA.
-    async fn instance_serving(&self, hash: ComposeHash) -> String {
+    /// A listener presenting a one-hour Instance leaf of `app` for `hash` issued by this CA.
+    async fn instance_serving(&self, app: AppId, hash: ComposeHash) -> String {
         let now = SystemTime::now();
         let ca_key = certs::key_pair(&self.key_der).unwrap();
         let runtime = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
         let pkcs8 = runtime.serialize_der();
-        let sans = certs::instance_sans(OrgId::mint(), AppId::mint(), &"ab".repeat(32), hash);
+        let sans = certs::instance_sans(OrgId::mint(), app, &"ab".repeat(32), hash);
         let leaf = certs::issue_leaf(
             &ca_key,
             &self.cert,
@@ -119,7 +119,7 @@ async fn add_waits_for_the_new_copy_to_attest() {
     let ca = Ca::new();
     let app = AppId::mint();
     let hash = compose_hash("{\"name\":\"worker\"}");
-    let url = ca.instance_serving(hash).await;
+    let url = ca.instance_serving(app, hash).await;
     let (shroud, seen) = shroud(copy(app, hash, &url)).await;
 
     let out = instances::add(
@@ -148,7 +148,7 @@ async fn add_refuses_a_copy_that_attests_another_revision() {
     let app = AppId::mint();
     let claimed = compose_hash("{\"name\":\"worker\"}");
     let served = compose_hash("{\"name\":\"something else\"}");
-    let url = ca.instance_serving(served).await;
+    let url = ca.instance_serving(app, served).await;
     let (shroud, _) = shroud(copy(app, claimed, &url)).await;
 
     let message = instances::add(&shroud, app, None, Some((Duration::ZERO, &ca.pem())))
@@ -157,6 +157,29 @@ async fn add_refuses_a_copy_that_attests_another_revision() {
 
     assert!(message.contains("did not attest"), "{message}");
     assert!(message.contains(&served.to_string()), "{message}");
+}
+
+#[tokio::test]
+async fn add_refuses_a_copy_of_another_app() {
+    let ca = Ca::new();
+    let (app, other) = (AppId::mint(), AppId::mint());
+    let hash = compose_hash("{\"name\":\"worker\"}");
+    let url = ca.instance_serving(other, hash).await;
+    let (shroud, _) = shroud(copy(app, hash, &url)).await;
+
+    let message = instances::add(
+        &shroud,
+        app,
+        None,
+        Some((Duration::from_secs(10), &ca.pem())),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(
+        message.contains(&format!("not an Instance of App {app}")),
+        "{message}"
+    );
 }
 
 #[tokio::test]
@@ -179,7 +202,7 @@ async fn list_prints_the_copies_and_sends_the_key() {
 async fn stop_drains_by_default_and_forces_on_request() {
     let app = AppId::mint();
     let (shroud, seen) = shroud(copy(app, compose_hash("{}"), "https://copy.example")).await;
-    let iid = "0199a1b2-0000-7000-8000-000000000001";
+    let iid: uuid::Uuid = "0199a1b2-0000-7000-8000-000000000001".parse().unwrap();
 
     instances::stop(&shroud, app, iid, false, None)
         .await
@@ -207,8 +230,8 @@ async fn a_deploy_waits_for_every_copy_in_reply_order() {
     let ca = Ca::new();
     let app = AppId::mint();
     let hash = compose_hash("{\"name\":\"worker\"}");
-    let first = ca.instance_serving(hash).await;
-    let second = ca.instance_serving(hash).await;
+    let first = ca.instance_serving(app, hash).await;
+    let second = ca.instance_serving(app, hash).await;
     let reply = json!({ "instances": [copy(app, hash, &first), copy(app, hash, &second)] });
 
     let attested =
@@ -227,9 +250,9 @@ async fn a_deploy_fails_when_one_copy_serves_another_revision() {
     let ca = Ca::new();
     let app = AppId::mint();
     let hash = compose_hash("{\"name\":\"worker\"}");
-    let good = ca.instance_serving(hash).await;
+    let good = ca.instance_serving(app, hash).await;
     let stale = ca
-        .instance_serving(compose_hash("{\"name\":\"previous\"}"))
+        .instance_serving(app, compose_hash("{\"name\":\"previous\"}"))
         .await;
     let reply = json!({ "instances": [copy(app, hash, &good), copy(app, hash, &stale)] });
 

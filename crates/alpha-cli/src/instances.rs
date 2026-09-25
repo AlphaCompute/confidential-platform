@@ -5,6 +5,7 @@ use std::time::Duration;
 use alpha_core::{AppId, ComposeHash};
 use reqwest::Method;
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::deploy::{Shroud, wait_for_attestation};
 
@@ -29,7 +30,8 @@ pub async fn shroud_call(
         .await
         .map_err(|e| format!("shroud-go: {e}"))?;
     let status = response.status();
-    let body: Value = response.json().await.unwrap_or(Value::Null);
+    let text = response.text().await.unwrap_or_default();
+    let body = serde_json::from_str(&text).unwrap_or(Value::String(text));
     if !status.is_success() {
         return Err(format!("shroud-go {path}: {status}: {body}"));
     }
@@ -70,6 +72,11 @@ pub async fn add(
         .parse()
         .map_err(|e| format!("shroud-go {path}: compose_hash: {e}"))?;
     let attested = wait_for_attestation(field("url")?, kms_ca_pem, expected, deadline).await?;
+    // The Revision came from shroud-go too, so only the leaf's App tells this copy apart from
+    // another App's Instance.
+    if attested.get("app_id").and_then(Value::as_str) != Some(app.to_string().as_str()) {
+        return Err(format!("{attested} is not an Instance of App {app}"));
+    }
     Ok(json!({ "instance": instance, "attested": attested }))
 }
 
@@ -78,7 +85,7 @@ pub async fn add(
 pub async fn stop(
     shroud: &Shroud,
     app: AppId,
-    instance: &str,
+    instance: Uuid,
     force: bool,
     drain_seconds: Option<u64>,
 ) -> Result<Value, String> {
