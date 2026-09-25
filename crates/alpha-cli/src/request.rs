@@ -17,15 +17,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct Call<'a> {
     pub method: Method,
-    /// Starts with `/`, so it cannot move the request to another host.
     pub path: &'a str,
     pub bearer: &'a str,
     pub body: Option<&'a Value>,
-}
-
-pub enum Target {
-    One(Uuid),
-    All,
 }
 
 /// Probes `url` under the KMS CA, refuses a leaf of any App but `app`, then sends `call` over a
@@ -38,9 +32,6 @@ pub async fn send_to(
     kms_ca_pem: &str,
     call: &Call<'_>,
 ) -> Result<Value, String> {
-    if !call.path.starts_with('/') {
-        return Err(format!("path {} does not start with /", call.path));
-    }
     // A copy mid-deploy may still serve the previous Revision; it is the App's own all the same.
     let sans = match probe_instance(url, kms_ca_pem, &listed, system_time_provider())
         .await
@@ -84,23 +75,24 @@ pub async fn send_to(
     }))
 }
 
-/// One entry per target in shroud-go's order, each tagged by its `instance`; a target that
-/// fails carries `error` and the others are still served.
+/// `instance`, or every copy shroud-go lists when `None`. One entry per copy in shroud-go's
+/// order, each tagged by its `instance`; a copy that fails carries `error`, the others are
+/// still served, and the flag says whether any failed.
 pub async fn run(
     shroud: &Shroud,
     app: AppId,
-    target: Target,
+    instance: Option<Uuid>,
     kms_ca_pem: &str,
     call: &Call<'_>,
-) -> Result<Value, String> {
+) -> Result<(Value, bool), String> {
     let listed = instances::list(shroud, app).await?;
     let copies = listed
         .get("instances")
         .and_then(Value::as_array)
         .ok_or_else(|| format!("shroud-go listed no instances: {listed}"))?;
-    let targets: Vec<&Value> = match target {
-        Target::All => copies.iter().collect(),
-        Target::One(iid) => {
+    let targets: Vec<&Value> = match instance {
+        None => copies.iter().collect(),
+        Some(iid) => {
             let iid = iid.to_string();
             let copy = copies
                 .iter()
@@ -109,7 +101,7 @@ pub async fn run(
             vec![copy]
         }
     };
-    let mut responses = Vec::new();
+    let (mut responses, mut failed) = (Vec::new(), false);
     for copy in targets {
         let instance = copy.get("id").cloned().unwrap_or(Value::Null);
         let reply = async {
@@ -131,8 +123,11 @@ pub async fn run(
                 }
                 reply
             }
-            Err(error) => json!({ "instance": instance, "error": error }),
+            Err(error) => {
+                failed = true;
+                json!({ "instance": instance, "error": error })
+            }
         });
     }
-    Ok(json!({ "responses": responses }))
+    Ok((json!({ "responses": responses }), failed))
 }

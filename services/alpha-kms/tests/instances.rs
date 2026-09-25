@@ -9,66 +9,19 @@
     clippy::arithmetic_side_effects
 )]
 
+mod common;
+
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use alpha_cli::deploy::Shroud;
 use alpha_cli::instances;
-use alpha_core::{AppId, ComposeHash, OrgId, compose_hash};
-use alpha_kms::certs;
-use alpha_kms::tls::{self, ServerCert};
+use alpha_core::{AppId, ComposeHash, compose_hash};
 use axum::http::{HeaderMap, Method, Uri};
-use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, PublicKeyData};
+use common::Ca;
 use serde_json::{Value, json};
 
 const API_KEY: &str = "sk_test_organization";
-
-struct Ca {
-    key_der: Vec<u8>,
-    cert: Vec<u8>,
-}
-
-impl Ca {
-    fn new() -> Self {
-        let (key_der, cert) = certs::new_ca(SystemTime::now()).unwrap();
-        Self { key_der, cert }
-    }
-
-    fn pem(&self) -> String {
-        pem::encode(&pem::Pem::new("CERTIFICATE", self.cert.clone()))
-    }
-
-    /// A listener presenting a one-hour Instance leaf of `app` for `hash` issued by this CA.
-    async fn instance_serving(&self, app: AppId, hash: ComposeHash) -> String {
-        let now = SystemTime::now();
-        let ca_key = certs::key_pair(&self.key_der).unwrap();
-        let runtime = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
-        let pkcs8 = runtime.serialize_der();
-        let sans = certs::instance_sans(OrgId::mint(), app, &"ab".repeat(32), hash);
-        let leaf = certs::issue_leaf(
-            &ca_key,
-            &self.cert,
-            &runtime.subject_public_key_info(),
-            sans,
-            now,
-        )
-        .unwrap();
-        let server = ServerCert::sealed(&pkcs8, now).unwrap();
-        server.serve(&pkcs8, leaf, self.cert.clone()).unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("https://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move {
-            alpha_client::tls::serve(
-                listener,
-                tls::server_config(Arc::new(server)).unwrap(),
-                axum::Router::new(),
-                std::future::pending::<()>(),
-            )
-            .await
-        });
-        url
-    }
-}
 
 fn copy(app: AppId, hash: ComposeHash, url: &str) -> Value {
     json!({
@@ -119,7 +72,7 @@ async fn add_waits_for_the_new_copy_to_attest() {
     let ca = Ca::new();
     let app = AppId::mint();
     let hash = compose_hash("{\"name\":\"worker\"}");
-    let url = ca.instance_serving(app, hash).await;
+    let url = ca.instance_serving(app, hash, axum::Router::new()).await;
     let (shroud, seen) = shroud(copy(app, hash, &url)).await;
 
     let out = instances::add(
@@ -148,7 +101,7 @@ async fn add_refuses_a_copy_that_attests_another_revision() {
     let app = AppId::mint();
     let claimed = compose_hash("{\"name\":\"worker\"}");
     let served = compose_hash("{\"name\":\"something else\"}");
-    let url = ca.instance_serving(app, served).await;
+    let url = ca.instance_serving(app, served, axum::Router::new()).await;
     let (shroud, _) = shroud(copy(app, claimed, &url)).await;
 
     let message = instances::add(&shroud, app, None, Some((Duration::ZERO, &ca.pem())))
@@ -164,7 +117,7 @@ async fn add_refuses_a_copy_of_another_app() {
     let ca = Ca::new();
     let (app, other) = (AppId::mint(), AppId::mint());
     let hash = compose_hash("{\"name\":\"worker\"}");
-    let url = ca.instance_serving(other, hash).await;
+    let url = ca.instance_serving(other, hash, axum::Router::new()).await;
     let (shroud, _) = shroud(copy(app, hash, &url)).await;
 
     let message = instances::add(
@@ -230,8 +183,8 @@ async fn a_deploy_waits_for_every_copy_in_reply_order() {
     let ca = Ca::new();
     let app = AppId::mint();
     let hash = compose_hash("{\"name\":\"worker\"}");
-    let first = ca.instance_serving(app, hash).await;
-    let second = ca.instance_serving(app, hash).await;
+    let first = ca.instance_serving(app, hash, axum::Router::new()).await;
+    let second = ca.instance_serving(app, hash, axum::Router::new()).await;
     let reply = json!({ "instances": [copy(app, hash, &first), copy(app, hash, &second)] });
 
     let attested =
@@ -250,9 +203,13 @@ async fn a_deploy_fails_when_one_copy_serves_another_revision() {
     let ca = Ca::new();
     let app = AppId::mint();
     let hash = compose_hash("{\"name\":\"worker\"}");
-    let good = ca.instance_serving(app, hash).await;
+    let good = ca.instance_serving(app, hash, axum::Router::new()).await;
     let stale = ca
-        .instance_serving(app, compose_hash("{\"name\":\"previous\"}"))
+        .instance_serving(
+            app,
+            compose_hash("{\"name\":\"previous\"}"),
+            axum::Router::new(),
+        )
         .await;
     let reply = json!({ "instances": [copy(app, hash, &good), copy(app, hash, &stale)] });
 

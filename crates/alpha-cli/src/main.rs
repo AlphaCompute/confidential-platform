@@ -7,7 +7,7 @@ use alpha_attest::PlatformDocument;
 use alpha_cli::call::Route;
 use alpha_cli::deploy::Shroud;
 use alpha_cli::keyfile::{self, Algorithm};
-use alpha_cli::request::{Call, Target};
+use alpha_cli::request::Call;
 use alpha_cli::{instances, node, sign};
 use alpha_client::platform::SignedDocument;
 use alpha_client::{Client, Pin};
@@ -434,11 +434,14 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             if bearer.is_empty() {
                 return Err(Exit::Usage(format!("{} is empty", bearer_file.display())));
             }
+            // The path is appended to the copy's URL, so without the slash it could extend the host.
+            if !path.starts_with('/') {
+                return Err(Exit::Usage(format!("{path} does not start with /")));
+            }
             let body = body
                 .map(|b| serde_json::from_str::<Value>(&b))
                 .transpose()
                 .map_err(|e| Exit::Usage(format!("--body: {e}")))?;
-            let target = instance.map_or(Target::All, Target::One);
             let call = Call {
                 method,
                 path: &path,
@@ -446,11 +449,8 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 body: body.as_ref(),
             };
             let doc = platform_document(config, now).await?;
-            let out = alpha_cli::request::run(&shroud, app, target, &doc.kms_ca_pem, &call).await?;
-            let failed = out
-                .get("responses")
-                .and_then(Value::as_array)
-                .is_some_and(|r| r.iter().any(|entry| entry.get("error").is_some()));
+            let (out, failed) =
+                alpha_cli::request::run(&shroud, app, instance, &doc.kms_ca_pem, &call).await?;
             if failed {
                 return Err(Exit::Partial(out));
             }
