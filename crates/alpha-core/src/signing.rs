@@ -10,6 +10,9 @@ pub mod context {
     pub const PLATFORM: &str = "alphacompute/platform/v1";
     pub const NODE_BOOTSTRAP: &str = "alphacompute/node-bootstrap/v1";
     pub const INNER_CHANNEL: &str = "alphacompute/inner-channel/v1";
+    pub const CONNECTOR_REQUEST: &str = "alphacompute/connector-request/v1";
+    pub const CONNECTOR_GRANT: &str = "alphacompute/connector-grant/v1";
+    pub const CONNECTOR_WRITE: &str = "alphacompute/connector-write/v1";
 }
 
 pub fn jcs(document: &Value) -> serde_json::Result<Vec<u8>> {

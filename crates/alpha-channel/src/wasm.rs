@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime};
 use serde_json::json;
 use wasm_bindgen::prelude::*;
 
-use crate::{Error, compose, frame, handshake, platform, rfc3339};
+use crate::{Error, compose, frame, handshake, member, platform, rfc3339, sha256_label};
 
 fn js(e: Error) -> JsError {
     JsError::new(&format!("{}: {e}", e.code()))
@@ -240,4 +240,62 @@ impl ServerChannel {
             .seal_response(u64::from(seq), index, end, body)
             .map_err(js)
     }
+}
+
+/// A member document and the digest the page signs with its WebCrypto key.
+#[wasm_bindgen(getter_with_clone)]
+pub struct Signable {
+    /// The JCS text; send it as the signed document.
+    pub document: String,
+    pub digest: Vec<u8>,
+}
+
+/// `fields_json` plus `v`, a fresh `nonce` and `issued_at` from `now_ms`, under one of the member
+/// contexts.
+#[wasm_bindgen]
+pub fn signable(context: &str, fields_json: &str, now_ms: f64) -> Result<Signable, JsError> {
+    let fields = parse("fields", fields_json)?;
+    let (document, digest) = member::signable(context, fields, at(now_ms)?).map_err(js)?;
+    Ok(Signable {
+        document,
+        digest: digest.to_vec(),
+    })
+}
+
+/// `sha256:<hex>` of a write's body.
+#[wasm_bindgen(js_name = bodySha256)]
+pub fn body_sha256(body: &[u8]) -> String {
+    sha256_label(body)
+}
+
+/// The hex SHA-256 of the member key, once the signature and the freshness check out.
+#[wasm_bindgen(js_name = verifyMemberRequest)]
+pub fn verify_member_request(
+    context: &str,
+    document_json: &str,
+    member_key_b64: &str,
+    signature_json: &str,
+    now_ms: f64,
+) -> Result<String, JsError> {
+    let document: serde_json::Value = parse("document", document_json)?;
+    let signature: member::MemberSignature = parse("signature", signature_json)?;
+    let signer =
+        member::verify_request(context, &document, member_key_b64, &signature).map_err(js)?;
+    let issued_at = document
+        .get("issued_at")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| js(Error::Malformed("issued_at is missing".into())))?;
+    member::check_fresh(issued_at, at(now_ms)?).map_err(js)?;
+    Ok(hex::encode(signer.key_sha256))
+}
+
+/// The grant JSON, once `wire` verifies under the base64url SPKI `spki_b64`.
+#[wasm_bindgen(js_name = verifyGrant)]
+pub fn verify_grant(wire: &str, spki_b64: &str) -> Result<String, JsError> {
+    use base64::Engine;
+    let spki = base64::prelude::BASE64_URL_SAFE_NO_PAD
+        .decode(spki_b64)
+        .map_err(|_| js(Error::Malformed("spki is not base64url".into())))?;
+    let grant = member::parse_grant(wire).map_err(js)?;
+    to_json(&grant.verify(&spki).map_err(js)?)
 }

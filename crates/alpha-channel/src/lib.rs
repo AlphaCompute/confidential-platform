@@ -25,6 +25,7 @@ pub mod cert;
 pub mod compose;
 pub mod frame;
 pub mod handshake;
+pub mod member;
 pub mod platform;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
@@ -58,6 +59,10 @@ pub enum Error {
     Exhausted,
     #[error("the response ended without its end frame")]
     Truncated,
+    #[error("{0}")]
+    SignatureInvalid(String),
+    #[error("issued_at is more than a minute from now")]
+    RequestStale,
 }
 
 impl Error {
@@ -76,6 +81,8 @@ impl Error {
             Self::Replayed(_) => "replayed",
             Self::Exhausted => "exhausted",
             Self::Truncated => "truncated",
+            Self::SignatureInvalid(_) => "signature_invalid",
+            Self::RequestStale => "request_stale",
         }
     }
 }

@@ -1,0 +1,74 @@
+{
+  "entries": [
+    {
+      "context": "alphacompute/connector-request/v1",
+      "document": {
+        "v": 1,
+        "op": "connect",
+        "provider": "google",
+        "nonce": "8CyZ3J2ktVOydf9l-h9_2XK6LI5EWoZoTpB-LGM-xnk",
+        "issued_at": "2026-09-25T12:00:00Z"
+      },
+      "member_key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEOtcKffOLRDOr6lO73EVt_z8Hthe1JiHAjYHWF7tPN4GoUY2H2LKLbdTb6ef7FSuHRWcZLccmJhRB7sFa1oc2iA",
+      "signature": {
+        "algorithm": "ecdsa-p256",
+        "signature": "OHUHjLrd8BJAoadGrgMVLvkfxOCN0y4_ON3dIisuCVpRpYVWulV5dbyUXMsEBdnDfbfxTH-u2jvrBv2xBHpHbg"
+      },
+      "high_s": false
+    },
+    {
+      "context": "alphacompute/connector-request/v1",
+      "document": {
+        "v": 1,
+        "op": "list",
+        "nonce": "jteTppktNDZDdOMX7peKQVTbrwJ5JUDyL7ybqhcCxvM",
+        "issued_at": "2026-09-25T12:00:00Z"
+      },
+      "member_key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEOtcKffOLRDOr6lO73EVt_z8Hthe1JiHAjYHWF7tPN4GoUY2H2LKLbdTb6ef7FSuHRWcZLccmJhRB7sFa1oc2iA",
+      "signature": {
+        "algorithm": "ecdsa-p256",
+        "signature": "hpHdyXhdZw_oD5qHpkq2aO3p7N_-FC2Q6GRbzTvONfW200DZ61HqmnUx323mR-mSyyuTauO-yqSV40E1Fa8XXg"
+      },
+      "high_s": true
+    },
+    {
+      "context": "alphacompute/connector-write/v1",
+      "document": {
+        "v": 1,
+        "connection_id": "01999999-0000-7000-8000-000000000001",
+        "method": "POST",
+        "url": "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart",
+        "body_sha256": "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        "nonce": "KKoFDHMU1plK0aCNAKDK-Pp47i0Ws5kMZxZG6P_vuR4",
+        "issued_at": "2026-09-25T12:00:00Z"
+      },
+      "member_key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEOtcKffOLRDOr6lO73EVt_z8Hthe1JiHAjYHWF7tPN4GoUY2H2LKLbdTb6ef7FSuHRWcZLccmJhRB7sFa1oc2iA",
+      "signature": {
+        "algorithm": "ecdsa-p256",
+        "signature": "48ZK3YrYl__ewYFeVJUA0BvSGuczxfDcQfqVpQ5UeSK1vD0LSxs4-EbKn23CiKnTLFKvM4bXUk8nSH5iZOMpGg"
+      },
+      "high_s": true
+    },
+    {
+      "context": "alphacompute/connector-grant/v1",
+      "document": {
+        "v": 1,
+        "aud": "sha256:abababababababababababababababababababababababababababababababab",
+        "connections": [
+          "01999999-0000-7000-8000-000000000001",
+          "01999999-0000-7000-8000-000000000002"
+        ],
+        "exp": "2026-09-25T12:15:00Z",
+        "nonce": "zLFbyDQHwVMEbSN_8GtzAl3_FOxDzQzGRP4eqNJhrGI",
+        "issued_at": "2026-09-25T12:00:00Z"
+      },
+      "member_key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEOtcKffOLRDOr6lO73EVt_z8Hthe1JiHAjYHWF7tPN4GoUY2H2LKLbdTb6ef7FSuHRWcZLccmJhRB7sFa1oc2iA",
+      "signature": {
+        "algorithm": "ecdsa-p256",
+        "signature": "T-2W6HpiD_P5fmkCGY-QkErvPfDlnrpxsHOyVLb2fDciWUvKvu6xrugXQ6k9Jdduql8TPsx9DW7zfPqZnlgrNw"
+      },
+      "high_s": false
+    }
+  ],
+  "grant_wire": "eyJhdWQiOiJzaGEyNTY6YWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYiIsImNvbm5lY3Rpb25zIjpbIjAxOTk5OTk5LTAwMDAtNzAwMC04MDAwLTAwMDAwMDAwMDAwMSIsIjAxOTk5OTk5LTAwMDAtNzAwMC04MDAwLTAwMDAwMDAwMDAwMiJdLCJleHAiOiIyMDI2LTA5LTI1VDEyOjE1OjAwWiIsImlzc3VlZF9hdCI6IjIwMjYtMDktMjVUMTI6MDA6MDBaIiwibm9uY2UiOiJ6TEZieURRSHdWTUViU05fOEd0ekFsM19GT3hEelF6R1JQNGVxTkpockdJIiwidiI6MX0.T-2W6HpiD_P5fmkCGY-QkErvPfDlnrpxsHOyVLb2fDciWUvKvu6xrugXQ6k9Jdduql8TPsx9DW7zfPqZnlgrNw"
+}

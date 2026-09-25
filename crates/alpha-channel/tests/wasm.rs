@@ -7,7 +7,15 @@
     clippy::arithmetic_side_effects
 )]
 
-use alpha_channel::wasm::{Initiator, Responder, verify_platform};
+use alpha_channel::wasm::{
+    Initiator, Responder, compose_services, signable, verify_grant, verify_member_request,
+    verify_platform,
+};
+use base64::Engine;
+use base64::prelude::BASE64_URL_SAFE_NO_PAD;
+use p256::ecdsa::signature::Signer;
+use p256::ecdsa::{Signature, SigningKey};
+use p256::pkcs8::EncodePublicKey;
 use serde_json::{Value, json};
 use wasm_bindgen::{JsCast, JsError, JsValue};
 use wasm_bindgen_test::wasm_bindgen_test;
@@ -130,4 +138,67 @@ fn the_platform_document_verifies_through_the_export() {
     );
     let err = verify_platform(PLATFORM_DOCUMENT, 0.0).err().unwrap();
     assert!(message(err).starts_with("platform_signature: "));
+}
+
+#[wasm_bindgen_test]
+fn member_documents_from_signable_verify_through_the_exports() {
+    let key = SigningKey::from_slice(&[7u8; 32]).unwrap();
+    let spki = BASE64_URL_SAFE_NO_PAD.encode(key.verifying_key().to_public_key_der().unwrap());
+    let sign = |digest: &[u8]| {
+        let signature: Signature = key.sign(digest);
+        BASE64_URL_SAFE_NO_PAD.encode(signature.to_bytes())
+    };
+
+    let list = signable(
+        "alphacompute/connector-request/v1",
+        r#"{"op":"list"}"#,
+        NOW_MS,
+    )
+    .map_err(message)
+    .unwrap();
+    let signature = json!({"algorithm": "ecdsa-p256", "signature": sign(&list.digest)});
+    let signer = verify_member_request(
+        "alphacompute/connector-request/v1",
+        &list.document,
+        &spki,
+        &signature.to_string(),
+        NOW_MS + 30_000.0,
+    )
+    .map_err(message)
+    .unwrap();
+    assert_eq!(signer.len(), 64);
+    let stale = verify_member_request(
+        "alphacompute/connector-request/v1",
+        &list.document,
+        &spki,
+        &signature.to_string(),
+        NOW_MS + 61_000.0,
+    );
+    assert!(message(stale.err().unwrap()).starts_with("request_stale: "));
+
+    let fields = json!({"aud": "sha256:00", "connections": [], "exp": "2026-06-01T00:15:00Z"});
+    let grant = signable(
+        "alphacompute/connector-grant/v1",
+        &fields.to_string(),
+        NOW_MS,
+    )
+    .map_err(message)
+    .unwrap();
+    let wire = format!(
+        "{}.{}",
+        BASE64_URL_SAFE_NO_PAD.encode(&grant.document),
+        sign(&grant.digest)
+    );
+    let verified: Value =
+        serde_json::from_str(&verify_grant(&wire, &spki).map_err(message).unwrap()).unwrap();
+    assert_eq!(verified["exp"], "2026-06-01T00:15:00Z");
+
+    let services: Value =
+        serde_json::from_str(&compose_services(COMPOSE).map_err(message).unwrap()).unwrap();
+    assert!(
+        services["app"]["image"]
+            .as_str()
+            .unwrap()
+            .contains("@sha256:")
+    );
 }
