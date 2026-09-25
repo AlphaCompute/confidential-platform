@@ -466,7 +466,7 @@ async fn an_expired_grant_is_refused() {
 }
 
 #[tokio::test]
-async fn a_grant_longer_than_twelve_hours_or_issued_ahead_of_the_clock_is_refused() {
+async fn a_grant_longer_than_twelve_hours_issued_ahead_or_ending_before_issue_is_refused() {
     let Some(h) = harness().await else { return };
     let (id, _) = h.connected().await;
     let now = SystemTime::now();
@@ -486,7 +486,14 @@ async fn a_grant_longer_than_twelve_hours_or_issued_ahead_of_the_clock_is_refuse
         ahead,
         ahead + Duration::from_secs(600),
     );
-    for grant in [overlong, early] {
+    let backwards = grant_at(
+        &member(),
+        &h.aud,
+        &[id],
+        now + Duration::from_secs(30),
+        now + Duration::from_secs(10),
+    );
+    for grant in [overlong, early, backwards] {
         refused(
             &h,
             with_grant(id, grant),

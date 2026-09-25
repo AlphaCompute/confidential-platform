@@ -32,6 +32,9 @@ pub struct Channels(parking_lot::Mutex<HashMap<String, (Channel, Instant)>>);
 
 impl Channels {
     /// Drops idle channels, then the least recently used one if the table is still full.
+    // ponytail: a channel whose request is still at the provider can be evicted by 1024 newer
+    // handshakes, and its reply is then lost as `channel_unknown` although the request ran. The
+    // upgrade is a response writer that leaves the table with the opened request.
     fn insert(&self, channel: Channel) {
         let mut table = self.0.lock();
         table.retain(|_, (_, used)| used.elapsed() < IDLE);

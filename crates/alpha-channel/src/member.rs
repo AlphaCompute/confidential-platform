@@ -270,14 +270,15 @@ pub fn check_fresh(issued_at: &str, now: SystemTime) -> Result<(), Error> {
 }
 
 impl Grant {
-    /// Refuses a grant issued more than a minute after `now`, expired at `now`, or lasting longer
-    /// than twelve hours.
+    /// Refuses a grant issued more than a minute after `now`, expired at `now`, ending before it
+    /// is issued, or lasting longer than twelve hours.
     pub fn check_window(&self, now: SystemTime) -> Result<(), Error> {
         let now = unix_seconds(now)?;
         let issued_at = seconds("issued_at", &self.issued_at)?;
         let exp = seconds("exp", &self.exp)?;
         if issued_at > now.saturating_add(FRESHNESS_SECONDS)
             || now >= exp
+            || exp <= issued_at
             || exp > issued_at.saturating_add(MAX_GRANT_SECONDS)
         {
             return Err(Error::GrantExpired);
