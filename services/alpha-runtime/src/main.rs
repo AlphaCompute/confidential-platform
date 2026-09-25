@@ -24,12 +24,15 @@ async fn run() -> Result<Exit, Error> {
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).map_err(|e| Error::Key(format!("rng: {e}")))?;
     let key = SigningKey::from_bytes(&seed.into()).map_err(|e| Error::Key(e.to_string()))?;
+    let app_compose =
+        alpha_tsm::app_compose().map_err(|e| Error::Evidence(format!("app_compose: {e}")))?;
     let runtime = Runtime::new(
         config,
         &key,
         Arc::new(SystemTime::now),
         alpha_runtime::tsm_evidence(),
         alpha_client::system_time_provider(),
+        app_compose,
     )?;
     let attested = runtime.attest().await?;
     eprintln!(

@@ -460,6 +460,7 @@ mod tests {
             certificate_chain: format!("{}\n{}", cert.pem(), ca_cert.pem()),
             tls_private_key: Zeroizing::new(leaf_key.serialize_der()),
             attestation_result: dummy_attestation(),
+            app_compose: "test".into(),
         }
     }
 

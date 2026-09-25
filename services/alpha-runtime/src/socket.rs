@@ -70,6 +70,7 @@ pub fn identity_json(runtime: &Runtime) -> Result<Value, Error> {
         "certificate_chain": attested.chain_pem,
         "tls_private_key": BASE64_URL_SAFE_NO_PAD.encode(runtime.tls_private_key()),
         "attestation_result": attested.result,
+        "app_compose": runtime.app_compose,
     }))
 }
 
