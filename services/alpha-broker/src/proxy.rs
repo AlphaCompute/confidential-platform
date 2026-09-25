@@ -200,19 +200,16 @@ async fn granted(state: &AppState, aud: &[u8; 32], wire: &str, id: Uuid) -> Resu
     {
         return Err(Error::NotFound);
     }
-    if listed.iter().any(|(_, other)| *other != key) {
-        return Err(Error::GrantInvalid);
-    }
-    if grant.aud != format!("sha256:{}", hex::encode(aud)) {
+    if listed.iter().any(|(_, other)| *other != key)
+        || grant.aud != format!("sha256:{}", hex::encode(aud))
+        || !grant.connections.contains(&id)
+    {
         return Err(Error::GrantInvalid);
     }
     grant.check_window(SystemTime::now()).map_err(|e| match e {
         alpha_channel::Error::GrantExpired => Error::GrantExpired,
         other => Error::Malformed(other.to_string()),
     })?;
-    if !grant.connections.contains(&id) {
-        return Err(Error::GrantInvalid);
-    }
     Ok(key)
 }
 
