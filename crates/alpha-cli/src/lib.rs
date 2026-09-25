@@ -17,6 +17,7 @@ pub mod deploy;
 pub mod instances;
 pub mod keyfile;
 pub mod node;
+pub mod request;
 pub mod sign;
 
 use std::time::SystemTime;

@@ -7,6 +7,7 @@ use alpha_attest::PlatformDocument;
 use alpha_cli::call::Route;
 use alpha_cli::deploy::Shroud;
 use alpha_cli::keyfile::{self, Algorithm};
+use alpha_cli::request::{Call, Target};
 use alpha_cli::{instances, node, sign};
 use alpha_client::platform::SignedDocument;
 use alpha_client::{Client, Pin};
@@ -143,6 +144,25 @@ enum Command {
         #[command(subcommand)]
         command: InstancesCommand,
     },
+    /// One HTTP request to one or every live copy of an App, each checked first to present a
+    /// leaf from the KMS CA naming this App; prints `{"responses": [...]}`, one per copy.
+    Request {
+        #[arg(long)]
+        app: AppId,
+        #[arg(long, conflicts_with = "all", required_unless_present = "all")]
+        instance: Option<uuid::Uuid>,
+        /// Every copy shroud-go lists, running or draining.
+        #[arg(long)]
+        all: bool,
+        /// File holding the bearer the App's route expects; never taken from the command line.
+        #[arg(long)]
+        bearer_file: PathBuf,
+        /// JSON request body.
+        #[arg(long)]
+        body: Option<String>,
+        method: reqwest::Method,
+        path: String,
+    },
     /// Hand one custodian's share to an attested sealed node.
     Unseal {
         #[arg(long)]
@@ -195,6 +215,8 @@ enum InstancesCommand {
 enum Exit {
     Refused(String),
     Usage(String),
+    /// Printed like a success, but some part of it failed.
+    Partial(Value),
 }
 
 impl From<String> for Exit {
@@ -393,6 +415,47 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 } => Ok(instances::stop(&shroud, app, instance, force, drain_seconds).await?),
             }
         }
+        Command::Request {
+            app,
+            instance,
+            all: _,
+            bearer_file,
+            body,
+            method,
+            path,
+        } => {
+            let shroud = Shroud {
+                url: need(config.shroud_url.clone(), "shroud-url")?,
+                api_key: need(config.shroud_api_key.clone(), "shroud-api-key")?,
+            };
+            let bearer = fs::read_to_string(&bearer_file)
+                .map_err(|e| Exit::Usage(format!("{}: {e}", bearer_file.display())))?;
+            let bearer = bearer.trim();
+            if bearer.is_empty() {
+                return Err(Exit::Usage(format!("{} is empty", bearer_file.display())));
+            }
+            let body = body
+                .map(|b| serde_json::from_str::<Value>(&b))
+                .transpose()
+                .map_err(|e| Exit::Usage(format!("--body: {e}")))?;
+            let target = instance.map_or(Target::All, Target::One);
+            let call = Call {
+                method,
+                path: &path,
+                bearer,
+                body: body.as_ref(),
+            };
+            let doc = platform_document(config, now).await?;
+            let out = alpha_cli::request::run(&shroud, app, target, &doc.kms_ca_pem, &call).await?;
+            let failed = out
+                .get("responses")
+                .and_then(Value::as_array)
+                .is_some_and(|r| r.iter().any(|entry| entry.get("error").is_some()));
+            if failed {
+                return Err(Exit::Partial(out));
+            }
+            Ok(out)
+        }
         Command::Unseal {
             share,
             key,
@@ -449,6 +512,10 @@ async fn main() {
         Err(Exit::Usage(message)) => {
             eprintln!("alpha: {message}");
             std::process::exit(2);
+        }
+        Err(Exit::Partial(value)) => {
+            println!("{value:#}");
+            std::process::exit(1);
         }
     }
 }
