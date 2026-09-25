@@ -55,9 +55,10 @@ pub fn services(compose: &str) -> Result<BTreeMap<String, Service>, Error> {
                 Some(Yaml::Hash(env)) => env
                     .iter()
                     .map(|(key, value)| match (key, value) {
-                        (Yaml::String(key), Yaml::String(v)) => Ok((key.clone(), v.clone())),
+                        (Yaml::String(key), Yaml::String(v) | Yaml::Real(v)) => {
+                            Ok((key.clone(), v.clone()))
+                        }
                         (Yaml::String(key), Yaml::Integer(v)) => Ok((key.clone(), v.to_string())),
-                        (Yaml::String(key), Yaml::Real(v)) => Ok((key.clone(), v.clone())),
                         (Yaml::String(key), Yaml::Boolean(v)) => Ok((key.clone(), v.to_string())),
                         _ => Err(malformed(&format!(
                             "{name}.environment holds a value that is not a scalar"
