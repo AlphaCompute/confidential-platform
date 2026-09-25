@@ -45,32 +45,34 @@ pub struct Member {
     pub spki: Vec<u8>,
 }
 
-/// The signature under `context`, the document's shape and its freshness; the SHA-256 of the
-/// key and the document.
+/// The signature under `context`, the document's shape and its freshness; the key that signed
+/// and the document.
 pub(crate) fn verify(
     context: &str,
     document: &Value,
     member_key: &str,
     signature: &NamedSignature,
-) -> Result<(Vec<u8>, MemberDocument), Error> {
-    verify_request(context, document, member_key, signature, SystemTime::now()).map_err(|e| match e
-    {
-        alpha_channel::Error::SignatureInvalid(m) => Error::SignatureInvalid(m),
-        alpha_channel::Error::RequestStale => Error::RequestStale,
-        other => Error::Malformed(other.to_string()),
-    })
+) -> Result<(Member, MemberDocument), Error> {
+    let (spki, document) =
+        verify_request(context, document, member_key, signature, SystemTime::now()).map_err(
+            |e| match e {
+                alpha_channel::Error::SignatureInvalid(m) => Error::SignatureInvalid(m),
+                alpha_channel::Error::RequestStale => Error::RequestStale,
+                other => Error::Malformed(other.to_string()),
+            },
+        )?;
+    let sha256 = Sha256::digest(&spki).into();
+    Ok((Member { sha256, spki }, document))
 }
 
 fn verified(plaintext: &[u8]) -> Result<(Member, MemberDocument), Error> {
     let signed: SignedRequest = parse_body(plaintext)?;
-    let (spki, document) = verify(
+    verify(
         context::CONNECTOR_REQUEST,
         &signed.document,
         &signed.member_key,
         &signed.signature,
-    )?;
-    let sha256 = Sha256::digest(&spki).into();
-    Ok((Member { sha256, spki }, document))
+    )
 }
 
 /// Records the document's nonce, refusing one seen before, before the request acts.

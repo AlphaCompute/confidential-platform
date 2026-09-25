@@ -72,12 +72,10 @@ pub async fn insert_pending(
     enc_pkce_verifier: &[u8],
 ) -> Result<(), Error> {
     sqlx::query(
-        "insert into pending_connects
-           (state, member_key_sha256, member_key, provider, enc_pkce_verifier, exp)
-         values ($1, $2, $3, $4, $5, now() + interval '10 minutes')",
+        "insert into pending_connects (state, member_key, provider, enc_pkce_verifier, exp)
+         values ($1, $2, $3, $4, now() + interval '10 minutes')",
     )
     .bind(state)
-    .bind(member.sha256.as_slice())
     .bind(member.spki.as_slice())
     .bind(provider)
     .bind(enc_pkce_verifier)
@@ -140,15 +138,14 @@ pub async fn save_connection(
     let sealed = seal(key, id.as_bytes(), refresh_token.as_bytes())?;
     let statement = if new {
         "insert into connections
-           (id, member_key_sha256, member_key, provider, subject, account, enc_refresh_token, scopes)
-         values ($1, $2, $8, $3, $4, $5, $6, $7)"
+           (id, member_key, provider, subject, account, enc_refresh_token, scopes)
+         values ($1, $7, $2, $3, $4, $5, $6)"
     } else {
-        "update connections set account = $5, enc_refresh_token = $6, scopes = $7, dead_at = null
+        "update connections set account = $4, enc_refresh_token = $5, scopes = $6, dead_at = null
          where id = $1"
     };
     sqlx::query(statement)
         .bind(id)
-        .bind(member.sha256.as_slice())
         .bind(provider)
         .bind(&account.subject)
         .bind(&account.email)

@@ -309,13 +309,12 @@ pub async fn write(
 ) -> Response {
     let result = async {
         let signed: SignedWrite = parse_body(&sealed.plaintext)?;
-        let (spki, document) = verify(
+        let (member, document) = verify(
             context::CONNECTOR_WRITE,
             &signed.document,
             &signed.member_key,
             &signed.signature,
         )?;
-        let member: [u8; 32] = Sha256::digest(&spki).into();
         spend(&state, &document).await?;
         let MemberDocument::Write(write) = document else {
             return Err(Error::Malformed("the document is not a write".into()));
@@ -334,7 +333,7 @@ pub async fn write(
         let id = write.connection_id;
         let (provider, entry, headers) = target(
             &state,
-            &member,
+            &member.sha256,
             id,
             &write.method,
             &url,
