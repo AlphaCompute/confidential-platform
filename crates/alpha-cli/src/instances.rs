@@ -75,3 +75,21 @@ pub async fn add(
     let attested = wait_for_attestation(field("url")?, kms_ca_pem, expected, deadline).await?;
     Ok(json!({ "instance": instance, "attested": attested }))
 }
+
+/// Drains the copy by default: shroud-go stops it once its chats end or the drain deadline
+/// passes. `force` deletes it now.
+pub async fn stop(
+    shroud: &Shroud,
+    app: AppId,
+    instance: &str,
+    force: bool,
+    drain_seconds: Option<u64>,
+) -> Result<Value, String> {
+    let query = match (force, drain_seconds) {
+        (true, _) => "?force=true".to_owned(),
+        (false, Some(seconds)) => format!("?drain_seconds={seconds}"),
+        (false, None) => String::new(),
+    };
+    let path = format!("/v1/apps/{app}/instances/{instance}{query}");
+    shroud_call(shroud, Method::DELETE, &path, None).await
+}

@@ -126,8 +126,8 @@ enum Command {
         /// Register the Revision and stop before shroud-go.
         #[arg(long)]
         register_only: bool,
-        /// After deploying, probe the App's Endpoint for this many seconds and fail unless an
-        /// Instance answers with a leaf from the KMS CA naming this Revision.
+        /// After deploying, probe every copy shroud-go returned, all within this many seconds,
+        /// and fail unless each answers with a leaf from the KMS CA naming this Revision.
         #[arg(long, value_name = "SECONDS")]
         wait: Option<u64>,
         #[arg(long)]
@@ -178,6 +178,17 @@ enum InstancesCommand {
         /// a leaf from the KMS CA naming the App's Revision.
         #[arg(long, value_name = "SECONDS")]
         wait: Option<u64>,
+    },
+    /// Stop one copy: drain it by default, so its chats finish first.
+    Stop {
+        instance: String,
+        /// Delete the copy now, ending its chats.
+        #[arg(long, conflicts_with = "drain_seconds")]
+        force: bool,
+        /// How long the copy may drain before shroud-go stops it; shroud-go's default is an
+        /// hour.
+        #[arg(long, value_name = "SECONDS")]
+        drain_seconds: Option<u64>,
     },
 }
 
@@ -375,6 +386,11 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                         .map(|(secs, doc)| (Duration::from_secs(*secs), doc.kms_ca_pem.as_str()));
                     Ok(instances::add(&shroud, app, resources, wait).await?)
                 }
+                InstancesCommand::Stop {
+                    instance,
+                    force,
+                    drain_seconds,
+                } => Ok(instances::stop(&shroud, app, &instance, force, drain_seconds).await?),
             }
         }
         Command::Unseal {
@@ -434,5 +450,29 @@ async fn main() {
             eprintln!("alpha: {message}");
             std::process::exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::Cli;
+
+    #[test]
+    fn stop_takes_force_or_a_drain_not_both() {
+        let stop = |flags: &[&str]| {
+            let args = [
+                "alpha",
+                "instances",
+                "--app",
+                "0199a1b2-0000-7000-8000-000000000001",
+            ];
+            Cli::try_parse_from(args.iter().chain(&["stop", "some-copy"]).chain(flags)).is_ok()
+        };
+        assert!(stop(&[]));
+        assert!(stop(&["--force"]));
+        assert!(stop(&["--drain-seconds", "60"]));
+        assert!(!stop(&["--force", "--drain-seconds", "60"]));
     }
 }

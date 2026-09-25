@@ -4,10 +4,13 @@
 use alpha_client::{Client, Probe, sign};
 use alpha_core::{AppId, ComposeHash, KeyId, check_registration, context, phala};
 use ed25519_dalek::SigningKey;
+use reqwest::Method;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use serde_yaml_ng::{Mapping, Value as Yaml};
 use std::time::{Duration, Instant};
+
+use crate::instances::shroud_call;
 
 pub const RUNTIME_SERVICE: &str = "alpha-runtime";
 /// The App's Endpoint is the CVM's 443: the dstack gateway passes
@@ -336,7 +339,7 @@ pub async fn wait_for_attestation(
 }
 
 /// Registers the Revision, then deploys through shroud-go unless `shroud` is `None`
-/// (`--register-only`), then waits for the Endpoint to attest when `wait` is set.
+/// (`--register-only`), then waits for every copy to attest when `wait` is set.
 pub async fn run(
     client: &Client,
     spec: &AppSpec,
@@ -360,35 +363,48 @@ pub async fn run(
     let Some(shroud) = shroud else {
         return Ok(json!({ "revision": revision }));
     };
-    let response = reqwest::Client::new()
-        .post(format!(
-            "{}/v1/apps/{}/deploy",
-            shroud.url.trim_end_matches('/'),
-            spec.app_id
-        ))
-        .bearer_auth(&shroud.api_key)
-        .json(&json!({
+    let body = shroud_call(
+        shroud,
+        Method::POST,
+        &format!("/v1/apps/{}/deploy", spec.app_id),
+        Some(json!({
             "compose_hash": revision.compose_hash,
             "resources": spec.resources,
             "compose": compose,
-        }))
-        .send()
-        .await
-        .map_err(|e| format!("shroud-go: {e}"))?;
-    let status = response.status();
-    let body: Value = response.json().await.unwrap_or(Value::Null);
-    if !status.is_success() {
-        return Err(format!("shroud-go deploy: {status}: {body}"));
-    }
+        })),
+    )
+    .await?;
     let Some((deadline, kms_ca_pem)) = wait else {
         return Ok(json!({ "revision": revision, "deploy": body }));
     };
-    let url = body
-        .get("url")
-        .and_then(Value::as_str)
-        .ok_or("shroud-go deploy: no url to wait on")?;
-    let attested = wait_for_attestation(url, kms_ca_pem, revision.compose_hash, deadline).await?;
+    let attested = wait_for_every_copy(&body, kms_ca_pem, revision.compose_hash, deadline).await?;
     Ok(json!({ "revision": revision, "deploy": body, "attested": attested }))
+}
+
+/// Waits for each copy a deploy replaced, within one `deadline` for them all; one copy that
+/// never attests fails the deploy.
+pub async fn wait_for_every_copy(
+    body: &Value,
+    kms_ca_pem: &str,
+    expected: ComposeHash,
+    deadline: Duration,
+) -> Result<Value, String> {
+    let copies = body
+        .get("instances")
+        .and_then(Value::as_array)
+        .filter(|copies| !copies.is_empty())
+        .ok_or_else(|| format!("shroud-go deploy: no instances to wait on in {body}"))?;
+    let started = Instant::now();
+    let mut attested = Vec::new();
+    for copy in copies {
+        let url = copy
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("shroud-go deploy: a copy without a url: {copy}"))?;
+        let left = deadline.saturating_sub(started.elapsed());
+        attested.push(wait_for_attestation(url, kms_ca_pem, expected, left).await?);
+    }
+    Ok(Value::Array(attested))
 }
 
 #[cfg(test)]
