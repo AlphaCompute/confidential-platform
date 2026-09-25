@@ -37,6 +37,8 @@ wasm-bindgen = "=0.2.128"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 js-sys = "0.3"
+
+[dev-dependencies]
 wasm-bindgen-test = "=0.3.78"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]

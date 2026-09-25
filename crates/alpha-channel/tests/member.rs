@@ -58,8 +58,7 @@ fn b64(bytes: &[u8]) -> String {
     BASE64_URL_SAFE_NO_PAD.encode(bytes)
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn every_webcrypto_signature_verifies_high_s_included() {
     let vectors = vectors();
     let entries = vectors["entries"].as_array().unwrap();
@@ -75,8 +74,7 @@ fn every_webcrypto_signature_verifies_high_s_included() {
     }
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn another_context_field_key_or_algorithm_is_signature_invalid() {
     let entry = vectors()["entries"][0].clone();
 
@@ -101,8 +99,7 @@ fn another_context_field_key_or_algorithm_is_signature_invalid() {
     assert_eq!(verify(&other).unwrap_err().code(), "signature_invalid");
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn a_member_key_that_is_not_p256_is_malformed() {
     let ed25519 = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32])
         .verifying_key()
@@ -115,8 +112,7 @@ fn a_member_key_that_is_not_p256_is_malformed() {
     }
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn the_webcrypto_grant_verifies_as_received_and_only_under_its_key() {
     let vectors = vectors();
     let member = BASE64_URL_SAFE_NO_PAD
@@ -133,8 +129,7 @@ fn the_webcrypto_grant_verifies_as_received_and_only_under_its_key() {
     );
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn a_grant_wire_without_a_dot_or_with_bad_base64url_is_malformed() {
     let wire = vectors()["grant_wire"].as_str().unwrap().to_owned();
     let (document, signature) = wire.split_once('.').unwrap();
@@ -148,8 +143,7 @@ fn a_grant_wire_without_a_dot_or_with_bad_base64url_is_malformed() {
     }
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn a_grant_reencoded_on_the_way_no_longer_verifies() {
     let vectors = vectors();
     let member = BASE64_URL_SAFE_NO_PAD
@@ -182,8 +176,7 @@ fn grant_wire(key: &SigningKey, fields: Value) -> String {
     )
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn an_unknown_grant_field_is_malformed_only_after_the_signature_verifies() {
     let key = other_key();
     let fields = json!({
@@ -201,8 +194,7 @@ fn an_unknown_grant_field_is_malformed_only_after_the_signature_verifies() {
     );
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn issued_at_more_than_sixty_seconds_away_is_stale() {
     let now = at("2026-09-25T12:00:00Z");
     for issued_at in ["2026-09-25T11:58:59Z", "2026-09-25T12:01:01Z"] {
@@ -224,8 +216,7 @@ fn issued_at_more_than_sixty_seconds_away_is_stale() {
     );
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn signable_returns_a_jcs_document_and_its_digest() {
     let now = at("2026-09-25T12:00:00Z") + Duration::from_millis(900);
     let fields = json!({"exp": "2026-09-25T12:15:00Z", "connections": [], "aud": "sha256:00"});

@@ -140,8 +140,7 @@ mod tests {
         )
     }
 
-    #[cfg_attr(not(target_arch = "wasm32"), test)]
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
     fn instance_sans_parse_and_others_are_foreign() {
         let key = "ab".repeat(32);
         let sans = [format!("alphacompute://{ORG}/{APP}/{key}"), revision()];
@@ -161,8 +160,7 @@ mod tests {
         assert!(parse_instance_sans(&short_key).is_err());
     }
 
-    #[cfg_attr(not(target_arch = "wasm32"), test)]
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
     fn pem_to_der_takes_one_certificate_block() {
         let pem = "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n";
         assert_eq!(pem_to_der(pem).unwrap(), [1, 2, 3]);

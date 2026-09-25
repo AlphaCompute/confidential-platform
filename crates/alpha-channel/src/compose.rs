@@ -84,8 +84,7 @@ mod tests {
         serde_json::json!({ "docker_compose_file": yaml }).to_string()
     }
 
-    #[cfg_attr(not(target_arch = "wasm32"), test)]
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
     fn reads_every_service_of_the_rendered_composes() {
         for compose in [DEPLOY, DOCKER] {
             let services = services(compose).unwrap();
@@ -103,8 +102,7 @@ mod tests {
         }
     }
 
-    #[cfg_attr(not(target_arch = "wasm32"), test)]
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
     fn scalars_read_as_text_and_the_list_form_is_refused() {
         let s = services(&compose(
             "services:\n  a:\n    environment:\n      N: 2\n      B: true\n",

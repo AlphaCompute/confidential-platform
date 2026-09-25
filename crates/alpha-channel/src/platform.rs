@@ -101,8 +101,7 @@ mod tests {
         })
     }
 
-    #[cfg_attr(not(target_arch = "wasm32"), test)]
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
     fn verify_checks_signature_key_and_issued_at() {
         let key = SigningKey::from_bytes(&[5u8; 32]);
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
@@ -131,8 +130,7 @@ mod tests {
         );
     }
 
-    #[cfg_attr(not(target_arch = "wasm32"), test)]
-    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+    #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
     fn the_compiled_in_release_key_parses() {
         release_key().unwrap();
     }

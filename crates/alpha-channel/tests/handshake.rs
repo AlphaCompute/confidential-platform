@@ -91,8 +91,7 @@ fn flip_first_byte(field: &mut Value) {
     *field = json!(BASE64_URL_SAFE_NO_PAD.encode(bytes));
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn a_responder_and_an_initiator_share_a_channel() {
     let now = at(NOW);
     let responder =
@@ -130,29 +129,25 @@ fn a_responder_and_an_initiator_share_a_channel() {
     reader.finish().unwrap();
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn a_ca_that_is_not_the_platforms_is_foreign() {
     let code = refused(LEAF, FOREIGN_CA, |_| {}, &expected(), NOW);
     assert_eq!(code, "foreign_certificate");
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn a_leaf_the_pinned_ca_did_not_sign_is_foreign() {
     let code = refused(FOREIGN_LEAF, CA, |_| {}, &expected(), NOW);
     assert_eq!(code, "foreign_certificate");
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn a_leaf_for_another_app_is_foreign() {
     let code = refused(OTHER_APP_LEAF, CA, |_| {}, &expected(), NOW);
     assert_eq!(code, "foreign_certificate");
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn a_leaf_for_another_organization_is_foreign() {
     let mut other = expected();
     other.org_id = "01920000-0000-7000-8000-0000000000ff".parse().unwrap();
@@ -162,24 +157,21 @@ fn a_leaf_for_another_organization_is_foreign() {
     );
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn a_compose_hash_outside_the_allowlist_is_unknown() {
     let mut other = expected();
     other.revisions = vec![alpha_core::compose_hash("{}")];
     assert_eq!(refused(LEAF, CA, |_| {}, &other, NOW), "unknown_revision");
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn an_empty_allowlist_knows_no_revision() {
     let mut other = expected();
     other.revisions.clear();
     assert_eq!(refused(LEAF, CA, |_| {}, &other, NOW), "unknown_revision");
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn a_compose_with_one_byte_changed_does_not_match_the_revision() {
     let tamper = |hello: &mut Value| {
         let compose = hello["compose"].as_str().unwrap().replacen('{', "[", 1);
@@ -191,8 +183,7 @@ fn a_compose_with_one_byte_changed_does_not_match_the_revision() {
     );
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn an_enc_changed_after_signing_breaks_the_signature() {
     let tamper = |hello: &mut Value| flip_first_byte(&mut hello["enc"]);
     assert_eq!(
@@ -201,8 +192,7 @@ fn an_enc_changed_after_signing_breaks_the_signature() {
     );
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn a_channel_id_changed_after_signing_breaks_the_signature() {
     let tamper = |hello: &mut Value| flip_first_byte(&mut hello["channel"]);
     assert_eq!(
@@ -211,8 +201,7 @@ fn a_channel_id_changed_after_signing_breaks_the_signature() {
     );
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn a_responder_time_changed_after_signing_breaks_the_signature() {
     let tamper = |hello: &mut Value| hello["now"] = json!("2026-06-01T00:00:01Z");
     assert_eq!(
@@ -221,8 +210,7 @@ fn a_responder_time_changed_after_signing_breaks_the_signature() {
     );
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn a_changed_signature_does_not_verify() {
     let tamper = |hello: &mut Value| flip_first_byte(&mut hello["signature"]["signature"]);
     assert_eq!(
@@ -231,8 +219,7 @@ fn a_changed_signature_does_not_verify() {
     );
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn a_signature_algorithm_other_than_ecdsa_p256_is_refused() {
     let tamper = |hello: &mut Value| hello["signature"]["algorithm"] = json!("ed25519");
     assert_eq!(
@@ -241,23 +228,20 @@ fn a_signature_algorithm_other_than_ecdsa_p256_is_refused() {
     );
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn a_leaf_before_its_not_before_is_expired() {
     let code = refused(LEAF, CA, |_| {}, &expected(), "2025-12-31T23:59:59Z");
     assert_eq!(code, "certificate_expired");
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn a_leaf_at_its_not_after_is_expired() {
     let code = refused(LEAF, CA, |_| {}, &expected(), "2036-01-01T00:00:00Z");
     assert_eq!(code, "certificate_expired");
     handshake(LEAF, CA, |_| {}, &expected(), "2035-12-31T23:59:59Z").unwrap();
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn a_chain_of_one_certificate_is_foreign() {
     let tamper = |hello: &mut Value| hello["certificate_chain"] = json!([LEAF]);
     assert_eq!(
@@ -266,8 +250,7 @@ fn a_chain_of_one_certificate_is_foreign() {
     );
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn a_chain_of_three_certificates_is_foreign() {
     let tamper = |hello: &mut Value| hello["certificate_chain"] = json!([LEAF, CA, CA]);
     assert_eq!(
@@ -276,8 +259,7 @@ fn a_chain_of_three_certificates_is_foreign() {
     );
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn the_stands_platform_document_verifies_under_the_compiled_in_release_key() {
     let signed: SignedDocument = serde_json::from_str(PLATFORM_DOCUMENT).unwrap();
     let view = verify(&signed, &release_key().unwrap(), at("2026-09-24T00:00:00Z")).unwrap();
@@ -286,8 +268,7 @@ fn the_stands_platform_document_verifies_under_the_compiled_in_release_key() {
     pem_to_der(&view.kms_ca_pem).unwrap();
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn a_platform_document_with_a_changed_ca_is_refused_platform_signature() {
     let mut signed: SignedDocument = serde_json::from_str(PLATFORM_DOCUMENT).unwrap();
     let ca = signed.document["kms_ca_pem"].as_str().unwrap();
@@ -300,8 +281,7 @@ fn a_platform_document_with_a_changed_ca_is_refused_platform_signature() {
     assert_eq!(err.code(), "platform_signature");
 }
 
-#[cfg_attr(not(target_arch = "wasm32"), test)]
-#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn a_platform_document_is_refused_before_it_was_issued() {
     let signed: SignedDocument = serde_json::from_str(PLATFORM_DOCUMENT).unwrap();
     let issued_at = signed.document["issued_at"].as_str().unwrap();
