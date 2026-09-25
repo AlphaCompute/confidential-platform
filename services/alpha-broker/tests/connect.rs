@@ -512,3 +512,331 @@ async fn a_connection_follows_the_google_account_not_its_email() {
     assert_ne!(reassigned, first);
     assert_eq!(count(h, "connections").await, 2);
 }
+
+/// One signed request per member route, for `id` where the route names a connection.
+fn member_routes(id: uuid::Uuid) -> [(&'static str, String, serde_json::Value); 4] {
+    [
+        (
+            "POST",
+            "/connect/google".to_string(),
+            json!({ "op": "connect", "provider": "google" }),
+        ),
+        (
+            "POST",
+            "/connect/finish".to_string(),
+            json!({ "op": "finish", "state": "s", "code": "c" }),
+        ),
+        ("POST", "/connections".to_string(), json!({ "op": "list" })),
+        (
+            "DELETE",
+            format!("/connections/{id}"),
+            json!({ "op": "disconnect", "connection_id": id }),
+        ),
+    ]
+}
+
+async fn nothing_stored(h: &Harness) {
+    for table in ["pending_connects", "connections", "member_nonces"] {
+        assert_eq!(count(h, table).await, 0, "{table}");
+    }
+}
+
+#[tokio::test]
+async fn a_finish_signed_by_another_key_is_state_invalid_and_spends_the_state() {
+    let Some(h) = harness().await else { return };
+    let me = member();
+    let query = h.start("google", &me).await;
+    let consent = h.fake.consent(&query["code_challenge"], EMAIL);
+
+    for key in [other_member(), member()] {
+        let reply = h.finish(&key, &consent.code, &query["state"]).await;
+        assert!(reply.sealed);
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+        assert_eq!(reply.body["error"]["code"], "state_invalid");
+    }
+    assert_eq!(h.fake.with(|f| f.hits("/token")), 0);
+    assert_eq!(count(&h, "connections").await, 0);
+}
+
+#[tokio::test]
+async fn another_key_lists_none_of_the_connections_and_cannot_disconnect_them() {
+    let Some(h) = harness().await else { return };
+    let me = member();
+    let (reply, _) = h.connect(&me, EMAIL).await;
+    let id = id_of(&reply);
+
+    let theirs = h.list(&other_member()).await;
+    assert!(theirs.sealed);
+    assert_eq!(theirs.body, json!({ "connections": [] }));
+
+    let reply = h.disconnect(&other_member(), id).await;
+    assert!(reply.sealed);
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+    assert_eq!(reply.body["error"]["code"], "not_found");
+    assert!(h.stored_token(id).await.is_some());
+    assert_eq!(
+        h.list(&me).await.body["connections"][0]["id"],
+        id.to_string()
+    );
+    assert_eq!(h.fake.with(|f| f.hits("/revoke")), 0);
+}
+
+#[tokio::test]
+async fn a_request_issued_more_than_a_minute_off_is_request_stale() {
+    let Some(h) = harness().await else { return };
+    let me = member();
+    let minute = std::time::Duration::from_secs(61);
+    let now = std::time::SystemTime::now();
+    nothing_reaches(&h, async {
+        for at in [now - minute, now + minute] {
+            for (method, path, fields) in member_routes(uuid::Uuid::now_v7()) {
+                let mut channel = h.channel().await;
+                let body = signed_at(&me, fields, at);
+                let reply = h.sealed(&mut channel, method, &path, &body).await;
+                assert!(reply.sealed);
+                assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{method} {path}");
+                assert_eq!(reply.body["error"]["code"], "request_stale");
+            }
+        }
+    })
+    .await;
+    nothing_stored(&h).await;
+}
+
+#[tokio::test]
+async fn a_nonce_is_used_once_even_across_a_restart() {
+    let Some(mut h) = harness().await else { return };
+    let me = member();
+    let body = signed(&me, json!({ "op": "list" }));
+
+    let mut first = h.channel().await;
+    let reply = h.sealed(&mut first, "POST", "/connections", &body).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+
+    let replayed = |reply: Reply| {
+        assert!(reply.sealed);
+        assert_eq!(reply.status, StatusCode::CONFLICT, "{}", reply.body);
+        assert_eq!(reply.body["error"]["code"], "nonce_replayed");
+    };
+    let mut second = h.channel().await;
+    replayed(h.sealed(&mut second, "POST", "/connections", &body).await);
+
+    h.restart();
+    let stale = h
+        .sealed(&mut first, "POST", "/connections", &json!({}))
+        .await;
+    assert!(!stale.sealed);
+    assert_eq!(stale.status, StatusCode::CONFLICT);
+    assert_eq!(stale.body["error"]["code"], "channel_unknown");
+    let mut third = h.channel().await;
+    replayed(h.sealed(&mut third, "POST", "/connections", &body).await);
+    assert_eq!(count(&h, "member_nonces").await, 1);
+}
+
+#[tokio::test]
+async fn another_keys_signature_another_op_or_another_target_is_refused() {
+    let Some(h) = harness().await else { return };
+    let me = member();
+    let id = uuid::Uuid::now_v7();
+    let mut foreign_key = signed(&me, json!({ "op": "connect", "provider": "google" }));
+    foreign_key["member_key"] = json!(other_member().key_b64());
+    let cases = [
+        (
+            "POST",
+            "/connect/google".to_string(),
+            foreign_key,
+            "signature_invalid",
+        ),
+        (
+            "POST",
+            "/connect/google".to_string(),
+            signed(&me, json!({ "op": "list" })),
+            "malformed",
+        ),
+        (
+            "POST",
+            "/connect/google".to_string(),
+            signed(&me, json!({ "op": "connect", "provider": "dropbox" })),
+            "malformed",
+        ),
+        (
+            "POST",
+            "/connect/finish".to_string(),
+            signed(&me, json!({ "op": "connect", "provider": "google" })),
+            "malformed",
+        ),
+        (
+            "POST",
+            "/connections".to_string(),
+            signed(&me, json!({ "op": "disconnect", "connection_id": id })),
+            "malformed",
+        ),
+        (
+            "DELETE",
+            format!("/connections/{id}"),
+            signed(
+                &me,
+                json!({ "op": "disconnect", "connection_id": uuid::Uuid::now_v7() }),
+            ),
+            "malformed",
+        ),
+        (
+            "POST",
+            "/connect/google".to_string(),
+            signed(
+                &me,
+                json!({ "op": "connect", "provider": "google", "member": me.reference() }),
+            ),
+            "malformed",
+        ),
+    ];
+    nothing_reaches(&h, async {
+        for (method, path, body, code) in cases {
+            let mut channel = h.channel().await;
+            let reply = h.sealed(&mut channel, method, &path, &body).await;
+            assert!(reply.sealed);
+            assert_eq!(reply.body["error"]["code"], code, "{method} {path} {body}");
+        }
+    })
+    .await;
+    nothing_stored(&h).await;
+}
+
+#[tokio::test]
+async fn a_sealed_request_without_a_signature_is_refused_on_every_route() {
+    let Some(h) = harness().await else { return };
+    let me = member();
+    nothing_reaches(&h, async {
+        for (method, path, fields) in member_routes(uuid::Uuid::now_v7()) {
+            let signed = signed(&me, fields);
+            for body in [
+                json!({ "document": signed["document"], "member_key": me.key_b64() }),
+                json!({ "member": me.reference() }),
+            ] {
+                let mut channel = h.channel().await;
+                let reply = h.sealed(&mut channel, method, &path, &body).await;
+                assert!(reply.sealed);
+                assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{method} {path}");
+                assert_eq!(reply.body["error"]["code"], "malformed");
+            }
+        }
+    })
+    .await;
+    nothing_stored(&h).await;
+}
+
+#[tokio::test]
+async fn the_connect_bearer_alone_opens_no_member_route() {
+    let Some(h) = harness().await else { return };
+    let me = member();
+    let id = uuid::Uuid::now_v7();
+    nothing_reaches(&h, async {
+        for (method, path, _) in member_routes(id) {
+            for body in [
+                json!({ "member": me.reference() }),
+                json!({ "member": me.reference(), "code": "4/any", "state": "s" }),
+            ] {
+                let reply = h.call(method, &path, Some(body)).await;
+                assert!(!reply.sealed);
+                assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{method} {path}");
+                assert_eq!(reply.body["error"]["code"], "frame_invalid");
+            }
+        }
+        let listed = h
+            .call(
+                "GET",
+                &format!("/connections?member={}", me.reference()),
+                None,
+            )
+            .await;
+        assert_eq!(listed.status, StatusCode::METHOD_NOT_ALLOWED);
+    })
+    .await;
+    nothing_stored(&h).await;
+}
+
+#[tokio::test]
+async fn a_frame_opened_twice_moved_to_another_route_or_on_an_unknown_channel_is_refused() {
+    let Some(h) = harness().await else { return };
+    let me = member();
+    nothing_reaches(&h, async {
+        let mut channel = h.channel().await;
+        let frame = channel
+            .seal_request(
+                "POST",
+                "/connections",
+                signed(&me, json!({ "op": "list" })).to_string().as_bytes(),
+            )
+            .unwrap();
+        let reply = h.send_frame(&channel, "POST", "/connections", &frame).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        let again = h.send_frame(&channel, "POST", "/connections", &frame).await;
+        assert!(!again.sealed);
+        assert_eq!(again.status, StatusCode::CONFLICT);
+        assert_eq!(again.body["error"]["code"], "replayed");
+
+        let finish = json!({ "op": "finish", "state": "s", "code": "c" });
+        let moved = channel
+            .seal_request(
+                "POST",
+                "/connect/finish",
+                signed(&me, finish).to_string().as_bytes(),
+            )
+            .unwrap();
+        let reply = h.send_frame(&channel, "POST", "/connections", &moved).await;
+        assert!(!reply.sealed);
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+        assert_eq!(reply.body["error"]["code"], "frame_invalid");
+
+        let mut unknown = channel
+            .seal_request(
+                "POST",
+                "/connections",
+                signed(&me, json!({ "op": "list" })).to_string().as_bytes(),
+            )
+            .unwrap();
+        unknown.channel = "AAAAAAAAAAAAAAAAAAAAAA".into();
+        let reply = h
+            .send_frame(&channel, "POST", "/connections", &unknown)
+            .await;
+        assert!(!reply.sealed);
+        assert_eq!(reply.status, StatusCode::CONFLICT);
+        assert_eq!(reply.body["error"]["code"], "channel_unknown");
+    })
+    .await;
+    assert_eq!(count(&h, "member_nonces").await, 1);
+}
+
+#[tokio::test]
+async fn a_row_whose_key_hash_is_not_its_keys_sha256_cannot_be_inserted() {
+    let Some(h) = harness().await else { return };
+    let me = member();
+    let insert = |hash: [u8; 32]| {
+        sqlx::query(
+            "insert into connections
+               (id, member_key_sha256, member_key, provider, subject, account, enc_refresh_token, scopes)
+             values ($1, $2, $3, 'google', 'subject', 'account', '\\x00', '')",
+        )
+        .bind(uuid::Uuid::now_v7())
+        .bind(hash.to_vec())
+        .bind(me.spki.clone())
+        .execute(&h.pool)
+    };
+    let refused = insert(other_member().sha256()).await.unwrap_err();
+    assert!(refused.to_string().contains("check"), "{refused}");
+    insert(me.sha256()).await.unwrap();
+
+    let pending = |hash: [u8; 32]| {
+        sqlx::query(
+            "insert into pending_connects
+               (state, member_key_sha256, member_key, provider, enc_pkce_verifier, exp)
+             values ($1, $2, $3, 'google', '\\x00', now())",
+        )
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(hash.to_vec())
+        .bind(me.spki.clone())
+        .execute(&h.pool)
+    };
+    assert!(pending(other_member().sha256()).await.is_err());
+    pending(me.sha256()).await.unwrap();
+}
