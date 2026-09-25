@@ -10,7 +10,9 @@ use std::time::{Duration, SystemTime};
 
 use alpha_channel::Error;
 use alpha_channel::NamedSignature;
-use alpha_channel::member::{check_fresh, parse_grant, signable, verify_request};
+use alpha_channel::member::{
+    ConnectorRequest, MemberDocument, check_fresh, parse_grant, signable, verify_request,
+};
 use alpha_core::{context, signing_digest};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
@@ -32,14 +34,28 @@ fn at(rfc3339: &str) -> SystemTime {
         .into()
 }
 
-fn verify(entry: &Value) -> Result<[u8; 32], Error> {
+/// The vectors' `issued_at`.
+const NOW: &str = "2026-09-25T12:00:00Z";
+
+fn verify(entry: &Value) -> Result<([u8; 32], MemberDocument), Error> {
     let signature: NamedSignature = serde_json::from_value(entry["signature"].clone()).unwrap();
     verify_request(
         entry["context"].as_str().unwrap(),
         &entry["document"],
         entry["member_key"].as_str().unwrap(),
         &signature,
+        at(NOW),
     )
+}
+
+/// `verify_request` over `document` signed by `key`, which may be anything, under `context`.
+fn signed_by(key: &SigningKey, context: &str, document: Value) -> Result<MemberDocument, Error> {
+    let signature: Signature = key.sign(&signing_digest(context, &document).unwrap());
+    let signature = NamedSignature {
+        algorithm: "ecdsa-p256".into(),
+        signature: b64(&signature.to_bytes()),
+    };
+    verify_request(context, &document, &b64(&spki(key)), &signature, at(NOW)).map(|r| r.1)
 }
 
 fn other_key() -> SigningKey {
@@ -62,13 +78,20 @@ fn b64(bytes: &[u8]) -> String {
 fn every_webcrypto_signature_verifies_high_s_included() {
     let vectors = vectors();
     let entries = vectors["entries"].as_array().unwrap();
-    assert!(entries.iter().any(|e| e["high_s"] == true));
-    for entry in entries {
+    assert!(
+        entries
+            .iter()
+            .any(|e| e["high_s"] == true && e["context"] != context::CONNECTOR_GRANT)
+    );
+    for entry in entries
+        .iter()
+        .filter(|e| e["context"] != context::CONNECTOR_GRANT)
+    {
         let spki = BASE64_URL_SAFE_NO_PAD
             .decode(entry["member_key"].as_str().unwrap())
             .unwrap();
         assert_eq!(
-            verify(entry).unwrap(),
+            verify(entry).unwrap().0,
             <[u8; 32]>::from(Sha256::digest(&spki))
         );
     }
@@ -249,5 +272,89 @@ fn signable_returns_a_jcs_document_and_its_digest() {
         (context::CONNECTOR_REQUEST, json!(["op"])),
     ] {
         assert_eq!(signable(ctx, fields, now).unwrap_err().code(), "malformed");
+    }
+}
+
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+fn the_vectors_read_as_the_request_or_write_their_context_names() {
+    let vectors = vectors();
+    let entry = |i: usize| verify(&vectors["entries"][i]).unwrap().1;
+    assert!(matches!(
+        entry(0),
+        MemberDocument::Request(ConnectorRequest::Connect { ref provider, .. }) if provider == "google"
+    ));
+    assert!(matches!(
+        entry(1),
+        MemberDocument::Request(ConnectorRequest::List { .. })
+    ));
+    let MemberDocument::Write(write) = entry(2) else {
+        panic!("not a write");
+    };
+    assert_eq!(write.method, "POST");
+    assert_eq!(
+        entry(2).nonce().as_str(),
+        vectors["entries"][2]["document"]["nonce"]
+    );
+}
+
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+fn a_signed_document_outside_its_contexts_shape_is_malformed() {
+    let key = other_key();
+    let list = json!({"v": 1, "op": "list", "nonce": b64(&[1u8; 32]), "issued_at": NOW});
+    signed_by(&key, context::CONNECTOR_REQUEST, list.clone()).unwrap();
+
+    let with = |field: &str, value: Value| {
+        let mut document = list.clone();
+        document[field] = value;
+        document
+    };
+    for (ctx, document) in [
+        (context::CONNECTOR_REQUEST, with("scope", json!("admin"))),
+        (context::CONNECTOR_REQUEST, with("op", json!("export"))),
+        (context::CONNECTOR_REQUEST, with("v", json!(2))),
+        (context::CONNECTOR_REQUEST, with("nonce", json!("short"))),
+        (context::CONNECTOR_WRITE, list.clone()),
+        (context::CONNECTOR_GRANT, list.clone()),
+    ] {
+        let err = signed_by(&key, ctx, document.clone()).unwrap_err();
+        assert_eq!(err.code(), "malformed", "{ctx} {document}");
+    }
+    let stale = with("issued_at", json!("2026-09-25T11:58:59Z"));
+    assert_eq!(
+        signed_by(&key, context::CONNECTOR_REQUEST, stale)
+            .unwrap_err()
+            .code(),
+        "request_stale"
+    );
+}
+
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+fn a_grant_of_another_version_or_with_a_short_nonce_is_malformed() {
+    let key = other_key();
+    let grant = json!({
+        "v": 1, "aud": "sha256:00", "connections": [], "exp": NOW,
+        "nonce": b64(&[1u8; 32]), "issued_at": NOW,
+    });
+    let wire = |document: &Value| {
+        let signature: Signature =
+            key.sign(&signing_digest(context::CONNECTOR_GRANT, document).unwrap());
+        format!(
+            "{}.{}",
+            b64(&alpha_core::jcs(document).unwrap()),
+            b64(&signature.to_bytes())
+        )
+    };
+    parse_grant(&wire(&grant))
+        .unwrap()
+        .verify(&spki(&key))
+        .unwrap();
+    for (field, value) in [("v", json!(2)), ("nonce", json!("short"))] {
+        let mut other = grant.clone();
+        other[field] = value;
+        let err = parse_grant(&wire(&other))
+            .unwrap()
+            .verify(&spki(&key))
+            .unwrap_err();
+        assert_eq!(err.code(), "malformed", "{field}");
     }
 }

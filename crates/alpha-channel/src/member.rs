@@ -27,17 +27,137 @@ use crate::{ECDSA_P256, Error, NamedSignature, p256_signature, random, rfc3339, 
 /// How far a request's `issued_at` may be from the verifier's clock, either way.
 const FRESHNESS_SECONDS: u64 = 60;
 
+/// `v`: every document here is version 1, and any other value does not parse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u8", into = "u8")]
+pub struct V1;
+
+impl TryFrom<u8> for V1 {
+    type Error = &'static str;
+
+    fn try_from(v: u8) -> Result<Self, Self::Error> {
+        if v == 1 { Ok(Self) } else { Err("v is not 1") }
+    }
+}
+
+impl From<V1> for u8 {
+    fn from(_: V1) -> u8 {
+        1
+    }
+}
+
+/// 32 random bytes in base64url; replay protection is keyed on it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
+pub struct Nonce(String);
+
+impl TryFrom<String> for Nonce {
+    type Error = &'static str;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        match BASE64_URL_SAFE_NO_PAD.decode(&text) {
+            Ok(bytes) if bytes.len() == 32 => Ok(Self(text)),
+            _ => Err("nonce is not 32 bytes of base64url"),
+        }
+    }
+}
+
+impl Nonce {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Under `alphacompute/connector-request/v1`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "lowercase", deny_unknown_fields)]
+pub enum ConnectorRequest {
+    Connect {
+        v: V1,
+        provider: String,
+        nonce: Nonce,
+        issued_at: String,
+    },
+    Finish {
+        v: V1,
+        state: String,
+        code: String,
+        nonce: Nonce,
+        issued_at: String,
+    },
+    List {
+        v: V1,
+        nonce: Nonce,
+        issued_at: String,
+    },
+    Disconnect {
+        v: V1,
+        connection_id: Uuid,
+        nonce: Nonce,
+        issued_at: String,
+    },
+}
+
+/// Under `alphacompute/connector-write/v1`: one request the member sends to a provider.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriteDocument {
+    pub v: V1,
+    pub connection_id: Uuid,
+    pub method: String,
+    pub url: String,
+    /// `sha256:<hex>` of the body sent beside the document.
+    pub body_sha256: String,
+    pub nonce: Nonce,
+    pub issued_at: String,
+}
+
+/// A request or a write whose signature, shape and freshness checked out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MemberDocument {
+    Request(ConnectorRequest),
+    Write(WriteDocument),
+}
+
+impl MemberDocument {
+    fn nonce_and_issued_at(&self) -> (&Nonce, &str) {
+        match self {
+            Self::Request(
+                ConnectorRequest::Connect {
+                    nonce, issued_at, ..
+                }
+                | ConnectorRequest::Finish {
+                    nonce, issued_at, ..
+                }
+                | ConnectorRequest::List {
+                    nonce, issued_at, ..
+                }
+                | ConnectorRequest::Disconnect {
+                    nonce, issued_at, ..
+                },
+            )
+            | Self::Write(WriteDocument {
+                nonce, issued_at, ..
+            }) => (nonce, issued_at),
+        }
+    }
+
+    pub fn nonce(&self) -> &Nonce {
+        self.nonce_and_issued_at().0
+    }
+}
+
 /// Under `alphacompute/connector-grant/v1`: lets the Instance whose leaf SPKI hashes to `aud` read
 /// through `connections` until `exp`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Grant {
-    pub v: u8,
+    pub v: V1,
     /// `sha256:<hex>` of the worker leaf's SPKI.
     pub aud: String,
     pub connections: Vec<Uuid>,
     pub exp: String,
-    pub nonce: String,
+    pub nonce: Nonce,
     pub issued_at: String,
 }
 
@@ -56,13 +176,16 @@ fn check(key: &VerifyingKey, digest: &[u8; 32], signature: &Signature) -> Result
 }
 
 /// Checks `signature` over `document` under `context` by the key `member_key_b64` (base64url SPKI
-/// DER), returning the SHA-256 of that SPKI. Freshness is the caller's, with `check_fresh`.
+/// DER), then reads the document as that context's request or write and checks its freshness
+/// against `now`. Returns the SHA-256 of the SPKI and the document; whether its nonce was seen
+/// before is the caller's.
 pub fn verify_request(
     context: &str,
     document: &Value,
     member_key_b64: &str,
     signature: &NamedSignature,
-) -> Result<[u8; 32], Error> {
+    now: SystemTime,
+) -> Result<([u8; 32], MemberDocument), Error> {
     if signature.algorithm != ECDSA_P256 {
         return Err(invalid("algorithm is not ecdsa-p256"));
     }
@@ -75,7 +198,22 @@ pub fn verify_request(
     let digest = signing_digest(context, document)
         .map_err(|e| Error::Malformed(format!("document: {e}")))?;
     check(&key, &digest, &signature)?;
-    Ok(Sha256::digest(&spki).into())
+    let parsed = match context {
+        context::CONNECTOR_REQUEST => {
+            serde_json::from_value(document.clone()).map(MemberDocument::Request)
+        }
+        context::CONNECTOR_WRITE => {
+            serde_json::from_value(document.clone()).map(MemberDocument::Write)
+        }
+        _ => {
+            return Err(Error::Malformed(format!(
+                "{context} is not a request or write context"
+            )));
+        }
+    }
+    .map_err(|e| Error::Malformed(format!("document: {e}")))?;
+    check_fresh(parsed.nonce_and_issued_at().1, now)?;
+    Ok((Sha256::digest(&spki).into(), parsed))
 }
 
 /// A grant as received: the JCS bytes that were signed, and the signature.

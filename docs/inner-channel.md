@@ -144,7 +144,9 @@ A signed request travels inside the channel as:
 ```
 
 Requests and writes are fresh when `now − 60 s ≤ issued_at ≤ now + 60 s` by the verifier's
-clock. Each nonce is accepted once.
+clock. Each nonce is accepted once. A verifier reads the document as its context's request or
+write only after the signature checks out, and refuses one with `v` other than 1, a nonce that is
+not 32 bytes, an unknown `op` or an unknown field.
 
 | Context | Document |
 |---|---|
@@ -174,7 +176,7 @@ Every export returns an error rather than trapping, and the error's message star
 | `handshake_signature` | the handshake signature or the encapsulation does not check out |
 | `malformed` | anything that does not parse, including a time that is not one |
 | `rng` | the system's randomness failed |
-| `seal` | sealing failed |
+| `seal` | sealing failed, or a response for a request the channel did not open or already ended |
 | `open` | a frame does not open on this channel, sequence number and route, or arrives out of order |
 | `replayed` | a request's sequence number was already used |
 | `exhausted` | the channel has carried its last request |
@@ -197,12 +199,14 @@ and `response(seq)`. The `ResponseReader` that `response` returns offers `openLi
 
 A tenant's server uses `new Responder(chainPem, pkcs8, compose)`. Its `respond(clientHelloJson,
 nowMs)` returns the ServerHello, and `channel()` returns a `ServerChannel`, which offers
-`openRequest(frameJson, method, path)` and `sealResponse(seq, index, end, body)`.
+`openRequest(frameJson, method, path)` and `sealResponse(seq, end, body)`. The channel numbers a
+response's frames itself, seals only for a request it opened, and seals nothing after the end
+frame, so no AES-GCM nonce is ever used twice.
 
 The rest are functions: `composeServices(compose)`,
 `signable(context, fieldsJson, nowMs)`, `bodySha256(bytes)`,
-`verifyMemberRequest(context, documentJson, memberKeyB64, signatureJson, nowMs)`, which returns
-the member key's SHA-256 in hex, and `verifyGrant(wire, spkiB64)`, which returns the grant as
+`verifyMemberRequest(context, documentJson, memberKeyB64, signatureJson, nowMs)`, which checks
+the signature, the document's shape and its freshness and returns the member key's SHA-256 in hex, and `verifyGrant(wire, spkiB64)`, which returns the grant as
 JSON.
 
 All of these are synchronous, so a page can seal a request inside `pagehide`.
