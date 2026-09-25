@@ -16,7 +16,6 @@ use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::channel::Sealed;
@@ -39,33 +38,23 @@ struct SignedRequest {
     signature: NamedSignature,
 }
 
-/// The key that signed a request: its SPKI and the SHA-256 rows are keyed by.
-pub struct Member {
-    pub sha256: [u8; 32],
-    pub spki: Vec<u8>,
-}
-
-/// The signature under `context`, the document's shape and its freshness; the key that signed
-/// and the document.
+/// The signature under `context`, the document's shape and its freshness; the SPKI of the key
+/// that signed, which is the member, and the document.
 pub(crate) fn verify(
     context: &str,
     document: &Value,
     member_key: &str,
     signature: &NamedSignature,
-) -> Result<(Member, MemberDocument), Error> {
-    let (spki, document) =
-        verify_request(context, document, member_key, signature, SystemTime::now()).map_err(
-            |e| match e {
-                alpha_channel::Error::SignatureInvalid(m) => Error::SignatureInvalid(m),
-                alpha_channel::Error::RequestStale => Error::RequestStale,
-                other => Error::Malformed(other.to_string()),
-            },
-        )?;
-    let sha256 = Sha256::digest(&spki).into();
-    Ok((Member { sha256, spki }, document))
+) -> Result<(Vec<u8>, MemberDocument), Error> {
+    verify_request(context, document, member_key, signature, SystemTime::now()).map_err(|e| match e
+    {
+        alpha_channel::Error::SignatureInvalid(m) => Error::SignatureInvalid(m),
+        alpha_channel::Error::RequestStale => Error::RequestStale,
+        other => Error::Malformed(other.to_string()),
+    })
 }
 
-fn verified(plaintext: &[u8]) -> Result<(Member, MemberDocument), Error> {
+fn verified(plaintext: &[u8]) -> Result<(Vec<u8>, MemberDocument), Error> {
     let signed: SignedRequest = parse_body(plaintext)?;
     verify(
         context::CONNECTOR_REQUEST,
@@ -152,7 +141,7 @@ pub async fn finish(
         spend(&state, &document).await?;
         let pending = store::take_pending(&state.pool, connect_state)
             .await?
-            .filter(|p| p.live && p.member == member.sha256)
+            .filter(|p| p.live && p.member == member)
             .ok_or(Error::StateInvalid)?;
         let provider = oauth::provider(&pending.provider)
             .ok_or_else(|| Error::internal("a pending connect names an unknown provider"))?;
@@ -202,7 +191,7 @@ pub async fn list(State(state): State<Arc<AppState>>, _: AuthedCorpus, sealed: S
             return Err(wrong_op("list"));
         };
         spend(&state, &document).await?;
-        let connections = store::list_connections(&state.pool, &member.sha256).await?;
+        let connections = store::list_connections(&state.pool, &member).await?;
         Ok(json!({ "connections": connections }))
     }
     .await;
@@ -229,7 +218,7 @@ pub async fn disconnect(
             ));
         }
         spend(&state, &document).await?;
-        let (provider, enc, shared) = store::revoke_connection(&state.pool, id, &member.sha256)
+        let (provider, enc, shared) = store::revoke_connection(&state.pool, id, &member)
             .await?
             .ok_or(Error::NotFound)?;
         state.tokens.lock().remove(&id);

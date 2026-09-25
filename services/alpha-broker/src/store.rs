@@ -10,7 +10,6 @@ use sqlx::PgPool;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::connect::Member;
 use crate::{Error, oauth};
 
 /// `nonce(12) ‖ AES-256-GCM(key, plaintext, aad)`.
@@ -67,7 +66,7 @@ pub async fn use_nonce(pool: &PgPool, nonce: &[u8]) -> Result<bool, Error> {
 pub async fn insert_pending(
     pool: &PgPool,
     state: &str,
-    member: &Member,
+    member: &[u8],
     provider: &str,
     enc_pkce_verifier: &[u8],
 ) -> Result<(), Error> {
@@ -76,7 +75,7 @@ pub async fn insert_pending(
          values ($1, $2, $3, $4, now() + interval '10 minutes')",
     )
     .bind(state)
-    .bind(member.spki.as_slice())
+    .bind(member)
     .bind(provider)
     .bind(enc_pkce_verifier)
     .execute(pool)
@@ -96,7 +95,7 @@ pub struct Pending {
 pub async fn take_pending(pool: &PgPool, state: &str) -> Result<Option<Pending>, Error> {
     Ok(sqlx::query_as(
         "delete from pending_connects where state = $1
-         returning member_key_sha256 as member, provider, enc_pkce_verifier, exp > now() as live",
+         returning member_key as member, provider, enc_pkce_verifier, exp > now() as live",
     )
     .bind(state)
     .fetch_optional(pool)
@@ -109,7 +108,7 @@ pub async fn take_pending(pool: &PgPool, state: &str) -> Result<Option<Pending>,
 pub async fn save_connection(
     pool: &PgPool,
     key: &[u8; 32],
-    member: &Member,
+    member: &[u8],
     provider: &str,
     account: &oauth::Account,
     refresh_token: &str,
@@ -119,17 +118,18 @@ pub async fn save_connection(
     sqlx::query("select pg_advisory_xact_lock(hashtext($1))")
         .bind(format!(
             "{}/{provider}/{}",
-            hex::encode(member.sha256),
+            hex::encode(member),
             account.subject
         ))
         .execute(&mut *tx)
         .await?;
     let existing: Option<Uuid> = sqlx::query_scalar(
         "select id from connections
-         where member_key_sha256 = $1 and provider = $2 and subject = $3 and revoked_at is null
+         where member_key_sha256 = sha256($1) and provider = $2 and subject = $3
+           and revoked_at is null
          for update",
     )
-    .bind(member.sha256.as_slice())
+    .bind(member)
     .bind(provider)
     .bind(&account.subject)
     .fetch_optional(&mut *tx)
@@ -151,7 +151,7 @@ pub async fn save_connection(
         .bind(&account.email)
         .bind(sealed)
         .bind(scopes)
-        .bind(member.spki.as_slice())
+        .bind(member)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -166,13 +166,13 @@ pub struct Connection {
     pub dead: bool,
 }
 
-pub async fn list_connections(pool: &PgPool, member: &[u8; 32]) -> Result<Vec<Connection>, Error> {
+pub async fn list_connections(pool: &PgPool, member: &[u8]) -> Result<Vec<Connection>, Error> {
     Ok(sqlx::query_as(
         "select id, provider, account, dead_at is not null as dead from connections
-         where member_key_sha256 = $1 and revoked_at is null
+         where member_key_sha256 = sha256($1) and revoked_at is null
          order by created_at, id",
     )
-    .bind(member.as_slice())
+    .bind(member)
     .fetch_all(pool)
     .await?)
 }
@@ -184,7 +184,7 @@ pub async fn list_connections(pool: &PgPool, member: &[u8; 32]) -> Result<Vec<Co
 pub async fn revoke_connection(
     pool: &PgPool,
     id: Uuid,
-    member: &[u8; 32],
+    member: &[u8],
 ) -> Result<Option<(String, Vec<u8>, bool)>, Error> {
     let mut tx = pool.begin().await?;
     // Two members disconnecting one account at once would each see the other still live and
@@ -192,19 +192,19 @@ pub async fn revoke_connection(
     sqlx::query(
         "select o.id from connections o
          join connections c on c.provider = o.provider and c.subject = o.subject
-         where c.id = $1 and c.member_key_sha256 = $2 and c.revoked_at is null
+         where c.id = $1 and c.member_key = $2 and c.revoked_at is null
            and o.revoked_at is null
          order by o.id
          for update of o",
     )
     .bind(id)
-    .bind(member.as_slice())
+    .bind(member)
     .execute(&mut *tx)
     .await?;
     let revoked = sqlx::query_as(
         "with prior as (
            select id, provider, subject, enc_refresh_token from connections
-           where id = $1 and member_key_sha256 = $2 and revoked_at is null
+           where id = $1 and member_key = $2 and revoked_at is null
          )
          update connections c set revoked_at = now(), enc_refresh_token = null
          from prior where c.id = prior.id
@@ -215,7 +215,7 @@ pub async fn revoke_connection(
          )",
     )
     .bind(id)
-    .bind(member.as_slice())
+    .bind(member)
     .fetch_optional(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -225,14 +225,14 @@ pub async fn revoke_connection(
 pub async fn load_connection(
     pool: &PgPool,
     id: Uuid,
-    member: &[u8; 32],
+    member: &[u8],
 ) -> Result<Option<(String, bool)>, Error> {
     Ok(sqlx::query_as(
         "select provider, dead_at is not null as dead from connections
-         where id = $1 and member_key_sha256 = $2 and revoked_at is null",
+         where id = $1 and member_key = $2 and revoked_at is null",
     )
     .bind(id)
-    .bind(member.as_slice())
+    .bind(member)
     .fetch_optional(pool)
     .await?)
 }

@@ -14,7 +14,6 @@ alpha-client = { path = "../../crates/alpha-client" }
 alpha-core = { path = "../../crates/alpha-core" }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 base64 = "0.23"
-chrono = { version = "0.4", default-features = false, features = ["std"] }
 getrandom = "0.4"
 hex = "0.4"
 parking_lot = "0.12"
@@ -30,6 +29,7 @@ uuid = { version = "1", features = ["v7", "serde"] }
 zeroize = "1"
 
 [dev-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 axum = { version = "0.8", default-features = false, features = ["form"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "service", "tokio"] }
 p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }

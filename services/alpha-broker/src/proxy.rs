@@ -19,7 +19,6 @@ use base64::prelude::BASE64_STANDARD;
 use reqwest::Url;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -42,12 +41,6 @@ pub const WRITE_BODY_LIMIT: usize = 16 << 20;
 
 /// A chat names at most as many connections as its worker keeps in one session.
 const MAX_GRANT_CONNECTIONS: usize = 16;
-
-/// The longest a grant may last from its `issued_at`.
-const MAX_GRANT_SECONDS: i64 = 12 * 3600;
-
-/// How far ahead of the broker's clock a grant's `issued_at` may be.
-const GRANT_SKEW_SECONDS: i64 = 60;
 
 /// An access token is used until this long before the provider says it expires.
 const EXPIRY_MARGIN: Duration = Duration::from_secs(60);
@@ -150,7 +143,7 @@ pub fn mcp_call_allowed(tools: &[&str], body: Option<&Value>) -> bool {
 #[allow(clippy::too_many_arguments)]
 async fn target(
     state: &AppState,
-    member: &[u8; 32],
+    member: &[u8],
     id: Uuid,
     method: &str,
     url: &Url,
@@ -177,36 +170,20 @@ async fn target(
     Ok((provider, entry, headers))
 }
 
-fn unix_now() -> Result<i64, Error> {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()
-        .and_then(|d| i64::try_from(d.as_secs()).ok())
-        .ok_or_else(|| Error::internal("the clock is before 1970"))
-}
-
-fn seconds(rfc3339: &str) -> Result<i64, Error> {
-    chrono::DateTime::parse_from_rfc3339(rfc3339)
-        .map(|t| t.timestamp())
-        .map_err(|_| Error::Malformed("the grant's times are not RFC 3339".into()))
-}
-
-/// The SHA-256 of the member key that signed `wire` for the Instance whose leaf SPKI hashes to
-/// `aud`, when the grant is live now and names `id` among connections that are all that key's.
-async fn granted(
-    state: &AppState,
-    aud: &[u8; 32],
-    wire: &str,
-    id: Uuid,
-) -> Result<[u8; 32], Error> {
+/// The member key that signed `wire` for the Instance whose leaf SPKI hashes to `aud`, when the
+/// grant is live now and names `id` among connections that are all that key's.
+async fn granted(state: &AppState, aud: &[u8; 32], wire: &str, id: Uuid) -> Result<Vec<u8>, Error> {
     let signed = parse_grant(wire).map_err(|e| Error::Malformed(e.to_string()))?;
     // The grant's connections can be read only once it verifies, so it is verified under the
     // requested connection's key, and every connection it names must then hold that same key.
-    let requested = store::load_grant_keys(&state.pool, &[id]).await?;
-    let [(_, key)] = requested.as_slice() else {
+    let Some((_, key)) = store::load_grant_keys(&state.pool, &[id])
+        .await?
+        .into_iter()
+        .next()
+    else {
         return Err(Error::NotFound);
     };
-    let grant = signed.verify(key).map_err(|e| match e {
+    let grant = signed.verify(&key).map_err(|e| match e {
         alpha_channel::Error::SignatureInvalid(_) => Error::GrantInvalid,
         other => Error::Malformed(other.to_string()),
     })?;
@@ -223,27 +200,20 @@ async fn granted(
     {
         return Err(Error::NotFound);
     }
-    if listed.iter().any(|(_, other)| other != key) {
+    if listed.iter().any(|(_, other)| *other != key) {
         return Err(Error::GrantInvalid);
     }
     if grant.aud != format!("sha256:{}", hex::encode(aud)) {
         return Err(Error::GrantInvalid);
     }
-    let (now, issued_at, exp) = (
-        unix_now()?,
-        seconds(&grant.issued_at)?,
-        seconds(&grant.exp)?,
-    );
-    if issued_at > now.saturating_add(GRANT_SKEW_SECONDS)
-        || now >= exp
-        || exp > issued_at.saturating_add(MAX_GRANT_SECONDS)
-    {
-        return Err(Error::GrantExpired);
-    }
+    grant.check_window(SystemTime::now()).map_err(|e| match e {
+        alpha_channel::Error::GrantExpired => Error::GrantExpired,
+        other => Error::Malformed(other.to_string()),
+    })?;
     if !grant.connections.contains(&id) {
         return Err(Error::GrantInvalid);
     }
-    Ok(Sha256::digest(key).into())
+    Ok(key)
 }
 
 fn parse_url(url: &str) -> Result<Url, Error> {
@@ -333,7 +303,7 @@ pub async fn write(
         let id = write.connection_id;
         let (provider, entry, headers) = target(
             &state,
-            &member.sha256,
+            &member,
             id,
             &write.method,
             &url,

@@ -22,7 +22,7 @@ use zeroize::Zeroizing;
 
 use crate::{AppState, AuthedCorpus, Error};
 
-pub const MAX_CHANNELS: usize = 1024;
+const MAX_CHANNELS: usize = 1024;
 const IDLE: Duration = Duration::from_secs(3600);
 
 /// This process's open channels by id, with when each was last used. A restart forgets them and
