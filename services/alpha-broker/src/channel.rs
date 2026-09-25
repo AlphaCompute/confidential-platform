@@ -84,8 +84,7 @@ pub async fn open(
     _: AuthedCorpus,
     body: Bytes,
 ) -> Result<Json<ServerHello>, Error> {
-    let hello: ClientHello =
-        serde_json::from_slice(&body).map_err(|e| Error::Malformed(format!("body: {e}")))?;
+    let hello: ClientHello = crate::connect::parse_body(&body)?;
     let (reply, channel) = state
         .responder
         .read()
