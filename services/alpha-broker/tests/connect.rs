@@ -585,12 +585,15 @@ async fn another_key_lists_none_of_the_connections_and_cannot_disconnect_them() 
 async fn a_request_issued_more_than_a_minute_off_is_request_stale() {
     let Some(h) = harness().await else { return };
     let me = member();
-    let minute = std::time::Duration::from_secs(61);
-    let now = std::time::SystemTime::now();
+    // Times are whole seconds on both ends, so 61 seconds ahead can read as 60 once the
+    // broker's clock ticks over.
+    let off = std::time::Duration::from_secs(62);
     nothing_reaches(&h, async {
-        for at in [now - minute, now + minute] {
+        for ahead in [false, true] {
             for (method, path, fields) in member_routes(uuid::Uuid::now_v7()) {
                 let mut channel = h.channel().await;
+                let now = std::time::SystemTime::now();
+                let at = if ahead { now + off } else { now - off };
                 let body = signed_at(&me, fields, at);
                 let reply = h.sealed(&mut channel, method, &path, &body).await;
                 assert!(reply.sealed);
@@ -685,7 +688,7 @@ async fn another_keys_signature_another_op_or_another_target_is_refused() {
             "/connect/google".to_string(),
             signed(
                 &me,
-                json!({ "op": "connect", "provider": "google", "member": me.reference() }),
+                json!({ "op": "connect", "provider": "google", "member": hex::encode(me.sha256()) }),
             ),
             "malformed",
         ),
@@ -711,7 +714,7 @@ async fn a_sealed_request_without_a_signature_is_refused_on_every_route() {
             let signed = signed(&me, fields);
             for body in [
                 json!({ "document": signed["document"], "member_key": me.key_b64() }),
-                json!({ "member": me.reference() }),
+                json!({ "member": hex::encode(me.sha256()) }),
             ] {
                 let mut channel = h.channel().await;
                 let reply = h.sealed(&mut channel, method, &path, &body).await;
@@ -733,8 +736,8 @@ async fn the_connect_bearer_alone_opens_no_member_route() {
     nothing_reaches(&h, async {
         for (method, path, _) in member_routes(id) {
             for body in [
-                json!({ "member": me.reference() }),
-                json!({ "member": me.reference(), "code": "4/any", "state": "s" }),
+                json!({ "member": hex::encode(me.sha256()) }),
+                json!({ "member": hex::encode(me.sha256()), "code": "4/any", "state": "s" }),
             ] {
                 let reply = h.call(method, &path, Some(body)).await;
                 assert!(!reply.sealed);
@@ -745,7 +748,7 @@ async fn the_connect_bearer_alone_opens_no_member_route() {
         let listed = h
             .call(
                 "GET",
-                &format!("/connections?member={}", me.reference()),
+                &format!("/connections?member={}", hex::encode(me.sha256())),
                 None,
             )
             .await;

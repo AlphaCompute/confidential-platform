@@ -106,18 +106,25 @@ pub struct Sealed {
 }
 
 impl FromRequest<Arc<AppState>> for Sealed {
-    type Rejection = Error;
+    /// A body over the route's limit keeps its 413; everything else is this service's error.
+    type Rejection = Response;
 
-    async fn from_request(req: Request, state: &Arc<AppState>) -> Result<Self, Error> {
+    async fn from_request(req: Request, state: &Arc<AppState>) -> Result<Self, Response> {
         let method = req.method().as_str().to_owned();
         let path = req.uri().path().to_owned();
         let body = Bytes::from_request(req, state)
             .await
-            .map_err(|_| Error::FrameInvalid)?;
-        let frame: RequestFrame = serde_json::from_slice(&body).map_err(|_| Error::FrameInvalid)?;
+            .map_err(IntoResponse::into_response)?;
+        Sealed::open(state, &method, &path, &body).map_err(IntoResponse::into_response)
+    }
+}
+
+impl Sealed {
+    fn open(state: &AppState, method: &str, path: &str, body: &[u8]) -> Result<Self, Error> {
+        let frame: RequestFrame = serde_json::from_slice(body).map_err(|_| Error::FrameInvalid)?;
         let plaintext = state
             .channels
-            .with(&frame.channel, |c| c.open_request(&frame, &method, &path))
+            .with(&frame.channel, |c| c.open_request(&frame, method, path))
             .ok_or(Error::ChannelUnknown)?
             .map_err(|e| match e {
                 alpha_channel::Error::Replayed(_) => Error::Replayed,
@@ -129,9 +136,7 @@ impl FromRequest<Arc<AppState>> for Sealed {
             plaintext,
         })
     }
-}
 
-impl Sealed {
     /// `result` as one end frame, a refusal in the same envelope as a plaintext one. The HTTP
     /// status mirrors it for the relay's logs; the page reads only the sealed body.
     pub fn reply(&self, state: &AppState, result: Result<Value, Error>) -> Response {

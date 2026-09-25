@@ -8,6 +8,8 @@
 
 mod common;
 
+use std::time::{Duration, SystemTime};
+
 use axum::http::StatusCode;
 use common::*;
 
@@ -411,4 +413,182 @@ async fn a_request_body_over_two_mib_is_refused_before_google() {
     let reply = h.proxy(&body).await;
     assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
     assert!(h.untouched());
+}
+
+async fn refused(h: &Harness, body: serde_json::Value, status: StatusCode, code: &str) {
+    nothing_reaches(h, async {
+        let reply = h.proxy(&body).await;
+        assert_eq!(reply.status, status, "{body}");
+        assert_eq!(reply.code(), code, "{body}");
+    })
+    .await;
+}
+
+fn with_grant(id: uuid::Uuid, grant: String) -> serde_json::Value {
+    let mut body = read(id, FILES);
+    body["grant"] = serde_json::json!(grant);
+    body
+}
+
+#[tokio::test]
+async fn a_grant_signed_by_another_member_is_refused_before_google() {
+    let Some(h) = harness().await else { return };
+    let (id, _) = h.connected().await;
+    let foreign = grant(&other_member(), &h.aud, &[id]);
+    refused(
+        &h,
+        with_grant(id, foreign),
+        StatusCode::FORBIDDEN,
+        "grant_invalid",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_expired_grant_is_refused() {
+    let Some(h) = harness().await else { return };
+    let (id, _) = h.connected().await;
+    let now = SystemTime::now();
+    let expired = grant_at(
+        &member(),
+        &h.aud,
+        &[id],
+        now - Duration::from_secs(1200),
+        now - Duration::from_secs(1),
+    );
+    refused(
+        &h,
+        with_grant(id, expired),
+        StatusCode::FORBIDDEN,
+        "grant_expired",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_grant_longer_than_twelve_hours_or_issued_ahead_of_the_clock_is_refused() {
+    let Some(h) = harness().await else { return };
+    let (id, _) = h.connected().await;
+    let now = SystemTime::now();
+    let twelve_hours = Duration::from_secs(12 * 3600);
+    let overlong = grant_at(
+        &member(),
+        &h.aud,
+        &[id],
+        now,
+        now + twelve_hours + Duration::from_secs(1),
+    );
+    let ahead = now + Duration::from_secs(120);
+    let early = grant_at(
+        &member(),
+        &h.aud,
+        &[id],
+        ahead,
+        ahead + Duration::from_secs(600),
+    );
+    for grant in [overlong, early] {
+        refused(
+            &h,
+            with_grant(id, grant),
+            StatusCode::FORBIDDEN,
+            "grant_expired",
+        )
+        .await;
+    }
+    let longest = grant_at(&member(), &h.aud, &[id], now, now + twelve_hours);
+    assert_eq!(
+        h.proxy(&with_grant(id, longest)).await.status,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn a_grant_presented_by_another_instance_is_refused() {
+    let Some(h) = harness().await else { return };
+    let (id, _) = h.connected().await;
+    let second = h.ca.instance();
+    let for_second = grant(&member(), &aud_of(&second), &[id]);
+    let other_client = instance_client(&h.ca, Some(second));
+    nothing_reaches(&h, async {
+        let reply = h
+            .post_with(
+                &other_client,
+                None,
+                "/proxy",
+                &with_grant(id, h.grant(&[id])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reply.status, StatusCode::FORBIDDEN);
+        assert_eq!(reply.code(), "grant_invalid");
+    })
+    .await;
+    refused(
+        &h,
+        with_grant(id, for_second),
+        StatusCode::FORBIDDEN,
+        "grant_invalid",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_grant_for_another_connection_of_the_member_is_refused() {
+    let Some(h) = harness().await else { return };
+    let (named, _) = h.connected().await;
+    let (other, _) = h.connect(&member(), "second@example.com").await;
+    refused(
+        &h,
+        with_grant(id_of(&other), h.grant(&[named])),
+        StatusCode::FORBIDDEN,
+        "grant_invalid",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_grant_naming_a_disconnected_connection_is_not_found() {
+    let Some(h) = harness().await else { return };
+    let (id, _) = h.connected().await;
+    let (gone, _) = h.connect(&member(), "second@example.com").await;
+    let gone = id_of(&gone);
+    assert_eq!(h.disconnect(&member(), gone).await.status, StatusCode::OK);
+    refused(
+        &h,
+        with_grant(id, h.grant(&[id, gone])),
+        StatusCode::NOT_FOUND,
+        "not_found",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_grant_naming_two_members_connections_is_refused() {
+    let Some(h) = harness().await else { return };
+    let (mine, _) = h.connected().await;
+    let (theirs, _) = h.connect(&other_member(), "other@example.com").await;
+    refused(
+        &h,
+        with_grant(mine, h.grant(&[mine, id_of(&theirs)])),
+        StatusCode::FORBIDDEN,
+        "grant_invalid",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_grant_naming_no_or_more_than_sixteen_connections_is_malformed() {
+    let Some(h) = harness().await else { return };
+    let (id, _) = h.connected().await;
+    let mut seventeen = vec![id];
+    seventeen.extend((0..16).map(|_| uuid::Uuid::now_v7()));
+    for connections in [vec![], seventeen] {
+        refused(
+            &h,
+            with_grant(id, h.grant(&connections)),
+            StatusCode::BAD_REQUEST,
+            "malformed",
+        )
+        .await;
+    }
 }

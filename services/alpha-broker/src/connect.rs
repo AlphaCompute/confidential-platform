@@ -44,21 +44,30 @@ pub struct Member {
     pub spki: Vec<u8>,
 }
 
-/// The signature under the request context, the document's shape and its freshness.
+/// The signature under `context`, the document's shape and its freshness; the SHA-256 of the
+/// key and the document.
+pub(crate) fn verify(
+    context: &str,
+    document: &Value,
+    member_key: &str,
+    signature: &NamedSignature,
+) -> Result<([u8; 32], MemberDocument), Error> {
+    verify_request(context, document, member_key, signature, SystemTime::now()).map_err(|e| match e
+    {
+        alpha_channel::Error::SignatureInvalid(m) => Error::SignatureInvalid(m),
+        alpha_channel::Error::RequestStale => Error::RequestStale,
+        other => Error::Malformed(other.to_string()),
+    })
+}
+
 fn verified(plaintext: &[u8]) -> Result<(Member, MemberDocument), Error> {
     let signed: SignedRequest = parse_body(plaintext)?;
-    let (sha256, document) = verify_request(
+    let (sha256, document) = verify(
         context::CONNECTOR_REQUEST,
         &signed.document,
         &signed.member_key,
         &signed.signature,
-        SystemTime::now(),
-    )
-    .map_err(|e| match e {
-        alpha_channel::Error::SignatureInvalid(m) => Error::SignatureInvalid(m),
-        alpha_channel::Error::RequestStale => Error::RequestStale,
-        other => Error::Malformed(other.to_string()),
-    })?;
+    )?;
     let spki = BASE64_URL_SAFE_NO_PAD
         .decode(&signed.member_key)
         .map_err(|_| Error::Malformed("member_key is not base64url".into()))?;
@@ -66,7 +75,7 @@ fn verified(plaintext: &[u8]) -> Result<(Member, MemberDocument), Error> {
 }
 
 /// Records the document's nonce, refusing one seen before, before the request acts.
-async fn spend(state: &AppState, document: &MemberDocument) -> Result<(), Error> {
+pub(crate) async fn spend(state: &AppState, document: &MemberDocument) -> Result<(), Error> {
     let nonce = BASE64_URL_SAFE_NO_PAD
         .decode(document.nonce().as_str())
         .map_err(|_| Error::Malformed("nonce is not base64url".into()))?;

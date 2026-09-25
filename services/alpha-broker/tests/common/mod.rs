@@ -115,11 +115,6 @@ impl Member {
         sha2::Sha256::digest(&self.spki).into()
     }
 
-    /// How `/proxy` and `/write` still name a member: the hex of the key's SHA-256.
-    pub fn reference(&self) -> String {
-        hex::encode(self.sha256())
-    }
-
     /// Signs a digest as WebCrypto does, `r‖s` in base64url.
     pub fn sign(&self, digest: &[u8; 32]) -> String {
         use base64::Engine;
@@ -139,9 +134,11 @@ pub fn other_member() -> Member {
 /// `{document, member_key, signature}` for `fields` under the connector request context, issued
 /// at `now`.
 pub fn signed_at(key: &Member, fields: Value, now: SystemTime) -> Value {
-    let (document, digest) =
-        alpha_channel::member::signable(alpha_core::context::CONNECTOR_REQUEST, fields, now)
-            .unwrap();
+    signed_under(alpha_core::context::CONNECTOR_REQUEST, key, fields, now)
+}
+
+fn signed_under(context: &str, key: &Member, fields: Value, now: SystemTime) -> Value {
+    let (document, digest) = alpha_channel::member::signable(context, fields, now).unwrap();
     json!({
         "document": serde_json::from_str::<Value>(&document).unwrap(),
         "member_key": key.key_b64(),
@@ -1303,17 +1300,52 @@ pub fn dropbox_read(connection: Uuid, url: &str) -> Value {
     json!({ "connection_id": connection, "method": "POST", "url": url })
 }
 
-/// A `/write` body carrying `bytes` base64-encoded.
-pub fn upload(connection: Uuid, url: &str, content_type: &str, bytes: &[u8]) -> Value {
+/// The plaintext of a `/write`: `bytes` sent as `content_type` to `method url` on `connection`,
+/// in a document signed by `key` at `now`.
+pub fn export_at(
+    key: &Member,
+    connection: Uuid,
+    method: &str,
+    url: &str,
+    content_type: &str,
+    bytes: &[u8],
+    now: SystemTime,
+) -> Value {
     use base64::Engine;
-    json!({
-        "member": member().reference(),
+    let fields = json!({
         "connection_id": connection,
-        "method": "POST",
+        "method": method,
         "url": url,
-        "content_type": content_type,
-        "body_base64": base64::prelude::BASE64_STANDARD.encode(bytes),
-    })
+        "body_sha256": alpha_channel::sha256_label(bytes),
+    });
+    let mut plaintext = signed_under(alpha_core::context::CONNECTOR_WRITE, key, fields, now);
+    plaintext["content_type"] = json!(content_type);
+    plaintext["body_base64"] = json!(base64::prelude::BASE64_STANDARD.encode(bytes));
+    plaintext
+}
+
+pub fn export(
+    key: &Member,
+    connection: Uuid,
+    method: &str,
+    url: &str,
+    content_type: &str,
+    bytes: &[u8],
+) -> Value {
+    export_at(
+        key,
+        connection,
+        method,
+        url,
+        content_type,
+        bytes,
+        SystemTime::now(),
+    )
+}
+
+/// A `POST` export by `member()`.
+pub fn upload(connection: Uuid, url: &str, content_type: &str, bytes: &[u8]) -> Value {
+    export(&member(), connection, "POST", url, content_type, bytes)
 }
 
 impl Harness {
@@ -1617,13 +1649,26 @@ impl Harness {
         grant(&member(), &self.aud, connections)
     }
 
-    /// `POST /write` over the real listener with the connect bearer and no client certificate,
-    /// as the tenant's backend calls it.
-    pub async fn write(&self, body: &Value) -> Raw {
-        let backend = instance_client(&self.ca, None);
-        self.post_with(&backend, Some(BEARER), "/write", body)
-            .await
-            .unwrap()
+    /// `plaintext` sealed to `POST /write` on a new channel. A relayed answer comes back as the
+    /// provider's status, content type and bytes; a refusal as its status and error body.
+    pub async fn write(&self, plaintext: &Value) -> Raw {
+        use base64::Engine;
+        let mut channel = self.channel().await;
+        let reply = self.sealed(&mut channel, "POST", "/write", plaintext).await;
+        let (status, content_type, bytes) = match reply.body["body_base64"].as_str() {
+            Some(body) => (
+                StatusCode::from_u16(reply.body["status"].as_u64().unwrap() as u16).unwrap(),
+                reply.body["content_type"].as_str().map(str::to_owned),
+                base64::prelude::BASE64_STANDARD.decode(body).unwrap(),
+            ),
+            None => (reply.status, None, reply.body.to_string().into_bytes()),
+        };
+        Raw {
+            status,
+            content_type,
+            headers: HeaderMap::new(),
+            bytes,
+        }
     }
 
     /// Nothing reached a provider's data API and no token was refreshed.

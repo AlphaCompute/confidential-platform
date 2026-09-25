@@ -1,10 +1,10 @@
 //! `POST /proxy`: an attested Instance presents a grant the member's key signed for its leaf, one
 //! of the connections the grant names and a read on that connection's provider's read list.
-//! `POST /write`: the tenant's backend, with its connect bearer, sends one export on the
-//! provider's write list. The broker attaches the
-//! member's access token and answers with the provider's status, content type and body. Neither
-//! route reaches the other's list, nothing outside them reaches the provider, and no token
-//! leaves the broker.
+//! `POST /write`: the tenant's backend relays, sealed on a channel, one export the member's key
+//! signed for that request alone, on the provider's write list. The broker attaches the member's
+//! access token and answers with the provider's status, content type and body. Neither route
+//! reaches the other's list, nothing outside them reaches the provider, and no token leaves the
+//! broker.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -13,19 +13,22 @@ use std::time::{Duration, Instant, SystemTime};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use reqwest::Url;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use alpha_channel::member::parse_grant;
+use alpha_channel::NamedSignature;
+use alpha_channel::member::{MemberDocument, parse_grant};
+use alpha_core::context;
 
-use crate::connect::parse_body;
+use crate::channel::Sealed;
+use crate::connect::{parse_body, spend, verify};
 use crate::oauth::{self, Entry, Provider, RefreshError};
 use crate::{AppState, AuthedCorpus, AuthedInstance, Error, store};
 
@@ -33,8 +36,9 @@ use crate::{AppState, AuthedCorpus, AuthedInstance, Error, store};
 // through the proxy. The upgrade is a ranged or streamed download.
 pub const MAX_RESPONSE: usize = 16 << 20;
 
-/// Fits a delivered file of 8 MiB once base64-encoded inside its JSON envelope.
-pub const WRITE_BODY_LIMIT: usize = 12 << 20;
+/// An 8 MiB file is base64 inside the member's plaintext, and that plaintext is base64 again
+/// inside the sealed frame: about 14.3 MiB on the wire.
+pub const WRITE_BODY_LIMIT: usize = 16 << 20;
 
 /// A chat names at most as many connections as its worker keeps in one session.
 const MAX_GRANT_CONNECTIONS: usize = 16;
@@ -173,16 +177,6 @@ async fn target(
     Ok((provider, entry, headers))
 }
 
-/// The lowercase hex SHA-256 of the member's key.
-fn parse_member(hex_member: &str) -> Result<[u8; 32], Error> {
-    use hex::FromHex;
-    let malformed = || Error::Malformed("member must be 64 lowercase hex characters".into());
-    if hex_member.bytes().any(|b| b.is_ascii_uppercase()) {
-        return Err(malformed());
-    }
-    <[u8; 32]>::from_hex(hex_member).map_err(|_| malformed())
-}
-
 fn unix_now() -> Result<i64, Error> {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -271,7 +265,7 @@ pub async fn proxy(
     State(state): State<Arc<AppState>>,
     instance: AuthedInstance,
     body: Bytes,
-) -> Result<Response, Error> {
+) -> Result<Relayed, Error> {
     let request: ProxyRequest = parse_body(&body)?;
     let url = parse_url(&request.url)?;
     let id = request.connection_id;
@@ -296,13 +290,13 @@ pub async fn proxy(
     forward(&state, id, provider, entry, url, headers, payload).await
 }
 
+/// The member's export as the page seals it: the signed document and the bytes it hashes.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WriteRequest {
-    member: String,
-    connection_id: String,
-    method: String,
-    url: String,
+struct SignedWrite {
+    document: Value,
+    member_key: String,
+    signature: NamedSignature,
     content_type: String,
     body_base64: String,
     headers: Option<BTreeMap<String, String>>,
@@ -311,30 +305,53 @@ struct WriteRequest {
 pub async fn write(
     State(state): State<Arc<AppState>>,
     _: AuthedCorpus,
-    body: Bytes,
-) -> Result<Response, Error> {
-    let request: WriteRequest = parse_body(&body)?;
-    let url = parse_url(&request.url)?;
-    let content_type = HeaderValue::from_str(&request.content_type)
-        .map_err(|_| Error::Malformed("content_type is not a valid header value".into()))?;
-    let bytes = BASE64_STANDARD
-        .decode(&request.body_base64)
-        .map_err(|_| Error::Malformed("body_base64 must be standard base64".into()))?;
-    let id = Uuid::parse_str(&request.connection_id)
-        .map_err(|_| Error::Malformed("connection_id must be a UUID".into()))?;
-    let (provider, entry, headers) = target(
-        &state,
-        &parse_member(&request.member)?,
-        id,
-        &request.method,
-        &url,
-        request.headers,
-        None,
-        |p| p.writes,
-    )
-    .await?;
-    let payload = Some((content_type, Bytes::from(bytes)));
-    forward(&state, id, provider, entry, url, headers, payload).await
+    sealed: Sealed,
+) -> Response {
+    let result = async {
+        let signed: SignedWrite = parse_body(&sealed.plaintext)?;
+        let (member, document) = verify(
+            context::CONNECTOR_WRITE,
+            &signed.document,
+            &signed.member_key,
+            &signed.signature,
+        )?;
+        spend(&state, &document).await?;
+        let MemberDocument::Write(write) = document else {
+            return Err(Error::Malformed("the document is not a write".into()));
+        };
+        let content_type = HeaderValue::from_str(&signed.content_type)
+            .map_err(|_| Error::Malformed("content_type is not a valid header value".into()))?;
+        let bytes = BASE64_STANDARD
+            .decode(&signed.body_base64)
+            .map_err(|_| Error::Malformed("body_base64 must be standard base64".into()))?;
+        if write.body_sha256 != alpha_channel::sha256_label(&bytes) {
+            return Err(Error::Malformed(
+                "body_sha256 is not the SHA-256 of the body".into(),
+            ));
+        }
+        let url = parse_url(&write.url)?;
+        let id = write.connection_id;
+        let (provider, entry, headers) = target(
+            &state,
+            &member,
+            id,
+            &write.method,
+            &url,
+            signed.headers,
+            None,
+            |p| p.writes,
+        )
+        .await?;
+        let payload = Some((content_type, Bytes::from(bytes)));
+        let relayed = forward(&state, id, provider, entry, url, headers, payload).await?;
+        Ok(json!({
+            "status": relayed.status.as_u16(),
+            "content_type": relayed.content_type.as_ref().and_then(|v| v.to_str().ok()),
+            "body_base64": BASE64_STANDARD.encode(&relayed.body),
+        }))
+    }
+    .await;
+    sealed.reply(&state, result)
 }
 
 /// Sends the entry's method to `url` with the member's access token; a 401 on a cached token
@@ -347,7 +364,7 @@ async fn forward(
     url: Url,
     headers: HeaderMap,
     payload: Option<(HeaderValue, Bytes)>,
-) -> Result<Response, Error> {
+) -> Result<Relayed, Error> {
     let mut retried = false;
     loop {
         let token = access_token(state, id, provider).await?;
@@ -376,7 +393,27 @@ async fn forward(
     }
 }
 
-async fn relay(mut response: reqwest::Response) -> Result<Response, Error> {
+/// The provider's answer, read whole.
+pub struct Relayed {
+    status: StatusCode,
+    content_type: Option<HeaderValue>,
+    body: Vec<u8>,
+}
+
+impl IntoResponse for Relayed {
+    fn into_response(self) -> Response {
+        let mut reply = Response::new(Body::from(self.body));
+        *reply.status_mut() = self.status;
+        if let Some(content_type) = self.content_type {
+            reply
+                .headers_mut()
+                .insert(header::CONTENT_TYPE, content_type);
+        }
+        reply
+    }
+}
+
+async fn relay(mut response: reqwest::Response) -> Result<Relayed, Error> {
     let status = response.status();
     let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
     let mut body = Vec::new();
@@ -386,14 +423,11 @@ async fn relay(mut response: reqwest::Response) -> Result<Response, Error> {
         }
         body.extend_from_slice(&chunk);
     }
-    let mut reply = Response::new(Body::from(body));
-    *reply.status_mut() = status;
-    if let Some(content_type) = content_type {
-        reply
-            .headers_mut()
-            .insert(header::CONTENT_TYPE, content_type);
-    }
-    Ok(reply)
+    Ok(Relayed {
+        status,
+        content_type,
+        body,
+    })
 }
 
 fn cached(state: &AppState, id: Uuid) -> Option<Zeroizing<String>> {
