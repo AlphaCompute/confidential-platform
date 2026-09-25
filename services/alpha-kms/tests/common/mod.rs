@@ -454,3 +454,57 @@ impl Harness {
 pub fn code(reply: &Value) -> &str {
     reply["error"]["code"].as_str().unwrap_or("")
 }
+
+/// A CA issuing Instance leaves, and the copies that serve them.
+pub struct Ca {
+    key_der: Vec<u8>,
+    cert: Vec<u8>,
+}
+
+impl Ca {
+    pub fn new() -> Self {
+        let (key_der, cert) = alpha_kms::certs::new_ca(SystemTime::now()).unwrap();
+        Self { key_der, cert }
+    }
+
+    pub fn pem(&self) -> String {
+        pem::encode(&pem::Pem::new("CERTIFICATE", self.cert.clone()))
+    }
+
+    /// A listener presenting a one-hour Instance leaf of `app` for `hash` issued by this CA.
+    pub async fn instance_serving(
+        &self,
+        app: AppId,
+        hash: alpha_core::ComposeHash,
+        router: axum::Router,
+    ) -> String {
+        use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, PublicKeyData};
+        let now = SystemTime::now();
+        let ca_key = alpha_kms::certs::key_pair(&self.key_der).unwrap();
+        let runtime = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+        let pkcs8 = runtime.serialize_der();
+        let sans = alpha_kms::certs::instance_sans(OrgId::mint(), app, &"ab".repeat(32), hash);
+        let leaf = alpha_kms::certs::issue_leaf(
+            &ca_key,
+            &self.cert,
+            &runtime.subject_public_key_info(),
+            sans,
+            now,
+        )
+        .unwrap();
+        let server = tls::ServerCert::sealed(&pkcs8, now).unwrap();
+        server.serve(&pkcs8, leaf, self.cert.clone()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("https://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            alpha_client::tls::serve(
+                listener,
+                tls::server_config(Arc::new(server)).unwrap(),
+                router,
+                std::future::pending::<()>(),
+            )
+            .await
+        });
+        url
+    }
+}
