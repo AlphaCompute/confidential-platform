@@ -86,8 +86,16 @@ fn config(h: &Harness, endpoints: Vec<String>) -> Config {
     }
 }
 
-/// A runtime holding the capture's key, its clock settable by the test.
+/// A runtime holding the capture's key and compose, its clock settable by the test.
 fn start_runtime(h: &Harness, config: Config) -> (Arc<Runtime>, Arc<Mutex<SystemTime>>) {
+    start_runtime_with_compose(h, config, text(KEYED, "app-compose.json"))
+}
+
+fn start_runtime_with_compose(
+    h: &Harness,
+    config: Config,
+    app_compose: String,
+) -> (Arc<Runtime>, Arc<Mutex<SystemTime>>) {
     let key = P256Key::from_pkcs8_der(&read(KEYED, "runtime.key.pkcs8.der")).unwrap();
     let clock = Arc::new(Mutex::new(h.now()));
     let shared = clock.clone();
@@ -97,6 +105,7 @@ fn start_runtime(h: &Harness, config: Config) -> (Arc<Runtime>, Arc<Mutex<System
         Arc::new(move || *shared.lock().unwrap()),
         capture_evidence(),
         pinned_time(h.now()),
+        app_compose,
     )
     .unwrap();
     (runtime, clock)
@@ -190,6 +199,10 @@ async fn runtime_attests_with_the_captures_key_and_serves_the_three_routes() {
     assert_eq!(identity["app_id"], json!(app));
     assert_eq!(identity["org_id"], json!(h.org));
     assert_eq!(identity["compose_hash"], json!(hash));
+    assert_eq!(
+        identity["app_compose"],
+        json!(text(KEYED, "app-compose.json"))
+    );
     assert_eq!(identity["attestation_result"]["verdict"], "verified");
     assert_eq!(
         identity["attestation_result"]["revision"]["compose_hash"],
@@ -462,6 +475,7 @@ async fn a_tenant_serves_its_endpoint_with_the_runtime_identity() {
     let identity = client.identity().await.unwrap();
     assert_eq!(identity.app_id, app);
     assert_eq!(identity.compose_hash, hash);
+    assert_eq!(identity.app_compose, text(KEYED, "app-compose.json"));
 
     let secret = client.secret("model-key").await.unwrap();
     assert_eq!(secret.as_slice(), b"v1");
@@ -653,6 +667,26 @@ async fn client_certificate_validity_follows_the_time_provider() {
             ClientError::Connect(_)
         ));
     }
+}
+
+#[tokio::test]
+async fn a_compose_that_is_not_the_attested_revision_is_refused() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    app_with_secret(&h, b"v1").await;
+    let other = text(KEYED, "app-compose.json").replacen('{', "{ ", 1);
+    let (runtime, _) = start_runtime_with_compose(&h, config(&h, vec![h.url.clone()]), other);
+    let Err(err) = runtime.attest().await else {
+        panic!("attested with a compose that is not the leaf's Revision");
+    };
+    assert!(matches!(err, Error::Certificate(_)), "{err}");
+    assert!(err.to_string().contains("app_compose"), "{err}");
+    assert!(runtime.last().is_none());
+
+    let socket = Socket::start(runtime);
+    let (status, reply) = socket.get("/v1/identity").await;
+    assert_eq!((status, code(&reply)), (503, "not_attested"), "{reply}");
 }
 
 #[tokio::test]

@@ -201,6 +201,8 @@ pub struct Runtime {
     clock: Clock,
     time: TimeProvider,
     evidence: EvidenceSource,
+    /// The guest agent's; served to the tenant's services only once a leaf names its hash.
+    app_compose: String,
     kms: Client,
     attested: RwLock<Option<Arc<Attested>>>,
     revoked: watch::Sender<bool>,
@@ -213,6 +215,7 @@ impl Runtime {
         clock: Clock,
         evidence: EvidenceSource,
         time: TimeProvider,
+        app_compose: String,
     ) -> Result<Arc<Self>, Error> {
         let key_error = |e: p256::pkcs8::Error| Error::Key(e.to_string());
         let spki = key
@@ -234,6 +237,7 @@ impl Runtime {
             clock,
             time,
             evidence,
+            app_compose,
             kms,
             attested: RwLock::new(None),
             revoked: watch::Sender::new(false),
@@ -322,6 +326,11 @@ impl Runtime {
         let identity = tls::uri_sans(leaf)
             .and_then(|sans| tls::parse_instance_sans(&sans))
             .map_err(alpha_client::Error::from)?;
+        if alpha_core::compose_hash(&self.app_compose) != identity.compose_hash {
+            return Err(Error::Certificate(
+                "the guest agent's app_compose is not the leaf's Revision".into(),
+            ));
+        }
         let not_after = chrono::DateTime::parse_from_rfc3339(&reply.not_after)
             .map_err(|e| Error::Certificate(format!("not_after: {e}")))?
             .into();

@@ -59,15 +59,49 @@ pub fn quote(report_data: &[u8; 64]) -> Result<Vec<u8>, Error> {
 }
 
 fn quote_from(socket: &Path, report_data: &[u8; 64]) -> Result<Vec<u8>, Error> {
+    let body = get(
+        socket,
+        &format!("/GetQuote?report_data=0x{}", hex(report_data)),
+    )?;
+    let reply: QuoteReply =
+        serde_json::from_slice(&body).map_err(|e| Error::Agent(format!("GetQuote reply: {e}")))?;
+    unhex(reply.quote.trim().trim_start_matches("0x"))
+}
+
+#[derive(Deserialize)]
+struct InfoReply {
+    /// A JSON document inside the JSON reply.
+    tcb_info: String,
+}
+
+#[derive(Deserialize)]
+struct TcbInfo {
+    app_compose: String,
+}
+
+/// The `app-compose.json` this CVM was booted from, exactly as measured, from the guest
+/// agent's `Info`.
+pub fn app_compose() -> Result<String, Error> {
+    app_compose_from(Path::new(DSTACK_SOCKET))
+}
+
+fn app_compose_from(socket: &Path) -> Result<String, Error> {
+    let body = get(socket, "/Info")?;
+    let reply: InfoReply =
+        serde_json::from_slice(&body).map_err(|e| Error::Agent(format!("Info reply: {e}")))?;
+    let tcb: TcbInfo = serde_json::from_str(&reply.tcb_info)
+        .map_err(|e| Error::Agent(format!("Info tcb_info: {e}")))?;
+    Ok(tcb.app_compose)
+}
+
+fn get(socket: &Path, path: &str) -> Result<Vec<u8>, Error> {
     let io = |what: String| move |e| Error::Io(what.clone(), e);
     let mut stream =
         UnixStream::connect(socket).map_err(io(format!("connect {}", socket.display())))?;
     // HTTP/1.0: the agent then answers without chunked framing and closes, which is the whole
     // protocol we need. `handle` reads a GET's query as the request body and replies in JSON.
-    let request = format!(
-        "GET /GetQuote?report_data=0x{} HTTP/1.0\r\nHost: dstack\r\nAccept: application/json\r\n\r\n",
-        hex(report_data)
-    );
+    let request =
+        format!("GET {path} HTTP/1.0\r\nHost: dstack\r\nAccept: application/json\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .map_err(io("write to the guest agent".into()))?;
@@ -75,10 +109,7 @@ fn quote_from(socket: &Path, report_data: &[u8; 64]) -> Result<Vec<u8>, Error> {
     stream
         .read_to_end(&mut response)
         .map_err(io("read from the guest agent".into()))?;
-    let body = http_body(&response)?;
-    let reply: QuoteReply =
-        serde_json::from_slice(&body).map_err(|e| Error::Agent(format!("GetQuote reply: {e}")))?;
-    unhex(reply.quote.trim().trim_start_matches("0x"))
+    http_body(&response)
 }
 
 /// The body of a `200` response, chunked or not.
@@ -333,7 +364,8 @@ mod agent_tests {
     use super::*;
 
     /// A guest agent that answers one request with `response` and reports the request line.
-    fn fake_agent(response: &'static str) -> (PathBuf, mpsc::Receiver<String>) {
+    fn fake_agent(response: impl Into<String>) -> (PathBuf, mpsc::Receiver<String>) {
+        let response = response.into();
         let path = std::env::temp_dir().join(format!(
             "alpha-tsm-{}-{:?}.sock",
             std::process::id(),
@@ -386,6 +418,30 @@ mod agent_tests {
         let error = quote_from(&path, &[0; 64]).unwrap_err().to_string();
         let _ = fs::remove_file(&path);
         assert!(error.contains("not hex"), "{error}");
+    }
+    #[test]
+    fn reads_the_measured_compose_from_info() {
+        let (path, requests) = fake_agent(concat!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n",
+            include_str!("../../../testdata/attest/phala-dev-0.5.9-keyed/info.json")
+        ));
+        let compose = app_compose_from(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert!(requests.recv().unwrap().starts_with("GET /Info HTTP/1.0"));
+        assert_eq!(
+            alpha_core::compose_hash(&compose).to_string(),
+            "sha256:1924b5252dd9b8075c610b2a855569064835c151048b672fc9c3a7fa01fbc61a"
+        );
+
+        let (path, _requests) = fake_agent("HTTP/1.1 500 Internal Server Error\r\n\r\nboom");
+        let error = app_compose_from(&path).unwrap_err().to_string();
+        let _ = fs::remove_file(&path);
+        assert!(error.contains("500"), "{error}");
+
+        let (path, _requests) = fake_agent("HTTP/1.1 200 OK\r\n\r\n{\"app_id\":\"x\"}");
+        let error = app_compose_from(&path).unwrap_err().to_string();
+        let _ = fs::remove_file(&path);
+        assert!(error.contains("tcb_info"), "{error}");
     }
 }
 
