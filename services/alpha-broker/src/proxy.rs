@@ -1,13 +1,14 @@
-//! `POST /proxy`: an attested Instance names a member, one of that member's connections and a
-//! read on the connection's provider's read list. `POST /write`: the tenant's backend, with its
-//! connect bearer, sends one export on the provider's write list. The broker attaches the
+//! `POST /proxy`: an attested Instance presents a grant the member's key signed for its leaf, one
+//! of the connections the grant names and a read on that connection's provider's read list.
+//! `POST /write`: the tenant's backend, with its connect bearer, sends one export on the
+//! provider's write list. The broker attaches the
 //! member's access token and answers with the provider's status, content type and body. Neither
 //! route reaches the other's list, nothing outside them reaches the provider, and no token
 //! leaves the broker.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -15,12 +16,14 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::Response;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
-use hex::FromHex;
 use reqwest::Url;
 use serde::Deserialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 use zeroize::Zeroizing;
+
+use alpha_channel::member::parse_grant;
 
 use crate::connect::parse_body;
 use crate::oauth::{self, Entry, Provider, RefreshError};
@@ -32,6 +35,15 @@ pub const MAX_RESPONSE: usize = 16 << 20;
 
 /// Fits a delivered file of 8 MiB once base64-encoded inside its JSON envelope.
 pub const WRITE_BODY_LIMIT: usize = 12 << 20;
+
+/// A chat names at most as many connections as its worker keeps in one session.
+const MAX_GRANT_CONNECTIONS: usize = 16;
+
+/// The longest a grant may last from its `issued_at`.
+const MAX_GRANT_SECONDS: i64 = 12 * 3600;
+
+/// How far ahead of the broker's clock a grant's `issued_at` may be.
+const GRANT_SKEW_SECONDS: i64 = 60;
 
 /// An access token is used until this long before the provider says it expires.
 const EXPIRY_MARGIN: Duration = Duration::from_secs(60);
@@ -135,15 +147,13 @@ pub fn mcp_call_allowed(tools: &[&str], body: Option<&Value>) -> bool {
 async fn target(
     state: &AppState,
     member: &[u8; 32],
-    connection_id: &str,
+    id: Uuid,
     method: &str,
     url: &Url,
     headers: Option<BTreeMap<String, String>>,
     body: Option<&Value>,
     list: fn(&Provider) -> &'static [Entry],
-) -> Result<(Uuid, &'static Provider, &'static Entry, HeaderMap), Error> {
-    let id = Uuid::parse_str(connection_id)
-        .map_err(|_| Error::Malformed("connection_id must be a UUID".into()))?;
+) -> Result<(&'static Provider, &'static Entry, HeaderMap), Error> {
     let (provider, dead) = store::load_connection(&state.pool, id, member)
         .await?
         .ok_or(Error::NotFound)?;
@@ -160,16 +170,86 @@ async fn target(
     if dead {
         return Err(Error::ReconnectRequired);
     }
-    Ok((id, provider, entry, headers))
+    Ok((provider, entry, headers))
 }
 
 /// The lowercase hex SHA-256 of the member's key.
 fn parse_member(hex_member: &str) -> Result<[u8; 32], Error> {
+    use hex::FromHex;
     let malformed = || Error::Malformed("member must be 64 lowercase hex characters".into());
     if hex_member.bytes().any(|b| b.is_ascii_uppercase()) {
         return Err(malformed());
     }
     <[u8; 32]>::from_hex(hex_member).map_err(|_| malformed())
+}
+
+fn unix_now() -> Result<i64, Error> {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .ok_or_else(|| Error::internal("the clock is before 1970"))
+}
+
+fn seconds(rfc3339: &str) -> Result<i64, Error> {
+    chrono::DateTime::parse_from_rfc3339(rfc3339)
+        .map(|t| t.timestamp())
+        .map_err(|_| Error::Malformed("the grant's times are not RFC 3339".into()))
+}
+
+/// The SHA-256 of the member key that signed `wire` for the Instance whose leaf SPKI hashes to
+/// `aud`, when the grant is live now and names `id` among connections that are all that key's.
+async fn granted(
+    state: &AppState,
+    aud: &[u8; 32],
+    wire: &str,
+    id: Uuid,
+) -> Result<[u8; 32], Error> {
+    let signed = parse_grant(wire).map_err(|e| Error::Malformed(e.to_string()))?;
+    // The grant's connections can be read only once it verifies, so it is verified under the
+    // requested connection's key, and every connection it names must then hold that same key.
+    let requested = store::load_grant_keys(&state.pool, &[id]).await?;
+    let [(_, key)] = requested.as_slice() else {
+        return Err(Error::NotFound);
+    };
+    let grant = signed.verify(key).map_err(|e| match e {
+        alpha_channel::Error::SignatureInvalid(_) => Error::GrantInvalid,
+        other => Error::Malformed(other.to_string()),
+    })?;
+    if grant.connections.is_empty() || grant.connections.len() > MAX_GRANT_CONNECTIONS {
+        return Err(Error::Malformed(format!(
+            "a grant names 1 to {MAX_GRANT_CONNECTIONS} connections"
+        )));
+    }
+    let listed = store::load_grant_keys(&state.pool, &grant.connections).await?;
+    if !grant
+        .connections
+        .iter()
+        .all(|c| listed.iter().any(|(live, _)| live == c))
+    {
+        return Err(Error::NotFound);
+    }
+    if listed.iter().any(|(_, other)| other != key) {
+        return Err(Error::GrantInvalid);
+    }
+    if grant.aud != format!("sha256:{}", hex::encode(aud)) {
+        return Err(Error::GrantInvalid);
+    }
+    let (now, issued_at, exp) = (
+        unix_now()?,
+        seconds(&grant.issued_at)?,
+        seconds(&grant.exp)?,
+    );
+    if issued_at > now.saturating_add(GRANT_SKEW_SECONDS)
+        || now >= exp
+        || exp > issued_at.saturating_add(MAX_GRANT_SECONDS)
+    {
+        return Err(Error::GrantExpired);
+    }
+    if !grant.connections.contains(&id) {
+        return Err(Error::GrantInvalid);
+    }
+    Ok(Sha256::digest(key).into())
 }
 
 fn parse_url(url: &str) -> Result<Url, Error> {
@@ -179,8 +259,8 @@ fn parse_url(url: &str) -> Result<Url, Error> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProxyRequest {
-    member: String,
-    connection_id: String,
+    grant: String,
+    connection_id: Uuid,
     method: String,
     url: String,
     body: Option<Value>,
@@ -189,15 +269,17 @@ struct ProxyRequest {
 
 pub async fn proxy(
     State(state): State<Arc<AppState>>,
-    _: AuthedInstance,
+    instance: AuthedInstance,
     body: Bytes,
 ) -> Result<Response, Error> {
     let request: ProxyRequest = parse_body(&body)?;
     let url = parse_url(&request.url)?;
-    let (id, provider, entry, headers) = target(
+    let id = request.connection_id;
+    let member = granted(&state, &instance.aud, &request.grant, id).await?;
+    let (provider, entry, headers) = target(
         &state,
-        &parse_member(&request.member)?,
-        &request.connection_id,
+        &member,
+        id,
         &request.method,
         &url,
         request.headers,
@@ -238,10 +320,12 @@ pub async fn write(
     let bytes = BASE64_STANDARD
         .decode(&request.body_base64)
         .map_err(|_| Error::Malformed("body_base64 must be standard base64".into()))?;
-    let (id, provider, entry, headers) = target(
+    let id = Uuid::parse_str(&request.connection_id)
+        .map_err(|_| Error::Malformed("connection_id must be a UUID".into()))?;
+    let (provider, entry, headers) = target(
         &state,
         &parse_member(&request.member)?,
-        &request.connection_id,
+        id,
         &request.method,
         &url,
         request.headers,

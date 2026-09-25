@@ -31,7 +31,6 @@ async fn a_member_connects_dropbox_and_an_instance_lists_a_folder_without_seeing
 
     let reply = h
         .proxy(&json!({
-            "member": member().reference(),
             "connection_id": id,
             "method": "POST",
             "url": LIST_FOLDER,

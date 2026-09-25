@@ -120,11 +120,11 @@ async fn only_the_connect_bearer_opens_write() {
     let body = upload(id, DRIVE_FILES, "application/json", b"{}");
     let backend = instance_client(&h.ca, None);
     let replies = [
-        h.post_with(&backend, Some(PROXY_BEARER), "/write", &body)
+        h.post_with(&backend, Some("wrong-bearer"), "/write", &body)
             .await
             .unwrap(),
         h.post_with(&backend, None, "/write", &body).await.unwrap(),
-        h.post_with(&h.instance, Some(PROXY_BEARER), "/write", &body)
+        h.post_with(&h.instance, None, "/write", &body)
             .await
             .unwrap(),
     ];

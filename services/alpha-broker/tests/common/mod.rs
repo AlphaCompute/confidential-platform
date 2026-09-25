@@ -49,7 +49,6 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 pub const BEARER: &str = "connect-bearer-for-tests";
-pub const PROXY_BEARER: &str = "proxy-bearer-for-tests";
 pub const CLIENT_ID: &str = "corpus-test.apps.googleusercontent.com";
 pub const CLIENT_SECRET: &str = "client-secret-for-tests";
 pub const REDIRECT_URI: &str = "https://corpus.example/oauth/google/callback";
@@ -152,6 +151,45 @@ pub fn signed_at(key: &Member, fields: Value, now: SystemTime) -> Value {
 
 pub fn signed(key: &Member, fields: Value) -> Value {
     signed_at(key, fields, SystemTime::now())
+}
+
+pub fn rfc3339(t: SystemTime) -> String {
+    let seconds = t.duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+    chrono::DateTime::from_timestamp(seconds as i64, 0)
+        .unwrap()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// `sha256:<hex>` of the SPKI of `identity`'s leaf: the `aud` of a grant for it.
+pub fn aud_of(identity: &Identity) -> String {
+    let spki = alpha_client::tls::spki_of(&identity.chain[0]).unwrap();
+    alpha_channel::sha256_label(&spki)
+}
+
+/// A grant's wire form, `base64url(JCS).base64url(r‖s)`, signed by `key` for the Instance `aud`
+/// over `connections`, issued at `issued_at` and ending at `exp`.
+pub fn grant_at(
+    key: &Member,
+    aud: &str,
+    connections: &[Uuid],
+    issued_at: SystemTime,
+    exp: SystemTime,
+) -> String {
+    use base64::Engine;
+    let (document, digest) = alpha_channel::member::signable(
+        alpha_core::context::CONNECTOR_GRANT,
+        json!({ "aud": aud, "connections": connections, "exp": rfc3339(exp) }),
+        issued_at,
+    )
+    .unwrap();
+    let document = base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(document);
+    format!("{document}.{}", key.sign(&digest))
+}
+
+/// `grant_at` issued now for fifteen minutes.
+pub fn grant(key: &Member, aud: &str, connections: &[Uuid]) -> String {
+    let now = SystemTime::now();
+    grant_at(key, aud, connections, now, now + Duration::from_secs(900))
 }
 
 /// What the stand-in expects of one provider's client and how its tokens look.
@@ -1125,6 +1163,8 @@ pub struct Harness {
     pub broker: SocketAddr,
     /// An attested Instance's client: a leaf from the broker's CA.
     pub instance: reqwest::Client,
+    /// The `aud` of a grant for that Instance.
+    pub aud: String,
     /// Who a page expects the broker to be: its org, App and Revision.
     pub expected: Expected,
     own: Identity,
@@ -1164,7 +1204,6 @@ fn app_state(
         secrets: parking_lot::RwLock::new(Secrets {
             client_secrets,
             connect_bearer: BEARER.as_bytes().to_vec().into(),
-            proxy_bearer: PROXY_BEARER.as_bytes().to_vec().into(),
             connectors_key: KEY.into(),
         }),
         pool: pool.clone(),
@@ -1202,7 +1241,9 @@ pub async fn harness() -> Option<Harness> {
         app.clone(),
     )
     .await;
-    let instance = instance_client(&ca, Some(ca.instance()));
+    let leaf = ca.instance();
+    let aud = aud_of(&leaf);
+    let instance = instance_client(&ca, Some(leaf));
     Some(Harness {
         state,
         pool,
@@ -1211,6 +1252,7 @@ pub async fn harness() -> Option<Harness> {
         ca,
         broker,
         instance,
+        aud,
         expected,
         own,
         own_chain,
@@ -1243,12 +1285,12 @@ impl Raw {
 }
 
 pub fn read(connection: Uuid, url: &str) -> Value {
-    json!({ "member": member().reference(), "connection_id": connection, "method": "GET", "url": url })
+    json!({ "connection_id": connection, "method": "GET", "url": url })
 }
 
 /// A `/proxy` body posting the JSON-RPC `body` to the MCP server at `url`.
 pub fn mcp_rpc(connection: Uuid, url: &str, body: Value) -> Value {
-    json!({ "member": member().reference(), "connection_id": connection, "method": "POST", "url": url, "body": body })
+    json!({ "connection_id": connection, "method": "POST", "url": url, "body": body })
 }
 
 pub fn mcp_call(connection: Uuid, url: &str, tool: &str) -> Value {
@@ -1258,7 +1300,7 @@ pub fn mcp_call(connection: Uuid, url: &str, tool: &str) -> Value {
 }
 
 pub fn dropbox_read(connection: Uuid, url: &str) -> Value {
-    json!({ "member": member().reference(), "connection_id": connection, "method": "POST", "url": url })
+    json!({ "connection_id": connection, "method": "POST", "url": url })
 }
 
 /// A `/write` body carrying `bytes` base64-encoded.
@@ -1551,11 +1593,28 @@ impl Harness {
         })
     }
 
-    /// From the attested Instance with the proxy bearer.
+    /// From the attested Instance, with a grant by `member()` for its leaf over the body's
+    /// connection unless the body carries a grant of its own.
     pub async fn proxy(&self, body: &Value) -> Raw {
-        self.post_with(&self.instance, Some(PROXY_BEARER), "/proxy", body)
+        let mut body = body.clone();
+        if let Some(fields) = body.as_object_mut()
+            && !fields.contains_key("grant")
+        {
+            let connection = fields
+                .get("connection_id")
+                .and_then(Value::as_str)
+                .and_then(|id| Uuid::parse_str(id).ok())
+                .unwrap_or(Uuid::nil());
+            fields.insert("grant".into(), json!(self.grant(&[connection])));
+        }
+        self.post_with(&self.instance, None, "/proxy", &body)
             .await
             .unwrap()
+    }
+
+    /// A grant by `member()` for this harness's Instance over `connections`.
+    pub fn grant(&self, connections: &[Uuid]) -> String {
+        grant(&member(), &self.aud, connections)
     }
 
     /// `POST /write` over the real listener with the connect bearer and no client certificate,

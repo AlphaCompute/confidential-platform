@@ -134,15 +134,15 @@ async fn a_body_that_is_not_one_well_formed_tool_call_is_refused_before_hubspot(
 async fn a_duplicated_tool_name_is_judged_and_sent_by_its_last_value() {
     let Some(h) = harness().await else { return };
     let (id, _) = h.connected_to("hubspot").await;
-    let reference = member().reference();
+    let grant = h.grant(&[id]);
     let raw = |first: &str, last: &str| {
         format!(
-            r#"{{"member":"{reference}","connection_id":"{id}","method":"POST","url":"{MCP}",
+            r#"{{"grant":"{grant}","connection_id":"{id}","method":"POST","url":"{MCP}",
             "body":{{"jsonrpc":"2.0","id":1,"method":"tools/call",
             "params":{{"name":"{first}","name":"{last}"}}}}}}"#
         )
     };
-    let proxy = |body: String| h.post_text(&h.instance, Some(PROXY_BEARER), "/proxy", body);
+    let proxy = |body: String| h.post_text(&h.instance, None, "/proxy", body);
     nothing_reaches(&h, async {
         let reply = proxy(raw("search_crm_objects", "manage_crm_objects"))
             .await

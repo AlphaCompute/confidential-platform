@@ -240,6 +240,16 @@ pub async fn load_connection(
     .await?)
 }
 
+/// The member key of each listed connection that is live; a missing id is revoked or unknown.
+pub async fn load_grant_keys(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<(Uuid, Vec<u8>)>, Error> {
+    Ok(sqlx::query_as(
+        "select id, member_key from connections where id = any($1) and revoked_at is null",
+    )
+    .bind(ids)
+    .fetch_all(pool)
+    .await?)
+}
+
 /// Locks a live connection's row until `tx` ends, so one refresh at a time uses its token: a
 /// provider that rotates refresh tokens refuses the old one once the new one is issued.
 pub async fn lock_token(tx: &mut sqlx::PgConnection, id: Uuid) -> Result<Option<Vec<u8>>, Error> {

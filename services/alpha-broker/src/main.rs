@@ -56,7 +56,6 @@ async fn read_secrets(runtime: &RuntimeSocket) -> Result<Secrets, Error> {
         client_secrets.insert(provider.name, value);
     }
     let connect_bearer = secret(runtime, "connect-bearer").await?;
-    let proxy_bearer = secret(runtime, "proxy-bearer").await?;
     let connectors_key = runtime
         .key("connectors")
         .await
@@ -64,7 +63,6 @@ async fn read_secrets(runtime: &RuntimeSocket) -> Result<Secrets, Error> {
     Ok(Secrets {
         client_secrets,
         connect_bearer,
-        proxy_bearer,
         connectors_key,
     })
 }

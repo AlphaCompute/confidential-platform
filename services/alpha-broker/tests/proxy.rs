@@ -12,7 +12,7 @@ use axum::http::StatusCode;
 use common::*;
 
 #[tokio::test]
-async fn an_instance_reads_drive_through_the_proxy_and_never_sees_a_token() {
+async fn a_chat_reads_drive_with_a_grant_for_its_own_leaf() {
     let Some(h) = harness().await else { return };
     let (id, _) = h.connected().await;
 
@@ -44,7 +44,7 @@ async fn a_caller_without_a_client_certificate_is_refused() {
     let (id, _) = h.connected().await;
     let anonymous = instance_client(&h.ca, None);
     let reply = h
-        .post_with(&anonymous, Some(PROXY_BEARER), "/proxy", &read(id, FILES))
+        .post_with(&anonymous, None, "/proxy", &read(id, FILES))
         .await
         .unwrap();
     assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
@@ -58,7 +58,7 @@ async fn a_leaf_from_another_ca_fails_the_handshake() {
     let (id, _) = h.connected().await;
     let stranger = instance_client(&h.ca, Some(Ca::new().instance()));
     assert!(
-        h.post_with(&stranger, Some(PROXY_BEARER), "/proxy", &read(id, FILES))
+        h.post_with(&stranger, None, "/proxy", &read(id, FILES))
             .await
             .is_err()
     );
@@ -76,7 +76,7 @@ async fn a_kms_node_leaf_is_refused() {
     let reply = h
         .post_with(
             &instance_client(&h.ca, Some(node)),
-            Some(PROXY_BEARER),
+            None,
             "/proxy",
             &read(id, FILES),
         )
@@ -88,26 +88,17 @@ async fn a_kms_node_leaf_is_refused() {
 }
 
 #[tokio::test]
-async fn each_bearer_opens_only_its_own_routes() {
+async fn a_bearer_without_a_grant_reads_nothing() {
     let Some(h) = harness().await else { return };
     let (id, _) = h.connected().await;
-    for bearer in [None, Some("wrong-bearer"), Some(BEARER)] {
+    for bearer in [None, Some("supervisor-bearer"), Some(BEARER)] {
         let reply = h
             .post_with(&h.instance, bearer, "/proxy", &read(id, FILES))
             .await
             .unwrap();
-        assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{bearer:?}");
-        assert_eq!(reply.code(), "unauthorized");
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{bearer:?}");
+        assert_eq!(reply.code(), "malformed");
     }
-    let listed = h
-        .call_as(
-            Some(PROXY_BEARER),
-            "POST",
-            "/connections",
-            Some(serde_json::json!({})),
-        )
-        .await;
-    assert_eq!(listed.status, StatusCode::UNAUTHORIZED);
     assert!(h.untouched());
 }
 
@@ -117,13 +108,16 @@ async fn a_malformed_body_is_refused() {
     let (id, _) = h.connected().await;
     let mut unknown = read(id, FILES);
     unknown["extra"] = serde_json::json!({});
-    let mut short_member = read(id, FILES);
-    short_member["member"] = serde_json::json!(&member().reference()[1..]);
+    let mut member_reference = read(id, FILES);
+    member_reference["member"] = serde_json::json!(hex::encode(member().sha256()));
+    let mut not_a_grant = read(id, FILES);
+    not_a_grant["grant"] = serde_json::json!("not-a-grant");
     let mut bad_id = read(id, FILES);
     bad_id["connection_id"] = serde_json::json!("not-a-uuid");
     for body in [
         unknown,
-        short_member,
+        member_reference,
+        not_a_grant,
         bad_id,
         read(id, "/drive/v3/files"),
         serde_json::json!("not an object"),
@@ -136,7 +130,7 @@ async fn a_malformed_body_is_refused() {
 }
 
 #[tokio::test]
-async fn an_unknown_revoked_or_foreign_connection_is_not_found() {
+async fn an_unknown_or_revoked_connection_is_not_found_and_a_foreign_one_is_not_granted() {
     let Some(h) = harness().await else { return };
     let (id, _) = h.connected().await;
     let (foreign, _) = h.connect(&other_member(), "other@example.com").await;
@@ -144,11 +138,14 @@ async fn an_unknown_revoked_or_foreign_connection_is_not_found() {
     let revoked = id_of(&revoked);
     let gone = h.disconnect(&member(), revoked).await;
     assert_eq!(gone.status, StatusCode::OK);
-    for connection in [uuid::Uuid::now_v7(), revoked, id_of(&foreign)] {
+    for connection in [uuid::Uuid::now_v7(), revoked] {
         let reply = h.proxy(&read(connection, FILES)).await;
         assert_eq!(reply.status, StatusCode::NOT_FOUND, "{connection}");
         assert_eq!(reply.code(), "not_found");
     }
+    let reply = h.proxy(&read(id_of(&foreign), FILES)).await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    assert_eq!(reply.code(), "grant_invalid");
     assert!(h.untouched());
     assert_eq!(h.proxy(&read(id, FILES)).await.status, StatusCode::OK);
 }
