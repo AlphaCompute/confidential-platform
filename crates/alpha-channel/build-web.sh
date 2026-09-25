@@ -26,4 +26,4 @@ wasm="$out/alpha_channel_bg.wasm"
 
 hash=$( (sha256sum "$wasm" 2>/dev/null || shasum -a 256 "$wasm") | cut -d' ' -f1)
 echo "sha256 $hash alpha_channel_bg.wasm"
-echo "revision $(git rev-parse HEAD)"
+echo "revision $(git rev-parse HEAD)$(git diff --quiet HEAD || echo -dirty)"
