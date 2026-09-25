@@ -131,7 +131,8 @@ fn from_unix_seconds(seconds: i64) -> Option<SystemTime> {
     SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(u64::try_from(seconds).ok()?))
 }
 
-fn sha256_label(bytes: &[u8]) -> String {
+/// `sha256:<hex>`.
+pub fn sha256_label(bytes: &[u8]) -> String {
     use sha2::Digest;
     format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
 }

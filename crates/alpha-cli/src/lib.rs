@@ -38,11 +38,6 @@ pub fn random<const N: usize>() -> Result<[u8; N], String> {
     Ok(out)
 }
 
-pub fn sha256_prefixed(bytes: &[u8]) -> String {
-    use sha2::Digest;
-    format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
-}
-
 #[cfg(test)]
 mod tests {
     #[test]

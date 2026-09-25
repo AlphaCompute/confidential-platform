@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::{random, sha256_prefixed};
+use alpha_channel::sha256_label;
+
+use crate::random;
 
 /// A node the CLI may seal to: its attested runtime key and X-Wing key.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,7 +181,7 @@ pub async fn bootstrap(
         ShareFile {
             format: SHARE_FORMAT.into(),
             share_hpke,
-            kms_node_spki_sha256: sha256_prefixed(&node.runtime_spki),
+            kms_node_spki_sha256: sha256_label(&node.runtime_spki),
             platform_document_version: doc_version,
         }
         .write(&path)?;
@@ -320,7 +322,7 @@ mod tests {
                 enc: "e".into(),
                 ct: "c".into(),
             },
-            kms_node_spki_sha256: sha256_prefixed(b"node"),
+            kms_node_spki_sha256: sha256_label(b"node"),
             platform_document_version: 3,
         };
         file.write(&path).unwrap();

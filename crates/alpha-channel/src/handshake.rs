@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::cert::{parse_instance_sans, pem_to_der, spki_of, spki_sha256, uri_sans, verify_leaf};
+use crate::cert::{parse_instance_sans, pem_to_der, spki_of, uri_sans, verify_leaf};
 use crate::frame::Channel;
 use crate::{
     ECDSA_P256, Error, NamedSignature, from_unix_seconds, p256_signature, random, rfc3339,
@@ -287,7 +287,7 @@ impl Responder {
             .verifying_key()
             .to_public_key_der()
             .map_err(|_| Error::Malformed("the public key does not encode".into()))?;
-        if spki_sha256(&leaf) != Some(Sha256::digest(public.as_bytes()).into()) {
+        if spki_of(&leaf)? != public.as_bytes() {
             return Err(Error::Malformed("the private key is not the leaf's".into()));
         }
         let compose_hash = parse_instance_sans(&uri_sans(&leaf)?)?.compose_hash;

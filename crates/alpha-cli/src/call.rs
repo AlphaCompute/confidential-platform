@@ -10,7 +10,9 @@ use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePublicKey;
 use serde_json::{Value, json};
 
-use crate::{rfc3339, sha256_prefixed};
+use alpha_channel::sha256_label;
+
+use crate::rfc3339;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Route {
@@ -57,7 +59,7 @@ pub async fn run(
     }
     if route == Route::PutSecret && !object.contains_key("content_sha256") {
         let value = value.ok_or("put-secret needs --value")?;
-        object.insert("content_sha256".into(), json!(sha256_prefixed(value)));
+        object.insert("content_sha256".into(), json!(sha256_label(value)));
     }
     if route != Route::PutSecret && value.is_some() {
         return Err("--value is only for put-secret".into());
