@@ -179,7 +179,7 @@ impl std::fmt::Debug for RuntimeIdentity {
             .field("certificate_chain", &self.certificate_chain)
             .field("tls_private_key", &"<redacted>")
             .field("attestation_result", &self.attestation_result)
-            .field("app_compose", &format!("{} bytes", self.app_compose.len()))
+            .field("app_compose", &self.app_compose)
             .finish()
     }
 }
