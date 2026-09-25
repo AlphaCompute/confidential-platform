@@ -117,8 +117,8 @@ fn a_responder_and_an_initiator_share_a_channel() {
     let body = server.open_request(&request, "POST", "/sessions").unwrap();
     assert_eq!(body.as_slice(), br#"{"hello":1}"#);
 
-    let first = server.seal_response(seq, 0, false, b"one").unwrap();
-    let last = server.seal_response(seq, 1, true, b"two").unwrap();
+    let first = server.seal_response(seq, false, b"one").unwrap();
+    let last = server.seal_response(seq, true, b"two").unwrap();
     let mut reader = client.response(seq);
     assert!(reader.finish().is_err());
     assert_eq!(

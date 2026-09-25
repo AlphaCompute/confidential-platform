@@ -4,7 +4,7 @@
 //! sequence number and its own index and flagged more or end, so a relay can neither reorder
 //! nor cut it short unnoticed.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fmt;
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -39,7 +39,9 @@ pub struct Channel {
     c2s: Zeroizing<[u8; 32]>,
     s2c: Zeroizing<[u8; 32]>,
     next_seq: u64,
-    used: BTreeSet<u64>,
+    /// Each opened request's next response frame index, `None` once its end frame is sealed. The
+    /// channel picks the index so no `(seq, index)` nonce is ever sealed twice under `s2c`.
+    responses: BTreeMap<u64, Option<u32>>,
 }
 
 impl fmt::Debug for Channel {
@@ -83,7 +85,7 @@ impl Channel {
             c2s,
             s2c,
             next_seq: 0,
-            used: BTreeSet::new(),
+            responses: BTreeMap::new(),
         }
     }
 
@@ -134,7 +136,7 @@ impl Channel {
         if frame.seq >= MAX_REQUESTS {
             return Err(Error::Exhausted);
         }
-        if self.used.contains(&frame.seq) {
+        if self.responses.contains_key(&frame.seq) {
             return Err(Error::Replayed(frame.seq));
         }
         let ct = BASE64_URL_SAFE_NO_PAD
@@ -146,18 +148,25 @@ impl Channel {
             &self.request_aad(frame.seq, method, path)?,
             &ct,
         )?;
-        self.used.insert(frame.seq);
+        self.responses.insert(frame.seq, Some(0));
         Ok(Zeroizing::new(plaintext))
     }
 
-    /// One line of the response to request `seq`, without its trailing newline.
+    /// The next line of the response to request `seq`, without its trailing newline. Only a
+    /// request this channel opened has a response, and nothing follows its end frame.
     pub fn seal_response(
-        &self,
+        &mut self,
         seq: u64,
-        index: u32,
         end: bool,
         plaintext: &[u8],
     ) -> Result<String, Error> {
+        let slot = self.responses.get_mut(&seq).ok_or(Error::Seal)?;
+        let index = slot.ok_or(Error::Seal)?;
+        let next = if end {
+            None
+        } else {
+            Some(index.checked_add(1).ok_or(Error::Exhausted)?)
+        };
         let mut framed = Zeroizing::new(Vec::with_capacity(plaintext.len().saturating_add(1)));
         framed.push(if end { END } else { MORE });
         framed.extend_from_slice(plaintext);
@@ -167,6 +176,7 @@ impl Channel {
             &response_aad(&self.id, seq, index)?,
             &framed,
         )?;
+        *slot = next;
         Ok(BASE64_URL_SAFE_NO_PAD.encode(ct))
     }
 

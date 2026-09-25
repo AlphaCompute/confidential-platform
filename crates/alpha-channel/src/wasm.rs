@@ -215,17 +215,11 @@ impl ServerChannel {
         Ok(body.to_vec())
     }
 
-    /// One line of the response to request `seq`.
+    /// The next line of the response to request `seq`, which must have opened here.
     #[wasm_bindgen(js_name = sealResponse)]
-    pub fn seal_response(
-        &self,
-        seq: u32,
-        index: u32,
-        end: bool,
-        body: &[u8],
-    ) -> Result<String, JsError> {
+    pub fn seal_response(&mut self, seq: u32, end: bool, body: &[u8]) -> Result<String, JsError> {
         self.inner
-            .seal_response(u64::from(seq), index, end, body)
+            .seal_response(u64::from(seq), end, body)
             .map_err(js)
     }
 }
@@ -256,7 +250,8 @@ pub fn body_sha256(body: &[u8]) -> String {
     sha256_label(body)
 }
 
-/// The hex SHA-256 of the member key, once the signature and the freshness check out.
+/// The hex SHA-256 of the member key, once the signature, the document's shape for its context
+/// and its freshness check out.
 #[wasm_bindgen(js_name = verifyMemberRequest)]
 pub fn verify_member_request(
     context: &str,
@@ -267,13 +262,9 @@ pub fn verify_member_request(
 ) -> Result<String, JsError> {
     let document: serde_json::Value = parse("document", document_json)?;
     let signature: crate::NamedSignature = parse("signature", signature_json)?;
-    let key_sha256 =
-        member::verify_request(context, &document, member_key_b64, &signature).map_err(js)?;
-    let issued_at = document
-        .get("issued_at")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| js(Error::Malformed("issued_at is missing".into())))?;
-    member::check_fresh(issued_at, at(now_ms)?).map_err(js)?;
+    let (key_sha256, _) =
+        member::verify_request(context, &document, member_key_b64, &signature, at(now_ms)?)
+            .map_err(js)?;
     Ok(hex::encode(key_sha256))
 }
 

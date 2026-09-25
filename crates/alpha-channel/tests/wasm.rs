@@ -89,9 +89,9 @@ fn the_exported_initiator_and_responder_share_a_channel() {
     assert_eq!(body, b"{}");
 
     let mut reader = client.response(seq);
-    for (index, end, text) in [(0, false, b"one"), (1, true, b"two")] {
+    for (end, text) in [(false, b"one"), (true, b"two")] {
         let line = server
-            .seal_response(seq, index, end, text)
+            .seal_response(seq, end, text)
             .map_err(message)
             .unwrap();
         let opened = reader.open_line(&line).map_err(message).unwrap();

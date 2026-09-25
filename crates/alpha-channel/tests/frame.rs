@@ -115,11 +115,19 @@ fn a_sequence_number_past_the_cap_is_exhausted() {
     assert_eq!(err.code(), "exhausted");
 }
 
+/// A channel pair with request 0 already opened by the responder.
+fn opened() -> (Channel, Channel) {
+    let (mut client, mut server) = pair();
+    let frame = client.seal_request("GET", "/", b"").unwrap();
+    server.open_request(&frame, "GET", "/").unwrap();
+    (client, server)
+}
+
 #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn response_frames_read_out_of_order_do_not_open() {
-    let (client, server) = pair();
-    let first = server.seal_response(0, 0, false, b"one").unwrap();
-    let second = server.seal_response(0, 1, true, b"two").unwrap();
+    let (client, mut server) = opened();
+    let first = server.seal_response(0, false, b"one").unwrap();
+    let second = server.seal_response(0, true, b"two").unwrap();
     let mut reader = client.response(0);
     assert_eq!(reader.open_line(&second).unwrap_err().code(), "open");
     let mut reader = client.response(0);
@@ -131,22 +139,42 @@ fn response_frames_read_out_of_order_do_not_open() {
 
 #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn a_response_that_stops_before_its_end_frame_is_truncated() {
-    let (client, server) = pair();
+    let (client, mut server) = opened();
     let mut reader = client.response(0);
-    let more = server.seal_response(0, 0, false, b"one").unwrap();
+    let more = server.seal_response(0, false, b"one").unwrap();
     reader.open_line(&more).unwrap();
     assert_eq!(reader.finish().unwrap_err().code(), "truncated");
 }
 
 #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn a_line_after_the_end_frame_is_refused() {
-    let (client, server) = pair();
+    let (client, mut server) = opened();
     let mut reader = client.response(0);
-    let end = server.seal_response(0, 0, true, b"done").unwrap();
-    let extra = server.seal_response(0, 1, false, b"more").unwrap();
+    let end = server.seal_response(0, true, b"done").unwrap();
     reader.open_line(&end).unwrap();
-    assert_eq!(reader.open_line(&extra).unwrap_err().code(), "open");
+    assert_eq!(reader.open_line(&end).unwrap_err().code(), "open");
     reader.finish().unwrap();
+}
+
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+fn a_response_is_sealed_only_for_an_opened_request_and_not_after_its_end() {
+    let (mut client, mut server) = pair();
+    assert_eq!(
+        server.seal_response(0, false, b"x").unwrap_err().code(),
+        "seal"
+    );
+    let frame = client.seal_request("POST", "/a", b"1").unwrap();
+    assert!(server.open_request(&frame, "POST", "/b").is_err());
+    assert_eq!(
+        server.seal_response(0, false, b"x").unwrap_err().code(),
+        "seal"
+    );
+    server.open_request(&frame, "POST", "/a").unwrap();
+    server.seal_response(0, true, b"done").unwrap();
+    assert_eq!(
+        server.seal_response(0, false, b"x").unwrap_err().code(),
+        "seal"
+    );
 }
 
 #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
