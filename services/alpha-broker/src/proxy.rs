@@ -176,13 +176,11 @@ async fn granted(state: &AppState, aud: &[u8; 32], wire: &str, id: Uuid) -> Resu
     let signed = parse_grant(wire).map_err(|e| Error::Malformed(e.to_string()))?;
     // The grant's connections can be read only once it verifies, so it is verified under the
     // requested connection's key, and every connection it names must then hold that same key.
-    let Some((_, key)) = store::load_grant_keys(&state.pool, &[id])
+    let (_, key) = store::load_grant_keys(&state.pool, &[id])
         .await?
         .into_iter()
         .next()
-    else {
-        return Err(Error::NotFound);
-    };
+        .ok_or(Error::NotFound)?;
     let grant = signed.verify(&key).map_err(|e| match e {
         alpha_channel::Error::SignatureInvalid(_) => Error::GrantInvalid,
         other => Error::Malformed(other.to_string()),
