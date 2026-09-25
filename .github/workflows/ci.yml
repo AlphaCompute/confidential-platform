@@ -17,7 +17,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy -p alpha-channel --target wasm32-unknown-unknown --all-targets -- -D warnings
       - run: cargo test --workspace
+      # The CLI must be the crate's exact wasm-bindgen version, or the glue refuses the module.
+      - run: cargo install wasm-bindgen-cli --version 0.2.128 --locked
+      - run: cargo test -p alpha-channel --target wasm32-unknown-unknown
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
 
   db-tests:
     runs-on: ubuntu-latest

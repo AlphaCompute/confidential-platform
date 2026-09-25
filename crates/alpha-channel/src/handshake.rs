@@ -26,7 +26,7 @@ use zeroize::Zeroizing;
 
 use crate::cert::{parse_instance_sans, pem_to_der, spki_of, spki_sha256, uri_sans, verify_leaf};
 use crate::frame::Channel;
-use crate::{Error, from_unix_seconds, random, sha256_label, unix_seconds};
+use crate::{Error, from_unix_seconds, random, rfc3339, sha256_label};
 
 pub const VERSION: u8 = 1;
 pub const SIGNATURE_ALGORITHM: &str = "ecdsa-p256";
@@ -66,7 +66,8 @@ pub struct LeafSignature {
 }
 
 /// Who the initiator means to reach: one App of one organization, at one of these Revisions.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Expected {
     pub org_id: OrgId,
     pub app_id: AppId,
@@ -330,9 +331,7 @@ impl Responder {
         let nonce = decode::<32>("nonce", &hello.nonce)?;
         let channel_id = random::<16>()?;
         let channel_b64 = BASE64_URL_SAFE_NO_PAD.encode(channel_id);
-        let now = DateTime::from_timestamp(unix_seconds(now)?, 0)
-            .ok_or_else(|| Error::Malformed("now is out of range".into()))?
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let now = rfc3339(now)?;
 
         let (enc, ctx) =
             hpke::setup_sender::<AesGcm256, HkdfSha256, XWing>(&OpModeS::Base, &pk, &info(&nonce))

@@ -37,7 +37,8 @@ fn pair() -> (Channel, Channel) {
     (client, server)
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn a_request_opened_twice_is_replayed() {
     let (mut client, mut server) = pair();
     let frame = client.seal_request("POST", "/sessions", b"{}").unwrap();
@@ -48,7 +49,8 @@ fn a_request_opened_twice_is_replayed() {
     assert_eq!(err.code(), "replayed");
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn requests_open_out_of_order_but_each_only_once() {
     let (mut client, mut server) = pair();
     let first = client.seal_request("POST", "/a", b"1").unwrap();
@@ -57,7 +59,8 @@ fn requests_open_out_of_order_but_each_only_once() {
     assert_eq!(server.open_request(&first, "POST", "/a").unwrap().0, 0);
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn a_body_moved_to_another_path_or_method_does_not_open() {
     let (mut client, mut server) = pair();
     let frame = client
@@ -72,7 +75,8 @@ fn a_body_moved_to_another_path_or_method_does_not_open() {
         .unwrap();
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn a_frame_from_another_channel_does_not_open() {
     let (mut client, _) = pair();
     let (_, mut server) = pair();
@@ -91,7 +95,8 @@ fn a_frame_from_another_channel_does_not_open() {
     assert_eq!(err.code(), "open");
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn a_sequence_number_past_the_cap_is_exhausted() {
     let (mut client, mut server) = pair();
     let frame = client.seal_request("POST", "/sessions", b"{}").unwrap();
@@ -103,7 +108,8 @@ fn a_sequence_number_past_the_cap_is_exhausted() {
     assert_eq!(err.code(), "exhausted");
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn response_frames_read_out_of_order_do_not_open() {
     let (client, server) = pair();
     let first = server.seal_response(0, 0, false, b"one").unwrap();
@@ -117,7 +123,8 @@ fn response_frames_read_out_of_order_do_not_open() {
     assert_eq!(other_request.open_line(&first).unwrap_err().code(), "open");
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn a_response_that_stops_before_its_end_frame_is_truncated() {
     let (client, server) = pair();
     let mut reader = client.response(0);
@@ -126,7 +133,8 @@ fn a_response_that_stops_before_its_end_frame_is_truncated() {
     assert_eq!(reader.finish().unwrap_err().code(), "truncated");
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn a_line_after_the_end_frame_is_refused() {
     let (client, server) = pair();
     let mut reader = client.response(0);
@@ -137,7 +145,8 @@ fn a_line_after_the_end_frame_is_refused() {
     reader.finish().unwrap();
 }
 
-#[test]
+#[cfg_attr(not(target_arch = "wasm32"), test)]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
 fn a_blank_line_carries_nothing() {
     let (client, _) = pair();
     assert!(client.response(0).open_line("  \n").unwrap().is_none());

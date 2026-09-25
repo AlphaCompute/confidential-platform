@@ -22,9 +22,12 @@ use std::time::{Duration, SystemTime};
 use alpha_core::ComposeHash;
 
 pub mod cert;
+pub mod compose;
 pub mod frame;
 pub mod handshake;
 pub mod platform;
+#[cfg(target_arch = "wasm32")]
+pub mod wasm;
 
 /// Every variant is one reason a client stops; `code()` is its stable name on the wire.
 #[derive(Debug, thiserror::Error)]
@@ -88,6 +91,12 @@ fn unix_seconds(t: SystemTime) -> Result<i64, Error> {
         .ok()
         .and_then(|d| i64::try_from(d.as_secs()).ok())
         .ok_or_else(|| Error::Malformed("now is before 1970 or too far ahead".into()))
+}
+
+fn rfc3339(t: SystemTime) -> Result<String, Error> {
+    chrono::DateTime::from_timestamp(unix_seconds(t)?, 0)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .ok_or_else(|| Error::Malformed("now is out of range".into()))
 }
 
 fn from_unix_seconds(seconds: i64) -> Option<SystemTime> {
