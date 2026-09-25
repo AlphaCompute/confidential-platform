@@ -76,8 +76,8 @@ pub async fn add(
     Ok(json!({ "instance": instance, "attested": attested }))
 }
 
-/// Drains the copy by default: shroud-go stops it once its chats end or the drain deadline
-/// passes. `force` deletes it now.
+/// Drains the copy by default: it stops once it signals it is done or at the drain deadline.
+/// `force` deletes it now.
 pub async fn stop(
     shroud: &Shroud,
     app: AppId,
