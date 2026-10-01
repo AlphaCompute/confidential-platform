@@ -335,9 +335,12 @@ pub fn mtls_server_config(
 pub struct PeerCerts(pub Vec<CertificateDer<'static>>);
 
 const HANDSHAKE: Duration = Duration::from_secs(10);
+/// A container runtime kills the process this long after SIGTERM anyway, and a shutdown the
+/// service chose itself (a leaf it can no longer renew) must not wait on a peer that stalls.
+const DRAIN: Duration = Duration::from_secs(10);
 
-/// Accepts until `shutdown` resolves, then drains the open connections. Each request carries
-/// the peer's chain as a [`PeerCerts`] extension.
+/// Accepts until `shutdown` resolves, then drains the open connections for at most [`DRAIN`].
+/// Each request carries the peer's chain as a [`PeerCerts`] extension.
 pub async fn serve(
     listener: TcpListener,
     config: Arc<ServerConfig>,
@@ -381,7 +384,7 @@ pub async fn serve(
             let _ = watcher.watch(conn).await;
         });
     }
-    graceful.shutdown().await;
+    let _ = tokio::time::timeout(DRAIN, graceful.shutdown()).await;
 }
 
 #[cfg(test)]
