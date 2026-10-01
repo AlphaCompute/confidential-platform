@@ -21,7 +21,9 @@ RUN --network=none cargo build --release --locked --offline -p alpha-cpu-app \
  && install -D -m 0755 target/release/alpha-cpu-app /out/alpha-cpu-app \
  && touch -h -d "@$SOURCE_DATE_EPOCH" /out/alpha-cpu-app /out
 
-# Runs as root, no USER: scratch has no /etc/passwd to name another user.
+# Needs nothing of root: it binds 8443 and the runtime's socket is open to every user of the
+# containers it is mounted into. scratch has no /etc/passwd, so the user is numeric.
 FROM scratch
 COPY --from=build /out/alpha-cpu-app /alpha-cpu-app
+USER 65532:65532
 ENTRYPOINT ["/alpha-cpu-app"]
