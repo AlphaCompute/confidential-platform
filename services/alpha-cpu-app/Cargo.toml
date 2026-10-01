@@ -1,0 +1,20 @@
+[package]
+name = "alpha-cpu-app"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+alpha-client = { path = "../../crates/alpha-client" }
+alpha-core = { path = "../../crates/alpha-core" }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+hex = "0.4"
+hmac = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+zeroize = "1"

@@ -1,0 +1,17 @@
+# The spec `alpha deploy` reads. Every angle-bracketed value is the tenant's own: the App id
+# shroud-go minted, the image digests it chose to run, and the KMS CA and node Revisions from
+# the platform document it trusts.
+app_id: <app uuid>
+services:
+  app:
+    image: ghcr.io/alphacompute/alpha-cpu-app@sha256:<digest>
+    port: 8443
+    socket: true
+runtime:
+  image: ghcr.io/alphacompute/alpha-runtime@sha256:<digest>
+  kms_ca_spki_sha256: sha256:<kms ca spki digest>
+  kms_revisions:
+    - sha256:<kms node revision>
+resources:
+  cpu: 1
+  memory_mib: 2048

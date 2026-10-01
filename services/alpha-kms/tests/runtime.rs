@@ -517,6 +517,112 @@ async fn a_tenant_serves_its_endpoint_with_the_runtime_identity() {
     socket.stop().await;
 }
 
+/// The demonstration App end to end: its Secret reaches it through the runtime socket, a client
+/// pinning the KMS CA reads the Instance's identity and an HMAC under that Secret, the leaf
+/// carries the Revision, and without the runtime the App stops claiming the Secret.
+#[tokio::test]
+async fn a_demonstration_app_proves_its_identity_and_uses_its_secret() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    let (app, hash, admin) = app_with_secret(&h, b"v1").await;
+    let key = b"an hmac key of at least thirty-two bytes";
+    let (status, reply) = h
+        .put_secret(alpha_cpu_app::SECRET, &[app], key, h.now(), &admin)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let (runtime, _) = start_runtime(&h, config(&h, vec![h.url.clone()]));
+    runtime.attest().await.unwrap();
+    let socket = Socket::start(runtime.clone());
+
+    let identity = RuntimeSocket::at(&socket.path).identity().await.unwrap();
+    let cert = Arc::new(tls::InstanceCert::new(&identity).unwrap());
+    let state = alpha_cpu_app::AppState::new(RuntimeSocket::at(&socket.path), &identity);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("https://{}", listener.local_addr().unwrap());
+    tokio::spawn(tls::serve(
+        listener,
+        tls::server_config(cert).unwrap(),
+        alpha_cpu_app::router(Arc::new(state)),
+        std::future::pending(),
+    ));
+
+    let pinned = tls::client_config(
+        Some(Pin::Ca(tls::cert_from_pem(&h.ca_pem).unwrap())),
+        None,
+        pinned_time(h.now()),
+    )
+    .unwrap();
+    let client = reqwest::Client::builder()
+        .tls_backend_preconfigured(pinned)
+        .build()
+        .unwrap();
+
+    let health = client
+        .get(format!("{url}/healthz?challenge=fresh"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+    assert_eq!(
+        health.json::<Value>().await.unwrap(),
+        json!({
+            "schema_version": 1,
+            "ready": true,
+            "secret_access": true,
+            "org_id": h.org,
+            "app_id": app,
+            "compose_hash": hash,
+            "challenge": "fresh",
+        })
+    );
+
+    let answer: Value = client
+        .post(format!("{url}/v1/hmac"))
+        .body("tenant data")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut expected = Hmac::<sha2::Sha256>::new_from_slice(key).unwrap();
+    expected.update(b"tenant data");
+    assert_eq!(
+        answer,
+        json!({ "hmac_sha256": hex::encode(expected.finalize().into_bytes()) })
+    );
+
+    let probe = |expected: ComposeHash| {
+        let (url, ca_pem, now) = (url.clone(), h.ca_pem.clone(), h.now());
+        async move {
+            alpha_client::probe_instance(&url, &ca_pem, &expected, pinned_time(now))
+                .await
+                .unwrap()
+        }
+    };
+    assert!(matches!(
+        probe(hash).await,
+        alpha_client::Probe::Attested(_)
+    ));
+    assert!(matches!(
+        probe(alpha_core::compose_hash("another compose")).await,
+        alpha_client::Probe::OtherRevision(_)
+    ));
+
+    socket.stop().await;
+    for request in [
+        client.get(format!("{url}/healthz?challenge=later")),
+        client.post(format!("{url}/v1/hmac")).body("tenant data"),
+    ] {
+        assert_eq!(
+            request.send().await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+}
+
 /// The App's key comes from the KMS through the socket, one derivation per purpose while the
 /// leaf lasts, and it is the key the KMS derives from the organization's anchor and the App.
 #[tokio::test]
