@@ -66,7 +66,9 @@ struct Challenge {
     challenge: Option<String>,
 }
 
-/// Echoes the caller's `challenge`, so an answer cannot be one recorded earlier.
+/// Echoes the caller's `challenge`, so an answer cannot be one recorded earlier. The three
+/// constant fields are the contract a deploy orchestrator's readiness check reads: it judges
+/// the body, not the status.
 async fn health(
     State(state): State<Arc<AppState>>,
     Query(query): Query<Challenge>,

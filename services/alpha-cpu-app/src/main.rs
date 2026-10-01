@@ -58,11 +58,7 @@ async fn run() -> Result<(), Box<dyn Error>> {
 async fn renew_forever(runtime: &RuntimeSocket, cert: &InstanceCert) -> alpha_client::Error {
     loop {
         tokio::time::sleep(RENEW_INTERVAL).await;
-        let renewed = match runtime.identity().await {
-            Ok(identity) => cert.replace(&identity),
-            Err(e) => Err(e),
-        };
-        if let Err(e) = renewed {
+        if let Err(e) = runtime.identity().await.and_then(|i| cert.replace(&i)) {
             return e;
         }
     }

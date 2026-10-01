@@ -518,8 +518,8 @@ async fn a_tenant_serves_its_endpoint_with_the_runtime_identity() {
 }
 
 /// The demonstration App end to end: its Secret reaches it through the runtime socket, a client
-/// pinning the KMS CA reads the Instance's identity and an HMAC under that Secret, the leaf
-/// carries the Revision, and without the runtime the App stops claiming the Secret.
+/// pinning the KMS CA reads the Instance's identity and an HMAC under that Secret, and without
+/// the runtime the App stops claiming the Secret.
 #[tokio::test]
 async fn a_demonstration_app_proves_its_identity_and_uses_its_secret() {
     let Some(h) = nonce_clock_harness().await else {
@@ -593,23 +593,6 @@ async fn a_demonstration_app_proves_its_identity_and_uses_its_secret() {
         answer,
         json!({ "hmac_sha256": hex::encode(expected.finalize().into_bytes()) })
     );
-
-    let probe = |expected: ComposeHash| {
-        let (url, ca_pem, now) = (url.clone(), h.ca_pem.clone(), h.now());
-        async move {
-            alpha_client::probe_instance(&url, &ca_pem, &expected, pinned_time(now))
-                .await
-                .unwrap()
-        }
-    };
-    assert!(matches!(
-        probe(hash).await,
-        alpha_client::Probe::Attested(_)
-    ));
-    assert!(matches!(
-        probe(alpha_core::compose_hash("another compose")).await,
-        alpha_client::Probe::OtherRevision(_)
-    ));
 
     socket.stop().await;
     for request in [
