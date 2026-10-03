@@ -34,6 +34,7 @@ jobs:
             done
             return $down
           }
-          [ -n "$APPS" ] || { echo "::error::STAND_APPS names no App"; exit 1; }
+          set -- $APPS
+          [ $# -gt 0 ] || { echo "::error::STAND_APPS names no App"; exit 1; }
           # A copy does not serve for a minute while it is being redeployed.
           check "" || { sleep 120; check "::error::"; }
