@@ -19,19 +19,21 @@ jobs:
           APPS: ${{ vars.STAND_APPS }}
           KEY: ${{ secrets.STAND_LIST_KEY }}
         run: |
+          # $1 prefixes each finding: only the last attempt's are errors.
           check() {
             down=0
             for app in $APPS; do
               if ! list=$(printf 'header = "Authorization: Bearer %s"\n' "$KEY" |
                 curl -sS -f -m 30 -K - "$SHROUD_URL/v1/apps/$app/instances"); then
-                echo "::error::$app: the list did not answer"
+                echo "$1$app: the list did not answer"
                 down=1
               elif ! echo "$list" | jq -e '.instances | length > 0 and all(.serving == true)' >/dev/null; then
-                echo "::error::$app: $(echo "$list" | jq -c '[.instances[] | {id, state, serving}]')"
+                echo "$1$app: $(echo "$list" | jq -c '[.instances[] | {id, state, serving}]')"
                 down=1
               fi
             done
             return $down
           }
+          [ -n "$APPS" ] || { echo "::error::STAND_APPS names no App"; exit 1; }
           # A copy does not serve for a minute while it is being redeployed.
-          check || { sleep 120; check; }
+          check "" || { sleep 120; check "::error::"; }
