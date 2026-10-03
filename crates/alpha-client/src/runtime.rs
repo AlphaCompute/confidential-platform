@@ -3,7 +3,9 @@
 //! liveness probe. No route needs a header — access is the right to open the socket, over plain
 //! HTTP/1.1.
 
+use std::fmt::Display;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use alpha_attest::AttestationResult;
 use alpha_core::{AppId, ComposeHash, OrgId};
@@ -13,6 +15,7 @@ use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use tokio::net::UnixStream;
+use tokio::time::Instant;
 use zeroize::Zeroizing;
 
 use crate::{Error, decode};
@@ -184,6 +187,40 @@ impl std::fmt::Debug for RuntimeIdentity {
     }
 }
 
+const REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+const RETRY_AFTER: Duration = Duration::from_secs(30);
+/// The runtime renews a leaf ten minutes before it expires, so the leaf a service read on its
+/// last good refresh is valid for at least this long.
+const GIVE_UP_AFTER: Duration = Duration::from_secs(600);
+
+/// Runs `refresh` every five minutes, so a renewed leaf is served and rotated Secrets take
+/// effect. A failure is retried every thirty seconds and returned only when ten minutes have
+/// passed since the last success: one failed call to the runtime or the KMS must not end a
+/// service whose Revision is still allowed, and a revoked Revision, whose runtime is gone, still
+/// stops serving before the leaf it holds runs out.
+pub async fn refresh_forever<F, E>(mut refresh: impl FnMut() -> F) -> E
+where
+    F: Future<Output = Result<(), E>>,
+    E: Display,
+{
+    let mut last_good = Instant::now();
+    let mut delay = REFRESH_INTERVAL;
+    loop {
+        tokio::time::sleep(delay).await;
+        match refresh().await {
+            Ok(()) => {
+                last_good = Instant::now();
+                delay = REFRESH_INTERVAL;
+            }
+            Err(e) if last_good.elapsed() >= GIVE_UP_AFTER => return e,
+            Err(e) => {
+                eprintln!("refresh failed, retrying: {e}");
+                delay = RETRY_AFTER;
+            }
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RuntimeHealth {
     pub attested: bool,
@@ -198,6 +235,24 @@ mod tests {
     use tokio::net::UnixListener;
 
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refresh_survives_one_failure_and_gives_up_after_ten_minutes_of_them() {
+        let calls = AtomicU32::new(0);
+        let started = Instant::now();
+        // The second call fails, the third succeeds, every later one fails.
+        let error = refresh_forever(|| async {
+            match calls.fetch_add(1, Ordering::SeqCst) {
+                0 | 2 => Ok(()),
+                n => Err(format!("call {n}")),
+            }
+        })
+        .await;
+        // Good at 5:00, failed at 10:00, good again at 10:30, then failing from 15:30 until ten
+        // minutes after that last success.
+        assert_eq!(started.elapsed(), Duration::from_secs(630 + 600));
+        assert_eq!(error, format!("call {}", calls.load(Ordering::SeqCst) - 1));
+    }
 
     /// Short: a unix socket path is capped at 104 bytes on macOS.
     fn socket_path() -> PathBuf {
