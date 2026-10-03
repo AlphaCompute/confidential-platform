@@ -3,7 +3,9 @@
 //! liveness probe. No route needs a header — access is the right to open the socket, over plain
 //! HTTP/1.1.
 
+use std::fmt::Display;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use alpha_attest::AttestationResult;
 use alpha_core::{AppId, ComposeHash, OrgId};
@@ -13,8 +15,10 @@ use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use tokio::net::UnixStream;
+use tokio::time::{Instant, timeout};
 use zeroize::Zeroizing;
 
+use crate::tls::InstanceCert;
 use crate::{Error, decode};
 
 pub const SOCKET_PATH: &str = "/run/alpha/runtime.sock";
@@ -184,6 +188,76 @@ impl std::fmt::Debug for RuntimeIdentity {
     }
 }
 
+const REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+const RETRY_AFTER: Duration = Duration::from_secs(30);
+/// A call to the runtime, and through it to the KMS, that has not answered by now never will.
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a service goes on with Secrets it could not re-read: a rotated or withdrawn one
+/// takes effect, or ends the service, by then.
+const GIVE_UP_AFTER: Duration = Duration::from_secs(600);
+
+/// Keeps what a service holds current: every five minutes it takes the identity from the
+/// runtime, serves the renewed leaf from `cert`, and hands the identity to `rest`, which
+/// re-reads whatever else the service keeps, its Secrets first of all.
+///
+/// The runtime answers the identity from memory, so that call fails only when the runtime is
+/// gone, as after its Revision is revoked, or its leaf has expired. Either ends the loop with
+/// the error, and the service must stop. What `rest` reads comes from the KMS through the
+/// runtime, where one failed or stuck call must not end a service whose Revision is still
+/// allowed: the service keeps what it read and tries again thirty seconds later, and stops
+/// only when ten minutes have passed since `rest` last succeeded.
+pub async fn refresh_forever<F, E>(
+    runtime: &RuntimeSocket,
+    cert: &InstanceCert,
+    rest: impl FnMut(RuntimeIdentity) -> F,
+) -> Error
+where
+    F: Future<Output = Result<(), E>>,
+    E: Display,
+{
+    let identity = || async {
+        let identity = runtime.identity().await?;
+        cert.replace(&identity)?;
+        Ok(identity)
+    };
+    refresh_loop(identity, rest).await
+}
+
+async fn refresh_loop<I, A, B, E>(
+    mut identity: impl FnMut() -> A,
+    mut rest: impl FnMut(I) -> B,
+) -> Error
+where
+    A: Future<Output = Result<I, Error>>,
+    B: Future<Output = Result<(), E>>,
+    E: Display,
+{
+    let mut delay = REFRESH_INTERVAL;
+    let mut last_good = Instant::now();
+    loop {
+        tokio::time::sleep(delay).await;
+        let identity = match timeout(ATTEMPT_TIMEOUT, identity()).await {
+            Ok(Ok(identity)) => identity,
+            Ok(Err(e)) => return e,
+            Err(_) => return Error::Connect("the runtime did not answer".into()),
+        };
+        let failure = match timeout(ATTEMPT_TIMEOUT, rest(identity)).await {
+            Ok(Ok(())) => {
+                last_good = Instant::now();
+                delay = REFRESH_INTERVAL;
+                continue;
+            }
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => "no answer".to_owned(),
+        };
+        if last_good.elapsed() >= GIVE_UP_AFTER {
+            return Error::Connect(format!("refresh kept failing: {failure}"));
+        }
+        eprintln!("refresh failed, retrying: {failure}");
+        delay = RETRY_AFTER;
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RuntimeHealth {
     pub attested: bool,
@@ -199,7 +273,48 @@ mod tests {
 
     use super::*;
 
-    /// Short: a unix socket path is capped at 104 bytes on macOS.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_or_stuck_reread_is_retried_and_only_a_lost_identity_ends_the_refresh() {
+        let started = Instant::now();
+        let identities = AtomicU32::new(0);
+        let rereads = AtomicU32::new(0);
+        let error = refresh_loop(
+            || async {
+                match identities.fetch_add(1, Ordering::SeqCst) {
+                    3 => Err(Error::Connect("gone".into())),
+                    n => Ok(n),
+                }
+            },
+            |n| {
+                rereads.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    match n {
+                        0 => Err("the KMS did not answer"),
+                        1 => std::future::pending().await,
+                        _ => Ok(()),
+                    }
+                }
+            },
+        )
+        .await;
+        assert!(matches!(error, Error::Connect(_)), "{error}");
+        // 5:00 a failed re-read, 5:30 a stuck one cut off at 6:00, 6:30 a good one, and the
+        // identity is gone five minutes later.
+        assert_eq!(started.elapsed(), Duration::from_secs(390 + 300));
+        assert_eq!(rereads.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reread_that_keeps_failing_ends_the_refresh_ten_minutes_after_its_last_success() {
+        let started = Instant::now();
+        let error = refresh_loop(|| async { Ok(()) }, |()| async { Err("withdrawn") }).await;
+        assert!(
+            matches!(&error, Error::Connect(m) if m.ends_with("withdrawn")),
+            "{error}"
+        );
+        assert_eq!(started.elapsed(), GIVE_UP_AFTER);
+    }
+
     fn socket_path() -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);

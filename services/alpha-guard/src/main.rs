@@ -1,20 +1,18 @@
 //! Thin entrypoint: attest, read this Instance's identity and its Secret, then serve over TLS on
 //! `:8443`, accepting client certificates that chain to the KMS CA, until SIGTERM, refreshing
-//! the leaf and the bearer every five minutes. A refresh that fails ends the process: the
-//! runtime removes its socket when the Revision is revoked, and the judge must not go on serving
-//! with what it read before. Every error is a non-zero exit.
+//! the leaf and the bearer every five minutes. A failed read of the bearer is retried; a lost
+//! identity ends the process: the runtime is gone when the Revision is revoked, and the judge
+//! must not go on serving with what it read before. Every error is a non-zero exit.
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use alpha_client::runtime::RuntimeSocket;
+use alpha_client::runtime::{RuntimeSocket, refresh_forever};
 use alpha_client::tls::InstanceCert;
 use alpha_guard::{AppState, Config, Error, front_client, router};
 use tokio::net::TcpListener;
 use zeroize::Zeroizing;
 
 const PORT: u16 = 8443;
-const RENEW_INTERVAL: Duration = Duration::from_secs(300);
 
 #[tokio::main]
 async fn main() {
@@ -76,28 +74,16 @@ async fn run() -> Result<(), Error> {
         tokio::select! {
             _ = term.recv() => {}
             _ = tokio::signal::ctrl_c() => {}
-            failed = renew_forever(&runtime, &cert, &state) => outcome = Err(failed),
+            failed = refresh_forever(&runtime, &cert, |_| refresh(&runtime, &state)) => {
+                outcome = Err(Error::internal(format!("refresh: {failed}")));
+            }
         }
     })
     .await;
     outcome
 }
 
-async fn renew_forever(runtime: &RuntimeSocket, cert: &InstanceCert, state: &AppState) -> Error {
-    loop {
-        tokio::time::sleep(RENEW_INTERVAL).await;
-        let renewed = async {
-            let identity = runtime
-                .identity()
-                .await
-                .map_err(|e| Error::internal(format!("renew identity: {e}")))?;
-            cert.replace(&identity)
-                .map_err(|e| Error::internal(format!("renew tls: {e}")))?;
-            *state.inference_bearer.write() = read_bearer(runtime).await?;
-            Ok::<(), Error>(())
-        };
-        if let Err(e) = renewed.await {
-            return e;
-        }
-    }
+async fn refresh(runtime: &RuntimeSocket, state: &AppState) -> Result<(), Error> {
+    *state.inference_bearer.write() = read_bearer(runtime).await?;
+    Ok(())
 }
