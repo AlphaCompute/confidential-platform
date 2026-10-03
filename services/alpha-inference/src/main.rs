@@ -1,7 +1,8 @@
 //! Thin entrypoint: attest, read this Instance's identity and both Secrets, then serve the
 //! `/v1` routes over TLS on `:8443` until SIGTERM, refreshing the leaf and both Secrets every
 //! five minutes. A refresh that keeps failing for ten minutes ends the process: the runtime is
-//! gone when the Revision is revoked, and the front must not go on serving with what it read before. All
+//! gone when the Revision is revoked, and the front must not go on serving with what it read
+//! before. All
 //! logic lives in `run`, which maps every error to a non-zero exit and never panics.
 
 use std::sync::Arc;
