@@ -1,5 +1,5 @@
 {
   "app_id": "01994c2e-0000-7000-8000-000000000006",
   "image": "ghcr.io/alphacompute/alpha-kms@sha256:6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b",
-  "compose_hash": "sha256:f60736f3d729b700534d59b939ad8b1eef62245466ed2dcb5052e3417ec33ef9"
+  "compose_hash": "sha256:efc4fc83b0fd6fa7e6e7095d602644557d42b5c28339231cfeef93096391fbbf"
 }

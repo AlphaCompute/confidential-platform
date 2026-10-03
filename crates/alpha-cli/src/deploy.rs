@@ -29,8 +29,9 @@ const KMS_ENVS: [&str; 4] = [
 ];
 const DEV_ROOT_ENV: &str = "ALPHACOMPUTE_KMS_DEV_ROOT_KEK";
 /// dstack's `app-compose.sh` sources this before `docker compose up`; it is sourced, so an
-/// `exit` ends the boot. It removes every container left on the disk, and when it cannot, it
-/// powers the CVM off instead of letting them run. A CVM redeployed in place boots with the
+/// `exit` ends the boot. It removes containers until none is left on the disk, since one that
+/// holds the daemon's socket can create another meanwhile, and when it cannot, it powers the
+/// CVM off instead of letting them run. A CVM redeployed in place boots with the
 /// previous Revision's containers still there, and the daemon starts those that have a restart
 /// policy on its own: without this they would run, and could attest, under the new Revision's
 /// measurement for the ten seconds until `docker compose up` replaced them. The daemon still
@@ -39,7 +40,7 @@ const DEV_ROOT_ENV: &str = "ALPHACOMPUTE_KMS_DEV_ROOT_KEK";
 /// compose. Images are kept, unlike with the script Phala's API inserts when there is none,
 /// which prunes them all: a CVM rebooted afterwards would lose the image it runs. What a
 /// container wrote outside a volume does not survive a reboot.
-const PRE_LAUNCH_SCRIPT: &str = "c=$(docker ps -aq) && { [ -z \"$c\" ] || docker rm -f $c >/dev/null; } || { poweroff; exit 1; }\n";
+const PRE_LAUNCH_SCRIPT: &str = "until c=$(docker ps -aq) && [ -z \"$c\" ]; do docker rm -f $c >/dev/null || { poweroff; exit 1; }; done\n";
 /// The guest agent's socket for the quote, dstack's runtime events, the CCEL boot events: what
 /// any container that produces evidence mounts.
 const EVIDENCE_MOUNTS: [&str; 3] = [
