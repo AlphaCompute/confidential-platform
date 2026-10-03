@@ -29,10 +29,13 @@ const KMS_ENVS: [&str; 4] = [
 ];
 const DEV_ROOT_ENV: &str = "ALPHACOMPUTE_KMS_DEV_ROOT_KEK";
 /// dstack's `app-compose.sh` sources this before `docker compose up`; it is sourced, so it
-/// must not `exit`. It does nothing, and exists only so that Phala's API does not insert its
-/// own, which prunes every image before pulling: a CVM rebooted afterwards would lose the
-/// image it runs.
-const PRE_LAUNCH_SCRIPT: &str = ":\n";
+/// must not `exit`. It removes every container left on the disk. A CVM redeployed in place
+/// boots with the previous Revision's containers still there, and the daemon starts those that
+/// have a restart policy on its own: for some ten seconds the old images would run, and attest,
+/// under the new Revision's measurement before `docker compose up` replaced them. Images are
+/// kept, unlike with the script Phala's API inserts when there is none, which prunes them all:
+/// a CVM rebooted afterwards would lose the image it runs.
+const PRE_LAUNCH_SCRIPT: &str = "docker rm -f $(docker ps -aq) 2>/dev/null || :\n";
 /// The guest agent's socket for the quote, dstack's runtime events, the CCEL boot events: what
 /// any container that produces evidence mounts.
 const EVIDENCE_MOUNTS: [&str; 3] = [

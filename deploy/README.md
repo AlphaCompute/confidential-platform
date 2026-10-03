@@ -38,9 +38,11 @@ different image with a different `compose_hash`; a production platform document 
 ## Pulling from ghcr
 
 The images are public, so a CVM pulls them anonymously and no credential is delivered to one.
-Every compose, the node's and every tenant's, still carries a one-line `pre_launch_script` that
-does nothing: without one the API inserts its own, which prunes every image before pulling, and
-a CVM rebooted afterwards would lose the image it runs. `deploy/phala.py` is the create/update
+Every compose, the node's and every tenant's, carries a one-line `pre_launch_script` that removes
+the containers left on the disk, so that a CVM redeployed in place never runs the previous
+Revision's images under the new measurement. It keeps the images: without a script the API
+inserts its own, which prunes every image before pulling, and a CVM rebooted afterwards would
+lose the image it runs. `deploy/phala.py` is the create/update
 call itself (exact compose, `compose_hash` check, encrypted env) for a deploy run by hand.
 
 ## Deploying the dev node
