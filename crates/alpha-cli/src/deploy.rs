@@ -30,14 +30,16 @@ const KMS_ENVS: [&str; 4] = [
 const DEV_ROOT_ENV: &str = "ALPHACOMPUTE_KMS_DEV_ROOT_KEK";
 /// dstack's `app-compose.sh` sources this before `docker compose up`; it is sourced, so an
 /// `exit` ends the boot. It removes every container left on the disk, and when it cannot, it
-/// reboots instead of letting them run. A CVM redeployed in place boots with the previous
-/// Revision's containers still there, and the daemon starts those that have a restart policy on
-/// its own: without this they would run, and could attest, under the new Revision's measurement
-/// for the ten seconds until `docker compose up` replaced them. The daemon still starts them
-/// before this runs, so about a second of that remains. Images are kept, unlike with the script
-/// Phala's API inserts when there is none, which prunes them all: a CVM rebooted afterwards
-/// would lose the image it runs.
-const PRE_LAUNCH_SCRIPT: &str = "c=$(docker ps -aq) && { [ -z \"$c\" ] || docker rm -f $c >/dev/null; } || { reboot; exit 1; }\n";
+/// powers the CVM off instead of letting them run. A CVM redeployed in place boots with the
+/// previous Revision's containers still there, and the daemon starts those that have a restart
+/// policy on its own: without this they would run, and could attest, under the new Revision's
+/// measurement for the ten seconds until `docker compose up` replaced them. The daemon still
+/// starts them before this runs, so about a second of that remains: dstack's `init_script`
+/// runs before the daemon and would close it, but Phala's API drops that field from the
+/// compose. Images are kept, unlike with the script Phala's API inserts when there is none,
+/// which prunes them all: a CVM rebooted afterwards would lose the image it runs. What a
+/// container wrote outside a volume does not survive a reboot.
+const PRE_LAUNCH_SCRIPT: &str = "c=$(docker ps -aq) && { [ -z \"$c\" ] || docker rm -f $c >/dev/null; } || { poweroff; exit 1; }\n";
 /// The guest agent's socket for the quote, dstack's runtime events, the CCEL boot events: what
 /// any container that produces evidence mounts.
 const EVIDENCE_MOUNTS: [&str; 3] = [
