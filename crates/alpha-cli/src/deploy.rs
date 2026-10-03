@@ -148,6 +148,9 @@ fn docker_compose_file(spec: &AppSpec) -> Result<String, String> {
             publishing.push(name.to_owned());
             out.insert(key("ports"), strings(&[&format!("{APP_PORT}:{port}")]));
         }
+        // The services exit on any error and fail closed; nothing in the CVM starts an exited
+        // container again unless the compose says so.
+        out.insert(key("restart"), key("always"));
         let mut mounts: Vec<&str> = Vec::new();
         if service.socket {
             mounts.push(SOCKET_VOLUME);
@@ -200,6 +203,7 @@ fn docker_compose_file(spec: &AppSpec) -> Result<String, String> {
     let mut runtime = Mapping::new();
     runtime.insert(key("image"), key(&spec.runtime.image));
     runtime.insert(key("environment"), Yaml::Mapping(environment));
+    runtime.insert(key("restart"), key("always"));
     let mut mounts = EVIDENCE_MOUNTS.to_vec();
     mounts.push(SOCKET_VOLUME);
     runtime.insert(key("volumes"), strings(&mounts));
