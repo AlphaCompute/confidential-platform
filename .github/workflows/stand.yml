@@ -1,0 +1,40 @@
+name: stand
+
+# The control plane lists a copy as running whatever its containers do, so a service that has
+# stopped is seen only by asking. This asks every fifteen minutes and fails when a copy of one
+# of the stand's Apps is not serving, which is what makes GitHub send a notification.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  serving:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          SHROUD_URL: ${{ vars.STAND_SHROUD_URL }}
+          APPS: ${{ vars.STAND_APPS }}
+          KEY: ${{ secrets.STAND_LIST_KEY }}
+        run: |
+          # $1 prefixes each finding: only the last attempt's are errors.
+          check() {
+            down=0
+            for app in $APPS; do
+              if ! list=$(printf 'header = "Authorization: Bearer %s"\n' "$KEY" |
+                curl -sS -f -m 30 -K - "$SHROUD_URL/v1/apps/$app/instances"); then
+                echo "$1$app: the list did not answer"
+                down=1
+              elif ! echo "$list" | jq -e '.instances | length > 0 and all(.serving == true)' >/dev/null; then
+                echo "$1$app: $(echo "$list" | jq -c '[.instances[] | {id, state, serving}]')"
+                down=1
+              fi
+            done
+            return $down
+          }
+          set -- $APPS
+          [ $# -gt 0 ] || { echo "::error::STAND_APPS names no App"; exit 1; }
+          # A copy does not serve for a minute while it is being redeployed.
+          check "" || { sleep 120; check "::error::"; }
