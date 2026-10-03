@@ -19,7 +19,7 @@ provider that writes them into the CVM.
   the KMS accepts them as a distinct Revision; `canonicalize` maps them back to `01`.
 - `05-deploy` — `app.yaml` is what a tenant hands to `alpha deploy`; `app-compose.json` is the
   compose the generator builds from it (envelope, the `alpha-runtime` service last with its three
-  host mounts and pins, the socket volume on the containers that asked for it, a `pre_launch_script`
+  host mounts and pins, the socket volume on the containers that asked for it, `restart: always` on every service, a `pre_launch_script`
   that does nothing, the fields Phala's
   API would otherwise fill in, no `key_provider`), already in Phala's form; `expected.json` holds its `compose_hash`. Produced by the generator itself, so it
   pins the generator's output; Phala's serialization is what `01` proves.
