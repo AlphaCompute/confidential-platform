@@ -1,13 +1,12 @@
 //! Thin entrypoint: wait for the runtime to attest, take this Instance's identity, then serve
-//! over TLS on `:8443` until SIGTERM, refreshing the leaf every five minutes. A refresh that
-//! keeps failing for ten minutes ends the process: the runtime is gone when the Revision is
-//! revoked, and the Endpoint must not go on presenting a leaf it can no longer renew. Every error
-//! is a non-zero exit.
+//! over TLS on `:8443` until SIGTERM, refreshing the leaf every five minutes. A lost identity
+//! ends the process: the runtime is gone when the Revision is revoked, and the Endpoint must not
+//! go on presenting a leaf it can no longer renew. Every error is a non-zero exit.
 
 use std::error::Error;
 use std::sync::Arc;
 
-use alpha_client::runtime::{RuntimeSocket, refresh_forever};
+use alpha_client::runtime::{RuntimeIdentity, RuntimeSocket, refresh_forever};
 use alpha_client::tls::InstanceCert;
 use alpha_cpu_app::{AppState, router};
 use tokio::net::TcpListener;
@@ -25,6 +24,11 @@ async fn main() {
         }
     };
     std::process::exit(code);
+}
+
+/// The leaf is all this App keeps from the runtime.
+async fn nothing_else(_: RuntimeIdentity) -> Result<(), alpha_client::Error> {
+    Ok(())
 }
 
 async fn run() -> Result<(), Box<dyn Error>> {
@@ -46,13 +50,9 @@ async fn run() -> Result<(), Box<dyn Error>> {
         tokio::select! {
             _ = term.recv() => {}
             _ = tokio::signal::ctrl_c() => {}
-            failed = refresh_forever(|| refresh(&runtime, &cert)) => outcome = Err(failed.into()),
+            failed = refresh_forever(&runtime, &cert, nothing_else) => outcome = Err(failed.into()),
         }
     })
     .await;
     outcome
-}
-
-async fn refresh(runtime: &RuntimeSocket, cert: &InstanceCert) -> Result<(), alpha_client::Error> {
-    runtime.identity().await.and_then(|i| cert.replace(&i))
 }

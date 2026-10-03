@@ -1,8 +1,8 @@
 //! Thin entrypoint: attest, read this Instance's identity and both Secrets, then serve the
 //! `/v1` routes over TLS on `:8443` until SIGTERM, refreshing the leaf and both Secrets every
-//! five minutes. A refresh that keeps failing for ten minutes ends the process: the runtime is
-//! gone when the Revision is revoked, and the front must not go on serving with what it read
-//! before. All logic lives in `run`, which maps every error to a non-zero exit and never
+//! five minutes. A failed read of the Secrets is retried; a lost identity ends the process: the
+//! runtime is gone when the Revision is revoked, and the front must not go on serving with what
+//! it read before. All logic lives in `run`, which maps every error to a non-zero exit and never
 //! panics.
 
 use std::sync::Arc;
@@ -83,24 +83,16 @@ async fn run() -> Result<(), Error> {
         tokio::select! {
             _ = term.recv() => {}
             _ = tokio::signal::ctrl_c() => {}
-            failed = refresh_forever(|| refresh(&runtime, &cert, &state)) => outcome = Err(failed),
+            failed = refresh_forever(&runtime, &cert, |_| refresh(&runtime, &state)) => {
+                outcome = Err(Error::internal(format!("refresh: {failed}")));
+            }
         }
     })
     .await;
     outcome
 }
 
-async fn refresh(
-    runtime: &RuntimeSocket,
-    cert: &InstanceCert,
-    state: &AppState,
-) -> Result<(), Error> {
-    let identity = runtime
-        .identity()
-        .await
-        .map_err(|e| Error::internal(format!("renew identity: {e}")))?;
-    cert.replace(&identity)
-        .map_err(|e| Error::internal(format!("renew tls: {e}")))?;
+async fn refresh(runtime: &RuntimeSocket, state: &AppState) -> Result<(), Error> {
     *state.secrets.write() = read_secrets(runtime).await?;
     Ok(())
 }

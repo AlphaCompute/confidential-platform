@@ -1,8 +1,8 @@
 //! Thin entrypoint: attest, read this Instance's identity and its Secret, then serve over TLS on
 //! `:8443`, accepting client certificates that chain to the KMS CA, until SIGTERM, refreshing
-//! the leaf and the bearer every five minutes. A refresh that keeps failing for ten minutes ends
-//! the process: the runtime is gone when the Revision is revoked, and the judge must not go on
-//! serving with what it read before. Every error is a non-zero exit.
+//! the leaf and the bearer every five minutes. A failed read of the bearer is retried; a lost
+//! identity ends the process: the runtime is gone when the Revision is revoked, and the judge
+//! must not go on serving with what it read before. Every error is a non-zero exit.
 
 use std::sync::Arc;
 
@@ -74,24 +74,16 @@ async fn run() -> Result<(), Error> {
         tokio::select! {
             _ = term.recv() => {}
             _ = tokio::signal::ctrl_c() => {}
-            failed = refresh_forever(|| refresh(&runtime, &cert, &state)) => outcome = Err(failed),
+            failed = refresh_forever(&runtime, &cert, |_| refresh(&runtime, &state)) => {
+                outcome = Err(Error::internal(format!("refresh: {failed}")));
+            }
         }
     })
     .await;
     outcome
 }
 
-async fn refresh(
-    runtime: &RuntimeSocket,
-    cert: &InstanceCert,
-    state: &AppState,
-) -> Result<(), Error> {
-    let identity = runtime
-        .identity()
-        .await
-        .map_err(|e| Error::internal(format!("renew identity: {e}")))?;
-    cert.replace(&identity)
-        .map_err(|e| Error::internal(format!("renew tls: {e}")))?;
+async fn refresh(runtime: &RuntimeSocket, state: &AppState) -> Result<(), Error> {
     *state.inference_bearer.write() = read_bearer(runtime).await?;
     Ok(())
 }

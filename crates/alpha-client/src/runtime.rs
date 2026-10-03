@@ -15,9 +15,10 @@ use hyper::{Method, Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use tokio::net::UnixStream;
-use tokio::time::Instant;
+use tokio::time::timeout;
 use zeroize::Zeroizing;
 
+use crate::tls::InstanceCert;
 use crate::{Error, decode};
 
 pub const SOCKET_PATH: &str = "/run/alpha/runtime.sock";
@@ -189,35 +190,63 @@ impl std::fmt::Debug for RuntimeIdentity {
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 const RETRY_AFTER: Duration = Duration::from_secs(30);
-/// The runtime renews a leaf ten minutes before it expires, so the leaf a service read on its
-/// last good refresh is valid for at least this long.
-const GIVE_UP_AFTER: Duration = Duration::from_secs(600);
+/// A call to the runtime, and through it to the KMS, that has not answered by now never will.
+const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Runs `refresh` every five minutes, so a renewed leaf is served and rotated Secrets take
-/// effect. A failure is retried every thirty seconds and returned only when ten minutes have
-/// passed since the last success: one failed call to the runtime or the KMS must not end a
-/// service whose Revision is still allowed, and a revoked Revision, whose runtime is gone, still
-/// stops serving before the leaf it holds runs out.
-pub async fn refresh_forever<F, E>(mut refresh: impl FnMut() -> F) -> E
+/// Keeps what a service holds current: every five minutes it takes the identity from the
+/// runtime, serves the renewed leaf from `cert`, and hands the identity to `rest`, which
+/// re-reads whatever else the service keeps, its Secrets first of all.
+///
+/// The runtime answers the identity from memory, so that call fails only when the runtime is
+/// gone, as after its Revision is revoked, or its leaf has expired. Either ends the loop with
+/// the error, and the service must stop. What `rest` reads comes from the KMS through the
+/// runtime, where one failed or stuck call must not end a service whose Revision is still
+/// allowed: the service keeps what it read and tries again thirty seconds later.
+pub async fn refresh_forever<F, E>(
+    runtime: &RuntimeSocket,
+    cert: &InstanceCert,
+    rest: impl FnMut(RuntimeIdentity) -> F,
+) -> Error
 where
     F: Future<Output = Result<(), E>>,
     E: Display,
 {
-    let mut last_good = Instant::now();
+    let identity = || async {
+        let identity = runtime.identity().await?;
+        cert.replace(&identity)?;
+        Ok(identity)
+    };
+    refresh_loop(identity, rest).await
+}
+
+async fn refresh_loop<I, A, B, E>(
+    mut identity: impl FnMut() -> A,
+    mut rest: impl FnMut(I) -> B,
+) -> Error
+where
+    A: Future<Output = Result<I, Error>>,
+    B: Future<Output = Result<(), E>>,
+    E: Display,
+{
     let mut delay = REFRESH_INTERVAL;
     loop {
         tokio::time::sleep(delay).await;
-        match refresh().await {
-            Ok(()) => {
-                last_good = Instant::now();
-                delay = REFRESH_INTERVAL;
-            }
-            Err(e) if last_good.elapsed() >= GIVE_UP_AFTER => return e,
-            Err(e) => {
+        let identity = match timeout(ATTEMPT_TIMEOUT, identity()).await {
+            Ok(Ok(identity)) => identity,
+            Ok(Err(e)) => return e,
+            Err(_) => return Error::Connect("the runtime did not answer".into()),
+        };
+        delay = match timeout(ATTEMPT_TIMEOUT, rest(identity)).await {
+            Ok(Ok(())) => REFRESH_INTERVAL,
+            Ok(Err(e)) => {
                 eprintln!("refresh failed, retrying: {e}");
-                delay = RETRY_AFTER;
+                RETRY_AFTER
             }
-        }
+            Err(_) => {
+                eprintln!("refresh did not answer, retrying");
+                RETRY_AFTER
+            }
+        };
     }
 }
 
@@ -237,24 +266,36 @@ mod tests {
     use super::*;
 
     #[tokio::test(start_paused = true)]
-    async fn a_refresh_survives_one_failure_and_gives_up_after_ten_minutes_of_them() {
-        let calls = AtomicU32::new(0);
-        let started = Instant::now();
-        // The second call fails, the third succeeds, every later one fails.
-        let error = refresh_forever(|| async {
-            match calls.fetch_add(1, Ordering::SeqCst) {
-                0 | 2 => Ok(()),
-                n => Err(format!("call {n}")),
-            }
-        })
+    async fn a_failed_or_stuck_reread_is_retried_and_only_a_lost_identity_ends_the_refresh() {
+        let started = tokio::time::Instant::now();
+        let identities = AtomicU32::new(0);
+        let rereads = AtomicU32::new(0);
+        let error = refresh_loop(
+            || async {
+                match identities.fetch_add(1, Ordering::SeqCst) {
+                    3 => Err(Error::Connect("gone".into())),
+                    n => Ok(n),
+                }
+            },
+            |n| {
+                rereads.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    match n {
+                        0 => Err("the KMS did not answer"),
+                        1 => std::future::pending().await,
+                        _ => Ok(()),
+                    }
+                }
+            },
+        )
         .await;
-        // Good at 5:00, failed at 10:00, good again at 10:30, then failing from 15:30 until ten
-        // minutes after that last success.
-        assert_eq!(started.elapsed(), Duration::from_secs(630 + 600));
-        assert_eq!(error, format!("call {}", calls.load(Ordering::SeqCst) - 1));
+        assert!(matches!(error, Error::Connect(_)), "{error}");
+        // 5:00 a failed re-read, 5:30 a stuck one cut off at 6:00, 6:30 a good one, and the
+        // identity is gone five minutes later.
+        assert_eq!(started.elapsed(), Duration::from_secs(390 + 300));
+        assert_eq!(rereads.load(Ordering::SeqCst), 3);
     }
 
-    /// Short: a unix socket path is capped at 104 bytes on macOS.
     fn socket_path() -> PathBuf {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
