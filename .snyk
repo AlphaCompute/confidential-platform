@@ -1,0 +1,8 @@
+# Snyk (https://snyk.io) policy file
+version: v1.25.0
+# Operator tools: their only inputs are the operator's own arguments, and phala.py
+# talks to a fixed host, so taint from argv is not attacker-controlled.
+exclude:
+  code:
+    - deploy/phala.py
+    - testdata/**
