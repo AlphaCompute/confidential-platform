@@ -1,7 +1,8 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use alpha_runtime::{Config, Error, Exit, Runtime, SOCKET_PATH};
+use alpha_runtime::{Config, Error, Exit, Runtime, SECRETS_DIR, SOCKET_PATH};
 use p256::ecdsa::SigningKey;
 use tokio::net::UnixListener;
 
@@ -64,7 +65,9 @@ async fn run() -> Result<Exit, Error> {
             _ = tokio::signal::ctrl_c() => {}
         }
     };
-    let exit = runtime.run(listener, shutdown).await;
+    let exit = runtime
+        .run(listener, PathBuf::from(SECRETS_DIR), shutdown)
+        .await;
     let _ = std::fs::remove_file(SOCKET_PATH);
     Ok(exit)
 }

@@ -19,7 +19,7 @@ pub mod socket;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -42,6 +42,11 @@ pub use alpha_client::runtime::SOCKET_PATH;
 
 pub const RENEW_BEFORE: Duration = Duration::from_secs(600);
 const RETRY_AFTER: Duration = Duration::from_secs(30);
+/// Each missing Secret is a denied `secret.get` audit row on the KMS; the backoff doubles from
+/// here up to `SECRETS_POLL`, so a Secret never set costs one row a minute.
+const SECRETS_FIRST_RETRY: Duration = Duration::from_secs(2);
+/// With every file written a pass hits the leaf's cache, so it costs nothing until a renewal.
+const SECRETS_POLL: Duration = Duration::from_secs(60);
 
 /// Distinct purposes cached per leaf; beyond it a key is still served, derived again on every
 /// read, so a caller naming ever new purposes cannot grow the process.
@@ -526,6 +531,32 @@ impl Runtime {
         }
     }
 
+    async fn deliver_forever(&self, root: PathBuf) {
+        if self.config.secrets.is_empty() {
+            return;
+        }
+        let mut retry = SECRETS_FIRST_RETRY;
+        let mut waiting = Vec::new();
+        loop {
+            match self.deliver(&root).await {
+                Delivery::Revoked => return,
+                Delivery::Complete => {
+                    retry = SECRETS_FIRST_RETRY;
+                    waiting.clear();
+                    tokio::time::sleep(SECRETS_POLL).await;
+                }
+                Delivery::Incomplete(names) => {
+                    if names != waiting {
+                        eprintln!("alpha-runtime: waiting for secrets: {}", names.join(", "));
+                        waiting = names;
+                    }
+                    tokio::time::sleep(retry).await;
+                    retry = retry.saturating_mul(2).min(SECRETS_POLL);
+                }
+            }
+        }
+    }
+
     async fn renew_forever(&self) {
         loop {
             let delay = match self.last() {
@@ -547,11 +578,13 @@ impl Runtime {
         }
     }
 
-    /// Serves the socket and renews the leaf until `shutdown` resolves or the Revision is
-    /// revoked; open connections drain either way.
+    /// Serves the socket, renews the leaf and keeps the declared Secret files under
+    /// `secrets_root` current until `shutdown` resolves or the Revision is revoked; open
+    /// connections drain either way.
     pub async fn run(
         self: Arc<Self>,
         listener: UnixListener,
+        secrets_root: PathBuf,
         shutdown: impl Future<Output = ()>,
     ) -> Exit {
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -562,12 +595,17 @@ impl Runtime {
                 })
                 .into_future(),
         );
+        let delivery = tokio::spawn({
+            let runtime = self.clone();
+            async move { runtime.deliver_forever(secrets_root).await }
+        });
         let mut revoked = self.revoked.subscribe();
         let exit = tokio::select! {
             () = shutdown => Exit::Drained,
             _ = revoked.wait_for(|r| *r) => Exit::Revoked,
             () = self.renew_forever() => Exit::Revoked,
         };
+        delivery.abort();
         let _ = stop.send(());
         let _ = server.await;
         exit
@@ -627,6 +665,69 @@ mod tests {
                 ("web".into(), set(&["db_password", "session_key"])),
             ])
         );
+    }
+
+    #[test]
+    fn secrets_refuse_anything_but_the_wraps_shape() {
+        for bad in [
+            r#"{"a":[],"a":[]}"#,
+            "[]",
+            r#""x""#,
+            r#"{"web":"x"}"#,
+            r#"{"web":[1]}"#,
+            r#"{"Web":["x"]}"#,
+            r#"{"web":[".."]}"#,
+            r#"{"web":["a/b"]}"#,
+            r#"{"..":["x"]}"#,
+            r#"{"web":[""]}"#,
+            "not json",
+        ] {
+            let Err(Error::Config(m)) = parse_secrets(bad) else {
+                panic!("{bad} was accepted");
+            };
+            assert!(m.starts_with("ALPHACOMPUTE_SECRETS:"), "{bad}: {m}");
+            let Err(Error::Config(m)) = Config::parse(HASH, HASH, "https://a", Some(bad)) else {
+                panic!("{bad} was accepted by Config::parse");
+            };
+            assert!(m.contains("ALPHACOMPUTE_SECRETS"), "{bad}: {m}");
+        }
+    }
+
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("alpha-runtime-{}", alpha_core::KeyId::mint()));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    fn mode(path: &Path) -> u32 {
+        std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(path).unwrap().permissions())
+            & 0o777
+    }
+
+    #[test]
+    fn a_secret_file_is_replaced_whole_and_stays_read_only() {
+        let dir = temp_dir();
+        let file = dir.join("k");
+        write_secret(&dir, "k", b"one").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"one");
+        assert_eq!(mode(&file), 0o444);
+
+        write_secret(&dir, "k", b"two").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"two");
+        assert_eq!(mode(&file), 0o444);
+        assert!(!dir.join(".k.tmp").exists());
+
+        std::fs::write(dir.join(".k.tmp"), b"half").unwrap();
+        write_secret(&dir, "k", b"three").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"three");
+        assert_eq!(mode(&file), 0o444);
+        assert!(!dir.join(".k.tmp").exists());
+
+        let missing = dir.join("missing");
+        assert!(write_secret(&missing, "k", b"x").is_err());
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
