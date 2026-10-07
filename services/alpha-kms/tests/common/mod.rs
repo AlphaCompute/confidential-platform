@@ -409,6 +409,32 @@ impl Harness {
             .await
     }
 
+    /// A put-Secret body whose value is sealed over a fresh `/v1/channel` handshake with this
+    /// node, pinning the bootstrap CA and the node's Revision, for this harness's organization;
+    /// returned unsent.
+    pub async fn sealed_body(
+        &self,
+        name: &str,
+        app_ids: &[AppId],
+        value: &[u8],
+        issued_at: SystemTime,
+        signer: &(KeyId, SigningKey),
+    ) -> Value {
+        let (initiator, hello) = alpha_channel::handshake::Initiator::new().unwrap();
+        let (status, reply) = self.post("/v1/channel", json!(hello)).await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        let hello: alpha_channel::handshake::ServerHello = serde_json::from_value(reply).unwrap();
+        let payload = json!({ "name": name, "app_ids": app_ids, "content_sha256": format!("sha256:{}", hex::encode(Sha256::digest(value))), "issued_at": rfc3339(issued_at) });
+        let (mut channel, ticket) = initiator
+            .finish_kms(&hello, &self.ca_pem, &[self.node.compose_hash], self.now())
+            .unwrap();
+        let sealed =
+            alpha_channel::secret::seal(&mut channel, ticket, &payload, self.org, value).unwrap();
+        let mut body = self.signed(context::SECRET, payload, signer);
+        body["sealed"] = json!(sealed);
+        body
+    }
+
     pub fn nonce(&self) -> String {
         b64(&read(KEYED, "nonce.bin"))
     }

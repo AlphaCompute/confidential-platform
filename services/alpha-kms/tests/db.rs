@@ -69,6 +69,16 @@ async fn bootstrap_once_unseal_with_two_shares_and_sealed_gate() {
     assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(r.headers().get("retry-after").unwrap(), "30");
     assert_eq!(code(&r.json().await.unwrap()), "sealed");
+    let (_, hello) = alpha_channel::handshake::Initiator::new().unwrap();
+    let r = client()
+        .post(format!("{url2}/v1/channel"))
+        .json(&hello)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(r.headers().get("retry-after").unwrap(), "30");
+    assert_eq!(code(&r.json().await.unwrap()), "sealed");
     assert_eq!(
         send(client().get(format!("{url2}/healthz"))).await.0,
         StatusCode::OK
@@ -1575,4 +1585,302 @@ async fn nonce_route_malformed_body_and_unknown_route() {
         send(client().get(format!("{}/v1/nope", h.url))).await.0,
         StatusCode::NOT_FOUND
     );
+}
+
+#[tokio::test]
+async fn a_sealed_put_through_the_channel_is_stored_and_read_by_a_granted_instance() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let admin = h.register_key(&h.root, 81).await;
+    let app = AppId::mint();
+    h.insert_capture_revision(app, &admin).await;
+    let body = h
+        .sealed_body("sealed-key", &[app], b"sealed value", h.now(), &admin)
+        .await;
+    let sent = body.to_string();
+    assert!(!sent.contains("sealed value"), "{sent}");
+    assert!(!sent.contains(&b64(b"sealed value")), "{sent}");
+
+    let (status, reply) = h
+        .call(reqwest::Method::PUT, "/v1/secrets/sealed-key", body.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    verified(
+        &h,
+        &reply,
+        "secret.put",
+        &body,
+        json!({ "name": "sealed-key", "org_id": h.org }),
+    );
+
+    let instance = h.instance_client().await;
+    let (status, secret) = send(instance.get(format!("{}/v1/secrets/sealed-key", h.url))).await;
+    assert_eq!(status, StatusCode::OK, "{secret}");
+    assert_eq!(secret["value"], json!(b64(b"sealed value")));
+}
+
+async fn secrets_named(h: &Harness, name: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>("select count(*) from secrets where name = $1")
+        .bind(name)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap()
+}
+
+/// Puts `body` under `name` and checks it is refused with `status` and `code`, without a receipt
+/// and without a stored row; returns the error message.
+async fn refused_put(
+    h: &Harness,
+    name: &str,
+    body: Value,
+    status: StatusCode,
+    expected: &str,
+) -> String {
+    let rows = secrets_named(h, name).await;
+    let (actual, reply) = h
+        .call(reqwest::Method::PUT, &format!("/v1/secrets/{name}"), body)
+        .await;
+    assert_eq!((actual, code(&reply)), (status, expected), "{reply}");
+    assert!(reply.get("receipt").is_none(), "{reply}");
+    assert_eq!(secrets_named(h, name).await, rows);
+    reply["error"]["message"].as_str().unwrap().to_owned()
+}
+
+fn flipped(text: &Value, at: usize) -> Value {
+    let mut bytes = BASE64_URL_SAFE_NO_PAD
+        .decode(text.as_str().unwrap())
+        .unwrap();
+    bytes[at] ^= 1;
+    json!(BASE64_URL_SAFE_NO_PAD.encode(bytes))
+}
+
+#[tokio::test]
+async fn a_sealed_put_with_a_tampered_frame_or_ticket_is_malformed_and_stores_nothing() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let admin = h.register_key(&h.root, 82).await;
+    let app = AppId::mint();
+    h.insert_capture_revision(app, &admin).await;
+    let body = h
+        .sealed_body("tampered", &[app], b"value", h.now(), &admin)
+        .await;
+    let other = h
+        .sealed_body("tampered", &[app], b"value", h.now(), &admin)
+        .await;
+    let channel: [u8; 16] = BASE64_URL_SAFE_NO_PAD
+        .decode(body["sealed"]["frame"]["channel"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+    let mut frame = body.clone();
+    frame["sealed"]["frame"]["ct"] = flipped(&body["sealed"]["frame"]["ct"], 0);
+    let mut ticket = body.clone();
+    ticket["sealed"]["ticket"] = flipped(&body["sealed"]["ticket"], 20);
+    let mut foreign_root = body.clone();
+    foreign_root["sealed"]["ticket"] = json!(
+        alpha_kms::channel::seal_ticket(
+            &[9u8; 32],
+            &channel,
+            &[0u8; 32],
+            h.now() + Duration::from_secs(600)
+        )
+        .unwrap()
+    );
+    let mut swapped = body.clone();
+    swapped["sealed"]["ticket"] = other["sealed"]["ticket"].clone();
+    for variant in [frame, ticket, foreign_root, swapped] {
+        refused_put(
+            &h,
+            "tampered",
+            variant,
+            StatusCode::BAD_REQUEST,
+            "malformed",
+        )
+        .await;
+    }
+    assert_eq!(secrets_named(&h, "tampered").await, 0);
+
+    let (_, hello) = alpha_channel::handshake::Initiator::new().unwrap();
+    let mut extra = json!(hello);
+    extra["extra"] = json!(1);
+    let mut out_of_range = json!(hello);
+    out_of_range["pk"] = json!(BASE64_URL_SAFE_NO_PAD.encode([0xff; 1216]));
+    for hello in [
+        json!({ "v": 1, "kem": "x-wing", "pk": "AA", "nonce": "AA" }),
+        extra,
+        out_of_range,
+    ] {
+        let (status, reply) = h.post("/v1/channel", hello).await;
+        assert_eq!(
+            (status, code(&reply)),
+            (StatusCode::BAD_REQUEST, "malformed"),
+            "{reply}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_sealed_put_after_its_ticket_expires_is_refused() {
+    let start = captured_at(KEYED);
+    let clock = std::sync::Arc::new(std::sync::Mutex::new(start));
+    let shared = clock.clone();
+    let Some(h) = harness_with_clock(std::sync::Arc::new(move || *shared.lock().unwrap())).await
+    else {
+        return;
+    };
+    let admin = h.register_key(&h.root, 83).await;
+    let app = AppId::mint();
+    h.insert_capture_revision(app, &admin).await;
+    let later = start + Duration::from_secs(11 * 60);
+    let body = h
+        .sealed_body("expiring", &[app], b"value", later, &admin)
+        .await;
+    *clock.lock().unwrap() = later;
+    let message = refused_put(&h, "expiring", body, StatusCode::BAD_REQUEST, "malformed").await;
+    assert!(message.contains("expired"), "{message}");
+
+    let body = h
+        .sealed_body("expiring", &[app], b"value", later, &admin)
+        .await;
+    let (status, reply) = h
+        .call(reqwest::Method::PUT, "/v1/secrets/expiring", body)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+}
+
+#[tokio::test]
+async fn a_replayed_sealed_put_already_exists_without_a_receipt() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let admin = h.register_key(&h.root, 84).await;
+    let app = AppId::mint();
+    h.insert_capture_revision(app, &admin).await;
+    let body = h
+        .sealed_body("replayed", &[app], b"value", h.now(), &admin)
+        .await;
+    let (status, reply) = h
+        .call(reqwest::Method::PUT, "/v1/secrets/replayed", body.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    refused_put(&h, "replayed", body, StatusCode::CONFLICT, "already_exists").await;
+    assert_eq!(secrets_named(&h, "replayed").await, 1);
+}
+
+/// An admin key of a second organization, registered beside the harness's.
+async fn second_organization(h: &Harness) -> (KeyId, SigningKey) {
+    let org_b = OrgId::mint();
+    let root_b_key = SigningKey::from_bytes(&[52u8; 32]);
+    let (status, reply) = h
+        .post(
+            "/v1/keys",
+            root_key_registration(org_b, &root_b_key, h.now()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let root_b = (reply["id"].as_str().unwrap().parse().unwrap(), root_b_key);
+    h.register_key(&root_b, 53).await
+}
+
+/// A second organization's verbatim copy is refused by the organization sealed beside the value,
+/// and its put naming an App of its own by the payload digest sealed at its head.
+#[tokio::test]
+async fn a_sealed_value_cannot_be_moved_into_another_organization() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let admin_a = h.register_key(&h.root, 85).await;
+    let app_a = AppId::mint();
+    h.insert_capture_revision(app_a, &admin_a).await;
+    let body = h
+        .sealed_body("moved", &[app_a], b"a's value", h.now(), &admin_a)
+        .await;
+    let admin_b = second_organization(&h).await;
+
+    let mut verbatim = h.signed(context::SECRET, body["payload"].clone(), &admin_b);
+    verbatim["sealed"] = body["sealed"].clone();
+    let message = refused_put(&h, "moved", verbatim, StatusCode::BAD_REQUEST, "malformed").await;
+    assert!(message.contains("another organization"), "{message}");
+
+    let mut own_app = body["payload"].clone();
+    own_app["app_ids"] = json!([AppId::mint()]);
+    let mut own = h.signed(context::SECRET, own_app, &admin_b);
+    own["sealed"] = body["sealed"].clone();
+    let message = refused_put(&h, "moved", own, StatusCode::BAD_REQUEST, "malformed").await;
+    assert!(message.contains("another document"), "{message}");
+
+    let (status, reply) = h
+        .call(reqwest::Method::PUT, "/v1/secrets/moved", body)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(secrets_named(&h, "moved").await, 1);
+    let owner = sqlx::query_scalar::<_, Uuid>("select org_id from secrets where name = $1")
+        .bind("moved")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(owner, Uuid::from(h.org));
+}
+
+/// Before the granted App has a Revision no other check knows whose App it is, so the
+/// organization sealed beside the value alone keeps a verbatim copy out of another organization.
+#[tokio::test]
+async fn a_sealed_value_for_an_app_without_a_revision_stays_with_its_organization() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let admin_a = h.register_key(&h.root, 87).await;
+    let app_a = AppId::mint();
+    let body = h
+        .sealed_body("early", &[app_a], b"a's value", h.now(), &admin_a)
+        .await;
+    let admin_b = second_organization(&h).await;
+
+    let mut verbatim = h.signed(context::SECRET, body["payload"].clone(), &admin_b);
+    verbatim["sealed"] = body["sealed"].clone();
+    let message = refused_put(&h, "early", verbatim, StatusCode::BAD_REQUEST, "malformed").await;
+    assert!(message.contains("another organization"), "{message}");
+    assert_eq!(secrets_named(&h, "early").await, 0);
+
+    let (status, reply) = h
+        .call(reqwest::Method::PUT, "/v1/secrets/early", body)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let owner = sqlx::query_scalar::<_, Uuid>("select org_id from secrets where name = $1")
+        .bind("early")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(owner, Uuid::from(h.org));
+}
+
+#[tokio::test]
+async fn a_put_carries_exactly_one_of_value_and_sealed() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let admin = h.register_key(&h.root, 86).await;
+    let app = AppId::mint();
+    h.insert_capture_revision(app, &admin).await;
+    let body = h
+        .sealed_body("shape", &[app], b"value", h.now(), &admin)
+        .await;
+    let value = json!(b64(b"value"));
+
+    let mut neither = body.clone();
+    neither.as_object_mut().unwrap().remove("sealed");
+    let mut both = body.clone();
+    both["value"] = value.clone();
+    let mut null_value = body.clone();
+    null_value["value"] = Value::Null;
+    let mut null_sealed = body.clone();
+    null_sealed["sealed"] = Value::Null;
+    null_sealed["value"] = value;
+    for variant in [neither, both, null_value, null_sealed] {
+        let message = refused_put(&h, "shape", variant, StatusCode::BAD_REQUEST, "malformed").await;
+        assert_eq!(message, "exactly one of value and sealed");
+    }
 }

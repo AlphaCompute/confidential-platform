@@ -189,6 +189,60 @@ hour. A verifier always takes an expectation `{route, request_sha256, response}`
 genuine receipt for another request must be refused, and returns the signed `document.response`
 rather than the reply's top-level fields, which no signature covers.
 
+## KMS channel
+
+A KMS node answers the same handshake at `POST /v1/channel`, so a page can hand it a Secret's
+value that the relay carrying the request cannot read. Its chain is `[node leaf, KMS CA]`, its
+`compose` is empty because a node runs no tenant compose, and it adds a `ticket`:
+
+```json
+{
+  "v": 1,
+  "channel": "<base64url, 16 random bytes>",
+  "enc": "<base64url HPKE encapsulation>",
+  "now": "2026-09-25T12:00:00Z",
+  "certificate_chain": ["<node leaf PEM>", "<KMS CA PEM>"],
+  "compose": "",
+  "signature": { "algorithm": "ecdsa-p256", "signature": "<base64url r‖s>" },
+  "ticket": "<base64url>"
+}
+```
+
+The page checks the leaf exactly as for a receipt: the CA is byte for byte the platform document's
+`kms_ca_pem`, the leaf is that CA's and valid at `now`, and its URI SANs are exactly
+`alphacompute://kms` and then a Revision from the platform document's `kms_revisions`. An Instance
+leaf from the same CA is refused. The page does not look at `compose`. The signed document is the
+one above, with `compose_hash` set to the node's Revision. An Instance never sends `ticket`, and a
+KMS reply without one is refused.
+
+The ticket is opaque to the page. The node seals the channel's request key into it for any node of
+the deployment, so the put may reach another node than the one that answered. It is valid for ten
+minutes; after that the put is refused as `malformed` and the page opens a new channel.
+
+The put then goes to `PUT /v1/secrets/<name>` as:
+
+```json
+{
+  "payload": { "name": "<name>", "app_ids": ["<uuid>", …], "content_sha256": "sha256:<hex>", "issued_at": "<RFC 3339>" },
+  "signature": { },
+  "sealed": { "ticket": "<as received>", "frame": { "channel": "<id>", "seq": 0, "ct": "<base64url>" } }
+}
+```
+
+The frame is one request frame on `PUT /v1/secrets/<name>` with `seq` 0. Its plaintext is the
+32-byte digest `SHA-256("alphacompute/secret/v1" ‖ 0x00 ‖ JCS(payload))`, the same digest the put's
+signature covers, then the 16 bytes of the organization id, then the value. The node refuses the
+put as `malformed` when the digest is not its own digest of the received payload, or when the
+organization is not the one the signing key belongs to. The digest keeps the value from travelling
+in a put with any other payload. The payload names no organization, so a relay holding a key of its
+own could sign the very same payload; the organization id is what keeps it from storing the value
+in its own organization, whether or not the granted Apps have a Revision yet. The path in the
+frame's associated data binds the value to its name. `content_sha256` stays the SHA-256 of the
+value alone. The reply is plain JSON with a receipt, whose `response` includes `org_id`.
+
+The node keeps no record of the frame. A replayed put is stopped by the put's own `issued_at` rule:
+a put no newer than the stored Secret is refused as `already_exists`.
+
 ## Error codes
 
 Every export returns an error rather than trapping, and the error's message starts with its code.
@@ -196,12 +250,12 @@ Every export returns an error rather than trapping, and the error's message star
 | Code | Meaning |
 |---|---|
 | `platform_signature` | the platform document does not verify, or was issued after `now` |
-| `foreign_certificate` | the chain is not a leaf and the platform's KMS CA, the leaf is not that CA's, or it names another organization or App; or a KMS receipt's chain is not exactly one leaf carrying `alphacompute://kms` |
+| `foreign_certificate` | the chain is not a leaf and the platform's KMS CA, the leaf is not that CA's, or it names another organization or App; or a KMS receipt's chain is not exactly one leaf carrying `alphacompute://kms`; or, on a KMS channel, the leaf does not carry exactly `alphacompute://kms` and a Revision |
 | `certificate_expired` | `now` (for a KMS receipt, its `issued_at`) is outside the leaf's validity |
-| `unknown_revision` | the leaf's Revision is not in the allowlist |
+| `unknown_revision` | the leaf's Revision is not in the allowlist (for a KMS node, `kms_revisions`) |
 | `compose_mismatch` | the compose does not hash to the leaf's Revision |
 | `handshake_signature` | the handshake signature or the encapsulation does not check out |
-| `malformed` | anything that does not parse, including a time that is not one |
+| `malformed` | anything that does not parse, including a time that is not one, a client key that is not a valid X-Wing public key, a KMS reply without a ticket, and a put whose name is not a Secret name |
 | `rng` | the system's randomness failed |
 | `seal` | sealing failed, or a response for a request the channel did not open or already ended |
 | `open` | a frame does not open on this channel, sequence number and route, or arrives out of order |
@@ -227,6 +281,14 @@ and returns the response it signed as JSON. `kmsRevisionsJson` lists the `compos
 `finish(serverHelloJson, kmsCaPem, expectedJson, nowMs)`, which returns a `Channel`.
 `expectedJson` is `{org_id, app_id, revisions}`. After `finish`, `verified()` returns what was
 verified as JSON, with `aud` and `kms_ca_sha256` in hex and the times in RFC 3339.
+
+`new KmsSecretSealer()` seals one put-Secret's value. It offers `hello()`, the ClientHello to post
+to `POST /v1/channel`, then
+`seal(serverHelloJson, platformJson, payloadJson, orgId, value, nowMs)`, which returns the body's
+`sealed` member, `{ticket, frame}`, as JSON. `platformJson` is `verifyPlatform`'s output,
+`payloadJson` is the put's payload exactly as it will be signed and sent, and `orgId` is the UUID
+of the organization whose key signs the put; a string that is not a UUID is `malformed`. A sealer
+seals once, so no two values are ever sealed under one nonce.
 
 A `Channel` offers `sealRequest(method, path, body)`, whose frame's `seq` names the response,
 and `response(seq)`. The `ResponseReader` that `response` returns offers `openLine(line)` and
@@ -269,6 +331,9 @@ and the script around it are delivered to every visitor, and anyone can compare 
 The channel authenticates the Instance, not the client. Anyone can open a channel. What a
 request is allowed to do rests on what travels inside it: a session secret, or a member's
 signature.
+
+A page swapped by whoever serves it sees a Secret's value before sealing it, the same caveat as
+every other use of the page.
 
 wasm memory is readable by the page's own scripts. The channel keys live there. The member's
 private key does not, because it stays in WebCrypto.

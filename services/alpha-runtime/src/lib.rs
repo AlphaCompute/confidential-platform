@@ -16,7 +16,10 @@
 
 pub mod socket;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -39,6 +42,11 @@ pub use alpha_client::runtime::SOCKET_PATH;
 
 pub const RENEW_BEFORE: Duration = Duration::from_secs(600);
 const RETRY_AFTER: Duration = Duration::from_secs(30);
+/// Each missing Secret is a denied `secret.get` audit row on the KMS; the backoff doubles from
+/// here up to `SECRETS_POLL`, so a Secret never set costs one row a minute.
+const SECRETS_FIRST_RETRY: Duration = Duration::from_secs(2);
+/// With every file written a pass hits the leaf's cache, so it costs nothing until a renewal.
+const SECRETS_POLL: Duration = Duration::from_secs(60);
 
 /// Distinct purposes cached per leaf; beyond it a key is still served, derived again on every
 /// read, so a caller naming ever new purposes cannot grow the process.
@@ -98,12 +106,48 @@ impl Exit {
     }
 }
 
-/// The three environment variables, nothing else.
+/// Each declaring service's tmpfs volume is mounted read-write here at `<SECRETS_DIR>/<service>`
+/// and read-only at `/run/secrets` in that service, so a file reaches only the services that
+/// declared it.
+pub const SECRETS_DIR: &str = "/run/alpha-secrets";
+
+/// Service name to the Secret names it declared.
+pub type Secrets = BTreeMap<String, BTreeSet<String>>;
+
+/// `ALPHACOMPUTE_SECRETS`: a JSON object of service name to an array of Secret names; unset
+/// declares none.
+pub fn parse_secrets(text: Option<&str>) -> Result<Secrets, Error> {
+    let Some(text) = text else {
+        return Ok(Secrets::default());
+    };
+    let refused = |m: String| Error::Config(format!("ALPHACOMPUTE_SECRETS: {m}"));
+    let value = alpha_core::parse(text.as_bytes()).map_err(|e| refused(e.to_string()))?;
+    let secrets: Secrets = serde_json::from_value(value).map_err(|e| refused(e.to_string()))?;
+    // The wrap checks these too, but they become path segments under SECRETS_DIR and a
+    // hand-written compose must not reach outside it.
+    for (service, names) in &secrets {
+        if !alpha_core::is_key_purpose(service) {
+            return Err(refused(format!(
+                "service {service:?} is not a lowercase path segment"
+            )));
+        }
+        if let Some(name) = names.iter().find(|n| !alpha_core::is_key_purpose(n)) {
+            return Err(refused(format!(
+                "{service}: secret {name:?} is not a lowercase path segment"
+            )));
+        }
+    }
+    Ok(secrets)
+}
+
+/// The three environment variables and, when a service declared a Secret,
+/// `ALPHACOMPUTE_SECRETS`.
 #[derive(Clone, Debug)]
 pub struct Config {
     pub kms_ca_spki_sha256: [u8; 32],
     pub kms_revisions: Vec<ComposeHash>,
     pub kms_endpoints: Vec<String>,
+    pub secrets: Secrets,
 }
 
 impl Config {
@@ -115,10 +159,16 @@ impl Config {
             &var("ALPHACOMPUTE_KMS_CA_SPKI_SHA256")?,
             &var("ALPHACOMPUTE_KMS_REVISIONS")?,
             &var("ALPHACOMPUTE_KMS_ENDPOINTS")?,
+            std::env::var("ALPHACOMPUTE_SECRETS").ok().as_deref(),
         )
     }
 
-    pub fn parse(ca_spki_sha256: &str, revisions: &str, endpoints: &str) -> Result<Self, Error> {
+    pub fn parse(
+        ca_spki_sha256: &str,
+        revisions: &str,
+        endpoints: &str,
+        secrets: Option<&str>,
+    ) -> Result<Self, Error> {
         let kms_ca_spki_sha256 = ca_spki_sha256
             .trim()
             .strip_prefix("sha256:")
@@ -144,10 +194,12 @@ impl Config {
         if kms_endpoints.is_empty() {
             return Err(Error::Config("ALPHACOMPUTE_KMS_ENDPOINTS is empty".into()));
         }
+        let secrets = parse_secrets(secrets)?;
         Ok(Self {
             kms_ca_spki_sha256,
             kms_revisions,
             kms_endpoints,
+            secrets,
         })
     }
 
@@ -158,6 +210,55 @@ impl Config {
 
 fn list(text: &str) -> impl Iterator<Item = &str> {
     text.split(',').map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Writes `value` to `dir/name` whole: a 0444 temp file in the same directory renamed over the
+/// name. A file already holding `value` is left alone; `dir` is never created.
+pub fn write_secret(dir: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
+    let path = dir.join(name);
+    if std::fs::read(&path)
+        .map(Zeroizing::new)
+        .is_ok_and(|current| current.as_slice() == value)
+    {
+        return Ok(());
+    }
+    // No Secret name starts with a dot, so the temp file never collides with one.
+    let temp = dir.join(format!(".{name}.tmp"));
+    let _ = std::fs::remove_file(&temp);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o444)
+        .open(&temp)?;
+    // The process umask narrows the mode given at creation, and the reading service usually
+    // runs as another user.
+    file.set_permissions(std::fs::Permissions::from_mode(0o444))?;
+    file.write_all(value)?;
+    drop(file);
+    std::fs::rename(&temp, &path)
+}
+
+/// Whether every declared Secret is a file under `root`; what a declaring service's
+/// `service_healthy` dependency waits on.
+// ponytail: one health for the whole runtime, so a declaring service also waits for every other
+// service's Secrets; acceptable while a tenant sets them in one session; the upgrade is a
+// per-service check the wrap can point each service's dependency at.
+pub fn healthcheck(root: &Path, secrets: &Secrets) -> bool {
+    secrets.iter().all(|(service, names)| {
+        let dir = root.join(service);
+        names.iter().all(|name| dir.join(name).is_file())
+    })
+}
+
+/// The outcome of one pass over the declared Secrets.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Delivery {
+    /// Every declared file holds the KMS's current value.
+    Complete,
+    /// These names are not stored yet, or could not be fetched or written.
+    Incomplete(Vec<String>),
+    /// The Revision is revoked; nothing more is written.
+    Revoked,
 }
 
 pub type Clock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
@@ -391,6 +492,85 @@ impl Runtime {
         Ok(key)
     }
 
+    /// One pass: every declared name fetched once, through the leaf's cache, and written into
+    /// the directory of each service that declared it.
+    // ponytail: files already written stay after a revocation or after a Secret leaves the App's
+    // grant, until the volume's last container stops (the lifetime of a cached secret); the
+    // upgrade is removing a delivered file once the KMS stops serving it.
+    pub async fn deliver(&self, root: &Path) -> Delivery {
+        if self.is_revoked() {
+            return Delivery::Revoked;
+        }
+        let names: BTreeSet<&String> = self.config.secrets.values().flatten().collect();
+        let mut incomplete = Vec::new();
+        for name in names {
+            let secret = match self.secret(name).await {
+                Ok(secret) => secret,
+                Err(e) if e.revoked() => return Delivery::Revoked,
+                Err(e) => {
+                    if !matches!(&e, Error::Kms(alpha_client::Error::Api(api)) if api.code == "not_found")
+                    {
+                        eprintln!("alpha-runtime: secret {name}: {e}");
+                    }
+                    incomplete.push(name.clone());
+                    continue;
+                }
+            };
+            let Ok(value) = BASE64_URL_SAFE_NO_PAD
+                .decode(&secret.value)
+                .map(Zeroizing::new)
+            else {
+                eprintln!("alpha-runtime: secret {name}: value is not base64url");
+                incomplete.push(name.clone());
+                continue;
+            };
+            let declaring = self
+                .config
+                .secrets
+                .iter()
+                .filter(|(_, declared)| declared.contains(name));
+            for (service, _) in declaring {
+                if let Err(e) = write_secret(&root.join(service), name, &value) {
+                    eprintln!("alpha-runtime: secret {name} for {service}: {e}");
+                    if incomplete.last() != Some(name) {
+                        incomplete.push(name.clone());
+                    }
+                }
+            }
+        }
+        if incomplete.is_empty() {
+            Delivery::Complete
+        } else {
+            Delivery::Incomplete(incomplete)
+        }
+    }
+
+    async fn deliver_forever(&self, root: PathBuf) {
+        if self.config.secrets.is_empty() {
+            return;
+        }
+        let mut retry = SECRETS_FIRST_RETRY;
+        let mut waiting = Vec::new();
+        loop {
+            match self.deliver(&root).await {
+                Delivery::Revoked => return,
+                Delivery::Complete => {
+                    retry = SECRETS_FIRST_RETRY;
+                    waiting.clear();
+                    tokio::time::sleep(SECRETS_POLL).await;
+                }
+                Delivery::Incomplete(names) => {
+                    if names != waiting {
+                        eprintln!("alpha-runtime: waiting for secrets: {}", names.join(", "));
+                        waiting = names;
+                    }
+                    tokio::time::sleep(retry).await;
+                    retry = retry.saturating_mul(2).min(SECRETS_POLL);
+                }
+            }
+        }
+    }
+
     async fn renew_forever(&self) {
         loop {
             let delay = match self.last() {
@@ -412,11 +592,13 @@ impl Runtime {
         }
     }
 
-    /// Serves the socket and renews the leaf until `shutdown` resolves or the Revision is
-    /// revoked; open connections drain either way.
+    /// Serves the socket, renews the leaf and keeps the declared Secret files under
+    /// `secrets_root` current until `shutdown` resolves or the Revision is revoked; open
+    /// connections drain either way.
     pub async fn run(
         self: Arc<Self>,
         listener: UnixListener,
+        secrets_root: PathBuf,
         shutdown: impl Future<Output = ()>,
     ) -> Exit {
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -427,12 +609,17 @@ impl Runtime {
                 })
                 .into_future(),
         );
+        let delivery = tokio::spawn({
+            let runtime = self.clone();
+            async move { runtime.deliver_forever(secrets_root).await }
+        });
         let mut revoked = self.revoked.subscribe();
         let exit = tokio::select! {
             () = shutdown => Exit::Drained,
             _ = revoked.wait_for(|r| *r) => Exit::Revoked,
             () = self.renew_forever() => Exit::Revoked,
         };
+        delivery.abort();
         let _ = stop.send(());
         let _ = server.await;
         exit
@@ -453,6 +640,7 @@ mod tests {
             &format!(" {HASH} "),
             &format!("{HASH}, {HASH},"),
             "https://a:8443/,, https://b:8443",
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -466,7 +654,7 @@ mod tests {
         );
 
         let refused = |a: &str, b: &str, c: &str| {
-            let Err(Error::Config(m)) = Config::parse(a, b, c) else {
+            let Err(Error::Config(m)) = Config::parse(a, b, c, None) else {
                 panic!("{a} {b} {c} was accepted");
             };
             m
@@ -476,6 +664,104 @@ mod tests {
         assert!(refused(HASH, "sha256:zz", "x").contains("REVISIONS"));
         assert!(refused(HASH, HASH, " , ").contains("ENDPOINTS"));
         assert!(refused("", HASH, "x").contains("CA_SPKI"));
+        assert!(c.secrets.is_empty());
+    }
+
+    #[test]
+    fn secrets_parse_the_wraps_variable() {
+        let wrap = r#"{"db":["db_password"],"web":["db_password","session_key"]}"#;
+        let c = Config::parse(HASH, HASH, "https://a", Some(wrap)).unwrap();
+        let set = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<BTreeSet<_>>();
+        assert_eq!(
+            c.secrets,
+            Secrets::from([
+                ("db".into(), set(&["db_password"])),
+                ("web".into(), set(&["db_password", "session_key"])),
+            ])
+        );
+    }
+
+    #[test]
+    fn secrets_refuse_anything_but_the_wraps_shape() {
+        for bad in [
+            r#"{"a":[],"a":[]}"#,
+            "[]",
+            r#""x""#,
+            r#"{"web":"x"}"#,
+            r#"{"web":[1]}"#,
+            r#"{"Web":["x"]}"#,
+            r#"{"web":[".."]}"#,
+            r#"{"web":["a/b"]}"#,
+            r#"{"..":["x"]}"#,
+            r#"{"web":[""]}"#,
+            "not json",
+        ] {
+            let Err(Error::Config(m)) = parse_secrets(Some(bad)) else {
+                panic!("{bad} was accepted");
+            };
+            assert!(m.starts_with("ALPHACOMPUTE_SECRETS:"), "{bad}: {m}");
+            let Err(Error::Config(m)) = Config::parse(HASH, HASH, "https://a", Some(bad)) else {
+                panic!("{bad} was accepted by Config::parse");
+            };
+            assert!(m.contains("ALPHACOMPUTE_SECRETS"), "{bad}: {m}");
+        }
+    }
+
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("alpha-runtime-{}", alpha_core::KeyId::mint()));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    fn mode(path: &Path) -> u32 {
+        std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(path).unwrap().permissions())
+            & 0o777
+    }
+
+    #[test]
+    fn a_secret_file_is_replaced_whole_and_stays_read_only() {
+        let dir = temp_dir();
+        let file = dir.join("k");
+        write_secret(&dir, "k", b"one").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"one");
+        assert_eq!(mode(&file), 0o444);
+
+        write_secret(&dir, "k", b"two").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"two");
+        assert_eq!(mode(&file), 0o444);
+        assert!(!dir.join(".k.tmp").exists());
+
+        std::fs::write(dir.join(".k.tmp"), b"half").unwrap();
+        write_secret(&dir, "k", b"three").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"three");
+        assert_eq!(mode(&file), 0o444);
+        assert!(!dir.join(".k.tmp").exists());
+
+        let missing = dir.join("missing");
+        assert!(write_secret(&missing, "k", b"x").is_err());
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn healthcheck_needs_every_declared_file() {
+        let root = temp_dir();
+        assert!(healthcheck(&root, &Secrets::new()));
+        let web = root.join("web");
+        std::fs::create_dir(&web).unwrap();
+        let mut secrets = parse_secrets(Some(r#"{"web":["a","b"]}"#)).unwrap();
+        assert!(!healthcheck(&root, &secrets));
+        write_secret(&web, "a", b"1").unwrap();
+        assert!(!healthcheck(&root, &secrets));
+        std::fs::create_dir(web.join("b")).unwrap();
+        assert!(!healthcheck(&root, &secrets), "a directory is not a file");
+        std::fs::remove_dir(web.join("b")).unwrap();
+        write_secret(&web, "b", b"2").unwrap();
+        assert!(healthcheck(&root, &secrets));
+        secrets.insert("db".into(), BTreeSet::from(["a".to_owned()]));
+        assert!(!healthcheck(&root, &secrets));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

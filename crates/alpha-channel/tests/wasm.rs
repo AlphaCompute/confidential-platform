@@ -9,9 +9,11 @@
 
 use std::collections::BTreeMap;
 
+use alpha_channel::handshake;
+use alpha_channel::secret::{self, Sealed};
 use alpha_channel::wasm::{
-    Initiator, Responder, compose_services, signable, verify_grant, verify_kms_receipt,
-    verify_member_request, verify_platform,
+    Initiator, KmsSecretSealer, Responder, body_sha256, compose_services, signable, verify_grant,
+    verify_kms_receipt, verify_member_request, verify_platform,
 };
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
@@ -28,6 +30,9 @@ const LEAF: &str = include_str!("../../../testdata/channel/leaf.pem");
 const LEAF_KEY: &str = include_str!("../../../testdata/channel/leaf-key.pem");
 const COMPOSE: &str = include_str!("../../../testdata/channel/app-compose.json");
 const PLATFORM_DOCUMENT: &str = include_str!("../../../testdata/channel/platform-document.json");
+const KMS_LEAF: &str = include_str!("../../../testdata/channel/kms-leaf.pem");
+const KMS_LEAF_KEY: &str = include_str!("../../../testdata/channel/kms-leaf-key.pem");
+const KMS_COMPOSE: &str = include_str!("../../../testdata/manifest/06-kms-node/app-compose.json");
 
 /// 2026-06-01T00:00:00Z.
 const NOW_MS: f64 = 1_780_272_000_000.0;
@@ -54,23 +59,72 @@ const RECEIPT_VECTORS: &[(&str, &str)] = &[
     r!("duplicate-key"),
 ];
 
+const ORG: &str = "01920000-0000-7000-8000-000000000001";
+
 fn expected() -> String {
     json!({
-        "org_id": "01920000-0000-7000-8000-000000000001",
+        "org_id": ORG,
         "app_id": "01920000-0000-7000-8000-000000000002",
         "revisions": [alpha_core::compose_hash(COMPOSE)],
     })
     .to_string()
 }
 
-fn responder() -> Responder {
-    let key = x509_parser::pem::parse_x509_pem(LEAF_KEY.as_bytes())
+fn der(pem: &str) -> Vec<u8> {
+    x509_parser::pem::parse_x509_pem(pem.as_bytes())
         .unwrap()
         .1
-        .contents;
-    Responder::new(vec![LEAF.into(), CA.into()], &key, COMPOSE.into())
+        .contents
+}
+
+fn responder() -> Responder {
+    Responder::new(vec![LEAF.into(), CA.into()], &der(LEAF_KEY), COMPOSE.into())
         .map_err(message)
         .unwrap()
+}
+
+/// What `verifyPlatform` returns, built by hand: the signed fixture document pins another CA and
+/// cannot be re-signed here.
+fn platform(kms_ca_pem: &str, revisions: &[String]) -> String {
+    let revisions: Vec<Value> = revisions
+        .iter()
+        .map(|h| json!({"compose_hash": h, "build": "test", "source_url": "https://example.com/kms"}))
+        .collect();
+    json!({
+        "version": 1,
+        "issued_at": "2026-06-01T00:00:00Z",
+        "kms_ca_pem": kms_ca_pem,
+        "kms_revisions": revisions,
+    })
+    .to_string()
+}
+
+fn kms_revision() -> String {
+    alpha_core::compose_hash(KMS_COMPOSE).to_string()
+}
+
+/// The KMS node's reply to `client_hello` with the ticket `"t"`, its channel id and `c2s`.
+fn kms_reply(client_hello: &str) -> (String, [u8; 16], [u8; 32]) {
+    let node =
+        handshake::Responder::kms(vec![KMS_LEAF.into(), CA.into()], &der(KMS_LEAF_KEY)).unwrap();
+    let client_hello: handshake::ClientHello = serde_json::from_str(client_hello).unwrap();
+    let (mut reply, id, c2s) = node
+        .respond_detached(
+            &client_hello,
+            std::time::UNIX_EPOCH + std::time::Duration::from_millis(NOW_MS as u64),
+        )
+        .unwrap();
+    reply.ticket = Some("t".into());
+    (serde_json::to_string(&reply).unwrap(), id, *c2s)
+}
+
+fn put_payload(value: &[u8]) -> Value {
+    json!({
+        "name": "db_password",
+        "app_ids": ["01920000-0000-7000-8000-000000000002"],
+        "content_sha256": body_sha256(value),
+        "issued_at": "2026-06-01T00:00:00Z",
+    })
 }
 
 fn message(e: JsError) -> String {
@@ -147,6 +201,86 @@ fn a_clock_before_the_leaf_is_refused_not_trapped() {
         let err = responder.respond(&initiator.hello(), bad).err().unwrap();
         assert!(message(err).starts_with("malformed: "));
     }
+}
+
+#[wasm_bindgen_test]
+fn the_sealer_seals_a_put_that_only_the_node_opens() {
+    let value = b"correct horse battery staple";
+    let payload = put_payload(value);
+    let mut sealer = KmsSecretSealer::new().map_err(message).unwrap();
+    let (reply, id, c2s) = kms_reply(&sealer.hello());
+    let sealed: Sealed = serde_json::from_str(
+        &sealer
+            .seal(
+                &reply,
+                &platform(CA, &[kms_revision()]),
+                &payload.to_string(),
+                ORG,
+                value,
+                NOW_MS,
+            )
+            .map_err(message)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(sealed.ticket, "t");
+    let (sealed_for, opened) =
+        secret::open(&id, &c2s, &sealed.frame, "db_password", &payload).unwrap();
+    assert_eq!(sealed_for.to_string(), ORG);
+    assert_eq!(opened.as_slice(), value);
+}
+
+#[wasm_bindgen_test]
+fn the_sealer_refuses_a_node_the_view_does_not_list() {
+    let value = b"v";
+    let payload = put_payload(value).to_string();
+    let listed = platform(CA, &[kms_revision()]);
+    let seal = |reply: &dyn Fn(&str) -> String, platform: &str, org_id: &str, now_ms: f64| {
+        let mut sealer = KmsSecretSealer::new().map_err(message).unwrap();
+        let reply = reply(&sealer.hello());
+        message(
+            sealer
+                .seal(&reply, platform, &payload, org_id, value, now_ms)
+                .err()
+                .unwrap(),
+        )
+    };
+    let node = |hello: &str| kms_reply(hello).0;
+    let instance = |hello: &str| {
+        let mut reply: Value =
+            serde_json::from_str(&responder().respond(hello, NOW_MS).map_err(message).unwrap())
+                .unwrap();
+        reply["ticket"] = json!("t");
+        reply.to_string()
+    };
+    let foreign_ca = include_str!("../../../testdata/channel/foreign-ca.pem");
+    let unlisted = alpha_core::compose_hash(COMPOSE).to_string();
+
+    for (code, m) in [
+        ("foreign_certificate", seal(&instance, &listed, ORG, NOW_MS)),
+        (
+            "foreign_certificate",
+            seal(&node, &platform(foreign_ca, &[kms_revision()]), ORG, NOW_MS),
+        ),
+        (
+            "unknown_revision",
+            seal(&node, &platform(CA, &[unlisted]), ORG, NOW_MS),
+        ),
+        ("malformed", seal(&node, &listed, ORG, f64::NAN)),
+        ("malformed", seal(&node, &listed, "acme", NOW_MS)),
+        ("malformed", seal(&node, &listed, "", NOW_MS)),
+    ] {
+        assert!(m.starts_with(&format!("{code}: ")), "{code}: {m}");
+    }
+
+    let mut sealer = KmsSecretSealer::new().map_err(message).unwrap();
+    let reply = node(&sealer.hello());
+    sealer
+        .seal(&reply, &listed, &payload, ORG, value, NOW_MS)
+        .map_err(message)
+        .unwrap();
+    let again = sealer.seal(&reply, &listed, &payload, ORG, value, NOW_MS);
+    assert!(message(again.err().unwrap()).starts_with("malformed: "));
 }
 
 #[wasm_bindgen_test]

@@ -1,6 +1,8 @@
 //! Writes the certificates under `testdata/channel/` that the tests read: a CA and an Instance
 //! leaf in the KMS's profile for the compose in `app-compose.json`, a leaf with the same SANs
-//! under another CA, and a leaf for another App under the same CA. Run once, commit the output.
+//! under another CA, a leaf for another App under the same CA, and a KMS node leaf with its own
+//! key under the same CA for the node compose in `testdata/manifest/06-kms-node`. Run once, commit
+//! the output.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -11,6 +13,7 @@ fn main() {}
 fn main() {
     use std::path::Path;
 
+    use alpha_channel::cert::KMS_SAN;
     use rcgen::string::Ia5String;
     use rcgen::{
         BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose,
@@ -24,11 +27,22 @@ fn main() {
     const OTHER_APP: &str = "01920000-0000-7000-8000-000000000003";
 
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/channel");
-    let compose = std::fs::read_to_string(dir.join("app-compose.json")).unwrap();
-    let revision = format!(
-        "urn:alphacompute:revision:{}",
-        alpha_core::compose_hash(&compose)
-    );
+    let revision = |path: &str| {
+        let compose = std::fs::read_to_string(dir.join(path)).unwrap();
+        format!(
+            "urn:alphacompute:revision:{}",
+            alpha_core::compose_hash(&compose)
+        )
+    };
+    let app_revision = revision("app-compose.json");
+    let kms_revision = revision("../manifest/06-kms-node/app-compose.json");
+    let instance_sans = |key: &KeyPair, app: &str| {
+        let spki_sha256 = hex::encode(Sha256::digest(key.subject_public_key_info()));
+        [
+            format!("alphacompute://{ORG}/{app}/{spki_sha256}"),
+            app_revision.clone(),
+        ]
+    };
 
     let ca = |cn: &str| {
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
@@ -42,44 +56,60 @@ fn main() {
         let cert = params.self_signed(&key).unwrap();
         (key, cert)
     };
-    let leaf = |ca_key: &KeyPair, ca_cert: &rcgen::Certificate, key: &KeyPair, app: &str| {
-        let spki_sha256 = hex::encode(Sha256::digest(key.subject_public_key_info()));
-        let issuer = Issuer::from_ca_cert_der(ca_cert.der(), ca_key).unwrap();
-        let mut params = CertificateParams::default();
-        params.distinguished_name = DistinguishedName::new();
-        params.subject_alt_names = [
-            format!("alphacompute://{ORG}/{app}/{spki_sha256}"),
-            revision.clone(),
-        ]
-        .into_iter()
-        .map(|s| SanType::URI(Ia5String::try_from(s).unwrap()))
-        .collect();
-        params.is_ca = IsCa::ExplicitNoCa;
-        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
-        params.extended_key_usages = vec![
-            ExtendedKeyUsagePurpose::ClientAuth,
-            ExtendedKeyUsagePurpose::ServerAuth,
-        ];
-        params.use_authority_key_identifier_extension = true;
-        params.not_before = date_time_ymd(2026, 1, 1);
-        params.not_after = date_time_ymd(2036, 1, 1);
-        params.signed_by(key, &issuer).unwrap().pem()
-    };
+    let leaf =
+        |ca_key: &KeyPair, ca_cert: &rcgen::Certificate, key: &KeyPair, sans: [String; 2]| {
+            let issuer = Issuer::from_ca_cert_der(ca_cert.der(), ca_key).unwrap();
+            let mut params = CertificateParams::default();
+            params.distinguished_name = DistinguishedName::new();
+            params.subject_alt_names = sans
+                .into_iter()
+                .map(|s| SanType::URI(Ia5String::try_from(s).unwrap()))
+                .collect();
+            params.is_ca = IsCa::ExplicitNoCa;
+            params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+            params.extended_key_usages = vec![
+                ExtendedKeyUsagePurpose::ClientAuth,
+                ExtendedKeyUsagePurpose::ServerAuth,
+            ];
+            params.use_authority_key_identifier_extension = true;
+            params.not_before = date_time_ymd(2026, 1, 1);
+            params.not_after = date_time_ymd(2036, 1, 1);
+            params.signed_by(key, &issuer).unwrap().pem()
+        };
 
     let (ca_key, ca_cert) = ca("alpha-kms ca");
     let (foreign_key, foreign_cert) = ca("alpha-kms ca");
     let leaf_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let kms_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
     let write = |name: &str, text: String| std::fs::write(dir.join(name), text).unwrap();
     write("ca.pem", ca_cert.pem());
-    write("leaf.pem", leaf(&ca_key, &ca_cert, &leaf_key, APP));
+    write(
+        "leaf.pem",
+        leaf(&ca_key, &ca_cert, &leaf_key, instance_sans(&leaf_key, APP)),
+    );
     write("leaf-key.pem", leaf_key.serialize_pem());
     write("foreign-ca.pem", foreign_cert.pem());
     write(
         "foreign-leaf.pem",
-        leaf(&foreign_key, &foreign_cert, &leaf_key, APP),
+        leaf(
+            &foreign_key,
+            &foreign_cert,
+            &leaf_key,
+            instance_sans(&leaf_key, APP),
+        ),
     );
     write(
         "other-app-leaf.pem",
-        leaf(&ca_key, &ca_cert, &leaf_key, OTHER_APP),
+        leaf(
+            &ca_key,
+            &ca_cert,
+            &leaf_key,
+            instance_sans(&leaf_key, OTHER_APP),
+        ),
     );
+    write(
+        "kms-leaf.pem",
+        leaf(&ca_key, &ca_cert, &kms_key, [KMS_SAN.into(), kms_revision]),
+    );
+    write("kms-leaf-key.pem", kms_key.serialize_pem());
 }

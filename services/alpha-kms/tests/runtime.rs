@@ -24,7 +24,7 @@ use alpha_client::tls::{self, Pin};
 use alpha_client::{Client, Error as ClientError};
 use alpha_core::{AppId, ComposeHash, KeyId, context};
 use alpha_kms::{certs, rfc3339};
-use alpha_runtime::{Config, Error, EvidenceSource, Exit, Runtime};
+use alpha_runtime::{Config, Delivery, Error, EvidenceSource, Exit, Runtime, Secrets};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use common::*;
@@ -83,7 +83,28 @@ fn config(h: &Harness, endpoints: Vec<String>) -> Config {
         kms_ca_spki_sha256: ca_spki_sha256(&h.ca_pem),
         kms_revisions: vec![h.node.compose_hash],
         kms_endpoints: endpoints,
+        secrets: Secrets::new(),
     }
+}
+
+fn config_with_secrets(h: &Harness, endpoints: Vec<String>, secrets: &str) -> Config {
+    Config {
+        secrets: alpha_runtime::parse_secrets(Some(secrets)).unwrap(),
+        ..config(h, endpoints)
+    }
+}
+
+/// A fresh secrets root holding one directory per listed service, as the mounted volumes.
+fn secrets_root(services: &[&str]) -> PathBuf {
+    let root = std::env::temp_dir().join(format!("alpha-secrets-{}", uuid::Uuid::now_v7()));
+    for service in services {
+        std::fs::create_dir_all(root.join(service)).unwrap();
+    }
+    root
+}
+
+fn mode(path: &std::path::Path) -> u32 {
+    std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(path).unwrap().permissions()) & 0o777
 }
 
 /// A runtime holding the capture's key and compose, its clock settable by the test.
@@ -128,6 +149,8 @@ async fn app_with_secret(
 /// The runtime served on a unix socket, as the tenant's containers see it.
 struct Socket {
     path: PathBuf,
+    /// The secrets root `run` writes into, with a `web` directory.
+    secrets: PathBuf,
     task: tokio::task::JoinHandle<Exit>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
 }
@@ -140,13 +163,15 @@ impl Socket {
             "alpha-{}.sock",
             &uuid::Uuid::now_v7().simple().to_string()[24..]
         ));
+        let secrets = secrets_root(&["web"]);
         let listener = UnixListener::bind(&path).unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let task = tokio::spawn(runtime.run(listener, async move {
+        let task = tokio::spawn(runtime.run(listener, secrets.clone(), async move {
             let _ = rx.await;
         }));
         Self {
             path,
+            secrets,
             task,
             shutdown: Some(tx),
         }
@@ -179,7 +204,19 @@ impl Socket {
 impl Drop for Socket {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_dir_all(&self.secrets);
     }
+}
+
+/// Polls every 200 ms for up to 15 s until `path` holds `value`.
+async fn wait_for_file(path: &std::path::Path, value: &[u8]) {
+    for _ in 0..75 {
+        if std::fs::read(path).is_ok_and(|v| v == value) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("{} did not get its value within 15 s", path.display());
 }
 
 #[tokio::test]
@@ -848,4 +885,154 @@ async fn a_revoked_revision_is_refused_its_key_and_ends_the_runtime_with_78() {
     assert!(runtime.is_revoked());
     let exit = (&mut socket.task).await.unwrap();
     assert_eq!(exit.code(), 78);
+}
+
+#[tokio::test]
+async fn secret_files_are_written_after_attestation_for_declaring_services_only() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    app_with_secret(&h, b"v1").await;
+    let (runtime, _) = start_runtime(
+        &h,
+        config_with_secrets(
+            &h,
+            vec![h.url.clone()],
+            r#"{"web":["model-key"],"worker":["model-key"]}"#,
+        ),
+    );
+    let root = secrets_root(&["web", "worker", "idle"]);
+    runtime.attest().await.unwrap();
+    assert_eq!(runtime.deliver(&root).await, Delivery::Complete);
+    for service in ["web", "worker"] {
+        let file = root.join(service).join("model-key");
+        assert_eq!(std::fs::read(&file).unwrap(), b"v1", "{}", file.display());
+        assert_eq!(mode(&file), 0o444, "{}", file.display());
+        assert!(!root.join(service).join(".model-key.tmp").exists());
+    }
+    assert_eq!(std::fs::read_dir(root.join("idle")).unwrap().count(), 0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn secret_files_wait_for_a_missing_secret_and_follow_a_renewal() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    let (app, _, admin) = app_with_secret(&h, b"v1").await;
+    let (runtime, _) = start_runtime(
+        &h,
+        config_with_secrets(&h, vec![h.url.clone()], r#"{"web":["model-key","later"]}"#),
+    );
+    let root = secrets_root(&["web"]);
+    let web = root.join("web");
+    runtime.attest().await.unwrap();
+    assert_eq!(
+        runtime.deliver(&root).await,
+        Delivery::Incomplete(vec!["later".into()])
+    );
+    assert_eq!(std::fs::read(web.join("model-key")).unwrap(), b"v1");
+    assert!(!web.join("later").exists());
+
+    let (status, reply) = h.put_secret("later", &[app], b"l1", h.now(), &admin).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(runtime.deliver(&root).await, Delivery::Complete);
+    assert_eq!(std::fs::read(web.join("later")).unwrap(), b"l1");
+
+    // A changed value is served from the leaf's cache until the next renewal empties it.
+    let (status, reply) = h
+        .put_secret(
+            "model-key",
+            &[app],
+            b"v2",
+            h.now() + Duration::from_secs(1),
+            &admin,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(runtime.deliver(&root).await, Delivery::Complete);
+    assert_eq!(std::fs::read(web.join("model-key")).unwrap(), b"v1");
+    runtime.attest().await.unwrap();
+    assert_eq!(runtime.deliver(&root).await, Delivery::Complete);
+    assert_eq!(std::fs::read(web.join("model-key")).unwrap(), b"v2");
+    assert_eq!(mode(&web.join("model-key")), 0o444);
+    assert_eq!(
+        std::fs::read_dir(&web).unwrap().count(),
+        2,
+        "no temp file left"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn secret_files_are_written_by_the_running_runtime() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    let (app, _, admin) = app_with_secret(&h, b"v1").await;
+    let (runtime, _) = start_runtime(
+        &h,
+        config_with_secrets(&h, vec![h.url.clone()], r#"{"web":["model-key","later"]}"#),
+    );
+    runtime.attest().await.unwrap();
+    let socket = Socket::start(runtime);
+    let web = socket.secrets.join("web");
+    wait_for_file(&web.join("model-key"), b"v1").await;
+
+    let (status, reply) = h.put_secret("later", &[app], b"l1", h.now(), &admin).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    wait_for_file(&web.join("later"), b"l1").await;
+
+    let (status, health) = socket.get("/healthz").await;
+    assert_eq!((status, &health["attested"]), (200, &json!(true)));
+    let (status, secret) = socket.get("/v1/secrets/later").await;
+    assert_eq!(status, 200, "{secret}");
+    assert_eq!(secret["value"], json!(b64(b"l1")));
+    assert_eq!(socket.stop().await, Exit::Drained);
+}
+
+#[tokio::test]
+async fn a_revoked_revision_gets_no_new_secret_files() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    let (app, hash, admin) = app_with_secret(&h, b"v1").await;
+    let secrets = r#"{"web":["model-key","later"]}"#;
+    let (runtime, _) = start_runtime(&h, config_with_secrets(&h, vec![h.url.clone()], secrets));
+    let root = secrets_root(&["web"]);
+    let web = root.join("web");
+    runtime.attest().await.unwrap();
+    assert_eq!(
+        runtime.deliver(&root).await,
+        Delivery::Incomplete(vec!["later".into()])
+    );
+
+    let payload = json!({ "compose_hash": hash, "issued_at": rfc3339(h.now()) });
+    let (status, reply) = h
+        .post(
+            &format!("/v1/revisions/{hash}/revoke"),
+            h.signed(context::CONTROL, payload, &admin),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let (status, reply) = h.put_secret("later", &[app], b"l1", h.now(), &admin).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+
+    assert_eq!(runtime.deliver(&root).await, Delivery::Revoked);
+    assert!(runtime.is_revoked());
+    assert!(!web.join("later").exists());
+    assert_eq!(std::fs::read(web.join("model-key")).unwrap(), b"v1");
+    assert_eq!(runtime.deliver(&root).await, Delivery::Revoked);
+
+    // Revoked at birth: nothing is ever written.
+    let (runtime, _) = start_runtime(&h, config_with_secrets(&h, vec![h.url.clone()], secrets));
+    let Err(err) = runtime.attest().await else {
+        panic!("a revoked revision attested");
+    };
+    assert_eq!(err.exit_code(), 78);
+    let fresh = secrets_root(&["web"]);
+    assert_eq!(runtime.deliver(&fresh).await, Delivery::Revoked);
+    assert_eq!(std::fs::read_dir(fresh.join("web")).unwrap().count(), 0);
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&fresh);
 }

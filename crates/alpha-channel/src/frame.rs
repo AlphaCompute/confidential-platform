@@ -2,7 +2,8 @@
 //! channel, its sequence number, the method and the path, so a relay can neither replay it nor
 //! move it to another route. A response is a run of lines under `s2c`, each bound to the request's
 //! sequence number and its own index and flagged more or end, so a relay can neither reorder
-//! nor cut it short unnoticed.
+//! nor cut it short unnoticed. A detached open keeps no record of the sequence numbers it opened,
+//! so its caller must make a replay harmless.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -74,8 +75,39 @@ fn jcs(value: serde_json::Value) -> Result<Vec<u8>, Error> {
     alpha_core::jcs(&value).map_err(|e| Error::Malformed(format!("aad: {e}")))
 }
 
+fn request_aad(id: &str, seq: u64, method: &str, path: &str) -> Result<Vec<u8>, Error> {
+    jcs(json!({ "channel": id, "seq": seq, "method": method, "path": path }))
+}
+
 fn response_aad(id: &str, seq: u64, index: u32) -> Result<Vec<u8>, Error> {
     jcs(json!({ "channel": id, "seq": seq, "frame": index }))
+}
+
+/// Opens one request under `c2s` without a `Channel`: the checks of `open_request` but no replay
+/// table.
+pub(crate) fn open_detached(
+    id: &str,
+    c2s: &[u8; 32],
+    frame: &RequestFrame,
+    method: &str,
+    path: &str,
+) -> Result<Zeroizing<Vec<u8>>, Error> {
+    if frame.channel != id {
+        return Err(Error::Open);
+    }
+    if frame.seq >= MAX_REQUESTS {
+        return Err(Error::Exhausted);
+    }
+    let ct = BASE64_URL_SAFE_NO_PAD
+        .decode(&frame.ct)
+        .map_err(|_| Error::Open)?;
+    let plaintext = open(
+        c2s,
+        nonce(frame.seq, 0),
+        &request_aad(id, frame.seq, method, path)?,
+        &ct,
+    )?;
+    Ok(Zeroizing::new(plaintext))
 }
 
 impl Channel {
@@ -94,10 +126,6 @@ impl Channel {
         &self.id
     }
 
-    fn request_aad(&self, seq: u64, method: &str, path: &str) -> Result<Vec<u8>, Error> {
-        jcs(json!({ "channel": self.id, "seq": seq, "method": method, "path": path }))
-    }
-
     pub fn seal_request(
         &mut self,
         method: &str,
@@ -111,7 +139,7 @@ impl Channel {
         let ct = seal(
             &self.c2s,
             nonce(seq, 0),
-            &self.request_aad(seq, method, path)?,
+            &request_aad(&self.id, seq, method, path)?,
             plaintext,
         )?;
         self.next_seq = seq.checked_add(1).ok_or(Error::Exhausted)?;
@@ -130,26 +158,12 @@ impl Channel {
         method: &str,
         path: &str,
     ) -> Result<Zeroizing<Vec<u8>>, Error> {
-        if frame.channel != self.id {
-            return Err(Error::Open);
-        }
-        if frame.seq >= MAX_REQUESTS {
-            return Err(Error::Exhausted);
-        }
         if self.responses.contains_key(&frame.seq) {
             return Err(Error::Replayed(frame.seq));
         }
-        let ct = BASE64_URL_SAFE_NO_PAD
-            .decode(&frame.ct)
-            .map_err(|_| Error::Open)?;
-        let plaintext = open(
-            &self.c2s,
-            nonce(frame.seq, 0),
-            &self.request_aad(frame.seq, method, path)?,
-            &ct,
-        )?;
+        let plaintext = open_detached(&self.id, &self.c2s, frame, method, path)?;
         self.responses.insert(frame.seq, Some(0));
-        Ok(Zeroizing::new(plaintext))
+        Ok(plaintext)
     }
 
     /// The next line of the response to request `seq`, without its trailing newline. Only a

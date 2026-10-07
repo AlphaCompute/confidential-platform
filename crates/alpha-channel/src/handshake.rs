@@ -3,6 +3,10 @@
 //! certificate chain and the exact compose it runs. The initiator derives keys only after the CA,
 //! the leaf, its SANs, the Revision allowlist, the compose and the signature all check out; both
 //! direction keys come from the HPKE exporter.
+//!
+//! A KMS node answers the same handshake with its own leaf, no compose and a ticket. The initiator
+//! then checks the node SAN pair and the platform document's `kms_revisions` instead of an App's
+//! identity.
 
 use std::fmt;
 use std::time::SystemTime;
@@ -24,7 +28,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::cert::{parse_instance_sans, pem_to_der, spki_of, uri_sans, verify_leaf};
+use crate::cert::{
+    parse_instance_sans, parse_kms_sans, pem_to_der, spki_of, uri_sans, verify_leaf,
+};
 use crate::frame::Channel;
 use crate::{
     ECDSA_P256, Error, NamedSignature, from_unix_seconds, p256_signature, random, rfc3339,
@@ -58,6 +64,10 @@ pub struct ServerHello {
     /// `app-compose.json`, the exact bytes whose SHA-256 is the Revision.
     pub compose: String,
     pub signature: NamedSignature,
+    /// A KMS node's sealed record of this channel's request key, carried back with the put to
+    /// whichever node takes it; Instances send none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<String>,
 }
 
 /// Who the initiator means to reach: one App of one organization, at one of these Revisions.
@@ -113,7 +123,10 @@ fn digest(document: &Value) -> Result<[u8; 32], Error> {
         .map_err(|e| Error::Malformed(format!("handshake document: {e}")))
 }
 
-fn channel<E>(id: &[u8; 16], export: E) -> Result<Channel, Error>
+type Key = Zeroizing<[u8; 32]>;
+
+/// `(c2s, s2c)`.
+fn direction_keys<E>(export: E) -> Result<(Key, Key), Error>
 where
     E: Fn(&[u8], &mut [u8]) -> Result<(), hpke::HpkeError>,
 {
@@ -121,7 +134,18 @@ where
     let mut s2c = Zeroizing::new([0u8; 32]);
     export(C2S, c2s.as_mut()).map_err(|_| Error::Seal)?;
     export(S2C, s2c.as_mut()).map_err(|_| Error::Seal)?;
-    Ok(Channel::new(id, c2s, s2c))
+    Ok((c2s, s2c))
+}
+
+/// What the initiator's common checks established, beside what the caller's SAN check returned.
+struct Finished<T> {
+    channel: Channel,
+    sans: T,
+    leaf_spki: Vec<u8>,
+    not_before: SystemTime,
+    not_after: SystemTime,
+    kms_ca: Vec<u8>,
+    responder_now: SystemTime,
 }
 
 fn decode<const N: usize>(field: &str, text: &str) -> Result<[u8; N], Error> {
@@ -165,6 +189,69 @@ impl Initiator {
         expected: &Expected,
         now: SystemTime,
     ) -> Result<(Channel, Verified), Error> {
+        let done = self.finish_with(hello, kms_ca_pem, now, |leaf| {
+            let sans = parse_instance_sans(&uri_sans(leaf)?)?;
+            if sans.org_id != expected.org_id || sans.app_id != expected.app_id {
+                return Err(Error::ForeignCertificate(
+                    "the certificate names another organization or app".into(),
+                ));
+            }
+            if !expected.revisions.contains(&sans.compose_hash) {
+                return Err(Error::UnknownRevision(sans.compose_hash));
+            }
+            if alpha_core::compose_hash(&hello.compose) != sans.compose_hash {
+                return Err(Error::ComposeMismatch);
+            }
+            Ok((sans.compose_hash, sans))
+        })?;
+        Ok((
+            done.channel,
+            Verified {
+                org_id: done.sans.org_id,
+                app_id: done.sans.app_id,
+                compose_hash: done.sans.compose_hash,
+                aud: Sha256::digest(&done.leaf_spki).into(),
+                not_before: done.not_before,
+                not_after: done.not_after,
+                kms_ca_sha256: Sha256::digest(&done.kms_ca).into(),
+                compose: hello.compose.clone(),
+                now: done.responder_now,
+            },
+        ))
+    }
+
+    /// The handshake with a KMS node: its leaf carries the node SAN pair and a Revision from the
+    /// platform document's `kms_revisions`; returns the channel and the node's ticket.
+    pub fn finish_kms(
+        self,
+        hello: &ServerHello,
+        kms_ca_pem: &str,
+        kms_revisions: &[ComposeHash],
+        now: SystemTime,
+    ) -> Result<(Channel, String), Error> {
+        let ticket = hello
+            .ticket
+            .clone()
+            .ok_or_else(|| Error::Malformed("the KMS answered without a ticket".into()))?;
+        let done = self.finish_with(hello, kms_ca_pem, now, |leaf| {
+            let revision = parse_kms_sans(&uri_sans(leaf)?)?;
+            if !kms_revisions.contains(&revision) {
+                return Err(Error::UnknownRevision(revision));
+            }
+            Ok((revision, ()))
+        })?;
+        Ok((done.channel, ticket))
+    }
+
+    /// Everything but the SAN check, which `check_sans` does on the leaf DER once the leaf is
+    /// known to be the CA's and valid; the Revision it returns is the one the signature covers.
+    fn finish_with<T>(
+        self,
+        hello: &ServerHello,
+        kms_ca_pem: &str,
+        now: SystemTime,
+        check_sans: impl FnOnce(&[u8]) -> Result<(ComposeHash, T), Error>,
+    ) -> Result<Finished<T>, Error> {
         if hello.v != VERSION {
             return Err(Error::Malformed(format!("version {}", hello.v)));
         }
@@ -190,16 +277,7 @@ impl Initiator {
         let leaf = pem_to_der(leaf_pem).map_err(|_| foreign("the leaf is not a certificate"))?;
         let (not_before, not_after) = verify_leaf(&leaf, &kms_ca, now)?;
 
-        let sans = parse_instance_sans(&uri_sans(&leaf)?)?;
-        if sans.org_id != expected.org_id || sans.app_id != expected.app_id {
-            return Err(foreign("the certificate names another organization or app"));
-        }
-        if !expected.revisions.contains(&sans.compose_hash) {
-            return Err(Error::UnknownRevision(sans.compose_hash));
-        }
-        if alpha_core::compose_hash(&hello.compose) != sans.compose_hash {
-            return Err(Error::ComposeMismatch);
-        }
+        let (compose_hash, sans) = check_sans(&leaf)?;
 
         let refuse = |m: &str| Error::HandshakeSignature(format!("handshake: {m}"));
         if hello.signature.algorithm != ECDSA_P256 {
@@ -215,7 +293,7 @@ impl Initiator {
             &BASE64_URL_SAFE_NO_PAD.encode(self.nonce),
             self.key.public().as_bytes(),
             &enc,
-            &sans.compose_hash,
+            &compose_hash,
             &hello.now,
         );
         key.verify(&digest(&document)?, &signature)
@@ -232,26 +310,21 @@ impl Initiator {
             &info(&self.nonce),
         )
         .map_err(|_| refuse("enc does not decapsulate"))?;
-        let channel = channel(&channel_id, |label, out| ctx.export(label, out))?;
+        let (c2s, s2c) = direction_keys(|label, out| ctx.export(label, out))?;
 
-        Ok((
-            channel,
-            Verified {
-                org_id: sans.org_id,
-                app_id: sans.app_id,
-                compose_hash: sans.compose_hash,
-                aud: Sha256::digest(&leaf_spki).into(),
-                not_before,
-                not_after,
-                kms_ca_sha256: Sha256::digest(&kms_ca).into(),
-                compose: hello.compose.clone(),
-                now: responder_now,
-            },
-        ))
+        Ok(Finished {
+            channel: Channel::new(&channel_id, c2s, s2c),
+            sans,
+            leaf_spki,
+            not_before,
+            not_after,
+            kms_ca,
+            responder_now,
+        })
     }
 }
 
-/// The Instance's end: its chain, its leaf key and the compose the leaf's Revision is the hash of.
+/// The responder's end: its chain, its leaf key and the compose the leaf's Revision is the hash of.
 pub struct Responder {
     certificate_chain: Vec<String>,
     key: SigningKey,
@@ -274,21 +347,7 @@ impl Responder {
         tls_private_key_pkcs8: &[u8],
         compose: String,
     ) -> Result<Self, Error> {
-        let [leaf_pem, _ca] = certificate_chain_pem.as_slice() else {
-            return Err(Error::Malformed(
-                "the chain is not exactly a leaf and a CA".into(),
-            ));
-        };
-        let leaf = pem_to_der(leaf_pem)?;
-        let key = SigningKey::from_pkcs8_der(tls_private_key_pkcs8)
-            .map_err(|_| Error::Malformed("the private key is not P-256 PKCS#8".into()))?;
-        let public = key
-            .verifying_key()
-            .to_public_key_der()
-            .map_err(|_| Error::Malformed("the public key does not encode".into()))?;
-        if spki_of(&leaf)? != public.as_bytes() {
-            return Err(Error::Malformed("the private key is not the leaf's".into()));
-        }
+        let (leaf, key) = leaf_and_key(&certificate_chain_pem, tls_private_key_pkcs8)?;
         let compose_hash = parse_instance_sans(&uri_sans(&leaf)?)?.compose_hash;
         if alpha_core::compose_hash(&compose) != compose_hash {
             return Err(Error::ComposeMismatch);
@@ -301,11 +360,48 @@ impl Responder {
         })
     }
 
+    /// A KMS node's end, which runs no tenant compose; its document is signed over the node's
+    /// Revision.
+    pub fn kms(
+        certificate_chain_pem: Vec<String>,
+        tls_private_key_pkcs8: &[u8],
+    ) -> Result<Self, Error> {
+        let (leaf, key) = leaf_and_key(&certificate_chain_pem, tls_private_key_pkcs8)?;
+        let compose_hash = parse_kms_sans(&uri_sans(&leaf)?)?;
+        Ok(Self {
+            certificate_chain: certificate_chain_pem,
+            key,
+            compose: String::new(),
+            compose_hash,
+        })
+    }
+
     pub fn respond(
         &self,
         hello: &ClientHello,
         now: SystemTime,
     ) -> Result<(ServerHello, Channel), Error> {
+        let (reply, channel_id, c2s, s2c) = self.reply(hello, now)?;
+        Ok((reply, Channel::new(&channel_id, c2s, s2c)))
+    }
+
+    /// For a responder that keeps no channel and opens one request through `secret::open`: the
+    /// reply, the channel id and the client-to-server key. The server-to-client key is dropped,
+    /// so nothing is ever sealed under it.
+    pub fn respond_detached(
+        &self,
+        hello: &ClientHello,
+        now: SystemTime,
+    ) -> Result<(ServerHello, [u8; 16], Key), Error> {
+        let (reply, channel_id, c2s, _) = self.reply(hello, now)?;
+        Ok((reply, channel_id, c2s))
+    }
+
+    fn reply(
+        &self,
+        hello: &ClientHello,
+        now: SystemTime,
+    ) -> Result<(ServerHello, [u8; 16], Key, Key), Error> {
         if hello.v != VERSION {
             return Err(Error::Malformed(format!("version {}", hello.v)));
         }
@@ -324,7 +420,7 @@ impl Responder {
 
         let (enc, ctx) =
             hpke::setup_sender::<AesGcm256, HkdfSha256, XWing>(&OpModeS::Base, &pk, &info(&nonce))
-                .map_err(|_| Error::Seal)?;
+                .map_err(|_| Error::Malformed("pk does not encapsulate".into()))?;
         let enc = enc.to_bytes();
         let document = signed_document(
             &channel_b64,
@@ -338,7 +434,7 @@ impl Responder {
             .key
             .try_sign(&digest(&document)?)
             .map_err(|_| Error::Seal)?;
-        let keys = channel(&channel_id, |label, out| ctx.export(label, out))?;
+        let (c2s, s2c) = direction_keys(|label, out| ctx.export(label, out))?;
 
         Ok((
             ServerHello {
@@ -352,8 +448,35 @@ impl Responder {
                     algorithm: ECDSA_P256.into(),
                     signature: BASE64_URL_SAFE_NO_PAD.encode(signature.to_bytes()),
                 },
+                ticket: None,
             },
-            keys,
+            channel_id,
+            c2s,
+            s2c,
         ))
     }
+}
+
+/// The leaf DER and its private key, refusing a chain that is not a leaf and a CA and a key that
+/// is not the leaf's.
+fn leaf_and_key(
+    certificate_chain_pem: &[String],
+    tls_private_key_pkcs8: &[u8],
+) -> Result<(Vec<u8>, SigningKey), Error> {
+    let [leaf_pem, _ca] = certificate_chain_pem else {
+        return Err(Error::Malformed(
+            "the chain is not exactly a leaf and a CA".into(),
+        ));
+    };
+    let leaf = pem_to_der(leaf_pem)?;
+    let key = SigningKey::from_pkcs8_der(tls_private_key_pkcs8)
+        .map_err(|_| Error::Malformed("the private key is not P-256 PKCS#8".into()))?;
+    let public = key
+        .verifying_key()
+        .to_public_key_der()
+        .map_err(|_| Error::Malformed("the public key does not encode".into()))?;
+    if spki_of(&leaf)? != public.as_bytes() {
+        return Err(Error::Malformed("the private key is not the leaf's".into()));
+    }
+    Ok((leaf, key))
 }
