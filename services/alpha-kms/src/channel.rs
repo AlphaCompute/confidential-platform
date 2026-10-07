@@ -89,3 +89,78 @@ pub async fn handshake(
     )?);
     Ok(Json(reply))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ROOT: [u8; 32] = [1u8; 32];
+    const CHANNEL: [u8; 16] = [3u8; 16];
+    const C2S: [u8; 32] = [4u8; 32];
+
+    fn at(seconds: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(seconds)
+    }
+
+    const T0: u64 = 1_800_000_000;
+
+    fn refused(ticket: &str, now: SystemTime) -> ApiError {
+        let e = open_ticket(&ROOT, ticket, now).unwrap_err();
+        assert_eq!(e.code, "malformed", "{}", e.message);
+        e
+    }
+
+    #[test]
+    fn ticket_opens_only_under_its_root_until_it_expires() {
+        let expires_at = at(T0 + 600);
+        let ticket = seal_ticket(&ROOT, &CHANNEL, &C2S, expires_at).unwrap();
+        let (channel, c2s) = open_ticket(&ROOT, &ticket, at(T0)).unwrap();
+        assert_eq!((channel, *c2s), (CHANNEL, C2S));
+        assert!(open_ticket(&ROOT, &ticket, at(T0 + 599)).is_ok());
+        assert!(refused(&ticket, at(T0 + 600)).message.contains("expired"));
+        assert!(refused(&ticket, at(T0 + 601)).message.contains("expired"));
+
+        let e = open_ticket(&[2u8; 32], &ticket, at(T0)).unwrap_err();
+        assert_eq!(e.code, "malformed");
+        assert!(e.message.contains("does not open"), "{}", e.message);
+
+        assert_ne!(
+            ticket,
+            seal_ticket(&ROOT, &CHANNEL, &C2S, expires_at).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_truncated_or_altered_ticket_is_malformed() {
+        let ticket = seal_ticket(&ROOT, &CHANNEL, &C2S, at(T0 + 600)).unwrap();
+        let bytes = BASE64_URL_SAFE_NO_PAD.decode(&ticket).unwrap();
+        assert_eq!(bytes.len(), 100);
+        let mut cases: Vec<String> = [0, 5, 16, 72]
+            .iter()
+            .map(|n| BASE64_URL_SAFE_NO_PAD.encode(&bytes[..*n]))
+            .collect();
+        cases.push("not base64!".into());
+        for at in [0, 20, 99] {
+            let mut altered = bytes.clone();
+            altered[at] ^= 1;
+            cases.push(BASE64_URL_SAFE_NO_PAD.encode(altered));
+        }
+        // A plaintext one byte short or long, sealed under the right key, still does not parse.
+        let salt = [5u8; 16];
+        for len in [55, 57] {
+            let sealed = aead_seal(
+                &ticket_key(&ROOT, &salt).unwrap(),
+                TICKET_LABEL,
+                &vec![0; len],
+            )
+            .unwrap();
+            cases.push(BASE64_URL_SAFE_NO_PAD.encode([salt.as_slice(), &sealed].concat()));
+        }
+        for case in cases {
+            assert!(
+                refused(&case, at(T0)).message.contains("does not open"),
+                "{case}"
+            );
+        }
+    }
+}
