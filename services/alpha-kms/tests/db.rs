@@ -1576,3 +1576,36 @@ async fn nonce_route_malformed_body_and_unknown_route() {
         StatusCode::NOT_FOUND
     );
 }
+
+#[tokio::test]
+async fn a_sealed_put_through_the_channel_is_stored_and_read_by_a_granted_instance() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let admin = h.register_key(&h.root, 81).await;
+    let app = AppId::mint();
+    h.insert_capture_revision(app, &admin).await;
+    let body = h
+        .sealed_body("sealed-key", &[app], b"sealed value", h.now(), &admin)
+        .await;
+    let sent = body.to_string();
+    assert!(!sent.contains("sealed value"), "{sent}");
+    assert!(!sent.contains(&b64(b"sealed value")), "{sent}");
+
+    let (status, reply) = h
+        .call(reqwest::Method::PUT, "/v1/secrets/sealed-key", body.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    verified(
+        &h,
+        &reply,
+        "secret.put",
+        &body,
+        json!({ "name": "sealed-key", "org_id": h.org }),
+    );
+
+    let instance = h.instance_client().await;
+    let (status, secret) = send(instance.get(format!("{}/v1/secrets/sealed-key", h.url))).await;
+    assert_eq!(status, StatusCode::OK, "{secret}");
+    assert_eq!(secret["value"], json!(b64(b"sealed value")));
+}

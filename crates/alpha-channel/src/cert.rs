@@ -1,5 +1,5 @@
-//! Instance certificates: their two URI SANs, their SPKI, and the check that a leaf was signed by
-//! the pinned KMS CA and is valid at a given time. The chain is exactly leaf then CA, so there is
+//! Instance and KMS node certificates: their two URI SANs, their SPKI, and the check that a leaf
+//! was signed by the pinned KMS CA and is valid at a given time. The chain is exactly leaf then CA, so there is
 //! no path to build.
 
 use std::time::SystemTime;
@@ -80,6 +80,22 @@ pub fn parse_instance_sans(sans: &[String]) -> Result<InstanceSans, Error> {
             .ok_or_else(invalid)?,
         compose_hash,
     })
+}
+
+/// A KMS node's leaf: `alphacompute://kms` then `urn:alphacompute:revision:sha256:<hex>`; returns
+/// the Revision, which the caller checks against its allowlist.
+pub fn parse_kms_sans(sans: &[String]) -> Result<ComposeHash, Error> {
+    let not_node = || Error::ForeignCertificate("the leaf is not a KMS node's".into());
+    let [kms, revision] = sans else {
+        return Err(not_node());
+    };
+    if kms != KMS_SAN {
+        return Err(not_node());
+    }
+    revision
+        .strip_prefix("urn:alphacompute:revision:")
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(not_node)
 }
 
 /// One PEM `CERTIFICATE` block and nothing else.

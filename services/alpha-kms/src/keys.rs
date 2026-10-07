@@ -1,5 +1,5 @@
-//! `org_key`, `anchor_check` and `app_key`, the two AES-256-GCM shapes, Ed25519 signature
-//! objects, and the chain walk from a key to its organization's anchor.
+//! `org_key`, `anchor_check` and `app_key`, the channel ticket key, the two AES-256-GCM shapes,
+//! Ed25519 signature objects, and the chain walk from a key to its organization's anchor.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -63,6 +63,15 @@ pub fn app_key(org_key: &[u8; 32], app: AppId, purpose: &str) -> Result<Key32, A
     let mut out = Zeroizing::new([0u8; 32]);
     Hkdf::<Sha256>::new(Some(b"alphacompute-kms/app-key/v1"), org_key)
         .expand(&info, out.as_mut())
+        .map_err(|e| ApiError::internal(format!("hkdf: {e}")))?;
+    Ok(out)
+}
+
+/// The key that seals one channel ticket, from the ticket's own random salt.
+pub fn ticket_key(tenant_kek_root: &[u8; 32], salt: &[u8; 16]) -> Result<Key32, ApiError> {
+    let mut out = Zeroizing::new([0u8; 32]);
+    Hkdf::<Sha256>::new(Some(b"alphacompute-kms/channel-ticket/v1"), tenant_kek_root)
+        .expand(salt, out.as_mut())
         .map_err(|e| ApiError::internal(format!("hkdf: {e}")))?;
     Ok(out)
 }

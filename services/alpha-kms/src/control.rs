@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::PgTransaction;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::audit::Audit;
 use crate::body::Body;
@@ -31,13 +32,17 @@ pub struct Signed {
     pub signature: SignatureObject,
 }
 
-/// Route 3 alone carries the value beside the signed document.
+/// Route 3 alone carries the value beside the signed document, in the clear or sealed to a node's
+/// channel, and exactly one of the two.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PutBody {
     pub payload: Value,
     pub signature: SignatureObject,
-    pub value: String,
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub sealed: Option<alpha_channel::secret::Sealed>,
 }
 
 const ISSUED_AT_WINDOW: Duration = Duration::minutes(5);
@@ -311,6 +316,7 @@ pub async fn put_secret(
             payload: document,
             signature,
             value,
+            sealed,
         },
         request,
     ): Body<PutBody>,
@@ -328,9 +334,24 @@ pub async fn put_secret(
         if p.app_ids.is_empty() {
             return Err(ApiError::malformed("app_ids is empty"));
         }
-        let value = BASE64_URL_SAFE_NO_PAD
-            .decode(&value)
-            .map_err(|_| ApiError::malformed("value: expected base64url"))?;
+        // On the parsed body, because `"value": null` deserializes to `None` beside `sealed`.
+        if request.get("value").is_some() == request.get("sealed").is_some() {
+            return Err(ApiError::malformed("exactly one of value and sealed"));
+        }
+        let value = match (&value, &sealed) {
+            (Some(value), None) => Zeroizing::new(
+                BASE64_URL_SAFE_NO_PAD
+                    .decode(value)
+                    .map_err(|_| ApiError::malformed("value: expected base64url"))?,
+            ),
+            (None, Some(sealed)) => {
+                let (channel, c2s) =
+                    crate::channel::open_ticket(&keys.tenant_kek_root, &sealed.ticket, node.now())?;
+                alpha_channel::secret::open(&channel, &c2s, &sealed.frame, &name, &body.payload)
+                    .map_err(|e| ApiError::malformed(format!("sealed: {e}")))?
+            }
+            _ => return Err(ApiError::malformed("exactly one of value and sealed")),
+        };
         let content_sha256: [u8; 32] = p
             .content_sha256
             .strip_prefix("sha256:")
@@ -409,7 +430,7 @@ pub async fn put_secret(
         .await?;
         tx.commit().await?;
         Ok(json!({
-            "id": id, "name": name, "app_ids": app_ids,
+            "id": id, "name": name, "org_id": org_id, "app_ids": app_ids,
             "content_sha256": p.content_sha256, "issued_at": rfc3339(at),
         }))
     })
