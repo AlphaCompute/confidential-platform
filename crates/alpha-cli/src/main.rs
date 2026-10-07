@@ -137,6 +137,11 @@ enum Command {
         key_id: KeyId,
         app: PathBuf,
     },
+    /// Catalog entries signed with the catalog key.
+    Catalog {
+        #[command(subcommand)]
+        command: CatalogCommand,
+    },
     /// An App's running copies through shroud-go.
     Instances {
         #[arg(long)]
@@ -180,6 +185,27 @@ enum Command {
         custodians: Vec<PathBuf>,
         #[arg(long)]
         endpoint: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum CatalogCommand {
+    /// Tenant YAML → template (the compose for the nil App id) → signed entry, written as
+    /// `<template hash hex>.json`.
+    Sign {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        title: String,
+        /// The catalog key: an Ed25519 key file from `alpha keygen --admin`.
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long, default_value = ".")]
+        out_dir: PathBuf,
+        /// The spec `alpha deploy` reads; its `app_id` is ignored.
+        app: PathBuf,
     },
 }
 
@@ -384,6 +410,32 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let wait = wait.map(|secs| (Duration::from_secs(secs), doc.kms_ca_pem.as_str()));
             Ok(alpha_cli::deploy::run(&client, &spec, key_id, &key, shroud.as_ref(), wait).await?)
         }
+        Command::Catalog {
+            command:
+                CatalogCommand::Sign {
+                    id,
+                    version,
+                    title,
+                    key,
+                    out_dir,
+                    app,
+                },
+        } => {
+            let text = fs::read_to_string(&app)
+                .map_err(|e| Exit::Usage(format!("{}: {e}", app.display())))?;
+            let spec = alpha_cli::deploy::parse(&text)
+                .map_err(|e| Exit::Usage(format!("{}: {e}", app.display())))?;
+            let key = read_ed25519(&key)?;
+            let file = alpha_cli::catalog::sign(spec, &id, &version, &title, &key)?;
+            let path = out_dir.join(alpha_cli::catalog::file_name(&file));
+            fs::write(&path, alpha_cli::catalog::file_bytes(&file)?)
+                .map_err(|e| Exit::Refused(format!("{}: {e}", path.display())))?;
+            Ok(json!({
+                "file": path,
+                "template_sha256": file.entry.template_sha256,
+                "catalog_key": alpha_cli::catalog::catalog_key(&key),
+            }))
+        }
         Command::Instances { app, command } => {
             let shroud = Shroud {
                 url: need(config.shroud_url.clone(), "shroud-url")?,
@@ -546,5 +598,32 @@ mod tests {
         assert!(stop(&["--force"]));
         assert!(stop(&["--drain-seconds", "60"]));
         assert!(!stop(&["--force", "--drain-seconds", "60"]));
+    }
+
+    #[test]
+    fn catalog_sign_takes_its_flags() {
+        let sign = |flags: &[&str]| {
+            let args = ["alpha", "catalog", "sign"];
+            Cli::try_parse_from(args.iter().chain(flags).chain(&["app.yaml"])).is_ok()
+        };
+        let all = [
+            "--id",
+            "cpu-app",
+            "--version",
+            "1",
+            "--title",
+            "CPU App",
+            "--key",
+            "k",
+        ];
+        assert!(sign(&all));
+        assert!(sign(&[&all[..], &["--out-dir", "d"]].concat()));
+        assert!(!sign(&all[2..]));
+        assert_eq!(
+            Cli::try_parse_from(["alpha", "--version"])
+                .err()
+                .map(|e| e.kind()),
+            Some(clap::error::ErrorKind::DisplayVersion)
+        );
     }
 }

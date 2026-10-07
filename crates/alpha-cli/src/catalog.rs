@@ -48,6 +48,22 @@ pub fn catalog_key(key: &SigningKey) -> CatalogKey {
     }
 }
 
+/// The bare hex of `template_sha256`: a colon does not belong in a file name.
+pub fn file_name(file: &CatalogFile) -> String {
+    format!(
+        "{}.json",
+        hex::encode(file.entry.template_sha256.as_bytes())
+    )
+}
+
+pub fn file_bytes(file: &CatalogFile) -> Result<Vec<u8>, String> {
+    let mut bytes = serde_json::to_value(file)
+        .and_then(|value| alpha_core::jcs(&value))
+        .map_err(|e| e.to_string())?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -93,6 +109,23 @@ mod tests {
             render(&file.template, &file.entry.template_sha256, app_id).unwrap(),
             expected
         );
+    }
+
+    #[test]
+    fn the_file_is_named_by_its_template_hash() {
+        let spec = parse(&fs::read_to_string(vector().join("app.yaml")).unwrap()).unwrap();
+        let file = sign(spec, "cpu-app", "1", "CPU App", &signing_key()).unwrap();
+        let name = file_name(&file);
+        let hex = name.strip_suffix(".json").unwrap();
+        assert_eq!(hex.len(), 64);
+        assert!(hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+        assert_eq!(
+            file.entry.template_sha256.to_string(),
+            format!("sha256:{hex}")
+        );
+        let bytes = file_bytes(&file).unwrap();
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        assert_eq!(serde_json::from_slice::<CatalogFile>(&bytes).unwrap(), file);
     }
 
     #[test]
