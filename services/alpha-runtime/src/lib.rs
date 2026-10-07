@@ -518,18 +518,18 @@ impl Runtime {
                 incomplete.push(name.clone());
                 continue;
             };
-            let mut written = true;
-            for (service, declared) in &self.config.secrets {
-                if !declared.contains(name) {
-                    continue;
-                }
+            let declaring = self
+                .config
+                .secrets
+                .iter()
+                .filter(|(_, declared)| declared.contains(name));
+            for (service, _) in declaring {
                 if let Err(e) = write_secret(&root.join(service), name, &value) {
                     eprintln!("alpha-runtime: secret {name} for {service}: {e}");
-                    written = false;
+                    if incomplete.last() != Some(name) {
+                        incomplete.push(name.clone());
+                    }
                 }
-            }
-            if !written {
-                incomplete.push(name.clone());
             }
         }
         if incomplete.is_empty() {
