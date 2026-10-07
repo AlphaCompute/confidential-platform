@@ -175,6 +175,7 @@ async fn call_signs_all_five_control_routes() {
         admin_key,
     );
     assert_eq!(reply["org_id"], json!(h.org));
+    assert_eq!(reply["receipt"]["document"]["route"], "key.register");
 
     // Route 1 with the canonical manifest vector.
     let compose =
@@ -193,6 +194,7 @@ async fn call_signs_all_five_control_routes() {
     .await
     .unwrap();
     assert_eq!(reply["compose_hash"], expected["compose_hash"]);
+    assert_eq!(reply["receipt"]["document"]["route"], "revision.register");
     let stored: String = sqlx::query_scalar!(
         "select compose from revisions where app_id = $1",
         Uuid::from(app_id)
@@ -219,6 +221,7 @@ async fn call_signs_all_five_control_routes() {
         json!(format!("sha256:{}", hex::encode(Sha256::digest(b"s3cret"))))
     );
     assert_eq!(reply["name"], "api-key");
+    assert_eq!(reply["receipt"]["document"]["route"], "secret.put");
     let err = run(
         Route::PutSecret,
         &admin,
@@ -244,6 +247,7 @@ async fn call_signs_all_five_control_routes() {
     .unwrap();
     assert_eq!(reply["compose_hash"], expected["compose_hash"]);
     assert!(reply["revoked_at"].is_string());
+    assert_eq!(reply["receipt"]["document"]["route"], "revision.revoke");
 
     // Route 5, then the revoked key signs nothing.
     let reply = run(
@@ -255,6 +259,7 @@ async fn call_signs_all_five_control_routes() {
     .await
     .unwrap();
     assert_eq!(reply["reason"], "compromised");
+    assert_eq!(reply["receipt"]["document"]["route"], "key.revoke");
     let err = run(
         Route::RevokeRevision,
         &admin,

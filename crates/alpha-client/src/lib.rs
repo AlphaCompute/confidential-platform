@@ -17,6 +17,7 @@ pub mod runtime;
 pub mod tls;
 
 use alpha_attest::{AttestationResult, EVIDENCE_FORMAT, EventLogEntry, Evidence};
+use alpha_channel::receipt::Receipt;
 use alpha_core::{
     AppId, ComposeHash, KeyId, OrgId, PrincipalId, SecretId, context, signing_digest,
 };
@@ -202,12 +203,14 @@ pub struct RevisionRegistered {
     pub app_id: AppId,
     pub org_id: OrgId,
     pub created_at: String,
+    pub receipt: Receipt,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RevisionRevoked {
     pub compose_hash: ComposeHash,
     pub revoked_at: String,
+    pub receipt: Receipt,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -217,6 +220,7 @@ pub struct SecretPut {
     pub app_ids: Vec<AppId>,
     pub content_sha256: String,
     pub issued_at: String,
+    pub receipt: Receipt,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -229,6 +233,7 @@ pub struct KeyRegistered {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
     pub created_at: String,
+    pub receipt: Receipt,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -236,6 +241,7 @@ pub struct KeyRevoked {
     pub key_id: KeyId,
     pub revoked_at: String,
     pub reason: String,
+    pub receipt: Receipt,
 }
 
 /// `GET /v1/node/evidence`: the quote is base64url, `runtime_pubkey` the P-256 SPKI DER.
