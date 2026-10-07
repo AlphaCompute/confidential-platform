@@ -13,6 +13,8 @@ pub mod context {
     pub const CONNECTOR_REQUEST: &str = "alphacompute/connector-request/v1";
     pub const CONNECTOR_GRANT: &str = "alphacompute/connector-grant/v1";
     pub const CONNECTOR_WRITE: &str = "alphacompute/connector-write/v1";
+    pub const KMS_RECEIPT: &str = "alphacompute/kms-receipt/v1";
+    pub const CATALOG: &str = "alphacompute/catalog/v1";
 }
 
 pub fn jcs(document: &Value) -> serde_json::Result<Vec<u8>> {
