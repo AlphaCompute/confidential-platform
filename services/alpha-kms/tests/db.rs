@@ -1706,9 +1706,12 @@ async fn a_sealed_put_with_a_tampered_frame_or_ticket_is_malformed_and_stores_no
     let (_, hello) = alpha_channel::handshake::Initiator::new().unwrap();
     let mut extra = json!(hello);
     extra["extra"] = json!(1);
+    let mut out_of_range = json!(hello);
+    out_of_range["pk"] = json!(BASE64_URL_SAFE_NO_PAD.encode([0xff; 1216]));
     for hello in [
         json!({ "v": 1, "kem": "x-wing", "pk": "AA", "nonce": "AA" }),
         extra,
+        out_of_range,
     ] {
         let (status, reply) = h.post("/v1/channel", hello).await;
         assert_eq!(

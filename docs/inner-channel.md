@@ -255,7 +255,7 @@ Every export returns an error rather than trapping, and the error's message star
 | `unknown_revision` | the leaf's Revision is not in the allowlist (for a KMS node, `kms_revisions`) |
 | `compose_mismatch` | the compose does not hash to the leaf's Revision |
 | `handshake_signature` | the handshake signature or the encapsulation does not check out |
-| `malformed` | anything that does not parse, including a time that is not one, a KMS reply without a ticket, and a put whose name is not a Secret name |
+| `malformed` | anything that does not parse, including a time that is not one, a client key that is not a valid X-Wing public key, a KMS reply without a ticket, and a put whose name is not a Secret name |
 | `rng` | the system's randomness failed |
 | `seal` | sealing failed, or a response for a request the channel did not open or already ended |
 | `open` | a frame does not open on this channel, sequence number and route, or arrives out of order |

@@ -420,7 +420,7 @@ impl Responder {
 
         let (enc, ctx) =
             hpke::setup_sender::<AesGcm256, HkdfSha256, XWing>(&OpModeS::Base, &pk, &info(&nonce))
-                .map_err(|_| Error::Seal)?;
+                .map_err(|_| Error::Malformed("pk does not encapsulate".into()))?;
         let enc = enc.to_bytes();
         let document = signed_document(
             &channel_b64,

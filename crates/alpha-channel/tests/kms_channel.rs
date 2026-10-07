@@ -282,6 +282,15 @@ fn a_payload_name_that_is_not_a_secret_name_is_refused() {
     }
 }
 
+/// A pk of the right length whose ML-KEM coefficients are all 4095, past the modulus 3329.
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+fn a_pk_that_cannot_be_encapsulated_to_is_malformed() {
+    let (_, mut hello) = Initiator::new().unwrap();
+    hello.pk = BASE64_URL_SAFE_NO_PAD.encode([0xff; 1216]);
+    let err = node().respond_detached(&hello, at(NOW)).unwrap_err();
+    assert_eq!(err.code(), "malformed");
+}
+
 #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn an_instance_reply_carries_no_ticket_key() {
     let (_, client_hello) = Initiator::new().unwrap();
