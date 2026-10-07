@@ -355,8 +355,7 @@ pub async fn wait_for_attestation(
     }
 }
 
-/// Registers the Revision, then deploys through shroud-go unless `shroud` is `None`
-/// (`--register-only`), then waits for every copy to attest when `wait` is set.
+/// The spec's compose through [`deploy_compose`], the function a wrapped compose takes too.
 pub async fn run(
     client: &Client,
     spec: &AppSpec,
@@ -365,10 +364,35 @@ pub async fn run(
     shroud: Option<&Shroud>,
     wait: Option<(Duration, &str)>,
 ) -> Result<Value, String> {
-    let compose = compose(spec)?;
+    deploy_compose(
+        client,
+        spec.app_id,
+        compose(spec)?,
+        &spec.resources,
+        key_id,
+        key,
+        shroud,
+        wait,
+    )
+    .await
+}
+
+/// Registers `compose` as a Revision of `app_id`, then deploys it through shroud-go unless
+/// `shroud` is `None` (`--register-only`), then waits for every copy to attest when `wait` is set.
+#[allow(clippy::too_many_arguments)]
+pub async fn deploy_compose(
+    client: &Client,
+    app_id: AppId,
+    compose: String,
+    resources: &Value,
+    key_id: KeyId,
+    key: &SigningKey,
+    shroud: Option<&Shroud>,
+    wait: Option<(Duration, &str)>,
+) -> Result<Value, String> {
     let signed = sign(
         context::REVISION,
-        json!({ "app_id": spec.app_id, "compose": compose }),
+        json!({ "app_id": app_id, "compose": compose }),
         key_id,
         key,
     )
@@ -383,10 +407,10 @@ pub async fn run(
     let body = shroud_call(
         shroud,
         Method::POST,
-        &format!("/v1/apps/{}/deploy", spec.app_id),
+        &format!("/v1/apps/{app_id}/deploy"),
         Some(json!({
             "compose_hash": revision.compose_hash,
-            "resources": spec.resources,
+            "resources": resources,
             "compose": compose,
         })),
     )

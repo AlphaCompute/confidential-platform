@@ -506,6 +506,35 @@ pub fn runtime(
     })
 }
 
+/// What [`wrap`] printed, read back from a file that may have been edited since: the App id in the
+/// compose's `name` and the compose itself, once they hold together as the KMS will check them.
+pub fn wrapped(output: &serde_json::Value) -> Result<(AppId, String), String> {
+    let field = |key: &str| {
+        output
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .ok_or(format!("{key}: missing or not a string"))
+    };
+    let compose = field("compose")?;
+    let hash = field("compose_hash")?;
+    if hash != compose_hash(compose).to_string() {
+        return Err(format!(
+            "compose_hash: {hash} is not the SHA-256 of compose; wrap the compose again"
+        ));
+    }
+    let parsed: serde_json::Value =
+        serde_json::from_str(compose).map_err(|e| format!("compose: not JSON: {e}"))?;
+    let name = parsed
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let app_id: AppId = name
+        .parse()
+        .map_err(|_| format!("compose: name {name} is not an App id"))?;
+    alpha_core::check_registration(compose, app_id).map_err(|e| format!("compose: {e}"))?;
+    Ok((app_id, compose.to_owned()))
+}
+
 /// A client for [`resolve`]; the production caller adds nothing and calls `build`, trusting the
 /// platform's root certificates.
 pub fn registry_client_builder() -> reqwest::ClientBuilder {
@@ -1177,6 +1206,56 @@ mod tests {
             err.contains("ghcr.io/alphacompute/alpha-runtime:latest"),
             "{err}"
         );
+    }
+
+    fn wrapped_vector() -> (Value, Value) {
+        let out = dir("08-wrap");
+        let expected: Value =
+            serde_json::from_str(&fs::read_to_string(out.join("expected.json")).unwrap()).unwrap();
+        let output = json!({
+            "compose_hash": expected["compose_hash"],
+            "compose": fs::read_to_string(out.join("app-compose.json")).unwrap(),
+            "secrets": expected["secrets"],
+        });
+        (output, expected)
+    }
+
+    #[test]
+    fn a_wrapped_file_gives_its_app_and_compose() {
+        let (output, expected) = wrapped_vector();
+        let (app_id, compose) = wrapped(&output).unwrap();
+        assert_eq!(json!(app_id), expected["app_id"]);
+        assert_eq!(compose, output["compose"].as_str().unwrap());
+    }
+
+    #[test]
+    fn a_wrapped_file_that_does_not_hold_together_is_refused() {
+        let (good, _) = wrapped_vector();
+        let refused = |output: Value, what: &str| {
+            let err = wrapped(&output).unwrap_err();
+            assert!(err.contains(what), "{what}: {err}");
+        };
+        let with =
+            |compose: &str| json!({ "compose_hash": compose_hash(compose), "compose": compose });
+
+        let mut other = good.clone();
+        other["compose_hash"] = json!(compose_hash("{}"));
+        refused(other, "is not the SHA-256 of compose");
+
+        let mut missing = good.clone();
+        missing.as_object_mut().unwrap().remove("compose");
+        refused(missing, "compose: missing");
+
+        refused(with("not json"), "compose: not JSON");
+
+        let compose = good["compose"].as_str().unwrap();
+        let mut renamed: Value = serde_json::from_str(compose).unwrap();
+        renamed["name"] = json!("web");
+        refused(with(&renamed.to_string()), "web is not an App id");
+
+        let pinned = format!("nginx:1.27@sha256:{}", "ab".repeat(32));
+        assert!(compose.contains(&pinned));
+        refused(with(&compose.replace(&pinned, "nginx:1.27")), "nginx:1.27");
     }
 
     #[test]

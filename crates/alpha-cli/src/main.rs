@@ -123,7 +123,7 @@ enum Command {
         check: bool,
         document: PathBuf,
     },
-    /// Tenant YAML → compose → Revision → shroud-go deploy.
+    /// Tenant YAML, or the output of `alpha compose wrap` → Revision → shroud-go deploy.
     Deploy {
         /// Register the Revision and stop before shroud-go.
         #[arg(long)]
@@ -136,7 +136,18 @@ enum Command {
         key: PathBuf,
         #[arg(long)]
         key_id: KeyId,
-        app: PathBuf,
+        /// The JSON `alpha compose wrap` printed; its compose is registered and deployed byte for
+        /// byte.
+        #[arg(long, conflicts_with = "app", requires_all = ["cpu", "memory_mib"])]
+        compose: Option<PathBuf>,
+        /// The CVM's CPU count, for a wrapped compose.
+        #[arg(long, requires = "compose", conflicts_with = "app")]
+        cpu: Option<u64>,
+        /// The CVM's memory, for a wrapped compose.
+        #[arg(long, requires = "compose", conflicts_with = "app")]
+        memory_mib: Option<u64>,
+        #[arg(required_unless_present = "compose")]
+        app: Option<PathBuf>,
     },
     /// A customer's plain docker-compose as a Revision.
     Compose {
@@ -418,12 +429,30 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             wait,
             key,
             key_id,
+            compose,
+            cpu,
+            memory_mib,
             app,
         } => {
-            let text = fs::read_to_string(&app)
-                .map_err(|e| Exit::Usage(format!("{}: {e}", app.display())))?;
-            let spec = alpha_cli::deploy::parse(&text)
-                .map_err(|e| Exit::Usage(format!("{}: {e}", app.display())))?;
+            let (app_id, compose, resources) = match (compose, app) {
+                (Some(path), _) => {
+                    let (app_id, compose) = wrap::wrapped(&read_json(&path)?)?;
+                    let resources = json!({ "cpu": cpu, "memory_mib": memory_mib });
+                    (app_id, compose, resources)
+                }
+                (None, Some(app)) => {
+                    let text = fs::read_to_string(&app)
+                        .map_err(|e| Exit::Usage(format!("{}: {e}", app.display())))?;
+                    let spec = alpha_cli::deploy::parse(&text)
+                        .map_err(|e| Exit::Usage(format!("{}: {e}", app.display())))?;
+                    (
+                        spec.app_id,
+                        alpha_cli::deploy::compose(&spec)?,
+                        spec.resources,
+                    )
+                }
+                (None, None) => return Err(Exit::Usage("give an app spec or --compose".into())),
+            };
             let shroud = if register_only {
                 None
             } else {
@@ -435,7 +464,17 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let key = read_ed25519(&key)?;
             let (client, doc) = admin_client_and_document(config, now).await?;
             let wait = wait.map(|secs| (Duration::from_secs(secs), doc.kms_ca_pem.as_str()));
-            Ok(alpha_cli::deploy::run(&client, &spec, key_id, &key, shroud.as_ref(), wait).await?)
+            Ok(alpha_cli::deploy::deploy_compose(
+                &client,
+                app_id,
+                compose,
+                &resources,
+                key_id,
+                &key,
+                shroud.as_ref(),
+                wait,
+            )
+            .await?)
         }
         Command::Compose {
             command:
@@ -700,5 +739,29 @@ mod tests {
         assert!(!wrap(
             &[&["--app-id", "not-a-uuid"][..], &platform, &runtime].concat()
         ));
+    }
+
+    #[test]
+    fn deploy_takes_a_spec_or_a_wrapped_compose() {
+        let deploy = |flags: &[&str]| {
+            let args = [
+                "alpha",
+                "deploy",
+                "--key",
+                "k",
+                "--key-id",
+                "0199a1b2-0000-7000-8000-000000000001",
+            ];
+            Cli::try_parse_from(args.iter().chain(flags)).is_ok()
+        };
+        let wrapped = ["--compose", "w.json", "--cpu", "1", "--memory-mib", "2048"];
+        assert!(deploy(&["app.yaml"]));
+        assert!(deploy(&wrapped));
+        assert!(deploy(&[&wrapped[..], &["--register-only"]].concat()));
+        assert!(deploy(&[&wrapped[..], &["--wait", "60"]].concat()));
+        assert!(!deploy(&[&wrapped[..], &["app.yaml"]].concat()));
+        assert!(!deploy(&["--compose", "w.json", "--memory-mib", "2048"]));
+        assert!(!deploy(&["--cpu", "1", "--memory-mib", "2048", "app.yaml"]));
+        assert!(!deploy(&[]));
     }
 }
