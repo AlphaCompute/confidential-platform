@@ -363,6 +363,57 @@ async fn a_root_key_claims_its_organization_once() {
 }
 
 #[tokio::test]
+async fn duplicate_keys_in_a_control_body_are_malformed() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let admin = h.register_key(&h.root, 61).await;
+    let compose =
+        fs::read_to_string(testdata().join("manifest/01-canonical/app-compose.json")).unwrap();
+    let expected: Value = serde_json::from_str(
+        &fs::read_to_string(testdata().join("manifest/01-canonical/expected.json")).unwrap(),
+    )
+    .unwrap();
+    let app_id = &expected["app_id"];
+    let body = h.signed(
+        context::REVISION,
+        json!({ "app_id": app_id, "compose": compose }),
+        &admin,
+    );
+    let p = body["payload"].to_string();
+    let s = body["signature"].to_string();
+    let repeats = [
+        format!(r#"{{"payload":{p},"payload":{p},"signature":{s}}}"#),
+        format!("{{\"payload\":{p},\"\x5cu0070ayload\":{p},\"signature\":{s}}}"),
+        format!(
+            r#"{{"payload":{{"app_id":{app_id},{},"signature":{s}}}"#,
+            &p[1..]
+        ),
+    ];
+
+    let audited = h.audit("revision.register").await.len();
+    for raw in repeats {
+        assert!(serde_json::from_str::<Value>(&raw).is_ok(), "{raw}");
+        let reply = send(
+            client()
+                .post(format!("{}/v1/revisions", h.url))
+                .header("content-type", "application/json")
+                .body(raw.clone()),
+        )
+        .await;
+        assert_eq!(
+            (reply.0, code(&reply.1)),
+            (StatusCode::BAD_REQUEST, "malformed"),
+            "{raw}"
+        );
+    }
+    assert_eq!(h.audit("revision.register").await.len(), audited);
+
+    let (status, reply) = h.post("/v1/revisions", body).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+}
+
+#[tokio::test]
 async fn control_routes_register_revoke_and_put() {
     let Some(h) = harness().await else {
         return;
