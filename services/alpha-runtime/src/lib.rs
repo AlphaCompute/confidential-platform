@@ -114,8 +114,12 @@ pub const SECRETS_DIR: &str = "/run/alpha-secrets";
 /// Service name to the Secret names it declared.
 pub type Secrets = BTreeMap<String, BTreeSet<String>>;
 
-/// `ALPHACOMPUTE_SECRETS`: a JSON object of service name to an array of Secret names.
-pub fn parse_secrets(text: &str) -> Result<Secrets, Error> {
+/// `ALPHACOMPUTE_SECRETS`: a JSON object of service name to an array of Secret names; unset
+/// declares none.
+pub fn parse_secrets(text: Option<&str>) -> Result<Secrets, Error> {
+    let Some(text) = text else {
+        return Ok(Secrets::default());
+    };
     let refused = |m: String| Error::Config(format!("ALPHACOMPUTE_SECRETS: {m}"));
     let value = alpha_core::parse(text.as_bytes()).map_err(|e| refused(e.to_string()))?;
     let secrets: Secrets = serde_json::from_value(value).map_err(|e| refused(e.to_string()))?;
@@ -190,7 +194,7 @@ impl Config {
         if kms_endpoints.is_empty() {
             return Err(Error::Config("ALPHACOMPUTE_KMS_ENDPOINTS is empty".into()));
         }
-        let secrets = secrets.map(parse_secrets).transpose()?.unwrap_or_default();
+        let secrets = parse_secrets(secrets)?;
         Ok(Self {
             kms_ca_spki_sha256,
             kms_revisions,
@@ -500,12 +504,11 @@ impl Runtime {
             let secret = match self.secret(name).await {
                 Ok(secret) => secret,
                 Err(e) if e.revoked() => return Delivery::Revoked,
-                Err(Error::Kms(alpha_client::Error::Api(e))) if e.code == "not_found" => {
-                    incomplete.push(name.clone());
-                    continue;
-                }
                 Err(e) => {
-                    eprintln!("alpha-runtime: secret {name}: {e}");
+                    if !matches!(&e, Error::Kms(alpha_client::Error::Api(api)) if api.code == "not_found")
+                    {
+                        eprintln!("alpha-runtime: secret {name}: {e}");
+                    }
                     incomplete.push(name.clone());
                     continue;
                 }
@@ -690,7 +693,7 @@ mod tests {
             r#"{"web":[""]}"#,
             "not json",
         ] {
-            let Err(Error::Config(m)) = parse_secrets(bad) else {
+            let Err(Error::Config(m)) = parse_secrets(Some(bad)) else {
                 panic!("{bad} was accepted");
             };
             assert!(m.starts_with("ALPHACOMPUTE_SECRETS:"), "{bad}: {m}");
@@ -744,7 +747,7 @@ mod tests {
         assert!(healthcheck(&root, &Secrets::new()));
         let web = root.join("web");
         std::fs::create_dir(&web).unwrap();
-        let mut secrets = parse_secrets(r#"{"web":["a","b"]}"#).unwrap();
+        let mut secrets = parse_secrets(Some(r#"{"web":["a","b"]}"#)).unwrap();
         assert!(!healthcheck(&root, &secrets));
         write_secret(&web, "a", b"1").unwrap();
         assert!(!healthcheck(&root, &secrets));

@@ -26,25 +26,18 @@ async fn main() {
 }
 
 fn healthcheck() -> i32 {
-    match std::env::var("ALPHACOMPUTE_SECRETS")
-        .ok()
-        .as_deref()
-        .map(alpha_runtime::parse_secrets)
-        .transpose()
-    {
-        Ok(secrets)
-            if alpha_runtime::healthcheck(
-                Path::new(SECRETS_DIR),
-                &secrets.clone().unwrap_or_default(),
-            ) =>
-        {
-            0
-        }
-        Ok(_) => EXIT_REFUSED,
+    let var = std::env::var("ALPHACOMPUTE_SECRETS").ok();
+    let secrets = match alpha_runtime::parse_secrets(var.as_deref()) {
+        Ok(secrets) => secrets,
         Err(e) => {
             eprintln!("alpha-runtime: {e}");
-            EXIT_REFUSED
+            return EXIT_REFUSED;
         }
+    };
+    if alpha_runtime::healthcheck(Path::new(SECRETS_DIR), &secrets) {
+        0
+    } else {
+        EXIT_REFUSED
     }
 }
 

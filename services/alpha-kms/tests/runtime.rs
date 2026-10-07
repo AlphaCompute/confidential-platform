@@ -89,7 +89,7 @@ fn config(h: &Harness, endpoints: Vec<String>) -> Config {
 
 fn config_with_secrets(h: &Harness, endpoints: Vec<String>, secrets: &str) -> Config {
     Config {
-        secrets: alpha_runtime::parse_secrets(secrets).unwrap(),
+        secrets: alpha_runtime::parse_secrets(Some(secrets)).unwrap(),
         ..config(h, endpoints)
     }
 }
