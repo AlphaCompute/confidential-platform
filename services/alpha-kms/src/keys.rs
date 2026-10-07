@@ -1,5 +1,5 @@
-//! `org_key`, `anchor_check` and `app_key`, the two AES-256-GCM shapes,
-//! Ed25519 signature objects, and the chain walk from a key to its organization's anchor.
+//! `org_key`, `anchor_check` and `app_key`, the two AES-256-GCM shapes, Ed25519 signature
+//! objects, and the chain walk from a key to its organization's anchor.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
