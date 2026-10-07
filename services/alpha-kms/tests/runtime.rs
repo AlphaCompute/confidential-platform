@@ -554,20 +554,17 @@ async fn a_tenant_serves_its_endpoint_with_the_runtime_identity() {
     socket.stop().await;
 }
 
-/// The demonstration App end to end: its Secret reaches it through the runtime socket, a client
-/// pinning the KMS CA reads the Instance's identity and an HMAC under that Secret, and without
-/// the runtime the App stops claiming the Secret.
+/// The demonstration App end to end: its key reaches it through the runtime socket, derived for
+/// its App, a client pinning the KMS CA reads the Instance's identity and an HMAC under that key,
+/// and without the runtime the App stops claiming the key.
 #[tokio::test]
-async fn a_demonstration_app_proves_its_identity_and_uses_its_secret() {
+async fn a_demonstration_app_proves_its_identity_with_its_derived_key() {
     let Some(h) = nonce_clock_harness().await else {
         return;
     };
-    let (app, hash, admin) = app_with_secret(&h, b"v1").await;
-    let key = b"an hmac key of at least thirty-two bytes";
-    let (status, reply) = h
-        .put_secret(alpha_cpu_app::SECRET, &[app], key, h.now(), &admin)
-        .await;
-    assert_eq!(status, StatusCode::OK, "{reply}");
+    let admin = h.register_key(&h.root, 21).await;
+    let app = AppId::mint();
+    let hash = h.insert_capture_revision(app, &admin).await;
     let (runtime, _) = start_runtime(&h, config(&h, vec![h.url.clone()]));
     runtime.attest().await.unwrap();
     let socket = Socket::start(runtime.clone());
@@ -624,12 +621,16 @@ async fn a_demonstration_app_proves_its_identity_and_uses_its_secret() {
         .await
         .unwrap();
     use hmac::{Hmac, KeyInit, Mac};
-    let mut expected = Hmac::<sha2::Sha256>::new_from_slice(key).unwrap();
+    let key = h.app_key(app, alpha_cpu_app::KEY_PURPOSE);
+    let mut expected = Hmac::<sha2::Sha256>::new_from_slice(&key).unwrap();
     expected.update(b"tenant data");
     assert_eq!(
         answer,
         json!({ "hmac_sha256": hex::encode(expected.finalize().into_bytes()) })
     );
+    let derived = h.audit("key.derive").await;
+    assert!(!derived.is_empty());
+    assert!(derived.iter().all(|(_, outcome, _)| outcome == "ok"));
 
     socket.stop().await;
     for request in [
