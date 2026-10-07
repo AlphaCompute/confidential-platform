@@ -135,6 +135,12 @@ mod tests {
         );
     }
 
+    fn catalog_public_key() -> [u8; 32] {
+        SigningKey::from_bytes(&[7u8; 32])
+            .verifying_key()
+            .to_bytes()
+    }
+
     fn document_with_signer_and_catalog_key() -> Value {
         let mut d = document(3, "2026-09-14T00:00:00Z");
         d["kms_revisions"] = json!([{
@@ -148,7 +154,7 @@ mod tests {
         });
         d["catalog_key"] = json!({
             "algorithm": "ed25519",
-            "public_key": BASE64_URL_SAFE_NO_PAD.encode([7u8; 32])
+            "public_key": BASE64_URL_SAFE_NO_PAD.encode(catalog_public_key())
         });
         d
     }
@@ -171,7 +177,7 @@ mod tests {
         assert_eq!(catalog_key.algorithm, "ed25519");
         assert_eq!(
             catalog_key.public_key,
-            BASE64_URL_SAFE_NO_PAD.encode([7u8; 32])
+            BASE64_URL_SAFE_NO_PAD.encode(catalog_public_key())
         );
         assert_eq!(view.kms_revisions.len(), 1);
         assert_eq!(
@@ -234,7 +240,7 @@ mod tests {
             (
                 "catalog_key",
                 "public_key",
-                json!(base64::prelude::BASE64_URL_SAFE.encode([7u8; 32])),
+                json!(base64::prelude::BASE64_URL_SAFE.encode(catalog_public_key())),
             ),
         ] {
             let mut d = document_with_signer_and_catalog_key();

@@ -93,7 +93,9 @@ mod tests {
             },
             "catalog_key": {
                 "algorithm": "ed25519",
-                "public_key": BASE64_URL_SAFE_NO_PAD.encode([7u8; 32])
+                "public_key": BASE64_URL_SAFE_NO_PAD.encode(
+                    SigningKey::from_bytes(&[7u8; 32]).verifying_key().to_bytes()
+                )
             }
         });
         let signed = sign(document.clone(), &key).unwrap();

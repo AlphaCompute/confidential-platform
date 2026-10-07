@@ -97,16 +97,22 @@ impl TryFrom<CatalogKeyFields> for CatalogKey {
         if f.algorithm != "ed25519" {
             return Err(format!("catalog_key.algorithm {:?}", f.algorithm));
         }
-        match BASE64_URL_SAFE_NO_PAD.decode(&f.public_key) {
-            Ok(bytes) if bytes.len() == 32 => Ok(Self {
-                algorithm: f.algorithm,
-                public_key: f.public_key,
-            }),
-            _ => Err(format!(
-                "catalog_key.public_key {:?} is not 32 bytes of base64url",
+        let usable = BASE64_URL_SAFE_NO_PAD
+            .decode(&f.public_key)
+            .ok()
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            .and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok())
+            .is_some_and(|k| !k.is_weak());
+        if !usable {
+            return Err(format!(
+                "catalog_key.public_key {:?} is not an Ed25519 public key in base64url",
                 f.public_key
-            )),
+            ));
         }
+        Ok(Self {
+            algorithm: f.algorithm,
+            public_key: f.public_key,
+        })
     }
 }
 
@@ -151,7 +157,8 @@ fn is_host(host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use base64::prelude::{BASE64_STANDARD, BASE64_URL_SAFE};
+    use base64::prelude::{BASE64_STANDARD_NO_PAD, BASE64_URL_SAFE};
+    use ed25519_dalek::SigningKey;
     use serde_json::{Value, json};
 
     use super::*;
@@ -169,6 +176,12 @@ mod tests {
 
     fn signer(field: &str, value: Value) -> Result<Signer, serde_json::Error> {
         signer_on("sign.example", field, value)
+    }
+
+    fn public_key() -> [u8; 32] {
+        SigningKey::from_bytes(&[7u8; 32])
+            .verifying_key()
+            .to_bytes()
     }
 
     fn catalog_key(algorithm: &str, public_key: &str) -> Result<CatalogKey, serde_json::Error> {
@@ -276,25 +289,33 @@ mod tests {
         assert!(signer("later", json!(1)).is_ok());
         let key = json!({
             "algorithm": "ed25519",
-            "public_key": BASE64_URL_SAFE_NO_PAD.encode([7u8; 32]),
+            "public_key": BASE64_URL_SAFE_NO_PAD.encode(public_key()),
             "later": 1
         });
         assert!(serde_json::from_value::<CatalogKey>(key).is_ok());
     }
 
     #[test]
-    fn catalog_key_is_ed25519_and_32_bytes_of_base64url() {
-        let good = BASE64_URL_SAFE_NO_PAD.encode([7u8; 32]);
+    fn catalog_key_is_an_ed25519_public_key_in_base64url() {
+        let good = BASE64_URL_SAFE_NO_PAD.encode(public_key());
         assert_eq!(catalog_key("ed25519", &good).unwrap().public_key, good);
-        let standard = BASE64_STANDARD.encode([0xfbu8; 32]);
+        let standard = BASE64_STANDARD_NO_PAD.encode(public_key());
         assert!(standard.contains('+') || standard.contains('/'));
         for (algorithm, public_key) in [
             ("ml-dsa", good.clone()),
             ("Ed25519", good.clone()),
-            ("ed25519", BASE64_URL_SAFE_NO_PAD.encode([7u8; 31])),
-            ("ed25519", BASE64_URL_SAFE_NO_PAD.encode([7u8; 33])),
-            ("ed25519", BASE64_URL_SAFE.encode([7u8; 32])),
+            (
+                "ed25519",
+                BASE64_URL_SAFE_NO_PAD.encode(&public_key()[..31]),
+            ),
+            (
+                "ed25519",
+                BASE64_URL_SAFE_NO_PAD.encode([&public_key()[..], &[0]].concat()),
+            ),
+            ("ed25519", BASE64_URL_SAFE.encode(public_key())),
             ("ed25519", standard),
+            ("ed25519", BASE64_URL_SAFE_NO_PAD.encode([0u8; 32])),
+            ("ed25519", BASE64_URL_SAFE_NO_PAD.encode([7u8; 32])),
         ] {
             assert!(
                 catalog_key(algorithm, &public_key).is_err(),
