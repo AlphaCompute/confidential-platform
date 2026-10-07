@@ -87,6 +87,8 @@ pub(crate) fn api_error(endpoint: &str, status: reqwest::StatusCode, bytes: &[u8
 
 /// `{ "key_id", "algorithm": "ed25519", "signature" }`; `key_id` is absent only on an
 /// organization's root key registration, whose signer is not in the roster yet.
+/// `authenticator_data` and `client_data_json` (base64url) carry a WebAuthn assertion and are
+/// absent for `ed25519`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SignatureObject {
@@ -94,6 +96,10 @@ pub struct SignatureObject {
     pub key_id: Option<KeyId>,
     pub algorithm: String,
     pub signature: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticator_data: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_data_json: Option<String>,
 }
 
 /// The body of every Control mutation.
@@ -137,6 +143,8 @@ fn sign_as(
             key_id,
             algorithm: "ed25519".into(),
             signature: BASE64_URL_SAFE_NO_PAD.encode(key.sign(&digest).to_bytes()),
+            authenticator_data: None,
+            client_data_json: None,
         },
     })
 }
@@ -615,6 +623,27 @@ mod tests {
     }
 
     use super::*;
+
+    fn round_trip(text: &str) -> serde_json::Result<String> {
+        serde_json::to_string(&serde_json::from_str::<SignatureObject>(text)?)
+    }
+
+    #[test]
+    fn a_signature_object_without_webauthn_fields_keeps_its_bytes() {
+        for text in [
+            r#"{"key_id":"01920000-0000-7000-8000-000000000001","algorithm":"ed25519","signature":"AAAA"}"#,
+            r#"{"algorithm":"ed25519","signature":"AAAA"}"#,
+        ] {
+            assert_eq!(round_trip(text).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn a_signature_object_admits_the_webauthn_fields_and_nothing_else() {
+        let text = r#"{"key_id":"01920000-0000-7000-8000-000000000001","algorithm":"ed25519","signature":"AAAA","authenticator_data":"AAAA","client_data_json":"e30"}"#;
+        assert_eq!(round_trip(text).unwrap(), text);
+        assert!(round_trip(r#"{"algorithm":"ed25519","signature":"AAAA","extra":1}"#).is_err());
+    }
 
     #[test]
     fn bootstrap_reply_is_typed_only_after_its_signature_verifies() {
