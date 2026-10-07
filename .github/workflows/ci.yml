@@ -18,7 +18,8 @@ jobs:
       # `sha256sum -c`, which fails on an empty manifest and misses a vector nobody listed. To
       # update the manifest, run the pipeline with `> SHA256SUMS` in place of the diff.
       - working-directory: testdata
-        run: find . -type f \( -path './webauthn/*' -o -path './receipt/*' -o -path './catalog/*' -o -path './jcs/*' \) | sed 's|^\./||' | LC_ALL=C sort | xargs -r sha256sum | diff - SHA256SUMS
+        shell: bash
+        run: find . -type f \( -path './webauthn/*' -o -path './receipt/*' -o -path './catalog/*' -o -path './jcs/*' \) -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum | sed 's|  \./|  |' | diff - SHA256SUMS
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
