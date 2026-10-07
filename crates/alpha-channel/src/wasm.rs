@@ -181,19 +181,10 @@ impl KmsSecretSealer {
             .ok_or_else(|| js(Error::Malformed("the sealer already sealed".into())))?;
         let revisions: Vec<ComposeHash> =
             view.kms_revisions.iter().map(|r| r.compose_hash).collect();
-        to_json(
-            &secret::seal(
-                inner,
-                &hello,
-                &view.kms_ca_pem,
-                &revisions,
-                &payload,
-                org_id,
-                value,
-                now,
-            )
-            .map_err(js)?,
-        )
+        let (mut channel, ticket) = inner
+            .finish_kms(&hello, &view.kms_ca_pem, &revisions, now)
+            .map_err(js)?;
+        to_json(&secret::seal(&mut channel, ticket, &payload, org_id, value).map_err(js)?)
     }
 }
 

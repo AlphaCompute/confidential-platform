@@ -425,17 +425,11 @@ impl Harness {
         assert_eq!(status, StatusCode::OK, "{reply}");
         let hello: alpha_channel::handshake::ServerHello = serde_json::from_value(reply).unwrap();
         let payload = json!({ "name": name, "app_ids": app_ids, "content_sha256": format!("sha256:{}", hex::encode(Sha256::digest(value))), "issued_at": rfc3339(issued_at) });
-        let sealed = alpha_channel::secret::seal(
-            initiator,
-            &hello,
-            &self.ca_pem,
-            &[self.node.compose_hash],
-            &payload,
-            self.org,
-            value,
-            self.now(),
-        )
-        .unwrap();
+        let (mut channel, ticket) = initiator
+            .finish_kms(&hello, &self.ca_pem, &[self.node.compose_hash], self.now())
+            .unwrap();
+        let sealed =
+            alpha_channel::secret::seal(&mut channel, ticket, &payload, self.org, value).unwrap();
         let mut body = self.signed(context::SECRET, payload, signer);
         body["sealed"] = json!(sealed);
         body

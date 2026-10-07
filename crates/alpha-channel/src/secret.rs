@@ -6,9 +6,7 @@
 //! stores the value only when the key that signed the put belongs to that organization. The path
 //! in the frame's AAD binds the value to its name.
 
-use std::time::SystemTime;
-
-use alpha_core::{ComposeHash, OrgId, context, signing_digest};
+use alpha_core::{OrgId, context, signing_digest};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
@@ -16,8 +14,7 @@ use serde_json::Value;
 use zeroize::Zeroizing;
 
 use crate::Error;
-use crate::frame::{RequestFrame, open_detached};
-use crate::handshake::{Initiator, ServerHello};
+use crate::frame::{Channel, RequestFrame, open_detached};
 
 /// `{ "ticket": "<base64url>", "frame": RequestFrame }`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,18 +32,14 @@ fn digest(payload: &Value) -> Result<[u8; 32], Error> {
     signing_digest(context::SECRET, payload).map_err(|e| Error::Malformed(format!("payload: {e}")))
 }
 
-/// Finishes the handshake with a KMS node and seals `digest(payload) ‖ org_id ‖ value` for
-/// `PUT /v1/secrets/<payload.name>`, signed by a key of `org_id`.
-#[allow(clippy::too_many_arguments)]
+/// Seals `digest(payload) ‖ org_id ‖ value` for `PUT /v1/secrets/<payload.name>`, signed by a key
+/// of `org_id`, on a channel and ticket from `Initiator::finish_kms`.
 pub fn seal(
-    initiator: Initiator,
-    hello: &ServerHello,
-    kms_ca_pem: &str,
-    kms_revisions: &[ComposeHash],
+    channel: &mut Channel,
+    ticket: String,
     payload: &Value,
     org_id: OrgId,
     value: &[u8],
-    now: SystemTime,
 ) -> Result<Sealed, Error> {
     let name = payload
         .get("name")
@@ -54,7 +47,6 @@ pub fn seal(
         .filter(|name| alpha_core::is_key_purpose(name))
         .ok_or_else(|| Error::Malformed("the payload's name is not a secret name".into()))?;
     let digest = digest(payload)?;
-    let (mut channel, ticket) = initiator.finish_kms(hello, kms_ca_pem, kms_revisions, now)?;
     let mut plaintext = Zeroizing::new(Vec::with_capacity(value.len().saturating_add(48)));
     plaintext.extend_from_slice(&digest);
     plaintext.extend_from_slice(org_id.as_bytes());

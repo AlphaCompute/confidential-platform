@@ -95,16 +95,8 @@ fn seal_to(
     now: &str,
 ) -> Result<Sealed, Error> {
     let (initiator, hello, _, _) = exchange(responder, tamper);
-    secret::seal(
-        initiator,
-        &hello,
-        kms_ca_pem,
-        kms_revisions,
-        payload,
-        org(),
-        VALUE,
-        at(now),
-    )
+    let (mut channel, ticket) = initiator.finish_kms(&hello, kms_ca_pem, kms_revisions, at(now))?;
+    secret::seal(&mut channel, ticket, payload, org(), VALUE)
 }
 
 fn refused(
@@ -139,17 +131,10 @@ fn a_value_sealed_to_a_kms_node_opens_there() {
     let payload = payload(Some("db_password"));
     let (initiator, hello, id, c2s) = exchange(&node(), with_ticket);
     assert!(hello.compose.is_empty());
-    let sealed = secret::seal(
-        initiator,
-        &hello,
-        CA,
-        &revisions(),
-        &payload,
-        org(),
-        VALUE,
-        at(NOW),
-    )
-    .unwrap();
+    let (mut channel, ticket) = initiator
+        .finish_kms(&hello, CA, &revisions(), at(NOW))
+        .unwrap();
+    let sealed = secret::seal(&mut channel, ticket, &payload, org(), VALUE).unwrap();
     assert_eq!(sealed.ticket, "t");
     let (sealed_for, opened) =
         secret::open(&id, &c2s, &sealed.frame, "db_password", &payload).unwrap();
@@ -224,17 +209,10 @@ fn a_kms_reply_with_a_changed_signature_or_no_ticket_is_refused() {
 fn a_frame_opens_only_for_its_name_key_channel_and_payload() {
     let payload = payload(Some("db_password"));
     let (initiator, hello, id, c2s) = exchange(&node(), with_ticket);
-    let sealed = secret::seal(
-        initiator,
-        &hello,
-        CA,
-        &revisions(),
-        &payload,
-        org(),
-        VALUE,
-        at(NOW),
-    )
-    .unwrap();
+    let (mut channel, ticket) = initiator
+        .finish_kms(&hello, CA, &revisions(), at(NOW))
+        .unwrap();
+    let sealed = secret::seal(&mut channel, ticket, &payload, org(), VALUE).unwrap();
     let open = |id: &[u8; 16], c2s: &[u8; 32], frame, name, payload| {
         secret::open(id, c2s, frame, name, payload)
             .unwrap_err()
