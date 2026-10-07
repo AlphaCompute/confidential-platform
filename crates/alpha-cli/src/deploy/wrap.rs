@@ -49,7 +49,7 @@ pub struct Wrapped {
 pub fn parse(bytes: &[u8]) -> Result<Plain, String> {
     if bytes.len() > MAX_COMPOSE_BYTES {
         return Err(format!(
-            "compose: {} bytes is over the limit of {MAX_COMPOSE_BYTES}; make it smaller",
+            "compose: {} bytes is over the 256 KiB limit; make it smaller",
             bytes.len()
         ));
     }
@@ -483,11 +483,18 @@ fn pinned(image: &str) -> bool {
 }
 
 /// The registry a reference names, split as Docker does: the first component is a registry only
-/// when it looks like a host, otherwise the image is on Docker Hub.
+/// when it looks like a host or has an upper-case letter (repositories are lower-case), otherwise
+/// the image is on Docker Hub.
 fn registry(image: &str) -> &str {
     match image.split_once('/') {
         Some(("index.docker.io", _)) => "docker.io",
-        Some((first, _)) if first.contains(['.', ':']) || first == "localhost" => first,
+        Some((first, _))
+            if first.contains(['.', ':'])
+                || first == "localhost"
+                || first.bytes().any(|b| b.is_ascii_uppercase()) =>
+        {
+            first
+        }
         _ => "docker.io",
     }
 }
@@ -785,6 +792,112 @@ mod tests {
             let err = parse(case.compose.as_bytes()).unwrap_err();
             assert!(err.contains(&case.refusal), "{name}: {err}");
             assert!(err.contains("; "), "{name}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_size_limit_comes_before_parsing() {
+        let mut text = vector_compose();
+        text.push_str("\n# ");
+        let padding = MAX_COMPOSE_BYTES - text.len() - 1;
+        text.push_str(&"x".repeat(padding));
+        text.push('\n');
+        assert_eq!(text.len(), MAX_COMPOSE_BYTES);
+        parse(text.as_bytes()).unwrap();
+        text.push('\n');
+        let err = parse(text.as_bytes()).unwrap_err();
+        assert!(err.contains("256 KiB"), "{err}");
+        let err = parse(&[b'['; MAX_COMPOSE_BYTES + 1]).unwrap_err();
+        assert!(err.contains("256 KiB"), "{err}");
+    }
+
+    #[test]
+    fn bytes_that_are_not_utf8_are_refused() {
+        let mut bytes = b"# \xff\n".to_vec();
+        bytes.extend_from_slice(vector_compose().as_bytes());
+        let err = parse(&bytes).unwrap_err();
+        assert!(err.contains("UTF-8"), "{err}");
+    }
+
+    fn single(name: &str, port: &str) -> String {
+        format!(
+            "services:\n  {name}:\n    image: nginx@sha256:{}\n    ports: [{port}]\n",
+            "ab".repeat(32)
+        )
+    }
+
+    #[test]
+    fn boundaries_of_names_and_ports() {
+        for name in ["alphaweb", &"a".repeat(64)] {
+            parse(single(name, "\"8080:80\"").as_bytes()).unwrap();
+        }
+        for name in ["alpha-web", &"a".repeat(65), "..", "Web"] {
+            let err = parse(single(name, "\"8080:80\"").as_bytes()).unwrap_err();
+            assert!(err.contains(name), "{err}");
+        }
+        let err = parse(single("Web", "\"8080:80\"").as_bytes()).unwrap_err();
+        assert!(err.contains("lowercase"), "{err}");
+
+        for (item, port) in [
+            ("\"8080:65535\"", 65535),
+            ("\"80\"", 80),
+            ("80", 80),
+            ("\"8080:80/tcp\"", 80),
+            ("{target: 80, published: 8080}", 80),
+        ] {
+            let plain = parse(single("web", item).as_bytes()).unwrap();
+            assert_eq!(plain.endpoint, ("web".to_owned(), port), "{item}");
+        }
+        for item in ["\"8080:0\"", "\"8080:65536\"", "\"8080:80/udp\""] {
+            let err = parse(single("web", item).as_bytes()).unwrap_err();
+            assert!(err.contains("not a TCP port"), "{item}: {err}");
+        }
+    }
+
+    #[test]
+    fn references_split_as_docker_does() {
+        for (image, domain) in [
+            ("nginx", "docker.io"),
+            ("nginx:1.27", "docker.io"),
+            ("docker.io/nginx", "docker.io"),
+            ("index.docker.io/nginx", "docker.io"),
+            ("acme/app:1", "docker.io"),
+            ("ghcr.io/acme/app", "ghcr.io"),
+            ("quay.io/prometheus/node-exporter:v1", "quay.io"),
+            ("localhost:5000/app:1", "localhost:5000"),
+            ("registry.example.com/app:1", "registry.example.com"),
+            ("Acme/app:1", "Acme"),
+        ] {
+            assert_eq!(registry(image), domain, "{image}");
+        }
+        let with = |image: &str| replaced(&single("web", "\"8080:80\""), "nginx@sha256:", image);
+        let hex = "ab".repeat(32);
+        for image in [
+            "nginx@sha256:",
+            "nginx:1.27@sha256:",
+            "registry.example.com/app@sha256:",
+        ] {
+            let plain = parse(with(image).as_bytes()).unwrap();
+            let (_, service) = &plain.services[0];
+            assert_eq!(service["image"], key(&format!("{image}{hex}")));
+        }
+        for image in [
+            "localhost:5000/app:1",
+            "registry.example.com/app:1",
+            "Acme/app:1",
+        ] {
+            let text = with(image).replace(&hex, "");
+            let err = parse(text.as_bytes()).unwrap_err();
+            assert!(err.contains("a tag outside"), "{image}: {err}");
+        }
+        for digest in [
+            format!("sha256:{}", "AB".repeat(32)),
+            format!("sha512:{}", "ab".repeat(64)),
+            format!("sha256:{}", "a".repeat(63)),
+        ] {
+            let text = with("nginx@").replace(&hex, &digest);
+            let err = parse(text.as_bytes()).unwrap_err();
+            assert!(err.contains("malformed digest"), "{digest}: {err}");
         }
     }
 
