@@ -37,9 +37,6 @@ pub fn provider() -> Arc<CryptoProvider> {
     })
 }
 
-/// The URI SAN every KMS node's leaf carries beside its Revision.
-pub const KMS_SAN: &str = "alphacompute://kms";
-
 /// What the server must prove, as a value.
 #[derive(Clone, Debug)]
 pub enum Pin {
@@ -244,7 +241,9 @@ pub fn client_config(
     })
 }
 
-pub use alpha_channel::cert::{InstanceSans, parse_instance_sans, spki_of, spki_sha256, uri_sans};
+pub use alpha_channel::cert::{
+    InstanceSans, KMS_SAN, parse_instance_sans, spki_of, spki_sha256, uri_sans,
+};
 
 fn certified_key(identity: &RuntimeIdentity) -> Result<Arc<CertifiedKey>, Error> {
     let chain: Vec<CertificateDer<'static>> =

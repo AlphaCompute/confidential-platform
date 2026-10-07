@@ -202,12 +202,16 @@ pub struct RevisionRegistered {
     pub app_id: AppId,
     pub org_id: OrgId,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RevisionRevoked {
     pub compose_hash: ComposeHash,
     pub revoked_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -217,6 +221,8 @@ pub struct SecretPut {
     pub app_ids: Vec<AppId>,
     pub content_sha256: String,
     pub issued_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -229,6 +235,8 @@ pub struct KeyRegistered {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -236,6 +244,8 @@ pub struct KeyRevoked {
     pub key_id: KeyId,
     pub revoked_at: String,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<Value>,
 }
 
 /// `GET /v1/node/evidence`: the quote is base64url, `runtime_pubkey` the P-256 SPKI DER.
@@ -643,6 +653,18 @@ mod tests {
         let text = r#"{"key_id":"01920000-0000-7000-8000-000000000001","algorithm":"ed25519","signature":"AAAA","authenticator_data":"AAAA","client_data_json":"e30"}"#;
         assert_eq!(round_trip(text).unwrap(), text);
         assert!(round_trip(r#"{"algorithm":"ed25519","signature":"AAAA","extra":1}"#).is_err());
+    }
+
+    #[test]
+    fn a_control_reply_keeps_a_receipt_whose_shape_grew() {
+        let receipt = json!({"document": {}, "signature": {}, "certificate_chain": [], "new": 1});
+        let reply: RevisionRevoked = serde_json::from_value(json!({
+            "compose_hash": format!("sha256:{}", "0".repeat(64)),
+            "revoked_at": "2026-06-01T00:00:00Z",
+            "receipt": receipt,
+        }))
+        .unwrap();
+        assert_eq!(reply.receipt, Some(receipt));
     }
 
     #[test]

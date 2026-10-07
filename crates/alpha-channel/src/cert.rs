@@ -14,6 +14,9 @@ use x509_parser::prelude::{FromDer, GeneralName, ParsedExtension, X509Certificat
 
 use crate::{Error, from_unix_seconds, unix_seconds};
 
+/// The URI SAN every KMS node's leaf carries beside its Revision.
+pub const KMS_SAN: &str = "alphacompute://kms";
+
 pub fn uri_sans(cert: &[u8]) -> Result<Vec<String>, Error> {
     let (_, cert) = X509Certificate::from_der(cert)
         .map_err(|e| Error::Malformed(format!("certificate: {e}")))?;

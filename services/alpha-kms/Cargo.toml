@@ -13,6 +13,7 @@ dev-root = []
 [dependencies]
 aes-gcm = "0.11"
 alpha-attest = { path = "../../crates/alpha-attest" }
+alpha-channel = { path = "../../crates/alpha-channel" }
 alpha-client = { path = "../../crates/alpha-client" }
 alpha-core = { path = "../../crates/alpha-core" }
 alpha-crypto = { path = "../../crates/alpha-crypto" }

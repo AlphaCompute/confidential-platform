@@ -1,0 +1,8 @@
+{
+  "דּ": "dagesh",
+  "😀": {"b": [{"ab": {"a": [{"ü": [true, false, null, {}, []]}]}}]},
+  "ü": "raw escaped\u2028 slash\/ tab\t nul\u0000 us\u001f <>&",
+  "b": [true, false, null, {}, []],
+  "ab": {"x": [{"y": {"z": "\u2028"}}]},
+  "a": 1
+}

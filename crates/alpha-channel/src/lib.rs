@@ -30,6 +30,7 @@ pub mod frame;
 pub mod handshake;
 pub mod member;
 pub mod platform;
+pub mod receipt;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
 
@@ -68,6 +69,8 @@ pub enum Error {
     RequestStale,
     #[error("the grant has expired, is not yet valid or lasts longer than twelve hours")]
     GrantExpired,
+    #[error("{0}")]
+    ReceiptMismatch(String),
 }
 
 impl Error {
@@ -89,6 +92,7 @@ impl Error {
             Self::SignatureInvalid(_) => "signature_invalid",
             Self::RequestStale => "request_stale",
             Self::GrantExpired => "grant_expired",
+            Self::ReceiptMismatch(_) => "receipt_mismatch",
         }
     }
 }

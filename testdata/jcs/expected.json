@@ -1,0 +1,11 @@
+{
+  "01-compose-body.json": "sha256:c1667435e44533051ce64e05d16bc7effb0422fcd510c3f4e31c5baab7bb5ff6",
+  "02-nested.json": "sha256:13bc8051c6dac3644c9a2f9b1751345c81554ecc318f8f55f61f08d0b6349cc0",
+  "03-numbers.json": "sha256:c16faa51e9c63b9c36d5ff55c015951d2a2f52ab1ec190f9b81a99a869fbe0cd",
+  "04-duplicate-key.json": "refused",
+  "05-escaped-duplicate.json": "refused",
+  "06-nested-duplicate.json": "refused",
+  "07-lone-surrogate.json": "refused",
+  "08-empty-object.json": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+  "09-empty.json": "refused"
+}

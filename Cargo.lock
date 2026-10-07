@@ -278,6 +278,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "alpha-attest",
+ "alpha-channel",
  "alpha-cli",
  "alpha-client",
  "alpha-core",
