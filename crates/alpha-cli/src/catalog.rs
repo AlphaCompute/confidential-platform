@@ -82,6 +82,131 @@ mod tests {
         SigningKey::from_bytes(&[11u8; 32])
     }
 
+    const SPEC: &str = "\
+app_id: 00000000-0000-0000-0000-000000000000
+services:
+  app:
+    image: ghcr.io/alphacompute/alpha-cpu-app@sha256:3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a
+    port: 8443
+    socket: true
+runtime:
+  image: ghcr.io/alphacompute/alpha-runtime@sha256:7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d
+  kms_ca_spki_sha256: sha256:c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1
+  kms_revisions:
+    - sha256:e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1
+resources:
+  cpu: 1
+  memory_mib: 2048
+";
+
+    const APP_ID: &str = "01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b";
+
+    fn catalog_vectors() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/catalog")
+    }
+
+    fn app_id() -> AppId {
+        APP_ID.parse().unwrap()
+    }
+
+    fn valid() -> CatalogFile {
+        sign(
+            parse(SPEC).unwrap(),
+            "cpu-app",
+            "1",
+            "CPU App",
+            &signing_key(),
+        )
+        .unwrap()
+    }
+
+    /// Every file under `testdata/catalog`; each catalog file differs from `valid.json` in one
+    /// respect only, so its refusal can come only from the check that respect exercises.
+    fn vectors() -> Vec<(&'static str, Vec<u8>)> {
+        let valid = valid();
+        let rendered = render(&valid.template, &valid.entry.template_sha256, app_id()).unwrap();
+        let catalog: Vec<(&'static str, &CatalogFile, &str, &str)> =
+            vec![("valid.json", &valid, "ok", "ok")];
+        let verdicts: serde_json::Map<String, serde_json::Value> = catalog
+            .iter()
+            .map(|(name, _, signature, render)| {
+                (
+                    (*name).to_owned(),
+                    serde_json::json!({"signature": signature, "render": render}),
+                )
+            })
+            .collect();
+        let expected = serde_json::json!({
+            "app_id": APP_ID,
+            "compose_hash": compose_hash(&rendered),
+            "catalog_key": catalog_key(&signing_key()),
+            "release_key": catalog_key(&SigningKey::from_bytes(&[12u8; 32])),
+            "vectors": verdicts,
+        });
+        let mut expected = alpha_core::jcs(&expected).unwrap();
+        expected.push(b'\n');
+        let mut files = vec![
+            ("app.yaml", SPEC.as_bytes().to_vec()),
+            ("app-compose.json", rendered.into_bytes()),
+            ("expected.json", expected),
+        ];
+        for (name, file, _, _) in catalog {
+            files.push((name, file_bytes(file).unwrap()));
+        }
+        files
+    }
+
+    #[test]
+    fn catalog_vectors_regenerate_byte_for_byte() {
+        let files = vectors();
+        let dir = catalog_vectors();
+        if std::env::var_os("WRITE_VECTORS").is_some() {
+            fs::create_dir_all(&dir).unwrap();
+            for (name, bytes) in &files {
+                fs::write(dir.join(name), bytes).unwrap();
+            }
+            return;
+        }
+        for (name, bytes) in &files {
+            let on_disk = fs::read(dir.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(on_disk == *bytes, "{name} does not regenerate");
+        }
+        let mut listed: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        listed.sort();
+        let mut generated: Vec<String> = files.iter().map(|(n, _)| (*n).to_owned()).collect();
+        generated.sort();
+        assert_eq!(listed, generated);
+    }
+
+    #[test]
+    fn the_catalog_vector_renders_what_deploy_builds() {
+        let mut spec = parse(SPEC).unwrap();
+        spec.app_id = app_id();
+        let compose = crate::deploy::compose(&spec).unwrap();
+        let dir = catalog_vectors();
+        let file: CatalogFile =
+            serde_json::from_slice(&fs::read(dir.join("valid.json")).unwrap()).unwrap();
+        assert_eq!(
+            render(&file.template, &file.entry.template_sha256, app_id()).unwrap(),
+            compose
+        );
+        assert_eq!(
+            fs::read(dir.join("app-compose.json")).unwrap(),
+            compose.as_bytes()
+        );
+        let expected: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join("expected.json")).unwrap()).unwrap();
+        assert_eq!(compose_hash(&compose).to_string(), expected["compose_hash"]);
+        // Go's encoding/json escapes these unless told not to, so a consumer that re-marshals the
+        // compose fails the byte comparison instead of passing by luck.
+        for raw in ["&&", ">", "$("] {
+            assert!(compose.contains(raw), "{raw}");
+        }
+    }
+
     #[test]
     fn a_signed_template_renders_to_the_deploy_vector() {
         let spec = parse(&fs::read_to_string(vector().join("app.yaml")).unwrap()).unwrap();
