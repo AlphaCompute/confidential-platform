@@ -47,10 +47,7 @@ pub fn seal(
         .filter(|name| alpha_core::is_key_purpose(name))
         .ok_or_else(|| Error::Malformed("the payload's name is not a secret name".into()))?;
     let digest = digest(payload)?;
-    let mut plaintext = Zeroizing::new(Vec::with_capacity(value.len().saturating_add(48)));
-    plaintext.extend_from_slice(&digest);
-    plaintext.extend_from_slice(org_id.as_bytes());
-    plaintext.extend_from_slice(value);
+    let plaintext = Zeroizing::new([&digest[..], org_id.as_bytes(), value].concat());
     let frame = channel.seal_request("PUT", &path(name), &plaintext)?;
     Ok(Sealed { ticket, frame })
 }
