@@ -1767,8 +1767,23 @@ async fn a_replayed_sealed_put_already_exists_without_a_receipt() {
     assert_eq!(secrets_named(&h, "replayed").await, 1);
 }
 
-/// Without the payload digest at the head of the sealed plaintext, the second organization's put
-/// naming its own App would be stored.
+/// An admin key of a second organization, registered beside the harness's.
+async fn second_organization(h: &Harness) -> (KeyId, SigningKey) {
+    let org_b = OrgId::mint();
+    let root_b_key = SigningKey::from_bytes(&[52u8; 32]);
+    let (status, reply) = h
+        .post(
+            "/v1/keys",
+            root_key_registration(org_b, &root_b_key, h.now()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let root_b = (reply["id"].as_str().unwrap().parse().unwrap(), root_b_key);
+    h.register_key(&root_b, 53).await
+}
+
+/// A second organization's verbatim copy is refused by the organization sealed beside the value,
+/// and its put naming an App of its own by the payload digest sealed at its head.
 #[tokio::test]
 async fn a_sealed_value_cannot_be_moved_into_another_organization() {
     let Some(h) = harness().await else {
@@ -1780,18 +1795,7 @@ async fn a_sealed_value_cannot_be_moved_into_another_organization() {
     let body = h
         .sealed_body("moved", &[app_a], b"a's value", h.now(), &admin_a)
         .await;
-
-    let org_b = OrgId::mint();
-    let root_b_key = SigningKey::from_bytes(&[52u8; 32]);
-    let (status, reply) = h
-        .post(
-            "/v1/keys",
-            root_key_registration(org_b, &root_b_key, h.now()),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{reply}");
-    let root_b = (reply["id"].as_str().unwrap().parse().unwrap(), root_b_key);
-    let admin_b = h.register_key(&root_b, 53).await;
+    let admin_b = second_organization(&h).await;
 
     let mut verbatim = h.signed(context::SECRET, body["payload"].clone(), &admin_b);
     verbatim["sealed"] = body["sealed"].clone();
@@ -1812,6 +1816,38 @@ async fn a_sealed_value_cannot_be_moved_into_another_organization() {
     assert_eq!(secrets_named(&h, "moved").await, 1);
     let owner = sqlx::query_scalar::<_, Uuid>("select org_id from secrets where name = $1")
         .bind("moved")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(owner, Uuid::from(h.org));
+}
+
+/// Before the granted App has a Revision no other check knows whose App it is, so the
+/// organization sealed beside the value alone keeps a verbatim copy out of another organization.
+#[tokio::test]
+async fn a_sealed_value_for_an_app_without_a_revision_stays_with_its_organization() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let admin_a = h.register_key(&h.root, 87).await;
+    let app_a = AppId::mint();
+    let body = h
+        .sealed_body("early", &[app_a], b"a's value", h.now(), &admin_a)
+        .await;
+    let admin_b = second_organization(&h).await;
+
+    let mut verbatim = h.signed(context::SECRET, body["payload"].clone(), &admin_b);
+    verbatim["sealed"] = body["sealed"].clone();
+    let message = refused_put(&h, "early", verbatim, StatusCode::BAD_REQUEST, "malformed").await;
+    assert!(message.contains("another organization"), "{message}");
+    assert_eq!(secrets_named(&h, "early").await, 0);
+
+    let (status, reply) = h
+        .call(reqwest::Method::PUT, "/v1/secrets/early", body)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let owner = sqlx::query_scalar::<_, Uuid>("select org_id from secrets where name = $1")
+        .bind("early")
         .fetch_one(&h.pool)
         .await
         .unwrap();
