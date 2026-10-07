@@ -125,8 +125,58 @@ resources:
     fn vectors() -> Vec<(&'static str, Vec<u8>)> {
         let valid = valid();
         let rendered = render(&valid.template, &valid.entry.template_sha256, app_id()).unwrap();
-        let catalog: Vec<(&'static str, &CatalogFile, &str, &str)> =
-            vec![("valid.json", &valid, "ok", "ok")];
+        let signed = |template: String, seed: u8| {
+            let entry = Entry {
+                template_sha256: compose_hash(&template),
+                ..valid.entry.clone()
+            };
+            alpha_core::catalog::sign(entry, template, &SigningKey::from_bytes(&[seed; 32]))
+                .unwrap()
+        };
+
+        // `alpha catalog sign` cannot produce a template whose nil name is absent or repeated, since
+        // `deploy::compose` refuses one; these are signed through the core function directly.
+        let mut spec = parse(SPEC).unwrap();
+        spec.app_id = app_id();
+        let name_absent = signed(crate::deploy::compose(&spec).unwrap(), 11);
+
+        let mut repeated: serde_json::Value = serde_json::from_str(&valid.template).unwrap();
+        let previous = repeated.as_object_mut().unwrap().insert(
+            "labels".into(),
+            serde_json::json!({"name": "00000000-0000-0000-0000-000000000000"}),
+        );
+        assert!(previous.is_none());
+        let name_repeated = signed(alpha_core::phala::canonicalize(&repeated).unwrap(), 11);
+
+        let mut tampered = valid.clone();
+        assert_eq!(tampered.template.matches("\"kms_enabled\":true").count(), 1);
+        tampered.template = tampered
+            .template
+            .replace("\"kms_enabled\":true", "\"kms_enabled\":false");
+
+        let catalog: Vec<(&'static str, CatalogFile, &str, &str)> = vec![
+            ("valid.json", valid.clone(), "ok", "ok"),
+            (
+                "signed-by-other-key.json",
+                signed(valid.template.clone(), 13),
+                "signature_invalid",
+                "ok",
+            ),
+            (
+                "signed-by-release-key.json",
+                signed(valid.template.clone(), 12),
+                "signature_invalid",
+                "ok",
+            ),
+            ("name-absent.json", name_absent, "ok", "name_not_once"),
+            ("name-repeated.json", name_repeated, "ok", "name_not_once"),
+            (
+                "template-tampered.json",
+                tampered,
+                "ok",
+                "template_mismatch",
+            ),
+        ];
         let verdicts: serde_json::Map<String, serde_json::Value> = catalog
             .iter()
             .map(|(name, _, signature, render)| {
@@ -150,8 +200,8 @@ resources:
             ("app-compose.json", rendered.into_bytes()),
             ("expected.json", expected),
         ];
-        for (name, file, _, _) in catalog {
-            files.push((name, file_bytes(file).unwrap()));
+        for (name, file, _, _) in &catalog {
+            files.push((*name, file_bytes(file).unwrap()));
         }
         files
     }

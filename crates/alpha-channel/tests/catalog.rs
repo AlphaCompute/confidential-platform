@@ -21,7 +21,14 @@ macro_rules! v {
     };
 }
 
-const FILES: &[(&str, &[u8])] = &[v!("valid.json")];
+const FILES: &[(&str, &[u8])] = &[
+    v!("name-absent.json"),
+    v!("name-repeated.json"),
+    v!("signed-by-other-key.json"),
+    v!("signed-by-release-key.json"),
+    v!("template-tampered.json"),
+    v!("valid.json"),
+];
 
 const EXPECTED: &str = include_str!("../../../testdata/catalog/expected.json");
 const COMPOSE: &[u8] = include_bytes!("../../../testdata/catalog/app-compose.json");
@@ -47,4 +54,18 @@ fn every_catalog_vector_gives_its_recorded_verdicts() {
         })
         .collect();
     assert_eq!(serde_json::to_value(computed).unwrap(), expected["vectors"]);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn every_file_in_the_catalog_vector_directory_is_listed() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/catalog");
+    let mut on_disk: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| !["app.yaml", "app-compose.json", "expected.json"].contains(&name.as_str()))
+        .collect();
+    on_disk.sort();
+    let listed: Vec<&str> = FILES.iter().map(|(name, _)| *name).collect();
+    assert_eq!(on_disk, listed);
 }
