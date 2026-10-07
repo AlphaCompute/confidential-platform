@@ -30,39 +30,24 @@ const PLATFORM_DOCUMENT: &str = include_str!("../../../testdata/channel/platform
 const NOW_MS: f64 = 1_780_272_000_000.0;
 
 const RECEIPT_CA: &str = include_str!("../../../testdata/receipt/ca.pem");
+macro_rules! r {
+    ($n:literal) => {
+        (
+            $n,
+            include_str!(concat!("../../../testdata/receipt/", $n, ".json")),
+        )
+    };
+}
+
 const RECEIPT_VECTORS: &[(&str, &str)] = &[
-    (
-        "valid",
-        include_str!("../../../testdata/receipt/valid.json"),
-    ),
-    (
-        "wrong-ca",
-        include_str!("../../../testdata/receipt/wrong-ca.json"),
-    ),
-    (
-        "instance-leaf",
-        include_str!("../../../testdata/receipt/instance-leaf.json"),
-    ),
-    (
-        "wrong-route",
-        include_str!("../../../testdata/receipt/wrong-route.json"),
-    ),
-    (
-        "wrong-request",
-        include_str!("../../../testdata/receipt/wrong-request.json"),
-    ),
-    (
-        "other-response",
-        include_str!("../../../testdata/receipt/other-response.json"),
-    ),
-    (
-        "tampered-response",
-        include_str!("../../../testdata/receipt/tampered-response.json"),
-    ),
-    (
-        "issued-at-outside",
-        include_str!("../../../testdata/receipt/issued-at-outside.json"),
-    ),
+    r!("valid"),
+    r!("wrong-ca"),
+    r!("instance-leaf"),
+    r!("wrong-route"),
+    r!("wrong-request"),
+    r!("other-response"),
+    r!("tampered-response"),
+    r!("issued-at-outside"),
 ];
 
 fn expected() -> String {

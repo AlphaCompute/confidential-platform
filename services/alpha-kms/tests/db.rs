@@ -369,18 +369,8 @@ async fn duplicate_keys_in_a_control_body_are_malformed() {
         return;
     };
     let admin = h.register_key(&h.root, 61).await;
-    let compose =
-        fs::read_to_string(testdata().join("manifest/01-canonical/app-compose.json")).unwrap();
-    let expected: Value = serde_json::from_str(
-        &fs::read_to_string(testdata().join("manifest/01-canonical/expected.json")).unwrap(),
-    )
-    .unwrap();
+    let (body, expected) = canonical_revision(&h, &admin);
     let app_id = &expected["app_id"];
-    let body = h.signed(
-        context::REVISION,
-        json!({ "app_id": app_id, "compose": compose }),
-        &admin,
-    );
     let p = body["payload"].to_string();
     let s = body["signature"].to_string();
     let repeats = [

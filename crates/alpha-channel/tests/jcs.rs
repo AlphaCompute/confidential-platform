@@ -8,43 +8,22 @@
 
 use std::collections::BTreeMap;
 
+macro_rules! v {
+    ($n:literal) => {
+        ($n, include_bytes!(concat!("../../../testdata/jcs/", $n)))
+    };
+}
+
 const VECTORS: &[(&str, &[u8])] = &[
-    (
-        "01-compose-body.json",
-        include_bytes!("../../../testdata/jcs/01-compose-body.json"),
-    ),
-    (
-        "02-nested.json",
-        include_bytes!("../../../testdata/jcs/02-nested.json"),
-    ),
-    (
-        "03-numbers.json",
-        include_bytes!("../../../testdata/jcs/03-numbers.json"),
-    ),
-    (
-        "04-duplicate-key.json",
-        include_bytes!("../../../testdata/jcs/04-duplicate-key.json"),
-    ),
-    (
-        "05-escaped-duplicate.json",
-        include_bytes!("../../../testdata/jcs/05-escaped-duplicate.json"),
-    ),
-    (
-        "06-nested-duplicate.json",
-        include_bytes!("../../../testdata/jcs/06-nested-duplicate.json"),
-    ),
-    (
-        "07-lone-surrogate.json",
-        include_bytes!("../../../testdata/jcs/07-lone-surrogate.json"),
-    ),
-    (
-        "08-empty-object.json",
-        include_bytes!("../../../testdata/jcs/08-empty-object.json"),
-    ),
-    (
-        "09-empty.json",
-        include_bytes!("../../../testdata/jcs/09-empty.json"),
-    ),
+    v!("01-compose-body.json"),
+    v!("02-nested.json"),
+    v!("03-numbers.json"),
+    v!("04-duplicate-key.json"),
+    v!("05-escaped-duplicate.json"),
+    v!("06-nested-duplicate.json"),
+    v!("07-lone-surrogate.json"),
+    v!("08-empty-object.json"),
+    v!("09-empty.json"),
 ];
 
 const EXPECTED: &str = include_str!("../../../testdata/jcs/expected.json");
