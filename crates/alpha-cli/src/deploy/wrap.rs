@@ -596,4 +596,77 @@ mod tests {
             ["db_password", "session_key"]
         );
     }
+
+    fn replaced(text: &str, from: &str, to: &str) -> String {
+        assert!(text.contains(from), "{from}");
+        text.replace(from, to)
+    }
+
+    #[test]
+    fn a_compose_without_secrets_gets_no_runtime_health() {
+        let text = vector_compose();
+        let (text, _) = text.split_once("\nsecrets:").unwrap();
+        let text = replaced(text, "    secrets: [session_key, db_password]\n", "");
+        let text = replaced(&text, "    secrets: [db_password]\n", "");
+        let wrapped = wrap_text(&text, &BTreeMap::new()).unwrap();
+        let yaml = compose_yaml(&wrapped);
+        assert!(
+            yaml["services"][RUNTIME_SERVICE]
+                .get("healthcheck")
+                .is_none()
+        );
+        for absent in ["ALPHACOMPUTE_SECRETS", "alpha-secrets", "service_healthy"] {
+            assert!(!wrapped.compose.contains(absent), "{absent}");
+        }
+        assert!(wrapped.secrets.is_empty());
+    }
+
+    #[test]
+    fn secret_order_does_not_change_the_bytes() {
+        let text = vector_compose();
+        let reordered = replaced(
+            &text,
+            "[session_key, db_password]",
+            "[db_password, session_key]",
+        );
+        let reordered = replaced(
+            &reordered,
+            "  db_password:\n    external: true\n  session_key: {}\n",
+            "  session_key: {}\n  db_password:\n    external: true\n",
+        );
+        assert_eq!(
+            wrap_text(&reordered, &BTreeMap::new()).unwrap().compose,
+            wrap_text(&text, &BTreeMap::new()).unwrap().compose
+        );
+    }
+
+    #[test]
+    fn a_tag_without_a_digest_is_refused_by_wrap() {
+        let pinned = format!("nginx:1.27@sha256:{}", "ab".repeat(32));
+        let text = replaced(&vector_compose(), &pinned, "nginx:1.27");
+        let err = wrap_text(&text, &BTreeMap::new()).unwrap_err();
+        assert!(
+            err.contains("nginx:1.27") && err.contains("@sha256:"),
+            "{err}"
+        );
+        let digest = format!("sha256:{}", "aa".repeat(32));
+        let digests = BTreeMap::from([("nginx:1.27".to_owned(), digest.clone())]);
+        let wrapped = wrap_text(&text, &digests).unwrap();
+        assert_eq!(
+            compose_yaml(&wrapped)["services"]["web"]["image"],
+            key(&format!("nginx:1.27@{digest}"))
+        );
+    }
+
+    #[test]
+    fn a_bad_runtime_image_is_refused() {
+        let mut spec = deploy_spec();
+        spec.runtime.image = "ghcr.io/alphacompute/alpha-runtime:latest".into();
+        let plain = parse(vector_compose().as_bytes()).unwrap();
+        let err = wrap(plain, &BTreeMap::new(), spec.app_id, &spec.runtime).unwrap_err();
+        assert!(
+            err.contains("ghcr.io/alphacompute/alpha-runtime:latest"),
+            "{err}"
+        );
+    }
 }
