@@ -206,6 +206,51 @@ mod tests {
     }
 
     #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+    fn a_signer_or_catalog_key_breaking_a_rule_is_refused_as_platform_signature() {
+        let key = SigningKey::from_bytes(&[5u8; 32]);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        for (section, field, bad) in [
+            ("signer", "origins", json!([])),
+            ("signer", "origins", json!(["https://sign.example/"])),
+            ("signer", "origins", json!(["http://sign.example"])),
+            ("signer", "origins", json!(["https://Sign.example"])),
+            ("signer", "origins", json!(["https://sign.example:443"])),
+            ("signer", "origins", json!(["https://sign.example:+8443"])),
+            ("signer", "origins", json!(["https://evilsign.example"])),
+            ("signer", "origins", json!(["https://u@sign.example"])),
+            ("signer", "origins", json!(["https://sign.example?x"])),
+            ("signer", "api_origin", json!("https://api.example/v1")),
+            (
+                "signer",
+                "bundle_sha256",
+                json!(format!("sha256:{}", "A".repeat(64))),
+            ),
+            ("catalog_key", "algorithm", json!("ml-dsa")),
+            (
+                "catalog_key",
+                "public_key",
+                json!(BASE64_URL_SAFE_NO_PAD.encode([7u8; 31])),
+            ),
+            (
+                "catalog_key",
+                "public_key",
+                json!(base64::prelude::BASE64_URL_SAFE.encode([7u8; 32])),
+            ),
+        ] {
+            let mut d = document_with_signer_and_catalog_key();
+            d[section][field] = bad.clone();
+            let signed = sign(d, &key).unwrap();
+            assert_eq!(
+                verify(&signed, &key.verifying_key(), now)
+                    .unwrap_err()
+                    .code(),
+                "platform_signature",
+                "{section}.{field} {bad}"
+            );
+        }
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
     fn the_compiled_in_release_key_parses() {
         release_key().unwrap();
     }

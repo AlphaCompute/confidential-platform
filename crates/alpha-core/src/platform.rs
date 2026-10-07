@@ -148,3 +148,158 @@ fn is_host(host: &str) -> bool {
             .next()
             .is_some_and(|tld| tld.bytes().any(|b| b.is_ascii_lowercase()))
 }
+
+#[cfg(test)]
+mod tests {
+    use base64::prelude::{BASE64_STANDARD, BASE64_URL_SAFE};
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    fn signer_on(rp_id: &str, field: &str, value: Value) -> Result<Signer, serde_json::Error> {
+        let mut s = json!({
+            "origins": [format!("https://{rp_id}")],
+            "rp_id": rp_id,
+            "bundle_sha256": format!("sha256:{}", "0".repeat(64)),
+            "api_origin": "https://api.example"
+        });
+        s[field] = value;
+        serde_json::from_value(s)
+    }
+
+    fn signer(field: &str, value: Value) -> Result<Signer, serde_json::Error> {
+        signer_on("sign.example", field, value)
+    }
+
+    fn catalog_key(algorithm: &str, public_key: &str) -> Result<CatalogKey, serde_json::Error> {
+        serde_json::from_value(json!({ "algorithm": algorithm, "public_key": public_key }))
+    }
+
+    #[test]
+    fn origin_is_a_serialized_https_origin() {
+        for ok in [
+            "https://api.example",
+            "https://api.example:1",
+            "https://api.example:65535",
+            "https://api.example:8443",
+            "https://localhost",
+        ] {
+            assert!(signer("api_origin", json!(ok)).is_ok(), "{ok:?}");
+        }
+        for bad in [
+            "http://api.example",
+            "https://API.example",
+            "https://api.example/",
+            "https://api.example/v1",
+            "https://api.example?x",
+            "https://api.example#x",
+            "https://u@api.example",
+            "https://api.example:",
+            "https://api.example:0",
+            "https://api.example:443",
+            "https://api.example:+443",
+            "https://api.example:0443",
+            "https://api.example:65536",
+            "https://api.example:99999999999999999999",
+            "https://127.0.0.1",
+            "https://[::1]",
+            "https://api.example.",
+            "https://-a.example",
+            "https://a..example",
+            "https://",
+            "",
+        ] {
+            assert!(signer("api_origin", json!(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn signer_origins_sit_on_rp_id_at_a_label_boundary() {
+        for ok in [
+            "https://sign.example",
+            "https://a.sign.example",
+            "https://a.b.sign.example:8443",
+        ] {
+            assert!(signer("origins", json!([ok])).is_ok(), "{ok:?}");
+        }
+        for bad in [
+            "https://evilsign.example",
+            "https://sign.example.evil",
+            "https://example",
+            "https://other.example",
+        ] {
+            assert!(signer("origins", json!([bad])).is_err(), "{bad:?}");
+        }
+        for ok in ["https://localhost:8443", "https://localhost"] {
+            assert!(
+                signer_on("localhost", "origins", json!([ok])).is_ok(),
+                "{ok:?}"
+            );
+        }
+        assert!(signer_on("localhost", "origins", json!(["http://localhost:8443"])).is_err());
+        for bad in [
+            "",
+            "Sign.example",
+            "sign.example.",
+            "127.0.0.1",
+            "https://sign.example",
+        ] {
+            assert!(signer("rp_id", json!(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn signer_refuses_empty_origins_and_bad_bundle_hashes() {
+        assert!(signer("origins", json!([])).is_err());
+        assert!(signer("origins", json!(["https://sign.example"])).is_ok());
+        for bad in [
+            format!("sha256:{}", "0".repeat(63)),
+            format!("sha256:{}", "0".repeat(65)),
+            format!("sha256:{}", "A".repeat(64)),
+            format!("sha256:{}", "g".repeat(64)),
+            "0".repeat(64),
+        ] {
+            assert!(signer("bundle_sha256", json!(bad)).is_err(), "{bad:?}");
+        }
+        let good = format!("sha256:{}", "0".repeat(64));
+        assert!(signer("bundle_sha256", json!(good)).is_ok());
+    }
+
+    #[test]
+    fn signer_keeps_origin_order_and_duplicates_and_tolerates_unknown_fields() {
+        let b = "https://b.sign.example";
+        let a = "https://a.sign.example";
+        assert_eq!(
+            signer("origins", json!([b, a, b])).unwrap().origins,
+            [b, a, b]
+        );
+        assert!(signer("later", json!(1)).is_ok());
+        let key = json!({
+            "algorithm": "ed25519",
+            "public_key": BASE64_URL_SAFE_NO_PAD.encode([7u8; 32]),
+            "later": 1
+        });
+        assert!(serde_json::from_value::<CatalogKey>(key).is_ok());
+    }
+
+    #[test]
+    fn catalog_key_is_ed25519_and_32_bytes_of_base64url() {
+        let good = BASE64_URL_SAFE_NO_PAD.encode([7u8; 32]);
+        assert_eq!(catalog_key("ed25519", &good).unwrap().public_key, good);
+        let standard = BASE64_STANDARD.encode([0xfbu8; 32]);
+        assert!(standard.contains('+') || standard.contains('/'));
+        for (algorithm, public_key) in [
+            ("ml-dsa", good.clone()),
+            ("Ed25519", good.clone()),
+            ("ed25519", BASE64_URL_SAFE_NO_PAD.encode([7u8; 31])),
+            ("ed25519", BASE64_URL_SAFE_NO_PAD.encode([7u8; 33])),
+            ("ed25519", BASE64_URL_SAFE.encode([7u8; 32])),
+            ("ed25519", standard),
+        ] {
+            assert!(
+                catalog_key(algorithm, &public_key).is_err(),
+                "{algorithm:?} {public_key:?}"
+            );
+        }
+    }
+}
