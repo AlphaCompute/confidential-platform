@@ -86,13 +86,12 @@ fn response_aad(id: &str, seq: u64, index: u32) -> Result<Vec<u8>, Error> {
 /// Opens one request under `c2s` without a `Channel`: the checks of `open_request` but no replay
 /// table.
 pub(crate) fn open_detached(
-    id: &[u8; 16],
+    id: &str,
     c2s: &[u8; 32],
     frame: &RequestFrame,
     method: &str,
     path: &str,
 ) -> Result<Zeroizing<Vec<u8>>, Error> {
-    let id = BASE64_URL_SAFE_NO_PAD.encode(id);
     if frame.channel != id {
         return Err(Error::Open);
     }
@@ -105,7 +104,7 @@ pub(crate) fn open_detached(
     let plaintext = open(
         c2s,
         nonce(frame.seq, 0),
-        &request_aad(&id, frame.seq, method, path)?,
+        &request_aad(id, frame.seq, method, path)?,
         &ct,
     )?;
     Ok(Zeroizing::new(plaintext))
@@ -159,26 +158,12 @@ impl Channel {
         method: &str,
         path: &str,
     ) -> Result<Zeroizing<Vec<u8>>, Error> {
-        if frame.channel != self.id {
-            return Err(Error::Open);
-        }
-        if frame.seq >= MAX_REQUESTS {
-            return Err(Error::Exhausted);
-        }
         if self.responses.contains_key(&frame.seq) {
             return Err(Error::Replayed(frame.seq));
         }
-        let ct = BASE64_URL_SAFE_NO_PAD
-            .decode(&frame.ct)
-            .map_err(|_| Error::Open)?;
-        let plaintext = open(
-            &self.c2s,
-            nonce(frame.seq, 0),
-            &request_aad(&self.id, frame.seq, method, path)?,
-            &ct,
-        )?;
+        let plaintext = open_detached(&self.id, &self.c2s, frame, method, path)?;
         self.responses.insert(frame.seq, Some(0));
-        Ok(Zeroizing::new(plaintext))
+        Ok(plaintext)
     }
 
     /// The next line of the response to request `seq`, without its trailing newline. Only a

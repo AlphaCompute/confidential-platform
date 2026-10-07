@@ -9,6 +9,8 @@
 use std::time::SystemTime;
 
 use alpha_core::{ComposeHash, OrgId, context, signing_digest};
+use base64::Engine;
+use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zeroize::Zeroizing;
@@ -71,7 +73,13 @@ pub fn open(
     name: &str,
     payload: &Value,
 ) -> Result<(OrgId, Zeroizing<Vec<u8>>), Error> {
-    let plaintext = open_detached(channel, c2s, frame, "PUT", &path(name))?;
+    let plaintext = open_detached(
+        &BASE64_URL_SAFE_NO_PAD.encode(channel),
+        c2s,
+        frame,
+        "PUT",
+        &path(name),
+    )?;
     let short =
         || Error::Malformed("the sealed value is shorter than its digest and organization".into());
     let (prefix, rest) = plaintext.split_first_chunk::<32>().ok_or_else(short)?;
