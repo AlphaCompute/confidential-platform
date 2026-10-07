@@ -73,10 +73,6 @@ impl<'de> Visitor<'de> for Unique {
         Ok(Value::String(v.to_owned()))
     }
 
-    fn visit_string<E>(self, v: String) -> Result<Value, E> {
-        Ok(Value::String(v))
-    }
-
     fn visit_unit<E>(self) -> Result<Value, E> {
         Ok(Value::Null)
     }
