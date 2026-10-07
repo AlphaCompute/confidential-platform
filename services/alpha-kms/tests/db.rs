@@ -738,6 +738,208 @@ async fn a_registered_revision_carries_a_receipt_that_verifies() {
 }
 
 #[tokio::test]
+async fn every_control_success_carries_a_receipt_and_no_error_does() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let admin = h.register_key(&h.root, 72).await;
+
+    let (body, expected) = canonical_revision(&h, &admin);
+    let hash = expected["compose_hash"].clone();
+    for _ in 0..2 {
+        let (status, reply) = h.post("/v1/revisions", body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        verified(
+            &h,
+            &reply,
+            "revision.register",
+            &body,
+            json!({ "compose_hash": hash, "org_id": h.org }),
+        );
+    }
+
+    let path = format!("/v1/revisions/{}/revoke", hash.as_str().unwrap());
+    let body = h.signed(
+        context::CONTROL,
+        json!({ "compose_hash": hash, "issued_at": rfc3339(h.now()) }),
+        &admin,
+    );
+    let (status, first) = h.post(&path, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    verified(
+        &h,
+        &first,
+        "revision.revoke",
+        &body,
+        json!({ "compose_hash": hash }),
+    );
+    let (status, again) = h.post(&path, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    verified(
+        &h,
+        &again,
+        "revision.revoke",
+        &body,
+        json!({ "compose_hash": hash, "revoked_at": first["revoked_at"] }),
+    );
+
+    let value = b"receipted";
+    let payload = json!({ "name": "receipted", "app_ids": [AppId::mint()],
+                          "content_sha256": format!("sha256:{}", hex::encode(Sha256::digest(value))),
+                          "issued_at": rfc3339(h.now()) });
+    let mut body = h.signed(context::SECRET, payload, &admin);
+    body["value"] = json!(b64(value));
+    let (status, reply) = h
+        .call(reqwest::Method::PUT, "/v1/secrets/receipted", body.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    verified(
+        &h,
+        &reply,
+        "secret.put",
+        &body,
+        json!({ "name": "receipted" }),
+    );
+    let (status, reply) = h
+        .call(reqwest::Method::PUT, "/v1/secrets/receipted", body)
+        .await;
+    assert_eq!(
+        (status, code(&reply)),
+        (StatusCode::CONFLICT, "already_exists")
+    );
+    assert!(reply.get("receipt").is_none(), "{reply}");
+
+    let endorsed = SigningKey::from_bytes(&[73u8; 32]);
+    let body = h.signed(
+        context::PRINCIPAL_KEY,
+        json!({ "principal_id": PrincipalId::mint(), "public_key": spki_b64(&endorsed),
+                "label": "endorsed", "issued_at": rfc3339(h.now()) }),
+        &h.root,
+    );
+    let (status, reply) = h.post("/v1/keys", body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    verified(
+        &h,
+        &reply,
+        "key.register",
+        &body,
+        json!({ "org_id": h.org }),
+    );
+    let endorsed_id = reply["id"].clone();
+    let (status, reply) = h.post("/v1/keys", body).await;
+    assert_eq!(
+        (status, code(&reply)),
+        (StatusCode::CONFLICT, "already_exists")
+    );
+    assert!(reply.get("receipt").is_none(), "{reply}");
+
+    let body = root_key_registration(OrgId::mint(), &SigningKey::from_bytes(&[74u8; 32]), h.now());
+    let (status, first) = h.post("/v1/keys", body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    verified(&h, &first, "key.register", &body, json!({}));
+    let (status, again) = h.post("/v1/keys", body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    verified(
+        &h,
+        &again,
+        "key.register",
+        &body,
+        json!({ "id": first["id"] }),
+    );
+
+    let path = format!("/v1/keys/{}/revoke", endorsed_id.as_str().unwrap());
+    let body = h.signed(
+        context::CONTROL,
+        json!({ "key_id": endorsed_id, "reason": "retired", "issued_at": rfc3339(h.now()) }),
+        &admin,
+    );
+    let (status, first) = h.post(&path, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    verified(
+        &h,
+        &first,
+        "key.revoke",
+        &body,
+        json!({ "key_id": endorsed_id }),
+    );
+    let (status, again) = h.post(&path, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    verified(
+        &h,
+        &again,
+        "key.revoke",
+        &body,
+        json!({ "key_id": endorsed_id, "revoked_at": first["revoked_at"] }),
+    );
+
+    let (wrong_context, _) = canonical_revision(&h, &admin);
+    let wrong_context = h.signed(context::CONTROL, wrong_context["payload"].clone(), &admin);
+    let (status, reply) = h.post("/v1/revisions", wrong_context).await;
+    assert_eq!(
+        (status, code(&reply)),
+        (StatusCode::BAD_REQUEST, "signature_invalid")
+    );
+    assert!(reply.get("receipt").is_none(), "{reply}");
+    let unknown = alpha_core::compose_hash("no such compose");
+    let (status, reply) = h
+        .post(
+            &format!("/v1/revisions/{unknown}/revoke"),
+            h.signed(
+                context::CONTROL,
+                json!({ "compose_hash": unknown, "issued_at": rfc3339(h.now()) }),
+                &admin,
+            ),
+        )
+        .await;
+    assert_eq!((status, code(&reply)), (StatusCode::NOT_FOUND, "not_found"));
+    assert!(reply.get("receipt").is_none(), "{reply}");
+}
+
+/// Re-serializing the typed body would drop an explicit `"key_id": null` and vouch for a request
+/// nobody sent.
+#[tokio::test]
+async fn a_receipt_hashes_the_body_as_received() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let mut body =
+        root_key_registration(OrgId::mint(), &SigningKey::from_bytes(&[75u8; 32]), h.now());
+    assert!(body["signature"].get("key_id").is_none(), "{body}");
+    body["signature"]["key_id"] = Value::Null;
+    let (status, reply) = h.post("/v1/keys", body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    verified(&h, &reply, "key.register", &body, json!({}));
+
+    let mut typed = body.clone();
+    typed["signature"].as_object_mut().unwrap().remove("key_id");
+    assert_ne!(
+        receipt::request_sha256(&body).unwrap(),
+        receipt::request_sha256(&typed).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn a_renewed_leaf_leaves_receipts_verifiable() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let admin = h.register_key(&h.root, 76).await;
+    let (body, expected) = canonical_revision(&h, &admin);
+    let expect = json!({ "compose_hash": expected["compose_hash"] });
+    let (status, reply) = h.post("/v1/revisions", body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let before = verified(&h, &reply, "revision.register", &body, expect.clone());
+
+    h.node
+        .issue_own_leaf(&h.node.intermediates().unwrap())
+        .unwrap();
+    let (status, reply) = h.post("/v1/revisions", body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let after = verified(&h, &reply, "revision.register", &body, expect);
+    assert_ne!(before, after);
+}
+
+#[tokio::test]
 async fn attest_release_revoke_and_tamper() {
     let Some(h) = harness().await else {
         return;
