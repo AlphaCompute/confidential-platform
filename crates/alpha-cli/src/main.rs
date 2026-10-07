@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -5,7 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use alpha_attest::PlatformDocument;
 use alpha_cli::call::Route;
-use alpha_cli::deploy::Shroud;
+use alpha_cli::deploy::{Shroud, wrap};
 use alpha_cli::keyfile::{self, Algorithm};
 use alpha_cli::request::Call;
 use alpha_cli::{instances, node, sign};
@@ -137,6 +138,11 @@ enum Command {
         key_id: KeyId,
         app: PathBuf,
     },
+    /// A customer's plain docker-compose as a Revision.
+    Compose {
+        #[command(subcommand)]
+        command: ComposeCommand,
+    },
     /// Catalog entries signed with the catalog key.
     Catalog {
         #[command(subcommand)]
@@ -185,6 +191,27 @@ enum Command {
         custodians: Vec<PathBuf>,
         #[arg(long)]
         endpoint: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ComposeCommand {
+    /// Prints `{compose_hash, compose, secrets}`: the App's `app-compose.json` with
+    /// `alpha-runtime` added, and the secret names whose values the App needs.
+    Wrap {
+        #[arg(long)]
+        app_id: AppId,
+        /// The signed platform document, as `alpha sign --check` reads it; the KMS pins come from
+        /// it once it verifies under the compiled-in release key.
+        #[arg(long)]
+        platform: PathBuf,
+        /// The `alpha-runtime` image, pinned as `<image>@sha256:<digest>`.
+        #[arg(long)]
+        runtime_image: String,
+        /// Refuse every tag instead of asking its registry for the digest.
+        #[arg(long)]
+        no_resolve: bool,
+        compose: PathBuf,
     },
 }
 
@@ -410,6 +437,33 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let wait = wait.map(|secs| (Duration::from_secs(secs), doc.kms_ca_pem.as_str()));
             Ok(alpha_cli::deploy::run(&client, &spec, key_id, &key, shroud.as_ref(), wait).await?)
         }
+        Command::Compose {
+            command:
+                ComposeCommand::Wrap {
+                    app_id,
+                    platform,
+                    runtime_image,
+                    no_resolve,
+                    compose,
+                },
+        } => {
+            let bytes = fs::read(&compose)
+                .map_err(|e| Exit::Usage(format!("{}: {e}", compose.display())))?;
+            let plain = wrap::parse(&bytes)?;
+            let artifact: SignedDocument = serde_json::from_value(read_json(&platform)?)
+                .map_err(|e| Exit::Refused(format!("artifact: {e}")))?;
+            let runtime =
+                wrap::runtime(&artifact, &alpha_cli::release_key()?, now, &runtime_image)?;
+            let digests = if no_resolve {
+                BTreeMap::new()
+            } else {
+                let http = wrap::registry_client_builder()
+                    .build()
+                    .map_err(|e| Exit::Refused(format!("registry client: {e}")))?;
+                wrap::resolve_all(&http, &plain).await?
+            };
+            Ok(json!(wrap::wrap(plain, &digests, app_id, &runtime)?))
+        }
         Command::Catalog {
             command:
                 CatalogCommand::Sign {
@@ -625,5 +679,26 @@ mod tests {
                 .map(|e| e.kind()),
             Some(clap::error::ErrorKind::DisplayVersion)
         );
+    }
+
+    #[test]
+    fn compose_wrap_parses() {
+        let image = format!("r@sha256:{}", "7d".repeat(32));
+        let wrap = |flags: &[&str]| {
+            let args = ["alpha", "compose", "wrap"];
+            Cli::try_parse_from(args.iter().chain(flags).chain(&["c.yaml"])).is_ok()
+        };
+        let app = ["--app-id", "0199a1b2-0000-7000-8000-000000000001"];
+        let platform = ["--platform", "p.json"];
+        let runtime = ["--runtime-image", image.as_str()];
+        assert!(wrap(&[&app[..], &platform, &runtime].concat()));
+        assert!(wrap(
+            &[&app[..], &platform, &runtime, &["--no-resolve"]].concat()
+        ));
+        assert!(!wrap(&[&app[..], &runtime].concat()));
+        assert!(!wrap(&[&app[..], &platform].concat()));
+        assert!(!wrap(
+            &[&["--app-id", "not-a-uuid"][..], &platform, &runtime].concat()
+        ));
     }
 }

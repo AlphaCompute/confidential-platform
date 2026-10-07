@@ -3,9 +3,11 @@
 //! reach only the services that list them, as files `alpha-runtime` writes into a tmpfs volume.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
+use alpha_client::platform::SignedDocument;
 use alpha_core::{AppId, ComposeHash, compose_hash, hex_bytes, is_key_purpose};
+use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::{Mapping, Value as Yaml};
 
@@ -484,6 +486,24 @@ fn list<'a>(value: &'a Yaml, place: &str) -> Result<&'a Vec<Yaml>, String> {
     value
         .as_sequence()
         .ok_or_else(|| format!("{place}: not a list"))
+}
+
+/// The runtime service's pins, only from a platform document verified under `release_key`.
+pub fn runtime(
+    artifact: &SignedDocument,
+    release_key: &VerifyingKey,
+    now: SystemTime,
+    image: &str,
+) -> Result<Runtime, String> {
+    let summary = crate::sign::check(artifact, release_key, now)?;
+    let kms_ca_spki_sha256 = summary.kms_ca_spki_sha256.ok_or(
+        "the platform document names no KMS CA yet; wrap against a document that pins one",
+    )?;
+    Ok(Runtime {
+        image: image.to_owned(),
+        kms_ca_spki_sha256,
+        kms_revisions: summary.kms_revisions,
+    })
 }
 
 /// A client for [`resolve`]; the production caller adds nothing and calls `build`, trusting the
@@ -1157,5 +1177,43 @@ mod tests {
             err.contains("ghcr.io/alphacompute/alpha-runtime:latest"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn pins_come_from_the_verified_platform_document() {
+        let ca = rcgen::generate_simple_self_signed(vec!["kms".into()]).unwrap();
+        let revision = compose_hash("{}");
+        let document = |pem: &str| {
+            json!({
+                "version": 4, "issued_at": "2026-09-14T00:00:00Z",
+                "policy": { "tcb_statuses": ["UpToDate"], "tolerated_advisories": [] },
+                "reference_values": [], "kms_ca_pem": pem,
+                "kms_revisions": [{ "compose_hash": revision, "build": "b", "source_url": "u" }]
+            })
+        };
+        let key = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+        let image = format!(
+            "ghcr.io/alphacompute/alpha-runtime@sha256:{}",
+            "7d".repeat(32)
+        );
+        let now = SystemTime::now();
+        let pem = ca.cert.pem();
+        let artifact = crate::sign::sign(document(&pem), &key).unwrap();
+
+        let pins = runtime(&artifact, &key.verifying_key(), now, &image).unwrap();
+        assert_eq!(
+            Some(pins.kms_ca_spki_sha256.clone()),
+            crate::sign::ca_spki_sha256(&pem).unwrap()
+        );
+        assert!(pins.kms_ca_spki_sha256.starts_with("sha256:"));
+        assert_eq!(pins.kms_revisions, [revision]);
+        assert_eq!(pins.image, image);
+
+        let other = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        assert!(runtime(&artifact, &other.verifying_key(), now, &image).is_err());
+
+        let day0 = crate::sign::sign(document(""), &key).unwrap();
+        let err = runtime(&day0, &key.verifying_key(), now, &image).unwrap_err();
+        assert!(err.contains("names no KMS CA"), "{err}");
     }
 }
