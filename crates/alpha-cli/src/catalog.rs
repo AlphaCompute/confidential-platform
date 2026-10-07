@@ -94,4 +94,39 @@ mod tests {
             expected
         );
     }
+
+    #[test]
+    fn signing_refuses_empty_labels_missing_resources_or_a_tagged_image() {
+        let base = fs::read_to_string(vector().join("app.yaml")).unwrap();
+        let key = signing_key();
+        let sign_yaml = |yaml: &str, id: &str, version: &str, title: &str| {
+            sign(parse(yaml).unwrap(), id, version, title, &key).unwrap_err()
+        };
+        for (id, version, title, flag) in [
+            ("", "1", "CPU App", "--id"),
+            ("cpu-app", "", "CPU App", "--version"),
+            ("cpu-app", "1", "", "--title"),
+        ] {
+            let err = sign_yaml(&base, id, version, title);
+            assert!(err.contains(flag), "{err}");
+        }
+        let resources = "resources:\n  cpu: 1\n  memory_mib: 2048\n";
+        assert!(base.contains(resources));
+        for yaml in [
+            base.replace(resources, ""),
+            base.replace(resources, &format!("{resources}  gpu: 1\n")),
+        ] {
+            let err = sign_yaml(&yaml, "cpu-app", "1", "CPU App");
+            assert!(err.starts_with("resources: "), "{err}");
+        }
+        let tagged = base.replace(
+            "ghcr.io/acme/app@sha256:3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a",
+            "ghcr.io/acme/app:latest",
+        );
+        let err = sign_yaml(&tagged, "cpu-app", "1", "CPU App");
+        assert!(err.contains("digest"), "{err}");
+        let taken = base.replace("  app:\n", "  alpha-runtime:\n");
+        let err = sign_yaml(&taken, "cpu-app", "1", "CPU App");
+        assert!(err.contains("added by alpha deploy"), "{err}");
+    }
 }
