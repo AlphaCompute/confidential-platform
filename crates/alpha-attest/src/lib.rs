@@ -19,8 +19,9 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub use alpha_core::KmsRevision;
 use alpha_core::{AppId, ComposeHash, OrgId, hex_bytes};
-pub use alpha_core::{CatalogKey, KmsRevision, Signer};
+use alpha_core::{CatalogKey, Signer};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 pub use dcap_qvl::QuoteCollateralV3 as Collateral;
