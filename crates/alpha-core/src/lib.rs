@@ -9,6 +9,9 @@
     )
 )]
 
+use serde::{Deserialize, Serialize};
+
+pub mod catalog;
 pub mod compose;
 pub mod id;
 pub mod phala;
@@ -22,6 +25,14 @@ pub use compose::{
 pub use id::{AppId, KeyId, OrgId, PrincipalId, RequestId, SecretId};
 pub use platform::{CatalogKey, KmsRevision, Signer};
 pub use signing::{context, jcs, parse, signing_digest};
+
+/// `{algorithm, signature}`, the signature in base64url.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamedSignature {
+    pub algorithm: String,
+    pub signature: String,
+}
 
 /// The name of a key an App derives: 1 to 64 lowercase ASCII letters, digits, `.`, `_` or `-`,
 /// starting with a letter or digit, so it is safe as a path segment.
