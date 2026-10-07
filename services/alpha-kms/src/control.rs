@@ -488,9 +488,7 @@ async fn register_root_key(
     let p: RootKeyPayload = payload(&body.payload)?;
     let spki = registered_spki(&p.public_key)?;
     within_window(p.issued_at, node.now_utc())?;
-    if body.signature.algorithm != "ed25519" {
-        return Err(ApiError::signature_invalid("unsupported algorithm"));
-    }
+    keys::ed25519_only(&body.signature)?;
     let digest = alpha_core::signing_digest(context::ORG_ROOT_KEY, &body.payload)
         .map_err(|e| ApiError::malformed(format!("payload: {e}")))?;
     if !keys::verify_ed25519(&spki, &digest, &body.signature.signature) {

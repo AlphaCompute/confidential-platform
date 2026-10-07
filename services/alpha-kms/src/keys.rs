@@ -273,6 +273,20 @@ fn verify_document_spki(row: &KeyRow) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// The WebAuthn fields belong to a passkey assertion, so beside `ed25519` they make the body
+/// malformed rather than the signature invalid.
+pub fn ed25519_only(signature: &SignatureObject) -> Result<(), ApiError> {
+    if signature.algorithm != "ed25519" {
+        return Err(ApiError::signature_invalid("unsupported algorithm"));
+    }
+    if signature.authenticator_data.is_some() || signature.client_data_json.is_some() {
+        return Err(ApiError::malformed(
+            "signature: authenticator_data and client_data_json are not allowed with ed25519",
+        ));
+    }
+    Ok(())
+}
+
 /// Verifies a signature object over `document` under `context` and walks the signer's chain.
 pub async fn verify_signed(
     exec: impl PgExecutor<'_> + Copy,
@@ -282,9 +296,7 @@ pub async fn verify_signed(
     document: &Value,
     signed_at: DateTime<Utc>,
 ) -> Result<Chain, ApiError> {
-    if signature.algorithm != "ed25519" {
-        return Err(ApiError::signature_invalid("unsupported algorithm"));
-    }
+    ed25519_only(signature)?;
     let key_id = signature
         .key_id
         .ok_or_else(|| ApiError::malformed("signature: key_id is required"))?;
@@ -304,6 +316,35 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ed25519_only_refuses_other_algorithms_and_webauthn_fields() {
+        let plain = SignatureObject {
+            key_id: None,
+            algorithm: "ed25519".into(),
+            signature: String::new(),
+            authenticator_data: None,
+            client_data_json: None,
+        };
+        assert!(ed25519_only(&plain).is_ok());
+        let other = SignatureObject {
+            algorithm: "ml-dsa".into(),
+            ..plain.clone()
+        };
+        assert_eq!(ed25519_only(&other).unwrap_err().code, "signature_invalid");
+        for (authenticator_data, client_data_json) in [
+            (Some("AAAA".to_owned()), None),
+            (None, Some("e30".to_owned())),
+            (Some("AAAA".to_owned()), Some("e30".to_owned())),
+        ] {
+            let webauthn = SignatureObject {
+                authenticator_data,
+                client_data_json,
+                ..plain.clone()
+            };
+            assert_eq!(ed25519_only(&webauthn).unwrap_err().code, "malformed");
+        }
+    }
 
     #[test]
     fn derivations_separate_salts_orgs_and_anchors() {

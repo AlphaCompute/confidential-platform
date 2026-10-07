@@ -14,6 +14,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Other repositories copy these vectors and check their copy with this same pipeline, not
+      # `sha256sum -c`, which fails on an empty manifest and misses a vector nobody listed. To
+      # update the manifest, run the pipeline with `> SHA256SUMS` in place of the diff.
+      - working-directory: testdata
+        shell: bash
+        run: find . -type f \( -path './webauthn/*' -o -path './receipt/*' -o -path './catalog/*' -o -path './jcs/*' \) -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum | sed 's|  \./|  |' | diff - SHA256SUMS
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings

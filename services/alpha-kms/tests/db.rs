@@ -310,6 +310,14 @@ async fn a_root_key_claims_its_organization_once() {
         (status, code(&reply)),
         (StatusCode::BAD_REQUEST, "signature_invalid")
     );
+    let mut webauthn =
+        root_key_registration(OrgId::mint(), &SigningKey::from_bytes(&[34u8; 32]), h.now());
+    webauthn["signature"]["client_data_json"] = json!("e30");
+    let (status, reply) = h.post("/v1/keys", webauthn).await;
+    assert_eq!(
+        (status, code(&reply)),
+        (StatusCode::BAD_REQUEST, "malformed")
+    );
 
     // An identifier spelled in uppercase is the same identifier: the row keeps the parsed value,
     // so a claim made that way must go on signing rather than burning the identifier.
@@ -390,6 +398,13 @@ async fn control_routes_register_revoke_and_put() {
     assert_eq!(
         (status, code(&reply)),
         (StatusCode::BAD_REQUEST, "signature_invalid")
+    );
+    let mut webauthn = h.signed(context::PRINCIPAL_KEY, payload.clone(), &h.root);
+    webauthn["signature"]["authenticator_data"] = json!("AAAA");
+    let (status, reply) = h.post("/v1/keys", webauthn).await;
+    assert_eq!(
+        (status, code(&reply)),
+        (StatusCode::BAD_REQUEST, "malformed")
     );
     let old = json!({ "principal_id": PrincipalId::mint(), "public_key": payload["public_key"], "label": "old", "issued_at": "2020-01-01T00:00:00Z" });
     let (status, reply) = h

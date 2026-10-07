@@ -29,8 +29,9 @@ fn to_json(value: &impl serde::Serialize) -> Result<String, JsError> {
     serde_json::to_string(value).map_err(|e| js(Error::Malformed(e.to_string())))
 }
 
-/// `{version, issued_at, kms_ca_pem}` of a platform document that verifies under the release key
-/// compiled into this package.
+/// `{version, issued_at, kms_ca_pem, kms_revisions}`, plus `signer` and `catalog_key` when the
+/// document has them, of a platform document that verifies under the release key compiled into
+/// this package.
 #[wasm_bindgen(js_name = verifyPlatform)]
 pub fn verify_platform(signed_json: &str, now_ms: f64) -> Result<String, JsError> {
     let signed: platform::SignedDocument = parse("platform document", signed_json)?;

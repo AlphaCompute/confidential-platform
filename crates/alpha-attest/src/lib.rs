@@ -19,7 +19,9 @@ use std::fmt;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub use alpha_core::KmsRevision;
 use alpha_core::{AppId, ComposeHash, OrgId, hex_bytes};
+use alpha_core::{CatalogKey, Signer};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 pub use dcap_qvl::QuoteCollateralV3 as Collateral;
@@ -119,6 +121,10 @@ pub struct PlatformDocument {
     pub reference_values: Vec<ReferenceValue>,
     pub kms_ca_pem: String,
     pub kms_revisions: Vec<KmsRevision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer: Option<Signer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_key: Option<CatalogKey>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,13 +146,6 @@ pub struct ReferenceMeasurements {
     pub rtmr0: Measurement,
     pub rtmr1: Measurement,
     pub rtmr2: Measurement,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KmsRevision {
-    pub compose_hash: ComposeHash,
-    pub build: String,
-    pub source_url: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -83,4 +83,26 @@ mod tests {
         assert!(check(&artifact, &other.verifying_key(), SystemTime::now()).is_err());
         assert!(ca_spki_sha256("not a pem").is_err());
     }
+
+    #[test]
+    fn sign_refuses_a_document_whose_signer_breaks_a_rule() {
+        let key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut document = json!({
+            "version": 4, "issued_at": "2026-09-14T00:00:00Z",
+            "policy": { "tcb_statuses": ["UpToDate"], "tolerated_advisories": [] },
+            "reference_values": [], "kms_ca_pem": "",
+            "kms_revisions": [{
+                "compose_hash": alpha_core::compose_hash("{}"), "build": "b", "source_url": "u"
+            }],
+            "signer": {
+                "origins": ["https://sign.example"],
+                "rp_id": "sign.example",
+                "bundle_sha256": format!("sha256:{}", "0".repeat(64)),
+                "api_origin": "https://api.example"
+            }
+        });
+        assert!(sign(document.clone(), &key).is_ok());
+        document["signer"]["origins"][0] = json!("https://sign.example/path");
+        assert!(sign(document, &key).is_err());
+    }
 }
