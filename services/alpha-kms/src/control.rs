@@ -1,5 +1,6 @@
 //! The Control API: five mutations, each `{payload, signature}`, the organization taken from the key,
-//! idempotent as the table says, one transaction with its audit row.
+//! idempotent as the table says, one transaction with its audit row; every success carries the
+//! node's receipt.
 
 use std::sync::Arc;
 
@@ -21,7 +22,7 @@ use crate::body::Body;
 use crate::error::ApiError;
 use crate::instance::load_revision;
 use crate::keys::{self, Chain, SignatureObject};
-use crate::{Intermediates, Node, rfc3339};
+use crate::{Intermediates, Node, certs, rfc3339};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -113,13 +114,43 @@ async fn denied(node: &Node, key_id: Option<KeyId>, action: &str, error: &ApiErr
     .await;
 }
 
+fn receipted(
+    node: &Node,
+    route: &str,
+    request: &Value,
+    response: Value,
+) -> Result<Value, ApiError> {
+    let Value::Object(mut fields) = response else {
+        return Err(ApiError::internal("a Control response is not an object"));
+    };
+    let leaf = certs::pem(&node.server_cert.leaf_der()?);
+    // Read after the leaf, so a renewal in between cannot put issued_at before its notBefore.
+    let issued_at = node.now();
+    let receipt = alpha_channel::receipt::issue(
+        &node.runtime_key,
+        leaf,
+        route,
+        request,
+        Value::Object(fields.clone()),
+        issued_at,
+    )
+    .map_err(|e| ApiError::internal(format!("receipt: {e}")))?;
+    let receipt =
+        serde_json::to_value(receipt).map_err(|e| ApiError::internal(format!("receipt: {e}")))?;
+    fields.insert("receipt".into(), receipt);
+    Ok(Value::Object(fields))
+}
+
+/// A receipt that cannot be built is not audited as denied: the mutation and its row committed.
 macro_rules! audited_route {
-    ($node:expr, $body:expr, $action:literal, $inner:expr) => {{
+    ($node:expr, $body:expr, $request:expr, $action:literal, $inner:expr) => {{
         let result = $inner.await;
         if let Err(e) = &result {
             denied(&$node, $body.signature.key_id, $action, e).await;
         }
-        result.map(Json)
+        result
+            .and_then(|response| receipted(&$node, $action, &$request, response))
+            .map(Json)
     }};
 }
 
@@ -132,9 +163,9 @@ struct RevisionPayload {
 
 pub async fn register_revision(
     State(node): State<Arc<Node>>,
-    Body(body, _): Body<Signed>,
+    Body(body, request): Body<Signed>,
 ) -> Result<Json<Value>, ApiError> {
-    audited_route!(node, body, "revision.register", async {
+    audited_route!(node, body, request, "revision.register", async {
         let keys = node.intermediates()?;
         let p: RevisionPayload = payload(&body.payload)?;
         let compose_hash = alpha_core::check_registration(&p.compose, p.app_id)?;
@@ -222,9 +253,9 @@ struct RevokeRevisionPayload {
 pub async fn revoke_revision(
     State(node): State<Arc<Node>>,
     Path(path_hash): Path<String>,
-    Body(body, _): Body<Signed>,
+    Body(body, request): Body<Signed>,
 ) -> Result<Json<Value>, ApiError> {
-    audited_route!(node, body, "revision.revoke", async {
+    audited_route!(node, body, request, "revision.revoke", async {
         let keys = node.intermediates()?;
         let p: RevokeRevisionPayload = payload(&body.payload)?;
         if path_hash != p.compose_hash.to_string() {
@@ -281,14 +312,14 @@ pub async fn put_secret(
             signature,
             value,
         },
-        _,
+        request,
     ): Body<PutBody>,
 ) -> Result<Json<Value>, ApiError> {
     let body = Signed {
         payload: document,
         signature,
     };
-    audited_route!(node, body, "secret.put", async {
+    audited_route!(node, body, request, "secret.put", async {
         let keys = node.intermediates()?;
         let p: SecretPayload = payload(&body.payload)?;
         if p.name != name {
@@ -420,9 +451,9 @@ fn registered_spki(public_key: &str) -> Result<Vec<u8>, ApiError> {
 /// key an existing one endorses.
 pub async fn register_key(
     State(node): State<Arc<Node>>,
-    Body(body, _): Body<Signed>,
+    Body(body, request): Body<Signed>,
 ) -> Result<Json<Value>, ApiError> {
-    audited_route!(node, body, "key.register", async {
+    audited_route!(node, body, request, "key.register", async {
         let keys = node.intermediates()?;
         match body.signature.key_id {
             Some(_) => register_endorsed_key(&node, &keys, &body).await,
@@ -601,9 +632,9 @@ struct RevokeKeyPayload {
 pub async fn revoke_key(
     State(node): State<Arc<Node>>,
     Path(path_id): Path<String>,
-    Body(body, _): Body<Signed>,
+    Body(body, request): Body<Signed>,
 ) -> Result<Json<Value>, ApiError> {
-    audited_route!(node, body, "key.revoke", async {
+    audited_route!(node, body, request, "key.revoke", async {
         let keys = node.intermediates()?;
         let p: RevokeKeyPayload = payload(&body.payload)?;
         if path_id != p.key_id.to_string() {

@@ -48,6 +48,15 @@ impl ServerCert {
         *self.0.write() = certified(runtime_pkcs8, vec![leaf_der, ca_der])?;
         Ok(())
     }
+
+    pub fn leaf_der(&self) -> Result<Vec<u8>, ApiError> {
+        Ok(self
+            .0
+            .read()
+            .end_entity_cert()
+            .map_err(|e| ApiError::internal(format!("server leaf: {e}")))?
+            .to_vec())
+    }
 }
 
 impl ResolvesServerCert for ServerCert {

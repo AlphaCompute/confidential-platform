@@ -13,6 +13,7 @@ mod common;
 use std::fs;
 use std::time::Duration;
 
+use alpha_channel::receipt::{self, Expected, Receipt};
 use alpha_core::{AppId, ComposeHash, KeyId, OrgId, PrincipalId, context};
 use alpha_crypto::{INFO_NODE_BOOTSTRAP, INFO_UNSEAL_SHARE};
 use alpha_kms::{certs, instance, platform, rfc3339};
@@ -682,6 +683,57 @@ async fn control_routes_register_revoke_and_put() {
                 .any(|(_, outcome, _)| outcome == "ok"),
             "{action}"
         );
+    }
+}
+
+/// Verifies `reply`'s receipt against the bootstrap CA and this node's Revision, checks that the
+/// signed response is the reply without `receipt`, and returns the receipt's leaf.
+fn verified(h: &Harness, reply: &Value, route: &str, request: &Value, expect: Value) -> String {
+    let mut rest = reply.clone();
+    let receipt: Receipt =
+        serde_json::from_value(rest.as_object_mut().unwrap().remove("receipt").unwrap()).unwrap();
+    let signed = receipt::verify(
+        &receipt,
+        &h.ca_pem,
+        &[h.node.compose_hash],
+        &Expected {
+            route: route.into(),
+            request_sha256: receipt::request_sha256(request).unwrap(),
+            response: expect.as_object().unwrap().clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(signed, rest);
+    receipt.certificate_chain[0].clone()
+}
+
+fn canonical_revision(h: &Harness, signer: &(KeyId, SigningKey)) -> (Value, Value) {
+    let compose =
+        fs::read_to_string(testdata().join("manifest/01-canonical/app-compose.json")).unwrap();
+    let expected: Value = serde_json::from_str(
+        &fs::read_to_string(testdata().join("manifest/01-canonical/expected.json")).unwrap(),
+    )
+    .unwrap();
+    let body = h.signed(
+        context::REVISION,
+        json!({ "app_id": expected["app_id"], "compose": compose }),
+        signer,
+    );
+    (body, expected)
+}
+
+#[tokio::test]
+async fn a_registered_revision_carries_a_receipt_that_verifies() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let admin = h.register_key(&h.root, 71).await;
+    let (body, expected) = canonical_revision(&h, &admin);
+    let expect = json!({ "compose_hash": expected["compose_hash"], "org_id": h.org });
+    for _ in 0..2 {
+        let (status, reply) = h.post("/v1/revisions", body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        verified(&h, &reply, "revision.register", &body, expect.clone());
     }
 }
 
