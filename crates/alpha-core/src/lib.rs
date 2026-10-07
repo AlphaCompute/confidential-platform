@@ -12,6 +12,7 @@
 pub mod compose;
 pub mod id;
 pub mod phala;
+pub mod platform;
 pub mod signing;
 
 pub use compose::{
@@ -19,6 +20,7 @@ pub use compose::{
     hex_bytes,
 };
 pub use id::{AppId, KeyId, OrgId, PrincipalId, RequestId, SecretId};
+pub use platform::{CatalogKey, KmsRevision, Signer};
 pub use signing::{context, jcs, signing_digest};
 
 /// The name of a key an App derives: 1 to 64 lowercase ASCII letters, digits, `.`, `_` or `-`,
