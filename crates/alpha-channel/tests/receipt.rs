@@ -7,6 +7,7 @@
     clippy::arithmetic_side_effects
 )]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -22,6 +23,7 @@ use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
     Issuer, KeyUsagePurpose, PublicKeyData, SanType, SerialNumber,
 };
+use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -304,17 +306,36 @@ fn vectors() -> Vec<(&'static str, Vec<u8>)> {
         bytes.push(b'\n');
         (name, bytes)
     }));
+
+    // A reader keeping the first of a repeated key sees `revision.revoke`; the signature covers
+    // the last. No `Value` can hold the repeat, so it is spliced into the canonical text.
+    let document = String::from_utf8(alpha_core::jcs(&valid.document).unwrap()).unwrap();
+    let repeated = document.replacen('{', r#"{"route":"revision.revoke","#, 1);
+    let canonical = String::from_utf8(
+        alpha_core::jcs(&vector(&request, &matching, &valid, "malformed")).unwrap(),
+    )
+    .unwrap();
+    let spliced = canonical.replacen(
+        &format!(r#""document":{document}"#),
+        &format!(r#""document":{repeated}"#),
+        1,
+    );
+    assert_ne!(spliced, canonical);
+    out.push(("duplicate-key.json", format!("{spliced}\n").into_bytes()));
     out
 }
 
-fn checked_in() -> Vec<(String, Value)> {
-    let mut out: Vec<(String, Value)> = fs::read_dir(vectors_dir())
+/// Each vector with its receipt's bytes as written, which a `Value` would lose a repeated key of.
+fn checked_in() -> Vec<(String, Value, String)> {
+    let mut out: Vec<(String, Value, String)> = fs::read_dir(vectors_dir())
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
         .filter(|name| name.ends_with(".json"))
         .map(|name| {
             let bytes = fs::read(vectors_dir().join(&name)).unwrap();
-            (name, serde_json::from_slice(&bytes).unwrap())
+            let raw: BTreeMap<String, Box<RawValue>> = serde_json::from_slice(&bytes).unwrap();
+            let receipt = raw["receipt"].get().to_owned();
+            (name, serde_json::from_slice(&bytes).unwrap(), receipt)
         })
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -326,9 +347,12 @@ fn ca_pem() -> String {
 }
 
 fn verify_vector(v: &Value) -> Result<Value, alpha_channel::Error> {
-    let receipt: Receipt = serde_json::from_value(v["receipt"].clone()).unwrap();
+    verify_raw(v, &serde_json::to_vec(&v["receipt"]).unwrap())
+}
+
+fn verify_raw(v: &Value, receipt: &[u8]) -> Result<Value, alpha_channel::Error> {
     let revisions: Vec<ComposeHash> = serde_json::from_value(v["kms_revisions"].clone()).unwrap();
-    receipt::verify(&receipt, &ca_pem(), &revisions, &typed(&v["expected"]))
+    receipt::verify(receipt, &ca_pem(), &revisions, &typed(&v["expected"]))
 }
 
 #[test]
@@ -336,7 +360,7 @@ fn a_receipt_verifies_against_its_ca_with_the_matching_expectation() {
     let node = node();
     let issued = issue(&node.key, node.leaf, NOT_BEFORE);
     let verified = receipt::verify(
-        &issued,
+        &serde_json::to_vec(&issued).unwrap(),
         &node.ca.pem,
         &[revision()],
         &typed(&expected(&request())),
@@ -373,14 +397,17 @@ fn receipt_vectors_regenerate_byte_for_byte() {
 #[test]
 fn every_receipt_vector_gives_its_recorded_result() {
     let vectors = checked_in();
-    assert_eq!(vectors.len(), 8);
-    for (name, v) in &vectors {
+    assert_eq!(vectors.len(), 9);
+    for (name, v, receipt) in &vectors {
         assert_eq!(
             receipt::request_sha256(&v["request"]).unwrap(),
             v["expected"]["request_sha256"],
             "{name}"
         );
-        match (verify_vector(v), v["result"].as_str().unwrap()) {
+        match (
+            verify_raw(v, receipt.as_bytes()),
+            v["result"].as_str().unwrap(),
+        ) {
             (Ok(response), "ok") => assert_eq!(response, v["receipt"]["document"]["response"]),
             (Err(e), result) => assert_eq!(e.code(), result, "{name}: {e}"),
             (Ok(_), result) => panic!("{name}: accepted, expected {result}"),
@@ -393,6 +420,12 @@ fn receipt_checks_at_the_edges_of_the_vectors() {
     let valid: Value =
         serde_json::from_slice(&fs::read(vectors_dir().join("valid.json")).unwrap()).unwrap();
     let code = |v: &Value| verify_vector(v).map(|_| "ok").unwrap_or_else(|e| e.code());
+
+    let duplicate: Value =
+        serde_json::from_slice(&fs::read(vectors_dir().join("duplicate-key.json")).unwrap())
+            .unwrap();
+    assert_eq!(duplicate["result"], "malformed");
+    assert_eq!(code(&duplicate), "ok", "the repeated key is its only fault");
 
     let mut v = valid.clone();
     v["expected"]["response"] = json!({});

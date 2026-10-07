@@ -51,10 +51,11 @@ pub fn verify_kms_receipt(
     kms_revisions_json: &str,
     expected_json: &str,
 ) -> Result<String, JsError> {
-    let signed: receipt::Receipt = parse("receipt", receipt_json)?;
     let revisions: Vec<ComposeHash> = parse("kms revisions", kms_revisions_json)?;
     let expected: receipt::Expected = parse("expected", expected_json)?;
-    to_json(&receipt::verify(&signed, kms_ca_pem, &revisions, &expected).map_err(js)?)
+    to_json(
+        &receipt::verify(receipt_json.as_bytes(), kms_ca_pem, &revisions, &expected).map_err(js)?,
+    )
 }
 
 /// `{name: {image, environment}}` for every service of an `app-compose.json`.

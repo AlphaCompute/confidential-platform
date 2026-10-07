@@ -13,7 +13,7 @@ mod common;
 use std::fs;
 use std::time::Duration;
 
-use alpha_channel::receipt::{self, Expected, Receipt};
+use alpha_channel::receipt::{self, Expected};
 use alpha_core::{AppId, ComposeHash, KeyId, OrgId, PrincipalId, context};
 use alpha_crypto::{INFO_NODE_BOOTSTRAP, INFO_UNSEAL_SHARE};
 use alpha_kms::{certs, instance, platform, rfc3339};
@@ -680,10 +680,9 @@ async fn control_routes_register_revoke_and_put() {
 /// signed response is the reply without `receipt`, and returns the receipt's leaf.
 fn verified(h: &Harness, reply: &Value, route: &str, request: &Value, expect: Value) -> String {
     let mut rest = reply.clone();
-    let receipt: Receipt =
-        serde_json::from_value(rest.as_object_mut().unwrap().remove("receipt").unwrap()).unwrap();
+    let receipt = rest.as_object_mut().unwrap().remove("receipt").unwrap();
     let signed = receipt::verify(
-        &receipt,
+        &serde_json::to_vec(&receipt).unwrap(),
         &h.ca_pem,
         &[h.node.compose_hash],
         &Expected {
@@ -694,7 +693,7 @@ fn verified(h: &Harness, reply: &Value, route: &str, request: &Value, expect: Va
     )
     .unwrap();
     assert_eq!(signed, rest);
-    receipt.certificate_chain[0].clone()
+    receipt["certificate_chain"][0].as_str().unwrap().to_owned()
 }
 
 fn canonical_revision(h: &Harness, signer: &(KeyId, SigningKey)) -> (Value, Value) {

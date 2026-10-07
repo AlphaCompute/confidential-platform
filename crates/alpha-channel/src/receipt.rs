@@ -86,13 +86,17 @@ pub fn issue(
 }
 
 /// Returns the response the KMS signed; callers use it instead of the reply's top-level fields,
-/// which no signature covers.
+/// which no signature covers. Takes the receipt's bytes because a typed `Receipt` has already
+/// collapsed a repeated key to its last value, which other verifiers refuse.
 pub fn verify(
-    receipt: &Receipt,
+    receipt_json: &[u8],
     kms_ca_pem: &str,
     kms_revisions: &[ComposeHash],
     expected: &Expected,
 ) -> Result<Value, Error> {
+    let receipt: Receipt = alpha_core::parse(receipt_json)
+        .and_then(serde_json::from_value)
+        .map_err(|e| Error::Malformed(format!("receipt: {e}")))?;
     let foreign = |m: &str| Error::ForeignCertificate(m.into());
     let [leaf_pem] = receipt.certificate_chain.as_slice() else {
         return Err(foreign("a receipt carries exactly the node's leaf"));

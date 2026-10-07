@@ -7,6 +7,8 @@
     clippy::arithmetic_side_effects
 )]
 
+use std::collections::BTreeMap;
+
 use alpha_channel::wasm::{
     Initiator, Responder, compose_services, signable, verify_grant, verify_kms_receipt,
     verify_member_request, verify_platform,
@@ -16,6 +18,7 @@ use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature, SigningKey};
 use p256::pkcs8::EncodePublicKey;
+use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use wasm_bindgen::{JsCast, JsError, JsValue};
 use wasm_bindgen_test::wasm_bindgen_test;
@@ -48,6 +51,7 @@ const RECEIPT_VECTORS: &[(&str, &str)] = &[
     r!("other-response"),
     r!("tampered-response"),
     r!("issued-at-outside"),
+    r!("duplicate-key"),
 ];
 
 fn expected() -> String {
@@ -237,10 +241,9 @@ fn member_documents_from_signable_verify_through_the_exports() {
 fn kms_receipt_vectors_give_their_recorded_result_through_the_export() {
     for (name, text) in RECEIPT_VECTORS {
         let v: Value = serde_json::from_str(text).unwrap();
-        // Re-serializing may reorder the receipt's keys; the signature covers JCS of the
-        // document, so that must not matter.
+        let raw: BTreeMap<String, Box<RawValue>> = serde_json::from_str(text).unwrap();
         let out = verify_kms_receipt(
-            &v["receipt"].to_string(),
+            raw["receipt"].get(),
             RECEIPT_CA,
             &v["kms_revisions"].to_string(),
             &v["expected"].to_string(),
