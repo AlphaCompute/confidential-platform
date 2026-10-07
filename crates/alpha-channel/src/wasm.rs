@@ -9,7 +9,9 @@ use alpha_core::ComposeHash;
 use serde_json::json;
 use wasm_bindgen::prelude::*;
 
-use crate::{Error, compose, frame, handshake, member, platform, receipt, rfc3339, sha256_label};
+use crate::{
+    Error, compose, frame, handshake, member, platform, receipt, rfc3339, secret, sha256_label,
+};
 
 fn js(e: Error) -> JsError {
     JsError::new(&format!("{}: {e}", e.code()))
@@ -126,6 +128,66 @@ impl Initiator {
         self.verified
             .clone()
             .ok_or_else(|| js(Error::Malformed("the initiator has not finished".into())))
+    }
+}
+
+/// One put-Secret's sealer: `hello()` goes to the KMS's `POST /v1/channel`, and its answer comes
+/// back to `seal`. A sealer seals once, so no two plaintexts share a nonce under one channel key.
+#[wasm_bindgen]
+pub struct KmsSecretSealer {
+    inner: Option<handshake::Initiator>,
+    hello: String,
+}
+
+#[wasm_bindgen]
+impl KmsSecretSealer {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Result<KmsSecretSealer, JsError> {
+        let (inner, hello) = handshake::Initiator::new().map_err(js)?;
+        Ok(Self {
+            inner: Some(inner),
+            hello: to_json(&hello)?,
+        })
+    }
+
+    /// The ClientHello JSON to post to the KMS.
+    pub fn hello(&self) -> String {
+        self.hello.clone()
+    }
+
+    /// The put body's `sealed` member, `{ticket, frame}`, once the reply verifies as a node of the
+    /// platform: `platform_json` is `verifyPlatform`'s output, and `payload_json` is the put's
+    /// payload exactly as it will be signed and sent.
+    pub fn seal(
+        &mut self,
+        server_hello_json: &str,
+        platform_json: &str,
+        payload_json: &str,
+        value: &[u8],
+        now_ms: f64,
+    ) -> Result<String, JsError> {
+        let hello: handshake::ServerHello = parse("server hello", server_hello_json)?;
+        let view: platform::PlatformView = parse("platform", platform_json)?;
+        let payload: serde_json::Value = parse("payload", payload_json)?;
+        let now = at(now_ms)?;
+        let inner = self
+            .inner
+            .take()
+            .ok_or_else(|| js(Error::Malformed("the sealer already sealed".into())))?;
+        let revisions: Vec<ComposeHash> =
+            view.kms_revisions.iter().map(|r| r.compose_hash).collect();
+        to_json(
+            &secret::seal(
+                inner,
+                &hello,
+                &view.kms_ca_pem,
+                &revisions,
+                &payload,
+                value,
+                now,
+            )
+            .map_err(js)?,
+        )
     }
 }
 
