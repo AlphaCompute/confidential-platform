@@ -518,7 +518,10 @@ pub async fn resolve(http: &reqwest::Client, image: &str) -> Result<String, Stri
         .send()
         .await
         .map_err(failed)?;
-    let Token { token } = answered(image, token)?.json().await.map_err(failed)?;
+    // A JSON error can quote the body, which a refusal never repeats.
+    let Token { token } = answered(image, token)?.json().await.map_err(|_| {
+        format!("could not resolve {image}: the token answer carries no token; pin @sha256:")
+    })?;
     let manifest = http
         .head(format!("https://{api}/v2/{repository}/manifests/{tag}"))
         .bearer_auth(token)
@@ -564,9 +567,17 @@ fn answered(image: &str, response: reqwest::Response) -> Result<reqwest::Respons
     if status.is_success() {
         return Ok(response);
     }
-    Err(format!(
-        "could not resolve {image}: the registry answered {status}; pin @sha256:"
-    ))
+    // Docker Hub and quay answer 401 for a missing repository as for a private one, and ghcr
+    // refuses the token with 403, so one message covers all of them.
+    Err(match status.as_u16() {
+        401 | 403 | 404 => format!(
+            "image {image}: the registry answered {status}, it is private or missing; make it public or pin @sha256: yourself"
+        ),
+        429 => {
+            format!("image {image}: the registry answered {status}; retry later or pin a digest")
+        }
+        _ => format!("could not resolve {image}: the registry answered {status}; pin @sha256:"),
+    })
 }
 
 fn pinned(image: &str) -> bool {

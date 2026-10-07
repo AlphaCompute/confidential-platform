@@ -256,3 +256,189 @@ async fn a_docker_hub_tag_resolves_and_is_pinned() {
     );
     assert_eq!(registry.requests(), [NGINX_TOKEN, NGINX_HEAD]);
 }
+
+#[tokio::test]
+async fn ghcr_and_quay_tags_resolve_with_their_own_tokens() {
+    let registry = FakeRegistry::start().await;
+    let client = registry.client();
+    for (image, token, head, first) in [
+        (
+            "ghcr.io/acme/app:1",
+            "GET ghcr.io/token?service=ghcr.io&scope=repository:acme/app:pull",
+            "HEAD ghcr.io/v2/acme/app/manifests/1",
+            "ec737804",
+        ),
+        (
+            "quay.io/prometheus/node-exporter:v1",
+            "GET quay.io/v2/auth?service=quay.io&scope=repository:prometheus/node-exporter:pull",
+            "HEAD quay.io/v2/prometheus/node-exporter/manifests/v1",
+            "1b4e4438",
+        ),
+    ] {
+        registry.digest(head, &digest(first));
+        assert_eq!(resolve(&client, image).await.unwrap(), digest(first));
+        assert_eq!(registry.requests(), [token, head]);
+    }
+}
+
+fn refused(err: &str, image: &str, says: &str) {
+    assert!(err.contains(image), "{err}");
+    assert!(err.contains(says), "{err}");
+    assert!(!err.contains("token-"), "{err}");
+}
+
+#[tokio::test]
+async fn a_private_or_missing_image_says_make_it_public_or_pin() {
+    let registry = FakeRegistry::start().await;
+    let client = registry.client();
+    let says = "make it public or pin @sha256: yourself";
+
+    let token = "GET ghcr.io/token?service=ghcr.io&scope=repository:acme/private:pull";
+    registry.reply(token, StatusCode::FORBIDDEN, None);
+    let err = resolve(&client, "ghcr.io/acme/private:1")
+        .await
+        .unwrap_err();
+    refused(&err, "ghcr.io/acme/private:1", says);
+    assert_eq!(registry.requests(), [token]);
+
+    registry.reply(NGINX_HEAD, StatusCode::UNAUTHORIZED, None);
+    let err = resolve(&client, "nginx:1.27").await.unwrap_err();
+    refused(&err, "nginx:1.27", says);
+    assert_eq!(registry.requests(), [NGINX_TOKEN, NGINX_HEAD]);
+
+    let err = resolve(&client, "quay.io/acme/app:gone").await.unwrap_err();
+    refused(&err, "quay.io/acme/app:gone", says);
+    assert_eq!(registry.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn a_rate_limit_says_retry_later() {
+    let registry = FakeRegistry::start().await;
+    registry.reply(NGINX_HEAD, StatusCode::TOO_MANY_REQUESTS, None);
+    let err = resolve(&registry.client(), "nginx:1.27").await.unwrap_err();
+    refused(&err, "nginx:1.27", "retry later or pin a digest");
+    assert_eq!(registry.requests(), [NGINX_TOKEN, NGINX_HEAD]);
+}
+
+#[tokio::test]
+async fn anything_else_says_could_not_resolve() {
+    let registry = FakeRegistry::start().await;
+    let client = registry.client();
+    let says = "could not resolve nginx:1.27";
+    let answers: [Reply; 5] = [
+        (StatusCode::INTERNAL_SERVER_ERROR, None),
+        (
+            StatusCode::FOUND,
+            Some(("location", "https://quay.io/elsewhere".to_owned())),
+        ),
+        (StatusCode::OK, None),
+        (
+            StatusCode::OK,
+            Some((
+                "docker-content-digest",
+                format!("sha256:{}", "AB".repeat(32)),
+            )),
+        ),
+        (
+            StatusCode::OK,
+            Some((
+                "docker-content-digest",
+                format!("sha512:{}", "ab".repeat(64)),
+            )),
+        ),
+    ];
+    for (status, header) in answers {
+        registry.reply(
+            NGINX_HEAD,
+            status,
+            header.as_ref().map(|(k, v)| (*k, v.as_str())),
+        );
+        let err = resolve(&client, "nginx:1.27").await.unwrap_err();
+        refused(&err, "nginx:1.27", says);
+        assert!(err.contains("; pin @sha256:"), "{err}");
+        assert_eq!(registry.requests(), [NGINX_TOKEN, NGINX_HEAD], "{status}");
+    }
+
+    registry.reply(NGINX_TOKEN, StatusCode::OK, None);
+    let err = resolve(&client, "nginx:1.27").await.unwrap_err();
+    refused(&err, "nginx:1.27", says);
+    assert_eq!(registry.requests(), [NGINX_TOKEN]);
+
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let err = resolve(&registry.client_at(closed), "nginx:1.27")
+        .await
+        .unwrap_err();
+    refused(&err, "nginx:1.27", says);
+    assert!(registry.requests().is_empty());
+}
+
+#[tokio::test]
+async fn one_request_per_distinct_image() {
+    let registry = FakeRegistry::start().await;
+    let redis_head = "HEAD registry-1.docker.io/v2/library/redis/manifests/7";
+    registry.digest(NGINX_HEAD, &digest("aa"));
+    registry.digest(redis_head, &digest("bb"));
+    let text = compose(&[
+        ("web", "nginx:1.27"),
+        ("worker", "nginx:1.27"),
+        ("cache", "redis:7"),
+    ]);
+    let plain = parse(text.as_bytes()).unwrap();
+    let digests = resolve_all(&registry.client(), &plain).await.unwrap();
+    assert_eq!(
+        digests,
+        BTreeMap::from([
+            ("nginx:1.27".to_owned(), digest("aa")),
+            ("redis:7".to_owned(), digest("bb")),
+        ])
+    );
+    assert_eq!(
+        registry.requests(),
+        [
+            NGINX_TOKEN,
+            NGINX_HEAD,
+            "GET auth.docker.io/token?service=registry.docker.io&scope=repository:library/redis:pull",
+            redis_head,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn pinned_images_make_no_request() {
+    let registry = FakeRegistry::start().await;
+    let tagged_and_pinned = format!("nginx:1.27@{}", digest("cc"));
+    let text = compose(&[
+        ("web", &tagged_and_pinned),
+        ("cache", &format!("ghcr.io/acme/cache@{}", digest("dd"))),
+        ("db", &format!("registry.example.com/db@{}", digest("ee"))),
+    ]);
+    let digests = resolve_all(&registry.client(), &parse(text.as_bytes()).unwrap())
+        .await
+        .unwrap();
+    assert!(digests.is_empty());
+    assert!(registry.requests().is_empty());
+    let out = wrapped(&text, &digests);
+    assert_eq!(out, wrapped(&text, &BTreeMap::new()));
+    assert!(compose_file(&out).contains(&format!("image: {tagged_and_pinned}\n")));
+}
+
+#[tokio::test]
+async fn a_refused_compose_makes_no_request() {
+    let registry = FakeRegistry::start().await;
+    let other = compose(&[("web", "registry.example.com/app:1")]);
+    let privileged = compose(&[("web", "nginx:1.27")]) + "    privileged: true\n";
+    for text in [other, privileged] {
+        assert!(parse(text.as_bytes()).is_err(), "{text}");
+    }
+    let err = resolve(&registry.client(), "registry.example.com/app:1")
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("outside Docker Hub, ghcr.io and quay.io"),
+        "{err}"
+    );
+    assert!(registry.requests().is_empty());
+}
