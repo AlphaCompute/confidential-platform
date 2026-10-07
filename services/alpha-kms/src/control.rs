@@ -132,7 +132,7 @@ struct RevisionPayload {
 
 pub async fn register_revision(
     State(node): State<Arc<Node>>,
-    Body(body): Body<Signed>,
+    Body(body, _): Body<Signed>,
 ) -> Result<Json<Value>, ApiError> {
     audited_route!(node, body, "revision.register", async {
         let keys = node.intermediates()?;
@@ -222,7 +222,7 @@ struct RevokeRevisionPayload {
 pub async fn revoke_revision(
     State(node): State<Arc<Node>>,
     Path(path_hash): Path<String>,
-    Body(body): Body<Signed>,
+    Body(body, _): Body<Signed>,
 ) -> Result<Json<Value>, ApiError> {
     audited_route!(node, body, "revision.revoke", async {
         let keys = node.intermediates()?;
@@ -275,11 +275,14 @@ pub struct SecretPayload {
 pub async fn put_secret(
     State(node): State<Arc<Node>>,
     Path(name): Path<String>,
-    Body(PutBody {
-        payload: document,
-        signature,
-        value,
-    }): Body<PutBody>,
+    Body(
+        PutBody {
+            payload: document,
+            signature,
+            value,
+        },
+        _,
+    ): Body<PutBody>,
 ) -> Result<Json<Value>, ApiError> {
     let body = Signed {
         payload: document,
@@ -417,7 +420,7 @@ fn registered_spki(public_key: &str) -> Result<Vec<u8>, ApiError> {
 /// key an existing one endorses.
 pub async fn register_key(
     State(node): State<Arc<Node>>,
-    Body(body): Body<Signed>,
+    Body(body, _): Body<Signed>,
 ) -> Result<Json<Value>, ApiError> {
     audited_route!(node, body, "key.register", async {
         let keys = node.intermediates()?;
@@ -598,7 +601,7 @@ struct RevokeKeyPayload {
 pub async fn revoke_key(
     State(node): State<Arc<Node>>,
     Path(path_id): Path<String>,
-    Body(body): Body<Signed>,
+    Body(body, _): Body<Signed>,
 ) -> Result<Json<Value>, ApiError> {
     audited_route!(node, body, "key.revoke", async {
         let keys = node.intermediates()?;

@@ -56,7 +56,7 @@ pub use alpha_client::{BootstrapBody, BootstrapRequest};
 
 pub async fn bootstrap(
     State(node): State<Arc<Node>>,
-    Body(request): Body<BootstrapRequest>,
+    Body(request, _): Body<BootstrapRequest>,
 ) -> Result<Json<Value>, ApiError> {
     if !node.is_sealed() {
         return Err(ApiError::new("already_exists", "node is already serving"));
@@ -171,7 +171,7 @@ pub async fn unwrap_intermediates(node: &Node, root: &[u8; 32]) -> Result<Interm
 
 pub async fn unseal(
     State(node): State<Arc<Node>>,
-    Body(request): Body<UnsealRequest>,
+    Body(request, _): Body<UnsealRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let aad = runtime_spki_sha256(&node);
     let share = alpha_crypto::open(
@@ -222,7 +222,7 @@ pub async fn unseal(
 pub async fn join(
     State(node): State<Arc<Node>>,
     Extension(peer): Extension<PeerCerts>,
-    Body(request): Body<JoinRequest>,
+    Body(request, _): Body<JoinRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let leaf = peer
         .0

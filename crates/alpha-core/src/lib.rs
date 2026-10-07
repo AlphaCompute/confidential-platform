@@ -21,7 +21,7 @@ pub use compose::{
 };
 pub use id::{AppId, KeyId, OrgId, PrincipalId, RequestId, SecretId};
 pub use platform::{CatalogKey, KmsRevision, Signer};
-pub use signing::{context, jcs, signing_digest};
+pub use signing::{context, jcs, parse, signing_digest};
 
 /// The name of a key an App derives: 1 to 64 lowercase ASCII letters, digits, `.`, `_` or `-`,
 /// starting with a letter or digit, so it is safe as a path segment.

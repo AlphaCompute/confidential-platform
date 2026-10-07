@@ -171,7 +171,7 @@ pub async fn verify_revision(
 
 pub async fn attest(
     State(node): State<Arc<Node>>,
-    Body(request): Body<AttestRequest>,
+    Body(request, _): Body<AttestRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let spki = BASE64_URL_SAFE_NO_PAD
         .decode(&request.runtime_pubkey)
