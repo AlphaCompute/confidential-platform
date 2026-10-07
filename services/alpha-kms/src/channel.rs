@@ -9,16 +9,27 @@ use axum::Json;
 use axum::extract::State;
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
+use hkdf::Hkdf;
+use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::body::Body;
 use crate::error::ApiError;
-use crate::keys::{aead_open, aead_seal, ticket_key};
+use crate::keys::{Key32, aead_open, aead_seal};
 use crate::{Node, certs, later, random};
 
 pub const TICKET_TTL: Duration = Duration::from_secs(600);
 
 const TICKET_LABEL: &[u8] = b"alphacompute-kms/channel-ticket/v1";
+
+/// The key that seals one channel ticket, from the ticket's own random salt.
+fn ticket_key(tenant_kek_root: &[u8; 32], salt: &[u8; 16]) -> Result<Key32, ApiError> {
+    let mut out = Zeroizing::new([0u8; 32]);
+    Hkdf::<Sha256>::new(Some(TICKET_LABEL), tenant_kek_root)
+        .expand(salt, out.as_mut())
+        .map_err(|e| ApiError::internal(format!("hkdf: {e}")))?;
+    Ok(out)
+}
 
 /// `base64url(salt(16) ‖ nonce(12) ‖ AES-256-GCM(channel(16) ‖ c2s(32) ‖ expires_at(8, BE)))`.
 pub fn seal_ticket(
