@@ -1,8 +1,8 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use alpha_runtime::{Config, Error, Exit, Runtime, SECRETS_DIR, SOCKET_PATH};
+use alpha_runtime::{Config, EXIT_REFUSED, Error, Exit, Runtime, SECRETS_DIR, SOCKET_PATH};
 use p256::ecdsa::SigningKey;
 use tokio::net::UnixListener;
 
@@ -10,6 +10,11 @@ use tokio::net::UnixListener;
 // runtime_pubkey_sha256 on every line is chosen at the first deploy.
 #[tokio::main]
 async fn main() {
+    // First: Docker runs this as a second process in the live container, and the server path
+    // removes and rebinds the live socket.
+    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
+        std::process::exit(healthcheck());
+    }
     let code = match run().await {
         Ok(exit) => exit.code(),
         Err(e) => {
@@ -18,6 +23,24 @@ async fn main() {
         }
     };
     std::process::exit(code);
+}
+
+fn healthcheck() -> i32 {
+    let secrets = match std::env::var("ALPHACOMPUTE_SECRETS") {
+        Ok(text) => match alpha_runtime::parse_secrets(&text) {
+            Ok(secrets) => secrets,
+            Err(e) => {
+                eprintln!("alpha-runtime: {e}");
+                return EXIT_REFUSED;
+            }
+        },
+        Err(_) => alpha_runtime::Secrets::new(),
+    };
+    if alpha_runtime::healthcheck(Path::new(SECRETS_DIR), &secrets) {
+        0
+    } else {
+        EXIT_REFUSED
+    }
 }
 
 async fn run() -> Result<Exit, Error> {

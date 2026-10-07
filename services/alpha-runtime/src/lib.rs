@@ -235,6 +235,18 @@ pub fn write_secret(dir: &Path, name: &str, value: &[u8]) -> std::io::Result<()>
     std::fs::rename(&temp, &path)
 }
 
+/// Whether every declared Secret is a file under `root`; what a declaring service's
+/// `service_healthy` dependency waits on.
+// ponytail: one health for the whole runtime, so a declaring service also waits for every other
+// service's Secrets; acceptable while a tenant sets them in one session; the upgrade is a
+// per-service check the wrap can point each service's dependency at.
+pub fn healthcheck(root: &Path, secrets: &Secrets) -> bool {
+    secrets.iter().all(|(service, names)| {
+        let dir = root.join(service);
+        names.iter().all(|name| dir.join(name).is_file())
+    })
+}
+
 /// The outcome of one pass over the declared Secrets.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Delivery {
@@ -728,6 +740,26 @@ mod tests {
         assert!(!missing.exists());
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn healthcheck_needs_every_declared_file() {
+        let root = temp_dir();
+        assert!(healthcheck(&root, &Secrets::new()));
+        let web = root.join("web");
+        std::fs::create_dir(&web).unwrap();
+        let mut secrets = parse_secrets(r#"{"web":["a","b"]}"#).unwrap();
+        assert!(!healthcheck(&root, &secrets));
+        write_secret(&web, "a", b"1").unwrap();
+        assert!(!healthcheck(&root, &secrets));
+        std::fs::create_dir(web.join("b")).unwrap();
+        assert!(!healthcheck(&root, &secrets), "a directory is not a file");
+        std::fs::remove_dir(web.join("b")).unwrap();
+        write_secret(&web, "b", b"2").unwrap();
+        assert!(healthcheck(&root, &secrets));
+        secrets.insert("db".into(), BTreeSet::from(["a".to_owned()]));
+        assert!(!healthcheck(&root, &secrets));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

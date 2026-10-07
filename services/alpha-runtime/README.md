@@ -8,12 +8,16 @@ the KMS answers `revision_revoked` — at the first attestation, a renewal, a se
 process exits with code 78 and the socket disappears. Startup and configuration refusals exit
 with 1 and name the check; a drain on SIGTERM exits with 0.
 
-Configuration is three environment variables and nothing else. `ALPHACOMPUTE_KMS_CA_SPKI_SHA256`
-(`sha256:<hex>` of the KMS CA's SubjectPublicKeyInfo) and `ALPHACOMPUTE_KMS_REVISIONS`
-(comma-separated `sha256:<hex>`) are in the measured compose and are all the runtime trusts:
-before the first request it refuses a KMS whose chain does not end at a CA with that key or
-whose leaf carries no listed Revision, and moves on to the next entry of
-`ALPHACOMPUTE_KMS_ENDPOINTS`. An empty Revision list is refused at start.
+Configuration is three environment variables and, when a service declared a Secret, a fourth.
+`ALPHACOMPUTE_KMS_CA_SPKI_SHA256` (`sha256:<hex>` of the KMS CA's SubjectPublicKeyInfo) and
+`ALPHACOMPUTE_KMS_REVISIONS` (comma-separated `sha256:<hex>`) are in the measured compose and are
+all the runtime trusts: before the first request it refuses a KMS whose chain does not end at a
+CA with that key or whose leaf carries no listed Revision, and moves on to the next entry of
+`ALPHACOMPUTE_KMS_ENDPOINTS`. An empty Revision list is refused at start. `ALPHACOMPUTE_SECRETS`,
+also measured, is a JSON object of service name to the Secret names it declared, for example
+`{"db":["db_password"],"web":["db_password","session_key"]}`, and is absent when nothing is
+declared. Every service and Secret name becomes a path segment, so each must be a lowercase key
+purpose (`[a-z0-9][a-z0-9._-]{0,63}`); a repeated key or any other shape is refused at start.
 
 The socket is `/run/alpha/runtime.sock`, HTTP/1.1 JSON, no authentication (access is the right
 to the socket), and comes up only after the first attestation succeeded:
@@ -29,18 +33,46 @@ With no valid leaf (the last renewal failed and the hour is over) the first thre
 `503 not_attested`. A cached secret or key is served until the leaf expires even after its Revision is
 revoked; the next call that reaches the KMS is the one that ends the process.
 
+## Secret files
+
+A stock image reads its Secrets as Docker-style files, with no code change. After the first
+attestation the runtime writes each declared Secret to `/run/alpha-secrets/<service>/<name>`, the
+read-write mount of that service's own tmpfs volume, which the service sees read-only as
+`/run/secrets/<name>`; a service that declared nothing has no volume and gets nothing. Each name
+is fetched once per pass through the same per-leaf cache as `GET /v1/secrets/{name}` and replaced
+atomically: a mode 0444 temp file in the same directory, renamed over the name; a file already
+holding the value is left alone. The runtime never creates a directory, so a missing volume shows
+up as a logged failure rather than as files in the container layer.
+
+A Secret not stored yet is retried after 2 s, doubling up to 60 s; once every file is written a
+pass runs every 60 s, which hits the cache, so a changed value is written after the next renewal
+(within the hour). A revoked Revision gets no new file, at birth or later; the files already
+written stay until the volume's last container stops.
+
+`alpha-runtime healthcheck` exits 0 only once every declared file exists under
+`/run/alpha-secrets`, and 1 otherwise or when `ALPHACOMPUTE_SECRETS` does not parse. It reads that
+one variable and nothing else, before configuration, the key, the guest agent or the socket,
+because Docker runs it as a second process in the live container. A declaring service's
+`depends_on: alpha-runtime: {condition: service_healthy}` waits on it. The socket's four routes
+are unchanged.
+
 ## Tests
 
-`cargo test -p alpha-runtime` covers the configuration parser, the renewal schedule and the
-exit-code decision. The end-to-end tests are `services/alpha-kms/tests/runtime.rs` (they need
+`cargo test -p alpha-runtime` covers the configuration parser (the secrets variable's accepted and
+refused shapes included), the renewal schedule, the exit-code decision, the atomic 0444 replace of
+a secret file and the healthcheck's file check; `tests/healthcheck.rs` runs the built binary's
+`healthcheck` with a cleared environment and checks it exits 0 without reaching configuration and
+1 for a missing file or an unparsable variable. The end-to-end tests are `services/alpha-kms/tests/runtime.rs` (they need
 `DATABASE_URL`): a runtime holding the key of the `phala-0.5.9-1c-2g-keyed` capture, with a
 quote source that hands out the captured quote for exactly the `report_data` that CVM quoted
 over, attests against the in-process node clocked to the instant the capture's nonce was
 minted — so `POST /v1/attest/nonce` returns that nonce and the appraisal is the real one. They
 prove the four routes, the refusal of a compose that is not the leaf's Revision, a tenant backend pinning the KMS CA and reading the Revision from the
 SAN URI with rustls and webpki alone, the refusal of a listener under another CA or with an
-unlisted Revision (and the walk to the next endpoint), the cache expiring with the leaf, and
-`revision_revoked` ending the runtime with 78.
+unlisted Revision (and the walk to the next endpoint), the cache expiring with the leaf,
+`revision_revoked` ending the runtime with 78, and the secret files: written only into the
+directories of declaring services, waiting for a Secret put later, following a renewal, written
+by the running runtime, and never written for a revoked Revision.
 
 What only a live CVM proves: the real quote and `Info` from the guest agent's socket, the real
 event log from the CCEL table and `/run/log/dstack`, that the registered `compose_hash` equals
