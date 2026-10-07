@@ -3,9 +3,10 @@
 //! reach only the services that list them, as files `alpha-runtime` writes into a tmpfs volume.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use alpha_core::{AppId, ComposeHash, compose_hash, hex_bytes, is_key_purpose};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_yaml_ng::{Mapping, Value as Yaml};
 
 use super::{APP_PORT, RUNTIME_SERVICE, Runtime, key, strings};
@@ -25,10 +26,22 @@ const SERVICE_KEYS: [&str; 12] = [
     "user",
     "working_dir",
 ];
+/// Domain, API host, token URL and token service.
+type Registry = (&'static str, &'static str, &'static str, &'static str);
 /// ponytail: tags resolve only on these three public registries, anonymously; any other registry
 /// needs a digest-pinned reference. Upgrade: a row per registry, or reading the registry's
 /// `WWW-Authenticate` challenge.
-const REGISTRIES: [&str; 3] = ["docker.io", "ghcr.io", "quay.io"];
+const REGISTRIES: [Registry; 3] = [
+    (
+        "docker.io",
+        "registry-1.docker.io",
+        "https://auth.docker.io/token",
+        "registry.docker.io",
+    ),
+    ("ghcr.io", "ghcr.io", "https://ghcr.io/token", "ghcr.io"),
+    ("quay.io", "quay.io", "https://quay.io/v2/auth", "quay.io"),
+];
+const MANIFEST_TYPES: &str = "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json";
 
 /// A compose that passed the allowlist, in the customer's order.
 #[derive(Debug)]
@@ -144,10 +157,8 @@ pub fn parse(bytes: &[u8]) -> Result<Plain, String> {
                             "{place}: {image} has a malformed digest; write <image>@sha256:<64 lowercase hex digits>"
                         ));
                     }
-                    if !pinned(image) && !REGISTRIES.contains(&registry(image)) {
-                        return Err(format!(
-                            "{place}: {image} is a tag outside Docker Hub, ghcr.io and quay.io; pin it as <image>@sha256:<digest>"
-                        ));
+                    if !pinned(image) {
+                        tagged(image).map_err(|e| format!("{place}: {e}"))?;
                     }
                 }
                 "environment" => {
@@ -475,28 +486,154 @@ fn list<'a>(value: &'a Yaml, place: &str) -> Result<&'a Vec<Yaml>, String> {
         .ok_or_else(|| format!("{place}: not a list"))
 }
 
+/// A client for [`resolve`]; the production caller adds nothing and calls `build`, trusting the
+/// platform's root certificates.
+pub fn registry_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(30))
+}
+
+/// The digest the registry pins a tagged image to, through one anonymous token request and one
+/// manifest HEAD.
+pub async fn resolve(http: &reqwest::Client, image: &str) -> Result<String, String> {
+    #[derive(Deserialize)]
+    struct Token {
+        token: String,
+    }
+    let ((_, api, token_url, service), repository, tag) =
+        tagged(image).map_err(|e| format!("image {e}"))?;
+    let failed = |e: reqwest::Error| {
+        let reason = std::iter::successors(Some(&e as &dyn std::error::Error), |e| e.source())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(": ");
+        format!("could not resolve {image}: {reason}; pin @sha256:")
+    };
+    let token = http
+        .get(format!(
+            "{token_url}?service={service}&scope=repository:{repository}:pull"
+        ))
+        .send()
+        .await
+        .map_err(failed)?;
+    let Token { token } = answered(image, token)?.json().await.map_err(failed)?;
+    let manifest = http
+        .head(format!("https://{api}/v2/{repository}/manifests/{tag}"))
+        .bearer_auth(token)
+        .header(reqwest::header::ACCEPT, MANIFEST_TYPES)
+        .send()
+        .await
+        .map_err(failed)?;
+    // Docker Hub answers with the OCI index even when asked for a single manifest only, so the
+    // content type says nothing; the digest is what gets pinned.
+    answered(image, manifest)?
+        .headers()
+        .get("docker-content-digest")
+        .and_then(|d| d.to_str().ok())
+        .filter(|d| digest(d))
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            format!(
+                "could not resolve {image}: the registry gave no sha256:<64 lowercase hex> Docker-Content-Digest; pin @sha256:"
+            )
+        })
+}
+
+/// One [`resolve`] per distinct tag, in sorted order, keyed as [`wrap`] reads them.
+pub async fn resolve_all(
+    http: &reqwest::Client,
+    plain: &Plain,
+) -> Result<BTreeMap<String, String>, String> {
+    let tags: BTreeSet<&str> = plain
+        .services
+        .iter()
+        .filter_map(|(_, service)| service.get("image")?.as_str())
+        .filter(|image| !pinned(image))
+        .collect();
+    let mut digests = BTreeMap::new();
+    for image in tags {
+        digests.insert(image.to_owned(), resolve(http, image).await?);
+    }
+    Ok(digests)
+}
+
+fn answered(image: &str, response: reqwest::Response) -> Result<reqwest::Response, String> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    Err(format!(
+        "could not resolve {image}: the registry answered {status}; pin @sha256:"
+    ))
+}
+
 fn pinned(image: &str) -> bool {
-    image
-        .split_once('@')
-        .and_then(|(_, digest)| digest.strip_prefix("sha256:"))
+    image.split_once('@').is_some_and(|(_, d)| digest(d))
+}
+
+fn digest(d: &str) -> bool {
+    d.strip_prefix("sha256:")
         .is_some_and(|hex| hex_bytes::<32>(hex).is_some())
 }
 
-/// The registry a reference names, split as Docker does: the first component is a registry only
-/// when it looks like a host or has an upper-case letter (repositories are lower-case), otherwise
-/// the image is on Docker Hub.
-fn registry(image: &str) -> &str {
+/// A reference split as Docker does into registry and the rest: the first component is a
+/// registry only when it looks like a host or has an upper-case letter (repositories are
+/// lower-case), otherwise the image is on Docker Hub.
+fn split(image: &str) -> (&str, &str) {
     match image.split_once('/') {
-        Some(("index.docker.io", _)) => "docker.io",
-        Some((first, _))
+        Some(("index.docker.io", rest)) => ("docker.io", rest),
+        Some((first, rest))
             if first.contains(['.', ':'])
                 || first == "localhost"
                 || first.bytes().any(|b| b.is_ascii_uppercase()) =>
         {
-            first
+            (first, rest)
         }
-        _ => "docker.io",
+        _ => ("docker.io", image),
     }
+}
+
+/// The registry, repository and tag of a reference by tag. The repository and tag go into the
+/// registry's URLs, so they are held to Docker's grammar; only the table picks a host.
+fn tagged(image: &str) -> Result<(Registry, String, &str), String> {
+    let (domain, rest) = split(image);
+    let registry = REGISTRIES
+        .iter()
+        .find(|(d, ..)| *d == domain)
+        .copied()
+        .ok_or_else(|| {
+            format!(
+                "{image} is a tag outside Docker Hub, ghcr.io and quay.io; pin it as <image>@sha256:<digest>"
+            )
+        })?;
+    let (path, tag) = rest.split_once(':').unwrap_or((rest, "latest"));
+    let alnum = |b: &u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    let component = |c: &str| {
+        c.as_bytes().first().is_some_and(alnum)
+            && c.as_bytes().last().is_some_and(alnum)
+            && c.bytes()
+                .all(|b| alnum(&b) || matches!(b, b'.' | b'_' | b'-'))
+    };
+    let tag_ok = tag.len() <= 128
+        && tag
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if !path.split('/').all(component) || !tag_ok {
+        return Err(format!(
+            "{image} is not an image reference; write <repository>:<tag> in lowercase, or pin it as <image>@sha256:<digest>"
+        ));
+    }
+    let repository = match (domain, path.contains('/')) {
+        ("docker.io", false) => format!("library/{path}"),
+        _ => path.to_owned(),
+    };
+    Ok((registry, repository, tag))
 }
 
 fn pin(image: &str, digests: &BTreeMap<String, String>) -> Result<String, String> {
@@ -868,7 +1005,44 @@ mod tests {
             ("registry.example.com/app:1", "registry.example.com"),
             ("Acme/app:1", "Acme"),
         ] {
-            assert_eq!(registry(image), domain, "{image}");
+            assert_eq!(split(image).0, domain, "{image}");
+        }
+        for (image, api, repository, tag) in [
+            ("nginx", "registry-1.docker.io", "library/nginx", "latest"),
+            (
+                "docker.io/nginx:1.27",
+                "registry-1.docker.io",
+                "library/nginx",
+                "1.27",
+            ),
+            (
+                "index.docker.io/acme/app:v1",
+                "registry-1.docker.io",
+                "acme/app",
+                "v1",
+            ),
+            ("ghcr.io/acme/app", "ghcr.io", "acme/app", "latest"),
+            (
+                "quay.io/prometheus/node-exporter:v1.8_0",
+                "quay.io",
+                "prometheus/node-exporter",
+                "v1.8_0",
+            ),
+        ] {
+            let ((_, a, ..), r, t) = tagged(image).unwrap();
+            assert_eq!((a, r.as_str(), t), (api, repository, tag), "{image}");
+        }
+        for image in [
+            "nginx:",
+            "nginx:-x",
+            "acme/../x:1",
+            "acme//x:1",
+            "ghcr.io/acme/app?x:1",
+            "nginx:1#x",
+            &format!("nginx:{}", "a".repeat(129)),
+        ] {
+            let err = tagged(image).unwrap_err();
+            assert!(err.contains("not an image reference"), "{image}: {err}");
         }
         let with = |image: &str| replaced(&single("web", "\"8080:80\""), "nginx@sha256:", image);
         let hex = "ab".repeat(32);
