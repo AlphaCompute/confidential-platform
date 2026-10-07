@@ -226,6 +226,57 @@ fn the_sealer_seals_a_put_that_only_the_node_opens() {
 }
 
 #[wasm_bindgen_test]
+fn the_sealer_refuses_a_node_the_view_does_not_list() {
+    let value = b"v";
+    let payload = put_payload(value).to_string();
+    let listed = platform(CA, &[kms_revision()]);
+    let seal = |reply: &dyn Fn(&str) -> String, platform: &str, now_ms: f64| {
+        let mut sealer = KmsSecretSealer::new().map_err(message).unwrap();
+        let reply = reply(&sealer.hello());
+        message(
+            sealer
+                .seal(&reply, platform, &payload, value, now_ms)
+                .err()
+                .unwrap(),
+        )
+    };
+    let node = |hello: &str| kms_reply(hello).0;
+    let instance = |hello: &str| {
+        let mut reply: Value =
+            serde_json::from_str(&responder().respond(hello, NOW_MS).map_err(message).unwrap())
+                .unwrap();
+        reply["ticket"] = json!("t");
+        reply.to_string()
+    };
+    let foreign_ca = include_str!("../../../testdata/channel/foreign-ca.pem");
+    let unlisted = alpha_core::compose_hash(COMPOSE).to_string();
+
+    for (code, m) in [
+        ("foreign_certificate", seal(&instance, &listed, NOW_MS)),
+        (
+            "foreign_certificate",
+            seal(&node, &platform(foreign_ca, &[kms_revision()]), NOW_MS),
+        ),
+        (
+            "unknown_revision",
+            seal(&node, &platform(CA, &[unlisted]), NOW_MS),
+        ),
+        ("malformed", seal(&node, &listed, f64::NAN)),
+    ] {
+        assert!(m.starts_with(&format!("{code}: ")), "{code}: {m}");
+    }
+
+    let mut sealer = KmsSecretSealer::new().map_err(message).unwrap();
+    let reply = node(&sealer.hello());
+    sealer
+        .seal(&reply, &listed, &payload, value, NOW_MS)
+        .map_err(message)
+        .unwrap();
+    let again = sealer.seal(&reply, &listed, &payload, value, NOW_MS);
+    assert!(message(again.err().unwrap()).starts_with("malformed: "));
+}
+
+#[wasm_bindgen_test]
 fn the_platform_document_verifies_through_the_export() {
     let view: Value = serde_json::from_str(
         &verify_platform(PLATFORM_DOCUMENT, 1_790_208_000_000.0)

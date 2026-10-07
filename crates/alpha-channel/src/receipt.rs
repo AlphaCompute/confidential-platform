@@ -14,7 +14,7 @@ use p256::pkcs8::DecodePublicKey;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::cert::{KMS_SAN, pem_to_der, spki_of, uri_sans, verify_leaf};
+use crate::cert::{parse_kms_sans, pem_to_der, spki_of, uri_sans, verify_leaf};
 use crate::{
     ECDSA_P256, Error, NamedSignature, from_unix_seconds, p256_signature, rfc3339, sha256_label,
 };
@@ -112,18 +112,7 @@ pub fn verify(
     let leaf = pem_to_der(leaf_pem).map_err(|_| foreign("the leaf is not a certificate"))?;
     verify_leaf(&leaf, &ca, issued_at)?;
 
-    let not_node = || foreign("the leaf is not a KMS node's");
-    let sans = uri_sans(&leaf)?;
-    let [kms, revision] = sans.as_slice() else {
-        return Err(not_node());
-    };
-    if kms != KMS_SAN {
-        return Err(not_node());
-    }
-    let revision: ComposeHash = revision
-        .strip_prefix("urn:alphacompute:revision:")
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(not_node)?;
+    let revision = parse_kms_sans(&uri_sans(&leaf)?)?;
     if !kms_revisions.contains(&revision) {
         return Err(Error::UnknownRevision(revision));
     }

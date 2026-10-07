@@ -180,6 +180,37 @@ mod tests {
     }
 
     #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+    fn kms_sans_parse_and_others_are_foreign() {
+        let node = [KMS_SAN.to_owned(), revision()];
+        assert_eq!(
+            parse_kms_sans(&node).unwrap(),
+            alpha_core::compose_hash("{}")
+        );
+
+        let key = "ab".repeat(32);
+        let instance = [format!("alphacompute://{ORG}/{APP}/{key}"), revision()];
+        let three = [KMS_SAN.to_owned(), revision(), revision()];
+        let wrong_first = ["alphacompute://kms/".to_owned(), revision()];
+        let not_a_hash = [
+            KMS_SAN.to_owned(),
+            "urn:alphacompute:revision:sha256:abcd".to_owned(),
+        ];
+        for sans in [
+            &instance[..],
+            &node[..1],
+            &three[..],
+            &wrong_first[..],
+            &not_a_hash[..],
+        ] {
+            assert_eq!(
+                parse_kms_sans(sans).unwrap_err().code(),
+                "foreign_certificate",
+                "{sans:?}"
+            );
+        }
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
     fn pem_to_der_takes_one_certificate_block() {
         let pem = "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n";
         assert_eq!(pem_to_der(pem).unwrap(), [1, 2, 3]);
