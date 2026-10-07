@@ -1,0 +1,599 @@
+//! A customer's plain docker-compose becomes a Revision through the same runtime service and
+//! envelope as `alpha deploy`. What the compose may contain is an allowlist, and declared secrets
+//! reach only the services that list them, as files `alpha-runtime` writes into a tmpfs volume.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use alpha_core::{AppId, ComposeHash, compose_hash, hex_bytes, is_key_purpose};
+use serde::Serialize;
+use serde_yaml_ng::{Mapping, Value as Yaml};
+
+use super::{APP_PORT, RUNTIME_SERVICE, Runtime, key, strings};
+
+const MAX_COMPOSE_BYTES: usize = 256 * 1024;
+const SERVICE_KEYS: [&str; 12] = [
+    "image",
+    "environment",
+    "ports",
+    "command",
+    "entrypoint",
+    "volumes",
+    "secrets",
+    "depends_on",
+    "healthcheck",
+    "restart",
+    "user",
+    "working_dir",
+];
+/// ponytail: tags resolve only on these three public registries, anonymously; any other registry
+/// needs a digest-pinned reference. Upgrade: a row per registry, or reading the registry's
+/// `WWW-Authenticate` challenge.
+const REGISTRIES: [&str; 3] = ["docker.io", "ghcr.io", "quay.io"];
+
+/// A compose that passed the allowlist, in the customer's order.
+#[derive(Debug)]
+pub struct Plain {
+    services: Vec<(String, Mapping)>,
+    volumes: Vec<String>,
+    secrets: BTreeMap<String, BTreeSet<String>>,
+    endpoint: (String, u16),
+}
+
+#[derive(Debug, Serialize)]
+pub struct Wrapped {
+    pub compose_hash: ComposeHash,
+    pub compose: String,
+    pub secrets: BTreeSet<String>,
+}
+
+pub fn parse(bytes: &[u8]) -> Result<Plain, String> {
+    if bytes.len() > MAX_COMPOSE_BYTES {
+        return Err(format!(
+            "compose: {} bytes is over the limit of {MAX_COMPOSE_BYTES}; make it smaller",
+            bytes.len()
+        ));
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| "compose: not UTF-8; save it as UTF-8".to_owned())?;
+    let mut root: Yaml =
+        serde_yaml_ng::from_str(text).map_err(|e| format!("compose: {e}; fix the YAML"))?;
+    root.apply_merge()
+        .map_err(|e| format!("compose: {e}; fix the YAML"))?;
+    let Yaml::Mapping(root) = root else {
+        return Err("compose: not a mapping; write a docker-compose file".into());
+    };
+    let (mut services, mut volumes, mut secrets) = (None, None, None);
+    for (k, v) in root {
+        match k.as_str() {
+            Some("services") => services = Some(v),
+            Some("volumes") => volumes = Some(v),
+            Some("secrets") => secrets = Some(v),
+            Some(k) if k == "version" || k == "name" || k.starts_with("x-") => {}
+            _ => return Err(format!("compose: {k:?} is not supported; remove it")),
+        }
+    }
+    let volumes = section(volumes, "volumes")?
+        .into_iter()
+        .map(|(name, v)| {
+            unreserved(&name, "volumes")?;
+            match v {
+                Yaml::Null => Ok(name),
+                Yaml::Mapping(m) if m.is_empty() => Ok(name),
+                _ => Err(format!(
+                    "volumes.{name}: options are not supported; declare it as `{name}: {{}}`"
+                )),
+            }
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let declared: BTreeSet<String> = section(secrets, "secrets")?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+
+    let mut plain_services = Vec::new();
+    let mut secrets = BTreeMap::new();
+    let mut endpoints = Vec::new();
+    for (service, value) in section(services, "services")? {
+        unreserved(&service, "services")?;
+        let Yaml::Mapping(value) = value else {
+            return Err(format!("services.{service}: not a mapping"));
+        };
+        if !value.contains_key("image") {
+            return Err(format!(
+                "services.{service}: no image; name one, by tag or as <image>@sha256:<digest>"
+            ));
+        }
+        for (k, v) in &value {
+            let Some(k) = k.as_str().filter(|k| SERVICE_KEYS.contains(k)) else {
+                return Err(format!(
+                    "services.{service}: {k:?} is not supported; the keys allowed are {}",
+                    SERVICE_KEYS.join(", ")
+                ));
+            };
+            let place = format!("services.{service}.{k}");
+            match k {
+                "image" => {
+                    let image = v.as_str().ok_or_else(|| format!("{place}: not a string"))?;
+                    if !pinned(image) && !REGISTRIES.contains(&registry(image)) {
+                        return Err(format!(
+                            "{place}: {image} is a tag outside Docker Hub, ghcr.io and quay.io; pin it as <image>@sha256:<digest>"
+                        ));
+                    }
+                }
+                "ports" => {
+                    for item in list(v, &place)? {
+                        let port = container_port(item).ok_or_else(|| {
+                            format!("{place}: {item:?} is not a TCP port; write \"<host port>:<container port>\"")
+                        })?;
+                        endpoints.push((service.clone(), port));
+                    }
+                }
+                "volumes" => {
+                    for item in list(v, &place)? {
+                        if !named_mount(item, &volumes) {
+                            return Err(format!(
+                                "{place}: {item:?} is not a volume declared under top-level volumes:; host paths are not mounted"
+                            ));
+                        }
+                    }
+                }
+                "secrets" => {
+                    let mut names = BTreeSet::new();
+                    for item in list(v, &place)? {
+                        let name = name(item.clone(), &place)?;
+                        if !declared.contains(&name) {
+                            return Err(format!(
+                                "{place}: {name} is not declared under top-level secrets:; declare it"
+                            ));
+                        }
+                        names.insert(name);
+                    }
+                    if !names.is_empty() {
+                        secrets.insert(service.clone(), names);
+                    }
+                }
+                "depends_on" => {
+                    let valid = match v {
+                        Yaml::Mapping(_) => true,
+                        Yaml::Sequence(items) => items.iter().all(Yaml::is_string),
+                        _ => false,
+                    };
+                    if !valid {
+                        return Err(format!("{place}: not a list or mapping of services"));
+                    }
+                }
+                _ => {}
+            }
+        }
+        plain_services.push((service, value));
+    }
+    let endpoint = <[(String, u16); 1]>::try_from(endpoints).map_err(|all| {
+        format!(
+            "services: publish exactly one port, the App's Endpoint; {} are published",
+            all.len()
+        )
+    })?;
+    let [endpoint] = endpoint;
+    Ok(Plain {
+        services: plain_services,
+        volumes,
+        secrets,
+        endpoint,
+    })
+}
+
+/// `digests` maps a tagged image, as the customer wrote it, to `sha256:<hex>`.
+pub fn wrap(
+    plain: Plain,
+    digests: &BTreeMap<String, String>,
+    app_id: AppId,
+    runtime: &Runtime,
+) -> Result<Wrapped, String> {
+    if !pinned(&runtime.image) {
+        return Err(format!(
+            "runtime image {}: not pinned; give it as <image>@sha256:<digest>",
+            runtime.image
+        ));
+    }
+    let Plain {
+        services: plain_services,
+        volumes,
+        secrets,
+        endpoint: (endpoint, port),
+    } = plain;
+    let mut services = Mapping::new();
+    let mut declaring = Vec::new();
+    for (name, service) in plain_services {
+        let secrets_volume = secrets
+            .contains_key(&name)
+            .then(|| format!("alpha-secrets-{name}"));
+        let mut out = Mapping::new();
+        for (k, v) in service {
+            let v = match k.as_str() {
+                Some("secrets") => continue,
+                Some("image") => {
+                    let image = v.as_str().ok_or("image is not a string")?;
+                    Yaml::String(pin(image, digests)?)
+                }
+                // ponytail: the published service must speak TLS itself; a stock plain-HTTP image
+                // is not reachable over the Endpoint's TLS passthrough. Upgrade: `alpha-runtime`
+                // terminates TLS with the Instance leaf and proxies to the service.
+                Some("ports") if name == endpoint => strings(&[&format!("{APP_PORT}:{port}")]),
+                Some("volumes") => match (&secrets_volume, v) {
+                    (Some(volume), Yaml::Sequence(mut mounts)) => {
+                        mounts.push(key(&format!("{volume}:/run/secrets:ro")));
+                        Yaml::Sequence(mounts)
+                    }
+                    (_, v) => v,
+                },
+                Some("depends_on") if secrets_volume.is_some() => after_runtime(v)?,
+                _ => v,
+            };
+            out.insert(k, v);
+        }
+        if let Some(volume) = secrets_volume {
+            if !out.contains_key("volumes") {
+                out.insert(
+                    key("volumes"),
+                    strings(&[&format!("{volume}:/run/secrets:ro")]),
+                );
+            }
+            if !out.contains_key("depends_on") {
+                out.insert(key("depends_on"), after_runtime(Yaml::Sequence(vec![]))?);
+            }
+            declaring.push(name.clone());
+        }
+        if !out.contains_key("restart") {
+            out.insert(key("restart"), key("always"));
+        }
+        services.insert(key(&name), Yaml::Mapping(out));
+    }
+
+    let mut runtime_service = super::runtime_service(runtime)?;
+    // Only when some service waits for its secrets: a runtime image without the `healthcheck`
+    // subcommand ignores its arguments and would start a second runtime that takes the socket.
+    if !secrets.is_empty() {
+        let map = serde_json::to_string(&secrets).map_err(|e| e.to_string())?;
+        let Some(Yaml::Mapping(environment)) = runtime_service.get_mut("environment") else {
+            return Err("runtime service has no environment".into());
+        };
+        environment.insert(key("ALPHACOMPUTE_SECRETS"), key(&map));
+        let Some(Yaml::Sequence(mounts)) = runtime_service.get_mut("volumes") else {
+            return Err("runtime service has no volumes".into());
+        };
+        for name in &declaring {
+            mounts.push(key(&format!(
+                "alpha-secrets-{name}:/run/alpha-secrets/{name}"
+            )));
+        }
+        // dstack runs `docker compose up` once and never again, and compose gives up on a
+        // dependency that turns unhealthy, so a slow first attestation must not count against it.
+        let mut healthcheck = Mapping::new();
+        healthcheck.insert(
+            key("test"),
+            strings(&["CMD", "/alpha-runtime", "healthcheck"]),
+        );
+        healthcheck.insert(key("interval"), key("5s"));
+        healthcheck.insert(key("start_period"), key("24h"));
+        runtime_service.insert(key("healthcheck"), Yaml::Mapping(healthcheck));
+    }
+    services.insert(key(RUNTIME_SERVICE), Yaml::Mapping(runtime_service));
+
+    let mut root_volumes = Mapping::new();
+    for name in volumes.iter().map(String::as_str).chain(["alpha-run"]) {
+        root_volumes.insert(key(name), Yaml::Mapping(Mapping::new()));
+    }
+    for name in &declaring {
+        let mut tmpfs = Mapping::new();
+        tmpfs.insert(key("type"), key("tmpfs"));
+        tmpfs.insert(key("device"), key("tmpfs"));
+        let mut volume = Mapping::new();
+        volume.insert(key("driver_opts"), Yaml::Mapping(tmpfs));
+        root_volumes.insert(key(&format!("alpha-secrets-{name}")), Yaml::Mapping(volume));
+    }
+    let mut root = Mapping::new();
+    root.insert(key("services"), Yaml::Mapping(services));
+    root.insert(key("volumes"), Yaml::Mapping(root_volumes));
+    let yaml = serde_yaml_ng::to_string(&root).map_err(|e| e.to_string())?;
+    let compose = super::envelope(app_id, yaml, &["ALPHACOMPUTE_KMS_ENDPOINTS"], false)?;
+    Ok(Wrapped {
+        compose_hash: compose_hash(&compose),
+        compose,
+        secrets: secrets.into_values().flatten().collect(),
+    })
+}
+
+fn section(value: Option<Yaml>, place: &str) -> Result<Vec<(String, Yaml)>, String> {
+    let mapping = match value {
+        None | Some(Yaml::Null) => Mapping::new(),
+        Some(Yaml::Mapping(m)) => m,
+        Some(_) => return Err(format!("{place}: not a mapping")),
+    };
+    mapping
+        .into_iter()
+        .map(|(k, v)| Ok((name(k, place)?, v)))
+        .collect()
+}
+
+fn name(value: Yaml, place: &str) -> Result<String, String> {
+    match value {
+        Yaml::String(s) if is_key_purpose(&s) => Ok(s),
+        other => Err(format!(
+            "{place}: {other:?} is not a name; use 1 to 64 lowercase letters, digits, `.`, `_` or `-`, starting with a letter or digit"
+        )),
+    }
+}
+
+fn unreserved(name: &str, place: &str) -> Result<(), String> {
+    if name.starts_with("alpha-") {
+        return Err(format!(
+            "{place}.{name}: names starting with alpha- are reserved; rename it"
+        ));
+    }
+    Ok(())
+}
+
+fn list<'a>(value: &'a Yaml, place: &str) -> Result<&'a Vec<Yaml>, String> {
+    value
+        .as_sequence()
+        .ok_or_else(|| format!("{place}: not a list"))
+}
+
+fn pinned(image: &str) -> bool {
+    image
+        .rsplit_once("@sha256:")
+        .is_some_and(|(_, hex)| hex_bytes::<32>(hex).is_some())
+}
+
+/// The registry a reference names, split as Docker does: the first component is a registry only
+/// when it looks like a host, otherwise the image is on Docker Hub.
+fn registry(image: &str) -> &str {
+    match image.split_once('/') {
+        Some(("index.docker.io", _)) => "docker.io",
+        Some((first, _)) if first.contains(['.', ':']) || first == "localhost" => first,
+        _ => "docker.io",
+    }
+}
+
+fn pin(image: &str, digests: &BTreeMap<String, String>) -> Result<String, String> {
+    if pinned(image) {
+        return Ok(image.to_owned());
+    }
+    digests
+        .get(image)
+        .map(|digest| format!("{image}@{digest}"))
+        .ok_or_else(|| {
+            format!("image {image}: the tag is not resolved; pin it as <image>@sha256:<digest>")
+        })
+}
+
+fn after_runtime(depends_on: Yaml) -> Result<Yaml, String> {
+    let condition = |c: &str| {
+        let mut m = Mapping::new();
+        m.insert(key("condition"), key(c));
+        Yaml::Mapping(m)
+    };
+    let mut map = match depends_on {
+        Yaml::Mapping(m) => m,
+        Yaml::Sequence(items) => items
+            .into_iter()
+            .map(|s| (s, condition("service_started")))
+            .collect(),
+        _ => return Err("depends_on is not a list or mapping".into()),
+    };
+    map.insert(key(RUNTIME_SERVICE), condition("service_healthy"));
+    Ok(Yaml::Mapping(map))
+}
+
+fn container_port(item: &Yaml) -> Option<u16> {
+    match item {
+        Yaml::String(s) => {
+            let s = s.strip_suffix("/tcp").unwrap_or(s);
+            match s.split_once(':') {
+                None => number(s),
+                Some((published, target)) => number(published).and(number(target)),
+            }
+        }
+        Yaml::Mapping(m) => {
+            let known = m
+                .keys()
+                .all(|k| matches!(k.as_str(), Some("target" | "published" | "protocol")));
+            let tcp = m.get("protocol").is_none_or(|p| p.as_str() == Some("tcp"));
+            let published = m.get("published").is_none_or(|p| port(p).is_some());
+            if known && tcp && published {
+                m.get("target").and_then(port)
+            } else {
+                None
+            }
+        }
+        _ => port(item),
+    }
+}
+
+fn port(value: &Yaml) -> Option<u16> {
+    match value {
+        Yaml::Number(n) => n
+            .as_u64()
+            .and_then(|p| u16::try_from(p).ok())
+            .filter(|p| *p != 0),
+        Yaml::String(s) => number(s),
+        _ => None,
+    }
+}
+
+fn number(s: &str) -> Option<u16> {
+    if s.bytes().all(|b| b.is_ascii_digit()) {
+        s.parse().ok().filter(|p| *p != 0)
+    } else {
+        None
+    }
+}
+
+fn named_mount(item: &Yaml, declared: &[String]) -> bool {
+    let is_declared = |source: &str| declared.iter().any(|d| d == source);
+    match item {
+        Yaml::String(s) => {
+            let mut parts = s.split(':');
+            let (Some(source), Some(target), mode, None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                return false;
+            };
+            is_declared(source)
+                && target.starts_with('/')
+                && matches!(mode, None | Some("ro" | "rw"))
+        }
+        Yaml::Mapping(m) => {
+            m.keys()
+                .all(|k| matches!(k.as_str(), Some("type" | "source" | "target" | "read_only")))
+                && m.get("type").and_then(Yaml::as_str) == Some("volume")
+                && m.get("source")
+                    .and_then(Yaml::as_str)
+                    .is_some_and(is_declared)
+                && m.get("target")
+                    .and_then(Yaml::as_str)
+                    .is_some_and(|t| t.starts_with('/'))
+                && m.get("read_only").is_none_or(Yaml::is_bool)
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    fn dir(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/manifest")
+            .join(name)
+    }
+
+    fn deploy_spec() -> super::super::AppSpec {
+        super::super::parse(&fs::read_to_string(dir("05-deploy").join("app.yaml")).unwrap())
+            .unwrap()
+    }
+
+    fn vector_compose() -> String {
+        fs::read_to_string(dir("08-wrap").join("compose.yaml")).unwrap()
+    }
+
+    fn wrap_text(text: &str, digests: &BTreeMap<String, String>) -> Result<Wrapped, String> {
+        let spec = deploy_spec();
+        wrap(parse(text.as_bytes())?, digests, spec.app_id, &spec.runtime)
+    }
+
+    fn compose_yaml(wrapped: &Wrapped) -> Yaml {
+        let parsed: Value = serde_json::from_str(&wrapped.compose).unwrap();
+        serde_yaml_ng::from_str(parsed["docker_compose_file"].as_str().unwrap()).unwrap()
+    }
+
+    fn keys(value: &Yaml) -> Vec<&str> {
+        value
+            .as_mapping()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn wrap_reproduces_the_vector() {
+        let out = dir("08-wrap");
+        let spec = deploy_spec();
+        let wrapped = wrap_text(&vector_compose(), &BTreeMap::new()).unwrap();
+        let expected = json!({
+            "app_id": spec.app_id,
+            "compose_hash": wrapped.compose_hash,
+            "secrets": wrapped.secrets,
+        });
+        if std::env::var_os("WRITE_VECTORS").is_some() {
+            fs::write(out.join("app-compose.json"), &wrapped.compose).unwrap();
+            fs::write(
+                out.join("expected.json"),
+                serde_json::to_string_pretty(&expected).unwrap() + "\n",
+            )
+            .unwrap();
+            return;
+        }
+        assert_eq!(
+            wrapped.compose,
+            fs::read_to_string(out.join("app-compose.json")).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_string_pretty(&expected).unwrap() + "\n",
+            fs::read_to_string(out.join("expected.json")).unwrap()
+        );
+        let again = wrap_text(&vector_compose(), &BTreeMap::new()).unwrap();
+        assert_eq!(again.compose, wrapped.compose);
+        assert_eq!(compose_hash(&wrapped.compose), wrapped.compose_hash);
+
+        let yaml = compose_yaml(&wrapped);
+        assert_eq!(keys(&yaml), ["services", "volumes"]);
+        let services = &yaml["services"];
+        assert_eq!(keys(services), ["web", "db", "cache", RUNTIME_SERVICE]);
+        for (service, own) in [("web", true), ("db", true), ("cache", false)] {
+            let mounts = services[service]["volumes"].as_sequence();
+            let secret_mounts: Vec<&str> = mounts
+                .into_iter()
+                .flatten()
+                .filter_map(Yaml::as_str)
+                .filter(|m| m.contains("alpha-secrets"))
+                .collect();
+            if own {
+                assert_eq!(
+                    secret_mounts,
+                    [format!("alpha-secrets-{service}:/run/secrets:ro")]
+                );
+                assert_eq!(
+                    mounts.unwrap().last().unwrap().as_str().unwrap(),
+                    secret_mounts[0]
+                );
+            } else {
+                assert!(secret_mounts.is_empty(), "{service}");
+            }
+            assert!(services[service].get("secrets").is_none());
+        }
+        let web = &services["web"];
+        assert_eq!(web["ports"], strings(&["443:80"]));
+        assert_eq!(web["restart"], key("unless-stopped"));
+        assert_eq!(
+            serde_yaml_ng::to_string(&web["depends_on"]).unwrap(),
+            "db:\n  condition: service_started\ncache:\n  condition: service_started\nalpha-runtime:\n  condition: service_healthy\n"
+        );
+        assert_eq!(web["environment"]["LOG_LEVEL"], key("info"));
+        assert_eq!(web["environment"]["MODE"], key("production"));
+        let cache = &services["cache"];
+        assert_eq!(cache["restart"], key("always"));
+        assert!(cache.get("depends_on").is_none());
+        let runtime = &services[RUNTIME_SERVICE];
+        assert_eq!(
+            runtime["environment"]["ALPHACOMPUTE_SECRETS"],
+            key(r#"{"db":["db_password"],"web":["db_password","session_key"]}"#)
+        );
+        assert_eq!(
+            runtime["healthcheck"]["test"],
+            strings(&["CMD", "/alpha-runtime", "healthcheck"])
+        );
+        assert_eq!(
+            keys(&yaml["volumes"]),
+            [
+                "pgdata",
+                "cachedata",
+                "alpha-run",
+                "alpha-secrets-web",
+                "alpha-secrets-db"
+            ]
+        );
+        assert!(!wrapped.compose.contains("x-env"));
+        assert_eq!(
+            wrapped.secrets.iter().collect::<Vec<_>>(),
+            ["db_password", "session_key"]
+        );
+    }
+}
