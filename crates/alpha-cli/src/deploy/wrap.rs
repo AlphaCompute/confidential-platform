@@ -57,6 +57,14 @@ pub fn parse(bytes: &[u8]) -> Result<Plain, String> {
         .map_err(|_| "compose: not UTF-8; save it as UTF-8".to_owned())?;
     let mut root: Yaml =
         serde_yaml_ng::from_str(text).map_err(|e| format!("compose: {e}; fix the YAML"))?;
+    if let Some(tag) = find(&root, &|v| match v {
+        Yaml::Tagged(t) => Some(t.tag.to_string()),
+        _ => None,
+    }) {
+        return Err(format!(
+            "compose: the YAML tag {tag} is not supported; write the value itself"
+        ));
+    }
     root.apply_merge()
         .map_err(|e| format!("compose: {e}; fix the YAML"))?;
     let Yaml::Mapping(root) = root else {
@@ -69,107 +77,191 @@ pub fn parse(bytes: &[u8]) -> Result<Plain, String> {
             Some("volumes") => volumes = Some(v),
             Some("secrets") => secrets = Some(v),
             Some(k) if k == "version" || k == "name" || k.starts_with("x-") => {}
-            _ => return Err(format!("compose: {k:?} is not supported; remove it")),
+            _ => {
+                return Err(format!(
+                    "compose: {} is not supported; remove it",
+                    shown(&k)
+                ));
+            }
         }
     }
     let volumes = section(volumes, "volumes")?
         .into_iter()
         .map(|(name, v)| {
             unreserved(&name, "volumes")?;
-            match v {
-                Yaml::Null => Ok(name),
-                Yaml::Mapping(m) if m.is_empty() => Ok(name),
-                _ => Err(format!(
-                    "volumes.{name}: options are not supported; declare it as `{name}: {{}}`"
+            match option(&v, |_, _| false) {
+                None => Ok(name),
+                Some(what) => Err(format!(
+                    "volumes.{name}: {what} is not supported; declare it as `{name}: {{}}`, a volume of this compose"
                 )),
             }
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let declared: BTreeSet<String> = section(secrets, "secrets")?
+    let declared = section(secrets, "secrets")?
         .into_iter()
-        .map(|(name, _)| name)
-        .collect();
+        .map(|(name, v)| {
+            match option(&v, |k, v| k.as_str() == Some("external") && v.as_bool() == Some(true)) {
+                None => Ok(name),
+                Some(what) => Err(format!(
+                    "secrets.{name}: {what} is not supported; values come from the signing page, declare it as `{name}: {{}}`"
+                )),
+            }
+        })
+        .collect::<Result<BTreeSet<_>, String>>()?;
 
+    let services = section(services, "services")?;
+    let names: BTreeSet<String> = services.iter().map(|(name, _)| name.clone()).collect();
     let mut plain_services = Vec::new();
     let mut secrets = BTreeMap::new();
     let mut endpoints = Vec::new();
-    for (service, value) in section(services, "services")? {
+    for (service, value) in services {
         unreserved(&service, "services")?;
         let Yaml::Mapping(value) = value else {
-            return Err(format!("services.{service}: not a mapping"));
+            return Err(format!("services.{service}: not a mapping; write its keys"));
         };
-        if !value.contains_key("image") {
-            return Err(format!(
-                "services.{service}: no image; name one, by tag or as <image>@sha256:<digest>"
-            ));
-        }
+        let mut targets = Vec::new();
         for (k, v) in &value {
             let Some(k) = k.as_str().filter(|k| SERVICE_KEYS.contains(k)) else {
                 return Err(format!(
-                    "services.{service}: {k:?} is not supported; the keys allowed are {}",
+                    "services.{service}: {} is not supported; the keys allowed are {}",
+                    shown(k),
                     SERVICE_KEYS.join(", ")
                 ));
             };
             let place = format!("services.{service}.{k}");
+            if let Some(s) = find(v, &|v| v.as_str().filter(|s| interpolates(s))) {
+                return Err(format!(
+                    "{place}: {s} interpolates; write the value, or `$$` for a literal `$`; the CVM has no environment for interpolation"
+                ));
+            }
             match k {
                 "image" => {
-                    let image = v.as_str().ok_or_else(|| format!("{place}: not a string"))?;
+                    let image = v
+                        .as_str()
+                        .ok_or_else(|| format!("{place}: not a string; name the image"))?;
+                    if image.contains('@') && !pinned(image) {
+                        return Err(format!(
+                            "{place}: {image} has a malformed digest; write <image>@sha256:<64 lowercase hex digits>"
+                        ));
+                    }
                     if !pinned(image) && !REGISTRIES.contains(&registry(image)) {
                         return Err(format!(
                             "{place}: {image} is a tag outside Docker Hub, ghcr.io and quay.io; pin it as <image>@sha256:<digest>"
                         ));
                     }
                 }
+                "environment" => {
+                    let unset = match v {
+                        Yaml::Mapping(m) => m.iter().find(|(_, v)| v.is_null()).map(|(k, _)| k),
+                        Yaml::Sequence(items) => items
+                            .iter()
+                            .find(|i| !i.as_str().is_some_and(|s| s.contains('='))),
+                        _ => {
+                            return Err(format!(
+                                "{place}: not a list or mapping; write NAME: value"
+                            ));
+                        }
+                    };
+                    if let Some(name) = unset {
+                        return Err(format!(
+                            "{place}: {} has no value; give it a value, or declare it as a secret",
+                            shown(name)
+                        ));
+                    }
+                }
                 "ports" => {
                     for item in list(v, &place)? {
                         let port = container_port(item).ok_or_else(|| {
-                            format!("{place}: {item:?} is not a TCP port; write \"<host port>:<container port>\"")
+                            format!(
+                                "{place}: {} is not a TCP port; write \"<host port>:<container port>\"",
+                                shown(item)
+                            )
                         })?;
                         endpoints.push((service.clone(), port));
                     }
                 }
                 "volumes" => {
                     for item in list(v, &place)? {
-                        if !named_mount(item, &volumes) {
-                            return Err(format!(
-                                "{place}: {item:?} is not a volume declared under top-level volumes:; host paths are not mounted"
-                            ));
-                        }
+                        let target = named_mount(item, &volumes).ok_or_else(|| {
+                            format!(
+                                "{place}: {} is not a named volume of this compose; declare it under top-level volumes and mount it by name",
+                                shown(item)
+                            )
+                        })?;
+                        targets.push(target);
                     }
                 }
                 "secrets" => {
-                    let mut names = BTreeSet::new();
+                    let mut listed = BTreeSet::new();
                     for item in list(v, &place)? {
+                        if item.is_mapping() {
+                            return Err(format!(
+                                "{place}: {} is not supported; list the secret by name, its file is /run/secrets/<name>",
+                                shown(item)
+                            ));
+                        }
                         let name = name(item.clone(), &place)?;
                         if !declared.contains(&name) {
                             return Err(format!(
-                                "{place}: {name} is not declared under top-level secrets:; declare it"
+                                "{place}: {name} is not declared; declare it under top-level secrets"
                             ));
                         }
-                        names.insert(name);
+                        listed.insert(name);
                     }
-                    if !names.is_empty() {
-                        secrets.insert(service.clone(), names);
+                    if !listed.is_empty() {
+                        secrets.insert(service.clone(), listed);
                     }
                 }
                 "depends_on" => {
-                    let valid = match v {
-                        Yaml::Mapping(_) => true,
-                        Yaml::Sequence(items) => items.iter().all(Yaml::is_string),
-                        _ => false,
+                    let dependencies: Vec<&Yaml> = match v {
+                        Yaml::Mapping(m) => m.keys().collect(),
+                        Yaml::Sequence(items) => items.iter().collect(),
+                        _ => {
+                            return Err(format!(
+                                "{place}: not a list or mapping; list the services it waits for"
+                            ));
+                        }
                     };
-                    if !valid {
-                        return Err(format!("{place}: not a list or mapping of services"));
+                    for dependency in dependencies {
+                        match dependency.as_str() {
+                            Some(RUNTIME_SERVICE) => {
+                                return Err(format!(
+                                    "{place}: {RUNTIME_SERVICE} is added by the platform; remove it, a service that lists secrets already waits for it"
+                                ));
+                            }
+                            Some(d) if names.contains(d) => {}
+                            _ => {
+                                return Err(format!(
+                                    "{place}: {} is not a service of this compose; remove it or add the service",
+                                    shown(dependency)
+                                ));
+                            }
+                        }
                     }
                 }
                 _ => {}
             }
         }
+        if !value.contains_key("image") {
+            return Err(format!(
+                "services.{service}: no image; name one, by tag or as <image>@sha256:<digest>"
+            ));
+        }
+        if secrets.contains_key(&service)
+            && let Some(target) = targets.iter().find(|t| {
+                t.strip_prefix("/run/secrets")
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+            })
+        {
+            return Err(format!(
+                "services.{service}.volumes: {target} is where its secrets are mounted; mount the volume elsewhere"
+            ));
+        }
         plain_services.push((service, value));
     }
     let endpoint = <[(String, u16); 1]>::try_from(endpoints).map_err(|all| {
         format!(
-            "services: publish exactly one port, the App's Endpoint; {} are published",
+            "services: {} ports are published; publish exactly one, the App's Endpoint",
             all.len()
         )
     })?;
@@ -319,9 +411,53 @@ fn name(value: Yaml, place: &str) -> Result<String, String> {
     match value {
         Yaml::String(s) if is_key_purpose(&s) => Ok(s),
         other => Err(format!(
-            "{place}: {other:?} is not a name; use 1 to 64 lowercase letters, digits, `.`, `_` or `-`, starting with a letter or digit"
+            "{place}: {} is not a name; use 1 to 64 lowercase letters, digits, `.`, `_` or `-`, starting with a letter or digit",
+            shown(&other)
         )),
     }
+}
+
+fn shown(value: &Yaml) -> String {
+    match value {
+        Yaml::String(s) => s.clone(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| format!("{other:?}")),
+    }
+}
+
+/// The first part of a top-level volume or secret definition outside what `allowed` admits.
+fn option(value: &Yaml, allowed: impl Fn(&Yaml, &Yaml) -> bool) -> Option<String> {
+    match value {
+        Yaml::Null => None,
+        Yaml::Mapping(m) => m
+            .iter()
+            .find(|(k, v)| !allowed(k, v))
+            .map(|(k, _)| shown(k)),
+        other => Some(shown(other)),
+    }
+}
+
+fn find<'a, T>(value: &'a Yaml, f: &impl Fn(&'a Yaml) -> Option<T>) -> Option<T> {
+    f(value).or_else(|| match value {
+        Yaml::Sequence(items) => items.iter().find_map(|v| find(v, f)),
+        Yaml::Mapping(m) => m
+            .iter()
+            .find_map(|(k, v)| find(k, f).or_else(|| find(v, f))),
+        Yaml::Tagged(t) => find(&t.value, f),
+        _ => None,
+    })
+}
+
+/// Compose substitutes `$NAME` and `${NAME}` from the environment `docker compose up` runs in,
+/// which the host partly controls; only `$$`, a literal `$`, is safe.
+fn interpolates(s: &str) -> bool {
+    let mut rest = s;
+    while let Some((_, after)) = rest.split_once('$') {
+        match after.strip_prefix('$') {
+            Some(after) => rest = after,
+            None => return true,
+        }
+    }
+    false
 }
 
 fn unreserved(name: &str, place: &str) -> Result<(), String> {
@@ -341,8 +477,9 @@ fn list<'a>(value: &'a Yaml, place: &str) -> Result<&'a Vec<Yaml>, String> {
 
 fn pinned(image: &str) -> bool {
     image
-        .rsplit_once("@sha256:")
-        .is_some_and(|(_, hex)| hex_bytes::<32>(hex).is_some())
+        .split_once('@')
+        .and_then(|(_, digest)| digest.strip_prefix("sha256:"))
+        .is_some_and(|hex| hex_bytes::<32>(hex).is_some())
 }
 
 /// The registry a reference names, split as Docker does: the first component is a registry only
@@ -429,34 +566,35 @@ fn number(s: &str) -> Option<u16> {
     }
 }
 
-fn named_mount(item: &Yaml, declared: &[String]) -> bool {
+/// The container path of a mount of a declared named volume.
+fn named_mount<'a>(item: &'a Yaml, declared: &[String]) -> Option<&'a str> {
     let is_declared = |source: &str| declared.iter().any(|d| d == source);
-    match item {
+    let (valid, target) = match item {
         Yaml::String(s) => {
             let mut parts = s.split(':');
             let (Some(source), Some(target), mode, None) =
                 (parts.next(), parts.next(), parts.next(), parts.next())
             else {
-                return false;
+                return None;
             };
-            is_declared(source)
-                && target.starts_with('/')
-                && matches!(mode, None | Some("ro" | "rw"))
+            (
+                is_declared(source) && matches!(mode, None | Some("ro" | "rw")),
+                target,
+            )
         }
-        Yaml::Mapping(m) => {
+        Yaml::Mapping(m) => (
             m.keys()
                 .all(|k| matches!(k.as_str(), Some("type" | "source" | "target" | "read_only")))
                 && m.get("type").and_then(Yaml::as_str) == Some("volume")
                 && m.get("source")
                     .and_then(Yaml::as_str)
                     .is_some_and(is_declared)
-                && m.get("target")
-                    .and_then(Yaml::as_str)
-                    .is_some_and(|t| t.starts_with('/'))
-                && m.get("read_only").is_none_or(Yaml::is_bool)
-        }
-        _ => false,
-    }
+                && m.get("read_only").is_none_or(Yaml::is_bool),
+            m.get("target").and_then(Yaml::as_str)?,
+        ),
+        _ => return None,
+    };
+    (valid && target.starts_with('/')).then_some(target)
 }
 
 #[cfg(test)]
@@ -595,6 +733,59 @@ mod tests {
             wrapped.secrets.iter().collect::<Vec<_>>(),
             ["db_password", "session_key"]
         );
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Case {
+        compose: String,
+        refusal: String,
+    }
+
+    #[test]
+    fn wrap_refuses_every_vector() {
+        let text = fs::read_to_string(dir("09-wrap-refusals").join("cases.yaml")).unwrap();
+        let cases: BTreeMap<String, Case> = serde_yaml_ng::from_str(&text).unwrap();
+        let mut decided = [
+            "build",
+            "runtime-service",
+            "service-reserved",
+            "service-name",
+            "bind-short",
+            "bind-long",
+            "mount-image",
+            "privileged",
+            "network-host",
+            "tag-other-registry",
+            "digest-malformed",
+            "volume-driver-opts",
+            "volume-name",
+            "volume-external",
+            "volume-reserved",
+            "secret-file",
+            "secret-environment",
+            "secret-long",
+            "secret-undeclared",
+            "secrets-mount-target",
+            "ports-two",
+            "ports-none",
+            "port-host-ip",
+            "interpolation",
+            "env-no-value",
+            "depends-on-runtime",
+            "depends-on-missing",
+            "top-level-key",
+            "yaml-tag",
+            "duplicate-key",
+            "two-documents",
+            "empty",
+        ];
+        decided.sort_unstable();
+        assert_eq!(cases.keys().collect::<Vec<_>>(), decided);
+        for (name, case) in &cases {
+            let err = parse(case.compose.as_bytes()).unwrap_err();
+            assert!(err.contains(&case.refusal), "{name}: {err}");
+            assert!(err.contains("; "), "{name}: {err}");
+        }
     }
 
     fn replaced(text: &str, from: &str, to: &str) -> String {
