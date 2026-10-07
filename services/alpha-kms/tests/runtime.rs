@@ -24,7 +24,7 @@ use alpha_client::tls::{self, Pin};
 use alpha_client::{Client, Error as ClientError};
 use alpha_core::{AppId, ComposeHash, KeyId, context};
 use alpha_kms::{certs, rfc3339};
-use alpha_runtime::{Config, Error, EvidenceSource, Exit, Runtime};
+use alpha_runtime::{Config, Delivery, Error, EvidenceSource, Exit, Runtime, Secrets};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use common::*;
@@ -83,7 +83,28 @@ fn config(h: &Harness, endpoints: Vec<String>) -> Config {
         kms_ca_spki_sha256: ca_spki_sha256(&h.ca_pem),
         kms_revisions: vec![h.node.compose_hash],
         kms_endpoints: endpoints,
+        secrets: Secrets::new(),
     }
+}
+
+fn config_with_secrets(h: &Harness, endpoints: Vec<String>, secrets: &str) -> Config {
+    Config {
+        secrets: alpha_runtime::parse_secrets(secrets).unwrap(),
+        ..config(h, endpoints)
+    }
+}
+
+/// A fresh secrets root holding one directory per listed service, as the mounted volumes.
+fn secrets_root(services: &[&str]) -> PathBuf {
+    let root = std::env::temp_dir().join(format!("alpha-secrets-{}", uuid::Uuid::now_v7()));
+    for service in services {
+        std::fs::create_dir_all(root.join(service)).unwrap();
+    }
+    root
+}
+
+fn mode(path: &std::path::Path) -> u32 {
+    std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(path).unwrap().permissions()) & 0o777
 }
 
 /// A runtime holding the capture's key and compose, its clock settable by the test.
@@ -848,4 +869,31 @@ async fn a_revoked_revision_is_refused_its_key_and_ends_the_runtime_with_78() {
     assert!(runtime.is_revoked());
     let exit = (&mut socket.task).await.unwrap();
     assert_eq!(exit.code(), 78);
+}
+
+#[tokio::test]
+async fn secret_files_are_written_after_attestation_for_declaring_services_only() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    app_with_secret(&h, b"v1").await;
+    let (runtime, _) = start_runtime(
+        &h,
+        config_with_secrets(
+            &h,
+            vec![h.url.clone()],
+            r#"{"web":["model-key"],"worker":["model-key"]}"#,
+        ),
+    );
+    let root = secrets_root(&["web", "worker", "idle"]);
+    runtime.attest().await.unwrap();
+    assert_eq!(runtime.deliver(&root).await, Delivery::Complete);
+    for service in ["web", "worker"] {
+        let file = root.join(service).join("model-key");
+        assert_eq!(std::fs::read(&file).unwrap(), b"v1", "{}", file.display());
+        assert_eq!(mode(&file), 0o444, "{}", file.display());
+        assert!(!root.join(service).join(".model-key.tmp").exists());
+    }
+    assert_eq!(std::fs::read_dir(root.join("idle")).unwrap().count(), 0);
+    let _ = std::fs::remove_dir_all(&root);
 }
