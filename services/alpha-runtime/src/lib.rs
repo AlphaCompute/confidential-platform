@@ -18,7 +18,7 @@ pub mod socket;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -230,6 +230,9 @@ pub fn write_secret(dir: &Path, name: &str, value: &[u8]) -> std::io::Result<()>
         .create_new(true)
         .mode(0o444)
         .open(&temp)?;
+    // The process umask narrows the mode given at creation, and the reading service usually
+    // runs as another user.
+    file.set_permissions(std::fs::Permissions::from_mode(0o444))?;
     file.write_all(value)?;
     drop(file);
     std::fs::rename(&temp, &path)
