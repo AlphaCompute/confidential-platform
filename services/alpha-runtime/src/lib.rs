@@ -220,11 +220,7 @@ pub fn write_secret(dir: &Path, name: &str, value: &[u8]) -> std::io::Result<()>
     }
     // No Secret name starts with a dot, so the temp file never collides with one.
     let temp = dir.join(format!(".{name}.tmp"));
-    match std::fs::remove_file(&temp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
+    let _ = std::fs::remove_file(&temp);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
