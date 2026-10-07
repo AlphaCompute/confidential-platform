@@ -138,6 +138,13 @@ fn the_platform_document_verifies_through_the_export() {
             .unwrap()
             .contains("BEGIN CERTIFICATE")
     );
+    let revisions = view["kms_revisions"].as_array().unwrap();
+    assert!(!revisions.is_empty());
+    for r in revisions {
+        assert!(r["compose_hash"].as_str().unwrap().starts_with("sha256:"));
+    }
+    assert!(view.get("signer").is_none());
+    assert!(view.get("catalog_key").is_none());
     let err = verify_platform(PLATFORM_DOCUMENT, 0.0).err().unwrap();
     assert!(message(err).starts_with("platform_signature: "));
 }

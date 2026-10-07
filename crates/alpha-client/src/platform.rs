@@ -43,6 +43,8 @@ pub async fn fetch(
 mod tests {
     use std::time::Duration;
 
+    use base64::Engine;
+    use base64::prelude::BASE64_URL_SAFE_NO_PAD;
     use ed25519_dalek::SigningKey;
     use serde_json::json;
 
@@ -73,5 +75,39 @@ mod tests {
         );
         let other = SigningKey::from_bytes(&[6u8; 32]);
         assert!(verify(&signed, &other.verifying_key(), now).is_err());
+    }
+
+    #[test]
+    fn verify_carries_signer_and_catalog_key_into_the_full_document() {
+        let key = SigningKey::from_bytes(&[5u8; 32]);
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let mut document = json!({
+            "version": 3, "issued_at": "2026-09-14T00:00:00Z",
+            "policy": { "tcb_statuses": ["UpToDate"], "tolerated_advisories": [] },
+            "reference_values": [], "kms_ca_pem": "", "kms_revisions": [],
+            "signer": {
+                "origins": ["https://sign.example"],
+                "rp_id": "sign.example",
+                "bundle_sha256": format!("sha256:{}", "0".repeat(64)),
+                "api_origin": "https://api.example"
+            },
+            "catalog_key": {
+                "algorithm": "ed25519",
+                "public_key": BASE64_URL_SAFE_NO_PAD.encode([7u8; 32])
+            }
+        });
+        let signed = sign(document.clone(), &key).unwrap();
+        let full = verify(&signed, &key.verifying_key(), now).unwrap();
+        assert_eq!(full.signer.unwrap().rp_id, "sign.example");
+        assert!(full.catalog_key.is_some());
+
+        document["signer"]["origins"][0] = json!("http://sign.example");
+        let signed = sign(document, &key).unwrap();
+        assert!(
+            verify(&signed, &key.verifying_key(), now)
+                .unwrap_err()
+                .to_string()
+                .contains("signer.origins \"http://sign.example\"")
+        );
     }
 }

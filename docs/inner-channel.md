@@ -189,7 +189,8 @@ Every export returns an error rather than trapping, and the error's message star
 
 ## The JavaScript surface
 
-`verifyPlatform(signedJson, nowMs)` returns `{version, issued_at, kms_ca_pem}` as JSON.
+`verifyPlatform(signedJson, nowMs)` returns `{version, issued_at, kms_ca_pem, kms_revisions}` as
+JSON, with `signer` and `catalog_key` when the document has them.
 
 `new Initiator()` offers `hello()`, then
 `finish(serverHelloJson, kmsCaPem, expectedJson, nowMs)`, which returns a `Channel`.
