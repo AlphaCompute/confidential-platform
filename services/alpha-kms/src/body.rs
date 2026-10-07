@@ -37,7 +37,7 @@ mod tests {
     async fn a_repeated_key_anywhere_in_a_body_is_malformed() {
         for bytes in [
             &br#"{"payload":{},"payload":{}}"#[..],
-            br#"{"payload":{},"payload":{}}"#,
+            b"{\"payload\":{},\"\x5cu0070ayload\":{}}",
             br#"{"payload":{"app_id":1,"app_id":2}}"#,
         ] {
             let Err(e) = extract(bytes).await else {

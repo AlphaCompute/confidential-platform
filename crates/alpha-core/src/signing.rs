@@ -140,7 +140,7 @@ mod tests {
     fn parse_refuses_repeated_keys_at_any_depth() {
         for bytes in [
             &br#"{"a":1,"a":2}"#[..],
-            br#"{"a":1,"a":2}"#,
+            b"{\"a\":1,\"\x5cu0061\":2}",
             br#"{"x":[{"k":1,"k":2}]}"#,
         ] {
             assert!(parse(bytes).is_err(), "{}", String::from_utf8_lossy(bytes));
@@ -149,8 +149,7 @@ mod tests {
 
     #[test]
     fn parse_matches_serde_json_when_no_key_repeats() {
-        let mixed =
-            r#"{"b":[1,2.5,-0,1e21,9007199254740993],"a":{"c":"ü 😀  ","d":null,"e":true}}"#;
+        let mixed = "{\"b\":[1,2.5,-0,1e21,9007199254740993],\"a\":{\"c\":\"ü 😀 \x5cu2028\",\"d\":null,\"e\":true}}";
         for bytes in [
             &b"{}"[..],
             b"[]",
