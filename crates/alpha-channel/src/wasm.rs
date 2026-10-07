@@ -5,10 +5,11 @@
 
 use std::time::{Duration, SystemTime};
 
+use alpha_core::ComposeHash;
 use serde_json::json;
 use wasm_bindgen::prelude::*;
 
-use crate::{Error, compose, frame, handshake, member, platform, rfc3339, sha256_label};
+use crate::{Error, compose, frame, handshake, member, platform, receipt, rfc3339, sha256_label};
 
 fn js(e: Error) -> JsError {
     JsError::new(&format!("{}: {e}", e.code()))
@@ -37,6 +38,23 @@ pub fn verify_platform(signed_json: &str, now_ms: f64) -> Result<String, JsError
     let signed: platform::SignedDocument = parse("platform document", signed_json)?;
     let key = platform::release_key().map_err(js)?;
     to_json(&platform::verify(&signed, &key, at(now_ms)?).map_err(js)?)
+}
+
+/// The response the KMS signed, which callers use instead of the reply's top-level fields.
+/// `kms_revisions_json` is `["sha256:<hex>", …]` and `expected_json` is
+/// `{route, request_sha256, response}`. There is no `now`: the leaf is checked at the receipt's
+/// own `issued_at`.
+#[wasm_bindgen(js_name = verifyKmsReceipt)]
+pub fn verify_kms_receipt(
+    receipt_json: &str,
+    kms_ca_pem: &str,
+    kms_revisions_json: &str,
+    expected_json: &str,
+) -> Result<String, JsError> {
+    let signed: receipt::Receipt = parse("receipt", receipt_json)?;
+    let revisions: Vec<ComposeHash> = parse("kms revisions", kms_revisions_json)?;
+    let expected: receipt::Expected = parse("expected", expected_json)?;
+    to_json(&receipt::verify(&signed, kms_ca_pem, &revisions, &expected).map_err(js)?)
 }
 
 /// `{name: {image, environment}}` for every service of an `app-compose.json`.

@@ -165,6 +165,30 @@ is `base64url(JCS(document)) "." base64url(r‖s)`. A verifier hashes the JCS by
 received, checks the signature, and only then parses them. Comparing `aud` with the presenting
 Instance and `exp` with the time is the verifier's part.
 
+## KMS receipts
+
+Every successful Control API response carries `receipt` beside its fields:
+
+```
+{"document": {"route", "request_sha256", "response", "issued_at"},
+ "signature": {"algorithm": "ecdsa-p256", "signature": "<base64url r‖s>"},
+ "certificate_chain": ["<PEM node leaf>"]}
+```
+
+`route` is one of `revision.register`, `revision.revoke`, `secret.put`, `key.register` and
+`key.revoke`. `request_sha256` is `sha256:<hex>` of the JCS of the request body as the KMS
+received it; the KMS refuses bodies that repeat a key, so the JCS of the parsed body loses
+nothing. `response` is the response without `receipt`, and `issued_at` is RFC 3339 UTC in whole
+seconds. The node's runtime key signs the document under context `alphacompute/kms-receipt/v1`.
+
+`certificate_chain` is the node's leaf only, because every verifier pins its own `kms_ca_pem`.
+The leaf must carry exactly `alphacompute://kms` and then a Revision from the platform document's
+`kms_revisions`, so an Instance leaf from the same CA cannot sign a receipt. The leaf is checked at
+`issued_at`, not at the verifier's clock, so a stored receipt stays verifiable after the leaf's
+hour. A verifier always takes an expectation `{route, request_sha256, response}`, because a
+genuine receipt for another request must be refused, and returns the signed `document.response`
+rather than the reply's top-level fields, which no signature covers.
+
 ## Error codes
 
 Every export returns an error rather than trapping, and the error's message starts with its code.
@@ -172,8 +196,8 @@ Every export returns an error rather than trapping, and the error's message star
 | Code | Meaning |
 |---|---|
 | `platform_signature` | the platform document does not verify, or was issued after `now` |
-| `foreign_certificate` | the chain is not a leaf and the platform's KMS CA, the leaf is not that CA's, or it names another organization or App |
-| `certificate_expired` | `now` is outside the leaf's validity |
+| `foreign_certificate` | the chain is not a leaf and the platform's KMS CA, the leaf is not that CA's, or it names another organization or App; or a KMS receipt's chain is not exactly one leaf carrying `alphacompute://kms` |
+| `certificate_expired` | `now` (for a KMS receipt, its `issued_at`) is outside the leaf's validity |
 | `unknown_revision` | the leaf's Revision is not in the allowlist |
 | `compose_mismatch` | the compose does not hash to the leaf's Revision |
 | `handshake_signature` | the handshake signature or the encapsulation does not check out |
@@ -186,11 +210,18 @@ Every export returns an error rather than trapping, and the error's message star
 | `truncated` | a response ended without its end frame |
 | `signature_invalid` | a member signature does not verify under that key, context and document, or names another algorithm |
 | `request_stale` | a member document's `issued_at` is more than a minute from `now` |
+| `receipt_mismatch` | a KMS receipt is genuine but for another route, request or response |
 
 ## The JavaScript surface
 
 `verifyPlatform(signedJson, nowMs)` returns `{version, issued_at, kms_ca_pem, kms_revisions}` as
 JSON, with `signer` and `catalog_key` when the document has them.
+
+`verifyKmsReceipt(receiptJson, kmsCaPem, kmsRevisionsJson, expectedJson)` checks a KMS receipt
+and returns the response it signed as JSON. `kmsRevisionsJson` lists the `compose_hash` of each
+`kms_revisions` entry `verifyPlatform` returns, and `expectedJson` is
+`{route, request_sha256, response}`, where every key listed in `response` must match. It takes no
+`nowMs`, because the leaf is checked at the receipt's `issued_at`.
 
 `new Initiator()` offers `hello()`, then
 `finish(serverHelloJson, kmsCaPem, expectedJson, nowMs)`, which returns a `Channel`.

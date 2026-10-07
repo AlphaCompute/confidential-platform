@@ -8,8 +8,8 @@
 )]
 
 use alpha_channel::wasm::{
-    Initiator, Responder, compose_services, signable, verify_grant, verify_member_request,
-    verify_platform,
+    Initiator, Responder, compose_services, signable, verify_grant, verify_kms_receipt,
+    verify_member_request, verify_platform,
 };
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
@@ -28,6 +28,42 @@ const PLATFORM_DOCUMENT: &str = include_str!("../../../testdata/channel/platform
 
 /// 2026-06-01T00:00:00Z.
 const NOW_MS: f64 = 1_780_272_000_000.0;
+
+const RECEIPT_CA: &str = include_str!("../../../testdata/receipt/ca.pem");
+const RECEIPT_VECTORS: &[(&str, &str)] = &[
+    (
+        "valid",
+        include_str!("../../../testdata/receipt/valid.json"),
+    ),
+    (
+        "wrong-ca",
+        include_str!("../../../testdata/receipt/wrong-ca.json"),
+    ),
+    (
+        "instance-leaf",
+        include_str!("../../../testdata/receipt/instance-leaf.json"),
+    ),
+    (
+        "wrong-route",
+        include_str!("../../../testdata/receipt/wrong-route.json"),
+    ),
+    (
+        "wrong-request",
+        include_str!("../../../testdata/receipt/wrong-request.json"),
+    ),
+    (
+        "other-response",
+        include_str!("../../../testdata/receipt/other-response.json"),
+    ),
+    (
+        "tampered-response",
+        include_str!("../../../testdata/receipt/tampered-response.json"),
+    ),
+    (
+        "issued-at-outside",
+        include_str!("../../../testdata/receipt/issued-at-outside.json"),
+    ),
+];
 
 fn expected() -> String {
     json!({
@@ -210,4 +246,31 @@ fn member_documents_from_signable_verify_through_the_exports() {
             .unwrap()
             .contains("@sha256:")
     );
+}
+
+#[wasm_bindgen_test]
+fn kms_receipt_vectors_give_their_recorded_result_through_the_export() {
+    for (name, text) in RECEIPT_VECTORS {
+        let v: Value = serde_json::from_str(text).unwrap();
+        // Re-serializing may reorder the receipt's keys; the signature covers JCS of the
+        // document, so that must not matter.
+        let out = verify_kms_receipt(
+            &v["receipt"].to_string(),
+            RECEIPT_CA,
+            &v["kms_revisions"].to_string(),
+            &v["expected"].to_string(),
+        );
+        match (out, v["result"].as_str().unwrap()) {
+            (Ok(json), "ok") => assert_eq!(
+                serde_json::from_str::<Value>(&json).unwrap(),
+                v["receipt"]["document"]["response"],
+                "{name}"
+            ),
+            (Err(e), result) => {
+                let m = message(e);
+                assert!(m.starts_with(&format!("{result}:")), "{name}: {m}");
+            }
+            (Ok(_), result) => panic!("{name}: accepted, expected {result}"),
+        }
+    }
 }
