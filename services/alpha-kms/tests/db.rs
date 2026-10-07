@@ -1795,7 +1795,8 @@ async fn a_sealed_value_cannot_be_moved_into_another_organization() {
 
     let mut verbatim = h.signed(context::SECRET, body["payload"].clone(), &admin_b);
     verbatim["sealed"] = body["sealed"].clone();
-    refused_put(&h, "moved", verbatim, StatusCode::NOT_FOUND, "not_found").await;
+    let message = refused_put(&h, "moved", verbatim, StatusCode::BAD_REQUEST, "malformed").await;
+    assert!(message.contains("another organization"), "{message}");
 
     let mut own_app = body["payload"].clone();
     own_app["app_ids"] = json!([AppId::mint()]);

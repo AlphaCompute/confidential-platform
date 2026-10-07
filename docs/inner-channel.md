@@ -231,11 +231,14 @@ The put then goes to `PUT /v1/secrets/<name>` as:
 
 The frame is one request frame on `PUT /v1/secrets/<name>` with `seq` 0. Its plaintext is the
 32-byte digest `SHA-256("alphacompute/secret/v1" ‖ 0x00 ‖ JCS(payload))`, the same digest the put's
-signature covers, followed by the value. The value is therefore bound to the document the
-signature covers, so a relay holding a key of its own cannot carry it into a put it signs itself,
-and the path in the frame's associated data binds it to its name. `content_sha256` stays the
-SHA-256 of the value alone. The reply is plain JSON with a receipt, whose `response` includes
-`org_id`.
+signature covers, then the 16 bytes of the organization id, then the value. The node refuses the
+put as `malformed` when the digest is not its own digest of the received payload, or when the
+organization is not the one the signing key belongs to. The digest keeps the value from travelling
+in a put with any other payload. The payload names no organization, so a relay holding a key of its
+own could sign the very same payload; the organization id is what keeps it from storing the value
+in its own organization, whether or not the granted Apps have a Revision yet. The path in the
+frame's associated data binds the value to its name. `content_sha256` stays the SHA-256 of the
+value alone. The reply is plain JSON with a receipt, whose `response` includes `org_id`.
 
 The node keeps no record of the frame. A replayed put is stopped by the put's own `issued_at` rule:
 a put no newer than the stored Secret is refused as `already_exists`.
@@ -280,9 +283,11 @@ and returns the response it signed as JSON. `kmsRevisionsJson` lists the `compos
 verified as JSON, with `aud` and `kms_ca_sha256` in hex and the times in RFC 3339.
 
 `new KmsSecretSealer()` seals one put-Secret's value. It offers `hello()`, the ClientHello to post
-to `POST /v1/channel`, then `seal(serverHelloJson, platformJson, payloadJson, value, nowMs)`, which
-returns the body's `sealed` member, `{ticket, frame}`, as JSON. `platformJson` is `verifyPlatform`'s
-output, and `payloadJson` is the put's payload exactly as it will be signed and sent. A sealer
+to `POST /v1/channel`, then
+`seal(serverHelloJson, platformJson, payloadJson, orgId, value, nowMs)`, which returns the body's
+`sealed` member, `{ticket, frame}`, as JSON. `platformJson` is `verifyPlatform`'s output,
+`payloadJson` is the put's payload exactly as it will be signed and sent, and `orgId` is the UUID
+of the organization whose key signs the put; a string that is not a UUID is `malformed`. A sealer
 seals once, so no two values are ever sealed under one nonce.
 
 A `Channel` offers `sealRequest(method, path, body)`, whose frame's `seq` names the response,

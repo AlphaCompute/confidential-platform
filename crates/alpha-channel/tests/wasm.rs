@@ -59,9 +59,11 @@ const RECEIPT_VECTORS: &[(&str, &str)] = &[
     r!("duplicate-key"),
 ];
 
+const ORG: &str = "01920000-0000-7000-8000-000000000001";
+
 fn expected() -> String {
     json!({
-        "org_id": "01920000-0000-7000-8000-000000000001",
+        "org_id": ORG,
         "app_id": "01920000-0000-7000-8000-000000000002",
         "revisions": [alpha_core::compose_hash(COMPOSE)],
     })
@@ -213,6 +215,7 @@ fn the_sealer_seals_a_put_that_only_the_node_opens() {
                 &reply,
                 &platform(CA, &[kms_revision()]),
                 &payload.to_string(),
+                ORG,
                 value,
                 NOW_MS,
             )
@@ -221,7 +224,9 @@ fn the_sealer_seals_a_put_that_only_the_node_opens() {
     )
     .unwrap();
     assert_eq!(sealed.ticket, "t");
-    let opened = secret::open(&id, &c2s, &sealed.frame, "db_password", &payload).unwrap();
+    let (sealed_for, opened) =
+        secret::open(&id, &c2s, &sealed.frame, "db_password", &payload).unwrap();
+    assert_eq!(sealed_for.to_string(), ORG);
     assert_eq!(opened.as_slice(), value);
 }
 
@@ -230,12 +235,12 @@ fn the_sealer_refuses_a_node_the_view_does_not_list() {
     let value = b"v";
     let payload = put_payload(value).to_string();
     let listed = platform(CA, &[kms_revision()]);
-    let seal = |reply: &dyn Fn(&str) -> String, platform: &str, now_ms: f64| {
+    let seal = |reply: &dyn Fn(&str) -> String, platform: &str, org_id: &str, now_ms: f64| {
         let mut sealer = KmsSecretSealer::new().map_err(message).unwrap();
         let reply = reply(&sealer.hello());
         message(
             sealer
-                .seal(&reply, platform, &payload, value, now_ms)
+                .seal(&reply, platform, &payload, org_id, value, now_ms)
                 .err()
                 .unwrap(),
         )
@@ -252,16 +257,18 @@ fn the_sealer_refuses_a_node_the_view_does_not_list() {
     let unlisted = alpha_core::compose_hash(COMPOSE).to_string();
 
     for (code, m) in [
-        ("foreign_certificate", seal(&instance, &listed, NOW_MS)),
+        ("foreign_certificate", seal(&instance, &listed, ORG, NOW_MS)),
         (
             "foreign_certificate",
-            seal(&node, &platform(foreign_ca, &[kms_revision()]), NOW_MS),
+            seal(&node, &platform(foreign_ca, &[kms_revision()]), ORG, NOW_MS),
         ),
         (
             "unknown_revision",
-            seal(&node, &platform(CA, &[unlisted]), NOW_MS),
+            seal(&node, &platform(CA, &[unlisted]), ORG, NOW_MS),
         ),
-        ("malformed", seal(&node, &listed, f64::NAN)),
+        ("malformed", seal(&node, &listed, ORG, f64::NAN)),
+        ("malformed", seal(&node, &listed, "acme", NOW_MS)),
+        ("malformed", seal(&node, &listed, "", NOW_MS)),
     ] {
         assert!(m.starts_with(&format!("{code}: ")), "{code}: {m}");
     }
@@ -269,10 +276,10 @@ fn the_sealer_refuses_a_node_the_view_does_not_list() {
     let mut sealer = KmsSecretSealer::new().map_err(message).unwrap();
     let reply = node(&sealer.hello());
     sealer
-        .seal(&reply, &listed, &payload, value, NOW_MS)
+        .seal(&reply, &listed, &payload, ORG, value, NOW_MS)
         .map_err(message)
         .unwrap();
-    let again = sealer.seal(&reply, &listed, &payload, value, NOW_MS);
+    let again = sealer.seal(&reply, &listed, &payload, ORG, value, NOW_MS);
     assert!(message(again.err().unwrap()).starts_with("malformed: "));
 }
 

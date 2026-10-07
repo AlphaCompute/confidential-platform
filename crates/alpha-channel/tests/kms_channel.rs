@@ -11,7 +11,7 @@ use std::time::SystemTime;
 use alpha_channel::Error;
 use alpha_channel::handshake::{Initiator, Responder, ServerHello};
 use alpha_channel::secret::{self, Sealed};
-use alpha_core::ComposeHash;
+use alpha_core::{ComposeHash, OrgId};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
@@ -27,6 +27,10 @@ const KMS_COMPOSE: &str = include_str!("../../../testdata/manifest/06-kms-node/a
 
 const NOW: &str = "2026-06-01T00:00:00Z";
 const VALUE: &[u8] = b"correct horse battery staple";
+
+fn org() -> OrgId {
+    "01920000-0000-7000-8000-000000000001".parse().unwrap()
+}
 
 fn at(rfc3339: &str) -> SystemTime {
     chrono::DateTime::parse_from_rfc3339(rfc3339)
@@ -97,6 +101,7 @@ fn seal_to(
         kms_ca_pem,
         kms_revisions,
         payload,
+        org(),
         VALUE,
         at(now),
     )
@@ -140,12 +145,15 @@ fn a_value_sealed_to_a_kms_node_opens_there() {
         CA,
         &revisions(),
         &payload,
+        org(),
         VALUE,
         at(NOW),
     )
     .unwrap();
     assert_eq!(sealed.ticket, "t");
-    let opened = secret::open(&id, &c2s, &sealed.frame, "db_password", &payload).unwrap();
+    let (sealed_for, opened) =
+        secret::open(&id, &c2s, &sealed.frame, "db_password", &payload).unwrap();
+    assert_eq!(sealed_for, org());
     assert_eq!(opened.as_slice(), VALUE);
 
     let (initiator, hello, _, _) = exchange(&node(), with_ticket);
@@ -222,6 +230,7 @@ fn a_frame_opens_only_for_its_name_key_channel_and_payload() {
         CA,
         &revisions(),
         &payload,
+        org(),
         VALUE,
         at(NOW),
     )
@@ -246,6 +255,23 @@ fn a_frame_opens_only_for_its_name_key_channel_and_payload() {
         open(&id, &c2s, &sealed.frame, "db_password", &later),
         "malformed"
     );
+}
+
+#[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+fn a_plaintext_without_its_organization_is_malformed() {
+    let payload = payload(Some("db_password"));
+    let digest = alpha_core::signing_digest(alpha_core::context::SECRET, &payload).unwrap();
+    for plaintext in [digest.to_vec(), [digest.as_slice(), &[1; 15]].concat()] {
+        let (initiator, hello, id, c2s) = exchange(&node(), with_ticket);
+        let (mut channel, _) = initiator
+            .finish_kms(&hello, CA, &revisions(), at(NOW))
+            .unwrap();
+        let frame = channel
+            .seal_request("PUT", "/v1/secrets/db_password", &plaintext)
+            .unwrap();
+        let err = secret::open(&id, &c2s, &frame, "db_password", &payload).unwrap_err();
+        assert_eq!(err.code(), "malformed");
+    }
 }
 
 #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]

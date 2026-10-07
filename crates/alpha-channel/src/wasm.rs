@@ -5,7 +5,7 @@
 
 use std::time::{Duration, SystemTime};
 
-use alpha_core::ComposeHash;
+use alpha_core::{ComposeHash, OrgId};
 use serde_json::json;
 use wasm_bindgen::prelude::*;
 
@@ -156,19 +156,24 @@ impl KmsSecretSealer {
     }
 
     /// The put body's `sealed` member, `{ticket, frame}`, once the reply verifies as a node of the
-    /// platform: `platform_json` is `verifyPlatform`'s output, and `payload_json` is the put's
-    /// payload exactly as it will be signed and sent.
+    /// platform: `platform_json` is `verifyPlatform`'s output, `payload_json` is the put's payload
+    /// exactly as it will be signed and sent, and `org_id` is the UUID of the organization whose
+    /// key signs the put; the KMS refuses the value under any other organization.
     pub fn seal(
         &mut self,
         server_hello_json: &str,
         platform_json: &str,
         payload_json: &str,
+        org_id: &str,
         value: &[u8],
         now_ms: f64,
     ) -> Result<String, JsError> {
         let hello: handshake::ServerHello = parse("server hello", server_hello_json)?;
         let view: platform::PlatformView = parse("platform", platform_json)?;
         let payload: serde_json::Value = parse("payload", payload_json)?;
+        let org_id: OrgId = org_id
+            .parse()
+            .map_err(|_| js(Error::Malformed(format!("org_id {org_id:?} is not a UUID"))))?;
         let now = at(now_ms)?;
         let inner = self
             .inner
@@ -183,6 +188,7 @@ impl KmsSecretSealer {
                 &view.kms_ca_pem,
                 &revisions,
                 &payload,
+                org_id,
                 value,
                 now,
             )

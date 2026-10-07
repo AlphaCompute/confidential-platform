@@ -410,7 +410,8 @@ impl Harness {
     }
 
     /// A put-Secret body whose value is sealed over a fresh `/v1/channel` handshake with this
-    /// node, pinning the bootstrap CA and the node's Revision; returned unsent.
+    /// node, pinning the bootstrap CA and the node's Revision, for this harness's organization;
+    /// returned unsent.
     pub async fn sealed_body(
         &self,
         name: &str,
@@ -430,6 +431,7 @@ impl Harness {
             &self.ca_pem,
             &[self.node.compose_hash],
             &payload,
+            self.org,
             value,
             self.now(),
         )

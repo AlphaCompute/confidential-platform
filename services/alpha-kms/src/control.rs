@@ -338,17 +338,27 @@ pub async fn put_secret(
         if request.get("value").is_some() == request.get("sealed").is_some() {
             return Err(ApiError::malformed("exactly one of value and sealed"));
         }
-        let value = match (&value, &sealed) {
-            (Some(value), None) => Zeroizing::new(
-                BASE64_URL_SAFE_NO_PAD
-                    .decode(value)
-                    .map_err(|_| ApiError::malformed("value: expected base64url"))?,
+        let (sealed_for, value) = match (&value, &sealed) {
+            (Some(value), None) => (
+                None,
+                Zeroizing::new(
+                    BASE64_URL_SAFE_NO_PAD
+                        .decode(value)
+                        .map_err(|_| ApiError::malformed("value: expected base64url"))?,
+                ),
             ),
             (None, Some(sealed)) => {
                 let (channel, c2s) =
                     crate::channel::open_ticket(&keys.tenant_kek_root, &sealed.ticket, node.now())?;
-                alpha_channel::secret::open(&channel, &c2s, &sealed.frame, &name, &body.payload)
-                    .map_err(|e| ApiError::malformed(format!("sealed: {e}")))?
+                let (sealed_for, value) = alpha_channel::secret::open(
+                    &channel,
+                    &c2s,
+                    &sealed.frame,
+                    &name,
+                    &body.payload,
+                )
+                .map_err(|e| ApiError::malformed(format!("sealed: {e}")))?;
+                (Some(sealed_for), value)
             }
             _ => return Err(ApiError::malformed("exactly one of value and sealed")),
         };
@@ -363,6 +373,13 @@ pub async fn put_secret(
         let at = within_window(p.issued_at, node.now_utc())?;
         let chain = authorize(&node, &keys, context::SECRET, &body, at).await?;
         let org_id = chain.key.org_id;
+        // The payload names no organization, so a key of any organization can sign a verbatim copy
+        // of it; the organization sealed beside the value is what keeps it with its owner.
+        if sealed_for.is_some_and(|sealed_for| Uuid::from(sealed_for) != org_id) {
+            return Err(ApiError::malformed(
+                "sealed: the value was sealed for another organization",
+            ));
+        }
         let app_ids: Vec<Uuid> = p.app_ids.iter().map(|a| Uuid::from(*a)).collect();
         let mut tx = node.pool.begin().await?;
         sqlx::query!(
