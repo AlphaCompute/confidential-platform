@@ -322,24 +322,18 @@ pub fn wrap(
                 // is not reachable over the Endpoint's TLS passthrough. Upgrade: `alpha-runtime`
                 // terminates TLS with the Instance leaf and proxies to the service.
                 Some("ports") if name == endpoint => strings(&[&format!("{APP_PORT}:{port}")]),
-                Some("volumes") => match (&secrets_volume, v) {
-                    (Some(volume), Yaml::Sequence(mut mounts)) => {
-                        mounts.push(key(&format!("{volume}:/run/secrets:ro")));
-                        Yaml::Sequence(mounts)
-                    }
-                    (_, v) => v,
-                },
                 Some("depends_on") if secrets_volume.is_some() => after_runtime(v)?,
                 _ => v,
             };
             out.insert(k, v);
         }
         if let Some(volume) = secrets_volume {
-            if !out.contains_key("volumes") {
-                out.insert(
-                    key("volumes"),
-                    strings(&[&format!("{volume}:/run/secrets:ro")]),
-                );
+            let mount = key(&format!("{volume}:/run/secrets:ro"));
+            match out.get_mut("volumes") {
+                Some(Yaml::Sequence(mounts)) => mounts.push(mount),
+                _ => {
+                    out.insert(key("volumes"), Yaml::Sequence(vec![mount]));
+                }
             }
             if !out.contains_key("depends_on") {
                 out.insert(key("depends_on"), after_runtime(Yaml::Sequence(vec![]))?);
@@ -460,14 +454,7 @@ fn find<'a, T>(value: &'a Yaml, f: &impl Fn(&'a Yaml) -> Option<T>) -> Option<T>
 /// Compose substitutes `$NAME` and `${NAME}` from the environment `docker compose up` runs in,
 /// which the host partly controls; only `$$`, a literal `$`, is safe.
 fn interpolates(s: &str) -> bool {
-    let mut rest = s;
-    while let Some((_, after)) = rest.split_once('$') {
-        match after.strip_prefix('$') {
-            Some(after) => rest = after,
-            None => return true,
-        }
-    }
-    false
+    s.replace("$$", "").contains('$')
 }
 
 fn unreserved(name: &str, place: &str) -> Result<(), String> {
