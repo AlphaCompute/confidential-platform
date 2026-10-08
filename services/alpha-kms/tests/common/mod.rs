@@ -516,6 +516,72 @@ pub fn with_signer(mut doc: Value, version: u64, origins: &[&str], rp_id: &str) 
     doc
 }
 
+/// A software authenticator on the captured origin, for calls the device vector cannot sign.
+pub struct Passkey {
+    key: p256::ecdsa::SigningKey,
+}
+
+impl Passkey {
+    pub fn new(seed: u8) -> Self {
+        Self {
+            key: p256::ecdsa::SigningKey::from_bytes((&[seed; 32]).into()).unwrap(),
+        }
+    }
+
+    pub fn spki(&self) -> Vec<u8> {
+        use p256::pkcs8::EncodePublicKey;
+        self.key
+            .verifying_key()
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes()
+            .to_vec()
+    }
+
+    pub fn spki_b64(&self) -> String {
+        b64(&self.spki())
+    }
+
+    pub fn signature(&self, ctx: &str, payload: &Value, key_id: Option<KeyId>) -> Value {
+        use p256::ecdsa::signature::Signer as _;
+        let v = webauthn_vector();
+        let digest = alpha_core::signing_digest(ctx, payload).unwrap();
+        let client_data_json = serde_json::to_vec(&json!({
+            "type": "webauthn.get", "challenge": b64(&digest),
+            "origin": v["origin"], "crossOrigin": false,
+        }))
+        .unwrap();
+        let authenticator_data = [
+            Sha256::digest(v["rp_id"].as_str().unwrap().as_bytes()).as_slice(),
+            &[0x05],
+            &0u32.to_be_bytes(),
+        ]
+        .concat();
+        let signature: p256::ecdsa::Signature = self.key.sign(
+            &[
+                authenticator_data.as_slice(),
+                &Sha256::digest(&client_data_json),
+            ]
+            .concat(),
+        );
+        let mut object = json!({
+            "algorithm": alpha_kms::webauthn::ALGORITHM,
+            "signature": b64(signature.to_der().as_bytes()),
+            "authenticator_data": b64(&authenticator_data),
+            "client_data_json": b64(&client_data_json),
+        });
+        if let Some(key_id) = key_id {
+            object["key_id"] = json!(key_id);
+        }
+        object
+    }
+
+    pub fn signed(&self, ctx: &str, payload: Value, key_id: Option<KeyId>) -> Value {
+        let signature = self.signature(ctx, &payload, key_id);
+        json!({ "payload": payload, "signature": signature })
+    }
+}
+
 pub fn code(reply: &Value) -> &str {
     reply["error"]["code"].as_str().unwrap_or("")
 }
