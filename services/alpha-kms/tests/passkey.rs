@@ -313,3 +313,134 @@ async fn a_passkey_signed_revision_attests_reads_its_secret_and_derives_its_key(
         json!(expected_app_key(&h, org, &root.1, app, "hmac"))
     );
 }
+
+fn canonical_revision() -> (Value, Value) {
+    let dir = testdata().join("manifest/01-canonical");
+    let compose = std::fs::read_to_string(dir.join("app-compose.json")).unwrap();
+    let expected: Value =
+        serde_json::from_slice(&std::fs::read(dir.join("expected.json")).unwrap()).unwrap();
+    (
+        json!({ "app_id": expected["app_id"], "compose": compose }),
+        expected["compose_hash"].clone(),
+    )
+}
+
+#[tokio::test]
+async fn a_second_passkey_signs_every_control_route() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    trust_signer(&h, 2, &[&origin()]).await;
+    let PasskeyOrg { org, admin, .. } = passkey_org(&h, 63).await;
+    let by_admin = |ctx: &str, payload: Value| admin.1.signed(ctx, payload, Some(admin.0));
+
+    let (payload, hash) = canonical_revision();
+    let body = by_admin(context::REVISION, payload);
+    for _ in 0..2 {
+        let (status, reply) = h.post("/v1/revisions", body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+        verified(
+            &h,
+            &reply,
+            "revision.register",
+            &body,
+            json!({ "compose_hash": hash, "org_id": org }),
+        );
+    }
+
+    let path = format!("/v1/revisions/{}/revoke", hash.as_str().unwrap());
+    let body = by_admin(
+        context::CONTROL,
+        json!({ "compose_hash": hash, "issued_at": rfc3339(h.now()) }),
+    );
+    let (status, first) = h.post(&path, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    verified(
+        &h,
+        &first,
+        "revision.revoke",
+        &body,
+        json!({ "compose_hash": hash }),
+    );
+    let (status, again) = h.post(&path, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    verified(
+        &h,
+        &again,
+        "revision.revoke",
+        &body,
+        json!({ "compose_hash": hash, "revoked_at": first["revoked_at"] }),
+    );
+
+    let app = AppId::mint();
+    let body = put_body("passkey-value", &[app], b"by value", h.now(), &admin);
+    let (status, reply) = put(&h, "passkey-value", body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    verified(
+        &h,
+        &reply,
+        "secret.put",
+        &body,
+        json!({ "name": "passkey-value", "org_id": org }),
+    );
+
+    let payload = put_payload("passkey-sealed", &[app], b"sealed", h.now());
+    let sealed = h.sealed(&payload, org, b"sealed").await;
+    let mut body = by_admin(context::SECRET, payload);
+    body["sealed"] = sealed;
+    let (status, reply) = put(&h, "passkey-sealed", body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    verified(
+        &h,
+        &reply,
+        "secret.put",
+        &body,
+        json!({ "name": "passkey-sealed", "org_id": org }),
+    );
+
+    let ed25519 = ed25519_dalek::SigningKey::from_bytes(&[65u8; 32]);
+    let principal_id = PrincipalId::mint();
+    let body = by_admin(
+        context::PRINCIPAL_KEY,
+        json!({ "principal_id": principal_id, "public_key": spki_b64(&ed25519),
+                "label": "ed25519 under a passkey", "issued_at": rfc3339(h.now()) }),
+    );
+    let (status, reply) = h.post("/v1/keys", body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    verified(
+        &h,
+        &reply,
+        "key.register",
+        &body,
+        json!({ "principal_id": principal_id, "org_id": org }),
+    );
+    let ed25519 = (registered(&reply), ed25519);
+    let (status, reply) = h
+        .put_secret("passkey-chain", &[app], b"chained", h.now(), &ed25519)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+
+    let path = format!("/v1/keys/{}/revoke", ed25519.0);
+    let body = by_admin(
+        context::CONTROL,
+        json!({ "key_id": ed25519.0, "reason": "retired", "issued_at": rfc3339(h.now()) }),
+    );
+    let (status, first) = h.post(&path, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    verified(
+        &h,
+        &first,
+        "key.revoke",
+        &body,
+        json!({ "key_id": ed25519.0, "reason": "retired" }),
+    );
+    let (status, again) = h.post(&path, body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    verified(
+        &h,
+        &again,
+        "key.revoke",
+        &body,
+        json!({ "key_id": ed25519.0, "revoked_at": first["revoked_at"] }),
+    );
+}
