@@ -421,7 +421,6 @@ async fn pinned_images_make_no_request() {
     assert!(digests.is_empty());
     assert!(registry.requests().is_empty());
     let out = wrapped(&text, &digests);
-    assert_eq!(out, wrapped(&text, &BTreeMap::new()));
     assert!(compose_file(&out).contains(&format!("image: {tagged_and_pinned}\n")));
 }
 

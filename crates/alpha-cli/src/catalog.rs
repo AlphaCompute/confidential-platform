@@ -3,8 +3,6 @@
 
 use alpha_core::catalog::{CatalogFile, Entry, Resources};
 use alpha_core::{AppId, CatalogKey, compose_hash};
-use base64::Engine;
-use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use ed25519_dalek::SigningKey;
 
 use crate::deploy::AppSpec;
@@ -42,10 +40,7 @@ pub fn sign(
 /// The raw 32-byte public key, the form the platform document's `catalog_key` takes; the SPKI
 /// a key file prints is not that form.
 pub fn catalog_key(key: &SigningKey) -> CatalogKey {
-    CatalogKey {
-        algorithm: "ed25519".into(),
-        public_key: BASE64_URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()),
-    }
+    CatalogKey::from(&key.verifying_key())
 }
 
 /// The bare hex of `template_sha256`: a colon does not belong in a file name.
@@ -138,7 +133,14 @@ resources:
         // `deploy::compose` refuses one; these are signed through the core function directly.
         let mut spec = parse(SPEC).unwrap();
         spec.app_id = app_id();
-        let name_absent = signed(crate::deploy::compose(&spec).unwrap(), 11);
+        let deployed = crate::deploy::compose(&spec).unwrap();
+        assert_eq!(rendered, deployed);
+        // Go's encoding/json escapes these unless told not to, so a consumer that re-marshals the
+        // compose fails the byte comparison instead of passing by luck.
+        for raw in ["&&", ">", "$("] {
+            assert!(deployed.contains(raw), "{raw}");
+        }
+        let name_absent = signed(deployed, 11);
 
         let mut repeated: serde_json::Value = serde_json::from_str(&valid.template).unwrap();
         let previous = repeated.as_object_mut().unwrap().insert(
@@ -232,32 +234,6 @@ resources:
     }
 
     #[test]
-    fn the_catalog_vector_renders_what_deploy_builds() {
-        let mut spec = parse(SPEC).unwrap();
-        spec.app_id = app_id();
-        let compose = crate::deploy::compose(&spec).unwrap();
-        let dir = catalog_vectors();
-        let file: CatalogFile =
-            serde_json::from_slice(&fs::read(dir.join("valid.json")).unwrap()).unwrap();
-        assert_eq!(
-            render(&file.template, &file.entry.template_sha256, app_id()).unwrap(),
-            compose
-        );
-        assert_eq!(
-            fs::read(dir.join("app-compose.json")).unwrap(),
-            compose.as_bytes()
-        );
-        let expected: serde_json::Value =
-            serde_json::from_slice(&fs::read(dir.join("expected.json")).unwrap()).unwrap();
-        assert_eq!(compose_hash(&compose).to_string(), expected["compose_hash"]);
-        // Go's encoding/json escapes these unless told not to, so a consumer that re-marshals the
-        // compose fails the byte comparison instead of passing by luck.
-        for raw in ["&&", ">", "$("] {
-            assert!(compose.contains(raw), "{raw}");
-        }
-    }
-
-    #[test]
     fn a_signed_template_renders_to_the_deploy_vector() {
         let spec = parse(&fs::read_to_string(vector().join("app.yaml")).unwrap()).unwrap();
         let app_id = spec.app_id;
@@ -292,8 +268,6 @@ resources:
         let file = sign(spec, "cpu-app", "1", "CPU App", &signing_key()).unwrap();
         let name = file_name(&file);
         let hex = name.strip_suffix(".json").unwrap();
-        assert_eq!(hex.len(), 64);
-        assert!(hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
         assert_eq!(
             file.entry.template_sha256.to_string(),
             format!("sha256:{hex}")

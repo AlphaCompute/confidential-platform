@@ -84,6 +84,32 @@ pub struct CatalogKey {
     pub public_key: String,
 }
 
+impl CatalogKey {
+    pub fn verifying_key(&self) -> Option<ed25519_dalek::VerifyingKey> {
+        (self.algorithm == "ed25519")
+            .then(|| ed25519_key(&self.public_key))
+            .flatten()
+    }
+}
+
+impl From<&ed25519_dalek::VerifyingKey> for CatalogKey {
+    fn from(key: &ed25519_dalek::VerifyingKey) -> Self {
+        Self {
+            algorithm: "ed25519".into(),
+            public_key: BASE64_URL_SAFE_NO_PAD.encode(key.to_bytes()),
+        }
+    }
+}
+
+fn ed25519_key(public_key: &str) -> Option<ed25519_dalek::VerifyingKey> {
+    BASE64_URL_SAFE_NO_PAD
+        .decode(public_key)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok())
+        .filter(|k| !k.is_weak())
+}
+
 #[derive(Deserialize)]
 struct CatalogKeyFields {
     algorithm: String,
@@ -97,13 +123,7 @@ impl TryFrom<CatalogKeyFields> for CatalogKey {
         if f.algorithm != "ed25519" {
             return Err(format!("catalog_key.algorithm {:?}", f.algorithm));
         }
-        let usable = BASE64_URL_SAFE_NO_PAD
-            .decode(&f.public_key)
-            .ok()
-            .and_then(|b| <[u8; 32]>::try_from(b).ok())
-            .and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok())
-            .is_some_and(|k| !k.is_weak());
-        if !usable {
+        if ed25519_key(&f.public_key).is_none() {
             return Err(format!(
                 "catalog_key.public_key {:?} is not an Ed25519 public key in base64url",
                 f.public_key

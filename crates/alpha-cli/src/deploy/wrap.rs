@@ -272,13 +272,12 @@ pub fn parse(bytes: &[u8]) -> Result<Plain, String> {
         }
         plain_services.push((service, value));
     }
-    let endpoint = <[(String, u16); 1]>::try_from(endpoints).map_err(|all| {
+    let [endpoint] = <[(String, u16); 1]>::try_from(endpoints).map_err(|all| {
         format!(
             "services: {} ports are published; publish exactly one, the App's Endpoint",
             all.len()
         )
     })?;
-    let [endpoint] = endpoint;
     Ok(Plain {
         services: plain_services,
         volumes,

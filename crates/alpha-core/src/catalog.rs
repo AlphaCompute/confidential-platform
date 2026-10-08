@@ -4,7 +4,7 @@
 
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
-use ed25519_dalek::{Signature, Signer as _, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, Signer as _, SigningKey};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -88,18 +88,12 @@ pub fn sign(entry: Entry, template: String, key: &SigningKey) -> Result<CatalogF
 
 /// Only `key` is tried: the caller passes the `catalog_key` of a verified platform document.
 pub fn verify(file: &CatalogFile, key: &CatalogKey) -> Result<(), CatalogError> {
-    let usable_key = (key.algorithm == "ed25519")
-        .then(|| BASE64_URL_SAFE_NO_PAD.decode(&key.public_key).ok())
-        .flatten()
-        .and_then(|b| <[u8; 32]>::try_from(b).ok())
-        .and_then(|b| VerifyingKey::from_bytes(&b).ok())
-        .filter(|k| !k.is_weak())
-        .ok_or_else(|| {
-            CatalogError::Malformed(format!(
-                "catalog key {:?} {:?} is not an Ed25519 public key in base64url",
-                key.algorithm, key.public_key
-            ))
-        })?;
+    let usable_key = key.verifying_key().ok_or_else(|| {
+        CatalogError::Malformed(format!(
+            "catalog key {:?} {:?} is not an Ed25519 public key in base64url",
+            key.algorithm, key.public_key
+        ))
+    })?;
     if file.signature.algorithm != "ed25519" {
         return Err(CatalogError::SignatureInvalid(format!(
             "signature algorithm {:?}",
@@ -149,10 +143,7 @@ mod tests {
     }
 
     fn catalog_key_of(key: &SigningKey) -> CatalogKey {
-        CatalogKey {
-            algorithm: "ed25519".into(),
-            public_key: BASE64_URL_SAFE_NO_PAD.encode(key.verifying_key().to_bytes()),
-        }
+        CatalogKey::from(&key.verifying_key())
     }
 
     fn entry(template: &str) -> Entry {
