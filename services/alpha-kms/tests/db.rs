@@ -13,7 +13,7 @@ mod common;
 use std::fs;
 use std::time::Duration;
 
-use alpha_channel::receipt::{self, Expected};
+use alpha_channel::receipt;
 use alpha_core::{AppId, ComposeHash, KeyId, OrgId, PrincipalId, context};
 use alpha_crypto::{INFO_NODE_BOOTSTRAP, INFO_UNSEAL_SHARE};
 use alpha_kms::{certs, instance, platform, rfc3339};
@@ -684,26 +684,6 @@ async fn control_routes_register_revoke_and_put() {
             "{action}"
         );
     }
-}
-
-/// Verifies `reply`'s receipt against the bootstrap CA and this node's Revision, checks that the
-/// signed response is the reply without `receipt`, and returns the receipt's leaf.
-fn verified(h: &Harness, reply: &Value, route: &str, request: &Value, expect: Value) -> String {
-    let mut rest = reply.clone();
-    let receipt = rest.as_object_mut().unwrap().remove("receipt").unwrap();
-    let signed = receipt::verify(
-        &serde_json::to_vec(&receipt).unwrap(),
-        &h.ca_pem,
-        &[h.node.compose_hash],
-        &Expected {
-            route: route.into(),
-            request_sha256: receipt::request_sha256(request).unwrap(),
-            response: expect.as_object().unwrap().clone(),
-        },
-    )
-    .unwrap();
-    assert_eq!(signed, rest);
-    receipt["certificate_chain"][0].as_str().unwrap().to_owned()
 }
 
 fn canonical_revision(h: &Harness, signer: &(KeyId, SigningKey)) -> (Value, Value) {

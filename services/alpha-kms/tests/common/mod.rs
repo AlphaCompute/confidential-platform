@@ -9,6 +9,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alpha_attest::{EVIDENCE_FORMAT, EventLogEntry, Evidence};
+use alpha_channel::receipt::{self, Expected};
 use alpha_cli::node::{NodeIdentity, ShareFile};
 use alpha_client::{Client, Pin};
 use alpha_core::{AppId, KeyId, OrgId, PrincipalId, context};
@@ -475,6 +476,44 @@ impl Harness {
         .map(|r| (r.seq, r.outcome, r.details))
         .collect()
     }
+}
+
+/// Verifies `reply`'s receipt against the bootstrap CA and this node's Revision, checks that the
+/// signed response is the reply without `receipt`, and returns the receipt's leaf.
+pub fn verified(h: &Harness, reply: &Value, route: &str, request: &Value, expect: Value) -> String {
+    let mut rest = reply.clone();
+    let receipt = rest.as_object_mut().unwrap().remove("receipt").unwrap();
+    let signed = receipt::verify(
+        &serde_json::to_vec(&receipt).unwrap(),
+        &h.ca_pem,
+        &[h.node.compose_hash],
+        &Expected {
+            route: route.into(),
+            request_sha256: receipt::request_sha256(request).unwrap(),
+            response: expect.as_object().unwrap().clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(signed, rest);
+    receipt["certificate_chain"][0].as_str().unwrap().to_owned()
+}
+
+/// The passkey assertions captured on a Mac (iCloud Keychain).
+pub fn webauthn_vector() -> Value {
+    serde_json::from_slice(&fs::read(testdata().join("webauthn/mac-icloud-keychain.json")).unwrap())
+        .unwrap()
+}
+
+/// `doc` as `version`, naming a signer page on `origins` with `rp_id`.
+pub fn with_signer(mut doc: Value, version: u64, origins: &[&str], rp_id: &str) -> Value {
+    doc["version"] = json!(version);
+    doc["signer"] = json!({
+        "origins": origins,
+        "rp_id": rp_id,
+        "bundle_sha256": format!("sha256:{}", "0".repeat(64)),
+        "api_origin": origins[0],
+    });
+    doc
 }
 
 pub fn code(reply: &Value) -> &str {

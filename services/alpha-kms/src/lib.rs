@@ -22,6 +22,7 @@ pub mod keys;
 pub mod node;
 pub mod platform;
 pub mod tls;
+pub mod webauthn;
 
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
