@@ -38,6 +38,13 @@ async fn trust_signer(h: &Harness, version: u64, origins: &[&str]) {
     platform::reload(&h.node).await.unwrap();
 }
 
+async fn drop_signer(h: &Harness, version: u64) {
+    let mut doc = platform_document(KEYED);
+    doc["version"] = json!(version);
+    h.release.set(doc);
+    platform::reload(&h.node).await.unwrap();
+}
+
 struct PasskeyOrg {
     org: OrgId,
     root: (KeyId, Passkey),
@@ -442,5 +449,315 @@ async fn a_second_passkey_signs_every_control_route() {
         "key.revoke",
         &body,
         json!({ "key_id": ed25519.0, "revoked_at": first["revoked_at"] }),
+    );
+}
+
+/// Under a document whose signer lists the vector's origin: a passkey organization, the keyed
+/// capture as a Revision of its App signed by its admin, and `passkey-secret` put for that App.
+async fn passkey_app(h: &Harness, seed: u8) -> (PasskeyOrg, AppId, ComposeHash) {
+    trust_signer(h, 2, &[&origin()]).await;
+    let org = passkey_org(h, seed).await;
+    let app = AppId::mint();
+    let hash = insert_passkey_revision(h, org.org, app, &org.admin).await;
+    let body = put_body(
+        "passkey-secret",
+        &[app],
+        b"passkey value",
+        h.now(),
+        &org.admin,
+    );
+    let (status, reply) = put(h, "passkey-secret", body).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    (org, app, hash)
+}
+
+/// Asserts `signature_invalid` without a receipt and returns the message.
+fn invalid((status, reply): (StatusCode, Value)) -> String {
+    assert_eq!(
+        (status, code(&reply)),
+        (StatusCode::BAD_REQUEST, "signature_invalid"),
+        "{reply}"
+    );
+    assert!(reply.get("receipt").is_none(), "{reply}");
+    reply["error"]["message"].as_str().unwrap().to_owned()
+}
+
+fn malformed((status, reply): (StatusCode, Value)) {
+    assert_eq!(
+        (status, code(&reply)),
+        (StatusCode::BAD_REQUEST, "malformed"),
+        "{reply}"
+    );
+    assert!(reply.get("receipt").is_none(), "{reply}");
+}
+
+async fn secrets_named(h: &Harness, name: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>("select count(*) from secrets where name = $1")
+        .bind(name)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap()
+}
+
+async fn last_audit(h: &Harness, action: &str) -> (String, Value) {
+    let (_, outcome, details) = h.audit(action).await.pop().unwrap();
+    (outcome, details)
+}
+
+#[tokio::test]
+async fn without_a_signer_no_passkey_signature_verifies_anywhere() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let (PasskeyOrg { admin, .. }, app, hash) = passkey_app(&h, 71).await;
+    let instance = h.instance_client().await;
+    let by_admin = |ctx: &str, payload: Value| admin.1.signed(ctx, payload, Some(admin.0));
+    let ed25519 = ed25519_dalek::SigningKey::from_bytes(&[73u8; 32]);
+    let (status, reply) = h
+        .post(
+            "/v1/keys",
+            by_admin(
+                context::PRINCIPAL_KEY,
+                json!({ "principal_id": PrincipalId::mint(), "public_key": spki_b64(&ed25519),
+                        "label": "ed25519 under a passkey", "issued_at": rfc3339(h.now()) }),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let ed25519 = (registered(&reply), ed25519);
+
+    drop_signer(&h, 3).await;
+    let no_signer = |reply| {
+        let message = invalid(reply);
+        assert!(message.contains("no signer"), "{message}");
+    };
+
+    let (payload, _) = canonical_revision();
+    no_signer(
+        h.post("/v1/revisions", by_admin(context::REVISION, payload))
+            .await,
+    );
+    no_signer(
+        h.post(
+            &format!("/v1/revisions/{hash}/revoke"),
+            by_admin(
+                context::CONTROL,
+                json!({ "compose_hash": hash, "issued_at": rfc3339(h.now()) }),
+            ),
+        )
+        .await,
+    );
+    no_signer(
+        put(
+            &h,
+            "no-signer",
+            put_body("no-signer", &[app], b"refused", h.now(), &admin),
+        )
+        .await,
+    );
+    no_signer(
+        h.post(
+            "/v1/keys",
+            by_admin(
+                context::PRINCIPAL_KEY,
+                json!({ "principal_id": PrincipalId::mint(),
+                        "public_key": Passkey::new(75).spki_b64(),
+                        "label": "refused", "issued_at": rfc3339(h.now()) }),
+            ),
+        )
+        .await,
+    );
+    no_signer(
+        h.post(
+            &format!("/v1/keys/{}/revoke", ed25519.0),
+            by_admin(
+                context::CONTROL,
+                json!({ "key_id": ed25519.0, "reason": "retired", "issued_at": rfc3339(h.now()) }),
+            ),
+        )
+        .await,
+    );
+    let claimant = Passkey::new(77);
+    no_signer(
+        h.post(
+            "/v1/keys",
+            claimant.signed(
+                context::ORG_ROOT_KEY,
+                json!({ "org_id": OrgId::mint(), "principal_id": PrincipalId::mint(),
+                        "public_key": claimant.spki_b64(), "label": "refused root",
+                        "issued_at": rfc3339(h.now()) }),
+                None,
+            ),
+        )
+        .await,
+    );
+    no_signer(
+        h.put_secret("ed25519-no-signer", &[app], b"refused", h.now(), &ed25519)
+            .await,
+    );
+    let (outcome, details) = last_audit(&h, "secret.put").await;
+    assert_eq!(
+        (outcome.as_str(), &details["code"]),
+        ("denied", &json!("signature_invalid"))
+    );
+
+    no_signer(h.attest(KEYED).await);
+    no_signer(send(instance.get(format!("{}/v1/secrets/passkey-secret", h.url))).await);
+    no_signer(derive(&instance, &h, "hmac").await);
+
+    h.register_key(&h.root, 90).await;
+    assert_eq!(secrets_named(&h, "no-signer").await, 0);
+    assert_eq!(secrets_named(&h, "ed25519-no-signer").await, 0);
+}
+
+#[tokio::test]
+async fn a_passkey_signature_on_an_origin_the_document_dropped_no_longer_verifies() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let (PasskeyOrg { admin, .. }, app, _) = passkey_app(&h, 81).await;
+    let other = "https://localhost:9443";
+
+    trust_signer(&h, 3, &[other]).await;
+    let message = invalid(
+        put(
+            &h,
+            "dropped-origin",
+            put_body("dropped-origin", &[app], b"refused", h.now(), &admin),
+        )
+        .await,
+    );
+    assert!(message.contains("signer.origins"), "{message}");
+    let message = invalid(h.attest(KEYED).await);
+    assert!(message.contains("signer.origins"), "{message}");
+
+    trust_signer(&h, 4, &[other, &origin()]).await;
+    let later = h.now() + std::time::Duration::from_secs(1);
+    let (status, reply) = put(
+        &h,
+        "dropped-origin",
+        put_body("dropped-origin", &[app], b"restored", later, &admin),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let (status, reply) = h.attest(KEYED).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+}
+
+#[tokio::test]
+async fn another_organizations_passkey_or_a_grafted_link_does_not_sign() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    trust_signer(&h, 2, &[&origin()]).await;
+    let x = passkey_org(&h, 66).await;
+    let y = passkey_org(&h, 68).await;
+    let app = AppId::mint();
+
+    let mut body = x.admin.1.signed(
+        context::SECRET,
+        put_payload("across", &[app], b"refused", h.now()),
+        Some(y.root.0),
+    );
+    body["value"] = json!(b64(b"refused"));
+    invalid(put(&h, "across", body).await);
+
+    // Would pass if the chain walk stopped verifying each link's registration under its parent.
+    sqlx::query("update principal_keys set org_id = $1, registered_by_key = $2 where id = $3")
+        .bind(Uuid::from(y.org))
+        .bind(Uuid::from(y.root.0))
+        .bind(Uuid::from(x.admin.0))
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let message = invalid(
+        put(
+            &h,
+            "grafted",
+            put_body("grafted", &[app], b"refused", h.now(), &x.admin),
+        )
+        .await,
+    );
+    assert!(
+        message.contains("not registered by its parent"),
+        "{message}"
+    );
+
+    assert_eq!(secrets_named(&h, "across").await, 0);
+    assert_eq!(secrets_named(&h, "grafted").await, 0);
+}
+
+#[tokio::test]
+async fn a_stored_passkey_signature_without_its_assertion_fields_is_invalid_not_malformed() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let (PasskeyOrg { admin, .. }, app, hash) = passkey_app(&h, 85).await;
+
+    sqlx::query(
+        "update revisions set signature = signature - 'client_data_json' where compose_hash = $1",
+    )
+    .bind(hash.as_bytes().as_slice())
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    invalid(h.attest(KEYED).await);
+
+    sqlx::query(
+        "update principal_keys set signature = signature - 'authenticator_data' where id = $1",
+    )
+    .bind(Uuid::from(admin.0))
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    invalid(
+        put(
+            &h,
+            "stripped",
+            put_body("stripped", &[app], b"refused", h.now(), &admin),
+        )
+        .await,
+    );
+    assert_eq!(secrets_named(&h, "stripped").await, 0);
+}
+
+#[tokio::test]
+async fn a_passkey_body_without_its_assertion_fields_is_malformed() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    trust_signer(&h, 2, &[&origin()]).await;
+    let PasskeyOrg { admin, .. } = passkey_org(&h, 87).await;
+    let app = AppId::mint();
+
+    for field in ["client_data_json", "authenticator_data"] {
+        let mut body = put_body("shapeless", &[app], b"refused", h.now(), &admin);
+        body["signature"].as_object_mut().unwrap().remove(field);
+        malformed(put(&h, "shapeless", body).await);
+        let (outcome, details) = last_audit(&h, "secret.put").await;
+        assert_eq!(
+            (outcome.as_str(), &details["code"]),
+            ("denied", &json!("malformed")),
+            "{field}"
+        );
+    }
+    assert_eq!(secrets_named(&h, "shapeless").await, 0);
+
+    let claimant = Passkey::new(89);
+    let mut claim = claimant.signed(
+        context::ORG_ROOT_KEY,
+        json!({ "org_id": OrgId::mint(), "principal_id": PrincipalId::mint(),
+                "public_key": claimant.spki_b64(), "label": "shapeless root",
+                "issued_at": rfc3339(h.now()) }),
+        None,
+    );
+    let signature = claim["signature"].as_object_mut().unwrap();
+    signature.remove("client_data_json");
+    signature.remove("authenticator_data");
+    malformed(h.post("/v1/keys", claim).await);
+    let (outcome, details) = last_audit(&h, "key.register").await;
+    assert_eq!(
+        (outcome.as_str(), &details["code"]),
+        ("denied", &json!("malformed"))
     );
 }
