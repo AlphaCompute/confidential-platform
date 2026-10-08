@@ -1,0 +1,285 @@
+# One compose per refusal of the wrap, with a substring of the message the customer sees.
+build:
+  compose: |
+    services:
+      web:
+        ports: ["8080:80"]
+        build: .
+  refusal: 'services.web: build is not supported'
+runtime-service:
+  compose: |
+    services:
+      alpha-runtime:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+  refusal: 'services.alpha-runtime: names starting with alpha- are reserved'
+service-reserved:
+  compose: |
+    services:
+      alpha-web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+  refusal: 'services.alpha-web: names starting with alpha- are reserved'
+service-name:
+  compose: |
+    services:
+      Web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+  refusal: 'services: Web is not a name; use 1 to 64 lowercase'
+bind-short:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+        volumes: ["/etc:/x:ro"]
+  refusal: 'services.web.volumes: /etc:/x:ro is not a named volume'
+bind-long:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+        volumes:
+          - type: bind
+            source: /etc
+            target: /x
+  refusal: 'services.web.volumes: {"type":"bind"'
+mount-image:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+        volumes:
+          - type: image
+            source: alpine
+            target: /x
+  refusal: 'services.web.volumes: {"type":"image"'
+privileged:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+        privileged: true
+  refusal: 'services.web: privileged is not supported'
+network-host:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+        network_mode: host
+  refusal: 'services.web: network_mode is not supported'
+tag-other-registry:
+  compose: |
+    services:
+      web:
+        image: registry.example.com/team/app:1.0
+        ports: ["8080:80"]
+  refusal: 'services.web.image: registry.example.com/team/app:1.0 is a tag outside'
+digest-malformed:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB
+        ports: ["8080:80"]
+  refusal: 'services.web.image: nginx@sha256:ABAB'
+volume-driver-opts:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+        volumes: ["data:/data"]
+    volumes:
+      data:
+        driver_opts: {type: none, o: bind, device: /}
+  refusal: 'volumes.data: driver_opts is not supported'
+volume-name:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+        volumes: ["data:/data"]
+    volumes:
+      data:
+        name: dstack_alpha-run
+  refusal: 'volumes.data: name is not supported'
+volume-external:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+        volumes: ["data:/data"]
+    volumes:
+      data:
+        external: true
+  refusal: 'volumes.data: external is not supported'
+volume-reserved:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+        volumes: ["alpha-data:/data"]
+    volumes:
+      alpha-data: {}
+  refusal: 'volumes.alpha-data: names starting with alpha- are reserved'
+secret-file:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+        secrets: [db_password]
+    secrets:
+      db_password:
+        file: ./db_password.txt
+  refusal: 'secrets.db_password: file is not supported'
+secret-environment:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+        secrets: [db_password]
+    secrets:
+      db_password:
+        environment: DB_PASSWORD
+  refusal: 'secrets.db_password: environment is not supported'
+secret-long:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+        secrets:
+          - source: db_password
+            target: /x
+    secrets:
+      db_password: {}
+  refusal: 'services.web.secrets: {"source":"db_password"'
+secret-undeclared:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+        secrets: [db_password]
+  refusal: 'services.web.secrets: db_password is not declared'
+secrets-mount-target:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+        secrets: [db_password]
+        volumes: ["data:/run/secrets/x"]
+    volumes:
+      data: {}
+    secrets:
+      db_password: {}
+  refusal: 'services.web.volumes: /run/secrets/x is where its secrets are mounted'
+ports-two:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+      api:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8081:81"]
+  refusal: 'services: 2 ports are published'
+ports-none:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+  refusal: 'services: 0 ports are published'
+port-host-ip:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["127.0.0.1:8080:80"]
+  refusal: 'services.web.ports: 127.0.0.1:8080:80 is not a TCP port'
+interpolation:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+        environment:
+          URL: ${PCCS_URL}
+  refusal: 'services.web.environment: ${PCCS_URL} interpolates'
+env-no-value:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+        environment:
+          - MODE=production
+          - TOKEN
+  refusal: 'services.web.environment: TOKEN has no value'
+depends-on-runtime:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+        depends_on: [alpha-runtime]
+  refusal: 'services.web.depends_on: alpha-runtime is added by the platform'
+depends-on-missing:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+        depends_on: [db]
+  refusal: 'services.web.depends_on: db is not a service of this compose'
+top-level-key:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+    networks:
+      default: {}
+  refusal: 'compose: networks is not supported'
+yaml-tag:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+        environment: !reset []
+  refusal: 'compose: the YAML tag !reset is not supported'
+duplicate-key:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+  refusal: 'duplicate entry with key "image"'
+two-documents:
+  compose: |
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+    ---
+    services:
+      web:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+  refusal: 'more than one document'
+empty:
+  compose: ""
+  refusal: 'compose: not a mapping'

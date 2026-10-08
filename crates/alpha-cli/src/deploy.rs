@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 use crate::instances::shroud_call;
 
+pub mod wrap;
+
 pub const RUNTIME_SERVICE: &str = "alpha-runtime";
 /// The App's Endpoint is the CVM's 443: the dstack gateway passes
 /// `<app id>-443s.<base>` through to it, and shroud-go builds the App's URL on
@@ -106,13 +108,12 @@ fn strings(items: &[&str]) -> Yaml {
     Yaml::Sequence(items.iter().map(|s| key(s)).collect())
 }
 
-fn docker_compose_file(spec: &AppSpec) -> Result<String, String> {
+fn runtime_service(runtime: &Runtime) -> Result<Mapping, String> {
     // alpha-runtime refuses these at start; a Revision that cannot boot is better refused here.
-    if spec.runtime.kms_revisions.is_empty() {
+    if runtime.kms_revisions.is_empty() {
         return Err("runtime.kms_revisions is empty".into());
     }
-    if spec
-        .runtime
+    if runtime
         .kms_ca_spki_sha256
         .strip_prefix("sha256:")
         .and_then(alpha_core::hex_bytes::<32>)
@@ -120,6 +121,33 @@ fn docker_compose_file(spec: &AppSpec) -> Result<String, String> {
     {
         return Err("runtime.kms_ca_spki_sha256 is not sha256:<64 hex>".into());
     }
+    let revisions: Vec<String> = runtime
+        .kms_revisions
+        .iter()
+        .map(|r| r.to_string())
+        .collect();
+    let mut environment = Mapping::new();
+    environment.insert(
+        key("ALPHACOMPUTE_KMS_CA_SPKI_SHA256"),
+        key(&runtime.kms_ca_spki_sha256),
+    );
+    environment.insert(key("ALPHACOMPUTE_KMS_REVISIONS"), key(&revisions.join(",")));
+    environment.insert(
+        key("ALPHACOMPUTE_KMS_ENDPOINTS"),
+        key("${ALPHACOMPUTE_KMS_ENDPOINTS}"),
+    );
+    let mut service = Mapping::new();
+    service.insert(key("image"), key(&runtime.image));
+    service.insert(key("environment"), Yaml::Mapping(environment));
+    service.insert(key("restart"), key("always"));
+    let mut mounts = EVIDENCE_MOUNTS.to_vec();
+    mounts.push(SOCKET_VOLUME);
+    service.insert(key("volumes"), strings(&mounts));
+    Ok(service)
+}
+
+fn docker_compose_file(spec: &AppSpec) -> Result<String, String> {
+    let runtime = runtime_service(&spec.runtime)?;
     let mut services = Mapping::new();
     let mut publishing: Vec<String> = Vec::new();
     let mut docker_holders: Vec<String> = Vec::new();
@@ -192,29 +220,6 @@ fn docker_compose_file(spec: &AppSpec) -> Result<String, String> {
             docker_holders.join(", ")
         ));
     }
-    let revisions: Vec<String> = spec
-        .runtime
-        .kms_revisions
-        .iter()
-        .map(|r| r.to_string())
-        .collect();
-    let mut environment = Mapping::new();
-    environment.insert(
-        key("ALPHACOMPUTE_KMS_CA_SPKI_SHA256"),
-        key(&spec.runtime.kms_ca_spki_sha256),
-    );
-    environment.insert(key("ALPHACOMPUTE_KMS_REVISIONS"), key(&revisions.join(",")));
-    environment.insert(
-        key("ALPHACOMPUTE_KMS_ENDPOINTS"),
-        key("${ALPHACOMPUTE_KMS_ENDPOINTS}"),
-    );
-    let mut runtime = Mapping::new();
-    runtime.insert(key("image"), key(&spec.runtime.image));
-    runtime.insert(key("environment"), Yaml::Mapping(environment));
-    runtime.insert(key("restart"), key("always"));
-    let mut mounts = EVIDENCE_MOUNTS.to_vec();
-    mounts.push(SOCKET_VOLUME);
-    runtime.insert(key("volumes"), strings(&mounts));
     services.insert(key(RUNTIME_SERVICE), Yaml::Mapping(runtime));
     let mut volumes = Mapping::new();
     volumes.insert(key("alpha-run"), Yaml::Mapping(Mapping::new()));
@@ -350,20 +355,22 @@ pub async fn wait_for_attestation(
     }
 }
 
-/// Registers the Revision, then deploys through shroud-go unless `shroud` is `None`
-/// (`--register-only`), then waits for every copy to attest when `wait` is set.
-pub async fn run(
+/// Registers `compose` as a Revision of `app_id`, then deploys it through shroud-go unless
+/// `shroud` is `None` (`--register-only`), then waits for every copy to attest when `wait` is set.
+#[allow(clippy::too_many_arguments)]
+pub async fn deploy_compose(
     client: &Client,
-    spec: &AppSpec,
+    app_id: AppId,
+    compose: String,
+    resources: &Value,
     key_id: KeyId,
     key: &SigningKey,
     shroud: Option<&Shroud>,
     wait: Option<(Duration, &str)>,
 ) -> Result<Value, String> {
-    let compose = compose(spec)?;
     let signed = sign(
         context::REVISION,
-        json!({ "app_id": spec.app_id, "compose": compose }),
+        json!({ "app_id": app_id, "compose": compose }),
         key_id,
         key,
     )
@@ -378,10 +385,10 @@ pub async fn run(
     let body = shroud_call(
         shroud,
         Method::POST,
-        &format!("/v1/apps/{}/deploy", spec.app_id),
+        &format!("/v1/apps/{app_id}/deploy"),
         Some(json!({
             "compose_hash": revision.compose_hash,
-            "resources": spec.resources,
+            "resources": resources,
             "compose": compose,
         })),
     )

@@ -1,0 +1,8 @@
+{
+  "app_id": "01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b",
+  "compose_hash": "sha256:27c6f8b515274448f2f62ebd44b0c8fefbb92164f03200fb321badb3c7c7a69d",
+  "secrets": [
+    "db_password",
+    "session_key"
+  ]
+}

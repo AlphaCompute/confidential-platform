@@ -34,3 +34,9 @@ sha2 = "0.11"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 uuid = "1"
 zeroize = "1"
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }

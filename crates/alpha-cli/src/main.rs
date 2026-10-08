@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -5,7 +6,7 @@ use std::time::{Duration, SystemTime};
 
 use alpha_attest::PlatformDocument;
 use alpha_cli::call::Route;
-use alpha_cli::deploy::Shroud;
+use alpha_cli::deploy::{Shroud, wrap};
 use alpha_cli::keyfile::{self, Algorithm};
 use alpha_cli::request::Call;
 use alpha_cli::{instances, node, sign};
@@ -122,7 +123,7 @@ enum Command {
         check: bool,
         document: PathBuf,
     },
-    /// Tenant YAML → compose → Revision → shroud-go deploy.
+    /// Tenant YAML, or the output of `alpha compose wrap` → Revision → shroud-go deploy.
     Deploy {
         /// Register the Revision and stop before shroud-go.
         #[arg(long)]
@@ -135,7 +136,28 @@ enum Command {
         key: PathBuf,
         #[arg(long)]
         key_id: KeyId,
-        app: PathBuf,
+        /// The JSON `alpha compose wrap` printed; its compose is registered and deployed byte for
+        /// byte.
+        #[arg(long, conflicts_with = "app", requires_all = ["cpu", "memory_mib"])]
+        compose: Option<PathBuf>,
+        /// The CVM's CPU count, for a wrapped compose.
+        #[arg(long, requires = "compose", conflicts_with = "app")]
+        cpu: Option<u64>,
+        /// The CVM's memory, for a wrapped compose.
+        #[arg(long, requires = "compose", conflicts_with = "app")]
+        memory_mib: Option<u64>,
+        #[arg(required_unless_present = "compose")]
+        app: Option<PathBuf>,
+    },
+    /// A customer's plain docker-compose as a Revision.
+    Compose {
+        #[command(subcommand)]
+        command: ComposeCommand,
+    },
+    /// Catalog entries signed with the catalog key.
+    Catalog {
+        #[command(subcommand)]
+        command: CatalogCommand,
     },
     /// An App's running copies through shroud-go.
     Instances {
@@ -180,6 +202,48 @@ enum Command {
         custodians: Vec<PathBuf>,
         #[arg(long)]
         endpoint: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ComposeCommand {
+    /// Prints `{compose_hash, compose, secrets}`: the App's `app-compose.json` with
+    /// `alpha-runtime` added, and the secret names whose values the App needs.
+    Wrap {
+        #[arg(long)]
+        app_id: AppId,
+        /// The signed platform document, as `alpha sign --check` reads it; the KMS pins come from
+        /// it once it verifies under the compiled-in release key.
+        #[arg(long)]
+        platform: PathBuf,
+        /// The `alpha-runtime` image, pinned as `<image>@sha256:<digest>`.
+        #[arg(long)]
+        runtime_image: String,
+        /// Refuse every tag instead of asking its registry for the digest.
+        #[arg(long)]
+        no_resolve: bool,
+        compose: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum CatalogCommand {
+    /// Tenant YAML → template (the compose for the nil App id) → signed entry, written as
+    /// `<template hash hex>.json`.
+    Sign {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        title: String,
+        /// The catalog key: an Ed25519 key file from `alpha keygen --admin`.
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long, default_value = ".")]
+        out_dir: PathBuf,
+        /// The spec `alpha deploy` reads; its `app_id` is ignored.
+        app: PathBuf,
     },
 }
 
@@ -252,6 +316,12 @@ fn passphrase(prompt: &str) -> Result<Vec<u8>, Exit> {
 fn read_json(path: &Path) -> Result<Value, Exit> {
     let text = fs::read(path).map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))?;
     serde_json::from_slice(&text).map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))
+}
+
+fn read_spec(path: &Path) -> Result<alpha_cli::deploy::AppSpec, Exit> {
+    let text =
+        fs::read_to_string(path).map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))?;
+    alpha_cli::deploy::parse(&text).map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))
 }
 
 fn read_ed25519(path: &Path) -> Result<ed25519_dalek::SigningKey, Exit> {
@@ -365,12 +435,27 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             wait,
             key,
             key_id,
+            compose,
+            cpu,
+            memory_mib,
             app,
         } => {
-            let text = fs::read_to_string(&app)
-                .map_err(|e| Exit::Usage(format!("{}: {e}", app.display())))?;
-            let spec = alpha_cli::deploy::parse(&text)
-                .map_err(|e| Exit::Usage(format!("{}: {e}", app.display())))?;
+            let (app_id, compose, resources) = match (compose, app) {
+                (Some(path), _) => {
+                    let (app_id, compose) = wrap::wrapped(&read_json(&path)?)?;
+                    let resources = json!({ "cpu": cpu, "memory_mib": memory_mib });
+                    (app_id, compose, resources)
+                }
+                (None, Some(app)) => {
+                    let spec = read_spec(&app)?;
+                    (
+                        spec.app_id,
+                        alpha_cli::deploy::compose(&spec)?,
+                        spec.resources,
+                    )
+                }
+                (None, None) => return Err(Exit::Usage("give an app spec or --compose".into())),
+            };
             let shroud = if register_only {
                 None
             } else {
@@ -382,7 +467,67 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let key = read_ed25519(&key)?;
             let (client, doc) = admin_client_and_document(config, now).await?;
             let wait = wait.map(|secs| (Duration::from_secs(secs), doc.kms_ca_pem.as_str()));
-            Ok(alpha_cli::deploy::run(&client, &spec, key_id, &key, shroud.as_ref(), wait).await?)
+            Ok(alpha_cli::deploy::deploy_compose(
+                &client,
+                app_id,
+                compose,
+                &resources,
+                key_id,
+                &key,
+                shroud.as_ref(),
+                wait,
+            )
+            .await?)
+        }
+        Command::Compose {
+            command:
+                ComposeCommand::Wrap {
+                    app_id,
+                    platform,
+                    runtime_image,
+                    no_resolve,
+                    compose,
+                },
+        } => {
+            let bytes = fs::read(&compose)
+                .map_err(|e| Exit::Usage(format!("{}: {e}", compose.display())))?;
+            let plain = wrap::parse(&bytes)?;
+            let artifact: SignedDocument = serde_json::from_value(read_json(&platform)?)
+                .map_err(|e| Exit::Refused(format!("artifact: {e}")))?;
+            let runtime =
+                wrap::runtime(&artifact, &alpha_cli::release_key()?, now, &runtime_image)?;
+            let digests = if no_resolve {
+                BTreeMap::new()
+            } else {
+                let http = wrap::registry_client_builder()
+                    .build()
+                    .map_err(|e| Exit::Refused(format!("registry client: {e}")))?;
+                wrap::resolve_all(&http, &plain).await?
+            };
+            Ok(json!(wrap::wrap(plain, &digests, app_id, &runtime)?))
+        }
+        Command::Catalog {
+            command:
+                CatalogCommand::Sign {
+                    id,
+                    version,
+                    title,
+                    key,
+                    out_dir,
+                    app,
+                },
+        } => {
+            let spec = read_spec(&app)?;
+            let key = read_ed25519(&key)?;
+            let file = alpha_cli::catalog::sign(spec, &id, &version, &title, &key)?;
+            let path = out_dir.join(alpha_cli::catalog::file_name(&file));
+            fs::write(&path, alpha_cli::catalog::file_bytes(&file)?)
+                .map_err(|e| Exit::Refused(format!("{}: {e}", path.display())))?;
+            Ok(json!({
+                "file": path,
+                "template_sha256": file.entry.template_sha256,
+                "catalog_key": alpha_core::CatalogKey::from(&key.verifying_key()),
+            }))
         }
         Command::Instances { app, command } => {
             let shroud = Shroud {
@@ -546,5 +691,77 @@ mod tests {
         assert!(stop(&["--force"]));
         assert!(stop(&["--drain-seconds", "60"]));
         assert!(!stop(&["--force", "--drain-seconds", "60"]));
+    }
+
+    #[test]
+    fn catalog_sign_takes_its_flags() {
+        let sign = |flags: &[&str]| {
+            let args = ["alpha", "catalog", "sign"];
+            Cli::try_parse_from(args.iter().chain(flags).chain(&["app.yaml"])).is_ok()
+        };
+        let all = [
+            "--id",
+            "cpu-app",
+            "--version",
+            "1",
+            "--title",
+            "CPU App",
+            "--key",
+            "k",
+        ];
+        assert!(sign(&all));
+        assert!(sign(&[&all[..], &["--out-dir", "d"]].concat()));
+        assert!(!sign(&all[2..]));
+        assert_eq!(
+            Cli::try_parse_from(["alpha", "--version"])
+                .err()
+                .map(|e| e.kind()),
+            Some(clap::error::ErrorKind::DisplayVersion)
+        );
+    }
+
+    #[test]
+    fn compose_wrap_parses() {
+        let image = format!("r@sha256:{}", "7d".repeat(32));
+        let wrap = |flags: &[&str]| {
+            let args = ["alpha", "compose", "wrap"];
+            Cli::try_parse_from(args.iter().chain(flags).chain(&["c.yaml"])).is_ok()
+        };
+        let app = ["--app-id", "0199a1b2-0000-7000-8000-000000000001"];
+        let platform = ["--platform", "p.json"];
+        let runtime = ["--runtime-image", image.as_str()];
+        assert!(wrap(&[&app[..], &platform, &runtime].concat()));
+        assert!(wrap(
+            &[&app[..], &platform, &runtime, &["--no-resolve"]].concat()
+        ));
+        assert!(!wrap(&[&app[..], &runtime].concat()));
+        assert!(!wrap(&[&app[..], &platform].concat()));
+        assert!(!wrap(
+            &[&["--app-id", "not-a-uuid"][..], &platform, &runtime].concat()
+        ));
+    }
+
+    #[test]
+    fn deploy_takes_a_spec_or_a_wrapped_compose() {
+        let deploy = |flags: &[&str]| {
+            let args = [
+                "alpha",
+                "deploy",
+                "--key",
+                "k",
+                "--key-id",
+                "0199a1b2-0000-7000-8000-000000000001",
+            ];
+            Cli::try_parse_from(args.iter().chain(flags)).is_ok()
+        };
+        let wrapped = ["--compose", "w.json", "--cpu", "1", "--memory-mib", "2048"];
+        assert!(deploy(&["app.yaml"]));
+        assert!(deploy(&wrapped));
+        assert!(deploy(&[&wrapped[..], &["--register-only"]].concat()));
+        assert!(deploy(&[&wrapped[..], &["--wait", "60"]].concat()));
+        assert!(!deploy(&[&wrapped[..], &["app.yaml"]].concat()));
+        assert!(!deploy(&["--compose", "w.json", "--memory-mib", "2048"]));
+        assert!(!deploy(&["--cpu", "1", "--memory-mib", "2048", "app.yaml"]));
+        assert!(!deploy(&[]));
     }
 }

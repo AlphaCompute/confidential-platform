@@ -1,0 +1,42 @@
+version: "3.8"
+
+x-env: &env
+  LOG_LEVEL: info
+
+services:
+  web:
+    image: nginx:1.27@sha256:abababababababababababababababababababababababababababababababab
+    ports: ["8080:80"]
+    environment:
+      <<: *env
+      MODE: production
+    secrets: [session_key, db_password]
+    depends_on: [db, cache]
+    restart: unless-stopped
+  db:
+    image: postgres@sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+    secrets: [db_password]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+  cache:
+    image: redis@sha256:efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef
+    command: ["redis-server", "--save", ""]
+    user: "999"
+    volumes:
+      - type: volume
+        source: cachedata
+        target: /data
+
+volumes:
+  pgdata:
+  cachedata: {}
+
+secrets:
+  db_password:
+    external: true
+  session_key: {}

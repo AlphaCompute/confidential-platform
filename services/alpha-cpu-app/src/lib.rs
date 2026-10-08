@@ -1,7 +1,8 @@
-//! A demonstration tenant: an App that proves to a caller it runs as an attested Instance with a
-//! released Secret, without ever disclosing the Secret. `/healthz` names the Instance and says
-//! whether the Secret is readable right now; `/v1/hmac` uses it as an HMAC-SHA256 key. The key
-//! is read from the runtime socket on every request and never kept, logged or returned.
+//! A demonstration tenant: an App that proves to a caller it runs as an attested Instance holding
+//! its App's key, derived by the KMS for purpose `hmac`, without ever disclosing the key.
+//! `/healthz` names the Instance and says whether the key was obtained right now; `/v1/hmac` uses
+//! it as an HMAC-SHA256 key. The key is read from the runtime socket on every request and never
+//! kept, logged or returned.
 
 #![cfg_attr(
     test,
@@ -29,8 +30,7 @@ use serde_json::{Value, json};
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
-pub const SECRET: &str = "cpu-app-key";
-const MIN_KEY_BYTES: usize = 32;
+pub const KEY_PURPOSE: &str = "hmac";
 const MAX_BODY_BYTES: usize = 64 * 1024;
 
 pub struct AppState {
@@ -50,14 +50,13 @@ impl AppState {
         }
     }
 
-    /// Any failure is the same answer to the caller: the Secret is not available to this
-    /// Instance now, whether the runtime is gone, the KMS refused, or the value is too short to
-    /// be a key.
-    async fn key(&self) -> Result<Zeroizing<Vec<u8>>, StatusCode> {
-        match self.runtime.secret(SECRET).await {
-            Ok(key) if key.len() >= MIN_KEY_BYTES => Ok(key),
-            _ => Err(StatusCode::SERVICE_UNAVAILABLE),
-        }
+    /// Any failure is the same answer to the caller: the key is not available to this Instance
+    /// now, whether the runtime is gone or the KMS refused.
+    async fn key(&self) -> Result<Zeroizing<[u8; 32]>, StatusCode> {
+        self.runtime
+            .key(KEY_PURPOSE)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)
     }
 }
 
@@ -90,8 +89,8 @@ async fn hmac_sha256(
     body: Bytes,
 ) -> Result<Json<Value>, StatusCode> {
     let key = state.key().await?;
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(&key).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(key.as_slice())
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     mac.update(&body);
     Ok(Json(
         json!({ "hmac_sha256": hex::encode(mac.finalize().into_bytes()) }),
