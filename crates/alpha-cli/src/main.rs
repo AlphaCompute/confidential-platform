@@ -526,7 +526,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             Ok(json!({
                 "file": path,
                 "template_sha256": file.entry.template_sha256,
-                "catalog_key": alpha_cli::catalog::catalog_key(&key),
+                "catalog_key": alpha_core::CatalogKey::from(&key.verifying_key()),
             }))
         }
         Command::Instances { app, command } => {

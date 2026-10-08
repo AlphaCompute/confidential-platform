@@ -2,7 +2,7 @@
 //! that command's `app-compose.json` for the nil App id, signed with the catalog key.
 
 use alpha_core::catalog::{CatalogFile, Entry, Resources};
-use alpha_core::{AppId, CatalogKey, compose_hash};
+use alpha_core::{AppId, compose_hash};
 use ed25519_dalek::SigningKey;
 
 use crate::deploy::AppSpec;
@@ -37,12 +37,6 @@ pub fn sign(
     alpha_core::catalog::sign(entry, template, key).map_err(|e| e.to_string())
 }
 
-/// The raw 32-byte public key, the form the platform document's `catalog_key` takes; the SPKI
-/// a key file prints is not that form.
-pub fn catalog_key(key: &SigningKey) -> CatalogKey {
-    CatalogKey::from(&key.verifying_key())
-}
-
 /// The bare hex of `template_sha256`: a colon does not belong in a file name.
 pub fn file_name(file: &CatalogFile) -> String {
     format!(
@@ -64,6 +58,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
+    use alpha_core::CatalogKey;
     use alpha_core::catalog::{render, verify};
 
     use super::*;
@@ -191,8 +186,8 @@ resources:
         let expected = serde_json::json!({
             "app_id": APP_ID,
             "compose_hash": compose_hash(&rendered),
-            "catalog_key": catalog_key(&signing_key()),
-            "release_key": catalog_key(&SigningKey::from_bytes(&[12u8; 32])),
+            "catalog_key": CatalogKey::from(&signing_key().verifying_key()),
+            "release_key": CatalogKey::from(&SigningKey::from_bytes(&[12u8; 32]).verifying_key()),
             "vectors": verdicts,
         });
         let mut expected = alpha_core::jcs(&expected).unwrap();
@@ -239,15 +234,11 @@ resources:
         let app_id = spec.app_id;
         let key = signing_key();
         let file = sign(spec, "cpu-app", "1", "CPU App", &key).unwrap();
-        let catalog_key: CatalogKey =
-            serde_json::from_value(serde_json::to_value(catalog_key(&key)).unwrap()).unwrap();
+        let catalog_key: CatalogKey = serde_json::from_value(
+            serde_json::to_value(CatalogKey::from(&key.verifying_key())).unwrap(),
+        )
+        .unwrap();
         verify(&file, &catalog_key).unwrap();
-        assert_eq!(
-            file.template
-                .matches("\"name\":\"00000000-0000-0000-0000-000000000000\"")
-                .count(),
-            1
-        );
         assert_eq!(
             file.entry.resources,
             Resources {

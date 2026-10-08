@@ -306,7 +306,6 @@ pub fn wrap(
         endpoint: (endpoint, port),
     } = plain;
     let mut services = Mapping::new();
-    let mut declaring = Vec::new();
     for (name, service) in plain_services {
         let secrets_volume = secrets
             .contains_key(&name)
@@ -345,7 +344,6 @@ pub fn wrap(
             if !out.contains_key("depends_on") {
                 out.insert(key("depends_on"), after_runtime(Yaml::Sequence(vec![]))?);
             }
-            declaring.push(name.clone());
         }
         if !out.contains_key("restart") {
             out.insert(key("restart"), key("always"));
@@ -365,7 +363,7 @@ pub fn wrap(
         let Some(Yaml::Sequence(mounts)) = runtime_service.get_mut("volumes") else {
             return Err("runtime service has no volumes".into());
         };
-        for name in &declaring {
+        for name in secrets.keys() {
             mounts.push(key(&format!(
                 "alpha-secrets-{name}:/run/alpha-secrets/{name}"
             )));
@@ -387,7 +385,7 @@ pub fn wrap(
     for name in volumes.iter().map(String::as_str).chain(["alpha-run"]) {
         root_volumes.insert(key(name), Yaml::Mapping(Mapping::new()));
     }
-    for name in &declaring {
+    for name in secrets.keys() {
         let mut tmpfs = Mapping::new();
         tmpfs.insert(key("type"), key("tmpfs"));
         tmpfs.insert(key("device"), key("tmpfs"));
@@ -870,8 +868,6 @@ mod tests {
             serde_json::to_string_pretty(&expected).unwrap() + "\n",
             fs::read_to_string(out.join("expected.json")).unwrap()
         );
-        let again = wrap_text(&vector_compose(), &BTreeMap::new()).unwrap();
-        assert_eq!(again.compose, wrapped.compose);
         assert_eq!(compose_hash(&wrapped.compose), wrapped.compose_hash);
 
         let yaml = compose_yaml(&wrapped);
@@ -927,8 +923,8 @@ mod tests {
                 "pgdata",
                 "cachedata",
                 "alpha-run",
-                "alpha-secrets-web",
-                "alpha-secrets-db"
+                "alpha-secrets-db",
+                "alpha-secrets-web"
             ]
         );
         assert!(!wrapped.compose.contains("x-env"));

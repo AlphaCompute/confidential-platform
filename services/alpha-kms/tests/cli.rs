@@ -298,9 +298,18 @@ async fn deploy_register_only_registers_the_generated_compose() {
     let expected: Value =
         serde_json::from_str(&fs::read_to_string(vector.join("expected.json")).unwrap()).unwrap();
 
-    let reply = deploy::run(&client, &spec, admin.0, &admin.1, None, None)
-        .await
-        .unwrap();
+    let reply = deploy::deploy_compose(
+        &client,
+        spec.app_id,
+        deploy::compose(&spec).unwrap(),
+        &spec.resources,
+        admin.0,
+        &admin.1,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(reply["revision"]["compose_hash"], expected["compose_hash"]);
     assert_eq!(reply["revision"]["app_id"], json!(spec.app_id));
     assert!(
@@ -319,9 +328,18 @@ async fn deploy_register_only_registers_the_generated_compose() {
         fs::read_to_string(vector.join("app-compose.json")).unwrap()
     );
 
-    let again = deploy::run(&client, &spec, admin.0, &admin.1, None, None)
-        .await
-        .unwrap();
+    let again = deploy::deploy_compose(
+        &client,
+        spec.app_id,
+        deploy::compose(&spec).unwrap(),
+        &spec.resources,
+        admin.0,
+        &admin.1,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     assert_eq!(
         again["revision"]["created_at"],
         reply["revision"]["created_at"]

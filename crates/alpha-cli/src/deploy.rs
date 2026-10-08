@@ -355,28 +355,6 @@ pub async fn wait_for_attestation(
     }
 }
 
-/// The spec's compose through [`deploy_compose`], the function a wrapped compose takes too.
-pub async fn run(
-    client: &Client,
-    spec: &AppSpec,
-    key_id: KeyId,
-    key: &SigningKey,
-    shroud: Option<&Shroud>,
-    wait: Option<(Duration, &str)>,
-) -> Result<Value, String> {
-    deploy_compose(
-        client,
-        spec.app_id,
-        compose(spec)?,
-        &spec.resources,
-        key_id,
-        key,
-        shroud,
-        wait,
-    )
-    .await
-}
-
 /// Registers `compose` as a Revision of `app_id`, then deploys it through shroud-go unless
 /// `shroud` is `None` (`--register-only`), then waits for every copy to attest when `wait` is set.
 #[allow(clippy::too_many_arguments)]
