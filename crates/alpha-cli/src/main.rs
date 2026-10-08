@@ -318,6 +318,12 @@ fn read_json(path: &Path) -> Result<Value, Exit> {
     serde_json::from_slice(&text).map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))
 }
 
+fn read_spec(path: &Path) -> Result<alpha_cli::deploy::AppSpec, Exit> {
+    let text =
+        fs::read_to_string(path).map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))?;
+    alpha_cli::deploy::parse(&text).map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))
+}
+
 fn read_ed25519(path: &Path) -> Result<ed25519_dalek::SigningKey, Exit> {
     Ok(keyfile::read(path, &passphrase("passphrase: ")?)?.ed25519()?)
 }
@@ -441,10 +447,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                     (app_id, compose, resources)
                 }
                 (None, Some(app)) => {
-                    let text = fs::read_to_string(&app)
-                        .map_err(|e| Exit::Usage(format!("{}: {e}", app.display())))?;
-                    let spec = alpha_cli::deploy::parse(&text)
-                        .map_err(|e| Exit::Usage(format!("{}: {e}", app.display())))?;
+                    let spec = read_spec(&app)?;
                     (
                         spec.app_id,
                         alpha_cli::deploy::compose(&spec)?,
@@ -514,10 +517,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                     app,
                 },
         } => {
-            let text = fs::read_to_string(&app)
-                .map_err(|e| Exit::Usage(format!("{}: {e}", app.display())))?;
-            let spec = alpha_cli::deploy::parse(&text)
-                .map_err(|e| Exit::Usage(format!("{}: {e}", app.display())))?;
+            let spec = read_spec(&app)?;
             let key = read_ed25519(&key)?;
             let file = alpha_cli::catalog::sign(spec, &id, &version, &title, &key)?;
             let path = out_dir.join(alpha_cli::catalog::file_name(&file));

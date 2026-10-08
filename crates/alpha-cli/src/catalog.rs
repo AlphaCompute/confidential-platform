@@ -72,22 +72,7 @@ mod tests {
         SigningKey::from_bytes(&[11u8; 32])
     }
 
-    const SPEC: &str = "\
-app_id: 00000000-0000-0000-0000-000000000000
-services:
-  app:
-    image: ghcr.io/alphacompute/alpha-cpu-app@sha256:3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a
-    port: 8443
-    socket: true
-runtime:
-  image: ghcr.io/alphacompute/alpha-runtime@sha256:7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d
-  kms_ca_spki_sha256: sha256:c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1
-  kms_revisions:
-    - sha256:e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1
-resources:
-  cpu: 1
-  memory_mib: 2048
-";
+    const SPEC: &str = include_str!("../../../testdata/catalog/app.yaml");
 
     const APP_ID: &str = "01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b";
 
