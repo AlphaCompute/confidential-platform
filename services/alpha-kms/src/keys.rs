@@ -356,7 +356,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn check_shape_refuses_other_algorithms_and_misplaced_webauthn_fields() {
+    fn check_shape_admits_exactly_the_fields_of_its_algorithm() {
         let plain = SignatureObject {
             key_id: None,
             algorithm: "ed25519".into(),
@@ -382,6 +382,103 @@ mod tests {
             };
             assert_eq!(check_shape(&webauthn).unwrap_err().code, "malformed");
         }
+        for (authenticator_data, client_data_json, admitted) in [
+            (Some("AAAA".to_owned()), Some("e30".to_owned()), true),
+            (Some("AAAA".to_owned()), None, false),
+            (None, Some("e30".to_owned()), false),
+            (None, None, false),
+        ] {
+            let passkey = SignatureObject {
+                algorithm: webauthn::ALGORITHM.into(),
+                authenticator_data,
+                client_data_json,
+                ..plain.clone()
+            };
+            match check_shape(&passkey) {
+                Ok(()) => assert!(admitted),
+                Err(e) => assert_eq!((admitted, e.code), (false, "malformed")),
+            }
+        }
+    }
+
+    fn device_assertion() -> (Vec<u8>, [u8; 32], SignatureObject, Signer) {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/webauthn/mac-icloud-keychain.json"
+        );
+        let v: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let a = &v["assertions"][0];
+        let text = |v: &Value| v.as_str().unwrap().to_owned();
+        let spki = BASE64_URL_SAFE_NO_PAD
+            .decode(text(&v["credential"]["spki"]))
+            .unwrap();
+        let digest = signing_digest(&text(&a["context"]), &a["payload"]).unwrap();
+        let object = SignatureObject {
+            key_id: None,
+            algorithm: webauthn::ALGORITHM.into(),
+            signature: text(&a["signature"]),
+            authenticator_data: Some(text(&a["authenticator_data"])),
+            client_data_json: Some(text(&a["client_data_json"])),
+        };
+        let signer = Signer {
+            origins: vec![text(&v["origin"])],
+            rp_id: text(&v["rp_id"]),
+            bundle_sha256: format!("sha256:{}", "0".repeat(64)),
+            api_origin: text(&v["origin"]),
+        };
+        (spki, digest, object, signer)
+    }
+
+    #[test]
+    fn the_algorithm_follows_the_key() {
+        use ed25519_dalek::SigningKey;
+        use ed25519_dalek::pkcs8::EncodePublicKey;
+        let (p256_spki, p256_digest, passkey, signer) = device_assertion();
+        let signer = Some(&signer);
+        let sk = SigningKey::from_bytes(&[3u8; 32]);
+        let ed_spki = sk.verifying_key().to_public_key_der().unwrap();
+        let ed_digest = signing_digest("ctx", &serde_json::json!({"a": 1})).unwrap();
+        let ed = SignatureObject {
+            key_id: None,
+            algorithm: "ed25519".into(),
+            signature: BASE64_URL_SAFE_NO_PAD
+                .encode(ed25519_dalek::Signer::sign(&sk, &ed_digest).to_bytes()),
+            authenticator_data: None,
+            client_data_json: None,
+        };
+        verify_signature(&p256_spki, &p256_digest, &passkey, signer).unwrap();
+        verify_signature(ed_spki.as_bytes(), &ed_digest, &ed, signer).unwrap();
+
+        let invalid =
+            |r: Result<(), ApiError>| assert_eq!(r.unwrap_err().code, "signature_invalid");
+        invalid(verify_signature(&p256_spki, &ed_digest, &ed, signer));
+        invalid(verify_signature(
+            ed_spki.as_bytes(),
+            &p256_digest,
+            &passkey,
+            signer,
+        ));
+        let ml_dsa = SignatureObject {
+            algorithm: "ml-dsa".into(),
+            ..ed.clone()
+        };
+        invalid(verify_signature(
+            ed_spki.as_bytes(),
+            &ed_digest,
+            &ml_dsa,
+            signer,
+        ));
+        let stray = SignatureObject {
+            client_data_json: passkey.client_data_json.clone(),
+            ..ed.clone()
+        };
+        invalid(verify_signature(
+            ed_spki.as_bytes(),
+            &ed_digest,
+            &stray,
+            signer,
+        ));
+        assert_eq!(check_shape(&stray).unwrap_err().code, "malformed");
     }
 
     #[test]

@@ -732,3 +732,53 @@ pub async fn revoke_key(
         Ok(json!({ "key_id": target.id, "revoked_at": rfc3339(revoked_at), "reason": reason }))
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_registered_key_is_ed25519_or_an_uncompressed_p256_spki() {
+        use ed25519_dalek::pkcs8::EncodePublicKey as _;
+        let b64 = |bytes: &[u8]| BASE64_URL_SAFE_NO_PAD.encode(bytes);
+        let ed25519 = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32])
+            .verifying_key()
+            .to_public_key_der()
+            .unwrap();
+        assert_eq!(
+            registered_spki(&b64(ed25519.as_bytes())).unwrap(),
+            ed25519.as_bytes()
+        );
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../testdata/webauthn/mac-icloud-keychain.json"
+        );
+        let vector: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let captured = vector["credential"]["spki"].as_str().unwrap();
+        let uncompressed = registered_spki(captured).unwrap();
+        assert_eq!(b64(&uncompressed), captured);
+
+        // SEQUENCE { algorithm identifier, BIT STRING { 0x02|0x03 ‖ x } }: the same key, compressed.
+        let (algorithm, point) = (&uncompressed[2..23], &uncompressed[27..]);
+        assert_eq!(&uncompressed[23..27], &[0x03, 0x42, 0x00, 0x04]);
+        let (x, y) = point.split_at(32);
+        let compressed = [
+            &[0x30, 0x39][..],
+            algorithm,
+            &[0x03, 0x22, 0x00, 0x02 | (y[31] & 1)],
+            x,
+        ]
+        .concat();
+        assert_eq!(
+            p256::PublicKey::from_public_key_der(&compressed).unwrap(),
+            p256::PublicKey::from_public_key_der(&uncompressed).unwrap()
+        );
+        let e = registered_spki(&b64(&compressed)).unwrap_err();
+        assert_eq!(e.code, "malformed");
+        assert!(e.message.contains("uncompressed point"), "{}", e.message);
+
+        let e = registered_spki(&b64(&[0x5a; 91])).unwrap_err();
+        assert_eq!(e.code, "malformed");
+    }
+}
