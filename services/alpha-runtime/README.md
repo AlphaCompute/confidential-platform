@@ -8,7 +8,8 @@ the KMS answers `revision_revoked` — at the first attestation, a renewal, a se
 process exits with code 78 and the socket disappears. Startup and configuration refusals exit
 with 1 and name the check; a drain on SIGTERM exits with 0.
 
-Configuration is three environment variables and, when a service declared a Secret, a fourth.
+Configuration is three environment variables, a fourth when a service declared a Secret and a
+fifth for a wrapped compose.
 `ALPHACOMPUTE_KMS_CA_SPKI_SHA256` (`sha256:<hex>` of the KMS CA's SubjectPublicKeyInfo) and
 `ALPHACOMPUTE_KMS_REVISIONS` (comma-separated `sha256:<hex>`) are in the measured compose and are
 all the runtime trusts: before the first request it refuses a KMS whose chain does not end at a
@@ -18,6 +19,10 @@ also measured, is a JSON object of service name to the Secret names it declared,
 `{"db":["db_password"],"web":["db_password","session_key"]}`, and is absent when nothing is
 declared. Every service and Secret name becomes a path segment, so each must be a lowercase key
 purpose (`[a-z0-9][a-z0-9._-]{0,63}`); a repeated key or any other shape is refused at start.
+`ALPHACOMPUTE_TLS_UPSTREAM`, measured too, is `<service>:<port>`, the published service of a
+wrapped compose and its plain container port; the service must be a lowercase key purpose and
+the port 1 to 65535, or the runtime exits 1 at start naming the variable. Without it the runtime
+opens no TCP port at all.
 
 The socket is `/run/alpha/runtime.sock`, HTTP/1.1 JSON, no authentication (access is the right
 to the socket), and comes up only after the first attestation succeeded:
@@ -60,10 +65,36 @@ because Docker runs it as a second process in the live container. A declaring se
 `depends_on: alpha-runtime: {condition: service_healthy}` waits on it. The socket's four routes
 are unchanged.
 
+## TLS for a wrapped compose
+
+A compose wrapped by `alpha compose wrap` publishes the CVM's 443 on `alpha-runtime` as its port
+8443, and the published service keeps only its plain port on the compose network. With
+`ALPHACOMPUTE_TLS_UPSTREAM` set, the runtime listens on 8443 once the first attestation
+succeeded (a bind failure exits 1) and terminates TLS there: TLS 1.3 with `X25519MLKEM768` only,
+no client certificate, and the chain of the current attestation, [leaf, KMS CA]. Each accepted
+connection then opens a TCP connection to the upstream and copies bytes both ways until either
+side closes, so HTTP/1.1, keep-alive, WebSocket upgrades, HTTP/2 by prior knowledge and any other
+byte stream pass unchanged. No ALPN protocol is advertised: a browser speaks HTTP/1.1, and a
+client that insists on `h2` by ALPN, such as gRPC, is not served.
+
+There is no session resumption (no tickets, no session cache): a resumed session presents no
+certificate, and every connection has to prove the current leaf. A renewal swaps the leaf for
+new handshakes only; a connection already open keeps going, since nothing after the handshake
+depends on the certificate. With no valid leaf (renewal failed past the hour) a handshake fails
+instead of serving an expired certificate.
+
+The handshake and the upstream connect are bounded at 10 s each; an upstream that does not
+answer closes the client's connection after the handshake and logs one line naming it. There
+is no idle timeout, so WebSockets and long polls stay open. No client address is forwarded (no
+PROXY protocol, no header): a stock image cannot read PROXY protocol, the proxy does not parse
+HTTP, and behind the provider's TLS passthrough the CVM sees the gateway's address anyway. On
+SIGTERM the listener closes at once and open connections get at most 10 s to finish; on
+`revision_revoked` every proxied connection is closed at once and the process exits 78.
+
 ## Tests
 
-`cargo test -p alpha-runtime` covers the configuration parser (the secrets variable's accepted and
-refused shapes included), the renewal schedule, the exit-code decision, the atomic 0444 replace of
+`cargo test -p alpha-runtime` covers the configuration parser (the secrets and upstream variables'
+accepted and refused shapes included), the renewal schedule, the exit-code decision, the atomic 0444 replace of
 a secret file and the healthcheck's file check; `tests/healthcheck.rs` runs the built binary's
 `healthcheck` with a cleared environment and checks it exits 0 without reaching configuration and
 1 for a missing file or an unparsable variable. The end-to-end tests are `services/alpha-kms/tests/runtime.rs` (they need
@@ -76,7 +107,19 @@ SAN URI with rustls and webpki alone, the refusal of a listener under another CA
 unlisted Revision (and the walk to the next endpoint), the cache expiring with the leaf,
 `revision_revoked` ending the runtime with 78, and the secret files: written only into the
 directories of declaring services, waiting for a Secret put later, following a renewal, written
-by the running runtime, and never written for a revoked Revision.
+by the running runtime, and never written for a revoked Revision. The TLS listener is proven with
+a client offering only the hybrid group: the Instance leaf served with the org, App and Revision
+SANs and no ALPN even when the client offers `h2` (`a_wrapped_endpoint_is_served_with_the_instance_leaf`),
+a client offering only `X25519` refused (`a_client_without_the_hybrid_group_is_refused`), a
+WebSocket upgrade and an HTTP/2 preface passed byte for byte
+(`a_websocket_upgrade_and_an_h2_preface_pass_through`), a renewal serving the new leaf in a full
+handshake while an open connection keeps echoing
+(`the_endpoint_serves_a_renewed_leaf_without_dropping_open_connections`), an expired leaf not
+served (`an_expired_leaf_is_not_served`), a dead upstream closing only its connection
+(`an_unreachable_upstream_closes_the_connection_and_the_proxy_keeps_serving`), revocation
+cutting connections (`a_revoked_revision_closes_proxied_connections`), the bounded drain on
+SIGTERM (`sigterm_drains_then_closes`), and the wrap's vector parsed by the runtime's own
+configuration (`the_wrap_and_the_runtime_agree_on_the_endpoint`).
 
 What only a live CVM proves: the real quote and `Info` from the guest agent's socket, the real
 event log from the CCEL table and `/run/log/dstack`, that the registered `compose_hash` equals

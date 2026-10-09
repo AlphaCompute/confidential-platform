@@ -48,6 +48,11 @@ Measured:
 An App's own container is bound by the same rule: whatever serves the Endpoint has to
 speak the hybrid, or nothing will reach it.
 
+An App deployed from a plain compose does not terminate TLS itself: the platform's runtime
+sits in front of the service, serves the Instance certificate and passes the bytes on to the
+service's plain port. The checks are the same — the chain, the SANs and the hybrid. A browser
+opening such an App shows a certificate warning, because the KMS CA is not a public CA.
+
 ## Pinning, in Node
 
 The KMS CA is the only root — a public CA proves nothing about what is running — and the
