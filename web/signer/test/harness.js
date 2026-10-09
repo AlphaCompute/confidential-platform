@@ -160,7 +160,7 @@ function testView() {
 class SoftwareAuthenticator {
   constructor(options = {}) {
     this.flags = options.flags === undefined ? 0x1d : options.flags;
-    this.highS = Boolean(options.highS);
+    this.highS = false;
     this.credentials = [];
     this.log = [];
     // Consumed by the next ceremony: {create: "NotAllowedError"}, {publicKey: null | "raw"},
@@ -170,8 +170,8 @@ class SoftwareAuthenticator {
   }
 
   // A credential made outside the page, as one from an earlier claim.
-  enroll(rpId = RP_ID) {
-    const credential = this.newCredential(rpId);
+  enroll() {
+    const credential = this.newCredential(RP_ID);
     return { id: b64u(credential.id), spki: b64u(credential.spki) };
   }
 
@@ -673,7 +673,7 @@ function claimApi(options = {}) {
 
 // shroud-go's approval routes for one ticket, with the KMS behind them. Receipts come from
 // `api.revisionReceipt` and `api.putReceipt`, which a test may replace; `api.reply[route]` may
-// answer a route instead (route: "revision", "put", "channel", "decline").
+// answer a route instead (route: "revision", "put").
 function approvalApi(options = {}) {
   const now = options.now === undefined ? Date.now() : options.now;
   const compose = options.compose;
@@ -696,7 +696,6 @@ function approvalApi(options = {}) {
     revisions: [],
     puts: [],
     channels: [],
-    declines: 0,
     reply: {},
     revisionReceipt: (text, response) => mintReceipt("revision.register", text, response),
     putReceipt: (text, response) => mintReceipt("secret.put", text, response),
@@ -722,7 +721,6 @@ function approvalApi(options = {}) {
     [`GET ${base}`]: () =>
       api.read || { status: 200, body: Object.fromEntries(fields.map((k) => [k, api[k]])) },
     [`POST ${base}/decline`]: () => {
-      api.declines += 1;
       if (api.state !== "pending") {
         return {
           status: 409,

@@ -802,10 +802,11 @@ async function startApproval(view, viewText, ticket) {
   const read = reply.body;
   const refusal = approvalRefusal(read);
   if (refusal) return stop(refusal);
+  const before = currentServices(read.current);
   const launch =
     read.catalog_template_sha256 === null || read.catalog_template_sha256 === undefined
       ? uploadedLaunch(read)
-      : await catalogLaunch(view, read);
+      : await catalogLaunch(view, read, before);
   if (launch.refusal) return stop(launch.refusal);
 
   const ui = screen(
@@ -813,7 +814,7 @@ async function startApproval(view, viewText, ticket) {
     el("p", `Launch approval for ${typeof read.org_name === "string" ? read.org_name : read.org_id}`),
   );
   const a = { view, viewText, read, ticket, ui, launch, credential: null, values: null };
-  a.fields = secretFields(launch.services, read.current);
+  a.fields = secretFields(launch.services, before);
   a.secretsBox = el("div");
   a.secretsBox.append(...a.fields.map((f) => f.node));
   ui.facts.replaceChildren(...describeLaunch(a), a.secretsBox);
@@ -826,13 +827,8 @@ function declaredSecrets(services) {
 
 // One password field per declared Secret. A Secret the current launch also declares is already
 // held by the KMS, because approving that launch put it, so it defaults to keeping that value.
-function secretFields(services, current) {
-  let held = [];
-  try {
-    if (current) held = declaredSecrets(JSON.parse(wasm_bindgen.composeServices(current.compose)));
-  } catch (_) {
-    held = [];
-  }
+function secretFields(services, before) {
+  const held = before ? declaredSecrets(before) : [];
   return declaredSecrets(services).map((name) => {
     const node = el("div", undefined, "secret");
     const input = el("input");
@@ -1007,7 +1003,7 @@ async function catalogEntry(view, templateHex, appId) {
   }
 }
 
-async function catalogLaunch(view, read) {
+async function catalogLaunch(view, read, before) {
   const hex = /^(?:sha256:)?([0-9a-f]{64})$/.exec(read.catalog_template_sha256);
   const found = view.catalog_key && hex ? await catalogEntry(view, hex[1], read.app_id) : null;
   if (!found) return { refusal: MESSAGES.catalog };
@@ -1018,12 +1014,12 @@ async function catalogLaunch(view, read) {
     heading: `${entry.title}, version ${entry.version}`,
   });
   if (launch.refusal || !read.current) return launch;
-  const before = await previousEntry(view, read);
-  if (before && before.entry.catalog_id === entry.catalog_id) {
-    launch.heading = `${entry.title}, version ${before.entry.version} → ${entry.version}`;
+  const previous = await previousEntry(view, read);
+  if (previous && previous.entry.catalog_id === entry.catalog_id) {
+    launch.heading = `${entry.title}, version ${previous.entry.version} → ${entry.version}`;
     return launch;
   }
-  launch.notes = [MESSAGES.not_from_catalog, ...imageChanges(read.current.compose, launch.services)];
+  launch.notes = [MESSAGES.not_from_catalog, ...imageChanges(before, launch.services)];
   return launch;
 }
 
@@ -1040,13 +1036,18 @@ async function previousEntry(view, read) {
 }
 
 // What `current` claims runs today, only where its image differs from this launch's.
-function imageChanges(currentCompose, services) {
-  let before;
+// The services of the compose the service says runs today, or null when it sent none or it does
+// not parse.
+function currentServices(current) {
   try {
-    before = JSON.parse(wasm_bindgen.composeServices(currentCompose));
+    return current ? JSON.parse(wasm_bindgen.composeServices(current.compose)) : null;
   } catch (_) {
-    return [];
+    return null;
   }
+}
+
+function imageChanges(before, services) {
+  if (!before) return [];
   const names = [...new Set([...Object.keys(before), ...Object.keys(services)])].sort();
   const image = (s) => (s && s.image) || "nothing";
   return names

@@ -161,25 +161,10 @@ fn volumes(name: &str, value: Option<&Yaml>) -> Result<Vec<String>, Error> {
 }
 
 fn declared_secrets(text: &str) -> Result<BTreeMap<String, Vec<String>>, Error> {
-    let not_lists = || malformed(&format!("{SECRETS} is not a JSON object of name lists"));
-    let Ok(Value::Object(map)) = alpha_core::parse(text.as_bytes()) else {
-        return Err(not_lists());
-    };
-    map.into_iter()
-        .map(|(service, names)| {
-            let Value::Array(names) = names else {
-                return Err(not_lists());
-            };
-            let names = names
-                .into_iter()
-                .map(|n| match n {
-                    Value::String(n) => Ok(n),
-                    _ => Err(not_lists()),
-                })
-                .collect::<Result<_, _>>()?;
-            Ok((service, names))
-        })
-        .collect()
+    alpha_core::parse(text.as_bytes())
+        .ok()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .ok_or_else(|| malformed(&format!("{SECRETS} is not a JSON object of name lists")))
 }
 
 #[cfg(test)]
