@@ -25,9 +25,7 @@ use alpha_client::tls::{self, Pin};
 use alpha_client::{Client, Error as ClientError};
 use alpha_core::{AppId, ComposeHash, KeyId, context};
 use alpha_kms::{certs, rfc3339};
-use alpha_runtime::{
-    Config, Delivery, Error, EvidenceSource, Exit, Runtime, Secrets, Upstream, proxy,
-};
+use alpha_runtime::{Config, Delivery, Error, EvidenceSource, Exit, Runtime, Secrets, proxy};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use common::*;
@@ -288,10 +286,7 @@ async fn start_plain_service() -> (u16, mpsc::UnboundedReceiver<Vec<u8>>) {
 
 fn config_with_upstream(h: &Harness, port: u16) -> Config {
     Config {
-        tls_upstream: Some(Upstream {
-            host: "localhost".into(),
-            port,
-        }),
+        tls_upstream: Some(format!("localhost:{port}")),
         ..config(h, vec![h.url.clone()])
     }
 }
@@ -507,19 +502,20 @@ impl ServerCertVerifier for CaOnly {
     }
 }
 
-fn backend_client(ca_der: &[u8], now: SystemTime) -> TlsConnector {
+fn backend_client(
+    ca_der: &[u8],
+    now: SystemTime,
+    provider: rustls::crypto::CryptoProvider,
+) -> TlsConnector {
     let anchor = webpki::anchor_from_trusted_cert(&CertificateDer::from(ca_der.to_vec()))
         .unwrap()
         .to_owned();
-    let config = ClientConfig::builder_with_details(
-        Arc::new(aws_lc_rs::default_provider()),
-        pinned_time(now),
-    )
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .unwrap()
-    .dangerous()
-    .with_custom_certificate_verifier(Arc::new(CaOnly(vec![anchor])))
-    .with_no_client_auth();
+    let config = ClientConfig::builder_with_details(Arc::new(provider), pinned_time(now))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(CaOnly(vec![anchor])))
+        .with_no_client_auth();
     TlsConnector::from(Arc::new(config))
 }
 
@@ -599,7 +595,7 @@ async fn tenant_backend_pins_the_kms_ca_and_reads_the_revision_from_the_san() {
 
     let ca_der = tls::cert_from_pem(&h.ca_pem).unwrap().to_vec();
     let tcp = TcpStream::connect(&addr).await.unwrap();
-    let mut tls = backend_client(&ca_der, h.now())
+    let mut tls = backend_client(&ca_der, h.now(), aws_lc_rs::default_provider())
         .connect(ServerName::try_from("app.example").unwrap(), tcp)
         .await
         .unwrap();
@@ -613,17 +609,21 @@ async fn tenant_backend_pins_the_kms_ca_and_reads_the_revision_from_the_san() {
     let (_, other_ca) = certs::new_ca(h.now()).unwrap();
     let tcp = TcpStream::connect(&addr).await.unwrap();
     assert!(
-        backend_client(&other_ca, h.now())
+        backend_client(&other_ca, h.now(), aws_lc_rs::default_provider())
             .connect(ServerName::try_from("app.example").unwrap(), tcp)
             .await
             .is_err()
     );
     let tcp = TcpStream::connect(&addr).await.unwrap();
     assert!(
-        backend_client(&ca_der, h.now() + certs::LEAF_TTL + Duration::from_secs(1))
-            .connect(ServerName::try_from("app.example").unwrap(), tcp)
-            .await
-            .is_err()
+        backend_client(
+            &ca_der,
+            h.now() + certs::LEAF_TTL + Duration::from_secs(1),
+            aws_lc_rs::default_provider(),
+        )
+        .connect(ServerName::try_from("app.example").unwrap(), tcp)
+        .await
+        .is_err()
     );
 }
 
@@ -666,7 +666,7 @@ async fn a_tenant_serves_its_endpoint_with_the_runtime_identity() {
 
     let ca_der = tls::cert_from_pem(&h.ca_pem).unwrap().to_vec();
     let tcp = TcpStream::connect(addr).await.unwrap();
-    let mut tls = backend_client(&ca_der, h.now())
+    let mut tls = backend_client(&ca_der, h.now(), aws_lc_rs::default_provider())
         .connect(ServerName::try_from("app.example").unwrap(), tcp)
         .await
         .unwrap();
@@ -827,7 +827,7 @@ async fn a_wrapped_endpoint_is_served_with_the_instance_leaf() {
 
     let mut config = hybrid_client(&h);
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    let mut tls = connect(addr, &Arc::new(config)).await.unwrap();
+    let tls = connect(addr, &Arc::new(config)).await.unwrap();
     let conn = tls.get_ref().1;
     assert_eq!(
         conn.negotiated_key_exchange_group().unwrap().name(),
@@ -847,11 +847,7 @@ async fn a_wrapped_endpoint_is_served_with_the_instance_leaf() {
         (h.org, app, hash)
     );
 
-    tls.write_all(b"GET / HTTP/1.1\r\nHost: app\r\nConnection: close\r\n\r\n")
-        .await
-        .unwrap();
-    let mut reply = String::new();
-    tls.read_to_string(&mut reply).await.unwrap();
+    let reply = get_body(tls).await;
     assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
     assert!(reply.ends_with(BODY), "{reply}");
 
@@ -871,7 +867,7 @@ async fn a_client_without_the_hybrid_group_is_refused() {
 
     let ca_der = tls::cert_from_pem(&h.ca_pem).unwrap().to_vec();
     let tcp = TcpStream::connect(addr).await.unwrap();
-    let tls = backend_client(&ca_der, h.now())
+    let tls = backend_client(&ca_der, h.now(), aws_lc_rs::default_provider())
         .connect(ServerName::try_from("app.example").unwrap(), tcp)
         .await
         .unwrap();
@@ -885,20 +881,15 @@ async fn a_client_without_the_hybrid_group_is_refused() {
         "a client offering both groups gets the hybrid one"
     );
 
-    let anchor = webpki::anchor_from_trusted_cert(&CertificateDer::from(ca_der))
-        .unwrap()
-        .to_owned();
     let classical = rustls::crypto::CryptoProvider {
         kx_groups: vec![aws_lc_rs::kx_group::X25519],
         ..aws_lc_rs::default_provider()
     };
-    let config = ClientConfig::builder_with_details(Arc::new(classical), pinned_time(h.now()))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(CaOnly(vec![anchor])))
-        .with_no_client_auth();
-    assert!(connect(addr, &Arc::new(config)).await.is_err());
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let refused = backend_client(&ca_der, h.now(), classical)
+        .connect(ServerName::try_from("app.example").unwrap(), tcp)
+        .await;
+    assert!(refused.is_err());
 
     assert_eq!(socket.stop().await, Exit::Drained);
 }
@@ -951,8 +942,7 @@ async fn closed(tls: &mut TlsStream<TcpStream>, within: Duration) {
     assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
 }
 
-async fn get_body(addr: SocketAddr, client: &Arc<ClientConfig>) -> String {
-    let mut tls = connect(addr, client).await.unwrap();
+async fn get_body(mut tls: TlsStream<TcpStream>) -> String {
     tls.write_all(b"GET / HTTP/1.1\r\nHost: app\r\nConnection: close\r\n\r\n")
         .await
         .unwrap();
@@ -1013,7 +1003,11 @@ async fn an_expired_leaf_is_not_served() {
 
     *clock.lock().unwrap() = h.now();
     runtime.attest().await.unwrap();
-    assert!(get_body(addr, &client).await.ends_with(BODY));
+    assert!(
+        get_body(connect(addr, &client).await.unwrap())
+            .await
+            .ends_with(BODY)
+    );
 
     assert_eq!(socket.stop().await, Exit::Drained);
 }
@@ -1036,7 +1030,11 @@ async fn an_unreachable_upstream_closes_the_connection_and_the_proxy_keeps_servi
     closed(&mut tls, Duration::from_secs(12)).await;
 
     plain_service(TcpListener::bind(("127.0.0.1", port)).await.unwrap());
-    assert!(get_body(addr, &client).await.ends_with(BODY));
+    assert!(
+        get_body(connect(addr, &client).await.unwrap())
+            .await
+            .ends_with(BODY)
+    );
 
     assert_eq!(socket.stop().await, Exit::Drained);
 }
@@ -1126,13 +1124,7 @@ fn the_wrap_and_the_runtime_agree_on_the_endpoint() {
         env("ALPHACOMPUTE_TLS_UPSTREAM"),
     )
     .unwrap();
-    assert_eq!(
-        config.tls_upstream,
-        Some(Upstream {
-            host: "web".into(),
-            port: 80
-        })
-    );
+    assert_eq!(config.tls_upstream.as_deref(), Some("web:80"));
 }
 
 #[tokio::test]

@@ -352,6 +352,10 @@ pub fn wrap(
         key("ALPHACOMPUTE_TLS_UPSTREAM"),
         key(&format!("{endpoint}:{port}")),
     );
+    if !secrets.is_empty() {
+        let map = serde_json::to_string(&secrets).map_err(|e| e.to_string())?;
+        environment.insert(key("ALPHACOMPUTE_SECRETS"), key(&map));
+    }
     runtime_service.insert(
         key("ports"),
         strings(&[&format!("{APP_PORT}:{}", alpha_client::runtime::TLS_PORT)]),
@@ -359,11 +363,6 @@ pub fn wrap(
     // Only when some service waits for its secrets: a runtime image without the `healthcheck`
     // subcommand ignores its arguments and would start a second runtime that takes the socket.
     if !secrets.is_empty() {
-        let map = serde_json::to_string(&secrets).map_err(|e| e.to_string())?;
-        let Some(Yaml::Mapping(environment)) = runtime_service.get_mut("environment") else {
-            return Err("runtime service has no environment".into());
-        };
-        environment.insert(key("ALPHACOMPUTE_SECRETS"), key(&map));
         let Some(Yaml::Sequence(mounts)) = runtime_service.get_mut("volumes") else {
             return Err("runtime service has no volumes".into());
         };

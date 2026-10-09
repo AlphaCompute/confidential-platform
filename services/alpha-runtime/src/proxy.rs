@@ -13,19 +13,12 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 
-use crate::{Error, Runtime, Upstream};
+use crate::{Error, Exit, Runtime};
 
 const HANDSHAKE: Duration = Duration::from_secs(10);
 const CONNECT: Duration = Duration::from_secs(10);
 /// Docker kills the container this long after SIGTERM anyway.
 const DRAIN: Duration = Duration::from_secs(10);
-
-/// How the proxy stops: let open connections finish for at most [`DRAIN`], or cut them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Stop {
-    Drain,
-    Now,
-}
 
 struct CurrentLeaf(Arc<Runtime>);
 
@@ -46,14 +39,13 @@ fn server_config(runtime: Arc<Runtime>) -> Result<Arc<ServerConfig>, Error> {
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| Error::Socket(format!("tls: {e}")))?
         .with_no_client_auth()
+        // ponytail: no ALPN, so a browser speaks HTTP/1.1 and HTTP/2 by prior knowledge still
+        // passes, but a client that insists on `h2` (gRPC) is not served; the upgrade is a
+        // measured opt-in that advertises `h2` for an `h2c` backend.
         .with_cert_resolver(Arc::new(CurrentLeaf(runtime)));
     // A resumed session presents no certificate, and each connection must prove the current leaf.
     config.send_tls13_tickets = 0;
     config.session_storage = Arc::new(NoServerSessionStorage {});
-    // ponytail: no ALPN, so a browser speaks HTTP/1.1 and HTTP/2 by prior knowledge still passes,
-    // but a client that insists on `h2` (gRPC) is not served; the upgrade is a measured opt-in
-    // that advertises `h2` for an `h2c` backend.
-    config.alpn_protocols = Vec::new();
     Ok(Arc::new(config))
 }
 
@@ -62,7 +54,7 @@ fn server_config(runtime: Arc<Runtime>) -> Result<Arc<ServerConfig>, Error> {
 pub struct Endpoint {
     listener: TcpListener,
     acceptor: TlsAcceptor,
-    upstream: Upstream,
+    upstream: String,
 }
 
 impl Endpoint {
@@ -87,7 +79,8 @@ impl Endpoint {
     }
 
     /// Accepts until `stop` resolves; no idle timeout, so WebSockets and long polls stay open.
-    pub async fn serve(self, stop: impl Future<Output = Stop>) {
+    /// Open connections get at most [`DRAIN`] on a shutdown and are cut on revocation.
+    pub async fn serve(self, stop: impl Future<Output = Exit>) {
         let mut stop = std::pin::pin!(stop);
         let mut open = JoinSet::new();
         let how = loop {
@@ -106,7 +99,7 @@ impl Endpoint {
             open.spawn(proxy(self.acceptor.clone(), tcp, self.upstream.clone()));
         };
         drop(self.listener);
-        if how == Stop::Drain {
+        if how == Exit::Drained {
             let _ = timeout(DRAIN, async { while open.join_next().await.is_some() {} }).await;
         }
         open.abort_all();
@@ -114,21 +107,19 @@ impl Endpoint {
     }
 }
 
-async fn proxy(acceptor: TlsAcceptor, tcp: TcpStream, upstream: Upstream) {
+async fn proxy(acceptor: TlsAcceptor, tcp: TcpStream, upstream: String) {
     let _ = tcp.set_nodelay(true);
     let Ok(Ok(mut tls)) = timeout(HANDSHAKE, acceptor.accept(tcp)).await else {
         return;
     };
-    let connect = TcpStream::connect((upstream.host.as_str(), upstream.port));
-    let mut backend = match timeout(CONNECT, connect).await {
-        Ok(Ok(backend)) => backend,
-        Ok(Err(e)) => {
-            eprintln!("alpha-runtime: upstream {upstream}: {e}");
-            let _ = tokio::io::AsyncWriteExt::shutdown(&mut tls).await;
-            return;
-        }
-        Err(_) => {
-            eprintln!("alpha-runtime: upstream {upstream}: no answer within {CONNECT:?}");
+    let connected = timeout(CONNECT, TcpStream::connect(upstream.as_str()))
+        .await
+        .map_err(|_| format!("no answer within {CONNECT:?}"))
+        .and_then(|r| r.map_err(|e| e.to_string()));
+    let mut backend = match connected {
+        Ok(backend) => backend,
+        Err(reason) => {
+            eprintln!("alpha-runtime: upstream {upstream}: {reason}");
             let _ = tokio::io::AsyncWriteExt::shutdown(&mut tls).await;
             return;
         }

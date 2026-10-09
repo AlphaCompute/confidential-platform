@@ -142,21 +142,9 @@ pub fn parse_secrets(text: Option<&str>) -> Result<Secrets, Error> {
     Ok(secrets)
 }
 
-/// The service a wrapped compose publishes, reached over the compose network.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Upstream {
-    pub host: String,
-    pub port: u16,
-}
-
-impl std::fmt::Display for Upstream {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.host, self.port)
-    }
-}
-
-/// `ALPHACOMPUTE_TLS_UPSTREAM`: `<service>:<port>`; unset means no TLS listener.
-pub fn parse_upstream(text: Option<&str>) -> Result<Option<Upstream>, Error> {
+/// `ALPHACOMPUTE_TLS_UPSTREAM`: `<service>:<port>`, the service a wrapped compose publishes,
+/// reached over the compose network; unset means no TLS listener.
+pub fn parse_upstream(text: Option<&str>) -> Result<Option<String>, Error> {
     let Some(text) = text else {
         return Ok(None);
     };
@@ -167,15 +155,12 @@ pub fn parse_upstream(text: Option<&str>) -> Result<Option<Upstream>, Error> {
     if !alpha_core::is_key_purpose(host) {
         return Err(refused("does not name a lowercase compose service"));
     }
-    let port = Some(port)
+    Some(port)
         .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
         .and_then(|p| p.parse::<u16>().ok())
         .filter(|p| *p != 0)
         .ok_or_else(|| refused("does not end in a port from 1 to 65535"))?;
-    Ok(Some(Upstream {
-        host: host.to_owned(),
-        port,
-    }))
+    Ok(Some(text.to_owned()))
 }
 
 /// The three environment variables and, when a service declared a Secret,
@@ -186,7 +171,7 @@ pub struct Config {
     pub kms_revisions: Vec<ComposeHash>,
     pub kms_endpoints: Vec<String>,
     pub secrets: Secrets,
-    pub tls_upstream: Option<Upstream>,
+    pub tls_upstream: Option<String>,
 }
 
 impl Config {
@@ -673,10 +658,10 @@ impl Runtime {
             let runtime = self.clone();
             async move { runtime.deliver_forever(secrets_root).await }
         });
-        let (stop_proxy, proxy_stopped) = tokio::sync::oneshot::channel::<proxy::Stop>();
+        let (stop_proxy, proxy_stopped) = tokio::sync::oneshot::channel::<Exit>();
         let proxy = tls.map(|endpoint| {
             tokio::spawn(
-                endpoint.serve(async move { proxy_stopped.await.unwrap_or(proxy::Stop::Now) }),
+                endpoint.serve(async move { proxy_stopped.await.unwrap_or(Exit::Revoked) }),
             )
         });
         let mut revoked = self.revoked.subscribe();
@@ -687,10 +672,7 @@ impl Runtime {
         };
         delivery.abort();
         let _ = stop.send(());
-        let _ = stop_proxy.send(match exit {
-            Exit::Drained => proxy::Stop::Drain,
-            Exit::Revoked => proxy::Stop::Now,
-        });
+        let _ = stop_proxy.send(exit);
         let proxied = async {
             if let Some(proxy) = proxy {
                 let _ = proxy.await;
@@ -789,15 +771,11 @@ mod tests {
     fn the_tls_upstream_is_a_lowercase_service_and_a_port() {
         assert_eq!(parse_upstream(None).unwrap(), None);
         let c = Config::parse(HASH, HASH, "https://a", None, Some("web:80")).unwrap();
+        assert_eq!(c.tls_upstream.as_deref(), Some("web:80"));
         assert_eq!(
-            c.tls_upstream,
-            Some(Upstream {
-                host: "web".into(),
-                port: 80
-            })
+            parse_upstream(Some("localhost:65535")).unwrap().as_deref(),
+            Some("localhost:65535")
         );
-        let max = parse_upstream(Some("localhost:65535")).unwrap().unwrap();
-        assert_eq!(max.to_string(), "localhost:65535");
         for bad in [
             "web",
             "web:",

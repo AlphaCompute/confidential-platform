@@ -107,19 +107,8 @@ SAN URI with rustls and webpki alone, the refusal of a listener under another CA
 unlisted Revision (and the walk to the next endpoint), the cache expiring with the leaf,
 `revision_revoked` ending the runtime with 78, and the secret files: written only into the
 directories of declaring services, waiting for a Secret put later, following a renewal, written
-by the running runtime, and never written for a revoked Revision. The TLS listener is proven with
-a client offering only the hybrid group: the Instance leaf served with the org, App and Revision
-SANs and no ALPN even when the client offers `h2` (`a_wrapped_endpoint_is_served_with_the_instance_leaf`),
-a client offering only `X25519` refused (`a_client_without_the_hybrid_group_is_refused`), a
-WebSocket upgrade and an HTTP/2 preface passed byte for byte
-(`a_websocket_upgrade_and_an_h2_preface_pass_through`), a renewal serving the new leaf in a full
-handshake while an open connection keeps echoing
-(`the_endpoint_serves_a_renewed_leaf_without_dropping_open_connections`), an expired leaf not
-served (`an_expired_leaf_is_not_served`), a dead upstream closing only its connection
-(`an_unreachable_upstream_closes_the_connection_and_the_proxy_keeps_serving`), revocation
-cutting connections (`a_revoked_revision_closes_proxied_connections`), the bounded drain on
-SIGTERM (`sigterm_drains_then_closes`), and the wrap's vector parsed by the runtime's own
-configuration (`the_wrap_and_the_runtime_agree_on_the_endpoint`).
+by the running runtime, and never written for a revoked Revision. The same file proves the TLS listener: the leaf it serves,
+the hybrid group it requires, pass-through, renewal, expiry, revocation and the drain on SIGTERM.
 
 What only a live CVM proves: the real quote and `Info` from the guest agent's socket, the real
 event log from the CCEL table and `/run/log/dstack`, that the registered `compose_hash` equals
