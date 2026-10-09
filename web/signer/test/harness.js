@@ -8,6 +8,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 
+const realSetTimeout = setTimeout;
+
 const ROOT = path.resolve(__dirname, "../../..");
 const ORIGIN = "https://signer.test";
 const RP_ID = "signer.test";
@@ -415,12 +417,11 @@ async function loadPage(options = {}) {
   async function fakeFetch(resource, init = {}) {
     const url = String(resource);
     const method = (init.method || "GET").toUpperCase();
-    const entry = { method, url, body: init.body, time: clock.now, init };
+    fetches.push({ method, url, body: init.body, time: clock.now, init });
     if (url === b.wasmName) {
       assert.equal(init.integrity, wasmSri, "the page fetched the wasm without its integrity");
       return new Response(b.wasm, { headers: { "Content-Type": "application/wasm" } });
     }
-    fetches.push(entry);
     if (url === "./platform.json") {
       const p = options.platform;
       if (p === undefined || p === null) return new Response("not found", { status: 404 });
@@ -538,10 +539,13 @@ async function loadPage(options = {}) {
       clicks.push(fetches.length);
       for (const listener of target.listeners.click || []) await listener({ target });
     },
+    // The page's listener does not return boot()'s promise, so this waits, in real time, until
+    // the page has left "Loading…".
     async boot() {
       for (const listener of document.listeners.DOMContentLoaded || []) listener({});
-      // boot() is not returned to the listener; wait until the page left "Loading…" or settles.
-      for (let i = 0; i < 200; i += 1) await new Promise((r) => setImmediate(r));
+      for (let i = 0; i < 2000 && page.text() === "Loading…"; i += 1) {
+        await new Promise((r) => realSetTimeout(r, 5));
+      }
     },
     async init() {
       await vm.runInContext(

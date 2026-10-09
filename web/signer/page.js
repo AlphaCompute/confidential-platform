@@ -689,6 +689,12 @@ async function signedAsExpected(view, key, challenge, assertion) {
   }
 }
 
+function servedBySigner(view) {
+  return Boolean(
+    view.signer && Array.isArray(view.signer.origins) && view.signer.origins.includes(location.origin),
+  );
+}
+
 async function verifiedPlatform() {
   try {
     const reply = await fetch("./platform.json", { cache: "no-store" });
@@ -717,7 +723,7 @@ async function boot() {
   if (view.version < storedVersion()) return refuse("older_platform");
   storeVersion(view.version);
 
-  if (!view.signer || !view.signer.origins.includes(location.origin)) return refuse("not_signer");
+  if (!servedBySigner(view)) return refuse("not_signer");
 
   if (mode === "claim") return startClaim(view, viewText, ticket);
   return startApproval(view, viewText, ticket);
