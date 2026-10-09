@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AlphaCompute signer</title>
+<link rel="stylesheet" href="@STYLE_NAME@" integrity="@STYLE_SRI@">
+<script defer src="@GLUE_NAME@" integrity="@GLUE_SRI@"></script>
+<script defer src="@PAGE_NAME@" integrity="@PAGE_SRI@"></script>
+</head>
+<body>
+<main id="main"><p>Loading…</p></main>
+</body>
+</html>

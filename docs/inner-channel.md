@@ -315,7 +315,8 @@ crates/alpha-channel/build-web.sh <out-dir>
 ```
 
 The script writes `alpha_channel.js`, its typings and `alpha_channel_bg.wasm` for
-`wasm-bindgen --target web`. It then prints `sha256 <hex> alpha_channel_bg.wasm` and the commit
+`wasm-bindgen --target web`; an optional second argument picks another wasm-bindgen target
+(`no-modules` for the signer page). It then prints `sha256 <hex> alpha_channel_bg.wasm` and the commit
 it was built from. It needs the toolchain in `rust-toolchain.toml` and the `wasm-bindgen` CLI at
 the exact version the crate pins (the script refuses any other). Paths are remapped, so the same
 commit built with those two gives the same hash. A page calls `init()` from the glue; Node calls
