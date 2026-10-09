@@ -67,10 +67,6 @@ function toBig(bytes) {
   return BigInt(`0x${Buffer.from(bytes).toString("hex") || "0"}`);
 }
 
-function fromBig(n) {
-  return Buffer.from(n.toString(16).padStart(64, "0"), "hex");
-}
-
 function derInt(n) {
   let bytes = Buffer.from(n.toString(16).padStart(64, "0"), "hex");
   while (bytes.length > 1 && bytes[0] === 0) bytes = bytes.subarray(1);
@@ -115,11 +111,9 @@ function mintReceipt(route, requestText, response, options = {}) {
     key: options.key || KMS_KEY,
     dsaEncoding: "ieee-p1363",
   });
-  let [r, s] = rawToRs(raw);
-  if (s > P256_N / 2n) s = P256_N - s;
   return {
     document,
-    signature: { algorithm: "ecdsa-p256", signature: b64u(Buffer.concat([fromBig(r), fromBig(s)])) },
+    signature: { algorithm: "ecdsa-p256", signature: b64u(raw) },
     certificate_chain: [options.leaf || KMS_LEAF],
   };
 }
@@ -765,7 +759,15 @@ function approvalApi(options = {}) {
   return api;
 }
 
+const NOT_CONFIRMED = "Not confirmed by the KMS.";
+// Values made inside the page's context have that context's prototypes.
+const plain = (value) => JSON.parse(JSON.stringify(value));
+const ids = (list) => plain(list.map((c) => b64u(Buffer.from(c.id))));
+
 module.exports = {
+  NOT_CONFIRMED,
+  plain,
+  ids,
   approvalApi,
   catalogFile,
   RP_ID,

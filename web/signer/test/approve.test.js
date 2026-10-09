@@ -3,6 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
+  NOT_CONFIRMED,
   SoftwareAuthenticator,
   approvalApi,
   b64u,
@@ -13,13 +14,14 @@ const {
   loadPage,
   memoryStorage,
   mintReceipt,
+  ids,
+  plain,
   sha256,
   testView,
   testdata,
 } = require("./harness.js");
 
 const APPROVED = "Approved. You can close this tab.";
-const NOT_CONFIRMED = "Not confirmed by the KMS.";
 const MISMATCH =
   "What the service asked you to approve does not match what it would run. Nothing was signed.";
 
@@ -34,8 +36,6 @@ function withoutSecrets() {
   return jcs(compose);
 }
 
-const plain = (value) => JSON.parse(JSON.stringify(value));
-const ids = (list) => plain(list.map((c) => b64u(Buffer.from(c.id))));
 
 // An organization with two passkeys on one laptop; the second answers.
 function organization() {

@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const crypto = require("node:crypto");
 const {
   FOREIGN_LEAF,
+  NOT_CONFIRMED,
   RP_ID,
   SoftwareAuthenticator,
   b64u,
@@ -14,11 +15,12 @@ const {
   loadPage,
   memoryStorage,
   mintReceipt,
+  ids,
+  plain,
   sha256,
 } = require("./harness.js");
 
 const YOURS = "This organization is yours.";
-const NOT_CONFIRMED = "Not confirmed by the KMS.";
 const SYNCED = "Synced passkey (backed up by your provider)";
 
 async function claimPage(apiOptions = {}, pageOptions = {}) {
@@ -28,8 +30,6 @@ async function claimPage(apiOptions = {}, pageOptions = {}) {
   return { api, page };
 }
 
-// Values made inside the page's context have that context's prototypes.
-const plain = (value) => JSON.parse(JSON.stringify(value));
 
 function grouped(spkiB64) {
   const hex = sha256(Buffer.from(spkiB64, "base64url")).toString("hex");
@@ -243,7 +243,6 @@ const SECOND = "Add a second passkey on another device or provider";
 const TWO_KEYS = "Done. Your organization has two passkeys.";
 const CHECK_FAILED = "This passkey did not sign as expected. Try again.";
 
-const ids = (list) => plain(list.map((c) => b64u(Buffer.from(c.id))));
 
 // A root claim up to the check step: the first passkey on `page.authenticator`, the second on a
 // phone.
