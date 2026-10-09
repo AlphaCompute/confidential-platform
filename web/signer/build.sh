@@ -1,8 +1,8 @@
 #!/bin/sh
-# Builds the signer page into <out-dir>: index.html, headers, and the glue, wasm, page script and
-# stylesheet under content-addressed names. index.html pins the scripts and the stylesheet by SRI,
-# and the page script pins the wasm, so the SHA-256 of index.html (printed as bundle_sha256) covers
-# every byte the page runs.
+# Builds the signer page into <out-dir>: index.html, headers, the font license, and the glue, wasm,
+# page script, stylesheet and fonts under content-addressed names. index.html pins the scripts and
+# the stylesheet by SRI, and the page script pins the wasm and the fonts, so the SHA-256 of
+# index.html (printed as bundle_sha256) covers every byte the page runs or draws with.
 set -eu
 LC_ALL=C
 export LC_ALL
@@ -42,8 +42,15 @@ unfilled() {
 glue=$(place "$tmp/pkg/alpha_channel.js" alpha_channel js)
 wasm=$(place "$tmp/pkg/alpha_channel_bg.wasm" alpha_channel_bg wasm)
 style=$(place "$here/style.css" style css)
+light=$(place "$here/fonts/PublicSans-Light.woff2" public_sans_light woff2)
+regular=$(place "$here/fonts/PublicSans-Regular.woff2" public_sans_regular woff2)
+bold=$(place "$here/fonts/PublicSans-Bold.woff2" public_sans_bold woff2)
 
-sed -e "s|@WASM_URL@|$wasm|" -e "s|@WASM_SRI@|$(sri "$out/$wasm")|" "$here/page.js" > "$tmp/page.js"
+sed -e "s|@WASM_URL@|$wasm|" -e "s|@WASM_SRI@|$(sri "$out/$wasm")|" \
+  -e "s|@FONT_LIGHT_URL@|$light|" -e "s|@FONT_LIGHT_SRI@|$(sri "$out/$light")|" \
+  -e "s|@FONT_REGULAR_URL@|$regular|" -e "s|@FONT_REGULAR_SRI@|$(sri "$out/$regular")|" \
+  -e "s|@FONT_BOLD_URL@|$bold|" -e "s|@FONT_BOLD_SRI@|$(sri "$out/$bold")|" \
+  "$here/page.js" > "$tmp/page.js"
 unfilled "$tmp/page.js"
 page=$(place "$tmp/page.js" page js)
 
@@ -53,6 +60,7 @@ sed -e "s|@STYLE_NAME@|$style|" -e "s|@STYLE_SRI@|$(sri "$out/$style")|" \
   "$here/index.html.in" > "$out/index.html"
 unfilled "$out/index.html"
 cp "$here/headers" "$out/headers"
+cp "$here/fonts/OFL.txt" "$out/OFL.txt"
 
 echo "bundle_sha256 sha256:$(hex "$out/index.html")"
 echo "revision $(git -C "$root" rev-parse HEAD)$(git -C "$root" diff --quiet HEAD || echo -dirty)"
