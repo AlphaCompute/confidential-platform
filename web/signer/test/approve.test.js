@@ -11,6 +11,7 @@ const {
   iso,
   jcs,
   loadPage,
+  memoryStorage,
   mintReceipt,
   sha256,
   testView,
@@ -383,4 +384,291 @@ test("every refusal is one fixed sentence", async () => {
       assert.ok(!text.includes(markup), `${markup} in ${text}`);
     }
   }
+});
+
+const SECRET_VALUES = { db_password: "pw-correct-horse-1", session_key: "sk-battery-staple-2" };
+
+function secretPage(apiOptions = {}, pageOptions = {}) {
+  return approvalPage({ compose: WRAP, ...apiOptions }, { sealer: true, ...pageOptions });
+}
+
+const field = (page, name) => page.find((n) => n.id === `secret-${name}`);
+const keepChoice = (page, name) => page.find((n) => n.id === `keep-${name}`);
+
+function fill(page, values) {
+  for (const [name, value] of Object.entries(values)) field(page, name).value = value;
+}
+
+// The same declared names, with only db_password delivered: the launch a re-approval replaces.
+function currentWithDbPassword() {
+  const compose = JSON.parse(WRAP);
+  compose.docker_compose_file = compose.docker_compose_file.replace(
+    `ALPHACOMPUTE_SECRETS: '{"db":["db_password"],"web":["db_password","session_key"]}'`,
+    `ALPHACOMPUTE_SECRETS: '{"db":["db_password"]}'`,
+  );
+  const text = jcs(compose);
+  assert.notEqual(text, WRAP);
+  return { compose_hash: `sha256:${hex(text)}`, compose: text };
+}
+
+async function approveAll(page) {
+  await page.click("Approve with passkey");
+  await page.click("Sign 2 of 3");
+  await page.click("Sign 3 of 3");
+}
+
+test("every secret is put and confirmed before the registration", async () => {
+  // Exists so that offering the registration before the last put's receipt verified fails.
+  const { api, page, laptop, credentials } = await secretPage();
+  const text = page.text();
+  assert.ok(text.includes("Receives secrets: db_password, session_key"), text);
+  assert.ok(text.includes("Receives secrets: db_password"), text);
+  for (const name of Object.keys(SECRET_VALUES)) {
+    const input = field(page, name);
+    assert.equal(input.type, "password");
+    assert.equal(input.autocomplete, "off");
+    assert.ok(text.includes(`Secret ${name}`));
+  }
+  fill(page, SECRET_VALUES);
+
+  await page.click("Approve with passkey");
+  assert.equal(api.puts.length, 1);
+  assert.equal(api.revisions.length, 0);
+  assert.ok(page.buttons().includes("Sign 2 of 3"), page.buttons());
+  await page.click("Sign 2 of 3");
+  assert.equal(api.puts.length, 2);
+  assert.equal(api.revisions.length, 0);
+  assert.ok(page.buttons().includes("Sign 3 of 3"), page.buttons());
+  await page.click("Sign 3 of 3");
+  assert.equal(api.revisions.length, 1);
+  assert.equal(api.revisions[0].puts, 2);
+  assert.ok(page.text().includes(APPROVED), page.text());
+
+  const wasm = page.wasm();
+  const gets = laptop.log.filter((l) => l.kind === "get");
+  assert.equal(gets.length, 3);
+  const names = Object.keys(SECRET_VALUES).sort();
+  for (const [i, name] of names.entries()) {
+    const sent = api.puts[i];
+    assert.equal(sent.declared, name);
+    const value = SECRET_VALUES[name];
+    const payload = {
+      name: `${WRAP_APP}.${name}`,
+      app_ids: [WRAP_APP],
+      content_sha256: `sha256:${hex(value)}`,
+      issued_at: sent.body.payload.issued_at,
+    };
+    const document = wasm.canonicalJson(JSON.stringify(payload));
+    assert.deepEqual(
+      Buffer.from(gets[i].options.challenge),
+      contextDigest("alphacompute/secret/v1", document),
+    );
+    const seal = page.seals[i];
+    assert.equal(api.channels[i], seal.hello);
+    assert.equal(seal.serverHello, wasm.canonicalJson(JSON.stringify({ server_hello: i + 1 })));
+    assert.equal(seal.platform, testView().viewText);
+    assert.equal(seal.payload, document);
+    assert.equal(seal.orgId, api.org_id);
+    assert.equal(seal.value.toString(), value);
+    const assertion = gets[i].result;
+    assert.equal(
+      sent.text,
+      wasm.canonicalJson(
+        JSON.stringify({
+          payload,
+          signature: {
+            key_id: credentials[1].key_id,
+            algorithm: "webauthn-es256",
+            signature: assertion.signature,
+            authenticator_data: assertion.authenticator_data,
+            client_data_json: assertion.client_data_json,
+          },
+          sealed: { ticket: `ticket-${i + 1}`, frame: "sealed-frame" },
+        }),
+      ),
+    );
+  }
+});
+
+test("later touches use the passkey of the first", async () => {
+  const { page, laptop, credentials } = await secretPage();
+  fill(page, SECRET_VALUES);
+  await approveAll(page);
+  assert.ok(page.text().includes(APPROVED));
+  const gets = laptop.log.filter((l) => l.kind === "get");
+  assert.deepEqual(ids(gets[0].options.allowCredentials), credentials.map((c) => c.credential_id));
+  for (const later of gets.slice(1)) {
+    assert.deepEqual(ids(later.options.allowCredentials), [credentials[1].credential_id]);
+  }
+});
+
+test("a failed put stops before the registration", async () => {
+  const faults = [
+    [
+      "a receipt over other bytes",
+      (api) => {
+        api.putReceipt = (text, response) => mintReceipt("secret.put", `${text} `, response);
+      },
+      NOT_CONFIRMED,
+    ],
+    [
+      "a receipt for another name",
+      (api) => {
+        api.putReceipt = (text, response) =>
+          mintReceipt("secret.put", text, { ...response, name: "db_password" });
+      },
+      NOT_CONFIRMED,
+    ],
+    [
+      "a 400",
+      (api) => {
+        api.reply.put = () => ({ status: 400, body: { error: { code: "malformed", message: "x" } } });
+      },
+      "The KMS refused this request (malformed).",
+    ],
+    [
+      "a 503",
+      (api) => {
+        api.reply.put = () => ({
+          status: 503,
+          body: { error: "down", error_code: "SHROUD_SERVICE_UNAVAILABLE" },
+        });
+      },
+      "The service is unavailable. Try again in a minute.",
+    ],
+  ];
+  for (const [name, fault, sentence] of faults) {
+    const { api, page } = await secretPage();
+    const original = api.putReceipt;
+    fault(api);
+    // The failed step is offered again as soon as it fails; two seconds later its issued_at is new.
+    const putRoute = Object.keys(api.routes).find((k) => k.startsWith("PUT "));
+    const relay = api.routes[putRoute];
+    api.routes[putRoute] = (req) => {
+      page.clock.now += 2000;
+      return relay(req);
+    };
+    fill(page, SECRET_VALUES);
+    await page.click("Approve with passkey");
+    assert.ok(page.text().includes(sentence), `${name}: ${page.text()}`);
+    assert.ok(!page.text().includes(APPROVED), name);
+    assert.equal(api.revisions.length, 0, name);
+    assert.deepEqual(page.buttons(), ["Approve with passkey", "Decline"], name);
+
+    api.putReceipt = original;
+    delete api.reply.put;
+    await page.click("Approve with passkey");
+    const tries = api.puts.filter((p) => p.declared === "db_password");
+    assert.equal(tries.length, 2, name);
+    assert.notEqual(tries[0].body.payload.issued_at, tries[1].body.payload.issued_at, name);
+    await page.click("Sign 2 of 3");
+    await page.click("Sign 3 of 3");
+    assert.ok(page.text().includes(APPROVED), name);
+  }
+
+  const { api, page } = await secretPage();
+  fill(page, SECRET_VALUES);
+  await page.click("Approve with passkey");
+  api.reply.put = () => ({ status: 400, body: { error: { code: "signature_invalid", message: "" } } });
+  await page.click("Sign 2 of 3");
+  assert.equal(api.revisions.length, 0);
+  assert.ok(page.buttons().includes("Sign 2 of 3"));
+  delete api.reply.put;
+  await page.click("Sign 2 of 3");
+  await page.click("Sign 3 of 3");
+  assert.equal(api.puts.filter((p) => p.declared === "db_password").length, 1);
+  assert.equal(api.puts.filter((p) => p.declared === "session_key").length, 2);
+  assert.ok(page.text().includes(APPROVED));
+});
+
+test("secret values are never echoed or stored", async () => {
+  const session = memoryStorage();
+  const local = memoryStorage();
+  const { page } = await secretPage({}, { sessionStorage: session, localStorage: local });
+  const inputs = Object.keys(SECRET_VALUES).map((n) => field(page, n));
+  fill(page, SECRET_VALUES);
+  await approveAll(page);
+  assert.ok(page.text().includes(APPROVED));
+  for (const input of inputs) assert.equal(input.value, "");
+  const haystacks = [
+    ...page.fetches.map((f) => `${f.url}\n${f.body || ""}`),
+    JSON.stringify([...session.data]),
+    JSON.stringify([...local.data]),
+    JSON.stringify(page.consoleCalls),
+    page.text(),
+  ];
+  for (const value of Object.values(SECRET_VALUES)) {
+    for (const form of [value, b64u(Buffer.from(value)), Buffer.from(value).toString("base64")]) {
+      for (const h of haystacks) assert.ok(!h.includes(form), `${form} leaked`);
+    }
+  }
+  assert.deepEqual(page.consoleCalls, []);
+});
+
+test("a re-approval keeps current values unless replaced", async () => {
+  const current = currentWithDbPassword();
+  const kept = await secretPage({ current });
+  const choice = keepChoice(kept.page, "db_password");
+  assert.ok(choice, kept.page.text());
+  assert.equal(choice.value, "keep");
+  assert.ok(kept.page.text().includes("Keep the current value"));
+  assert.equal(keepChoice(kept.page, "session_key"), undefined);
+
+  await kept.page.click("Approve with passkey");
+  assert.ok(kept.page.text().includes("Enter a value for every secret."));
+  assert.equal(kept.laptop.log.length, 0);
+
+  fill(kept.page, { session_key: SECRET_VALUES.session_key });
+  await kept.page.click("Approve with passkey");
+  await kept.page.click("Sign 2 of 2");
+  assert.ok(kept.page.text().includes(APPROVED), kept.page.text());
+  assert.deepEqual(
+    kept.api.puts.map((p) => p.declared),
+    ["session_key"],
+  );
+
+  const replaced = await secretPage({ current });
+  keepChoice(replaced.page, "db_password").value = "replace";
+  fill(replaced.page, { session_key: SECRET_VALUES.session_key });
+  await replaced.page.click("Approve with passkey");
+  assert.ok(replaced.page.text().includes("Enter a value for every secret."));
+  assert.equal(replaced.laptop.log.length, 0);
+  assert.equal(field(replaced.page, "session_key").value, SECRET_VALUES.session_key);
+  fill(replaced.page, { db_password: SECRET_VALUES.db_password });
+  await approveAll(replaced.page);
+  assert.ok(replaced.page.text().includes(APPROVED));
+  assert.deepEqual(
+    replaced.api.puts.map((p) => p.declared),
+    ["db_password", "session_key"],
+  );
+});
+
+test("relay calls are paced and a 429 is retried once", async () => {
+  const { page } = await secretPage();
+  fill(page, SECRET_VALUES);
+  await approveAll(page);
+  const calls = page.fetches.filter((f) => f.url.includes("/v1/"));
+  assert.ok(calls.length >= 6);
+  for (let i = 1; i < calls.length; i += 1) {
+    assert.ok(calls[i].time - calls[i - 1].time >= 250, `${calls[i - 1].url} then ${calls[i].url}`);
+  }
+
+  const limited = await secretPage();
+  let first = true;
+  limited.api.reply.put = () => {
+    if (!first) return null;
+    first = false;
+    return {
+      status: 429,
+      body: { error: "slow down", error_code: "SHROUD_RATE_LIMITED" },
+      headers: { "Retry-After": "2" },
+    };
+  };
+  fill(limited.page, SECRET_VALUES);
+  await approveAll(limited.page);
+  assert.ok(limited.page.text().includes(APPROVED));
+  const tries = limited.api.puts.filter((p) => p.declared === "db_password");
+  assert.equal(tries.length, 2);
+  assert.equal(tries[0].text, tries[1].text);
+  assert.ok(limited.page.timers.includes(2000));
 });

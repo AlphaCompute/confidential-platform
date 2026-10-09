@@ -68,6 +68,8 @@ const MESSAGES = {
     "What the service asked you to approve does not match what it would run. Nothing was signed.",
   approved: "Approved. You can close this tab.",
   declined: "Declined. You can close this tab.",
+  secret_missing: "Enter a value for every secret.",
+  not_sealed: "The KMS node did not prove itself, so the secret was not sent. Try again.",
   catalog: "The catalog entry for this launch is not signed by AlphaCompute. Nothing was signed.",
   not_from_catalog: "This launch is replacing a launch not from this catalog.",
   revision_revoked: "The KMS refuses this launch because it was revoked before. Nothing was approved.",
@@ -815,9 +817,65 @@ async function startApproval(view, viewText, ticket) {
     el("h1", read.title),
     el("p", `Launch approval for ${typeof read.org_name === "string" ? read.org_name : read.org_id}`),
   );
-  const a = { view, viewText, read, ticket, ui, launch, credential: null };
-  ui.facts.replaceChildren(...describeLaunch(a));
-  return offerRevision(a);
+  const a = { view, viewText, read, ticket, ui, launch, credential: null, values: null };
+  a.fields = secretFields(launch.services, read.current);
+  a.secretsBox = el("div");
+  if (a.fields.length) a.secretsBox.append(...a.fields.map((f) => f.node));
+  ui.facts.replaceChildren(...describeLaunch(a), a.secretsBox);
+  return offerApproval(a);
+}
+
+function declaredSecrets(services) {
+  return [...new Set(Object.values(services).flatMap((s) => s.secrets))].sort();
+}
+
+// One password field per declared Secret. A Secret the current launch also declares is already
+// held by the KMS, because approving that launch put it, so it defaults to keeping that value.
+function secretFields(services, current) {
+  let held = [];
+  try {
+    if (current) held = declaredSecrets(JSON.parse(wasm_bindgen.composeServices(current.compose)));
+  } catch (_) {
+    held = [];
+  }
+  return declaredSecrets(services).map((name) => {
+    const node = el("div", undefined, "secret");
+    const input = el("input");
+    input.type = "password";
+    input.autocomplete = "off";
+    input.id = `secret-${name}`;
+    const label = el("label", `Secret ${name}`);
+    label.htmlFor = input.id;
+    node.append(label);
+    let keep = null;
+    if (held.includes(name)) {
+      keep = el("select");
+      keep.id = `keep-${name}`;
+      const kept = el("option", "Keep the current value");
+      kept.value = "keep";
+      const replaced = el("option", "Replace");
+      replaced.value = "replace";
+      keep.append(kept, replaced);
+      keep.value = "keep";
+      node.append(keep);
+    }
+    node.append(input);
+    return { name, input, keep, node };
+  });
+}
+
+// Reads every field once and empties it, or returns a note and leaves the fields as they were.
+function takeValues(a) {
+  const sent = a.fields.filter((f) => !f.keep || f.keep.value !== "keep");
+  if (sent.some((f) => !f.input.value)) return { note: MESSAGES.secret_missing };
+  const values = sent.map((f) => ({ name: f.name, value: utf8(f.input.value), done: false }));
+  for (const f of a.fields) f.input.value = "";
+  a.secretsBox.replaceChildren(
+    ...a.fields.map((f) =>
+      el("p", f.keep && f.keep.value === "keep" ? `${f.name}: keeping the current value` : f.name),
+    ),
+  );
+  return { values };
 }
 
 // Every touch after the first is limited to the passkey the first one used.
@@ -825,8 +883,7 @@ function allowed(a) {
   return a.credential ? [a.credential] : a.read.credentials.map((x) => x.credential_id);
 }
 
-// Signs the Revision with one passkey and keeps the passkey's id for later touches, or returns a
-// note.
+// Signs with one passkey and keeps the passkey's id for later touches, or returns a note.
 async function approvalSignature(a, options) {
   const { credential, note } = await passkey("get", options);
   if (!credential) return { note };
@@ -836,30 +893,101 @@ async function approvalSignature(a, options) {
   return { signature: signatureObject(credential, keyId) };
 }
 
-function offerRevision(a, note) {
-  const { read } = a;
-  const payload = { app_id: read.app_id, compose: a.launch.compose };
-  const signable = wasm_bindgen.signingDigest("revision", JSON.stringify(payload));
-  const options = getOptions(a.view, signable.digest, allowed(a));
-  offer(
-    a.ui,
-    note,
-    button("Approve with passkey", async () => {
-      const { signature, note } = await approvalSignature(a, options);
-      if (!signature) return offerRevision(a, note);
-      const body = wasm_bindgen.canonicalJson(JSON.stringify({ payload, signature }));
-      const reply = await api(a.view, "POST", approvalPath(a, "/revision"), body);
-      if (reply.status !== 200) return offerRevision(a, approvalFailure(reply));
-      const signed = receipt(a.view, reply, "revision.register", body, {
-        app_id: read.app_id,
-        compose_hash: read.compose_hash,
-        org_id: read.org_id,
-      });
-      if (!signed) return offerRevision(a, MESSAGES.not_confirmed);
-      return offer(a.ui, "", el("p", MESSAGES.approved, "confirmed"));
-    }),
-    declineButton(a),
+// The next step: each Secret put, then the registration, which shroud-go refuses Secrets after.
+function offerApproval(a, note) {
+  const pending = a.values ? a.values.filter((v) => !v.done) : [];
+  const total = a.values ? a.values.length + 1 : 1;
+  const step = total - pending.length;
+  const label = step === 1 ? "Approve with passkey" : `Sign ${step} of ${total}`;
+  const run = a.values ? stepAction(a, pending[0]) : firstAction(a);
+  offer(a.ui, note, button(label, run), declineButton(a));
+}
+
+// The first click reads the Secret values, so its inputs are built in the click, before any await.
+function firstAction(a) {
+  return () => {
+    if (a.fields.length) {
+      const taken = takeValues(a);
+      if (taken.note) return offerApproval(a, taken.note);
+      a.values = taken.values;
+    } else {
+      a.values = [];
+    }
+    return stepAction(a, a.values[0])();
+  };
+}
+
+function stepAction(a, item) {
+  const inputs = item ? putInputs(a, item) : revisionInputs(a);
+  return () => (item ? put(a, item, inputs) : registerRevision(a, inputs));
+}
+
+function putInputs(a, item) {
+  const payload = {
+    name: `${a.read.app_id}.${item.name}`,
+    app_ids: [a.read.app_id],
+    content_sha256: wasm_bindgen.bodySha256(item.value),
+    issued_at: issuedAt(),
+  };
+  const signable = wasm_bindgen.signingDigest("secret", JSON.stringify(payload));
+  return { payload, document: signable.document, options: getOptions(a.view, signable.digest, allowed(a)) };
+}
+
+async function put(a, item, inputs) {
+  const { signature, note } = await approvalSignature(a, inputs.options);
+  if (!signature) return offerApproval(a, note);
+  const sealer = new wasm_bindgen.KmsSecretSealer();
+  const channel = await api(a.view, "POST", approvalPath(a, "/kms-channel"), sealer.hello());
+  if (channel.status !== 200) return offerApproval(a, approvalFailure(channel));
+  let sealed;
+  try {
+    sealed = sealer.seal(
+      JSON.stringify(channel.body),
+      a.viewText,
+      inputs.document,
+      a.read.org_id,
+      item.value,
+      Date.now(),
+    );
+  } catch (_) {
+    return offerApproval(a, MESSAGES.not_sealed);
+  }
+  const body = wasm_bindgen.canonicalJson(
+    JSON.stringify({ payload: inputs.payload, signature, sealed: JSON.parse(sealed) }),
   );
+  const reply = await api(a.view, "PUT", approvalPath(a, `/secrets/${item.name}`), body);
+  if (reply.status !== 200) return offerApproval(a, approvalFailure(reply));
+  const signed = receipt(a.view, reply, "secret.put", body, {
+    name: inputs.payload.name,
+    org_id: a.read.org_id,
+  });
+  if (!signed) return offerApproval(a, MESSAGES.not_confirmed);
+  // Kept until now so that a failed put can be sealed again; a confirmed one is never resent.
+  item.value.fill(0);
+  item.done = true;
+  return offerApproval(a);
+}
+
+function revisionInputs(a) {
+  const payload = { app_id: a.read.app_id, compose: a.launch.compose };
+  const signable = wasm_bindgen.signingDigest("revision", JSON.stringify(payload));
+  return { payload, options: getOptions(a.view, signable.digest, allowed(a)) };
+}
+
+async function registerRevision(a, inputs) {
+  const { read } = a;
+  const { signature, note } = await approvalSignature(a, inputs.options);
+  if (!signature) return offerApproval(a, note);
+  const body = wasm_bindgen.canonicalJson(JSON.stringify({ payload: inputs.payload, signature }));
+  const reply = await api(a.view, "POST", approvalPath(a, "/revision"), body);
+  if (reply.status !== 200) return offerApproval(a, approvalFailure(reply));
+  const signed = receipt(a.view, reply, "revision.register", body, {
+    app_id: read.app_id,
+    compose_hash: read.compose_hash,
+    org_id: read.org_id,
+  });
+  if (!signed) return offerApproval(a, MESSAGES.not_confirmed);
+  return offer(a.ui, "", el("p", MESSAGES.approved, "confirmed"));
 }
 
 function declineButton(a) {

@@ -77,3 +77,17 @@ pre {
 details {
   margin: 1rem 0;
 }
+
+.secret {
+  margin: 0.75rem 0;
+}
+
+.secret label {
+  display: block;
+  font-weight: 600;
+}
+
+select {
+  font: inherit;
+  margin: 0.25rem 0;
+}

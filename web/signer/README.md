@@ -6,6 +6,16 @@ compiled into that wasm, and signs only what it has verified itself. It is stati
 JavaScript in classic scripts, one stylesheet and the wasm, with no host name inside, so the same
 bytes can be served from any origin the platform document lists under `signer.origins`.
 
+## Secrets
+
+A launch whose compose declares Secrets gets one password field per Secret. Each value is read
+once, sealed with `KmsSecretSealer` to a KMS node that proves itself against the platform
+document, and put in its own step, signed by the same passkey that made the first signature; the
+relay sees only the sealed frame. At the KMS the Secret is named `<app_id>.<name>`, so two Apps
+of one organization that declare the same name keep separate values. Every put comes before the
+Revision's registration, because shroud-go refuses puts once a request is approved, and the page
+says "Approved" only after the receipt of every put and of the registration verified.
+
 ## Building
 
 ```

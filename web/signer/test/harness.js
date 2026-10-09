@@ -520,6 +520,37 @@ async function loadPage(options = {}) {
   vm.runInContext(b.glue, context, { filename: "alpha_channel.js" });
   vm.runInContext(b.page, context, { filename: "page.js" });
 
+  // No KMS-profile responder runs here, so `options.sealer` swaps the wasm sealer for one that
+  // records its inputs and returns a fixed `sealed` member; sealing itself is tested in Rust.
+  const seals = [];
+  if (options.sealer) {
+    class RecordingSealer {
+      constructor() {
+        this.record = { hello: `{"client_hello":${seals.length + 1}}` };
+        seals.push(this.record);
+      }
+
+      hello() {
+        return this.record.hello;
+      }
+
+      seal(serverHello, platform, payload, orgId, value, now) {
+        if (this.record.sealed) throw new Error("malformed: the sealer already sealed");
+        Object.assign(this.record, {
+          serverHello,
+          platform,
+          payload,
+          orgId,
+          value: Buffer.from(value),
+          now,
+          sealed: true,
+        });
+        return JSON.stringify({ ticket: `ticket-${seals.length}`, frame: "sealed-frame" });
+      }
+    }
+    vm.runInContext("wasm_bindgen", context).KmsSecretSealer = RecordingSealer;
+  }
+
   const page = {
     context,
     clock,
@@ -529,6 +560,7 @@ async function loadPage(options = {}) {
     clicks,
     authenticator,
     consoleCalls,
+    seals,
     sandbox,
     main,
     use(other) {
