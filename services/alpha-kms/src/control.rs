@@ -11,6 +11,7 @@ use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::pkcs8::DecodePublicKey;
+use p256::pkcs8::EncodePublicKey;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -66,6 +67,9 @@ async fn authorize(
     body: &Signed,
     signed_at: DateTime<Utc>,
 ) -> Result<Chain, ApiError> {
+    let doc = node.platform_document();
+    let signer = doc.as_deref().and_then(|d| d.signer.as_ref());
+    keys::check_shape(&body.signature)?;
     let chain = keys::verify_signed(
         &node.pool,
         &keys.tenant_kek_root,
@@ -73,6 +77,7 @@ async fn authorize(
         ctx,
         &body.payload,
         signed_at,
+        signer,
     )
     .await?;
     if chain.key.revoked_at.is_some() {
@@ -480,8 +485,18 @@ fn registered_spki(public_key: &str) -> Result<Vec<u8>, ApiError> {
     let spki = BASE64_URL_SAFE_NO_PAD
         .decode(public_key)
         .map_err(|_| ApiError::malformed("public_key: not base64url"))?;
-    ed25519_dalek::VerifyingKey::from_public_key_der(&spki)
-        .map_err(|_| ApiError::malformed("public_key: not an Ed25519 SPKI"))?;
+    if ed25519_dalek::VerifyingKey::from_public_key_der(&spki).is_ok() {
+        return Ok(spki);
+    }
+    let p256 = p256::PublicKey::from_public_key_der(&spki)
+        .map_err(|_| ApiError::malformed("public_key: not an Ed25519 or P-256 SPKI"))?;
+    // Refused rather than normalized: two encodings of one key would occupy two rows of
+    // `unique (public_key)` and claim two organizations.
+    if p256.to_public_key_der().ok().as_ref().map(|d| d.as_bytes()) != Some(spki.as_slice()) {
+        return Err(ApiError::malformed(
+            "public_key: a P-256 SPKI must carry an uncompressed point on the named curve",
+        ));
+    }
     Ok(spki)
 }
 
@@ -560,12 +575,12 @@ async fn register_root_key(
     let p: RootKeyPayload = payload(&body.payload)?;
     let spki = registered_spki(&p.public_key)?;
     within_window(p.issued_at, node.now_utc())?;
-    keys::ed25519_only(&body.signature)?;
+    let doc = node.platform_document();
+    let signer = doc.as_deref().and_then(|d| d.signer.as_ref());
+    keys::check_shape(&body.signature)?;
     let digest = alpha_core::signing_digest(context::ORG_ROOT_KEY, &body.payload)
         .map_err(|e| ApiError::malformed(format!("payload: {e}")))?;
-    if !keys::verify_ed25519(&spki, &digest, &body.signature.signature) {
-        return Err(ApiError::signature_invalid("signature does not verify"));
-    }
+    keys::verify_signature(&spki, &digest, &body.signature, signer)?;
     let org_id = Uuid::from(p.org_id);
     let mut tx = node.pool.begin().await?;
     sqlx::query!(
@@ -716,4 +731,52 @@ pub async fn revoke_key(
         tx.commit().await?;
         Ok(json!({ "key_id": target.id, "revoked_at": rfc3339(revoked_at), "reason": reason }))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_registered_key_is_ed25519_or_an_uncompressed_p256_spki() {
+        use ed25519_dalek::pkcs8::EncodePublicKey as _;
+        let b64 = |bytes: &[u8]| BASE64_URL_SAFE_NO_PAD.encode(bytes);
+        let ed25519 = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32])
+            .verifying_key()
+            .to_public_key_der()
+            .unwrap();
+        assert_eq!(
+            registered_spki(&b64(ed25519.as_bytes())).unwrap(),
+            ed25519.as_bytes()
+        );
+
+        let captured = b64(&crate::webauthn::tests::spki(
+            &crate::webauthn::tests::vector(),
+        ));
+        let uncompressed = registered_spki(&captured).unwrap();
+        assert_eq!(b64(&uncompressed), captured);
+
+        // SEQUENCE { algorithm identifier, BIT STRING { 0x02|0x03 ‖ x } }: the same key, compressed.
+        use p256::elliptic_curve::sec1::ToSec1Point as _;
+        let point = p256::PublicKey::from_public_key_der(&uncompressed)
+            .unwrap()
+            .to_sec1_point(true);
+        let compressed = [
+            &[0x30, 0x39][..],
+            &uncompressed[2..23],
+            &[0x03, 0x22, 0x00],
+            point.as_bytes(),
+        ]
+        .concat();
+        assert_eq!(
+            p256::PublicKey::from_public_key_der(&compressed).unwrap(),
+            p256::PublicKey::from_public_key_der(&uncompressed).unwrap()
+        );
+        let e = registered_spki(&b64(&compressed)).unwrap_err();
+        assert_eq!(e.code, "malformed");
+        assert!(e.message.contains("uncompressed point"), "{}", e.message);
+
+        let e = registered_spki(&b64(&[0x5a; 91])).unwrap_err();
+        assert_eq!(e.code, "malformed");
+    }
 }

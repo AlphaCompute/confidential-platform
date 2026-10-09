@@ -1,0 +1,55 @@
+{
+  "device": "mac-icloud-keychain",
+  "note": "",
+  "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36",
+  "origin": "https://localhost:8443",
+  "rp_id": "localhost",
+  "captured_at": "2026-10-08T12:25:39Z",
+  "credential": {
+    "id": "fRJ7rnGUyPmIzeqccnnSD2oXTRs",
+    "spki": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEbTT4i1cL7NHldO0D98UwWVwXPXS4eQNIu9m0AlUulDyEPWB3ldk28ZzjlqI5X3kn20qAXZ_85rU8iqGX5JgAqg",
+    "public_key_algorithm": -7,
+    "attestation_object": "o2NmbXRkbm9uZWdhdHRTdG10oGhhdXRoRGF0YViYSZYN5YgOjGh0NBcPZHZgW4_krrmihjLHmVzzuoMdl2NdAAAAAPv8MAcVTk7MjAtuAgVX170AFH0Se65xlMj5iM3qnHJ50g9qF00bpQECAyYgASFYIG00-ItXC-zR5XTtA_fFMFlcFz10uHkDSLvZtAJVLpQ8IlgghD1gd5XZNvGc45aiOV95J9tKgF2f_Oa1PIqhl-SYAKo",
+    "client_data_json": "eyJ0eXBlIjoid2ViYXV0aG4uY3JlYXRlIiwiY2hhbGxlbmdlIjoia2tRX1EtYk54b2lKamVxRGk4ZDFERlU0Y3RFMm5xX0xySzRYZ2hJS1ZRSSIsIm9yaWdpbiI6Imh0dHBzOi8vbG9jYWxob3N0Ojg0NDMiLCJjcm9zc09yaWdpbiI6ZmFsc2V9",
+    "authenticator_data": "SZYN5YgOjGh0NBcPZHZgW4_krrmihjLHmVzzuoMdl2NdAAAAAPv8MAcVTk7MjAtuAgVX170AFH0Se65xlMj5iM3qnHJ50g9qF00bpQECAyYgASFYIG00-ItXC-zR5XTtA_fFMFlcFz10uHkDSLvZtAJVLpQ8IlgghD1gd5XZNvGc45aiOV95J9tKgF2f_Oa1PIqhl-SYAKo",
+    "transports": [
+      "hybrid",
+      "internal"
+    ],
+    "authenticator_attachment": "platform"
+  },
+  "assertions": [
+    {
+      "context": "alphacompute/org-root-key/v1",
+      "payload": {
+        "org_id": "26ded89d-7c35-4dd6-afdf-58fc22c3a28f",
+        "principal_id": "2243f074-bcd7-4a01-a373-6ed2b57af0f1",
+        "public_key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEbTT4i1cL7NHldO0D98UwWVwXPXS4eQNIu9m0AlUulDyEPWB3ldk28ZzjlqI5X3kn20qAXZ_85rU8iqGX5JgAqg",
+        "label": "mac-icloud-keychain",
+        "issued_at": "2026-10-08T12:25:29Z"
+      },
+      "digest": "VC29CnNp35BzxRSZYrFyV_160QR-KtUGl4lg34KRPL0",
+      "authenticator_data": "SZYN5YgOjGh0NBcPZHZgW4_krrmihjLHmVzzuoMdl2MdAAAAAA",
+      "client_data_json": "eyJ0eXBlIjoid2ViYXV0aG4uZ2V0IiwiY2hhbGxlbmdlIjoiVkMyOUNuTnAzNUJ6eFJTWllyRnlWXzE2MFFSLUt0VUdsNGxnMzRLUlBMMCIsIm9yaWdpbiI6Imh0dHBzOi8vbG9jYWxob3N0Ojg0NDMiLCJjcm9zc09yaWdpbiI6ZmFsc2UsIm90aGVyX2tleXNfY2FuX2JlX2FkZGVkX2hlcmUiOiJkbyBub3QgY29tcGFyZSBjbGllbnREYXRhSlNPTiBhZ2FpbnN0IGEgdGVtcGxhdGUuIFNlZSBodHRwczovL2dvby5nbC95YWJQZXgifQ",
+      "signature": "MEUCIAnPFaiTnvv7HFFQIOvXmZGOJrOFnR3N6R35TzJNs4ZDAiEA8_obfu1uUpARjg2WBRoxatOXtXhAqKpwaGOFmoebse4",
+      "user_handle": "b907FnpSn12wOj0vvmfSAQ",
+      "authenticator_attachment": "platform"
+    },
+    {
+      "context": "alphacompute/principal-key/v1",
+      "payload": {
+        "principal_id": "2243f074-bcd7-4a01-a373-6ed2b57af0f1",
+        "public_key": "MCowBQYDK2VwAyEATAAcpN8eXTfEqwyGLOVqBwpbHJIrhKIojjooLTEKAg4",
+        "label": "second key",
+        "issued_at": "2026-10-08T12:25:29Z"
+      },
+      "digest": "iskP9esPqlBu-zq5EL3DM0nH_rPco9shyRIh9mgSMKk",
+      "authenticator_data": "SZYN5YgOjGh0NBcPZHZgW4_krrmihjLHmVzzuoMdl2MdAAAAAA",
+      "client_data_json": "eyJ0eXBlIjoid2ViYXV0aG4uZ2V0IiwiY2hhbGxlbmdlIjoiaXNrUDllc1BxbEJ1LXpxNUVMM0RNMG5IX3JQY285c2h5UkloOW1nU01LayIsIm9yaWdpbiI6Imh0dHBzOi8vbG9jYWxob3N0Ojg0NDMiLCJjcm9zc09yaWdpbiI6ZmFsc2V9",
+      "signature": "MEUCIQCMWWm8UKK4tVuEX9VG_guwAlJR8Wwo5c_Ow4TiUpEN7wIgLxNEboKRRyd-EZuuaTyCbdhRXznN4iZ5-Y8wSypKbK0",
+      "user_handle": "b907FnpSn12wOj0vvmfSAQ",
+      "authenticator_attachment": "platform"
+    }
+  ],
+  "server_check": "ok"
+}

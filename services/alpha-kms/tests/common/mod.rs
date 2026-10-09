@@ -9,6 +9,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alpha_attest::{EVIDENCE_FORMAT, EventLogEntry, Evidence};
+use alpha_channel::receipt::{self, Expected};
 use alpha_cli::node::{NodeIdentity, ShareFile};
 use alpha_client::{Client, Pin};
 use alpha_core::{AppId, KeyId, OrgId, PrincipalId, context};
@@ -384,14 +385,35 @@ impl Harness {
         compose: String,
         signer: &(KeyId, SigningKey),
     ) -> alpha_core::ComposeHash {
-        let hash = alpha_core::compose_hash(&compose);
         let document = json!({ "app_id": app_id, "compose": compose });
         let sig = self.signed(context::REVISION, document, signer)["signature"].clone();
+        self.insert_signed_revision(self.org, app_id, compose, signer.0, sig)
+            .await
+    }
+
+    /// `compose` as a Revision of `app_id` in `org` with `signature` by `key`, straight into the table.
+    pub async fn insert_signed_revision(
+        &self,
+        org: OrgId,
+        app_id: AppId,
+        compose: String,
+        key: KeyId,
+        signature: Value,
+    ) -> alpha_core::ComposeHash {
+        let hash = alpha_core::compose_hash(&compose);
         sqlx::query!("insert into revisions (compose_hash, app_id, org_id, compose, created_by_key, signature, created_at) values ($1, $2, $3, $4, $5, $6, $7)",
-            hash.as_bytes().as_slice(), Uuid::from(app_id), Uuid::from(self.org), compose, Uuid::from(signer.0), sig,
+            hash.as_bytes().as_slice(), Uuid::from(app_id), Uuid::from(org), compose, Uuid::from(key), signature,
             chrono::DateTime::<chrono::Utc>::from(self.now()))
             .execute(&self.pool).await.unwrap();
         hash
+    }
+
+    pub async fn secrets_named(&self, name: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>("select count(*) from secrets where name = $1")
+            .bind(name)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
     }
 
     pub async fn put_secret(
@@ -402,7 +424,7 @@ impl Harness {
         issued_at: SystemTime,
         signer: &(KeyId, SigningKey),
     ) -> (StatusCode, Value) {
-        let payload = json!({ "name": name, "app_ids": app_ids, "content_sha256": format!("sha256:{}", hex::encode(Sha256::digest(value))), "issued_at": rfc3339(issued_at) });
+        let payload = put_payload(name, app_ids, value, issued_at);
         let mut body = self.signed(context::SECRET, payload, signer);
         body["value"] = json!(b64(value));
         self.call(reqwest::Method::PUT, &format!("/v1/secrets/{name}"), body)
@@ -420,19 +442,24 @@ impl Harness {
         issued_at: SystemTime,
         signer: &(KeyId, SigningKey),
     ) -> Value {
+        let payload = put_payload(name, app_ids, value, issued_at);
+        let sealed = self.sealed(&payload, self.org, value).await;
+        let mut body = self.signed(context::SECRET, payload, signer);
+        body["sealed"] = sealed;
+        body
+    }
+
+    /// `value` sealed for `org` over a fresh `/v1/channel` handshake with this node, pinning the
+    /// bootstrap CA and the node's Revision: the `sealed` object of a put-Secret body.
+    pub async fn sealed(&self, payload: &Value, org: OrgId, value: &[u8]) -> Value {
         let (initiator, hello) = alpha_channel::handshake::Initiator::new().unwrap();
         let (status, reply) = self.post("/v1/channel", json!(hello)).await;
         assert_eq!(status, StatusCode::OK, "{reply}");
         let hello: alpha_channel::handshake::ServerHello = serde_json::from_value(reply).unwrap();
-        let payload = json!({ "name": name, "app_ids": app_ids, "content_sha256": format!("sha256:{}", hex::encode(Sha256::digest(value))), "issued_at": rfc3339(issued_at) });
         let (mut channel, ticket) = initiator
             .finish_kms(&hello, &self.ca_pem, &[self.node.compose_hash], self.now())
             .unwrap();
-        let sealed =
-            alpha_channel::secret::seal(&mut channel, ticket, &payload, self.org, value).unwrap();
-        let mut body = self.signed(context::SECRET, payload, signer);
-        body["sealed"] = json!(sealed);
-        body
+        json!(alpha_channel::secret::seal(&mut channel, ticket, payload, org, value).unwrap())
     }
 
     pub fn nonce(&self) -> String {
@@ -474,6 +501,131 @@ impl Harness {
         .into_iter()
         .map(|r| (r.seq, r.outcome, r.details))
         .collect()
+    }
+}
+
+/// Verifies `reply`'s receipt against the bootstrap CA and this node's Revision, checks that the
+/// signed response is the reply without `receipt`, and returns the receipt's leaf.
+pub fn verified(h: &Harness, reply: &Value, route: &str, request: &Value, expect: Value) -> String {
+    let mut rest = reply.clone();
+    let receipt = rest.as_object_mut().unwrap().remove("receipt").unwrap();
+    let signed = receipt::verify(
+        &serde_json::to_vec(&receipt).unwrap(),
+        &h.ca_pem,
+        &[h.node.compose_hash],
+        &Expected {
+            route: route.into(),
+            request_sha256: receipt::request_sha256(request).unwrap(),
+            response: expect.as_object().unwrap().clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(signed, rest);
+    receipt["certificate_chain"][0].as_str().unwrap().to_owned()
+}
+
+pub async fn derive(h: &Harness, client: &reqwest::Client, body: Value) -> (StatusCode, Value) {
+    send(client.post(format!("{}/v1/keys/derive", h.url)).json(&body)).await
+}
+
+/// The passkey assertions captured on a Mac (iCloud Keychain).
+pub fn webauthn_vector() -> Value {
+    serde_json::from_slice(&fs::read(testdata().join("webauthn/mac-icloud-keychain.json")).unwrap())
+        .unwrap()
+}
+
+pub fn put_payload(name: &str, app_ids: &[AppId], value: &[u8], issued_at: SystemTime) -> Value {
+    json!({ "name": name, "app_ids": app_ids,
+            "content_sha256": format!("sha256:{}", hex::encode(Sha256::digest(value))),
+            "issued_at": rfc3339(issued_at) })
+}
+
+/// The unsigned put-Revision payload of `manifest/01-canonical` and its `expected.json`.
+pub fn canonical_compose() -> (Value, Value) {
+    let dir = testdata().join("manifest/01-canonical");
+    let compose = fs::read_to_string(dir.join("app-compose.json")).unwrap();
+    let expected: Value =
+        serde_json::from_slice(&fs::read(dir.join("expected.json")).unwrap()).unwrap();
+    (
+        json!({ "app_id": expected["app_id"], "compose": compose }),
+        expected,
+    )
+}
+
+/// A software authenticator on the captured origin, for calls the device vector cannot sign.
+pub struct Passkey {
+    key: p256::ecdsa::SigningKey,
+}
+
+impl Passkey {
+    pub fn new(seed: u8) -> Self {
+        Self {
+            key: p256::ecdsa::SigningKey::from_bytes((&[seed; 32]).into()).unwrap(),
+        }
+    }
+
+    pub fn spki(&self) -> Vec<u8> {
+        use p256::pkcs8::EncodePublicKey;
+        self.key
+            .verifying_key()
+            .to_public_key_der()
+            .unwrap()
+            .as_bytes()
+            .to_vec()
+    }
+
+    pub fn spki_b64(&self) -> String {
+        b64(&self.spki())
+    }
+
+    pub fn signature(&self, ctx: &str, payload: &Value, key_id: Option<KeyId>) -> Value {
+        use p256::ecdsa::signature::Signer as _;
+        let v = webauthn_vector();
+        let digest = alpha_core::signing_digest(ctx, payload).unwrap();
+        let client_data_json = serde_json::to_vec(&json!({
+            "type": "webauthn.get", "challenge": b64(&digest),
+            "origin": v["origin"], "crossOrigin": false,
+        }))
+        .unwrap();
+        let authenticator_data = [
+            Sha256::digest(v["rp_id"].as_str().unwrap().as_bytes()).as_slice(),
+            &[0x05],
+            &0u32.to_be_bytes(),
+        ]
+        .concat();
+        let signature: p256::ecdsa::Signature = self.key.sign(
+            &[
+                authenticator_data.as_slice(),
+                &Sha256::digest(&client_data_json),
+            ]
+            .concat(),
+        );
+        let mut object = json!({
+            "algorithm": alpha_kms::webauthn::ALGORITHM,
+            "signature": b64(signature.to_der().as_bytes()),
+            "authenticator_data": b64(&authenticator_data),
+            "client_data_json": b64(&client_data_json),
+        });
+        if let Some(key_id) = key_id {
+            object["key_id"] = json!(key_id);
+        }
+        object
+    }
+
+    pub fn signed(&self, ctx: &str, payload: Value, key_id: Option<KeyId>) -> Value {
+        let signature = self.signature(ctx, &payload, key_id);
+        json!({ "payload": payload, "signature": signature })
+    }
+
+    /// This passkey's self-signed claim of `org` as its root key.
+    pub fn claim(&self, org: OrgId, now: SystemTime) -> Value {
+        self.signed(
+            context::ORG_ROOT_KEY,
+            json!({ "org_id": org, "principal_id": PrincipalId::mint(),
+                    "public_key": self.spki_b64(), "label": "root passkey",
+                    "issued_at": rfc3339(now) }),
+            None,
+        )
     }
 }
 

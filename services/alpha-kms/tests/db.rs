@@ -13,7 +13,7 @@ mod common;
 use std::fs;
 use std::time::Duration;
 
-use alpha_channel::receipt::{self, Expected};
+use alpha_channel::receipt;
 use alpha_core::{AppId, ComposeHash, KeyId, OrgId, PrincipalId, context};
 use alpha_crypto::{INFO_NODE_BOOTSTRAP, INFO_UNSEAL_SHARE};
 use alpha_kms::{certs, instance, platform, rfc3339};
@@ -686,39 +686,9 @@ async fn control_routes_register_revoke_and_put() {
     }
 }
 
-/// Verifies `reply`'s receipt against the bootstrap CA and this node's Revision, checks that the
-/// signed response is the reply without `receipt`, and returns the receipt's leaf.
-fn verified(h: &Harness, reply: &Value, route: &str, request: &Value, expect: Value) -> String {
-    let mut rest = reply.clone();
-    let receipt = rest.as_object_mut().unwrap().remove("receipt").unwrap();
-    let signed = receipt::verify(
-        &serde_json::to_vec(&receipt).unwrap(),
-        &h.ca_pem,
-        &[h.node.compose_hash],
-        &Expected {
-            route: route.into(),
-            request_sha256: receipt::request_sha256(request).unwrap(),
-            response: expect.as_object().unwrap().clone(),
-        },
-    )
-    .unwrap();
-    assert_eq!(signed, rest);
-    receipt["certificate_chain"][0].as_str().unwrap().to_owned()
-}
-
 fn canonical_revision(h: &Harness, signer: &(KeyId, SigningKey)) -> (Value, Value) {
-    let compose =
-        fs::read_to_string(testdata().join("manifest/01-canonical/app-compose.json")).unwrap();
-    let expected: Value = serde_json::from_str(
-        &fs::read_to_string(testdata().join("manifest/01-canonical/expected.json")).unwrap(),
-    )
-    .unwrap();
-    let body = h.signed(
-        context::REVISION,
-        json!({ "app_id": expected["app_id"], "compose": compose }),
-        signer,
-    );
-    (body, expected)
+    let (payload, expected) = canonical_compose();
+    (h.signed(context::REVISION, payload, signer), expected)
 }
 
 #[tokio::test]
@@ -1273,10 +1243,6 @@ fn leaf_client(h: &Harness, app: AppId, hash: ComposeHash) -> reqwest::Client {
     ))
 }
 
-async fn derive(h: &Harness, client: &reqwest::Client, body: Value) -> (StatusCode, Value) {
-    send(client.post(format!("{}/v1/keys/derive", h.url)).json(&body)).await
-}
-
 fn derived(reply: &Value) -> Vec<u8> {
     BASE64_URL_SAFE_NO_PAD
         .decode(reply["key"].as_str().unwrap())
@@ -1620,14 +1586,6 @@ async fn a_sealed_put_through_the_channel_is_stored_and_read_by_a_granted_instan
     assert_eq!(secret["value"], json!(b64(b"sealed value")));
 }
 
-async fn secrets_named(h: &Harness, name: &str) -> i64 {
-    sqlx::query_scalar::<_, i64>("select count(*) from secrets where name = $1")
-        .bind(name)
-        .fetch_one(&h.pool)
-        .await
-        .unwrap()
-}
-
 /// Puts `body` under `name` and checks it is refused with `status` and `code`, without a receipt
 /// and without a stored row; returns the error message.
 async fn refused_put(
@@ -1637,13 +1595,13 @@ async fn refused_put(
     status: StatusCode,
     expected: &str,
 ) -> String {
-    let rows = secrets_named(h, name).await;
+    let rows = h.secrets_named(name).await;
     let (actual, reply) = h
         .call(reqwest::Method::PUT, &format!("/v1/secrets/{name}"), body)
         .await;
     assert_eq!((actual, code(&reply)), (status, expected), "{reply}");
     assert!(reply.get("receipt").is_none(), "{reply}");
-    assert_eq!(secrets_named(h, name).await, rows);
+    assert_eq!(h.secrets_named(name).await, rows);
     reply["error"]["message"].as_str().unwrap().to_owned()
 }
 
@@ -1701,7 +1659,7 @@ async fn a_sealed_put_with_a_tampered_frame_or_ticket_is_malformed_and_stores_no
         )
         .await;
     }
-    assert_eq!(secrets_named(&h, "tampered").await, 0);
+    assert_eq!(h.secrets_named("tampered").await, 0);
 
     let (_, hello) = alpha_channel::handshake::Initiator::new().unwrap();
     let mut extra = json!(hello);
@@ -1767,7 +1725,7 @@ async fn a_replayed_sealed_put_already_exists_without_a_receipt() {
         .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
     refused_put(&h, "replayed", body, StatusCode::CONFLICT, "already_exists").await;
-    assert_eq!(secrets_named(&h, "replayed").await, 1);
+    assert_eq!(h.secrets_named("replayed").await, 1);
 }
 
 /// An admin key of a second organization, registered beside the harness's.
@@ -1816,7 +1774,7 @@ async fn a_sealed_value_cannot_be_moved_into_another_organization() {
         .call(reqwest::Method::PUT, "/v1/secrets/moved", body)
         .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
-    assert_eq!(secrets_named(&h, "moved").await, 1);
+    assert_eq!(h.secrets_named("moved").await, 1);
     let owner = sqlx::query_scalar::<_, Uuid>("select org_id from secrets where name = $1")
         .bind("moved")
         .fetch_one(&h.pool)
@@ -1843,7 +1801,7 @@ async fn a_sealed_value_for_an_app_without_a_revision_stays_with_its_organizatio
     verbatim["sealed"] = body["sealed"].clone();
     let message = refused_put(&h, "early", verbatim, StatusCode::BAD_REQUEST, "malformed").await;
     assert!(message.contains("another organization"), "{message}");
-    assert_eq!(secrets_named(&h, "early").await, 0);
+    assert_eq!(h.secrets_named("early").await, 0);
 
     let (status, reply) = h
         .call(reqwest::Method::PUT, "/v1/secrets/early", body)

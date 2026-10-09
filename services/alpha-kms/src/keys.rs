@@ -1,9 +1,9 @@
-//! `org_key`, `anchor_check` and `app_key`, the two AES-256-GCM shapes, Ed25519 signature
-//! objects, and the chain walk from a key to its organization's anchor.
+//! `org_key`, `anchor_check` and `app_key`, the two AES-256-GCM shapes, signature objects
+//! (Ed25519 and passkey), and the chain walk from a key to its organization's anchor.
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
-use alpha_core::{AppId, OrgId, signing_digest};
+use alpha_core::{AppId, OrgId, Signer, signing_digest};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
@@ -17,6 +17,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::error::ApiError;
+use crate::webauthn;
 
 pub type Key32 = Zeroizing<[u8; 32]>;
 
@@ -106,6 +107,23 @@ pub fn verify_ed25519(spki_der: &[u8], digest: &[u8; 32], signature_b64: &str) -
     key.verify_strict(digest, &signature).is_ok()
 }
 
+/// The algorithm the object names must be the one its key's SPKI parses as: each branch parses
+/// only its own key type, so no column records a key's kind.
+pub fn verify_signature(
+    spki: &[u8],
+    digest: &[u8; 32],
+    signature: &SignatureObject,
+    signer: Option<&Signer>,
+) -> Result<(), ApiError> {
+    check_shape(signature).map_err(|e| ApiError::signature_invalid(e.message))?;
+    match signature.algorithm.as_str() {
+        "ed25519" if verify_ed25519(spki, digest, &signature.signature) => Ok(()),
+        "ed25519" => Err(ApiError::signature_invalid("signature does not verify")),
+        webauthn::ALGORITHM => webauthn::verify(spki, digest, signature, signer),
+        _ => Err(ApiError::signature_invalid("unsupported algorithm")),
+    }
+}
+
 /// A `principal_keys` row as the chain walk needs it.
 #[derive(Clone)]
 pub struct KeyRow {
@@ -149,6 +167,7 @@ pub async fn walk_chain(
     tenant_kek_root: &[u8; 32],
     key_id: Uuid,
     mut signed_at: DateTime<Utc>,
+    signer: Option<&Signer>,
 ) -> Result<Chain, ApiError> {
     let invalid = |m: &str| ApiError::signature_invalid(m.to_owned());
     let first = load_key(exec, key_id)
@@ -162,7 +181,7 @@ pub async fn walk_chain(
             return Err(invalid("the chain crosses organizations"));
         }
         if let Some(child) = &child {
-            verify_registration(child, &link)?;
+            verify_registration(child, &link, signer)?;
         }
         if let Some(revoked_at) = link.revoked_at {
             let retired = link.revocation_reason.as_deref() == Some("retired");
@@ -179,7 +198,7 @@ pub async fn walk_chain(
                         "the chain does not end at the organization's anchor",
                     ));
                 }
-                verify_self_registration(&link)?;
+                verify_self_registration(&link, signer)?;
                 return Ok(Chain {
                     key: first,
                     anchor_spki: link.public_key,
@@ -206,10 +225,14 @@ pub async fn walk_chain(
 }
 
 /// The child's registration document names the child's own SPKI and is signed by the parent.
-fn verify_registration(child: &KeyRow, parent: &KeyRow) -> Result<(), ApiError> {
+fn verify_registration(
+    child: &KeyRow,
+    parent: &KeyRow,
+    signer: Option<&Signer>,
+) -> Result<(), ApiError> {
     let invalid = |m: &str| ApiError::signature_invalid(m.to_owned());
     let signature = registration_signature(child)?;
-    if signature.key_id.map(Uuid::from) != Some(parent.id) || signature.algorithm != "ed25519" {
+    if signature.key_id.map(Uuid::from) != Some(parent.id) {
         return Err(invalid(
             "a key in the chain was not registered by its parent",
         ));
@@ -217,21 +240,21 @@ fn verify_registration(child: &KeyRow, parent: &KeyRow) -> Result<(), ApiError> 
     verify_document_spki(child)?;
     let digest = signing_digest(alpha_core::context::PRINCIPAL_KEY, &child.document)
         .map_err(|e| invalid(&format!("registration document: {e}")))?;
-    if !verify_ed25519(&parent.public_key, &digest, &signature.signature) {
-        return Err(invalid(
-            "a key in the chain has a bad registration signature",
-        ));
-    }
-    Ok(())
+    verify_signature(&parent.public_key, &digest, &signature, signer).map_err(|e| {
+        invalid(&format!(
+            "a key in the chain has a bad registration signature: {}",
+            e.message
+        ))
+    })
 }
 
 /// The root key's registration is signed by the key it carries, under its own context and with
 /// no `key_id`. It proves nothing on its own — a forged one verifies against itself — but it is
 /// what binds `org_id` to the key, and `anchor_check` above is what a forger cannot recompute.
-fn verify_self_registration(root: &KeyRow) -> Result<(), ApiError> {
+fn verify_self_registration(root: &KeyRow, signer: Option<&Signer>) -> Result<(), ApiError> {
     let invalid = |m: &str| ApiError::signature_invalid(m.to_owned());
     let signature = registration_signature(root)?;
-    if signature.key_id.is_some() || signature.algorithm != "ed25519" {
+    if signature.key_id.is_some() {
         return Err(invalid("the root key's registration names a signer"));
     }
     verify_document_spki(root)?;
@@ -247,10 +270,12 @@ fn verify_self_registration(root: &KeyRow) -> Result<(), ApiError> {
     }
     let digest = signing_digest(alpha_core::context::ORG_ROOT_KEY, &root.document)
         .map_err(|e| invalid(&format!("registration document: {e}")))?;
-    if !verify_ed25519(&root.public_key, &digest, &signature.signature) {
-        return Err(invalid("the root key has a bad registration signature"));
-    }
-    Ok(())
+    verify_signature(&root.public_key, &digest, &signature, signer).map_err(|e| {
+        invalid(&format!(
+            "the root key has a bad registration signature: {}",
+            e.message
+        ))
+    })
 }
 
 fn registration_signature(row: &KeyRow) -> Result<SignatureObject, ApiError> {
@@ -273,18 +298,25 @@ fn verify_document_spki(row: &KeyRow) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// The WebAuthn fields belong to a passkey assertion, so beside `ed25519` they make the body
-/// malformed rather than the signature invalid.
-pub fn ed25519_only(signature: &SignatureObject) -> Result<(), ApiError> {
-    if signature.algorithm != "ed25519" {
-        return Err(ApiError::signature_invalid("unsupported algorithm"));
-    }
-    if signature.authenticator_data.is_some() || signature.client_data_json.is_some() {
-        return Err(ApiError::malformed(
+/// A request body's signature object has the fields of its algorithm, and a wrong shape is the
+/// caller's malformed body. A stored row is never malformed: `verify_signature` refuses the same
+/// shape as an invalid signature.
+pub fn check_shape(signature: &SignatureObject) -> Result<(), ApiError> {
+    let webauthn_fields = (
+        signature.authenticator_data.is_some(),
+        signature.client_data_json.is_some(),
+    );
+    match signature.algorithm.as_str() {
+        "ed25519" if webauthn_fields != (false, false) => Err(ApiError::malformed(
             "signature: authenticator_data and client_data_json are not allowed with ed25519",
-        ));
+        )),
+        "ed25519" => Ok(()),
+        webauthn::ALGORITHM if webauthn_fields != (true, true) => Err(ApiError::malformed(
+            "signature: webauthn-es256 needs authenticator_data and client_data_json",
+        )),
+        webauthn::ALGORITHM => Ok(()),
+        _ => Err(ApiError::signature_invalid("unsupported algorithm")),
     }
-    Ok(())
 }
 
 /// Verifies a signature object over `document` under `context` and walks the signer's chain.
@@ -295,17 +327,15 @@ pub async fn verify_signed(
     context: &str,
     document: &Value,
     signed_at: DateTime<Utc>,
+    signer: Option<&Signer>,
 ) -> Result<Chain, ApiError> {
-    ed25519_only(signature)?;
     let key_id = signature
         .key_id
         .ok_or_else(|| ApiError::malformed("signature: key_id is required"))?;
-    let chain = walk_chain(exec, tenant_kek_root, key_id.into(), signed_at).await?;
+    let chain = walk_chain(exec, tenant_kek_root, key_id.into(), signed_at, signer).await?;
     let digest = signing_digest(context, document)
         .map_err(|e| ApiError::malformed(format!("payload: {e}")))?;
-    if !verify_ed25519(&chain.key.public_key, &digest, &signature.signature) {
-        return Err(ApiError::signature_invalid("signature does not verify"));
-    }
+    verify_signature(&chain.key.public_key, &digest, signature, signer)?;
     Ok(chain)
 }
 
@@ -318,31 +348,74 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ed25519_only_refuses_other_algorithms_and_webauthn_fields() {
-        let plain = SignatureObject {
+    fn check_shape_admits_exactly_the_fields_of_its_algorithm() {
+        let (ad, cd) = (Some("AAAA"), Some("e30"));
+        for (algorithm, authenticator_data, client_data_json, expected) in [
+            ("ed25519", None, None, Ok(())),
+            ("ed25519", ad, None, Err("malformed")),
+            ("ed25519", None, cd, Err("malformed")),
+            ("ed25519", ad, cd, Err("malformed")),
+            (webauthn::ALGORITHM, ad, cd, Ok(())),
+            (webauthn::ALGORITHM, ad, None, Err("malformed")),
+            (webauthn::ALGORITHM, None, cd, Err("malformed")),
+            (webauthn::ALGORITHM, None, None, Err("malformed")),
+            ("ml-dsa", None, None, Err("signature_invalid")),
+        ] {
+            let object = SignatureObject {
+                key_id: None,
+                algorithm: algorithm.into(),
+                signature: String::new(),
+                authenticator_data: authenticator_data.map(str::to_owned),
+                client_data_json: client_data_json.map(str::to_owned),
+            };
+            assert_eq!(
+                check_shape(&object).map_err(|e| e.code),
+                expected,
+                "{algorithm}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_algorithm_follows_the_key() {
+        use ed25519_dalek::SigningKey;
+        use ed25519_dalek::pkcs8::EncodePublicKey;
+        use webauthn::tests::{digest, object, spki, vector, vector_signer};
+        let v = vector();
+        let a = &v["assertions"][0];
+        let (p256_spki, p256_digest, passkey) = (spki(&v), digest(a), object(a));
+        let signer = vector_signer(&v);
+        let signer = Some(&signer);
+        let sk = SigningKey::from_bytes(&[3u8; 32]);
+        let ed_spki = sk.verifying_key().to_public_key_der().unwrap();
+        let ed_digest = signing_digest("ctx", &serde_json::json!({"a": 1})).unwrap();
+        let ed = SignatureObject {
             key_id: None,
             algorithm: "ed25519".into(),
-            signature: String::new(),
+            signature: BASE64_URL_SAFE_NO_PAD
+                .encode(ed25519_dalek::Signer::sign(&sk, &ed_digest).to_bytes()),
             authenticator_data: None,
             client_data_json: None,
         };
-        assert!(ed25519_only(&plain).is_ok());
-        let other = SignatureObject {
+        verify_signature(&p256_spki, &p256_digest, &passkey, signer).unwrap();
+        verify_signature(ed_spki.as_bytes(), &ed_digest, &ed, signer).unwrap();
+
+        let ml_dsa = SignatureObject {
             algorithm: "ml-dsa".into(),
-            ..plain.clone()
+            ..ed.clone()
         };
-        assert_eq!(ed25519_only(&other).unwrap_err().code, "signature_invalid");
-        for (authenticator_data, client_data_json) in [
-            (Some("AAAA".to_owned()), None),
-            (None, Some("e30".to_owned())),
-            (Some("AAAA".to_owned()), Some("e30".to_owned())),
+        let stray = SignatureObject {
+            client_data_json: passkey.client_data_json.clone(),
+            ..ed.clone()
+        };
+        for (key, signed, object) in [
+            (p256_spki.as_slice(), &ed_digest, &ed),
+            (ed_spki.as_bytes(), &p256_digest, &passkey),
+            (ed_spki.as_bytes(), &ed_digest, &ml_dsa),
+            (ed_spki.as_bytes(), &ed_digest, &stray),
         ] {
-            let webauthn = SignatureObject {
-                authenticator_data,
-                client_data_json,
-                ..plain.clone()
-            };
-            assert_eq!(ed25519_only(&webauthn).unwrap_err().code, "malformed");
+            let refused = verify_signature(key, signed, object, signer).unwrap_err();
+            assert_eq!(refused.code, "signature_invalid");
         }
     }
 

@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alpha_attest::{AttestationResult, Evidence, RESULT_FORMAT, Revision, Verdict, appraise};
 use alpha_client::DerivedKey;
 use alpha_client::tls::PeerCerts;
-use alpha_core::{ComposeHash, context};
+use alpha_core::{ComposeHash, Signer, context};
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Extension, Path, State};
@@ -135,6 +135,7 @@ pub async fn verify_revision(
     tenant_kek_root: &[u8; 32],
     compose_hash: ComposeHash,
     revision: &RevisionRow,
+    signer: Option<&Signer>,
 ) -> Result<keys::Chain, ApiError> {
     if revision.revoked_at.is_some() {
         return Err(ApiError::new("revision_revoked", "revision is revoked"));
@@ -159,6 +160,7 @@ pub async fn verify_revision(
         context::REVISION,
         &document,
         revision.created_at,
+        signer,
     )
     .await?;
     if chain.key.org_id != revision.org_id {
@@ -251,6 +253,7 @@ async fn attest_inner(
         &keys.tenant_kek_root,
         appraised.compose_hash,
         &revision,
+        doc.signer.as_ref(),
     )
     .await?;
     let runtime_sha_hex = appraised
@@ -324,6 +327,8 @@ async fn get_secret_inner(
     identity: &certs::InstanceIdentity,
     name: &str,
 ) -> Result<Value, ApiError> {
+    let doc = node.platform_document();
+    let signer = doc.as_deref().and_then(|d| d.signer.as_ref());
     let revision = load_revision(&node.pool, identity.compose_hash)
         .await?
         .filter(|r| {
@@ -335,6 +340,7 @@ async fn get_secret_inner(
         tenant_kek_root,
         identity.compose_hash,
         &revision,
+        signer,
     )
     .await?;
     let secret = sqlx::query!(
@@ -372,6 +378,7 @@ async fn get_secret_inner(
         context::SECRET,
         &secret.document,
         document.issued_at,
+        signer,
     )
     .await?;
     if chain.key.org_id != Uuid::from(identity.org_id) {
@@ -461,6 +468,7 @@ async fn derive_key_inner(
             "purpose: 1 to 64 of a-z, 0-9, '.', '_', '-', starting with a letter or digit",
         ));
     }
+    let doc = node.platform_document();
     let revision = load_revision(&node.pool, identity.compose_hash)
         .await?
         .filter(|r| {
@@ -472,6 +480,7 @@ async fn derive_key_inner(
         tenant_kek_root,
         identity.compose_hash,
         &revision,
+        doc.as_deref().and_then(|d| d.signer.as_ref()),
     )
     .await?;
     let org_key = keys::org_key(tenant_kek_root, identity.org_id, &chain.anchor_spki)?;

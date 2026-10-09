@@ -6,6 +6,8 @@ The Instance API is `POST /v1/attest/nonce`, `POST /v1/attest`, and two routes t
 
 `POST /v1/channel` answers an inner-channel handshake with the node's leaf and a ticket, and `PUT /v1/secrets/{name}` then takes the value either as `value` or as `sealed: {ticket, frame}`, whose plaintext begins with the signing digest of the put's payload, so a relay sees only ciphertext; any node of the deployment opens the ticket within ten minutes.
 
+Control bodies are signed `ed25519` or `webauthn-es256`, a passkey's WebAuthn assertion over the same signing digest, accepted only on the origins and `rp_id` of the current platform document's `signer` and refused everywhere, stored signatures included, when the document has none; a passkey can be an organization's root key.
+
 ## Configuration (environment only)
 
 | Variable | Meaning |
@@ -25,6 +27,8 @@ The image is `images/kms/Dockerfile` (`alpha-kms`, or `alpha-kms-dev` with `--bu
 ## Tests
 
 `cargo test -p alpha-kms` runs the unit tests always and `tests/db.rs` when `DATABASE_URL` points at a Postgres the tests may `create database` in (each test makes its own). The db tests attest with real Phala quotes from `testdata/attest/*-keyed`, pinned to the capture's time, nonce key and collateral, and cover the server side of every route: bootstrap once, unseal with one and two shares, join only for an attested, listed, requesting node; the Control API's checks and idempotency; sealed puts and their refusals; attestation, release, revocation on the next call, the derived key's stability across Revisions and separation across Apps with an audit row for every refusal, re-verification of a tampered row, the anchor and chain rules, `cert_invalid` for a self-signed client certificate; the monotone platform document; and the append-only audit role.
+
+`tests/passkey.rs`, on the same database, covers passkey signatures: a captured iCloud Keychain assertion claiming an organization, software passkeys on every Control route, attestation, secret read and key derivation, and the refusals without a signer, on a dropped origin, under another organization's key and for a stored row missing its fields.
 
 `tests/cli.rs` drives `alpha-cli`'s library functions against the same in-process node (`crates/alpha-cli/README.md`).
 
