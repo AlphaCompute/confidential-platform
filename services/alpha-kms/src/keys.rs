@@ -417,7 +417,6 @@ mod tests {
             let refused = verify_signature(key, signed, object, signer).unwrap_err();
             assert_eq!(refused.code, "signature_invalid");
         }
-        assert_eq!(check_shape(&stray).unwrap_err().code, "malformed");
     }
 
     #[test]

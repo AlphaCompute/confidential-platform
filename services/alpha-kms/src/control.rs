@@ -757,14 +757,15 @@ mod tests {
         assert_eq!(b64(&uncompressed), captured);
 
         // SEQUENCE { algorithm identifier, BIT STRING { 0x02|0x03 ‖ x } }: the same key, compressed.
-        let (algorithm, point) = (&uncompressed[2..23], &uncompressed[27..]);
-        assert_eq!(&uncompressed[23..27], &[0x03, 0x42, 0x00, 0x04]);
-        let (x, y) = point.split_at(32);
+        use p256::elliptic_curve::sec1::ToSec1Point as _;
+        let point = p256::PublicKey::from_public_key_der(&uncompressed)
+            .unwrap()
+            .to_sec1_point(true);
         let compressed = [
             &[0x30, 0x39][..],
-            algorithm,
-            &[0x03, 0x22, 0x00, 0x02 | (y[31] & 1)],
-            x,
+            &uncompressed[2..23],
+            &[0x03, 0x22, 0x00],
+            point.as_bytes(),
         ]
         .concat();
         assert_eq!(
