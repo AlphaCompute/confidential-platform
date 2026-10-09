@@ -20,7 +20,6 @@ use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use common::*;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 fn origin() -> String {
@@ -28,13 +27,15 @@ fn origin() -> String {
 }
 
 async fn trust_signer(h: &Harness, version: u64, origins: &[&str]) {
-    let rp_id = webauthn_vector()["rp_id"].as_str().unwrap().to_owned();
-    h.release.set(with_signer(
-        platform_document(KEYED),
-        version,
-        origins,
-        &rp_id,
-    ));
+    let mut doc = platform_document(KEYED);
+    doc["version"] = json!(version);
+    doc["signer"] = json!({
+        "origins": origins,
+        "rp_id": webauthn_vector()["rp_id"],
+        "bundle_sha256": format!("sha256:{}", "0".repeat(64)),
+        "api_origin": origins[0],
+    });
+    h.release.set(doc);
     platform::reload(&h.node).await.unwrap();
 }
 
@@ -115,12 +116,6 @@ async fn insert_passkey_revision(
     hash
 }
 
-fn put_payload(name: &str, app_ids: &[AppId], value: &[u8], issued_at: SystemTime) -> Value {
-    json!({ "name": name, "app_ids": app_ids,
-            "content_sha256": format!("sha256:{}", hex::encode(Sha256::digest(value))),
-            "issued_at": rfc3339(issued_at) })
-}
-
 fn put_body(
     name: &str,
     app_ids: &[AppId],
@@ -149,21 +144,6 @@ async fn derive(client: &reqwest::Client, h: &Harness, purpose: &str) -> (Status
             .json(&json!({ "purpose": purpose })),
     )
     .await
-}
-
-fn expected_app_key(
-    h: &Harness,
-    org: OrgId,
-    anchor: &Passkey,
-    app: AppId,
-    purpose: &str,
-) -> String {
-    let intermediates = h.node.intermediates().unwrap();
-    let org_key =
-        alpha_kms::keys::org_key(&intermediates.tenant_kek_root, org, &anchor.spki()).unwrap();
-    b64(alpha_kms::keys::app_key(&org_key, app, purpose)
-        .unwrap()
-        .as_slice())
 }
 
 fn assertion_body(assertion: &Value, key_id: Option<&Value>) -> Value {
@@ -216,14 +196,7 @@ async fn a_device_passkey_claims_its_organization_and_registers_a_key() {
     assert_eq!(outcome, "denied");
     assert_eq!(details["code"], "signature_invalid");
 
-    let origin = v["origin"].as_str().unwrap();
-    h.release.set(with_signer(
-        platform_document(KEYED),
-        2,
-        &[origin],
-        v["rp_id"].as_str().unwrap(),
-    ));
-    platform::reload(&h.node).await.unwrap();
+    trust_signer(&h, 2, &[&origin()]).await;
 
     let (status, root) = h.post("/v1/keys", claim.clone()).await;
     assert_eq!(status, StatusCode::OK, "{root}");
@@ -285,21 +258,7 @@ async fn a_passkey_signed_revision_attests_reads_its_secret_and_derives_its_key(
     let Some(h) = harness().await else {
         return;
     };
-    trust_signer(&h, 2, &[&origin()]).await;
-    let PasskeyOrg { org, root, admin } = passkey_org(&h, 61).await;
-    let app = AppId::mint();
-    insert_passkey_revision(&h, org, app, &admin).await;
-
-    let body = put_body("passkey-secret", &[app], b"passkey value", h.now(), &admin);
-    let (status, reply) = put(&h, "passkey-secret", body.clone()).await;
-    assert_eq!(status, StatusCode::OK, "{reply}");
-    verified(
-        &h,
-        &reply,
-        "secret.put",
-        &body,
-        json!({ "name": "passkey-secret", "org_id": org }),
-    );
+    let (PasskeyOrg { org, root, .. }, app, _) = passkey_app(&h, 61).await;
 
     let (status, reply) = h.attest(KEYED).await;
     assert_eq!(status, StatusCode::OK, "{reply}");
@@ -315,21 +274,11 @@ async fn a_passkey_signed_revision_attests_reads_its_secret_and_derives_its_key(
 
     let (status, derived) = derive(&instance, &h, "hmac").await;
     assert_eq!(status, StatusCode::OK, "{derived}");
-    assert_eq!(
-        derived["key"],
-        json!(expected_app_key(&h, org, &root.1, app, "hmac"))
-    );
-}
-
-fn canonical_revision() -> (Value, Value) {
-    let dir = testdata().join("manifest/01-canonical");
-    let compose = std::fs::read_to_string(dir.join("app-compose.json")).unwrap();
-    let expected: Value =
-        serde_json::from_slice(&std::fs::read(dir.join("expected.json")).unwrap()).unwrap();
-    (
-        json!({ "app_id": expected["app_id"], "compose": compose }),
-        expected["compose_hash"].clone(),
-    )
+    let intermediates = h.node.intermediates().unwrap();
+    let org_key =
+        alpha_kms::keys::org_key(&intermediates.tenant_kek_root, org, &root.1.spki()).unwrap();
+    let app_key = alpha_kms::keys::app_key(&org_key, app, "hmac").unwrap();
+    assert_eq!(derived["key"], json!(b64(app_key.as_slice())));
 }
 
 #[tokio::test]
@@ -341,7 +290,8 @@ async fn a_second_passkey_signs_every_control_route() {
     let PasskeyOrg { org, admin, .. } = passkey_org(&h, 63).await;
     let by_admin = |ctx: &str, payload: Value| admin.1.signed(ctx, payload, Some(admin.0));
 
-    let (payload, hash) = canonical_revision();
+    let (payload, expected) = canonical_compose();
+    let hash = &expected["compose_hash"];
     let body = by_admin(context::REVISION, payload);
     for _ in 0..2 {
         let (status, reply) = h.post("/v1/revisions", body.clone()).await;
@@ -532,7 +482,7 @@ async fn without_a_signer_no_passkey_signature_verifies_anywhere() {
         assert!(message.contains("no signer"), "{message}");
     };
 
-    let (payload, _) = canonical_revision();
+    let (payload, _) = canonical_compose();
     no_signer(
         h.post("/v1/revisions", by_admin(context::REVISION, payload))
             .await,

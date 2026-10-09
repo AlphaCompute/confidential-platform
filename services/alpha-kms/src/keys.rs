@@ -401,39 +401,15 @@ mod tests {
         }
     }
 
-    fn device_assertion() -> (Vec<u8>, [u8; 32], SignatureObject, Signer) {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/webauthn/mac-icloud-keychain.json"
-        );
-        let v: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        let a = &v["assertions"][0];
-        let text = |v: &Value| v.as_str().unwrap().to_owned();
-        let spki = BASE64_URL_SAFE_NO_PAD
-            .decode(text(&v["credential"]["spki"]))
-            .unwrap();
-        let digest = signing_digest(&text(&a["context"]), &a["payload"]).unwrap();
-        let object = SignatureObject {
-            key_id: None,
-            algorithm: webauthn::ALGORITHM.into(),
-            signature: text(&a["signature"]),
-            authenticator_data: Some(text(&a["authenticator_data"])),
-            client_data_json: Some(text(&a["client_data_json"])),
-        };
-        let signer = Signer {
-            origins: vec![text(&v["origin"])],
-            rp_id: text(&v["rp_id"]),
-            bundle_sha256: format!("sha256:{}", "0".repeat(64)),
-            api_origin: text(&v["origin"]),
-        };
-        (spki, digest, object, signer)
-    }
-
     #[test]
     fn the_algorithm_follows_the_key() {
         use ed25519_dalek::SigningKey;
         use ed25519_dalek::pkcs8::EncodePublicKey;
-        let (p256_spki, p256_digest, passkey, signer) = device_assertion();
+        use webauthn::tests::{digest, object, spki, vector, vector_signer};
+        let v = vector();
+        let a = &v["assertions"][0];
+        let (p256_spki, p256_digest, passkey) = (spki(&v), digest(a), object(a));
+        let signer = vector_signer(&v);
         let signer = Some(&signer);
         let sk = SigningKey::from_bytes(&[3u8; 32]);
         let ed_spki = sk.verifying_key().to_public_key_der().unwrap();

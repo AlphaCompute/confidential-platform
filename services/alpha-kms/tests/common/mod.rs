@@ -403,7 +403,7 @@ impl Harness {
         issued_at: SystemTime,
         signer: &(KeyId, SigningKey),
     ) -> (StatusCode, Value) {
-        let payload = json!({ "name": name, "app_ids": app_ids, "content_sha256": format!("sha256:{}", hex::encode(Sha256::digest(value))), "issued_at": rfc3339(issued_at) });
+        let payload = put_payload(name, app_ids, value, issued_at);
         let mut body = self.signed(context::SECRET, payload, signer);
         body["value"] = json!(b64(value));
         self.call(reqwest::Method::PUT, &format!("/v1/secrets/{name}"), body)
@@ -421,7 +421,7 @@ impl Harness {
         issued_at: SystemTime,
         signer: &(KeyId, SigningKey),
     ) -> Value {
-        let payload = json!({ "name": name, "app_ids": app_ids, "content_sha256": format!("sha256:{}", hex::encode(Sha256::digest(value))), "issued_at": rfc3339(issued_at) });
+        let payload = put_payload(name, app_ids, value, issued_at);
         let sealed = self.sealed(&payload, self.org, value).await;
         let mut body = self.signed(context::SECRET, payload, signer);
         body["sealed"] = sealed;
@@ -509,16 +509,22 @@ pub fn webauthn_vector() -> Value {
         .unwrap()
 }
 
-/// `doc` as `version`, naming a signer page on `origins` with `rp_id`.
-pub fn with_signer(mut doc: Value, version: u64, origins: &[&str], rp_id: &str) -> Value {
-    doc["version"] = json!(version);
-    doc["signer"] = json!({
-        "origins": origins,
-        "rp_id": rp_id,
-        "bundle_sha256": format!("sha256:{}", "0".repeat(64)),
-        "api_origin": origins[0],
-    });
-    doc
+pub fn put_payload(name: &str, app_ids: &[AppId], value: &[u8], issued_at: SystemTime) -> Value {
+    json!({ "name": name, "app_ids": app_ids,
+            "content_sha256": format!("sha256:{}", hex::encode(Sha256::digest(value))),
+            "issued_at": rfc3339(issued_at) })
+}
+
+/// The unsigned put-Revision payload of `manifest/01-canonical` and its `expected.json`.
+pub fn canonical_compose() -> (Value, Value) {
+    let dir = testdata().join("manifest/01-canonical");
+    let compose = fs::read_to_string(dir.join("app-compose.json")).unwrap();
+    let expected: Value =
+        serde_json::from_slice(&fs::read(dir.join("expected.json")).unwrap()).unwrap();
+    (
+        json!({ "app_id": expected["app_id"], "compose": compose }),
+        expected,
+    )
 }
 
 /// A software authenticator on the captured origin, for calls the device vector cannot sign.

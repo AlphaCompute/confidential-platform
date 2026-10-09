@@ -750,13 +750,10 @@ mod tests {
             ed25519.as_bytes()
         );
 
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../testdata/webauthn/mac-icloud-keychain.json"
-        );
-        let vector: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        let captured = vector["credential"]["spki"].as_str().unwrap();
-        let uncompressed = registered_spki(captured).unwrap();
+        let captured = b64(&crate::webauthn::tests::spki(
+            &crate::webauthn::tests::vector(),
+        ));
+        let uncompressed = registered_spki(&captured).unwrap();
         assert_eq!(b64(&uncompressed), captured);
 
         // SEQUENCE { algorithm identifier, BIT STRING { 0x02|0x03 ‖ x } }: the same key, compressed.

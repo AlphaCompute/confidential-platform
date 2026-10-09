@@ -91,12 +91,12 @@ pub fn verify(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use alpha_core::signing_digest;
     use serde_json::json;
 
-    fn vector() -> Value {
+    pub(crate) fn vector() -> Value {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../testdata/webauthn/mac-icloud-keychain.json"
@@ -104,7 +104,7 @@ mod tests {
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
     }
 
-    fn vector_signer(v: &Value) -> Signer {
+    pub(crate) fn vector_signer(v: &Value) -> Signer {
         let origin = v["origin"].as_str().unwrap().to_owned();
         Signer {
             origins: vec![origin.clone()],
@@ -114,7 +114,7 @@ mod tests {
         }
     }
 
-    fn object(assertion: &Value) -> SignatureObject {
+    pub(crate) fn object(assertion: &Value) -> SignatureObject {
         let field = |name: &str| assertion[name].as_str().unwrap().to_owned();
         SignatureObject {
             key_id: None,
@@ -125,13 +125,13 @@ mod tests {
         }
     }
 
-    fn spki(v: &Value) -> Vec<u8> {
+    pub(crate) fn spki(v: &Value) -> Vec<u8> {
         BASE64_URL_SAFE_NO_PAD
             .decode(v["credential"]["spki"].as_str().unwrap())
             .unwrap()
     }
 
-    fn digest(assertion: &Value) -> [u8; 32] {
+    pub(crate) fn digest(assertion: &Value) -> [u8; 32] {
         signing_digest(
             assertion["context"].as_str().unwrap(),
             &assertion["payload"],

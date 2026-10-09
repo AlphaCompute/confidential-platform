@@ -687,18 +687,8 @@ async fn control_routes_register_revoke_and_put() {
 }
 
 fn canonical_revision(h: &Harness, signer: &(KeyId, SigningKey)) -> (Value, Value) {
-    let compose =
-        fs::read_to_string(testdata().join("manifest/01-canonical/app-compose.json")).unwrap();
-    let expected: Value = serde_json::from_str(
-        &fs::read_to_string(testdata().join("manifest/01-canonical/expected.json")).unwrap(),
-    )
-    .unwrap();
-    let body = h.signed(
-        context::REVISION,
-        json!({ "app_id": expected["app_id"], "compose": compose }),
-        signer,
-    );
-    (body, expected)
+    let (payload, expected) = canonical_compose();
+    (h.signed(context::REVISION, payload, signer), expected)
 }
 
 #[tokio::test]
