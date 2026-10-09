@@ -140,7 +140,7 @@ async fn app_with_secret(
     let app = AppId::mint();
     let hash = h.insert_capture_revision(app, &admin).await;
     let (status, reply) = h
-        .put_secret("model-key", &[app], value, h.now(), &admin)
+        .put_secret(&format!("{app}.model-key"), &[app], value, h.now(), &admin)
         .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
     (app, hash, admin)
@@ -273,12 +273,13 @@ async fn runtime_attests_with_the_captures_key_and_serves_the_three_routes() {
     );
 
     // Secrets over mTLS with the leaf, cached with it: a later put is not seen until renewal.
-    let (status, secret) = socket.get("/v1/secrets/model-key").await;
+    let model_key = format!("/v1/secrets/{app}.model-key");
+    let (status, secret) = socket.get(&model_key).await;
     assert_eq!(status, 200, "{secret}");
     assert_eq!(secret["value"], json!(b64(b"v1")));
     let (status, reply) = h
         .put_secret(
-            "model-key",
+            &format!("{app}.model-key"),
             &[app],
             b"v2",
             h.now() + Duration::from_secs(1),
@@ -286,7 +287,7 @@ async fn runtime_attests_with_the_captures_key_and_serves_the_three_routes() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
-    let (_, secret) = socket.get("/v1/secrets/model-key").await;
+    let (_, secret) = socket.get(&model_key).await;
     assert_eq!(secret["value"], json!(b64(b"v1")), "cached");
     let (status, reply) = socket.get("/v1/secrets/other").await;
     assert_eq!((status, code(&reply)), (404, "not_found"), "{reply}");
@@ -298,13 +299,13 @@ async fn runtime_attests_with_the_captures_key_and_serves_the_three_routes() {
     *clock.lock().unwrap() = h.now() + certs::LEAF_TTL + Duration::from_secs(1);
     let (_, health) = socket.get("/healthz").await;
     assert_eq!(health["attested"], false);
-    for route in ["/v1/identity", "/v1/secrets/model-key"] {
+    for route in ["/v1/identity", model_key.as_str()] {
         let (status, reply) = socket.get(route).await;
         assert_eq!((status, code(&reply)), (503, "not_attested"), "{route}");
     }
     *clock.lock().unwrap() = h.now();
     runtime.attest().await.unwrap();
-    let (status, secret) = socket.get("/v1/secrets/model-key").await;
+    let (status, secret) = socket.get(&model_key).await;
     assert_eq!(status, 200, "{secret}");
     assert_eq!(secret["value"], json!(b64(b"v2")));
 
@@ -514,7 +515,7 @@ async fn a_tenant_serves_its_endpoint_with_the_runtime_identity() {
     assert_eq!(identity.compose_hash, hash);
     assert_eq!(identity.app_compose, text(KEYED, "app-compose.json"));
 
-    let secret = client.secret("model-key").await.unwrap();
+    let secret = client.secret(&format!("{app}.model-key")).await.unwrap();
     assert_eq!(secret.as_slice(), b"v1");
 
     let health = client.healthz().await.unwrap();
@@ -821,11 +822,12 @@ async fn revoked_revision_ends_the_runtime_with_78() {
     let Some(h) = nonce_clock_harness().await else {
         return;
     };
-    let (_, hash, admin) = app_with_secret(&h, b"v1").await;
+    let (app, hash, admin) = app_with_secret(&h, b"v1").await;
     let (runtime, _) = start_runtime(&h, config(&h, vec![h.url.clone()]));
     runtime.attest().await.unwrap();
     let mut socket = Socket::start(runtime.clone());
-    let (status, _) = socket.get("/v1/secrets/model-key").await;
+    let model_key = format!("/v1/secrets/{app}.model-key");
+    let (status, _) = socket.get(&model_key).await;
     assert_eq!(status, 200);
 
     let payload = json!({ "compose_hash": hash, "issued_at": rfc3339(h.now()) });
@@ -839,7 +841,7 @@ async fn revoked_revision_ends_the_runtime_with_78() {
 
     // The cached secret is still served; the next call that reaches the KMS is refused and
     // the runtime ends itself.
-    let (status, _) = socket.get("/v1/secrets/model-key").await;
+    let (status, _) = socket.get(&model_key).await;
     assert_eq!(status, 200);
     let (status, reply) = socket.get("/v1/secrets/other").await;
     assert_eq!((status, code(&reply)), (409, "revision_revoked"), "{reply}");
@@ -915,6 +917,35 @@ async fn secret_files_are_written_after_attestation_for_declaring_services_only(
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The organization holds the declared name both bare and under the App, so a runtime that
+/// fetched the bare name would write the other value.
+#[tokio::test]
+async fn a_declared_secret_is_read_under_the_apps_own_name() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    let (app, _, admin) = app_with_secret(&h, b"v1").await;
+    for (name, value) in [
+        ("shared".to_owned(), &b"bare"[..]),
+        (format!("{app}.shared"), &b"scoped"[..]),
+    ] {
+        let (status, reply) = h.put_secret(&name, &[app], value, h.now(), &admin).await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+    }
+    let (runtime, _) = start_runtime(
+        &h,
+        config_with_secrets(&h, vec![h.url.clone()], r#"{"web":["shared"]}"#),
+    );
+    let root = secrets_root(&["web"]);
+    runtime.attest().await.unwrap();
+    assert_eq!(runtime.deliver(&root).await, Delivery::Complete);
+    assert_eq!(
+        std::fs::read(root.join("web").join("shared")).unwrap(),
+        b"scoped"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[tokio::test]
 async fn secret_files_wait_for_a_missing_secret_and_follow_a_renewal() {
     let Some(h) = nonce_clock_harness().await else {
@@ -935,7 +966,9 @@ async fn secret_files_wait_for_a_missing_secret_and_follow_a_renewal() {
     assert_eq!(std::fs::read(web.join("model-key")).unwrap(), b"v1");
     assert!(!web.join("later").exists());
 
-    let (status, reply) = h.put_secret("later", &[app], b"l1", h.now(), &admin).await;
+    let (status, reply) = h
+        .put_secret(&format!("{app}.later"), &[app], b"l1", h.now(), &admin)
+        .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
     assert_eq!(runtime.deliver(&root).await, Delivery::Complete);
     assert_eq!(std::fs::read(web.join("later")).unwrap(), b"l1");
@@ -943,7 +976,7 @@ async fn secret_files_wait_for_a_missing_secret_and_follow_a_renewal() {
     // A changed value is served from the leaf's cache until the next renewal empties it.
     let (status, reply) = h
         .put_secret(
-            "model-key",
+            &format!("{app}.model-key"),
             &[app],
             b"v2",
             h.now() + Duration::from_secs(1),
@@ -980,13 +1013,15 @@ async fn secret_files_are_written_by_the_running_runtime() {
     let web = socket.secrets.join("web");
     wait_for_file(&web.join("model-key"), b"v1").await;
 
-    let (status, reply) = h.put_secret("later", &[app], b"l1", h.now(), &admin).await;
+    let (status, reply) = h
+        .put_secret(&format!("{app}.later"), &[app], b"l1", h.now(), &admin)
+        .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
     wait_for_file(&web.join("later"), b"l1").await;
 
     let (status, health) = socket.get("/healthz").await;
     assert_eq!((status, &health["attested"]), (200, &json!(true)));
-    let (status, secret) = socket.get("/v1/secrets/later").await;
+    let (status, secret) = socket.get(&format!("/v1/secrets/{app}.later")).await;
     assert_eq!(status, 200, "{secret}");
     assert_eq!(secret["value"], json!(b64(b"l1")));
     assert_eq!(socket.stop().await, Exit::Drained);
@@ -1016,7 +1051,9 @@ async fn a_revoked_revision_gets_no_new_secret_files() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
-    let (status, reply) = h.put_secret("later", &[app], b"l1", h.now(), &admin).await;
+    let (status, reply) = h
+        .put_secret(&format!("{app}.later"), &[app], b"l1", h.now(), &admin)
+        .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
 
     assert_eq!(runtime.deliver(&root).await, Delivery::Revoked);
