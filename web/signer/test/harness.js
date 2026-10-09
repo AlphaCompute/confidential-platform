@@ -436,7 +436,11 @@ async function loadPage(options = {}) {
     }
     if (url.startsWith(`${ORIGIN}/`)) {
       const pathname = url.slice(ORIGIN.length);
-      const route = routes[`${method} ${pathname}`];
+      const key = `${method} ${pathname}`;
+      const prefix = Object.keys(routes).find(
+        (k) => k.endsWith("*") && key.startsWith(k.slice(0, -1)),
+      );
+      const route = routes[key] || routes[prefix];
       if (!route) return jsonReply(404, { error: "no route", error_code: "SHROUD_NOT_FOUND" });
       const answer = await route({ method, path: pathname, body: init.body, init });
       if (answer instanceof Error) throw new TypeError("network");
@@ -654,8 +658,113 @@ function claimApi(options = {}) {
   return api;
 }
 
+// shroud-go's approval routes for one ticket, with the KMS behind them. Receipts come from
+// `api.revisionReceipt` and `api.putReceipt`, which a test may replace; `api.reply[route]` may
+// answer a route instead (route: "revision", "put", "channel", "decline").
+function approvalApi(options = {}) {
+  const now = options.now === undefined ? Date.now() : options.now;
+  const compose = options.compose;
+  const api = {
+    org_id: options.org_id || uuid7(),
+    org_name: "Acme",
+    app_id: options.app_id,
+    title: options.title || "Production",
+    compose_hash: options.compose_hash || `sha256:${sha256(compose || "").toString("hex")}`,
+    catalog_template_sha256: options.catalog_template_sha256 || null,
+    compose: options.catalog_template_sha256 ? null : compose,
+    machine: options.machine === undefined ? "tdx.medium" : options.machine,
+    secrets: options.secrets || [],
+    credentials: options.credentials || [],
+    current: options.current || null,
+    expires_at: options.expires_at || iso(now + 24 * 3600 * 1000),
+    state: options.state || "pending",
+    server_time: options.server_time || iso(now),
+    read: options.read,
+    revisions: [],
+    puts: [],
+    channels: [],
+    declines: 0,
+    reply: {},
+    revisionReceipt: (text, response) => mintReceipt("revision.register", text, response),
+    putReceipt: (text, response) => mintReceipt("secret.put", text, response),
+  };
+  const base = `/v1/approval-requests/${options.ticket || TICKET}`;
+  const fields = [
+    "org_id",
+    "org_name",
+    "app_id",
+    "title",
+    "compose_hash",
+    "catalog_template_sha256",
+    "compose",
+    "machine",
+    "secrets",
+    "credentials",
+    "current",
+    "expires_at",
+    "state",
+    "server_time",
+  ];
+  api.routes = {
+    [`GET ${base}`]: () =>
+      api.read || { status: 200, body: Object.fromEntries(fields.map((k) => [k, api[k]])) },
+    [`POST ${base}/decline`]: () => {
+      api.declines += 1;
+      if (api.reply.decline) return api.reply.decline();
+      if (api.state !== "pending") {
+        return {
+          status: 409,
+          body: { error: "conflict", error_code: "SHROUD_CONFLICT", details: { state: api.state } },
+        };
+      }
+      api.state = "cancelled";
+      return { status: 200, body: { state: "cancelled" } };
+    },
+    [`POST ${base}/revision`]: (req) => {
+      const body = JSON.parse(req.body);
+      api.revisions.push({ text: req.body, body, puts: api.puts.length });
+      if (api.reply.revision) return api.reply.revision(req.body);
+      const response = {
+        compose_hash: `sha256:${sha256(body.payload.compose).toString("hex")}`,
+        app_id: body.payload.app_id,
+        org_id: api.org_id,
+        created_at: RECEIPT_TIME,
+      };
+      api.state = "approved";
+      return {
+        status: 200,
+        body: { ...response, receipt: api.revisionReceipt(req.body, response) },
+      };
+    },
+    [`POST ${base}/kms-channel`]: (req) => {
+      api.channels.push(req.body);
+      if (api.reply.channel) return api.reply.channel(req.body);
+      return { status: 200, body: { server_hello: api.channels.length } };
+    },
+    [`PUT ${base}/secrets/*`]: (req) => {
+      const declared = req.path.slice(`${base}/secrets/`.length);
+      const body = JSON.parse(req.body);
+      api.puts.push({ declared, text: req.body, body });
+      const answer = api.reply.put && api.reply.put(req.body, declared);
+      if (answer) return answer;
+      const p = body.payload;
+      const response = {
+        id: uuid7(),
+        name: p.name,
+        org_id: api.org_id,
+        app_ids: p.app_ids,
+        content_sha256: p.content_sha256,
+        issued_at: p.issued_at,
+      };
+      return { status: 200, body: { ...response, receipt: api.putReceipt(req.body, response) } };
+    },
+  };
+  return api;
+}
+
 module.exports = {
   ORIGIN,
+  approvalApi,
   RP_ID,
   TICKET,
   SoftwareAuthenticator,

@@ -66,3 +66,14 @@ pre {
 .status {
   font-weight: 600;
 }
+
+.service {
+  border: 1px solid rgba(127, 127, 127, 0.4);
+  border-radius: 0.375rem;
+  padding: 0 0.75rem;
+  margin: 0.75rem 0;
+}
+
+details {
+  margin: 1rem 0;
+}

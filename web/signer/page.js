@@ -61,6 +61,11 @@ const MESSAGES = {
   device_bound: "Device-bound passkey: if you lose this device you lose this key",
   two_keys: "Done. Your organization has two passkeys.",
   added_done: "Done. The new passkey signs as expected.",
+  approval_expired: "This approval link has expired.",
+  decided: "This request was already approved, declined or cancelled.",
+  mismatch:
+    "What the service asked you to approve does not match what it would run. Nothing was signed.",
+  approved: "Approved. You can close this tab.",
   one_key: (expiresAt) =>
     `Your organization has one passkey. If you lose it you lose the organization. Your link stays open until ${expiresAt}.`,
 };
@@ -687,6 +692,154 @@ async function signedAsExpected(view, key, challenge, assertion) {
   } catch (_) {
     return false;
   }
+}
+
+function approvalPath(a, suffix) {
+  return `/v1/approval-requests/${a.ticket}${suffix}`;
+}
+
+function approvalRefusal(read) {
+  if (!read || typeof read !== "object") return MESSAGES.unavailable;
+  if (read.state === "expired") return MESSAGES.approval_expired;
+  if (read.state !== "pending") return MESSAGES.decided;
+  const expires = Date.parse(read.expires_at);
+  if (!Number.isFinite(expires) || expires <= Date.now()) return MESSAGES.approval_expired;
+  if (
+    !UUID.test(read.org_id) ||
+    !UUID.test(read.app_id) ||
+    !/^sha256:[0-9a-f]{64}$/.test(read.compose_hash) ||
+    typeof read.title !== "string" ||
+    !Array.isArray(read.credentials)
+  ) {
+    return MESSAGES.unavailable;
+  }
+  return clockRefusal(read.server_time) || (read.credentials.length ? null : MESSAGES.no_credentials);
+}
+
+// What the request asks to run, or a refusal: the compose bytes it names, only if they hash to
+// its compose_hash, parsed for display from those same bytes.
+function uploadedLaunch(read) {
+  if (typeof read.compose !== "string") return { refusal: MESSAGES.mismatch };
+  return parsedLaunch(read, read.compose, {
+    machine: `${read.machine || "not stated"} (chosen by the service, not part of what you sign)`,
+  });
+}
+
+function parsedLaunch(read, compose, extra) {
+  if (wasm_bindgen.bodySha256(utf8(compose)) !== read.compose_hash) {
+    return { refusal: MESSAGES.mismatch };
+  }
+  try {
+    return { compose, services: JSON.parse(wasm_bindgen.composeServices(compose)), ...extra };
+  } catch (_) {
+    return { refusal: MESSAGES.mismatch };
+  }
+}
+
+function imageLines(image) {
+  const at = (image || "").indexOf("@sha256:");
+  return at < 0
+    ? [el("p", `Image: ${image || "none"}`), el("p", "Digest: none (not pinned)", "digest")]
+    : [el("p", `Image: ${image.slice(0, at)}`), el("p", `Digest: ${image.slice(at + 1)}`, "digest")];
+}
+
+function serviceBlock(name, service) {
+  const block = el("div", undefined, "service");
+  block.append(el("h3", name), ...imageLines(service.image));
+  const lists = [
+    ["Published ports", service.ports],
+    ["Named volumes", service.volumes],
+    ["Receives secrets", service.secrets],
+  ];
+  for (const [title, items] of lists) {
+    if (items.length) block.append(el("p", `${title}: ${items.join(", ")}`));
+  }
+  return block;
+}
+
+function describeLaunch(a) {
+  const { read, launch } = a;
+  const nodes = [];
+  if (launch.heading) nodes.push(el("p", launch.heading));
+  nodes.push(el("h2", "What will run"));
+  const runtime = launch.services["alpha-runtime"];
+  for (const [name, service] of Object.entries(launch.services)) {
+    if (name !== "alpha-runtime") nodes.push(serviceBlock(name, service));
+  }
+  if (runtime) {
+    const block = el("div", undefined, "service");
+    block.append(el("h3", "AlphaCompute runtime"), ...imageLines(runtime.image));
+    nodes.push(block);
+  }
+  nodes.push(el("p", `Machine: ${launch.machine}`));
+  const details = el("details");
+  details.append(
+    el("summary", "Technical details"),
+    el("p", `App: ${read.app_id}`),
+    el("p", `compose_hash: ${read.compose_hash}`, "digest"),
+    el("pre", launch.compose),
+  );
+  nodes.push(details);
+  return nodes;
+}
+
+async function startApproval(view, viewText, ticket) {
+  const reply = await api(view, "GET", `/v1/approval-requests/${ticket}`);
+  if (reply.status !== 200) return stop(failure(reply));
+  const read = reply.body;
+  const refusal = approvalRefusal(read);
+  if (refusal) return stop(refusal);
+  const launch = uploadedLaunch(read);
+  if (launch.refusal) return stop(launch.refusal);
+
+  const ui = screen(
+    el("h1", read.title),
+    el("p", `Launch approval for ${typeof read.org_name === "string" ? read.org_name : read.org_id}`),
+  );
+  const a = { view, viewText, read, ticket, ui, launch, credential: null };
+  ui.facts.replaceChildren(...describeLaunch(a));
+  return offerRevision(a);
+}
+
+// Every touch after the first is limited to the passkey the first one used.
+function allowed(a) {
+  return a.credential ? [a.credential] : a.read.credentials.map((x) => x.credential_id);
+}
+
+// Signs the Revision with one passkey and keeps the passkey's id for later touches, or returns a
+// note.
+async function approvalSignature(a, options) {
+  const { credential, note } = await passkey("get", options);
+  if (!credential) return { note };
+  const keyId = keyIdOf(credential.rawId, a.read.credentials);
+  if (keyId === null) return { note: MESSAGES.foreign_passkey };
+  a.credential = b64u(credential.rawId);
+  return { signature: signatureObject(credential, keyId) };
+}
+
+function offerRevision(a, note) {
+  const { read } = a;
+  const payload = { app_id: read.app_id, compose: a.launch.compose };
+  const signable = wasm_bindgen.signingDigest("revision", JSON.stringify(payload));
+  const options = getOptions(a.view, signable.digest, allowed(a));
+  offer(
+    a.ui,
+    note,
+    button("Approve with passkey", async () => {
+      const { signature, note } = await approvalSignature(a, options);
+      if (!signature) return offerRevision(a, note);
+      const body = wasm_bindgen.canonicalJson(JSON.stringify({ payload, signature }));
+      const reply = await api(a.view, "POST", approvalPath(a, "/revision"), body);
+      if (reply.status !== 200) return offerRevision(a, failure(reply));
+      const signed = receipt(a.view, reply, "revision.register", body, {
+        app_id: read.app_id,
+        compose_hash: read.compose_hash,
+        org_id: read.org_id,
+      });
+      if (!signed) return offerRevision(a, MESSAGES.not_confirmed);
+      return offer(a.ui, "", el("p", MESSAGES.approved, "confirmed"));
+    }),
+  );
 }
 
 function servedBySigner(view) {
