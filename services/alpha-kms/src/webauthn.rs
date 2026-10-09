@@ -317,7 +317,15 @@ pub(crate) mod tests {
             edit(&mut map);
             let cdj = serde_json::to_vec(&map).unwrap();
             let ad = authenticator_data(flags, 0, &[]);
-            object(&cdj, &ad, &sign(&cdj, &ad))
+            signed(&cdj, &ad)
+        }
+
+        pub fn signed(client_data_json: &[u8], authenticator_data: &[u8]) -> SignatureObject {
+            object(
+                client_data_json,
+                authenticator_data,
+                &sign(client_data_json, authenticator_data),
+            )
         }
     }
 
@@ -361,10 +369,7 @@ pub(crate) mod tests {
             software::ORIGIN
         );
         for cdj in [b"[]".as_slice(), repeated.as_bytes()] {
-            refused(
-                check(&software::object(cdj, &ad, &software::sign(cdj, &ad))),
-                "JSON object",
-            );
+            refused(check(&software::signed(cdj, &ad)), "JSON object");
         }
 
         let cdj = serde_json::to_vec(&software::client(&DIGEST)).unwrap();
@@ -377,7 +382,7 @@ pub(crate) mod tests {
         let mut client = software::client(&DIGEST);
         client.insert("pad".into(), json!("x"));
         let cdj = serde_json::to_vec(&client).unwrap();
-        let good = software::object(&cdj, &ad, &software::sign(&cdj, &ad));
+        let good = software::signed(&cdj, &ad);
         check(&good).unwrap();
         let padded = |bytes: &[u8]| {
             let s = base64::prelude::BASE64_URL_SAFE.encode(bytes);
@@ -424,12 +429,7 @@ pub(crate) mod tests {
         let cdj = serde_json::to_vec(&software::client(&DIGEST)).unwrap();
 
         let counted = software::authenticator_data(0x05, 42, &[]);
-        check(&software::object(
-            &cdj,
-            &counted,
-            &software::sign(&cdj, &counted),
-        ))
-        .unwrap();
+        check(&software::signed(&cdj, &counted)).unwrap();
         check(&software::assertion(&DIGEST, 0x05, |m| {
             m.remove("crossOrigin");
         }))
@@ -439,12 +439,7 @@ pub(crate) mod tests {
         }))
         .unwrap();
         let extended = software::authenticator_data(0x85, 0, &[0xa1, 0x01, 0x02]);
-        check(&software::object(
-            &cdj,
-            &extended,
-            &software::sign(&cdj, &extended),
-        ))
-        .unwrap();
+        check(&software::signed(&cdj, &extended)).unwrap();
 
         let ad = software::authenticator_data(0x05, 0, &[]);
         let sig = software::sign(&cdj, &ad);

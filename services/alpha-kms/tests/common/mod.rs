@@ -616,6 +616,17 @@ impl Passkey {
         let signature = self.signature(ctx, &payload, key_id);
         json!({ "payload": payload, "signature": signature })
     }
+
+    /// This passkey's self-signed claim of `org` as its root key.
+    pub fn claim(&self, org: OrgId, now: SystemTime) -> Value {
+        self.signed(
+            context::ORG_ROOT_KEY,
+            json!({ "org_id": org, "principal_id": PrincipalId::mint(),
+                    "public_key": self.spki_b64(), "label": "root passkey",
+                    "issued_at": rfc3339(now) }),
+            None,
+        )
+    }
 }
 
 pub fn code(reply: &Value) -> &str {

@@ -54,14 +54,7 @@ fn registered(reply: &Value) -> KeyId {
 async fn passkey_org(h: &Harness, seed: u8) -> PasskeyOrg {
     let org = OrgId::mint();
     let root = Passkey::new(seed);
-    let claim = root.signed(
-        context::ORG_ROOT_KEY,
-        json!({ "org_id": org, "principal_id": PrincipalId::mint(),
-                "public_key": root.spki_b64(), "label": "root passkey",
-                "issued_at": rfc3339(h.now()) }),
-        None,
-    );
-    let (status, reply) = h.post("/v1/keys", claim).await;
+    let (status, reply) = h.post("/v1/keys", root.claim(org, h.now())).await;
     assert_eq!(status, StatusCode::OK, "{reply}");
     let root = (registered(&reply), root);
 
@@ -471,19 +464,9 @@ async fn without_a_signer_no_passkey_signature_verifies_anywhere() {
         )
         .await,
     );
-    let claimant = Passkey::new(77);
     no_signer(
-        h.post(
-            "/v1/keys",
-            claimant.signed(
-                context::ORG_ROOT_KEY,
-                json!({ "org_id": OrgId::mint(), "principal_id": PrincipalId::mint(),
-                        "public_key": claimant.spki_b64(), "label": "refused root",
-                        "issued_at": rfc3339(h.now()) }),
-                None,
-            ),
-        )
-        .await,
+        h.post("/v1/keys", Passkey::new(77).claim(OrgId::mint(), h.now()))
+            .await,
     );
     no_signer(
         h.put_secret("ed25519-no-signer", &[app], b"refused", h.now(), &ed25519)
@@ -628,14 +611,7 @@ async fn a_passkey_body_without_its_assertion_fields_is_malformed() {
     }
     assert_eq!(h.secrets_named("shapeless").await, 0);
 
-    let claimant = Passkey::new(89);
-    let mut claim = claimant.signed(
-        context::ORG_ROOT_KEY,
-        json!({ "org_id": OrgId::mint(), "principal_id": PrincipalId::mint(),
-                "public_key": claimant.spki_b64(), "label": "shapeless root",
-                "issued_at": rfc3339(h.now()) }),
-        None,
-    );
+    let mut claim = Passkey::new(89).claim(OrgId::mint(), h.now());
     let signature = claim["signature"].as_object_mut().unwrap();
     signature.remove("client_data_json");
     signature.remove("authenticator_data");
