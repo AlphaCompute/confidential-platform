@@ -524,6 +524,10 @@ pub fn verified(h: &Harness, reply: &Value, route: &str, request: &Value, expect
     receipt["certificate_chain"][0].as_str().unwrap().to_owned()
 }
 
+pub async fn derive(h: &Harness, client: &reqwest::Client, body: Value) -> (StatusCode, Value) {
+    send(client.post(format!("{}/v1/keys/derive", h.url)).json(&body)).await
+}
+
 /// The passkey assertions captured on a Mac (iCloud Keychain).
 pub fn webauthn_vector() -> Value {
     serde_json::from_slice(&fs::read(testdata().join("webauthn/mac-icloud-keychain.json")).unwrap())

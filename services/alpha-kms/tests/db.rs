@@ -1243,10 +1243,6 @@ fn leaf_client(h: &Harness, app: AppId, hash: ComposeHash) -> reqwest::Client {
     ))
 }
 
-async fn derive(h: &Harness, client: &reqwest::Client, body: Value) -> (StatusCode, Value) {
-    send(client.post(format!("{}/v1/keys/derive", h.url)).json(&body)).await
-}
-
 fn derived(reply: &Value) -> Vec<u8> {
     BASE64_URL_SAFE_NO_PAD
         .decode(reply["key"].as_str().unwrap())

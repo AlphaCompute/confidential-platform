@@ -15,8 +15,6 @@ use std::time::SystemTime;
 
 use alpha_core::{AppId, ComposeHash, KeyId, OrgId, PrincipalId, context};
 use alpha_kms::{platform, rfc3339};
-use base64::Engine;
-use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use common::*;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -104,15 +102,6 @@ async fn put(h: &Harness, name: &str, body: Value) -> (StatusCode, Value) {
         .await
 }
 
-async fn derive(client: &reqwest::Client, h: &Harness, purpose: &str) -> (StatusCode, Value) {
-    send(
-        client
-            .post(format!("{}/v1/keys/derive", h.url))
-            .json(&json!({ "purpose": purpose })),
-    )
-    .await
-}
-
 fn assertion_body(assertion: &Value, key_id: Option<&Value>) -> Value {
     let mut signature = json!({
         "algorithm": "webauthn-es256",
@@ -176,7 +165,7 @@ async fn a_device_passkey_claims_its_organization_and_registers_a_key() {
         json!({ "principal_id": a1["payload"]["principal_id"], "org_id": org }),
     );
 
-    let second_id: Uuid = second["id"].as_str().unwrap().parse().unwrap();
+    let second_id = Uuid::from(registered(&second));
     let keys = h.node.intermediates().unwrap();
     let doc = h.node.platform_document().unwrap();
     let chain = alpha_kms::keys::walk_chain(
@@ -188,13 +177,11 @@ async fn a_device_passkey_claims_its_organization_and_registers_a_key() {
     )
     .await
     .unwrap();
-    let decoded = |field: &Value| {
-        BASE64_URL_SAFE_NO_PAD
-            .decode(field.as_str().unwrap())
-            .unwrap()
-    };
-    assert_eq!(chain.anchor_spki, decoded(&v["credential"]["spki"]));
-    assert_eq!(chain.key.public_key, decoded(&a1["payload"]["public_key"]));
+    assert_eq!(json!(b64(&chain.anchor_spki)), v["credential"]["spki"]);
+    assert_eq!(
+        json!(b64(&chain.key.public_key)),
+        a1["payload"]["public_key"]
+    );
     let refused = alpha_kms::keys::walk_chain(
         &h.pool,
         &keys.tenant_kek_root,
@@ -227,7 +214,7 @@ async fn a_passkey_signed_revision_attests_reads_its_secret_and_derives_its_key(
     assert_eq!(status, StatusCode::OK, "{secret}");
     assert_eq!(secret["value"], json!(b64(b"passkey value")));
 
-    let (status, derived) = derive(&instance, &h, "hmac").await;
+    let (status, derived) = derive(&h, &instance, json!({ "purpose": "hmac" })).await;
     assert_eq!(status, StatusCode::OK, "{derived}");
     let intermediates = h.node.intermediates().unwrap();
     let org_key =
@@ -506,7 +493,7 @@ async fn without_a_signer_no_passkey_signature_verifies_anywhere() {
 
     no_signer(h.attest(KEYED).await);
     no_signer(send(instance.get(format!("{}/v1/secrets/passkey-secret", h.url))).await);
-    no_signer(derive(&instance, &h, "hmac").await);
+    no_signer(derive(&h, &instance, json!({ "purpose": "hmac" })).await);
 
     h.register_key(&h.root, 90).await;
     assert_eq!(h.secrets_named("no-signer").await, 0);

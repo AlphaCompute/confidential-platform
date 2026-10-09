@@ -349,47 +349,30 @@ mod tests {
 
     #[test]
     fn check_shape_admits_exactly_the_fields_of_its_algorithm() {
-        let plain = SignatureObject {
-            key_id: None,
-            algorithm: "ed25519".into(),
-            signature: String::new(),
-            authenticator_data: None,
-            client_data_json: None,
-        };
-        assert!(check_shape(&plain).is_ok());
-        let other = SignatureObject {
-            algorithm: "ml-dsa".into(),
-            ..plain.clone()
-        };
-        assert_eq!(check_shape(&other).unwrap_err().code, "signature_invalid");
-        for (authenticator_data, client_data_json) in [
-            (Some("AAAA".to_owned()), None),
-            (None, Some("e30".to_owned())),
-            (Some("AAAA".to_owned()), Some("e30".to_owned())),
+        let (ad, cd) = (Some("AAAA"), Some("e30"));
+        for (algorithm, authenticator_data, client_data_json, expected) in [
+            ("ed25519", None, None, Ok(())),
+            ("ed25519", ad, None, Err("malformed")),
+            ("ed25519", None, cd, Err("malformed")),
+            ("ed25519", ad, cd, Err("malformed")),
+            (webauthn::ALGORITHM, ad, cd, Ok(())),
+            (webauthn::ALGORITHM, ad, None, Err("malformed")),
+            (webauthn::ALGORITHM, None, cd, Err("malformed")),
+            (webauthn::ALGORITHM, None, None, Err("malformed")),
+            ("ml-dsa", None, None, Err("signature_invalid")),
         ] {
-            let webauthn = SignatureObject {
-                authenticator_data,
-                client_data_json,
-                ..plain.clone()
+            let object = SignatureObject {
+                key_id: None,
+                algorithm: algorithm.into(),
+                signature: String::new(),
+                authenticator_data: authenticator_data.map(str::to_owned),
+                client_data_json: client_data_json.map(str::to_owned),
             };
-            assert_eq!(check_shape(&webauthn).unwrap_err().code, "malformed");
-        }
-        for (authenticator_data, client_data_json, admitted) in [
-            (Some("AAAA".to_owned()), Some("e30".to_owned()), true),
-            (Some("AAAA".to_owned()), None, false),
-            (None, Some("e30".to_owned()), false),
-            (None, None, false),
-        ] {
-            let passkey = SignatureObject {
-                algorithm: webauthn::ALGORITHM.into(),
-                authenticator_data,
-                client_data_json,
-                ..plain.clone()
-            };
-            match check_shape(&passkey) {
-                Ok(()) => assert!(admitted),
-                Err(e) => assert_eq!((admitted, e.code), (false, "malformed")),
-            }
+            assert_eq!(
+                check_shape(&object).map_err(|e| e.code),
+                expected,
+                "{algorithm}"
+            );
         }
     }
 
@@ -417,35 +400,23 @@ mod tests {
         verify_signature(&p256_spki, &p256_digest, &passkey, signer).unwrap();
         verify_signature(ed_spki.as_bytes(), &ed_digest, &ed, signer).unwrap();
 
-        let invalid =
-            |r: Result<(), ApiError>| assert_eq!(r.unwrap_err().code, "signature_invalid");
-        invalid(verify_signature(&p256_spki, &ed_digest, &ed, signer));
-        invalid(verify_signature(
-            ed_spki.as_bytes(),
-            &p256_digest,
-            &passkey,
-            signer,
-        ));
         let ml_dsa = SignatureObject {
             algorithm: "ml-dsa".into(),
             ..ed.clone()
         };
-        invalid(verify_signature(
-            ed_spki.as_bytes(),
-            &ed_digest,
-            &ml_dsa,
-            signer,
-        ));
         let stray = SignatureObject {
             client_data_json: passkey.client_data_json.clone(),
             ..ed.clone()
         };
-        invalid(verify_signature(
-            ed_spki.as_bytes(),
-            &ed_digest,
-            &stray,
-            signer,
-        ));
+        for (key, signed, object) in [
+            (p256_spki.as_slice(), &ed_digest, &ed),
+            (ed_spki.as_bytes(), &p256_digest, &passkey),
+            (ed_spki.as_bytes(), &ed_digest, &ml_dsa),
+            (ed_spki.as_bytes(), &ed_digest, &stray),
+        ] {
+            let refused = verify_signature(key, signed, object, signer).unwrap_err();
+            assert_eq!(refused.code, "signature_invalid");
+        }
         assert_eq!(check_shape(&stray).unwrap_err().code, "malformed");
     }
 
