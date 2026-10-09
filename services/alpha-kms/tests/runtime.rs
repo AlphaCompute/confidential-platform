@@ -14,6 +14,7 @@
 
 mod common;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,7 +25,7 @@ use alpha_client::tls::{self, Pin};
 use alpha_client::{Client, Error as ClientError};
 use alpha_core::{AppId, ComposeHash, KeyId, context};
 use alpha_kms::{certs, rfc3339};
-use alpha_runtime::{Config, Delivery, Error, EvidenceSource, Exit, Runtime, Secrets};
+use alpha_runtime::{Config, Delivery, Error, EvidenceSource, Exit, Runtime, Secrets, proxy};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use common::*;
@@ -36,10 +37,12 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::aws_lc_rs;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::time_provider::TimeProvider;
-use rustls::{ClientConfig, ServerConfig};
+use rustls::{ClientConfig, HandshakeKind, ServerConfig};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+use tokio::sync::mpsc;
+use tokio_rustls::client::TlsStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use x509_parser::prelude::{FromDer, GeneralName, ParsedExtension, X509Certificate};
 
@@ -84,6 +87,7 @@ fn config(h: &Harness, endpoints: Vec<String>) -> Config {
         kms_revisions: vec![h.node.compose_hash],
         kms_endpoints: endpoints,
         secrets: Secrets::new(),
+        tls_upstream: None,
     }
 }
 
@@ -157,6 +161,20 @@ struct Socket {
 
 impl Socket {
     fn start(runtime: Arc<Runtime>) -> Self {
+        Self::serve(runtime, None)
+    }
+
+    /// As [`Socket::start`], with the Endpoint listening on a free local port.
+    async fn with_endpoint(runtime: Arc<Runtime>) -> (Self, SocketAddr) {
+        let endpoint = proxy::Endpoint::bind(runtime.clone(), "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap()
+            .expect("the config names an upstream");
+        let addr = endpoint.local_addr().unwrap();
+        (Self::serve(runtime, Some(endpoint)), addr)
+    }
+
+    fn serve(runtime: Arc<Runtime>, tls: Option<proxy::Endpoint>) -> Self {
         // Short: a unix socket path is capped at 104 bytes on macOS; the random tail of the
         // UUID, not the timestamp head, keeps parallel tests apart.
         let path = std::env::temp_dir().join(format!(
@@ -166,7 +184,7 @@ impl Socket {
         let secrets = secrets_root(&["web"]);
         let listener = UnixListener::bind(&path).unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let task = tokio::spawn(runtime.run(listener, secrets.clone(), async move {
+        let task = tokio::spawn(runtime.run(listener, secrets.clone(), tls, async move {
             let _ = rx.await;
         }));
         Self {
@@ -206,6 +224,114 @@ impl Drop for Socket {
         let _ = std::fs::remove_file(&self.path);
         let _ = std::fs::remove_dir_all(&self.secrets);
     }
+}
+
+const BODY: &str = "hello from the service\n";
+const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// A plain service on `listener`: `BODY` for an HTTP/1.1 request, `101` and then an echo for a
+/// WebSocket upgrade, and for an HTTP/2 preface the bytes it received, sent on the channel.
+fn plain_service(listener: TcpListener) -> mpsc::UnboundedReceiver<Vec<u8>> {
+    let (seen, received) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = tcp.read(&mut buf).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    head.extend_from_slice(&buf[..n]);
+                    if head.starts_with(b"PRI ") {
+                        if head.len() >= H2_PREFACE.len() {
+                            let _ = seen.send(head);
+                            return;
+                        }
+                    } else if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+                if head.contains("upgrade: websocket") {
+                    tcp.write_all(
+                        b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                    let (mut read, mut write) = tcp.split();
+                    let _ = tokio::io::copy(&mut read, &mut write).await;
+                } else {
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{BODY}",
+                        BODY.len()
+                    );
+                    let _ = tcp.write_all(reply.as_bytes()).await;
+                    let _ = tcp.shutdown().await;
+                }
+            });
+        }
+    });
+    received
+}
+
+async fn start_plain_service() -> (u16, mpsc::UnboundedReceiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    (port, plain_service(listener))
+}
+
+fn config_with_upstream(h: &Harness, port: u16) -> Config {
+    Config {
+        tls_upstream: Some(format!("localhost:{port}")),
+        ..config(h, vec![h.url.clone()])
+    }
+}
+
+/// The platform's client: TLS 1.3, `X25519MLKEM768` only, the KMS CA pinned.
+fn hybrid_client(h: &Harness) -> ClientConfig {
+    tls::client_config(
+        Some(Pin::Ca(tls::cert_from_pem(&h.ca_pem).unwrap())),
+        None,
+        pinned_time(h.now()),
+    )
+    .unwrap()
+}
+
+async fn connect(
+    addr: SocketAddr,
+    config: &Arc<ClientConfig>,
+) -> std::io::Result<TlsStream<TcpStream>> {
+    let tcp = TcpStream::connect(addr).await?;
+    TlsConnector::from(config.clone())
+        .connect(ServerName::try_from("app.example").unwrap(), tcp)
+        .await
+}
+
+/// Sends a WebSocket upgrade and reads the `101` head.
+async fn upgrade(tls: &mut TlsStream<TcpStream>) {
+    tls.write_all(
+        b"GET /ws HTTP/1.1\r\nHost: app\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        let mut byte = [0u8; 1];
+        tls.read_exact(&mut byte).await.unwrap();
+        head.push(byte[0]);
+    }
+    assert!(head.starts_with(b"HTTP/1.1 101 "), "{head:?}");
+}
+
+async fn echo(tls: &mut TlsStream<TcpStream>, frame: &[u8]) {
+    tls.write_all(frame).await.unwrap();
+    let mut back = vec![0u8; frame.len()];
+    tls.read_exact(&mut back).await.unwrap();
+    assert_eq!(back, frame);
 }
 
 /// Polls every 200 ms for up to 15 s until `path` holds `value`.
@@ -376,19 +502,20 @@ impl ServerCertVerifier for CaOnly {
     }
 }
 
-fn backend_client(ca_der: &[u8], now: SystemTime) -> TlsConnector {
+fn backend_client(
+    ca_der: &[u8],
+    now: SystemTime,
+    provider: rustls::crypto::CryptoProvider,
+) -> TlsConnector {
     let anchor = webpki::anchor_from_trusted_cert(&CertificateDer::from(ca_der.to_vec()))
         .unwrap()
         .to_owned();
-    let config = ClientConfig::builder_with_details(
-        Arc::new(aws_lc_rs::default_provider()),
-        pinned_time(now),
-    )
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .unwrap()
-    .dangerous()
-    .with_custom_certificate_verifier(Arc::new(CaOnly(vec![anchor])))
-    .with_no_client_auth();
+    let config = ClientConfig::builder_with_details(Arc::new(provider), pinned_time(now))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(CaOnly(vec![anchor])))
+        .with_no_client_auth();
     TlsConnector::from(Arc::new(config))
 }
 
@@ -468,7 +595,7 @@ async fn tenant_backend_pins_the_kms_ca_and_reads_the_revision_from_the_san() {
 
     let ca_der = tls::cert_from_pem(&h.ca_pem).unwrap().to_vec();
     let tcp = TcpStream::connect(&addr).await.unwrap();
-    let mut tls = backend_client(&ca_der, h.now())
+    let mut tls = backend_client(&ca_der, h.now(), aws_lc_rs::default_provider())
         .connect(ServerName::try_from("app.example").unwrap(), tcp)
         .await
         .unwrap();
@@ -482,17 +609,21 @@ async fn tenant_backend_pins_the_kms_ca_and_reads_the_revision_from_the_san() {
     let (_, other_ca) = certs::new_ca(h.now()).unwrap();
     let tcp = TcpStream::connect(&addr).await.unwrap();
     assert!(
-        backend_client(&other_ca, h.now())
+        backend_client(&other_ca, h.now(), aws_lc_rs::default_provider())
             .connect(ServerName::try_from("app.example").unwrap(), tcp)
             .await
             .is_err()
     );
     let tcp = TcpStream::connect(&addr).await.unwrap();
     assert!(
-        backend_client(&ca_der, h.now() + certs::LEAF_TTL + Duration::from_secs(1))
-            .connect(ServerName::try_from("app.example").unwrap(), tcp)
-            .await
-            .is_err()
+        backend_client(
+            &ca_der,
+            h.now() + certs::LEAF_TTL + Duration::from_secs(1),
+            aws_lc_rs::default_provider(),
+        )
+        .connect(ServerName::try_from("app.example").unwrap(), tcp)
+        .await
+        .is_err()
     );
 }
 
@@ -535,7 +666,7 @@ async fn a_tenant_serves_its_endpoint_with_the_runtime_identity() {
 
     let ca_der = tls::cert_from_pem(&h.ca_pem).unwrap().to_vec();
     let tcp = TcpStream::connect(addr).await.unwrap();
-    let mut tls = backend_client(&ca_der, h.now())
+    let mut tls = backend_client(&ca_der, h.now(), aws_lc_rs::default_provider())
         .connect(ServerName::try_from("app.example").unwrap(), tcp)
         .await
         .unwrap();
@@ -681,6 +812,319 @@ async fn a_tenant_receives_its_app_key_through_the_runtime() {
     assert_eq!(h.audit("key.derive").await.len(), reads + 2);
 
     socket.stop().await;
+}
+
+#[tokio::test]
+async fn a_wrapped_endpoint_is_served_with_the_instance_leaf() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    let (app, hash, _) = app_with_secret(&h, b"v1").await;
+    let (port, _) = start_plain_service().await;
+    let (runtime, _) = start_runtime(&h, config_with_upstream(&h, port));
+    runtime.attest().await.unwrap();
+    let (socket, addr) = Socket::with_endpoint(runtime.clone()).await;
+
+    let mut config = hybrid_client(&h);
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let tls = connect(addr, &Arc::new(config)).await.unwrap();
+    let conn = tls.get_ref().1;
+    assert_eq!(
+        conn.negotiated_key_exchange_group().unwrap().name(),
+        rustls::NamedGroup::X25519MLKEM768
+    );
+    assert_eq!(
+        conn.protocol_version(),
+        Some(rustls::ProtocolVersion::TLSv1_3)
+    );
+    assert_eq!(conn.alpn_protocol(), None);
+    let chain = conn.peer_certificates().unwrap();
+    assert_eq!(chain.len(), 2);
+    assert_eq!(chain[1], tls::cert_from_pem(&h.ca_pem).unwrap());
+    let sans = tls::parse_instance_sans(&tls::uri_sans(&chain[0]).unwrap()).unwrap();
+    assert_eq!(
+        (sans.org_id, sans.app_id, sans.compose_hash),
+        (h.org, app, hash)
+    );
+
+    let reply = get_body(tls).await;
+    assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
+    assert!(reply.ends_with(BODY), "{reply}");
+
+    assert_eq!(socket.stop().await, Exit::Drained);
+}
+
+#[tokio::test]
+async fn a_client_without_the_hybrid_group_is_refused() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    app_with_secret(&h, b"v1").await;
+    let (port, _) = start_plain_service().await;
+    let (runtime, _) = start_runtime(&h, config_with_upstream(&h, port));
+    runtime.attest().await.unwrap();
+    let (socket, addr) = Socket::with_endpoint(runtime.clone()).await;
+
+    let ca_der = tls::cert_from_pem(&h.ca_pem).unwrap().to_vec();
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let tls = backend_client(&ca_der, h.now(), aws_lc_rs::default_provider())
+        .connect(ServerName::try_from("app.example").unwrap(), tcp)
+        .await
+        .unwrap();
+    assert_eq!(
+        tls.get_ref()
+            .1
+            .negotiated_key_exchange_group()
+            .unwrap()
+            .name(),
+        rustls::NamedGroup::X25519MLKEM768,
+        "a client offering both groups gets the hybrid one"
+    );
+
+    let classical = rustls::crypto::CryptoProvider {
+        kx_groups: vec![aws_lc_rs::kx_group::X25519],
+        ..aws_lc_rs::default_provider()
+    };
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let refused = backend_client(&ca_der, h.now(), classical)
+        .connect(ServerName::try_from("app.example").unwrap(), tcp)
+        .await;
+    assert!(refused.is_err());
+
+    assert_eq!(socket.stop().await, Exit::Drained);
+}
+
+#[tokio::test]
+async fn a_websocket_upgrade_and_an_h2_preface_pass_through() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    app_with_secret(&h, b"v1").await;
+    let (port, mut received) = start_plain_service().await;
+    let (runtime, _) = start_runtime(&h, config_with_upstream(&h, port));
+    runtime.attest().await.unwrap();
+    let (socket, addr) = Socket::with_endpoint(runtime.clone()).await;
+    let client = Arc::new(hybrid_client(&h));
+
+    let mut ws = connect(addr, &client).await.unwrap();
+    upgrade(&mut ws).await;
+    echo(&mut ws, b"\x81\x05hello").await;
+    echo(&mut ws, &[0u8, 1, 2, 255, 254, b'\r', b'\n']).await;
+
+    let mut h2 = connect(addr, &client).await.unwrap();
+    h2.write_all(H2_PREFACE).await.unwrap();
+    let seen = tokio::time::timeout(Duration::from_secs(5), received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(seen, H2_PREFACE);
+
+    drop(ws);
+    drop(h2);
+    assert_eq!(socket.stop().await, Exit::Drained);
+}
+
+fn leaf_serial(tls: &TlsStream<TcpStream>) -> Vec<u8> {
+    let leaf = &tls.get_ref().1.peer_certificates().unwrap()[0];
+    X509Certificate::from_der(leaf)
+        .unwrap()
+        .1
+        .raw_serial()
+        .to_vec()
+}
+
+/// The connection ends within `within`: EOF or an error, never data.
+async fn closed(tls: &mut TlsStream<TcpStream>, within: Duration) {
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(within, tls.read(&mut byte))
+        .await
+        .expect("the connection stayed open");
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+}
+
+async fn get_body(mut tls: TlsStream<TcpStream>) -> String {
+    tls.write_all(b"GET / HTTP/1.1\r\nHost: app\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut reply = String::new();
+    tls.read_to_string(&mut reply).await.unwrap();
+    reply
+}
+
+#[tokio::test]
+async fn the_endpoint_serves_a_renewed_leaf_without_dropping_open_connections() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    app_with_secret(&h, b"v1").await;
+    let (port, _) = start_plain_service().await;
+    let (runtime, _) = start_runtime(&h, config_with_upstream(&h, port));
+    runtime.attest().await.unwrap();
+    let (socket, addr) = Socket::with_endpoint(runtime.clone()).await;
+    // rustls' default client keeps a session cache and resumes whenever the server lets it.
+    let client = Arc::new(hybrid_client(&h));
+
+    let mut a = connect(addr, &client).await.unwrap();
+    upgrade(&mut a).await;
+    echo(&mut a, b"before the renewal").await;
+
+    runtime.attest().await.unwrap();
+    let mut b = connect(addr, &client).await.unwrap();
+    assert_ne!(leaf_serial(&b), leaf_serial(&a));
+    assert_eq!(b.get_ref().1.handshake_kind(), Some(HandshakeKind::Full));
+    upgrade(&mut b).await;
+    echo(&mut b, b"on the new leaf").await;
+
+    echo(&mut a, b"after the renewal").await;
+
+    let c = connect(addr, &client).await.unwrap();
+    assert_eq!(c.get_ref().1.handshake_kind(), Some(HandshakeKind::Full));
+    assert_eq!(leaf_serial(&c), leaf_serial(&b));
+
+    drop((a, b, c));
+    assert_eq!(socket.stop().await, Exit::Drained);
+}
+
+#[tokio::test]
+async fn an_expired_leaf_is_not_served() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    app_with_secret(&h, b"v1").await;
+    let (port, _) = start_plain_service().await;
+    let (runtime, clock) = start_runtime(&h, config_with_upstream(&h, port));
+    runtime.attest().await.unwrap();
+    let (socket, addr) = Socket::with_endpoint(runtime.clone()).await;
+    // The client's clock stays at the leaf's birth, so only the runtime can refuse.
+    let client = Arc::new(hybrid_client(&h));
+
+    *clock.lock().unwrap() = h.now() + certs::LEAF_TTL + Duration::from_secs(1);
+    assert!(connect(addr, &client).await.is_err());
+
+    *clock.lock().unwrap() = h.now();
+    runtime.attest().await.unwrap();
+    assert!(
+        get_body(connect(addr, &client).await.unwrap())
+            .await
+            .ends_with(BODY)
+    );
+
+    assert_eq!(socket.stop().await, Exit::Drained);
+}
+
+#[tokio::test]
+async fn an_unreachable_upstream_closes_the_connection_and_the_proxy_keeps_serving() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    app_with_secret(&h, b"v1").await;
+    let spare = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = spare.local_addr().unwrap().port();
+    drop(spare);
+    let (runtime, _) = start_runtime(&h, config_with_upstream(&h, port));
+    runtime.attest().await.unwrap();
+    let (socket, addr) = Socket::with_endpoint(runtime.clone()).await;
+    let client = Arc::new(hybrid_client(&h));
+
+    let mut tls = connect(addr, &client).await.unwrap();
+    closed(&mut tls, Duration::from_secs(12)).await;
+
+    plain_service(TcpListener::bind(("127.0.0.1", port)).await.unwrap());
+    assert!(
+        get_body(connect(addr, &client).await.unwrap())
+            .await
+            .ends_with(BODY)
+    );
+
+    assert_eq!(socket.stop().await, Exit::Drained);
+}
+
+#[tokio::test]
+async fn a_revoked_revision_closes_proxied_connections() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    let (_, hash, admin) = app_with_secret(&h, b"v1").await;
+    let (port, _) = start_plain_service().await;
+    let (runtime, _) = start_runtime(&h, config_with_upstream(&h, port));
+    runtime.attest().await.unwrap();
+    let (mut socket, addr) = Socket::with_endpoint(runtime.clone()).await;
+    let client = Arc::new(hybrid_client(&h));
+    let mut ws = connect(addr, &client).await.unwrap();
+    upgrade(&mut ws).await;
+    echo(&mut ws, b"open").await;
+
+    let payload = json!({ "compose_hash": hash, "issued_at": rfc3339(h.now()) });
+    let (status, reply) = h
+        .post(
+            &format!("/v1/revisions/{hash}/revoke"),
+            h.signed(context::CONTROL, payload, &admin),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let (status, reply) = socket.get("/v1/secrets/other").await;
+    assert_eq!((status, code(&reply)), (409, "revision_revoked"), "{reply}");
+
+    let exit = tokio::time::timeout(Duration::from_secs(5), &mut socket.task)
+        .await
+        .expect("a revocation does not wait for proxied connections")
+        .unwrap();
+    assert_eq!(exit, Exit::Revoked);
+    closed(&mut ws, Duration::from_secs(5)).await;
+    assert!(TcpStream::connect(addr).await.is_err());
+}
+
+#[tokio::test]
+async fn sigterm_drains_then_closes() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    app_with_secret(&h, b"v1").await;
+    let (port, _) = start_plain_service().await;
+    let (runtime, _) = start_runtime(&h, config_with_upstream(&h, port));
+    runtime.attest().await.unwrap();
+    let (mut socket, addr) = Socket::with_endpoint(runtime.clone()).await;
+    let client = Arc::new(hybrid_client(&h));
+    let mut idle = connect(addr, &client).await.unwrap();
+    upgrade(&mut idle).await;
+    echo(&mut idle, b"open").await;
+
+    let _ = socket.shutdown.take().unwrap().send(());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(TcpStream::connect(addr).await.is_err(), "still accepting");
+    echo(&mut idle, b"draining").await;
+
+    let exit = tokio::time::timeout(Duration::from_secs(12), &mut socket.task)
+        .await
+        .expect("the drain is bounded")
+        .unwrap();
+    assert_eq!(exit, Exit::Drained);
+    closed(&mut idle, Duration::from_secs(1)).await;
+}
+
+/// The wrap's output is what the runtime parses, binds and dials.
+#[test]
+fn the_wrap_and_the_runtime_agree_on_the_endpoint() {
+    let compose = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../testdata/manifest/08-wrap/app-compose.json"
+    ))
+    .unwrap();
+    let services = alpha_channel::compose::services(&compose).unwrap();
+    let runtime = &services["alpha-runtime"];
+    assert_eq!(runtime.ports, [format!("443:{}", alpha_runtime::TLS_PORT)]);
+    assert!(services["web"].ports.is_empty());
+
+    let env = |name: &str| runtime.environment.get(name).map(String::as_str);
+    let config = Config::parse(
+        env("ALPHACOMPUTE_KMS_CA_SPKI_SHA256").unwrap(),
+        env("ALPHACOMPUTE_KMS_REVISIONS").unwrap(),
+        env("ALPHACOMPUTE_KMS_ENDPOINTS").unwrap(),
+        env("ALPHACOMPUTE_SECRETS"),
+        env("ALPHACOMPUTE_TLS_UPSTREAM"),
+    )
+    .unwrap();
+    assert_eq!(config.tls_upstream.as_deref(), Some("web:80"));
 }
 
 #[tokio::test]

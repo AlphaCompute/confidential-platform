@@ -27,6 +27,13 @@ service-name:
         image: nginx@sha256:abababababababababababababababababababababababababababababababab
         ports: ["8080:80"]
   refusal: 'services: Web is not a name; use 1 to 64 lowercase'
+endpoint-host:
+  compose: |
+    services:
+      a..b:
+        image: nginx@sha256:abababababababababababababababababababababababababababababababab
+        ports: ["8080:80"]
+  refusal: 'services.a..b: the published service is reached by name over the compose network; use dot-separated labels'
 bind-short:
   compose: |
     services:

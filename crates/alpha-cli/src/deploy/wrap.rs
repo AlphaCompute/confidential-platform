@@ -1,6 +1,8 @@
 //! A customer's plain docker-compose becomes a Revision through the same runtime service and
 //! envelope as `alpha deploy`. What the compose may contain is an allowlist, and declared secrets
 //! reach only the services that list them, as files `alpha-runtime` writes into a tmpfs volume.
+//! The published service keeps its plain port on the compose network only: `alpha-runtime` owns
+//! the CVM's 443, terminates TLS there with the Instance leaf and proxies to it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
@@ -278,6 +280,12 @@ pub fn parse(bytes: &[u8]) -> Result<Plain, String> {
             all.len()
         )
     })?;
+    if !alpha_client::runtime::is_upstream_host(&endpoint.0) {
+        return Err(format!(
+            "services.{}: the published service is reached by name over the compose network; use dot-separated labels of 1 to 63 characters",
+            endpoint.0
+        ));
+    }
     Ok(Plain {
         services: plain_services,
         volumes,
@@ -318,10 +326,7 @@ pub fn wrap(
                     let image = v.as_str().ok_or("image is not a string")?;
                     Yaml::String(pin(image, digests)?)
                 }
-                // ponytail: the published service must speak TLS itself; a stock plain-HTTP image
-                // is not reachable over the Endpoint's TLS passthrough. Upgrade: `alpha-runtime`
-                // terminates TLS with the Instance leaf and proxies to the service.
-                Some("ports") if name == endpoint => strings(&[&format!("{APP_PORT}:{port}")]),
+                Some("ports") => continue,
                 Some("depends_on") if secrets_volume.is_some() => after_runtime(v)?,
                 _ => v,
             };
@@ -346,13 +351,21 @@ pub fn wrap(
     }
 
     let mut runtime_service = super::runtime_service(runtime)?;
+    runtime_service.insert(
+        key("ports"),
+        strings(&[&format!("{APP_PORT}:{}", alpha_client::runtime::TLS_PORT)]),
+    );
+    let Some(Yaml::Mapping(environment)) = runtime_service.get_mut("environment") else {
+        return Err("runtime service has no environment".into());
+    };
+    environment.insert(
+        key("ALPHACOMPUTE_TLS_UPSTREAM"),
+        key(&format!("{endpoint}:{port}")),
+    );
     // Only when some service waits for its secrets: a runtime image without the `healthcheck`
     // subcommand ignores its arguments and would start a second runtime that takes the socket.
     if !secrets.is_empty() {
         let map = serde_json::to_string(&secrets).map_err(|e| e.to_string())?;
-        let Some(Yaml::Mapping(environment)) = runtime_service.get_mut("environment") else {
-            return Err("runtime service has no environment".into());
-        };
         environment.insert(key("ALPHACOMPUTE_SECRETS"), key(&map));
         let Some(Yaml::Sequence(mounts)) = runtime_service.get_mut("volumes") else {
             return Err("runtime service has no volumes".into());
@@ -884,7 +897,7 @@ mod tests {
             assert!(services[service].get("secrets").is_none());
         }
         let web = &services["web"];
-        assert_eq!(web["ports"], strings(&["443:80"]));
+        assert!(web.get("ports").is_none());
         assert_eq!(web["restart"], key("unless-stopped"));
         assert_eq!(
             serde_yaml_ng::to_string(&web["depends_on"]).unwrap(),
@@ -896,6 +909,11 @@ mod tests {
         assert_eq!(cache["restart"], key("always"));
         assert!(cache.get("depends_on").is_none());
         let runtime = &services[RUNTIME_SERVICE];
+        assert_eq!(runtime["ports"], strings(&["443:8443"]));
+        assert_eq!(
+            runtime["environment"]["ALPHACOMPUTE_TLS_UPSTREAM"],
+            key("web:80")
+        );
         assert_eq!(
             runtime["environment"]["ALPHACOMPUTE_SECRETS"],
             key(r#"{"db":["db_password"],"web":["db_password","session_key"]}"#)
@@ -936,6 +954,7 @@ mod tests {
             "runtime-service",
             "service-reserved",
             "service-name",
+            "endpoint-host",
             "bind-short",
             "bind-long",
             "mount-image",
@@ -1007,10 +1026,10 @@ mod tests {
 
     #[test]
     fn boundaries_of_names_and_ports() {
-        for name in ["alphaweb", &"a".repeat(64)] {
+        for name in ["alphaweb", &"a".repeat(63)] {
             parse(single(name, "\"8080:80\"").as_bytes()).unwrap();
         }
-        for name in ["alpha-web", &"a".repeat(65), "..", "Web"] {
+        for name in ["alpha-web", &"a".repeat(64), &"a".repeat(65), "..", "Web"] {
             let err = parse(single(name, "\"8080:80\"").as_bytes()).unwrap_err();
             assert!(err.contains(name), "{err}");
         }
@@ -1130,11 +1149,14 @@ mod tests {
         let text = replaced(&text, "    secrets: [db_password]\n", "");
         let wrapped = wrap_text(&text, &BTreeMap::new()).unwrap();
         let yaml = compose_yaml(&wrapped);
-        assert!(
-            yaml["services"][RUNTIME_SERVICE]
-                .get("healthcheck")
-                .is_none()
+        let runtime = &yaml["services"][RUNTIME_SERVICE];
+        assert!(runtime.get("healthcheck").is_none());
+        assert_eq!(runtime["ports"], strings(&["443:8443"]));
+        assert_eq!(
+            runtime["environment"]["ALPHACOMPUTE_TLS_UPSTREAM"],
+            key("web:80")
         );
+        assert!(yaml["services"]["web"].get("ports").is_none());
         for absent in ["ALPHACOMPUTE_SECRETS", "alpha-secrets", "service_healthy"] {
             assert!(!wrapped.compose.contains(absent), "{absent}");
         }

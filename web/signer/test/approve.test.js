@@ -72,7 +72,6 @@ test("an uploaded compose is approved only after the registration receipt verifi
     "web",
     "Image: nginx:1.27",
     `Digest: sha256:${"ab".repeat(32)}`,
-    "Published ports: 443:80",
     "Image: postgres",
     "Named volumes: pgdata, alpha-secrets-db",
     "Named volumes: cachedata",
@@ -84,6 +83,7 @@ test("an uploaded compose is approved only after the registration receipt verifi
     assert.ok(text.includes(line), `${line}\n${text}`);
   }
   assert.ok(!text.includes("Receives secrets"));
+  assert.ok(!text.includes("Published ports"), "only the runtime publishes a port");
   const details = page.find((n) => n.tagName === "DETAILS");
   assert.ok(details && !details.open);
   const technical = details.lines().join("\n");
