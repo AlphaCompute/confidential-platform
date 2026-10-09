@@ -5,8 +5,13 @@ import pathlib
 import re
 import sys
 
-ASSET = re.compile(r"^[a-z_]+-[0-9a-f]{16}\.(js|wasm|css)$")
-TYPES = {"js": "text/javascript", "wasm": "application/wasm", "css": "text/css"}
+ASSET = re.compile(r"^[a-z_]+-[0-9a-f]{16}\.(js|wasm|css|woff2)$")
+TYPES = {
+    "js": "text/javascript",
+    "wasm": "application/wasm",
+    "css": "text/css",
+    "woff2": "font/woff2",
+}
 
 
 def main():

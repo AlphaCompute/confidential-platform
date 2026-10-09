@@ -4,7 +4,10 @@ Chrome's `--dump-dom` fires on virtual time, which runs past wasm compiling on a
 it sometimes prints the page before the page has run. This drives Chrome over its debugging pipe
 instead and waits until `#main` leaves its loading text or Chrome reports a resource blocked by its
 integrity attribute, after which nothing more will run. A block is printed as the first line,
-`INTEGRITY_BLOCKED`; a page that does neither before the deadline is a failure.
+`INTEGRITY_BLOCKED`; a page that does neither before the deadline is a failure. A page that ran
+then waits for its Public Sans face, printed as `FONTS_LOADED` once it is loaded, and
+every Content Security Policy violation Chrome logged is printed as a line `CSP_VIOLATION <text>`,
+all before the DOM.
 """
 
 import json
@@ -16,6 +19,11 @@ import time
 
 LOADING = "Loading…"
 DEADLINE = 30.0
+FONT_LOADED = """
+[...document.fonts].some(
+  (f) => f.family.replace(/"/g, "") === "Public Sans" && f.status === "loaded"
+)
+"""
 
 
 class Browser:
@@ -53,6 +61,7 @@ class Browser:
         self.buffer = b""
         self.next_id = 0
         self.blocked = False
+        self.violations = []
 
     def read(self, timeout):
         while b"\0" not in self.buffer:
@@ -79,8 +88,11 @@ class Browser:
                     raise RuntimeError(f"{method}: {reply['error']}")
                 return reply.get("result", {})
             if reply.get("method") == "Log.entryAdded":
-                if "integrity" in reply["params"]["entry"].get("text", ""):
+                text = reply["params"]["entry"].get("text", "")
+                if "integrity" in text:
                     self.blocked = True
+                if "Content Security Policy" in text:
+                    self.violations.append(text)
 
     def close(self):
         self.process.kill()
@@ -116,6 +128,13 @@ def main():
             time.sleep(0.1)
         if browser.blocked:
             print("INTEGRITY_BLOCKED")
+        else:
+            while not (loaded := evaluate(FONT_LOADED)) and time.monotonic() < end:
+                time.sleep(0.1)
+            if loaded:
+                print("FONTS_LOADED")
+        for violation in browser.violations:
+            print(f"CSP_VIOLATION {violation}")
         print(evaluate("document.documentElement.outerHTML"))
     finally:
         browser.close()

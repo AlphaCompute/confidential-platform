@@ -9,6 +9,9 @@
 <script defer src="@PAGE_NAME@" integrity="@PAGE_SRI@"></script>
 </head>
 <body>
-<main id="main"><p>Loading…</p></main>
+<div class="panel">
+<header class="brand"><span class="mark" aria-hidden="true"></span>AlphaCompute</header>
+<main id="main"><p class="loading">Loading…</p></main>
+</div>
 </body>
 </html>

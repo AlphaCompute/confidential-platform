@@ -325,10 +325,10 @@ class Node {
     for (const c of this.children) yield* c.walk();
   }
 
-  // One line per block, for assertions and failure messages.
+  // One line per block, for assertions and failure messages; a span is inline, part of its line.
   lines() {
     if (this.tagName === "#TEXT") return this.own ? [this.own] : [];
-    if (this.children.every((c) => c.tagName === "#TEXT")) {
+    if (this.children.every((c) => c.tagName === "#TEXT" || c.tagName === "SPAN")) {
       const t = this.textContent;
       return t ? [t] : [];
     }

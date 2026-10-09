@@ -2,6 +2,8 @@
 
 const WASM_URL = "@WASM_URL@";
 const WASM_SRI = "@WASM_SRI@";
+const FONT_URL = "@FONT_URL@";
+const FONT_SRI = "@FONT_SRI@";
 
 const VERSION_KEY = "alphacompute-platform-version";
 const TICKET = /^[A-Za-z0-9_-]{43}$/;
@@ -97,6 +99,13 @@ function el(tag, text, className) {
   if (text !== undefined) node.textContent = text;
   if (className) node.className = className;
   return node;
+}
+
+// A row of `label: value` whose two spans the stylesheet lays out apart.
+function fact(label, value, valueClass) {
+  const row = el("p", undefined, "fact");
+  row.append(el("span", `${label}: `), el("span", value, valueClass));
+  return row;
 }
 
 function stop(text) {
@@ -351,8 +360,8 @@ function keyIdOf(rawId, credentials) {
   return found ? found.key_id : null;
 }
 
-function button(label, action) {
-  const b = el("button", label);
+function button(label, action, className) {
+  const b = el("button", label, className);
   b.type = "button";
   b.addEventListener("click", async () => {
     b.disabled = true;
@@ -373,7 +382,11 @@ function offer(ui, note, ...nodes) {
 }
 
 function screen(...head) {
-  const ui = { facts: el("div"), step: el("div"), status: el("p", "", "status") };
+  const ui = {
+    facts: el("div", undefined, "facts"),
+    step: el("div", undefined, "step"),
+    status: el("p", "", "status"),
+  };
   document.getElementById("main").replaceChildren(...head, ui.facts, ui.step, ui.status);
   return ui;
 }
@@ -427,8 +440,12 @@ async function startClaim(view, ticket) {
   if (read.kind === "add" && read.credentials.length === 0) return stop(MESSAGES.no_credentials);
 
   const ui = screen(
+    el(
+      "p",
+      read.kind === "root" ? "Claim this organization" : "Add a passkey to this organization",
+      "eyebrow",
+    ),
     el("h1", read.org_name),
-    el("p", read.kind === "root" ? "Claim this organization" : "Add a passkey to this organization"),
     el("p", `This link stays open until ${read.expires_at}.`),
   );
   const c = { view, read, ticket, ui, session, checked: new Set() };
@@ -563,9 +580,9 @@ function principalKey(s, key, label) {
 
 function describeKey(title, key) {
   return [
-    el("p", title),
+    el("p", title, "eyebrow"),
     el("p", fingerprint(unb64u(key.spki)), "fingerprint"),
-    el("p", key.backed_up ? MESSAGES.synced : MESSAGES.device_bound),
+    el("p", key.backed_up ? MESSAGES.synced : MESSAGES.device_bound, "muted"),
   ];
 }
 
@@ -606,8 +623,10 @@ function offerSecond(c, note) {
         return offerSecondApproval(c);
       },
     ),
-    button("Skip for now", () =>
-      offer(c.ui, "", el("p", MESSAGES.one_key(c.read.expires_at), "warning")),
+    button(
+      "Skip for now",
+      () => offer(c.ui, "", el("p", MESSAGES.one_key(c.read.expires_at), "warning")),
+      "secondary",
     ),
   );
 }
@@ -631,7 +650,7 @@ function offerChecks(c, keys, done, note) {
   if (keys.every((k) => c.checked.has(k.id))) return offer(c.ui, "", el("p", done, "confirmed"));
   const steps = keys.map((key, i) => {
     const label = `Check passkey ${i + 1}`;
-    if (c.checked.has(key.id)) return el("p", `${label}: signed as expected.`);
+    if (c.checked.has(key.id)) return el("p", `${label}: signed as expected.`, "verified");
     const challenge = random(32);
     const options = getOptions(c.view, challenge, [key.id]);
     return button(label, async () => {
@@ -748,8 +767,8 @@ function parsedLaunch(read, compose, extra) {
 function imageLines(image) {
   const at = (image || "").indexOf("@sha256:");
   return at < 0
-    ? [el("p", `Image: ${image || "none"}`), el("p", "Digest: none (not pinned)", "digest")]
-    : [el("p", `Image: ${image.slice(0, at)}`), el("p", `Digest: ${image.slice(at + 1)}`, "digest")];
+    ? [fact("Image", image || "none"), fact("Digest", "none (not pinned)", "digest")]
+    : [fact("Image", image.slice(0, at)), fact("Digest", image.slice(at + 1), "digest")];
 }
 
 function serviceBlock(name, service) {
@@ -761,7 +780,7 @@ function serviceBlock(name, service) {
     ["Receives secrets", service.secrets],
   ];
   for (const [title, items] of lists) {
-    if (items.length) block.append(el("p", `${title}: ${items.join(", ")}`));
+    if (items.length) block.append(fact(title, items.join(", ")));
   }
   return block;
 }
@@ -781,12 +800,12 @@ function describeLaunch(a) {
     block.append(el("h3", "AlphaCompute runtime"), ...imageLines(runtime.image));
     nodes.push(block);
   }
-  nodes.push(el("p", `Machine: ${launch.machine}`));
+  nodes.push(fact("Machine", launch.machine));
   const details = el("details");
   details.append(
     el("summary", "Technical details"),
-    el("p", `App: ${read.app_id}`),
-    el("p", `compose_hash: ${read.compose_hash}`, "digest"),
+    fact("App", read.app_id),
+    fact("compose_hash", read.compose_hash, "digest"),
     el("pre", launch.compose),
   );
   nodes.push(details);
@@ -807,8 +826,12 @@ async function startApproval(view, viewText, ticket) {
   if (launch.refusal) return stop(launch.refusal);
 
   const ui = screen(
+    el(
+      "p",
+      `Launch approval for ${typeof read.org_name === "string" ? read.org_name : read.org_id}`,
+      "eyebrow",
+    ),
     el("h1", read.title),
-    el("p", `Launch approval for ${typeof read.org_name === "string" ? read.org_name : read.org_id}`),
   );
   const a = { view, viewText, read, ticket, ui, launch, credential: null, values: null };
   a.fields = secretFields(launch.services, before);
@@ -975,11 +998,15 @@ async function registerRevision(a, inputs) {
 }
 
 function declineButton(a) {
-  return button("Decline", async () => {
-    const reply = await api(a.view, "POST", `/v1/approval-requests/${a.ticket}/decline`);
-    if (reply.status === 200) return offer(a.ui, "", el("p", MESSAGES.declined, "confirmed"));
-    a.ui.status.textContent = approvalFailure(reply);
-  });
+  return button(
+    "Decline",
+    async () => {
+      const reply = await api(a.view, "POST", `/v1/approval-requests/${a.ticket}/decline`);
+      if (reply.status === 200) return offer(a.ui, "", el("p", MESSAGES.declined, "confirmed"));
+      a.ui.status.textContent = approvalFailure(reply);
+    },
+    "secondary",
+  );
 }
 
 // The verified catalog entry named by a template hash, rendered for `appId`, or null.
@@ -1066,6 +1093,15 @@ async function verifiedPlatform() {
   }
 }
 
+// Fetched with its integrity, which an @font-face source cannot carry, so that the hash of
+// index.html covers the glyphs the page draws. A font that fails leaves the fallback in place.
+async function loadFont() {
+  if (!document.fonts) return;
+  const reply = await fetch(FONT_URL, { integrity: FONT_SRI });
+  const face = new FontFace("Public Sans", await reply.arrayBuffer());
+  document.fonts.add(await face.load());
+}
+
 async function boot() {
   if (window.top !== window.self) return stop(MESSAGES.framed);
   if (!window.PublicKeyCredential) return stop(MESSAGES.no_passkeys);
@@ -1090,5 +1126,6 @@ async function boot() {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  loadFont().catch(() => {});
   boot().catch(() => stop(MESSAGES.unexpected));
 });
