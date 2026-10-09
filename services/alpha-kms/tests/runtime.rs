@@ -1104,6 +1104,37 @@ async fn sigterm_drains_then_closes() {
     closed(&mut idle, Duration::from_secs(1)).await;
 }
 
+/// The wrap's output is what the runtime parses, binds and dials.
+#[test]
+fn the_wrap_and_the_runtime_agree_on_the_endpoint() {
+    let compose = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../testdata/manifest/08-wrap/app-compose.json"
+    ))
+    .unwrap();
+    let services = alpha_channel::compose::services(&compose).unwrap();
+    let runtime = &services["alpha-runtime"];
+    assert_eq!(runtime.ports, [format!("443:{}", alpha_runtime::TLS_PORT)]);
+    assert!(services["web"].ports.is_empty());
+
+    let env = |name: &str| runtime.environment.get(name).map(String::as_str);
+    let config = Config::parse(
+        env("ALPHACOMPUTE_KMS_CA_SPKI_SHA256").unwrap(),
+        env("ALPHACOMPUTE_KMS_REVISIONS").unwrap(),
+        env("ALPHACOMPUTE_KMS_ENDPOINTS").unwrap(),
+        env("ALPHACOMPUTE_SECRETS"),
+        env("ALPHACOMPUTE_TLS_UPSTREAM"),
+    )
+    .unwrap();
+    assert_eq!(
+        config.tls_upstream,
+        Some(Upstream {
+            host: "web".into(),
+            port: 80
+        })
+    );
+}
+
 #[tokio::test]
 async fn runtime_refuses_another_ca_or_an_unlisted_revision_and_tries_the_next_endpoint() {
     let Some(h) = nonce_clock_harness().await else {

@@ -238,7 +238,7 @@ mod tests {
         let s = services(WRAP).unwrap();
         let strings = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
 
-        assert_eq!(s["web"].ports, strings(&["443:80"]));
+        assert!(s["web"].ports.is_empty());
         assert_eq!(s["web"].volumes, strings(&["alpha-secrets-web"]));
         assert_eq!(s["web"].secrets, strings(&["db_password", "session_key"]));
         assert!(
@@ -258,6 +258,7 @@ mod tests {
         assert!(s["cache"].secrets.is_empty());
 
         let runtime = &s["alpha-runtime"];
+        assert_eq!(runtime.ports, strings(&["443:8443"]));
         assert_eq!(
             runtime.volumes,
             strings(&["alpha-run", "alpha-secrets-db", "alpha-secrets-web"])
