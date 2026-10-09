@@ -3,7 +3,8 @@
 Chrome's `--dump-dom` fires on virtual time, which runs past wasm compiling on another thread, so
 it sometimes prints the page before the page has run. This drives Chrome over its debugging pipe
 instead and waits until `#main` leaves its loading text or Chrome reports a resource blocked by its
-integrity attribute, after which nothing more will run.
+integrity attribute, after which nothing more will run. A block is printed as the first line,
+`INTEGRITY_BLOCKED`; a page that does neither before the deadline is a failure.
 """
 
 import json
@@ -106,11 +107,15 @@ def main():
             return result.get("result", {}).get("value")
 
         end = time.monotonic() + DEADLINE
-        while time.monotonic() < end and not browser.blocked:
+        while not browser.blocked:
             text = evaluate('document.getElementById("main")?.textContent')
             if text is not None and text != LOADING:
                 break
+            if time.monotonic() >= end:
+                sys.exit("render.py: the page neither ran nor was blocked by integrity")
             time.sleep(0.1)
+        if browser.blocked:
+            print("INTEGRITY_BLOCKED")
         print(evaluate("document.documentElement.outerHTML"))
     finally:
         browser.close()

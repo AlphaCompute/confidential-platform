@@ -442,13 +442,16 @@ test("an add ticket registers a key signed by an existing passkey", async () => 
 });
 
 test("a device-bound passkey is named as such", async () => {
-  const { page } = await claimPage({}, { authenticator: new SoftwareAuthenticator({ flags: 0x05 }) });
-  await page.click("Create passkey");
-  await page.click("Confirm with passkey");
-  const text = page.text();
-  assert.ok(
-    text.includes("Device-bound passkey: if you lose this device you lose this key"),
-    text,
-  );
-  assert.ok(!text.includes(SYNCED));
+  // 0x0d is eligible for backup but not backed up yet.
+  for (const flags of [0x05, 0x0d]) {
+    const { page } = await claimPage({}, { authenticator: new SoftwareAuthenticator({ flags }) });
+    await page.click("Create passkey");
+    await page.click("Confirm with passkey");
+    const text = page.text();
+    assert.ok(
+      text.includes("Device-bound passkey: if you lose this device you lose this key"),
+      `${flags}: ${text}`,
+    );
+    assert.ok(!text.includes(SYNCED), flags);
+  }
 });

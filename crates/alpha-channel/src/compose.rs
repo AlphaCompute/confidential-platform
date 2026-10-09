@@ -161,10 +161,23 @@ fn volumes(name: &str, value: Option<&Yaml>) -> Result<Vec<String>, Error> {
 }
 
 fn declared_secrets(text: &str) -> Result<BTreeMap<String, Vec<String>>, Error> {
-    alpha_core::parse(text.as_bytes())
+    let declared: BTreeMap<String, Vec<String>> = alpha_core::parse(text.as_bytes())
         .ok()
         .and_then(|v| serde_json::from_value(v).ok())
-        .ok_or_else(|| malformed(&format!("{SECRETS} is not a JSON object of name lists")))
+        .ok_or_else(|| malformed(&format!("{SECRETS} is not a JSON object of name lists")))?;
+    // The runtime refuses at start what is not a lowercase path segment, so a compose naming one
+    // would be approved and never become healthy.
+    for (service, names) in &declared {
+        if let Some(bad) = std::iter::once(service)
+            .chain(names)
+            .find(|n| !alpha_core::is_key_purpose(n))
+        {
+            return Err(malformed(&format!(
+                "{SECRETS}: {bad:?} is not a lowercase path segment"
+            )));
+        }
+    }
+    Ok(declared)
 }
 
 #[cfg(test)]
@@ -271,6 +284,8 @@ mod tests {
             "services:\n  alpha-runtime:\n    environment:\n      ALPHACOMPUTE_SECRETS: '{\"alpha-runtime\":[1]}'\n",
             "services:\n  alpha-runtime:\n    environment:\n      ALPHACOMPUTE_SECRETS: '{\"alpha-runtime\":[\"a\"],\"alpha-runtime\":[\"b\"]}'\n",
             "services:\n  alpha-runtime:\n    environment:\n      ALPHACOMPUTE_SECRETS: '{\"web\":[\"a\"]}'\n",
+            "services:\n  alpha-runtime:\n    environment:\n      ALPHACOMPUTE_SECRETS: '{\"Alpha-runtime\":[\"a\"]}'\n",
+            "services:\n  alpha-runtime:\n    environment:\n      ALPHACOMPUTE_SECRETS: '{\"alpha-runtime\":[\"../a\"]}'\n",
         ] {
             assert_eq!(
                 services(&compose(yaml)).unwrap_err().code(),

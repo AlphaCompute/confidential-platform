@@ -33,6 +33,8 @@ jobs:
 
   signer:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2

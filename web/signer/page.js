@@ -24,7 +24,7 @@ const P256_SPKI_PREFIX = [
 const P256_SPKI_LENGTH = 91;
 const FLAG_UP = 0x01;
 const FLAG_UV = 0x04;
-const FLAG_BE = 0x08;
+const FLAG_BS = 0x10;
 
 const MESSAGES = {
   framed: "This page cannot run inside another page. Open the link in its own tab.",
@@ -329,7 +329,7 @@ function createdKey(credential) {
   return {
     id: b64u(credential.rawId),
     spki: b64u(spki),
-    backed_up: (authData[32] & FLAG_BE) !== 0,
+    backed_up: (authData[32] & FLAG_BS) !== 0,
   };
 }
 

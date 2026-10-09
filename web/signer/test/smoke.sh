@@ -92,5 +92,7 @@ render "$port" "$tmp/tampered.html"
 if grep -qF "$sentence" "$tmp/tampered.html"; then
   fail "a page script that does not match its integrity attribute ran"
 fi
+head -n 1 "$tmp/tampered.html" | grep -qx INTEGRITY_BLOCKED ||
+  fail "Chrome did not report the tampered page script blocked by its integrity attribute"
 
 echo SMOKE_OK
