@@ -300,8 +300,17 @@ nowMs)` returns the ServerHello, and `channel()` returns a `ServerChannel`, whic
 response's frames itself, seals only for a request it opened, and seals nothing after the end
 frame, so no AES-GCM nonce is ever used twice.
 
-The rest are functions: `composeServices(compose)`,
-`signable(context, fieldsJson, nowMs)`, `bodySha256(bytes)`,
+The rest are functions: `composeServices(compose)`, which returns
+`{service: {image, environment, ports, volumes, secrets}}`, with named volumes only and the
+Secrets the runtime delivers to each service from its measured `ALPHACOMPUTE_SECRETS`;
+`signingDigest(context, documentJson)`, which returns `{document, digest}`, the JCS text and its
+signing digest for `revision`, `secret`, `org-root-key` or `principal-key` and refuses any other
+context; `canonicalJson(text)`, the JCS text of a body, refusing a repeated key, whose
+`bodySha256` is the `request_sha256` a KMS receipt names;
+`verifyCatalog(text, catalogKeyJson, appId)`, which verifies a catalog file under the platform
+document's `catalog_key` and returns `{entry, compose}` with the template rendered for the App,
+or an error starting with `signature_invalid`, `template_mismatch`, `name_not_once` or
+`malformed`; `signable(context, fieldsJson, nowMs)`, `bodySha256(bytes)`,
 `verifyMemberRequest(context, documentJson, memberKeyB64, signatureJson, nowMs)`, which checks
 the signature, the document's shape and its freshness and returns the member key's SHA-256 in hex, and `verifyGrant(wire, spkiB64)`, which returns the grant as
 JSON.

@@ -1,5 +1,8 @@
-//! Each service's image and environment, read from the `app-compose.json` whose SHA-256 is the
-//! Revision, so a page shows what was measured rather than what its own bundle claims.
+//! Each service's image, environment, published ports, named volumes and the Secrets it
+//! receives, read from the `app-compose.json` whose SHA-256 is the Revision, so a page shows what
+//! was measured rather than what its own bundle claims. Which Secrets a service receives comes
+//! from the `alpha-runtime` service's measured `ALPHACOMPUTE_SECRETS`, the list the runtime itself
+//! delivers from.
 
 use std::collections::BTreeMap;
 
@@ -13,7 +16,13 @@ use crate::Error;
 pub struct Service {
     pub image: Option<String>,
     pub environment: BTreeMap<String, String>,
+    pub ports: Vec<String>,
+    pub volumes: Vec<String>,
+    pub secrets: Vec<String>,
 }
+
+const RUNTIME: &str = "alpha-runtime";
+const SECRETS: &str = "ALPHACOMPUTE_SECRETS";
 
 fn malformed(m: &str) -> Error {
     Error::Malformed(format!("compose: {m}"))
@@ -36,7 +45,7 @@ pub fn services(compose: &str) -> Result<BTreeMap<String, Service>, Error> {
     let Some(Yaml::Hash(services)) = get(root, "services") else {
         return Err(malformed("services is not a map"));
     };
-    services
+    let mut services = services
         .iter()
         .map(|(name, service)| {
             let name = name
@@ -67,7 +76,108 @@ pub fn services(compose: &str) -> Result<BTreeMap<String, Service>, Error> {
                     .collect::<Result<_, _>>()?,
                 Some(_) => return Err(malformed(&format!("{name}.environment is not a map"))),
             };
-            Ok((name.to_owned(), Service { image, environment }))
+            let service = Service {
+                image,
+                environment,
+                ports: ports(name, get(service, "ports"))?,
+                volumes: volumes(name, get(service, "volumes"))?,
+                secrets: Vec::new(),
+            };
+            Ok((name.to_owned(), service))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+
+    let declared = match services
+        .get(RUNTIME)
+        .and_then(|runtime| runtime.environment.get(SECRETS))
+    {
+        None => BTreeMap::new(),
+        Some(text) => declared_secrets(text)?,
+    };
+    // A Secret declared for a service the compose lacks would still be awaited by the runtime,
+    // so the page could not leave it out without the Instance never becoming healthy.
+    for (name, secrets) in declared {
+        services
+            .get_mut(&name)
+            .ok_or_else(|| malformed(&format!("{SECRETS} names {name}, which is not a service")))?
+            .secrets = secrets;
+    }
+    Ok(services)
+}
+
+fn list<'a>(name: &str, field: &str, value: Option<&'a Yaml>) -> Result<&'a [Yaml], Error> {
+    match value {
+        None => Ok(&[]),
+        Some(Yaml::Array(items)) => Ok(items),
+        Some(_) => Err(malformed(&format!("{name}.{field} is not a list"))),
+    }
+}
+
+fn ports(name: &str, value: Option<&Yaml>) -> Result<Vec<String>, Error> {
+    list(name, "ports", value)?
+        .iter()
+        .map(|port| match port {
+            Yaml::String(p) => Ok(p.clone()),
+            Yaml::Integer(p) => Ok(p.to_string()),
+            _ => Err(malformed(&format!(
+                "{name}.ports holds an entry that is neither text nor a number"
+            ))),
+        })
+        .collect()
+}
+
+/// Named volumes only: a bind mount names a host path, which says nothing about the Instance,
+/// and an anonymous volume has no name to show.
+fn volumes(name: &str, value: Option<&Yaml>) -> Result<Vec<String>, Error> {
+    let mut named = Vec::new();
+    for volume in list(name, "volumes", value)? {
+        match volume {
+            Yaml::String(short) => {
+                if let Some((source, _)) = short.split_once(':')
+                    && !source.starts_with(['/', '.', '~'])
+                {
+                    named.push(source.to_owned());
+                }
+            }
+            Yaml::Hash(long) => match (get(long, "type"), get(long, "source")) {
+                (Some(Yaml::String(kind)), Some(Yaml::String(source))) if kind == "volume" => {
+                    named.push(source.clone());
+                }
+                (Some(Yaml::String(_)), None | Some(Yaml::String(_))) => {}
+                _ => {
+                    return Err(malformed(&format!(
+                        "{name}.volumes holds a map without a text type and source"
+                    )));
+                }
+            },
+            _ => {
+                return Err(malformed(&format!(
+                    "{name}.volumes holds an entry that is neither text nor a map"
+                )));
+            }
+        }
+    }
+    Ok(named)
+}
+
+fn declared_secrets(text: &str) -> Result<BTreeMap<String, Vec<String>>, Error> {
+    let not_lists = || malformed(&format!("{SECRETS} is not a JSON object of name lists"));
+    let Ok(Value::Object(map)) = alpha_core::parse(text.as_bytes()) else {
+        return Err(not_lists());
+    };
+    map.into_iter()
+        .map(|(service, names)| {
+            let Value::Array(names) = names else {
+                return Err(not_lists());
+            };
+            let names = names
+                .into_iter()
+                .map(|n| match n {
+                    Value::String(n) => Ok(n),
+                    _ => Err(not_lists()),
+                })
+                .collect::<Result<_, _>>()?;
+            Ok((service, names))
         })
         .collect()
 }
@@ -79,6 +189,7 @@ mod tests {
     const DEPLOY: &str = include_str!("../../../testdata/manifest/05-deploy/app-compose.json");
     const DOCKER: &str =
         include_str!("../../../testdata/manifest/07-deploy-docker/app-compose.json");
+    const WRAP: &str = include_str!("../../../testdata/manifest/08-wrap/app-compose.json");
 
     fn compose(yaml: &str) -> String {
         serde_json::json!({ "docker_compose_file": yaml }).to_string()
@@ -122,5 +233,65 @@ mod tests {
             assert_eq!(services(&compose(yaml)).unwrap_err().code(), "malformed");
         }
         assert_eq!(services("{}").unwrap_err().code(), "malformed");
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+    fn reads_ports_named_volumes_and_secrets_of_a_wrapped_compose() {
+        let s = services(WRAP).unwrap();
+        let strings = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+
+        assert_eq!(s["web"].ports, strings(&["443:80"]));
+        assert_eq!(s["web"].volumes, strings(&["alpha-secrets-web"]));
+        assert_eq!(s["web"].secrets, strings(&["db_password", "session_key"]));
+        assert!(
+            s["web"]
+                .image
+                .as_deref()
+                .unwrap()
+                .starts_with("nginx:1.27@sha256:")
+        );
+        assert_eq!(s["web"].environment["MODE"], "production");
+
+        assert!(s["db"].ports.is_empty());
+        assert_eq!(s["db"].volumes, strings(&["pgdata", "alpha-secrets-db"]));
+        assert_eq!(s["db"].secrets, strings(&["db_password"]));
+
+        assert_eq!(s["cache"].volumes, strings(&["cachedata"]));
+        assert!(s["cache"].secrets.is_empty());
+
+        let runtime = &s["alpha-runtime"];
+        assert_eq!(
+            runtime.volumes,
+            strings(&["alpha-run", "alpha-secrets-db", "alpha-secrets-web"])
+        );
+        assert!(runtime.secrets.is_empty());
+        assert!(runtime.environment[SECRETS].starts_with("{\"db\""));
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+    fn ports_volumes_and_declared_secrets_of_another_shape_are_refused() {
+        let s = services(&compose(
+            "services:\n  a:\n    ports: [8080, \"9000:9000\"]\n    volumes:\n      - ./x:/x\n      - ~/y:/y\n      - /z\n      - type: bind\n        source: /h\n        target: /h\n      - type: volume\n        target: /anon\n",
+        ))
+        .unwrap();
+        assert_eq!(s["a"].ports, ["8080", "9000:9000"]);
+        assert!(s["a"].volumes.is_empty());
+
+        for yaml in [
+            "services:\n  a:\n    ports:\n      - target: 80\n",
+            "services:\n  a:\n    ports: \"80\"\n",
+            "services:\n  a:\n    volumes:\n      - 3\n",
+            "services:\n  a:\n    volumes:\n      - source: v\n        target: /v\n",
+            "services:\n  alpha-runtime:\n    environment:\n      ALPHACOMPUTE_SECRETS: '[\"x\"]'\n",
+            "services:\n  alpha-runtime:\n    environment:\n      ALPHACOMPUTE_SECRETS: '{\"alpha-runtime\":[1]}'\n",
+            "services:\n  alpha-runtime:\n    environment:\n      ALPHACOMPUTE_SECRETS: '{\"alpha-runtime\":[\"a\"],\"alpha-runtime\":[\"b\"]}'\n",
+            "services:\n  alpha-runtime:\n    environment:\n      ALPHACOMPUTE_SECRETS: '{\"web\":[\"a\"]}'\n",
+        ] {
+            assert_eq!(
+                services(&compose(yaml)).unwrap_err().code(),
+                "malformed",
+                "{yaml}"
+            );
+        }
     }
 }

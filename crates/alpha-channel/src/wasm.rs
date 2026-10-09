@@ -60,10 +60,83 @@ pub fn verify_kms_receipt(
     )
 }
 
-/// `{name: {image, environment}}` for every service of an `app-compose.json`.
+/// `{name: {image, environment, ports, volumes, secrets}}` for every service of an
+/// `app-compose.json`: `volumes` lists named volumes only, and `secrets` the names the runtime
+/// delivers to that service, from its measured `ALPHACOMPUTE_SECRETS`.
 #[wasm_bindgen(js_name = composeServices)]
 pub fn compose_services(compose: &str) -> Result<String, JsError> {
     to_json(&compose::services(compose).map_err(js)?)
+}
+
+fn json_text(what: &str, text: &str) -> Result<serde_json::Value, JsError> {
+    alpha_core::parse(text.as_bytes()).map_err(|e| js(Error::Malformed(format!("{what}: {e}"))))
+}
+
+fn canonical(value: &serde_json::Value) -> Result<String, JsError> {
+    alpha_core::jcs(value)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(|| {
+            js(Error::Malformed(
+                "the document does not canonicalize".into(),
+            ))
+        })
+}
+
+/// The document's JCS text and its signing digest under one of the four documents the signer
+/// page signs: `revision`, `secret`, `org-root-key` or `principal-key`. Nothing is added to the
+/// document, unlike `signable`.
+#[wasm_bindgen(js_name = signingDigest)]
+pub fn signing_digest(context: &str, document_json: &str) -> Result<Signable, JsError> {
+    use alpha_core::context;
+    let context = match context {
+        "revision" => context::REVISION,
+        "secret" => context::SECRET,
+        "org-root-key" => context::ORG_ROOT_KEY,
+        "principal-key" => context::PRINCIPAL_KEY,
+        other => {
+            return Err(js(Error::Malformed(format!(
+                "{other:?} is not a context the page signs"
+            ))));
+        }
+    };
+    let document = json_text("document", document_json)?;
+    let digest = alpha_core::signing_digest(context, &document)
+        .map_err(|e| js(Error::Malformed(e.to_string())))?;
+    Ok(Signable {
+        document: canonical(&document)?,
+        digest: digest.to_vec(),
+    })
+}
+
+/// The JCS text of `text`, refusing a repeated key: the exact bytes to send, whose `bodySha256`
+/// is the `request_sha256` a KMS receipt names.
+#[wasm_bindgen(js_name = canonicalJson)]
+pub fn canonical_json(text: &str) -> Result<String, JsError> {
+    canonical(&json_text("body", text)?)
+}
+
+fn catalog_error(e: alpha_core::catalog::CatalogError) -> JsError {
+    JsError::new(&format!("{}: {e}", e.code()))
+}
+
+/// `{entry, compose}` of a catalog file whose entry verifies under `catalog_key_json`, with the
+/// template rendered for `app_id`. The key must be the `catalog_key` of a verified platform
+/// document, and the caller must still compare the SHA-256 of `compose` with the hash it was
+/// asked to approve.
+#[wasm_bindgen(js_name = verifyCatalog)]
+pub fn verify_catalog(text: &str, catalog_key_json: &str, app_id: &str) -> Result<String, JsError> {
+    use alpha_core::catalog::{self, CatalogFile};
+    let file: CatalogFile = serde_json::from_value(json_text("catalog file", text)?)
+        .map_err(|e| js(Error::Malformed(format!("catalog file: {e}"))))?;
+    let key: alpha_core::CatalogKey = parse("catalog key", catalog_key_json)?;
+    let app_id: alpha_core::AppId = app_id
+        .parse()
+        .map_err(|_| js(Error::Malformed(format!("app_id {app_id:?} is not a UUID"))))?;
+    catalog::verify(&file, &key).map_err(catalog_error)?;
+    let compose = catalog::render(&file.template, &file.entry.template_sha256, app_id)
+        .map_err(catalog_error)?;
+    to_json(&json!({"entry": file.entry, "compose": compose}))
 }
 
 #[wasm_bindgen]
