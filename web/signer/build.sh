@@ -1,7 +1,7 @@
 #!/bin/sh
 # Builds the signer page into <out-dir>: index.html, headers, the font license, and the glue, wasm,
-# page script, stylesheet and fonts under content-addressed names. index.html pins the scripts and
-# the stylesheet by SRI, and the page script pins the wasm and the fonts, so the SHA-256 of
+# page script, stylesheet and font under content-addressed names. index.html pins the scripts and
+# the stylesheet by SRI, and the page script pins the wasm and the font, so the SHA-256 of
 # index.html (printed as bundle_sha256) covers every byte the page runs or draws with.
 set -eu
 LC_ALL=C
@@ -42,14 +42,10 @@ unfilled() {
 glue=$(place "$tmp/pkg/alpha_channel.js" alpha_channel js)
 wasm=$(place "$tmp/pkg/alpha_channel_bg.wasm" alpha_channel_bg wasm)
 style=$(place "$here/style.css" style css)
-light=$(place "$here/fonts/PublicSans-Light.woff2" public_sans_light woff2)
-regular=$(place "$here/fonts/PublicSans-Regular.woff2" public_sans_regular woff2)
-bold=$(place "$here/fonts/PublicSans-Bold.woff2" public_sans_bold woff2)
+font=$(place "$here/fonts/PublicSans-Regular.woff2" public_sans woff2)
 
 sed -e "s|@WASM_URL@|$wasm|" -e "s|@WASM_SRI@|$(sri "$out/$wasm")|" \
-  -e "s|@FONT_LIGHT_URL@|$light|" -e "s|@FONT_LIGHT_SRI@|$(sri "$out/$light")|" \
-  -e "s|@FONT_REGULAR_URL@|$regular|" -e "s|@FONT_REGULAR_SRI@|$(sri "$out/$regular")|" \
-  -e "s|@FONT_BOLD_URL@|$bold|" -e "s|@FONT_BOLD_SRI@|$(sri "$out/$bold")|" \
+  -e "s|@FONT_URL@|$font|" -e "s|@FONT_SRI@|$(sri "$out/$font")|" \
   "$here/page.js" > "$tmp/page.js"
 unfilled "$tmp/page.js"
 page=$(place "$tmp/page.js" page js)

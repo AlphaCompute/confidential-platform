@@ -2,11 +2,8 @@
 
 const WASM_URL = "@WASM_URL@";
 const WASM_SRI = "@WASM_SRI@";
-const FONTS = [
-  { url: "@FONT_LIGHT_URL@", integrity: "@FONT_LIGHT_SRI@", weight: "300" },
-  { url: "@FONT_REGULAR_URL@", integrity: "@FONT_REGULAR_SRI@", weight: "400" },
-  { url: "@FONT_BOLD_URL@", integrity: "@FONT_BOLD_SRI@", weight: "700" },
-];
+const FONT_URL = "@FONT_URL@";
+const FONT_SRI = "@FONT_SRI@";
 
 const VERSION_KEY = "alphacompute-platform-version";
 const TICKET = /^[A-Za-z0-9_-]{43}$/;
@@ -1096,17 +1093,13 @@ async function verifiedPlatform() {
   }
 }
 
-// Fetched with their integrity, which an @font-face source cannot carry, so that the hash of
+// Fetched with its integrity, which an @font-face source cannot carry, so that the hash of
 // index.html covers the glyphs the page draws. A font that fails leaves the fallback in place.
-async function loadFonts() {
-  if (!document.fonts || typeof FontFace !== "function") return;
-  await Promise.all(
-    FONTS.map(async ({ url, integrity, weight }) => {
-      const reply = await fetch(url, { integrity });
-      const face = new FontFace("Public Sans", await reply.arrayBuffer(), { weight });
-      document.fonts.add(await face.load());
-    }),
-  );
+async function loadFont() {
+  if (!document.fonts) return;
+  const reply = await fetch(FONT_URL, { integrity: FONT_SRI });
+  const face = new FontFace("Public Sans", await reply.arrayBuffer());
+  document.fonts.add(await face.load());
 }
 
 async function boot() {
@@ -1133,6 +1126,6 @@ async function boot() {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-  loadFonts().catch(() => {});
+  loadFont().catch(() => {});
   boot().catch(() => stop(MESSAGES.unexpected));
 });

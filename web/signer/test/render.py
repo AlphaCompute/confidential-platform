@@ -5,9 +5,9 @@ it sometimes prints the page before the page has run. This drives Chrome over it
 instead and waits until `#main` leaves its loading text or Chrome reports a resource blocked by its
 integrity attribute, after which nothing more will run. A block is printed as the first line,
 `INTEGRITY_BLOCKED`; a page that does neither before the deadline is a failure. A page that ran
-then waits for its three Public Sans faces, printed as `FONTS_LOADED` once all are loaded, and
-every Content Security Policy violation the document reported is printed as a line
-`CSP_VIOLATION <directive> <blocked URI>`, all before the DOM.
+then waits for its Public Sans face, printed as `FONTS_LOADED` once it is loaded, and
+every Content Security Policy violation Chrome logged is printed as a line `CSP_VIOLATION <text>`,
+all before the DOM.
 """
 
 import json
@@ -19,14 +19,7 @@ import time
 
 LOADING = "Loading…"
 DEADLINE = 30.0
-FONT_FACES = 3
-
-RECORD_VIOLATIONS = """
-window.__violations = [];
-document.addEventListener("securitypolicyviolation", (e) => {
-  window.__violations.push(`${e.effectiveDirective} ${e.blockedURI}`);
-});
-"""
+FONT_FACES = 1
 FONTS_LOADED = """
 [...document.fonts].filter(
   (f) => f.family.replace(/"/g, "") === "Public Sans" && f.status === "loaded"
@@ -69,6 +62,7 @@ class Browser:
         self.buffer = b""
         self.next_id = 0
         self.blocked = False
+        self.violations = []
 
     def read(self, timeout):
         while b"\0" not in self.buffer:
@@ -95,8 +89,11 @@ class Browser:
                     raise RuntimeError(f"{method}: {reply['error']}")
                 return reply.get("result", {})
             if reply.get("method") == "Log.entryAdded":
-                if "integrity" in reply["params"]["entry"].get("text", ""):
+                text = reply["params"]["entry"].get("text", "")
+                if "integrity" in text:
                     self.blocked = True
+                if "Content Security Policy" in text:
+                    self.violations.append(text)
 
     def close(self):
         self.process.kill()
@@ -112,12 +109,6 @@ def main():
             "Target.attachToTarget", {"targetId": target, "flatten": True}
         )["sessionId"]
         browser.call("Log.enable", session=session)
-        browser.call("Page.enable", session=session)
-        browser.call(
-            "Page.addScriptToEvaluateOnNewDocument",
-            {"source": RECORD_VIOLATIONS},
-            session=session,
-        )
         browser.call("Page.navigate", {"url": url}, session=session)
 
         def evaluate(expression):
@@ -143,7 +134,7 @@ def main():
                 time.sleep(0.1)
             if evaluate(FONTS_LOADED) == FONT_FACES:
                 print("FONTS_LOADED")
-        for violation in evaluate("window.__violations") or []:
+        for violation in browser.violations:
             print(f"CSP_VIOLATION {violation}")
         print(evaluate("document.documentElement.outerHTML"))
     finally:

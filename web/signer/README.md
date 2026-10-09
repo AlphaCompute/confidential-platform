@@ -3,7 +3,7 @@
 The page an organization opens to claim itself with passkeys and to approve or decline a launch.
 It runs `alpha-channel` as wasm, verifies the release-signed platform document with the key
 compiled into that wasm, and signs only what it has verified itself. It is static: plain
-JavaScript in classic scripts, one stylesheet, three fonts and the wasm, with no host name inside, so the same
+JavaScript in classic scripts, one stylesheet, one font and the wasm, with no host name inside, so the same
 bytes can be served from any origin the platform document lists under `signer.origins`.
 
 ## Secrets
@@ -25,23 +25,23 @@ web/signer/build.sh web/signer/dist
 
 It needs the toolchain in `rust-toolchain.toml`, `openssl`, and the `wasm-bindgen` CLI at the
 version `crates/alpha-channel` pins (`cargo install wasm-bindgen-cli --version 0.2.128 --locked`).
-The output directory must be empty or absent, and receives ten files:
+The output directory must be empty or absent, and receives eight files:
 
 - `index.html`, which loads the stylesheet and both scripts with `integrity="sha256-…"`;
 - `alpha_channel-<hex>.js`, the wasm-bindgen glue built for `--target no-modules`;
 - `alpha_channel_bg-<hex>.wasm`, which the page script fetches with its integrity;
 - `page-<hex>.js` and `style-<hex>.css`;
-- `public_sans_{light,regular,bold}-<hex>.woff2`, which the page script fetches with their
-  integrity and adds as `FontFace`s, because an `@font-face` source cannot carry one;
+- `public_sans-<hex>.woff2`, which the page script fetches with its integrity and adds as a
+  `FontFace`, because an `@font-face` source cannot carry one;
 - `headers`, the response headers the host must send;
-- `OFL.txt`, the license of the fonts, which the host need not serve.
+- `OFL.txt`, the license of the font, which the host need not serve.
 
-The fonts are Public Sans (from `fonts/`), under the SIL Open Font License 1.1 in
+The font is Public Sans Regular (from `fonts/`), under the SIL Open Font License 1.1 in
 `fonts/OFL.txt`. Headings use the system's serif faces; no font of unknown license is bundled.
 
 Every `<hex>` is the first 16 hex digits of the file's SHA-256. The script prints
 `bundle_sha256 sha256:<hex>`, the SHA-256 of `index.html`, and the commit it was built from.
-`index.html` pins both scripts and the stylesheet, and the page script pins the wasm and the fonts,
+`index.html` pins both scripts and the stylesheet, and the page script pins the wasm and the font,
 so that one hash covers every byte the page runs or draws with.
 
 ## Comparing `bundle_sha256`
@@ -91,5 +91,4 @@ give, checks the headers and content types, and loads `/sign/approve` in headles
 (`$CHROME`, or `google-chrome`, `chromium` or the macOS application) through `test/render.py`. The
 test platform document verifies but names no signer, so the page must end on "This page is not
 served from an AlphaCompute signer address."; with one byte of the page script changed, its
-integrity check must stop it before that. The page that ran must also have loaded its three font
-faces and met no Content Security Policy violation. It prints `SMOKE_OK` when all of this holds.
+integrity check must stop it before that. The page that ran must also have loaded its font and met no Content Security Policy violation. It prints `SMOKE_OK` when all of this holds.

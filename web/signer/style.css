@@ -31,7 +31,6 @@ body {
   background: #0c0c0c;
   color: var(--text);
   font-family: var(--sans);
-  font-weight: 400;
   -webkit-font-smoothing: antialiased;
 }
 
@@ -150,19 +149,12 @@ h3 {
   margin: 0;
   font-family: var(--serif);
   font-weight: 300;
-  color: var(--text);
   overflow-wrap: anywhere;
 }
 
 h1 {
-  font-size: 26px;
+  font-size: clamp(26px, 5vw, 30px);
   line-height: 1.2;
-}
-
-@media (min-width: 620px) {
-  h1 {
-    font-size: 30px;
-  }
 }
 
 h2 {
@@ -245,8 +237,6 @@ pre {
 }
 
 .service {
-  display: flex;
-  flex-direction: column;
   padding-top: 16px;
   border-top: 1px solid var(--border-subtle);
 }
