@@ -52,3 +52,17 @@ pre {
   padding: 0.5rem 0.75rem;
   background: rgba(198, 40, 40, 0.08);
 }
+
+.confirmed {
+  border-left: 4px solid #2e7d32;
+  padding: 0.5rem 0.75rem;
+  background: rgba(46, 125, 50, 0.08);
+}
+
+.status:empty {
+  display: none;
+}
+
+.status {
+  font-weight: 600;
+}
