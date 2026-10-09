@@ -250,7 +250,7 @@ class SoftwareAuthenticator {
       JSON.stringify({
         type: "webauthn.get",
         challenge: b64u(challenge),
-        origin: this.origin || ORIGIN,
+        origin: ORIGIN,
         crossOrigin: false,
       }),
     );
@@ -357,7 +357,7 @@ class Node {
 
 function jsonReply(status, body, headers = {}) {
   const text = typeof body === "string" ? body : JSON.stringify(body);
-  return new Response(status === 204 ? null : text, {
+  return new Response(text, {
     status,
     headers: { "Content-Type": "application/json", ...headers },
   });
@@ -369,7 +369,6 @@ function memoryStorage(initial = {}) {
     data,
     getItem: (k) => (data.has(k) ? data.get(k) : null),
     setItem: (k, v) => data.set(k, String(v)),
-    removeItem: (k) => data.delete(k),
   };
 }
 
@@ -410,7 +409,7 @@ async function loadPage(options = {}) {
   async function fakeFetch(resource, init = {}) {
     const url = String(resource);
     const method = (init.method || "GET").toUpperCase();
-    fetches.push({ method, url, body: init.body, time: clock.now, init });
+    fetches.push({ method, url, body: init.body, time: clock.now });
     if (url === b.wasmName) {
       assert.equal(init.integrity, wasmSri, "the page fetched the wasm without its integrity");
       return new Response(b.wasm, { headers: { "Content-Type": "application/wasm" } });
@@ -435,7 +434,7 @@ async function loadPage(options = {}) {
       );
       const route = routes[key] || routes[prefix];
       if (!route) return jsonReply(404, { error: "no route", error_code: "SHROUD_NOT_FOUND" });
-      const answer = await route({ method, path: pathname, body: init.body, init });
+      const answer = await route({ method, path: pathname, body: init.body });
       if (answer instanceof Error) throw new TypeError("network");
       return jsonReply(answer.status, answer.body, answer.headers);
     }
@@ -537,16 +536,13 @@ async function loadPage(options = {}) {
     fetches,
     timers,
     prompts,
-    clicks,
     authenticator,
     consoleCalls,
     seals,
-    sandbox,
     main,
     use(other) {
       device.current = other;
     },
-    run: (code) => vm.runInContext(code, context),
     call(name, ...args) {
       context.__args = args;
       return vm.runInContext(`${name}(...__args)`, context);
@@ -727,7 +723,6 @@ function approvalApi(options = {}) {
       api.read || { status: 200, body: Object.fromEntries(fields.map((k) => [k, api[k]])) },
     [`POST ${base}/decline`]: () => {
       api.declines += 1;
-      if (api.reply.decline) return api.reply.decline();
       if (api.state !== "pending") {
         return {
           status: 409,
@@ -755,7 +750,6 @@ function approvalApi(options = {}) {
     },
     [`POST ${base}/kms-channel`]: (req) => {
       api.channels.push(req.body);
-      if (api.reply.channel) return api.reply.channel(req.body);
       return { status: 200, body: { server_hello: api.channels.length } };
     },
     [`PUT ${base}/secrets/*`]: (req) => {

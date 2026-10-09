@@ -198,6 +198,15 @@ test("a clock off by more than four minutes is refused before any prompt", async
   assert.ok(near.page.buttons().includes("Create passkey"), near.page.text());
 });
 
+test("a claim read that never arrives reads unavailable", async () => {
+  const api = claimApi();
+  const read = Object.keys(api.routes).find((k) => k.startsWith("GET "));
+  api.routes[read] = () => new Error("network");
+  const page = await loadPage({ routes: api.routes });
+  await page.startClaim();
+  assert.equal(page.text(), "The service is unavailable. Try again in a minute.");
+});
+
 test("a closed, expired or unknown claim is refused", async () => {
   const now = Date.now();
   const cases = [
