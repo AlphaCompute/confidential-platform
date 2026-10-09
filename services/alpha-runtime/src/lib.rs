@@ -502,9 +502,15 @@ impl Runtime {
             return Delivery::Revoked;
         }
         let names: BTreeSet<&String> = self.config.secrets.values().flatten().collect();
+        let Some(app_id) = self.attested().map(|a| a.identity.app_id) else {
+            eprintln!("alpha-runtime: secrets: {}", Error::NotAttested);
+            return Delivery::Incomplete(names.into_iter().cloned().collect());
+        };
         let mut incomplete = Vec::new();
         for name in names {
-            let secret = match self.secret(name).await {
+            // Secrets are unique per organization and name, so two Apps declaring the same name
+            // would replace each other's value and grant.
+            let secret = match self.secret(&format!("{app_id}.{name}")).await {
                 Ok(secret) => secret,
                 Err(e) if e.revoked() => return Delivery::Revoked,
                 Err(e) => {

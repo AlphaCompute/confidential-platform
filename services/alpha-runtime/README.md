@@ -25,7 +25,7 @@ to the socket), and comes up only after the first attestation succeeded:
 | Route | Reply |
 |---|---|
 | `GET /v1/identity` | `{app_id, org_id, compose_hash, certificate_chain, tls_private_key, attestation_result, app_compose}` — the ids and the hash are read from the leaf's SANs; `tls_private_key` is the PKCS#8 DER, base64url; `app_compose` is the Instance's `app-compose.json`, read once at start from the guest agent's `Info` and refused unless its SHA-256 is the leaf's Revision digest, so a service can show a client which compose it runs |
-| `GET /v1/secrets/{name}` | the KMS reply, fetched over mTLS with the leaf and cached until the leaf expires; a KMS error passes through in its envelope with its status |
+| `GET /v1/secrets/{name}` | the KMS reply for the Secret of that KMS name (a declared Secret's is `<app_id>.<name>`), fetched over mTLS with the leaf and cached until the leaf expires; a KMS error passes through in its envelope with its status |
 | `GET /v1/keys/{purpose}` | the KMS reply to `POST /v1/keys/derive` for that purpose, `{key}`, 32 bytes base64url: the App's own key, the same for every Revision of the App; fetched and cached like a secret, up to 64 purposes per leaf, beyond which a key is derived again on every read |
 | `GET /healthz` | `{attested, cert_not_after}` |
 
@@ -38,8 +38,12 @@ revoked; the next call that reaches the KMS is the one that ends the process.
 A stock image reads its Secrets as Docker-style files, with no code change. After the first
 attestation the runtime writes each declared Secret to `/run/alpha-secrets/<service>/<name>`, the
 read-write mount of that service's own tmpfs volume, which the service sees read-only as
-`/run/secrets/<name>`; a service that declared nothing has no volume and gets nothing. Each name
-is fetched once per pass through the same per-leaf cache as `GET /v1/secrets/{name}` and replaced
+`/run/secrets/<name>`; a service that declared nothing has no volume and gets nothing. A declared
+`<name>` is read from the KMS as `<app_id>.<name>`, with the App id the runtime attested as
+(lowercase, hyphenated): Secrets are unique per organization and name, so two Apps of one
+organization declaring the same name would otherwise replace each other's value and grant. The
+socket route `GET /v1/secrets/{name}` is unchanged and passes its name to the KMS as it is. Each
+name is fetched once per pass through the same per-leaf cache as that route and replaced
 atomically: a mode 0444 temp file in the same directory, renamed over the name; a file already
 holding the value is left alone. The runtime never creates a directory, so a missing volume shows
 up as a logged failure rather than as files in the container layer.

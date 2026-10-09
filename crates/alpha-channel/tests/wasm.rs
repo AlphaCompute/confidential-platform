@@ -12,8 +12,9 @@ use std::collections::BTreeMap;
 use alpha_channel::handshake;
 use alpha_channel::secret::{self, Sealed};
 use alpha_channel::wasm::{
-    Initiator, KmsSecretSealer, Responder, body_sha256, compose_services, signable, verify_grant,
-    verify_kms_receipt, verify_member_request, verify_platform,
+    Initiator, KmsSecretSealer, Responder, body_sha256, canonical_json, compose_services, signable,
+    signing_digest, verify_catalog, verify_grant, verify_kms_receipt, verify_member_request,
+    verify_platform,
 };
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
@@ -395,4 +396,124 @@ fn kms_receipt_vectors_give_their_recorded_result_through_the_export() {
             (Ok(_), result) => panic!("{name}: accepted, expected {result}"),
         }
     }
+}
+
+#[wasm_bindgen_test]
+fn signing_digest_matches_the_core_for_the_four_page_contexts() {
+    use alpha_core::context;
+    let text = r#"{"z":1,"a":{"y":"é","b":[2,1]},"m":null}"#;
+    let value: Value = serde_json::from_str(text).unwrap();
+    let jcs = String::from_utf8(alpha_core::jcs(&value).unwrap()).unwrap();
+    for (name, full) in [
+        ("revision", context::REVISION),
+        ("secret", context::SECRET),
+        ("org-root-key", context::ORG_ROOT_KEY),
+        ("principal-key", context::PRINCIPAL_KEY),
+    ] {
+        let s = signing_digest(name, text).map_err(message).unwrap();
+        assert_eq!(s.document, jcs, "{name}");
+        assert_eq!(
+            s.digest,
+            alpha_core::signing_digest(full, &value).unwrap(),
+            "{name}"
+        );
+    }
+    for other in ["control", "catalog", "kms-receipt", context::REVISION, ""] {
+        let m = message(signing_digest(other, text).err().unwrap());
+        assert!(m.starts_with("malformed:"), "{other}: {m}");
+    }
+    let m = message(
+        signing_digest("revision", r#"{"a":1,"a":2}"#)
+            .err()
+            .unwrap(),
+    );
+    assert!(m.starts_with("malformed:"), "{m}");
+}
+
+macro_rules! vector {
+    ($dir:literal, $n:literal) => {
+        (
+            $n,
+            include_str!(concat!("../../../testdata/", $dir, "/", $n)),
+        )
+    };
+}
+
+#[wasm_bindgen_test]
+fn canonical_json_gives_the_recorded_digest_for_every_jcs_vector() {
+    let expected: BTreeMap<String, String> =
+        serde_json::from_str(include_str!("../../../testdata/jcs/expected.json")).unwrap();
+    let vectors = [
+        vector!("jcs", "01-compose-body.json"),
+        vector!("jcs", "02-nested.json"),
+        vector!("jcs", "03-numbers.json"),
+        vector!("jcs", "04-duplicate-key.json"),
+        vector!("jcs", "05-escaped-duplicate.json"),
+        vector!("jcs", "06-nested-duplicate.json"),
+        vector!("jcs", "07-lone-surrogate.json"),
+        vector!("jcs", "08-empty-object.json"),
+        vector!("jcs", "09-empty.json"),
+    ];
+    assert_eq!(vectors.len(), expected.len());
+    for (name, text) in vectors {
+        match (canonical_json(text), expected[name].as_str()) {
+            (Ok(c), digest) => assert_eq!(body_sha256(c.as_bytes()), digest, "{name}"),
+            (Err(e), "refused") => {
+                let m = message(e);
+                assert!(m.starts_with("malformed:"), "{name}: {m}");
+            }
+            (Err(e), digest) => panic!("{name}: refused ({}), expected {digest}", message(e)),
+        }
+    }
+}
+
+#[wasm_bindgen_test]
+fn verify_catalog_gives_the_recorded_verdicts_and_the_rendered_compose() {
+    let expected: Value =
+        serde_json::from_str(include_str!("../../../testdata/catalog/expected.json")).unwrap();
+    let key = expected["catalog_key"].to_string();
+    let app_id = expected["app_id"].as_str().unwrap();
+    let vectors = [
+        vector!("catalog", "name-absent.json"),
+        vector!("catalog", "name-repeated.json"),
+        vector!("catalog", "signed-by-other-key.json"),
+        vector!("catalog", "signed-by-release-key.json"),
+        vector!("catalog", "template-tampered.json"),
+        vector!("catalog", "valid.json"),
+    ];
+    for (name, text) in vectors {
+        let verdicts = &expected["vectors"][name];
+        let code = [&verdicts["signature"], &verdicts["render"]]
+            .into_iter()
+            .map(|v| v.as_str().unwrap())
+            .find(|v| *v != "ok");
+        match (verify_catalog(text, &key, app_id), code) {
+            (Ok(out), None) => {
+                let out: Value = serde_json::from_str(&out).unwrap();
+                let file: Value = serde_json::from_str(text).unwrap();
+                assert_eq!(out["entry"], file["entry"], "{name}");
+                assert_eq!(
+                    out["compose"].as_str().unwrap().as_bytes(),
+                    include_bytes!("../../../testdata/catalog/app-compose.json"),
+                    "{name}"
+                );
+            }
+            (Err(e), Some(code)) => {
+                let m = message(e);
+                assert!(m.starts_with(&format!("{code}:")), "{name}: {m}");
+            }
+            (Ok(_), Some(code)) => panic!("{name}: accepted, expected {code}"),
+            (Err(e), None) => panic!("{name}: refused: {}", message(e)),
+        }
+    }
+
+    let valid = include_str!("../../../testdata/catalog/valid.json");
+    let repeated = valid.replacen('{', r#"{"template":"x","#, 1);
+    let m = message(verify_catalog(&repeated, &key, app_id).err().unwrap());
+    assert!(m.starts_with("malformed:"), "{m}");
+    let not_ed25519 =
+        json!({"algorithm": "ecdsa-p256", "public_key": expected["catalog_key"]["public_key"]})
+            .to_string();
+    let m = message(verify_catalog(valid, &not_ed25519, app_id).err().unwrap());
+    assert!(m.starts_with("malformed:"), "{m}");
 }

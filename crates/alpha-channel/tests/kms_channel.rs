@@ -254,10 +254,21 @@ fn a_plaintext_without_its_organization_is_malformed() {
 
 #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn a_payload_name_that_is_not_a_secret_name_is_refused() {
-    for name in [Some("../x"), Some("A"), None] {
+    let scoped = format!("01920000-0000-7000-8000-000000000002.{}", "a".repeat(64));
+    let too_long = format!("{scoped}a");
+    for name in [Some("../x"), Some("A"), Some(too_long.as_str()), None] {
         let err = seal_to(&node(), with_ticket, CA, &revisions(), &payload(name), NOW).unwrap_err();
         assert_eq!(err.code(), "malformed", "{name:?}");
     }
+    seal_to(
+        &node(),
+        with_ticket,
+        CA,
+        &revisions(),
+        &payload(Some(&scoped)),
+        NOW,
+    )
+    .unwrap();
 }
 
 /// A pk of the right length whose ML-KEM coefficients are all 4095, past the modulus 3329.

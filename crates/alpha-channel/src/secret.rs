@@ -44,7 +44,7 @@ pub fn seal(
     let name = payload
         .get("name")
         .and_then(Value::as_str)
-        .filter(|name| alpha_core::is_key_purpose(name))
+        .filter(|name| alpha_core::is_secret_name(name))
         .ok_or_else(|| Error::Malformed("the payload's name is not a secret name".into()))?;
     let digest = digest(payload)?;
     let plaintext = Zeroizing::new([&digest[..], org_id.as_bytes(), value].concat());

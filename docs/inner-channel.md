@@ -300,8 +300,17 @@ nowMs)` returns the ServerHello, and `channel()` returns a `ServerChannel`, whic
 response's frames itself, seals only for a request it opened, and seals nothing after the end
 frame, so no AES-GCM nonce is ever used twice.
 
-The rest are functions: `composeServices(compose)`,
-`signable(context, fieldsJson, nowMs)`, `bodySha256(bytes)`,
+The rest are functions: `composeServices(compose)`, which returns
+`{service: {image, environment, ports, volumes, secrets}}`, with named volumes only and the
+Secrets the runtime delivers to each service from its measured `ALPHACOMPUTE_SECRETS`;
+`signingDigest(context, documentJson)`, which returns `{document, digest}`, the JCS text and its
+signing digest for `revision`, `secret`, `org-root-key` or `principal-key` and refuses any other
+context; `canonicalJson(text)`, the JCS text of a body, refusing a repeated key, whose
+`bodySha256` is the `request_sha256` a KMS receipt names;
+`verifyCatalog(text, catalogKeyJson, appId)`, which verifies a catalog file under the platform
+document's `catalog_key` and returns `{entry, compose}` with the template rendered for the App,
+or an error starting with `signature_invalid`, `template_mismatch`, `name_not_once` or
+`malformed`; `signable(context, fieldsJson, nowMs)`, `bodySha256(bytes)`,
 `verifyMemberRequest(context, documentJson, memberKeyB64, signatureJson, nowMs)`, which checks
 the signature, the document's shape and its freshness and returns the member key's SHA-256 in hex, and `verifyGrant(wire, spkiB64)`, which returns the grant as
 JSON.
@@ -315,7 +324,8 @@ crates/alpha-channel/build-web.sh <out-dir>
 ```
 
 The script writes `alpha_channel.js`, its typings and `alpha_channel_bg.wasm` for
-`wasm-bindgen --target web`. It then prints `sha256 <hex> alpha_channel_bg.wasm` and the commit
+`wasm-bindgen --target web`; an optional second argument picks another wasm-bindgen target
+(`no-modules` for the signer page). It then prints `sha256 <hex> alpha_channel_bg.wasm` and the commit
 it was built from. It needs the toolchain in `rust-toolchain.toml` and the `wasm-bindgen` CLI at
 the exact version the crate pins (the script refuses any other). Paths are remapped, so the same
 commit built with those two gives the same hash. A page calls `init()` from the glue; Node calls

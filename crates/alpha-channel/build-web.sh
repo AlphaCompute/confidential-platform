@@ -1,10 +1,12 @@
 #!/bin/sh
 # Builds the package a page loads (JavaScript glue, typings and the .wasm) into <out-dir>, then
 # prints the .wasm's SHA-256 and the revision it was built from, so anyone can rebuild it from a
-# public commit and compare.
+# public commit and compare. The optional [target] is the wasm-bindgen target, `web` by default;
+# the signer page uses `no-modules`, whose glue is a classic script that SRI can cover.
 set -eu
 
-out=${1:?usage: build-web.sh <out-dir>}
+out=${1:?usage: build-web.sh <out-dir> [target]}
+target=${2:-web}
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
 
@@ -21,7 +23,8 @@ fi
 # Absolute paths end up in the binary; mapping them keeps the hash independent of the checkout.
 RUSTFLAGS="--remap-path-prefix=$root=/src --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo" \
   cargo build -p alpha-channel --release --target wasm32-unknown-unknown
-wasm-bindgen --target web --out-dir "$out" target/wasm32-unknown-unknown/release/alpha_channel.wasm
+wasm-bindgen --target "$target" --out-dir "$out" \
+  "${CARGO_TARGET_DIR:-target}/wasm32-unknown-unknown/release/alpha_channel.wasm"
 wasm="$out/alpha_channel_bg.wasm"
 
 hash=$( (sha256sum "$wasm" 2>/dev/null || shasum -a 256 "$wasm") | cut -d' ' -f1)
