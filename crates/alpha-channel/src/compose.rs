@@ -33,7 +33,7 @@ fn get<'a>(map: &'a yaml_rust2::yaml::Hash, key: &str) -> Option<&'a Yaml> {
 }
 
 pub fn services(compose: &str) -> Result<BTreeMap<String, Service>, Error> {
-    let value: Value = serde_json::from_str(compose).map_err(|e| malformed(&e.to_string()))?;
+    let value = alpha_core::parse(compose.as_bytes()).map_err(|e| malformed(&e.to_string()))?;
     let yaml = value
         .get("docker_compose_file")
         .and_then(Value::as_str)
@@ -293,5 +293,8 @@ mod tests {
                 "{yaml}"
             );
         }
+        let repeated =
+            r#"{"docker_compose_file":"services: {}","docker_compose_file":"services: {}"}"#;
+        assert_eq!(services(repeated).unwrap_err().code(), "malformed");
     }
 }
