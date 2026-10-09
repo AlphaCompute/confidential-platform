@@ -19,11 +19,10 @@ import time
 
 LOADING = "Loading…"
 DEADLINE = 30.0
-FONT_FACES = 1
-FONTS_LOADED = """
-[...document.fonts].filter(
+FONT_LOADED = """
+[...document.fonts].some(
   (f) => f.family.replace(/"/g, "") === "Public Sans" && f.status === "loaded"
-).length
+)
 """
 
 
@@ -130,9 +129,9 @@ def main():
         if browser.blocked:
             print("INTEGRITY_BLOCKED")
         else:
-            while evaluate(FONTS_LOADED) != FONT_FACES and time.monotonic() < end:
+            while not (loaded := evaluate(FONT_LOADED)) and time.monotonic() < end:
                 time.sleep(0.1)
-            if evaluate(FONTS_LOADED) == FONT_FACES:
+            if loaded:
                 print("FONTS_LOADED")
         for violation in browser.violations:
             print(f"CSP_VIOLATION {violation}")
