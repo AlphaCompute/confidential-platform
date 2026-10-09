@@ -61,9 +61,7 @@ pub fn verify(
 
     let authenticator_data = decode(signature.authenticator_data.as_deref())
         .ok_or_else(|| refuse("authenticator_data is not base64url"))?;
-    let Some((rp_id_hash, [flags, ..])) = authenticator_data
-        .split_first_chunk::<32>()
-        .and_then(|(hash, rest)| Some((hash, rest.split_first_chunk::<5>()?.0)))
+    let Some((rp_id_hash, [flags, _, _, _, _, ..])) = authenticator_data.split_first_chunk::<32>()
     else {
         return Err(refuse("authenticator_data is shorter than 37 bytes"));
     };

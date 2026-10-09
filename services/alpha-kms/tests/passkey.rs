@@ -26,22 +26,18 @@ fn origin() -> String {
     webauthn_vector()["origin"].as_str().unwrap().to_owned()
 }
 
-async fn trust_signer(h: &Harness, version: u64, origins: &[&str]) {
+/// Publishes the document as `version` with a signer on `origins`, or without a signer if none.
+async fn set_signer(h: &Harness, version: u64, origins: &[&str]) {
     let mut doc = platform_document(KEYED);
     doc["version"] = json!(version);
-    doc["signer"] = json!({
-        "origins": origins,
-        "rp_id": webauthn_vector()["rp_id"],
-        "bundle_sha256": format!("sha256:{}", "0".repeat(64)),
-        "api_origin": origins[0],
-    });
-    h.release.set(doc);
-    platform::reload(&h.node).await.unwrap();
-}
-
-async fn drop_signer(h: &Harness, version: u64) {
-    let mut doc = platform_document(KEYED);
-    doc["version"] = json!(version);
+    if let Some(api_origin) = origins.first() {
+        doc["signer"] = json!({
+            "origins": origins,
+            "rp_id": webauthn_vector()["rp_id"],
+            "bundle_sha256": format!("sha256:{}", "0".repeat(64)),
+            "api_origin": api_origin,
+        });
+    }
     h.release.set(doc);
     platform::reload(&h.node).await.unwrap();
 }
@@ -85,35 +81,6 @@ async fn passkey_org(h: &Harness, seed: u8) -> PasskeyOrg {
         root,
         admin: (registered(&reply), admin),
     }
-}
-
-/// The keyed capture's compose as a Revision of `app` in `org`, straight into the table (its
-/// Phala `name` is not a UUID, so route 1 would refuse it).
-async fn insert_passkey_revision(
-    h: &Harness,
-    org: OrgId,
-    app: AppId,
-    signer: &(KeyId, Passkey),
-) -> ComposeHash {
-    let compose = text(KEYED, "app-compose.json");
-    let hash = alpha_core::compose_hash(&compose);
-    let signature = signer.1.signature(
-        context::REVISION,
-        &json!({ "app_id": app, "compose": compose }),
-        Some(signer.0),
-    );
-    sqlx::query("insert into revisions (compose_hash, app_id, org_id, compose, created_by_key, signature, created_at) values ($1, $2, $3, $4, $5, $6, $7)")
-        .bind(hash.as_bytes().as_slice())
-        .bind(Uuid::from(app))
-        .bind(Uuid::from(org))
-        .bind(&compose)
-        .bind(Uuid::from(signer.0))
-        .bind(signature)
-        .bind(chrono::DateTime::<chrono::Utc>::from(h.now()))
-        .execute(&h.pool)
-        .await
-        .unwrap();
-    hash
 }
 
 fn put_body(
@@ -173,18 +140,8 @@ async fn a_device_passkey_claims_its_organization_and_registers_a_key() {
     let org: Uuid = a0["payload"]["org_id"].as_str().unwrap().parse().unwrap();
     let claim = assertion_body(a0, None);
 
-    let (status, reply) = h.post("/v1/keys", claim.clone()).await;
-    assert_eq!(
-        (status, code(&reply)),
-        (StatusCode::BAD_REQUEST, "signature_invalid")
-    );
-    assert!(
-        reply["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("no signer"),
-        "{reply}"
-    );
+    let message = invalid(h.post("/v1/keys", claim.clone()).await);
+    assert!(message.contains("no signer"), "{message}");
     let rows =
         sqlx::query_scalar::<_, i64>("select count(*) from principal_keys where org_id = $1")
             .bind(org)
@@ -192,11 +149,9 @@ async fn a_device_passkey_claims_its_organization_and_registers_a_key() {
             .await
             .unwrap();
     assert_eq!(rows, 0);
-    let (_, outcome, details) = h.audit("key.register").await.pop().unwrap();
-    assert_eq!(outcome, "denied");
-    assert_eq!(details["code"], "signature_invalid");
+    assert_eq!(denied(&h, "key.register").await, "signature_invalid");
 
-    trust_signer(&h, 2, &[&origin()]).await;
+    set_signer(&h, 2, &[&origin()]).await;
 
     let (status, root) = h.post("/v1/keys", claim.clone()).await;
     assert_eq!(status, StatusCode::OK, "{root}");
@@ -286,7 +241,7 @@ async fn a_second_passkey_signs_every_control_route() {
     let Some(h) = harness().await else {
         return;
     };
-    trust_signer(&h, 2, &[&origin()]).await;
+    set_signer(&h, 2, &[&origin()]).await;
     let PasskeyOrg { org, admin, .. } = passkey_org(&h, 63).await;
     let by_admin = |ctx: &str, payload: Value| admin.1.signed(ctx, payload, Some(admin.0));
 
@@ -405,10 +360,18 @@ async fn a_second_passkey_signs_every_control_route() {
 /// Under a document whose signer lists the vector's origin: a passkey organization, the keyed
 /// capture as a Revision of its App signed by its admin, and `passkey-secret` put for that App.
 async fn passkey_app(h: &Harness, seed: u8) -> (PasskeyOrg, AppId, ComposeHash) {
-    trust_signer(h, 2, &[&origin()]).await;
+    set_signer(h, 2, &[&origin()]).await;
     let org = passkey_org(h, seed).await;
     let app = AppId::mint();
-    let hash = insert_passkey_revision(h, org.org, app, &org.admin).await;
+    let compose = text(KEYED, "app-compose.json");
+    let signature = org.admin.1.signature(
+        context::REVISION,
+        &json!({ "app_id": app, "compose": compose }),
+        Some(org.admin.0),
+    );
+    let hash = h
+        .insert_signed_revision(org.org, app, compose, org.admin.0, signature)
+        .await;
     let body = put_body(
         "passkey-secret",
         &[app],
@@ -441,17 +404,11 @@ fn malformed((status, reply): (StatusCode, Value)) {
     assert!(reply.get("receipt").is_none(), "{reply}");
 }
 
-async fn secrets_named(h: &Harness, name: &str) -> i64 {
-    sqlx::query_scalar::<_, i64>("select count(*) from secrets where name = $1")
-        .bind(name)
-        .fetch_one(&h.pool)
-        .await
-        .unwrap()
-}
-
-async fn last_audit(h: &Harness, action: &str) -> (String, Value) {
+/// Asserts the last `action` audit row was denied and returns its code.
+async fn denied(h: &Harness, action: &str) -> Value {
     let (_, outcome, details) = h.audit(action).await.pop().unwrap();
-    (outcome, details)
+    assert_eq!(outcome, "denied", "{details}");
+    details["code"].clone()
 }
 
 #[tokio::test]
@@ -476,7 +433,7 @@ async fn without_a_signer_no_passkey_signature_verifies_anywhere() {
     assert_eq!(status, StatusCode::OK, "{reply}");
     let ed25519 = (registered(&reply), ed25519);
 
-    drop_signer(&h, 3).await;
+    set_signer(&h, 3, &[]).await;
     let no_signer = |reply| {
         let message = invalid(reply);
         assert!(message.contains("no signer"), "{message}");
@@ -545,19 +502,15 @@ async fn without_a_signer_no_passkey_signature_verifies_anywhere() {
         h.put_secret("ed25519-no-signer", &[app], b"refused", h.now(), &ed25519)
             .await,
     );
-    let (outcome, details) = last_audit(&h, "secret.put").await;
-    assert_eq!(
-        (outcome.as_str(), &details["code"]),
-        ("denied", &json!("signature_invalid"))
-    );
+    assert_eq!(denied(&h, "secret.put").await, "signature_invalid");
 
     no_signer(h.attest(KEYED).await);
     no_signer(send(instance.get(format!("{}/v1/secrets/passkey-secret", h.url))).await);
     no_signer(derive(&instance, &h, "hmac").await);
 
     h.register_key(&h.root, 90).await;
-    assert_eq!(secrets_named(&h, "no-signer").await, 0);
-    assert_eq!(secrets_named(&h, "ed25519-no-signer").await, 0);
+    assert_eq!(h.secrets_named("no-signer").await, 0);
+    assert_eq!(h.secrets_named("ed25519-no-signer").await, 0);
 }
 
 #[tokio::test]
@@ -568,7 +521,7 @@ async fn a_passkey_signature_on_an_origin_the_document_dropped_no_longer_verifie
     let (PasskeyOrg { admin, .. }, app, _) = passkey_app(&h, 81).await;
     let other = "https://localhost:9443";
 
-    trust_signer(&h, 3, &[other]).await;
+    set_signer(&h, 3, &[other]).await;
     let message = invalid(
         put(
             &h,
@@ -581,7 +534,7 @@ async fn a_passkey_signature_on_an_origin_the_document_dropped_no_longer_verifie
     let message = invalid(h.attest(KEYED).await);
     assert!(message.contains("signer.origins"), "{message}");
 
-    trust_signer(&h, 4, &[other, &origin()]).await;
+    set_signer(&h, 4, &[other, &origin()]).await;
     let later = h.now() + std::time::Duration::from_secs(1);
     let (status, reply) = put(
         &h,
@@ -599,7 +552,7 @@ async fn another_organizations_passkey_or_a_grafted_link_does_not_sign() {
     let Some(h) = harness().await else {
         return;
     };
-    trust_signer(&h, 2, &[&origin()]).await;
+    set_signer(&h, 2, &[&origin()]).await;
     let x = passkey_org(&h, 66).await;
     let y = passkey_org(&h, 68).await;
     let app = AppId::mint();
@@ -633,8 +586,8 @@ async fn another_organizations_passkey_or_a_grafted_link_does_not_sign() {
         "{message}"
     );
 
-    assert_eq!(secrets_named(&h, "across").await, 0);
-    assert_eq!(secrets_named(&h, "grafted").await, 0);
+    assert_eq!(h.secrets_named("across").await, 0);
+    assert_eq!(h.secrets_named("grafted").await, 0);
 }
 
 #[tokio::test]
@@ -668,7 +621,7 @@ async fn a_stored_passkey_signature_without_its_assertion_fields_is_invalid_not_
         )
         .await,
     );
-    assert_eq!(secrets_named(&h, "stripped").await, 0);
+    assert_eq!(h.secrets_named("stripped").await, 0);
 }
 
 #[tokio::test]
@@ -676,7 +629,7 @@ async fn a_passkey_body_without_its_assertion_fields_is_malformed() {
     let Some(h) = harness().await else {
         return;
     };
-    trust_signer(&h, 2, &[&origin()]).await;
+    set_signer(&h, 2, &[&origin()]).await;
     let PasskeyOrg { admin, .. } = passkey_org(&h, 87).await;
     let app = AppId::mint();
 
@@ -684,14 +637,9 @@ async fn a_passkey_body_without_its_assertion_fields_is_malformed() {
         let mut body = put_body("shapeless", &[app], b"refused", h.now(), &admin);
         body["signature"].as_object_mut().unwrap().remove(field);
         malformed(put(&h, "shapeless", body).await);
-        let (outcome, details) = last_audit(&h, "secret.put").await;
-        assert_eq!(
-            (outcome.as_str(), &details["code"]),
-            ("denied", &json!("malformed")),
-            "{field}"
-        );
+        assert_eq!(denied(&h, "secret.put").await, "malformed", "{field}");
     }
-    assert_eq!(secrets_named(&h, "shapeless").await, 0);
+    assert_eq!(h.secrets_named("shapeless").await, 0);
 
     let claimant = Passkey::new(89);
     let mut claim = claimant.signed(
@@ -705,9 +653,5 @@ async fn a_passkey_body_without_its_assertion_fields_is_malformed() {
     signature.remove("client_data_json");
     signature.remove("authenticator_data");
     malformed(h.post("/v1/keys", claim).await);
-    let (outcome, details) = last_audit(&h, "key.register").await;
-    assert_eq!(
-        (outcome.as_str(), &details["code"]),
-        ("denied", &json!("malformed"))
-    );
+    assert_eq!(denied(&h, "key.register").await, "malformed");
 }

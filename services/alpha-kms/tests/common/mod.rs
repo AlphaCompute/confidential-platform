@@ -385,14 +385,35 @@ impl Harness {
         compose: String,
         signer: &(KeyId, SigningKey),
     ) -> alpha_core::ComposeHash {
-        let hash = alpha_core::compose_hash(&compose);
         let document = json!({ "app_id": app_id, "compose": compose });
         let sig = self.signed(context::REVISION, document, signer)["signature"].clone();
+        self.insert_signed_revision(self.org, app_id, compose, signer.0, sig)
+            .await
+    }
+
+    /// `compose` as a Revision of `app_id` in `org` with `signature` by `key`, straight into the table.
+    pub async fn insert_signed_revision(
+        &self,
+        org: OrgId,
+        app_id: AppId,
+        compose: String,
+        key: KeyId,
+        signature: Value,
+    ) -> alpha_core::ComposeHash {
+        let hash = alpha_core::compose_hash(&compose);
         sqlx::query!("insert into revisions (compose_hash, app_id, org_id, compose, created_by_key, signature, created_at) values ($1, $2, $3, $4, $5, $6, $7)",
-            hash.as_bytes().as_slice(), Uuid::from(app_id), Uuid::from(self.org), compose, Uuid::from(signer.0), sig,
+            hash.as_bytes().as_slice(), Uuid::from(app_id), Uuid::from(org), compose, Uuid::from(key), signature,
             chrono::DateTime::<chrono::Utc>::from(self.now()))
             .execute(&self.pool).await.unwrap();
         hash
+    }
+
+    pub async fn secrets_named(&self, name: &str) -> i64 {
+        sqlx::query_scalar::<_, i64>("select count(*) from secrets where name = $1")
+            .bind(name)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap()
     }
 
     pub async fn put_secret(
