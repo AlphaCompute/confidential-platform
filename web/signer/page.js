@@ -66,6 +66,8 @@ const MESSAGES = {
   decided: "This request was already approved, declined or cancelled.",
   mismatch:
     "What the service asked you to approve does not match what it would run. Nothing was signed.",
+  unreadable:
+    "This page cannot read what the service asked you to approve, so it cannot show it to you. Nothing was signed.",
   approved: "Approved. You can close this tab.",
   declined: "Declined. You can close this tab.",
   secret_missing: "Enter a value for every secret.",
@@ -413,7 +415,7 @@ function claimPath(c, suffix) {
   return `/v1/claims/${c.ticket}${suffix}`;
 }
 
-function claimRefusal(read) {
+function claimRefusal(read, resuming) {
   if (!read || typeof read !== "object") return MESSAGES.unavailable;
   if (read.kind !== "root" && read.kind !== "add") return MESSAGES.bad_link;
   if (read.state === "closed") return MESSAGES.claim_closed;
@@ -421,7 +423,7 @@ function claimRefusal(read) {
   if (read.state !== "open" && read.state !== "rooted") return MESSAGES.bad_link;
   const expires = Date.parse(read.expires_at);
   if (!Number.isFinite(expires) || expires <= Date.now()) return MESSAGES.claim_expired;
-  if (read.keys_left === 0) return MESSAGES.claim_closed;
+  if (read.keys_left === 0 && !resuming) return MESSAGES.claim_closed;
   if (typeof read.org_name !== "string" || !Array.isArray(read.credentials)) {
     return MESSAGES.unavailable;
   }
@@ -432,7 +434,9 @@ async function startClaim(view, viewText, ticket) {
   const reply = await api(view, "GET", `/v1/claims/${ticket}`);
   if (reply.status !== 200) return stop(failure(reply));
   const read = reply.body;
-  const refusal = claimRefusal(read);
+  const session = loadSession(ticket);
+  // The last key registered spends the link, and a reload in this tab still owes the checks.
+  const refusal = claimRefusal(read, Boolean(session && session.first && session.first.key_id));
   if (refusal) return stop(refusal);
   if (read.kind === "add" && read.credentials.length === 0) return stop(MESSAGES.no_credentials);
 
@@ -441,7 +445,7 @@ async function startClaim(view, viewText, ticket) {
     el("p", read.kind === "root" ? "Claim this organization" : "Add a passkey to this organization"),
     el("p", `This link stays open until ${read.expires_at}.`),
   );
-  const c = { view, read, ticket, ui, session: loadSession(ticket), checked: new Set() };
+  const c = { view, read, ticket, ui, session, checked: new Set() };
   const s = c.session;
   const revealed = Boolean(s && s.org_id && s.first);
   const registered = revealed && Boolean(s.first.key_id);
@@ -749,7 +753,7 @@ function parsedLaunch(read, compose, extra) {
   try {
     return { compose, services: JSON.parse(wasm_bindgen.composeServices(compose)), ...extra };
   } catch (_) {
-    return { refusal: MESSAGES.mismatch };
+    return { refusal: MESSAGES.unreadable };
   }
 }
 

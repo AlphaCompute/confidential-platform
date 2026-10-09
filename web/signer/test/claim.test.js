@@ -377,6 +377,22 @@ test("a reload in the same tab resumes and another tab is sent back to the conta
   );
 });
 
+test("a reload after the last key spent the link still offers the checks", async () => {
+  const tab = memoryStorage();
+  const { api } = await twoKeys({ keys_left: 2 }, { sessionStorage: tab });
+  assert.equal(api.keys_left, 0);
+  const reloaded = await loadPage({ routes: api.routes, sessionStorage: tab });
+  await reloaded.startClaim();
+  assert.deepEqual(reloaded.buttons(), ["Check passkey 1", "Check passkey 2"]);
+
+  const other = await loadPage({ routes: api.routes, sessionStorage: memoryStorage() });
+  await other.startClaim();
+  assert.equal(
+    other.text(),
+    "This claim link is closed. Ask your AlphaCompute contact for a new link.",
+  );
+});
+
 test("an add ticket registers a key signed by an existing passkey", async () => {
   const laptop = new SoftwareAuthenticator();
   const a = laptop.enroll();

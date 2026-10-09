@@ -11,7 +11,8 @@ bytes can be served from any origin the platform document lists under `signer.or
 A launch whose compose declares Secrets gets one password field per Secret. Each value is read
 once, sealed with `KmsSecretSealer` to a KMS node that proves itself against the platform
 document, and put in its own step, signed by the same passkey that made the first signature; the
-relay sees only the sealed frame. At the KMS the Secret is named `<app_id>.<name>`, so two Apps
+relay sees the value only as the sealed frame, but it does see the signed document with the
+value's unsalted SHA-256, so a short or guessable value can be found by trying candidates. At the KMS the Secret is named `<app_id>.<name>`, so two Apps
 of one organization that declare the same name keep separate values. Every put comes before the
 Revision's registration, because shroud-go refuses puts once a request is approved, and the page
 says "Approved" only after the receipt of every put and of the registration verified.
@@ -51,8 +52,11 @@ serve the same `index.html`, which picks its mode from the last path segment; th
 the fragment, so it never reaches a server. The assets are served next to it under `/sign/`, with
 the types `text/javascript`, `application/wasm` and `text/css`, and may be cached forever because
 their names change with their content. `/sign/platform.json` is the release-signed platform
-document. Every response under `/sign/` carries each line of `headers` verbatim; the policy there
-forbids framing, inline code, string evaluation and any other origin.
+document, and `/sign/catalog/<64 hex>.json` serves each catalog entry under the SHA-256 of its
+bytes. Every response under `/sign/` carries each line of `headers` verbatim; the policy there
+forbids framing, inline code, string evaluation and any other origin. `connect-src 'self'` holds
+only while the document's `api_origin` is the page's own origin; a host whose API lives on another
+origin adds it to `connect-src`, or every call fails as unavailable.
 
 On dev, shroud-go serves the page and embeds a copy of this build.
 

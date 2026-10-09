@@ -166,6 +166,18 @@ test("a compose that does not hash to the request is refused before any prompt",
   assert.equal(laptop.log.length, 0);
 });
 
+test("a compose that hashes to the request but cannot be read is refused as unreadable", async () => {
+  const compose = JSON.parse(withoutSecrets());
+  compose.docker_compose_file = "services: [";
+  const { page, laptop } = await approvalPage({ compose: jcs(compose) });
+  assert.equal(
+    page.text(),
+    "This page cannot read what the service asked you to approve, so it cannot show it to you. Nothing was signed.",
+  );
+  assert.deepEqual(page.buttons(), []);
+  assert.equal(laptop.log.length, 0);
+});
+
 test("a request without known passkeys is refused", async () => {
   const { page, laptop } = await approvalPage({ compose: withoutSecrets(), credentials: [] });
   assert.equal(
