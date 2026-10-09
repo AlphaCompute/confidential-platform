@@ -293,6 +293,7 @@ details[open] summary {
 }
 
 .confirmed::before {
+  content: "✓";
   content: "✓" / "";
   width: 34px;
   height: 34px;
