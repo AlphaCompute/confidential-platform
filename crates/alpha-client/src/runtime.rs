@@ -23,6 +23,10 @@ use crate::{Error, decode};
 
 pub const SOCKET_PATH: &str = "/run/alpha/runtime.sock";
 
+/// Where `alpha-runtime` terminates TLS for a wrapped compose; the wrap publishes it as the
+/// CVM's 443.
+pub const TLS_PORT: u16 = 8443;
+
 /// A secret name as it becomes a path segment: no separator, no traversal.
 fn valid_secret_name(name: &str) -> bool {
     !name.is_empty()

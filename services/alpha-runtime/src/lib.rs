@@ -14,6 +14,7 @@
     )
 )]
 
+pub mod proxy;
 pub mod socket;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -34,11 +35,12 @@ use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use p256::ecdsa::SigningKey;
 use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
 use parking_lot::{Mutex, RwLock};
+use rustls::sign::CertifiedKey;
 use tokio::net::UnixListener;
 use tokio::sync::watch;
 use zeroize::Zeroizing;
 
-pub use alpha_client::runtime::SOCKET_PATH;
+pub use alpha_client::runtime::{SOCKET_PATH, TLS_PORT};
 
 pub const RENEW_BEFORE: Duration = Duration::from_secs(600);
 const RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -140,14 +142,51 @@ pub fn parse_secrets(text: Option<&str>) -> Result<Secrets, Error> {
     Ok(secrets)
 }
 
+/// The service a wrapped compose publishes, reached over the compose network.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Upstream {
+    pub host: String,
+    pub port: u16,
+}
+
+impl std::fmt::Display for Upstream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.host, self.port)
+    }
+}
+
+/// `ALPHACOMPUTE_TLS_UPSTREAM`: `<service>:<port>`; unset means no TLS listener.
+pub fn parse_upstream(text: Option<&str>) -> Result<Option<Upstream>, Error> {
+    let Some(text) = text else {
+        return Ok(None);
+    };
+    let refused = |m: &str| Error::Config(format!("ALPHACOMPUTE_TLS_UPSTREAM: {text:?} {m}"));
+    let (host, port) = text
+        .rsplit_once(':')
+        .ok_or_else(|| refused("is not <service>:<port>"))?;
+    if !alpha_core::is_key_purpose(host) {
+        return Err(refused("does not name a lowercase compose service"));
+    }
+    let port = Some(port)
+        .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|p| p.parse::<u16>().ok())
+        .filter(|p| *p != 0)
+        .ok_or_else(|| refused("does not end in a port from 1 to 65535"))?;
+    Ok(Some(Upstream {
+        host: host.to_owned(),
+        port,
+    }))
+}
+
 /// The three environment variables and, when a service declared a Secret,
-/// `ALPHACOMPUTE_SECRETS`.
+/// `ALPHACOMPUTE_SECRETS`; for a wrapped compose, `ALPHACOMPUTE_TLS_UPSTREAM`.
 #[derive(Clone, Debug)]
 pub struct Config {
     pub kms_ca_spki_sha256: [u8; 32],
     pub kms_revisions: Vec<ComposeHash>,
     pub kms_endpoints: Vec<String>,
     pub secrets: Secrets,
+    pub tls_upstream: Option<Upstream>,
 }
 
 impl Config {
@@ -160,6 +199,7 @@ impl Config {
             &var("ALPHACOMPUTE_KMS_REVISIONS")?,
             &var("ALPHACOMPUTE_KMS_ENDPOINTS")?,
             std::env::var("ALPHACOMPUTE_SECRETS").ok().as_deref(),
+            std::env::var("ALPHACOMPUTE_TLS_UPSTREAM").ok().as_deref(),
         )
     }
 
@@ -168,6 +208,7 @@ impl Config {
         revisions: &str,
         endpoints: &str,
         secrets: Option<&str>,
+        tls_upstream: Option<&str>,
     ) -> Result<Self, Error> {
         let kms_ca_spki_sha256 = ca_spki_sha256
             .trim()
@@ -195,11 +236,13 @@ impl Config {
             return Err(Error::Config("ALPHACOMPUTE_KMS_ENDPOINTS is empty".into()));
         }
         let secrets = parse_secrets(secrets)?;
+        let tls_upstream = parse_upstream(tls_upstream)?;
         Ok(Self {
             kms_ca_spki_sha256,
             kms_revisions,
             kms_endpoints,
             secrets,
+            tls_upstream,
         })
     }
 
@@ -290,6 +333,8 @@ pub struct Attested {
     pub chain_pem: Vec<String>,
     pub not_after: SystemTime,
     pub result: AttestationResult,
+    /// The leaf and the runtime key as the TLS listener serves them.
+    pub certified: Arc<CertifiedKey>,
     client: Client,
     secrets: Mutex<HashMap<String, Secret>>,
     keys: Mutex<HashMap<String, DerivedKey>>,
@@ -347,6 +392,10 @@ impl Runtime {
 
     pub fn now(&self) -> SystemTime {
         (self.clock)()
+    }
+
+    pub fn config(&self) -> &Config {
+        &self.config
     }
 
     pub fn spki(&self) -> &[u8] {
@@ -432,6 +481,8 @@ impl Runtime {
                 "the guest agent's app_compose is not the leaf's Revision".into(),
             ));
         }
+        let certified =
+            tls::certified(chain.iter().cloned().map(Into::into).collect(), &self.pkcs8)?;
         let not_after = chrono::DateTime::parse_from_rfc3339(&reply.not_after)
             .map_err(|e| Error::Certificate(format!("not_after: {e}")))?
             .into();
@@ -449,6 +500,7 @@ impl Runtime {
             chain_pem: reply.certificate_chain,
             not_after,
             result: reply.attestation_result,
+            certified,
             client,
             secrets: Mutex::new(HashMap::new()),
             keys: Mutex::new(HashMap::new()),
@@ -598,13 +650,15 @@ impl Runtime {
         }
     }
 
-    /// Serves the socket, renews the leaf and keeps the declared Secret files under
-    /// `secrets_root` current until `shutdown` resolves or the Revision is revoked; open
-    /// connections drain either way.
+    /// Serves the socket, renews the leaf, keeps the declared Secret files under
+    /// `secrets_root` current and, given `tls` and an upstream, proxies the Endpoint until
+    /// `shutdown` resolves or the Revision is revoked. Socket connections drain either way;
+    /// proxied ones drain on shutdown and are cut on revocation.
     pub async fn run(
         self: Arc<Self>,
         listener: UnixListener,
         secrets_root: PathBuf,
+        tls: Option<proxy::Endpoint>,
         shutdown: impl Future<Output = ()>,
     ) -> Exit {
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -619,6 +673,12 @@ impl Runtime {
             let runtime = self.clone();
             async move { runtime.deliver_forever(secrets_root).await }
         });
+        let (stop_proxy, proxy_stopped) = tokio::sync::oneshot::channel::<proxy::Stop>();
+        let proxy = tls.map(|endpoint| {
+            tokio::spawn(
+                endpoint.serve(async move { proxy_stopped.await.unwrap_or(proxy::Stop::Now) }),
+            )
+        });
         let mut revoked = self.revoked.subscribe();
         let exit = tokio::select! {
             () = shutdown => Exit::Drained,
@@ -627,7 +687,16 @@ impl Runtime {
         };
         delivery.abort();
         let _ = stop.send(());
-        let _ = server.await;
+        let _ = stop_proxy.send(match exit {
+            Exit::Drained => proxy::Stop::Drain,
+            Exit::Revoked => proxy::Stop::Now,
+        });
+        let proxied = async {
+            if let Some(proxy) = proxy {
+                let _ = proxy.await;
+            }
+        };
+        let _ = tokio::join!(server, proxied);
         exit
     }
 }
@@ -647,6 +716,7 @@ mod tests {
             &format!("{HASH}, {HASH},"),
             "https://a:8443/,, https://b:8443",
             None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -660,7 +730,7 @@ mod tests {
         );
 
         let refused = |a: &str, b: &str, c: &str| {
-            let Err(Error::Config(m)) = Config::parse(a, b, c, None) else {
+            let Err(Error::Config(m)) = Config::parse(a, b, c, None, None) else {
                 panic!("{a} {b} {c} was accepted");
             };
             m
@@ -671,12 +741,13 @@ mod tests {
         assert!(refused(HASH, HASH, " , ").contains("ENDPOINTS"));
         assert!(refused("", HASH, "x").contains("CA_SPKI"));
         assert!(c.secrets.is_empty());
+        assert!(c.tls_upstream.is_none());
     }
 
     #[test]
     fn secrets_parse_the_wraps_variable() {
         let wrap = r#"{"db":["db_password"],"web":["db_password","session_key"]}"#;
-        let c = Config::parse(HASH, HASH, "https://a", Some(wrap)).unwrap();
+        let c = Config::parse(HASH, HASH, "https://a", Some(wrap), None).unwrap();
         let set = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<BTreeSet<_>>();
         assert_eq!(
             c.secrets,
@@ -706,7 +777,8 @@ mod tests {
                 panic!("{bad} was accepted");
             };
             assert!(m.starts_with("ALPHACOMPUTE_SECRETS:"), "{bad}: {m}");
-            let Err(Error::Config(m)) = Config::parse(HASH, HASH, "https://a", Some(bad)) else {
+            let Err(Error::Config(m)) = Config::parse(HASH, HASH, "https://a", Some(bad), None)
+            else {
                 panic!("{bad} was accepted by Config::parse");
             };
             assert!(m.contains("ALPHACOMPUTE_SECRETS"), "{bad}: {m}");

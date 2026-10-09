@@ -245,20 +245,28 @@ pub use alpha_channel::cert::{
     InstanceSans, KMS_SAN, parse_instance_sans, spki_of, spki_sha256, uri_sans,
 };
 
-fn certified_key(identity: &RuntimeIdentity) -> Result<Arc<CertifiedKey>, Error> {
-    let chain: Vec<CertificateDer<'static>> =
-        CertificateDer::pem_slice_iter(identity.certificate_chain.as_bytes())
-            .collect::<Result<_, _>>()
-            .map_err(|e| Error::Invalid(format!("certificate chain: {e}")))?;
+/// A server's chain and its PKCS#8 key as rustls serves them.
+pub fn certified(
+    chain: Vec<CertificateDer<'static>>,
+    pkcs8: &[u8],
+) -> Result<Arc<CertifiedKey>, Error> {
     if chain.is_empty() {
         return Err(Error::Invalid("certificate chain is empty".into()));
     }
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.tls_private_key.to_vec()));
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8.to_vec()));
     let signing = provider()
         .key_provider
         .load_private_key(key)
         .map_err(|e| Error::Invalid(format!("runtime key: {e}")))?;
     Ok(Arc::new(CertifiedKey::new(chain, signing)))
+}
+
+fn certified_key(identity: &RuntimeIdentity) -> Result<Arc<CertifiedKey>, Error> {
+    let chain: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_slice_iter(identity.certificate_chain.as_bytes())
+            .collect::<Result<_, _>>()
+            .map_err(|e| Error::Invalid(format!("certificate chain: {e}")))?;
+    certified(chain, &identity.tls_private_key)
 }
 
 /// The Endpoint's TLS key material, swapped whole on renewal so a handshake in flight during a

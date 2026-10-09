@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use alpha_runtime::{Config, EXIT_REFUSED, Error, Exit, Runtime, SECRETS_DIR, SOCKET_PATH};
+use alpha_runtime::{
+    Config, EXIT_REFUSED, Error, Exit, Runtime, SECRETS_DIR, SOCKET_PATH, TLS_PORT, proxy,
+};
 use p256::ecdsa::SigningKey;
 use tokio::net::UnixListener;
 
@@ -78,6 +80,7 @@ async fn run() -> Result<Exit, Error> {
         std::os::unix::fs::PermissionsExt::from_mode(0o666),
     )
     .map_err(socket)?;
+    let tls = proxy::Endpoint::bind(runtime.clone(), ([0, 0, 0, 0], TLS_PORT).into()).await?;
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| Error::Socket(format!("SIGTERM handler: {e}")))?;
     let shutdown = async move {
@@ -87,7 +90,7 @@ async fn run() -> Result<Exit, Error> {
         }
     };
     let exit = runtime
-        .run(listener, PathBuf::from(SECRETS_DIR), shutdown)
+        .run(listener, PathBuf::from(SECRETS_DIR), tls, shutdown)
         .await;
     let _ = std::fs::remove_file(SOCKET_PATH);
     Ok(exit)

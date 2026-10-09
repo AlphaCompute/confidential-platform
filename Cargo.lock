@@ -331,9 +331,11 @@ dependencies = [
  "getrandom 0.4.3",
  "p256 0.14.0",
  "parking_lot",
+ "rustls",
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "zeroize",
 ]
 
