@@ -6,6 +6,7 @@ const WASM_SRI = "@WASM_SRI@";
 const VERSION_KEY = "alphacompute-platform-version";
 const TICKET = /^[A-Za-z0-9_-]{43}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const NIL_APP = "00000000-0000-0000-0000-000000000000";
 const CODE = /^[A-Za-z_]{1,64}$/;
 // shroud-go limits its public routes to 5 requests per second per IP.
 const PACE_MS = 250;
@@ -66,6 +67,10 @@ const MESSAGES = {
   mismatch:
     "What the service asked you to approve does not match what it would run. Nothing was signed.",
   approved: "Approved. You can close this tab.",
+  declined: "Declined. You can close this tab.",
+  catalog: "The catalog entry for this launch is not signed by AlphaCompute. Nothing was signed.",
+  not_from_catalog: "This launch is replacing a launch not from this catalog.",
+  revision_revoked: "The KMS refuses this launch because it was revoked before. Nothing was approved.",
   one_key: (expiresAt) =>
     `Your organization has one passkey. If you lose it you lose the organization. Your link stays open until ${expiresAt}.`,
 };
@@ -80,6 +85,7 @@ const CODES = {
   sealed: MESSAGES.unavailable,
   signature_invalid: MESSAGES.signature_invalid,
   already_exists: MESSAGES.already_exists,
+  revision_revoked: MESSAGES.revision_revoked,
 };
 
 function message(key, arg) {
@@ -221,6 +227,15 @@ function failure(reply) {
   if (CODE.test(code)) return message("kms_refused", code);
   if (reply.status === 404) return MESSAGES.bad_link;
   return MESSAGES.unavailable;
+}
+
+// As `failure`, but a request that is no longer pending names its state.
+function approvalFailure(reply) {
+  const details = reply.status === 409 && reply.body && reply.body.details;
+  if (details && typeof details.state === "string") {
+    return details.state === "expired" ? MESSAGES.approval_expired : MESSAGES.decided;
+  }
+  return failure(reply);
 }
 
 function clockRefusal(serverTime) {
@@ -761,6 +776,7 @@ function describeLaunch(a) {
   const { read, launch } = a;
   const nodes = [];
   if (launch.heading) nodes.push(el("p", launch.heading));
+  for (const line of launch.notes || []) nodes.push(el("p", line, "warning"));
   nodes.push(el("h2", "What will run"));
   const runtime = launch.services["alpha-runtime"];
   for (const [name, service] of Object.entries(launch.services)) {
@@ -789,7 +805,10 @@ async function startApproval(view, viewText, ticket) {
   const read = reply.body;
   const refusal = approvalRefusal(read);
   if (refusal) return stop(refusal);
-  const launch = uploadedLaunch(read);
+  const launch =
+    read.catalog_template_sha256 === null || read.catalog_template_sha256 === undefined
+      ? uploadedLaunch(read)
+      : await catalogLaunch(view, read);
   if (launch.refusal) return stop(launch.refusal);
 
   const ui = screen(
@@ -830,7 +849,7 @@ function offerRevision(a, note) {
       if (!signature) return offerRevision(a, note);
       const body = wasm_bindgen.canonicalJson(JSON.stringify({ payload, signature }));
       const reply = await api(a.view, "POST", approvalPath(a, "/revision"), body);
-      if (reply.status !== 200) return offerRevision(a, failure(reply));
+      if (reply.status !== 200) return offerRevision(a, approvalFailure(reply));
       const signed = receipt(a.view, reply, "revision.register", body, {
         app_id: read.app_id,
         compose_hash: read.compose_hash,
@@ -839,7 +858,80 @@ function offerRevision(a, note) {
       if (!signed) return offerRevision(a, MESSAGES.not_confirmed);
       return offer(a.ui, "", el("p", MESSAGES.approved, "confirmed"));
     }),
+    declineButton(a),
   );
+}
+
+function declineButton(a) {
+  return button("Decline", async () => {
+    const reply = await api(a.view, "POST", approvalPath(a, "/decline"));
+    if (reply.status === 200) return offer(a.ui, "", el("p", MESSAGES.declined, "confirmed"));
+    a.ui.status.textContent = approvalFailure(reply);
+  });
+}
+
+// The verified catalog entry named by a template hash, rendered for `appId`, or null.
+async function catalogEntry(view, templateHex, appId) {
+  try {
+    const reply = await fetch(`./catalog/${templateHex}.json`, { cache: "no-store" });
+    if (!reply.ok) return null;
+    const text = await reply.text();
+    return JSON.parse(
+      wasm_bindgen.verifyCatalog(text, JSON.stringify(view.catalog_key), appId),
+    );
+  } catch (_) {
+    return null;
+  }
+}
+
+async function catalogLaunch(view, read) {
+  const hex = /^(?:sha256:)?([0-9a-f]{64})$/.exec(read.catalog_template_sha256);
+  const found = view.catalog_key && hex ? await catalogEntry(view, hex[1], read.app_id) : null;
+  if (!found) return { refusal: MESSAGES.catalog };
+  const { entry, compose } = found;
+  const r = entry.resources || {};
+  const launch = parsedLaunch(read, compose, {
+    machine: `${r.cpu} vCPU, ${r.memory_mib} MiB`,
+    heading: `${entry.title}, version ${entry.version}`,
+  });
+  if (launch.refusal || !read.current) return launch;
+  const before = await previousEntry(view, read);
+  if (before && before.entry.catalog_id === entry.catalog_id) {
+    launch.heading = `${entry.title}, version ${before.entry.version} → ${entry.version}`;
+    return launch;
+  }
+  launch.notes = [MESSAGES.not_from_catalog, ...imageChanges(read.current.compose, launch.services)];
+  return launch;
+}
+
+// The verified entry `current` was rendered from: the render replaced the template's one nil
+// App id with this App's, so putting the nil id back gives the template's exact bytes.
+async function previousEntry(view, read) {
+  const compose = read.current.compose;
+  const name = `"name":"${read.app_id}"`;
+  if (typeof compose !== "string" || compose.split(name).length !== 2) return null;
+  const template = compose.replace(name, `"name":"${NIL_APP}"`);
+  const hex = wasm_bindgen.bodySha256(utf8(template)).slice("sha256:".length);
+  const found = await catalogEntry(view, hex, read.app_id);
+  return found && found.compose === compose ? found : null;
+}
+
+// What `current` claims runs today, only where its image differs from this launch's.
+function imageChanges(currentCompose, services) {
+  let before;
+  try {
+    before = JSON.parse(wasm_bindgen.composeServices(currentCompose));
+  } catch (_) {
+    return [];
+  }
+  const names = [...new Set([...Object.keys(before), ...Object.keys(services)])].sort();
+  const image = (s) => (s && s.image) || "nothing";
+  return names
+    .filter((n) => image(before[n]) !== image(services[n]))
+    .map(
+      (n) =>
+        `${n}: ${image(before[n])} today, according to the service; ${image(services[n])} in this launch.`,
+    );
 }
 
 function servedBySigner(view) {

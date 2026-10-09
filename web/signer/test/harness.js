@@ -124,6 +124,19 @@ function mintReceipt(route, requestText, response, options = {}) {
   };
 }
 
+// The catalog test key: Ed25519 from the seed of 32 bytes 11, as the CLI's catalog tests use.
+const CATALOG_KEY = crypto.createPrivateKey({
+  key: Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), Buffer.alloc(32, 11)]),
+  format: "der",
+  type: "pkcs8",
+});
+
+// A catalog file whose entry the catalog test key signs.
+function catalogFile(entry, template) {
+  const signature = crypto.sign(null, contextDigest("alphacompute/catalog/v1", jcs(entry)), CATALOG_KEY);
+  return JSON.stringify({ entry, signature: { algorithm: "ed25519", signature: b64u(signature) }, template });
+}
+
 function testView() {
   const catalog = JSON.parse(testdata("catalog/expected.json"));
   const view = {
@@ -765,6 +778,7 @@ function approvalApi(options = {}) {
 module.exports = {
   ORIGIN,
   approvalApi,
+  catalogFile,
   RP_ID,
   TICKET,
   SoftwareAuthenticator,
