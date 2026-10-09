@@ -401,10 +401,6 @@ function saveSession(c) {
   }
 }
 
-function claimPath(c, suffix) {
-  return `/v1/claims/${c.ticket}${suffix}`;
-}
-
 function claimRefusal(read, resuming) {
   if (!read || typeof read !== "object") return MESSAGES.unavailable;
   if (read.kind !== "root" && read.kind !== "add") return MESSAGES.bad_link;
@@ -471,7 +467,7 @@ function offerFirst(c, note) {
 
 // Asked only once a passkey exists, so a closed prompt never spends the one reveal.
 async function reveal(c, key) {
-  const reply = await api(c.view, "POST", claimPath(c, "/org"));
+  const reply = await api(c.view, "POST", `/v1/claims/${c.ticket}/org`);
   if (reply.status === 409) {
     const state = reply.body?.details?.state;
     if (state === "closed") return stop(MESSAGES.claim_closed);
@@ -491,7 +487,7 @@ async function reveal(c, key) {
 // Relays one key registration and returns the response the KMS signed for it, or a note.
 async function register(c, credentialId, registration, publicKey) {
   const body = `{"credential_id":${JSON.stringify(credentialId)},"registration":${registration}}`;
-  const reply = await api(c.view, "POST", claimPath(c, "/keys"), body);
+  const reply = await api(c.view, "POST", `/v1/claims/${c.ticket}/keys`, body);
   if (reply.status !== 200) return { note: failure(reply) };
   const signed = receipt(c.view, reply, "key.register", registration, {
     org_id: c.session.org_id,
@@ -711,10 +707,6 @@ async function signedAsExpected(view, key, challenge, assertion) {
   }
 }
 
-function approvalPath(a, suffix) {
-  return `/v1/approval-requests/${a.ticket}${suffix}`;
-}
-
 function approvalRefusal(read) {
   if (!read || typeof read !== "object") return MESSAGES.unavailable;
   if (read.state === "expired") return MESSAGES.approval_expired;
@@ -929,7 +921,7 @@ async function put(a, item, inputs) {
   const { signature, note } = await approvalSignature(a, inputs.options);
   if (!signature) return offerApproval(a, note);
   const sealer = new wasm_bindgen.KmsSecretSealer();
-  const channel = await api(a.view, "POST", approvalPath(a, "/kms-channel"), sealer.hello());
+  const channel = await api(a.view, "POST", `/v1/approval-requests/${a.ticket}/kms-channel`, sealer.hello());
   if (channel.status !== 200) return offerApproval(a, approvalFailure(channel));
   let sealed;
   try {
@@ -947,7 +939,7 @@ async function put(a, item, inputs) {
   const body = wasm_bindgen.canonicalJson(
     JSON.stringify({ payload: inputs.payload, signature, sealed: JSON.parse(sealed) }),
   );
-  const reply = await api(a.view, "PUT", approvalPath(a, `/secrets/${item.name}`), body);
+  const reply = await api(a.view, "PUT", `/v1/approval-requests/${a.ticket}/secrets/${item.name}`, body);
   if (reply.status !== 200) return offerApproval(a, approvalFailure(reply));
   const signed = receipt(a.view, reply, "secret.put", body, {
     name: inputs.payload.name,
@@ -971,7 +963,7 @@ async function registerRevision(a, inputs) {
   const { signature, note } = await approvalSignature(a, inputs.options);
   if (!signature) return offerApproval(a, note);
   const body = wasm_bindgen.canonicalJson(JSON.stringify({ payload: inputs.payload, signature }));
-  const reply = await api(a.view, "POST", approvalPath(a, "/revision"), body);
+  const reply = await api(a.view, "POST", `/v1/approval-requests/${a.ticket}/revision`, body);
   if (reply.status !== 200) return offerApproval(a, approvalFailure(reply));
   const signed = receipt(a.view, reply, "revision.register", body, {
     app_id: read.app_id,
@@ -984,7 +976,7 @@ async function registerRevision(a, inputs) {
 
 function declineButton(a) {
   return button("Decline", async () => {
-    const reply = await api(a.view, "POST", approvalPath(a, "/decline"));
+    const reply = await api(a.view, "POST", `/v1/approval-requests/${a.ticket}/decline`);
     if (reply.status === 200) return offer(a.ui, "", el("p", MESSAGES.declined, "confirmed"));
     a.ui.status.textContent = approvalFailure(reply);
   });
