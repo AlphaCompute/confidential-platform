@@ -156,9 +156,8 @@ pub fn parse_upstream(text: Option<&str>) -> Result<Option<String>, Error> {
         return Err(refused("does not name a lowercase compose service"));
     }
     Some(port)
-        .filter(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
-        .and_then(|p| p.parse::<u16>().ok())
-        .filter(|p| *p != 0)
+        .filter(|p| p.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|p| p.parse::<std::num::NonZeroU16>().ok())
         .ok_or_else(|| refused("does not end in a port from 1 to 65535"))?;
     Ok(Some(text.to_owned()))
 }
@@ -673,12 +672,10 @@ impl Runtime {
         delivery.abort();
         let _ = stop.send(());
         let _ = stop_proxy.send(exit);
-        let proxied = async {
-            if let Some(proxy) = proxy {
-                let _ = proxy.await;
-            }
-        };
-        let _ = tokio::join!(server, proxied);
+        let _ = server.await;
+        if let Some(proxy) = proxy {
+            let _ = proxy.await;
+        }
         exit
     }
 }
