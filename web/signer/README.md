@@ -91,4 +91,5 @@ give, checks the headers and content types, and loads `/sign/approve` in headles
 (`$CHROME`, or `google-chrome`, `chromium` or the macOS application) through `test/render.py`. The
 test platform document verifies but names no signer, so the page must end on "This page is not
 served from an AlphaCompute signer address."; with one byte of the page script changed, its
-integrity check must stop it before that. It prints `SMOKE_OK` when both hold.
+integrity check must stop it before that. The page that ran must also have loaded its three font
+faces and met no Content Security Policy violation. It prints `SMOKE_OK` when all of this holds.

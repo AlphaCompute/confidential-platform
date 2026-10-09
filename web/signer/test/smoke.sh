@@ -2,7 +2,8 @@
 # Serves a built bundle with its headers and loads it in headless Chrome. The test platform
 # document verifies but names no signer, so a page that ran through its SRI chain, the wasm and
 # the release-key check ends on the signer refusal; with one byte of the page script changed, SRI
-# must stop it before that. Usage: smoke.sh <dist>.
+# must stop it before that. The page that ran must also have loaded its fonts and met no CSP
+# violation. Usage: smoke.sh <dist>.
 set -eu
 LC_ALL=C
 export LC_ALL
@@ -73,6 +74,8 @@ wasm=$(cd "$dist" && ls alpha_channel_bg-*.wasm)
 has_headers "$port" /sign/approve 200 "text/html; charset=utf-8"
 has_headers "$port" /sign/claim 200 "text/html; charset=utf-8"
 has_headers "$port" "/sign/$wasm" 200 application/wasm
+font=$(cd "$dist" && ls public_sans_light-*.woff2)
+has_headers "$port" "/sign/$font" 200 font/woff2
 has_headers "$port" /sign/ 404 ""
 has_headers "$port" /sign/nope.js 404 ""
 
@@ -81,6 +84,10 @@ grep -qF "$sentence" "$tmp/good.html" || {
   cat "$tmp/good.html" >&2
   fail "the bundle did not reach the signer refusal"
 }
+grep -qx FONTS_LOADED "$tmp/good.html" || fail "the page did not load its fonts"
+if grep '^CSP_VIOLATION' "$tmp/good.html" >&2; then
+  fail "the page met a Content Security Policy violation"
+fi
 
 cp -R "$dist" "$tmp/tampered"
 page=$(cd "$tmp/tampered" && ls page-*.js)

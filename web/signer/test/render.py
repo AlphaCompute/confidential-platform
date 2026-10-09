@@ -4,7 +4,10 @@ Chrome's `--dump-dom` fires on virtual time, which runs past wasm compiling on a
 it sometimes prints the page before the page has run. This drives Chrome over its debugging pipe
 instead and waits until `#main` leaves its loading text or Chrome reports a resource blocked by its
 integrity attribute, after which nothing more will run. A block is printed as the first line,
-`INTEGRITY_BLOCKED`; a page that does neither before the deadline is a failure.
+`INTEGRITY_BLOCKED`; a page that does neither before the deadline is a failure. A page that ran
+then waits for its three Public Sans faces, printed as `FONTS_LOADED` once all are loaded, and
+every Content Security Policy violation the document reported is printed as a line
+`CSP_VIOLATION <directive> <blocked URI>`, all before the DOM.
 """
 
 import json
@@ -16,6 +19,19 @@ import time
 
 LOADING = "Loading…"
 DEADLINE = 30.0
+FONT_FACES = 3
+
+RECORD_VIOLATIONS = """
+window.__violations = [];
+document.addEventListener("securitypolicyviolation", (e) => {
+  window.__violations.push(`${e.effectiveDirective} ${e.blockedURI}`);
+});
+"""
+FONTS_LOADED = """
+[...document.fonts].filter(
+  (f) => f.family.replace(/"/g, "") === "Public Sans" && f.status === "loaded"
+).length
+"""
 
 
 class Browser:
@@ -96,6 +112,12 @@ def main():
             "Target.attachToTarget", {"targetId": target, "flatten": True}
         )["sessionId"]
         browser.call("Log.enable", session=session)
+        browser.call("Page.enable", session=session)
+        browser.call(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": RECORD_VIOLATIONS},
+            session=session,
+        )
         browser.call("Page.navigate", {"url": url}, session=session)
 
         def evaluate(expression):
@@ -116,6 +138,13 @@ def main():
             time.sleep(0.1)
         if browser.blocked:
             print("INTEGRITY_BLOCKED")
+        else:
+            while evaluate(FONTS_LOADED) != FONT_FACES and time.monotonic() < end:
+                time.sleep(0.1)
+            if evaluate(FONTS_LOADED) == FONT_FACES:
+                print("FONTS_LOADED")
+        for violation in evaluate("window.__violations") or []:
+            print(f"CSP_VIOLATION {violation}")
         print(evaluate("document.documentElement.outerHTML"))
     finally:
         browser.close()
