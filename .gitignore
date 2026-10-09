@@ -2,4 +2,3 @@
 .idea/
 /target/
 web/signer/dist/
-__pycache__/

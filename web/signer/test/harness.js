@@ -184,17 +184,13 @@ class SoftwareAuthenticator {
     return Buffer.concat([sha256(rpId), Buffer.from([this.flags]), Buffer.alloc(4)]);
   }
 
-  fail(kind) {
-    const name = this.fault[kind];
-    if (name) {
-      delete this.fault[kind];
-      throw new DOMException("refused", name);
-    }
-  }
-
   async create(options) {
     this.log.push({ kind: "create", options });
-    this.fail("create");
+    const refusal = this.fault.create;
+    if (refusal) {
+      delete this.fault.create;
+      throw new DOMException("refused", refusal);
+    }
     const excluded = (options.excludeCredentials || []).map((c) => b64u(c.id));
     if (this.credentials.some((c) => excluded.includes(b64u(c.id)) && c.rpId === options.rp.id)) {
       throw new DOMException("already registered", "InvalidStateError");
@@ -224,7 +220,6 @@ class SoftwareAuthenticator {
 
   async get(options) {
     this.log.push({ kind: "get", options });
-    this.fail("get");
     const allowed = (options.allowCredentials || []).map((c) => b64u(c.id));
     const held = this.credentials.filter((c) => c.rpId === options.rpId);
     const choice = this.prefer
@@ -591,11 +586,11 @@ function iso(ms) {
 function claimApi(options = {}) {
   const now = options.now === undefined ? Date.now() : options.now;
   const api = {
-    org_id: options.org_id || crypto.randomUUID(),
-    principal_id: options.principal_id || crypto.randomUUID(),
+    org_id: crypto.randomUUID(),
+    principal_id: crypto.randomUUID(),
     kind: options.kind || "root",
     state: options.state || "open",
-    org_name: options.org_name || "Acme",
+    org_name: "Acme",
     expires_at: options.expires_at || iso(now + 72 * 3600 * 1000),
     server_time: options.server_time || iso(now),
     keys_left: options.keys_left === undefined ? 3 : options.keys_left,
@@ -606,7 +601,7 @@ function claimApi(options = {}) {
     receiptFor: (registrationText, response) =>
       mintReceipt("key.register", registrationText, response),
   };
-  const base = `/v1/claims/${options.ticket || TICKET}`;
+  const base = `/v1/claims/${TICKET}`;
   api.routes = {
     [`GET ${base}`]: () =>
       api.read || {
@@ -668,10 +663,10 @@ function approvalApi(options = {}) {
   const now = options.now === undefined ? Date.now() : options.now;
   const compose = options.compose;
   const api = {
-    org_id: options.org_id || crypto.randomUUID(),
+    org_id: crypto.randomUUID(),
     org_name: "Acme",
     app_id: options.app_id,
-    title: options.title || "Production",
+    title: "Production",
     compose_hash: options.compose_hash || `sha256:${sha256(compose || "").toString("hex")}`,
     catalog_template_sha256: options.catalog_template_sha256 || null,
     compose: options.catalog_template_sha256 ? null : compose,
@@ -689,7 +684,7 @@ function approvalApi(options = {}) {
     revisionReceipt: (text, response) => mintReceipt("revision.register", text, response),
     putReceipt: (text, response) => mintReceipt("secret.put", text, response),
   };
-  const base = `/v1/approval-requests/${options.ticket || TICKET}`;
+  const base = `/v1/approval-requests/${TICKET}`;
   const fields = [
     "org_id",
     "org_name",

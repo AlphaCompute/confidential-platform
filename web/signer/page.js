@@ -218,7 +218,7 @@ function errorCode(body) {
 function failure(reply) {
   if (reply.status === 0) return MESSAGES.unavailable;
   const code = errorCode(reply.body);
-  if (Object.prototype.hasOwnProperty.call(CODES, code)) return CODES[code];
+  if (Object.hasOwn(CODES, code)) return CODES[code];
   if (CODE.test(code)) return MESSAGES.kms_refused(code);
   if (reply.status === 404) return MESSAGES.bad_link;
   return MESSAGES.unavailable;
@@ -226,7 +226,7 @@ function failure(reply) {
 
 // As `failure`, but a request that is no longer pending names its state.
 function approvalFailure(reply) {
-  const details = reply.status === 409 && reply.body && reply.body.details;
+  const details = reply.status === 409 && reply.body?.details;
   if (details && typeof details.state === "string") {
     return details.state === "expired" ? MESSAGES.approval_expired : MESSAGES.decided;
   }
@@ -426,7 +426,7 @@ async function startClaim(view, ticket) {
   const read = reply.body;
   const session = loadSession(ticket);
   // The last key registered spends the link, and a reload in this tab still owes the checks.
-  const refusal = claimRefusal(read, Boolean(session && session.first && session.first.key_id));
+  const refusal = claimRefusal(read, Boolean(session?.first?.key_id));
   if (refusal) return stop(refusal);
   if (read.kind === "add" && read.credentials.length === 0) return stop(MESSAGES.no_credentials);
 
@@ -437,7 +437,7 @@ async function startClaim(view, ticket) {
   );
   const c = { view, read, ticket, ui, session, checked: new Set() };
   const s = c.session;
-  const revealed = Boolean(s && s.org_id && s.first);
+  const revealed = Boolean(s?.org_id && s.first);
   const registered = revealed && Boolean(s.first.key_id);
   if (read.kind === "add") {
     if (registered) return added(c);
@@ -448,19 +448,24 @@ async function startClaim(view, ticket) {
   return revealed ? offerRoot(c) : offerFirst(c);
 }
 
+// A button that creates one passkey and hands its key to `next`, or offers `retry` a note.
+function createButton(label, options, retry, next) {
+  return button(label, async () => {
+    const { credential, note } = await passkey("create", options);
+    if (!credential) return retry(note);
+    const key = createdKey(credential);
+    if (!key) return retry(MESSAGES.unusable_key);
+    return next(key);
+  });
+}
+
 function offerFirst(c, note) {
   const exclude = c.read.credentials.map((x) => x.credential_id);
   const options = createOptions(c.view, c.read.org_name, exclude);
   offer(
     c.ui,
     note,
-    button("Create passkey", async () => {
-      const { credential, note } = await passkey("create", options);
-      if (!credential) return offerFirst(c, note);
-      const key = createdKey(credential);
-      if (!key) return offerFirst(c, MESSAGES.unusable_key);
-      return reveal(c, key);
-    }),
+    createButton("Create passkey", options, (n) => offerFirst(c, n), (key) => reveal(c, key)),
   );
 }
 
@@ -468,7 +473,7 @@ function offerFirst(c, note) {
 async function reveal(c, key) {
   const reply = await api(c.view, "POST", claimPath(c, "/org"));
   if (reply.status === 409) {
-    const state = reply.body && reply.body.details && reply.body.details.state;
+    const state = reply.body?.details?.state;
     if (state === "closed") return stop(MESSAGES.claim_closed);
     if (state === "expired") return stop(MESSAGES.claim_expired);
     return stop(MESSAGES.other_tab);
@@ -571,9 +576,9 @@ function describeKey(title, key) {
 function rooted(c) {
   const s = c.session;
   const facts = [el("p", MESSAGES.yours, "confirmed"), ...describeKey("Root passkey:", s.first)];
-  if (s.second && s.second.key_id) facts.push(...describeKey("Second passkey:", s.second));
+  if (s.second?.key_id) facts.push(...describeKey("Second passkey:", s.second));
   c.ui.facts.replaceChildren(...facts);
-  if (s.second && s.second.key_id) return offerChecks(c, [s.first, s.second], MESSAGES.two_keys);
+  if (s.second?.key_id) return offerChecks(c, [s.first, s.second], MESSAGES.two_keys);
   if (s.second) return offerSecondApproval(c);
   return offerSecond(c);
 }
@@ -595,15 +600,16 @@ function offerSecond(c, note) {
     c.ui,
     note,
     el("p", "Add a second passkey so that losing one device does not lose the organization."),
-    button("Add a second passkey on another device or provider", async () => {
-      const { credential, note } = await passkey("create", options);
-      if (!credential) return offerSecond(c, note);
-      const key = createdKey(credential);
-      if (!key) return offerSecond(c, MESSAGES.unusable_key);
-      s.second = key;
-      saveSession(c);
-      return offerSecondApproval(c);
-    }),
+    createButton(
+      "Add a second passkey on another device or provider",
+      options,
+      (n) => offerSecond(c, n),
+      (key) => {
+        s.second = key;
+        saveSession(c);
+        return offerSecondApproval(c);
+      },
+    ),
     button("Skip for now", () =>
       offer(c.ui, "", el("p", MESSAGES.one_key(c.read.expires_at), "warning")),
     ),
@@ -803,7 +809,7 @@ async function startApproval(view, viewText, ticket) {
   if (refusal) return stop(refusal);
   const before = currentServices(read.current);
   const launch =
-    read.catalog_template_sha256 === null || read.catalog_template_sha256 === undefined
+    read.catalog_template_sha256 == null
       ? uploadedLaunch(read)
       : await catalogLaunch(view, read, before);
   if (launch.refusal) return stop(launch.refusal);
@@ -856,13 +862,13 @@ function secretFields(services, before) {
 
 // Reads every field once and empties it, or returns a note and leaves the fields as they were.
 function takeValues(a) {
-  const sent = a.fields.filter((f) => !f.keep || f.keep.value !== "keep");
+  const sent = a.fields.filter((f) => f.keep?.value !== "keep");
   if (sent.some((f) => !f.input.value)) return { note: MESSAGES.secret_missing };
   const values = sent.map((f) => ({ name: f.name, value: utf8(f.input.value), done: false }));
   for (const f of a.fields) f.input.value = "";
   a.secretsBox.replaceChildren(
     ...a.fields.map((f) =>
-      el("p", f.keep && f.keep.value === "keep" ? `${f.name}: keeping the current value` : f.name),
+      el("p", f.keep?.value === "keep" ? `${f.name}: keeping the current value` : f.name),
     ),
   );
   return { values };
