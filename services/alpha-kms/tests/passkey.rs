@@ -122,7 +122,7 @@ async fn a_device_passkey_claims_its_organization_and_registers_a_key() {
     let org: Uuid = a0["payload"]["org_id"].as_str().unwrap().parse().unwrap();
     let claim = assertion_body(a0, None);
 
-    let message = invalid(h.post("/v1/keys", claim.clone()).await);
+    let message = refused(h.post("/v1/keys", claim.clone()).await, "signature_invalid");
     assert!(message.contains("no signer"), "{message}");
     let rows =
         sqlx::query_scalar::<_, i64>("select count(*) from principal_keys where org_id = $1")
@@ -364,24 +364,15 @@ async fn passkey_app(h: &Harness, seed: u8) -> (PasskeyOrg, AppId, ComposeHash) 
     (org, app, hash)
 }
 
-/// Asserts `signature_invalid` without a receipt and returns the message.
-fn invalid((status, reply): (StatusCode, Value)) -> String {
+/// Asserts a 400 with `expected` and no receipt, and returns the message.
+fn refused((status, reply): (StatusCode, Value), expected: &str) -> String {
     assert_eq!(
         (status, code(&reply)),
-        (StatusCode::BAD_REQUEST, "signature_invalid"),
+        (StatusCode::BAD_REQUEST, expected),
         "{reply}"
     );
     assert!(reply.get("receipt").is_none(), "{reply}");
     reply["error"]["message"].as_str().unwrap().to_owned()
-}
-
-fn malformed((status, reply): (StatusCode, Value)) {
-    assert_eq!(
-        (status, code(&reply)),
-        (StatusCode::BAD_REQUEST, "malformed"),
-        "{reply}"
-    );
-    assert!(reply.get("receipt").is_none(), "{reply}");
 }
 
 /// Asserts the last `action` audit row was denied and returns its code.
@@ -415,7 +406,7 @@ async fn without_a_signer_no_passkey_signature_verifies_anywhere() {
 
     set_signer(&h, 3, &[]).await;
     let no_signer = |reply| {
-        let message = invalid(reply);
+        let message = refused(reply, "signature_invalid");
         assert!(message.contains("no signer"), "{message}");
     };
 
@@ -492,16 +483,17 @@ async fn a_passkey_signature_on_an_origin_the_document_dropped_no_longer_verifie
     let other = "https://localhost:9443";
 
     set_signer(&h, 3, &[other]).await;
-    let message = invalid(
+    let message = refused(
         put(
             &h,
             "dropped-origin",
             put_body("dropped-origin", &[app], b"refused", h.now(), &admin),
         )
         .await,
+        "signature_invalid",
     );
     assert!(message.contains("signer.origins"), "{message}");
-    let message = invalid(h.attest(KEYED).await);
+    let message = refused(h.attest(KEYED).await, "signature_invalid");
     assert!(message.contains("signer.origins"), "{message}");
 
     set_signer(&h, 4, &[other, &origin()]).await;
@@ -533,7 +525,7 @@ async fn another_organizations_passkey_or_a_grafted_link_does_not_sign() {
         Some(y.root.0),
     );
     body["value"] = json!(b64(b"refused"));
-    invalid(put(&h, "across", body).await);
+    refused(put(&h, "across", body).await, "signature_invalid");
 
     // Would pass if the chain walk stopped verifying each link's registration under its parent.
     sqlx::query("update principal_keys set org_id = $1, registered_by_key = $2 where id = $3")
@@ -543,13 +535,14 @@ async fn another_organizations_passkey_or_a_grafted_link_does_not_sign() {
         .execute(&h.pool)
         .await
         .unwrap();
-    let message = invalid(
+    let message = refused(
         put(
             &h,
             "grafted",
             put_body("grafted", &[app], b"refused", h.now(), &x.admin),
         )
         .await,
+        "signature_invalid",
     );
     assert!(
         message.contains("not registered by its parent"),
@@ -574,7 +567,7 @@ async fn a_stored_passkey_signature_without_its_assertion_fields_is_invalid_not_
     .execute(&h.pool)
     .await
     .unwrap();
-    invalid(h.attest(KEYED).await);
+    refused(h.attest(KEYED).await, "signature_invalid");
 
     sqlx::query(
         "update principal_keys set signature = signature - 'authenticator_data' where id = $1",
@@ -583,13 +576,14 @@ async fn a_stored_passkey_signature_without_its_assertion_fields_is_invalid_not_
     .execute(&h.pool)
     .await
     .unwrap();
-    invalid(
+    refused(
         put(
             &h,
             "stripped",
             put_body("stripped", &[app], b"refused", h.now(), &admin),
         )
         .await,
+        "signature_invalid",
     );
     assert_eq!(h.secrets_named("stripped").await, 0);
 }
@@ -606,7 +600,7 @@ async fn a_passkey_body_without_its_assertion_fields_is_malformed() {
     for field in ["client_data_json", "authenticator_data"] {
         let mut body = put_body("shapeless", &[app], b"refused", h.now(), &admin);
         body["signature"].as_object_mut().unwrap().remove(field);
-        malformed(put(&h, "shapeless", body).await);
+        refused(put(&h, "shapeless", body).await, "malformed");
         assert_eq!(denied(&h, "secret.put").await, "malformed", "{field}");
     }
     assert_eq!(h.secrets_named("shapeless").await, 0);
@@ -615,6 +609,6 @@ async fn a_passkey_body_without_its_assertion_fields_is_malformed() {
     let signature = claim["signature"].as_object_mut().unwrap();
     signature.remove("client_data_json");
     signature.remove("authenticator_data");
-    malformed(h.post("/v1/keys", claim).await);
+    refused(h.post("/v1/keys", claim).await, "malformed");
     assert_eq!(denied(&h, "key.register").await, "malformed");
 }
