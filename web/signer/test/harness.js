@@ -148,7 +148,8 @@ class SoftwareAuthenticator {
     this.highS = Boolean(options.highS);
     this.credentials = [];
     this.log = [];
-    // Set per ceremony: {create: "NotAllowedError"}, {publicKey: null}, {algorithm: -8}, ...
+    // Consumed by the next ceremony: {create: "NotAllowedError"}, {publicKey: null | "raw"},
+    // {algorithm: -8}, {tamper: true} (one bit of the signature), {otherChallenge: true}.
     this.fault = {};
     this.counter = 0;
   }
@@ -227,10 +228,15 @@ class SoftwareAuthenticator {
       ? held.find((c) => b64u(c.id) === this.prefer && allowed.includes(this.prefer))
       : held.find((c) => allowed.length === 0 || allowed.includes(b64u(c.id)));
     if (!choice) throw new DOMException("no credential", "NotAllowedError");
+    let challenge = Buffer.from(options.challenge);
+    if (this.fault.otherChallenge) {
+      challenge = crypto.randomBytes(32);
+      delete this.fault.otherChallenge;
+    }
     const clientData = Buffer.from(
       JSON.stringify({
         type: "webauthn.get",
-        challenge: b64u(Buffer.from(options.challenge)),
+        challenge: b64u(challenge),
         origin: this.origin || ORIGIN,
         crossOrigin: false,
       }),
@@ -383,6 +389,8 @@ async function loadPage(options = {}) {
   const prompts = [];
   const clicks = [];
   const authenticator = options.authenticator || new SoftwareAuthenticator();
+  // The passkey provider the next prompt reaches; `page.use` moves to another device.
+  const device = { current: authenticator };
   const wasmSri = `sha256-${crypto.createHash("sha256").update(b.wasm).digest("base64")}`;
   const routes = options.routes || {};
 
@@ -450,11 +458,11 @@ async function loadPage(options = {}) {
       credentials: {
         create: (o) => {
           prompts.push({ kind: "create", fetches: fetches.length, click: clicks[clicks.length - 1] });
-          return authenticator.create(o.publicKey);
+          return device.current.create(o.publicKey);
         },
         get: (o) => {
           prompts.push({ kind: "get", fetches: fetches.length, click: clicks[clicks.length - 1] });
-          return authenticator.get(o.publicKey);
+          return device.current.get(o.publicKey);
         },
       },
     },
@@ -505,6 +513,9 @@ async function loadPage(options = {}) {
     consoleCalls,
     sandbox,
     main,
+    use(other) {
+      device.current = other;
+    },
     run: (code) => vm.runInContext(code, context),
     call(name, ...args) {
       context.__args = args;

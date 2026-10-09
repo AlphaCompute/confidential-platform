@@ -52,9 +52,17 @@ const MESSAGES = {
   signature_invalid: "The KMS did not accept the passkey's signature. Nothing was changed.",
   already_exists: "The KMS already holds this. Reload to see where it stands.",
   kms_refused: (code) => `The KMS refused this request (${code}).`,
+  no_credentials: "No passkey of this organization is known. Ask your AlphaCompute contact.",
+  foreign_passkey: "That passkey does not belong to this organization. Use one that does.",
+  check_failed: "This passkey did not sign as expected. Try again.",
   yours: "This organization is yours.",
+  added: "The new passkey is registered.",
   synced: "Synced passkey (backed up by your provider)",
   device_bound: "Device-bound passkey: if you lose this device you lose this key",
+  two_keys: "Done. Your organization has two passkeys.",
+  added_done: "Done. The new passkey signs as expected.",
+  one_key: (expiresAt) =>
+    `Your organization has one passkey. If you lose it you lose the organization. Your link stays open until ${expiresAt}.`,
 };
 
 const CODES = {
@@ -404,20 +412,24 @@ async function startClaim(view, viewText, ticket) {
   const read = reply.body;
   const refusal = claimRefusal(read);
   if (refusal) return stop(refusal);
+  if (read.kind === "add" && read.credentials.length === 0) return stop(MESSAGES.no_credentials);
 
   const ui = screen(
     el("h1", read.org_name),
     el("p", read.kind === "root" ? "Claim this organization" : "Add a passkey to this organization"),
     el("p", `This link stays open until ${read.expires_at}.`),
   );
-  const c = { view, read, ticket, ui, session: loadSession(ticket) };
+  const c = { view, read, ticket, ui, session: loadSession(ticket), checked: new Set() };
   const s = c.session;
-  if (read.state === "rooted") {
-    if (!s || !s.root_key_id) return stop(MESSAGES.other_tab);
-    return rooted(c);
+  const revealed = Boolean(s && s.org_id && s.first);
+  const registered = revealed && Boolean(s.first.key_id);
+  if (read.kind === "add") {
+    if (registered) return added(c);
+    return revealed ? offerAddApproval(c) : offerFirst(c);
   }
-  if (s && s.org_id && s.first) return offerRoot(c);
-  return offerFirst(c);
+  if (registered) return rooted(c);
+  if (read.state === "rooted") return stop(MESSAGES.other_tab);
+  return revealed ? offerRoot(c) : offerFirst(c);
 }
 
 function offerFirst(c, note) {
@@ -452,7 +464,7 @@ async function reveal(c, key) {
   }
   c.session = { org_id: b.org_id, principal_id: b.principal_id, first: key };
   saveSession(c);
-  return offerRoot(c);
+  return c.read.kind === "root" ? offerRoot(c) : offerAddApproval(c);
 }
 
 // Relays one key registration and returns the response the KMS signed for it, or a note.
@@ -468,49 +480,213 @@ async function register(c, credentialId, registration, publicKey) {
   return { signed };
 }
 
-function offerRoot(c, note) {
-  const s = c.session;
-  const payload = {
-    org_id: s.org_id,
-    principal_id: s.principal_id,
-    public_key: s.first.spki,
-    label: "passkey-1",
-    issued_at: issuedAt(),
-  };
-  const signable = wasm_bindgen.signingDigest("org-root-key", JSON.stringify(payload));
-  const options = getOptions(c.view, signable.digest, [s.first.id]);
+// One step that signs a key document and relays it: `allow` limits the passkeys asked, `keyIdFor`
+// maps the one that answered to its KMS key id (undefined for the root's self-signature), and
+// `next` runs once the receipt verified.
+function offerRegistration(c, note, step) {
+  const signable = wasm_bindgen.signingDigest(step.context, JSON.stringify(step.payload));
+  const options = getOptions(c.view, signable.digest, step.allow);
   offer(
     c.ui,
     note,
-    button("Confirm with passkey", async () => {
+    button(step.label, async () => {
       const { credential, note } = await passkey("get", options);
-      if (!credential) return offerRoot(c, note);
+      if (!credential) return step.retry(note);
+      const keyId = step.keyIdFor(credential);
+      if (keyId === null) return step.retry(MESSAGES.foreign_passkey);
       const registration = wasm_bindgen.canonicalJson(
-        JSON.stringify({ payload, signature: signatureObject(credential) }),
+        JSON.stringify({ payload: step.payload, signature: signatureObject(credential, keyId) }),
       );
-      const result = await register(c, s.first.id, registration, s.first.spki);
-      if (!result.signed) return offerRoot(c, result.note);
-      s.root_key_id = result.signed.id;
+      const result = await register(c, step.key.id, registration, step.key.spki);
+      if (!result.signed) return step.retry(result.note);
+      step.key.key_id = result.signed.id;
       saveSession(c);
-      return rooted(c);
+      return step.next();
     }),
   );
 }
 
-function describeKey(key) {
+function offerRoot(c, note) {
+  const s = c.session;
+  offerRegistration(c, note, {
+    label: "Confirm with passkey",
+    context: "org-root-key",
+    payload: {
+      org_id: s.org_id,
+      principal_id: s.principal_id,
+      public_key: s.first.spki,
+      label: "passkey-1",
+      issued_at: issuedAt(),
+    },
+    key: s.first,
+    allow: [s.first.id],
+    keyIdFor: () => undefined,
+    retry: (n) => offerRoot(c, n),
+    next: () => rooted(c),
+  });
+}
+
+function offerAddApproval(c, note) {
+  const s = c.session;
+  offerRegistration(c, note, {
+    label: "Approve it with a passkey of this organization",
+    context: "principal-key",
+    payload: principalKey(s, s.first, "passkey-1"),
+    key: s.first,
+    allow: c.read.credentials.map((x) => x.credential_id),
+    keyIdFor: (credential) => keyIdOf(credential.rawId, c.read.credentials),
+    retry: (n) => offerAddApproval(c, n),
+    next: () => added(c),
+  });
+}
+
+function principalKey(s, key, label) {
+  return { principal_id: s.principal_id, public_key: key.spki, label, issued_at: issuedAt() };
+}
+
+function describeKey(title, key) {
   return [
+    el("p", title),
     el("p", fingerprint(unb64u(key.spki)), "fingerprint"),
     el("p", key.backed_up ? MESSAGES.synced : MESSAGES.device_bound),
   ];
 }
 
 function rooted(c) {
+  const s = c.session;
+  const facts = [el("p", MESSAGES.yours, "confirmed"), ...describeKey("Root passkey:", s.first)];
+  if (s.second && s.second.key_id) facts.push(...describeKey("Second passkey:", s.second));
+  c.ui.facts.replaceChildren(...facts);
+  if (s.second && s.second.key_id) return offerChecks(c, [s.first, s.second], MESSAGES.two_keys);
+  if (s.second) return offerSecondApproval(c);
+  return offerSecond(c);
+}
+
+function added(c) {
   c.ui.facts.replaceChildren(
-    el("p", MESSAGES.yours, "confirmed"),
-    el("p", "Root passkey fingerprint:"),
-    ...describeKey(c.session.first),
+    el("p", MESSAGES.added, "confirmed"),
+    ...describeKey("New passkey:", c.session.first),
   );
-  offer(c.ui, "");
+  // The passkey that signed the registration has just been checked by the KMS, and the page
+  // knows no public key of it to check it against.
+  return offerChecks(c, [c.session.first], MESSAGES.added_done);
+}
+
+function offerSecond(c, note) {
+  const s = c.session;
+  const options = createOptions(c.view, c.read.org_name, [s.first.id]);
+  offer(
+    c.ui,
+    note,
+    el("p", "Add a second passkey so that losing one device does not lose the organization."),
+    button("Add a second passkey on another device or provider", async () => {
+      const { credential, note } = await passkey("create", options);
+      if (!credential) return offerSecond(c, note);
+      const key = createdKey(credential);
+      if (!key) return offerSecond(c, MESSAGES.unusable_key);
+      s.second = key;
+      saveSession(c);
+      return offerSecondApproval(c);
+    }),
+    button("Skip for now", () =>
+      offer(c.ui, "", el("p", message("one_key", c.read.expires_at), "warning")),
+    ),
+  );
+}
+
+function offerSecondApproval(c, note) {
+  const s = c.session;
+  offerRegistration(c, note, {
+    label: "Approve it with your first passkey",
+    context: "principal-key",
+    payload: principalKey(s, s.second, "passkey-2"),
+    key: s.second,
+    allow: [s.first.id],
+    keyIdFor: () => s.first.key_id,
+    retry: (n) => offerSecondApproval(c, n),
+    next: () => rooted(c),
+  });
+}
+
+// One assertion from each key over a fresh challenge, verified here against the key it claims.
+function offerChecks(c, keys, done, note) {
+  if (keys.every((k) => c.checked.has(k.id))) return offer(c.ui, "", el("p", done, "confirmed"));
+  const steps = keys.map((key, i) => {
+    const label = `Check passkey ${i + 1}`;
+    if (c.checked.has(key.id)) return el("p", `${label}: signed as expected.`);
+    const challenge = random(32);
+    const options = getOptions(c.view, challenge, [key.id]);
+    return button(label, async () => {
+      const { credential, note } = await passkey("get", options);
+      if (!credential) return offerChecks(c, keys, done, note);
+      if (!(await signedAsExpected(c.view, key, challenge, credential))) {
+        return offerChecks(c, keys, done, MESSAGES.check_failed);
+      }
+      c.checked.add(key.id);
+      return offerChecks(c, keys, done);
+    });
+  });
+  offer(c.ui, note, el("p", "Check that each passkey signs, one at a time."), ...steps);
+}
+
+// r ‖ s, each 32 bytes, of a DER ECDSA signature, or null.
+function rawSignature(der) {
+  if (der.length < 8 || der[0] !== 0x30 || der[1] !== der.length - 2) return null;
+  const raw = new Uint8Array(64);
+  let at = 2;
+  for (let i = 0; i < 2; i += 1) {
+    const length = der[at + 1];
+    if (der[at] !== 0x02 || !length || at + 2 + length > der.length) return null;
+    let int = der.subarray(at + 2, at + 2 + length);
+    while (int.length > 1 && int[0] === 0) int = int.subarray(1);
+    if (int.length > 32) return null;
+    raw.set(int, (i + 1) * 32 - int.length);
+    at += 2 + length;
+  }
+  return at === der.length ? raw : null;
+}
+
+async function signedAsExpected(view, key, challenge, assertion) {
+  try {
+    const r = assertion.response;
+    if (b64u(assertion.rawId) !== key.id) return false;
+    const clientData = bytesOf(r.clientDataJSON);
+    const client = JSON.parse(new TextDecoder().decode(clientData));
+    if (
+      client.type !== "webauthn.get" ||
+      client.challenge !== b64u(challenge) ||
+      client.origin !== location.origin ||
+      client.crossOrigin === true ||
+      client.topOrigin !== undefined
+    ) {
+      return false;
+    }
+    const authData = bytesOf(r.authenticatorData);
+    const rpHash = new Uint8Array(await crypto.subtle.digest("SHA-256", utf8(view.signer.rp_id)));
+    if (authData.length < 37 || !equalBytes(authData.subarray(0, 32), rpHash)) return false;
+    if ((authData[32] & (FLAG_UP | FLAG_UV)) !== (FLAG_UP | FLAG_UV)) return false;
+    const signature = rawSignature(bytesOf(r.signature));
+    if (!signature) return false;
+    const publicKey = await crypto.subtle.importKey(
+      "spki",
+      unb64u(key.spki),
+      { name: "ECDSA", namedCurve: "P-256" },
+      false,
+      ["verify"],
+    );
+    const clientHash = new Uint8Array(await crypto.subtle.digest("SHA-256", clientData));
+    const signed = new Uint8Array(authData.length + clientHash.length);
+    signed.set(authData);
+    signed.set(clientHash, authData.length);
+    return await crypto.subtle.verify(
+      { name: "ECDSA", hash: "SHA-256" },
+      publicKey,
+      signature,
+      signed,
+    );
+  } catch (_) {
+    return false;
+  }
 }
 
 async function verifiedPlatform() {
