@@ -11,9 +11,7 @@ out=${1:?usage: build.sh <out-dir>}
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 
-for tool in openssl sed cut; do
-  command -v "$tool" >/dev/null || { echo "build.sh needs $tool" >&2; exit 1; }
-done
+command -v openssl >/dev/null || { echo "build.sh needs openssl" >&2; exit 1; }
 
 mkdir -p "$out"
 if [ -n "$(ls -A "$out")" ]; then

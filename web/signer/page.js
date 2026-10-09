@@ -92,11 +92,6 @@ const CODES = {
   revision_revoked: MESSAGES.revision_revoked,
 };
 
-function message(key, arg) {
-  const m = MESSAGES[key];
-  return typeof m === "function" ? m(arg) : m;
-}
-
 function el(tag, text, className) {
   const node = document.createElement(tag);
   if (text !== undefined) node.textContent = text;
@@ -106,10 +101,6 @@ function el(tag, text, className) {
 
 function stop(text) {
   document.getElementById("main").replaceChildren(el("p", text, "refusal"));
-}
-
-function refuse(key, arg) {
-  stop(message(key, arg));
 }
 
 function sleep(ms) {
@@ -228,7 +219,7 @@ function failure(reply) {
   if (reply.status === 0) return MESSAGES.unavailable;
   const code = errorCode(reply.body);
   if (Object.prototype.hasOwnProperty.call(CODES, code)) return CODES[code];
-  if (CODE.test(code)) return message("kms_refused", code);
+  if (CODE.test(code)) return MESSAGES.kms_refused(code);
   if (reply.status === 404) return MESSAGES.bad_link;
   return MESSAGES.unavailable;
 }
@@ -246,7 +237,7 @@ function clockRefusal(serverTime) {
   const server = typeof serverTime === "string" ? Date.parse(serverTime) : NaN;
   if (!Number.isFinite(server)) return MESSAGES.unavailable;
   const skew = Math.abs(server - Date.now());
-  return skew > MAX_SKEW_MS ? message("clock", Math.round(skew / 60000)) : null;
+  return skew > MAX_SKEW_MS ? MESSAGES.clock(Math.round(skew / 60000)) : null;
 }
 
 function revisionsJson(view) {
@@ -369,7 +360,7 @@ function button(label, action) {
     try {
       await action();
     } catch (_) {
-      refuse("unexpected");
+      stop(MESSAGES.unexpected);
     } finally {
       b.disabled = false;
     }
@@ -430,7 +421,7 @@ function claimRefusal(read, resuming) {
   return clockRefusal(read.server_time);
 }
 
-async function startClaim(view, viewText, ticket) {
+async function startClaim(view, ticket) {
   const reply = await api(view, "GET", `/v1/claims/${ticket}`);
   if (reply.status !== 200) return stop(failure(reply));
   const read = reply.body;
@@ -615,7 +606,7 @@ function offerSecond(c, note) {
       return offerSecondApproval(c);
     }),
     button("Skip for now", () =>
-      offer(c.ui, "", el("p", message("one_key", c.read.expires_at), "warning")),
+      offer(c.ui, "", el("p", MESSAGES.one_key(c.read.expires_at), "warning")),
     ),
   );
 }
@@ -824,7 +815,7 @@ async function startApproval(view, viewText, ticket) {
   const a = { view, viewText, read, ticket, ui, launch, credential: null, values: null };
   a.fields = secretFields(launch.services, read.current);
   a.secretsBox = el("div");
-  if (a.fields.length) a.secretsBox.append(...a.fields.map((f) => f.node));
+  a.secretsBox.append(...a.fields.map((f) => f.node));
   ui.facts.replaceChildren(...describeLaunch(a), a.secretsBox);
   return offerApproval(a);
 }
@@ -1084,28 +1075,28 @@ async function verifiedPlatform() {
 }
 
 async function boot() {
-  if (window.top !== window.self) return refuse("framed");
-  if (!window.PublicKeyCredential) return refuse("no_passkeys");
+  if (window.top !== window.self) return stop(MESSAGES.framed);
+  if (!window.PublicKeyCredential) return stop(MESSAGES.no_passkeys);
 
   await wasm_bindgen({ module_or_path: fetch(WASM_URL, { integrity: WASM_SRI }) });
 
   const mode = location.pathname.split("/").pop();
   const ticket = location.hash.slice(1);
-  if ((mode !== "claim" && mode !== "approve") || !TICKET.test(ticket)) return refuse("bad_link");
+  if ((mode !== "claim" && mode !== "approve") || !TICKET.test(ticket)) return stop(MESSAGES.bad_link);
 
   const platform = await verifiedPlatform();
-  if (!platform) return refuse("platform");
+  if (!platform) return stop(MESSAGES.platform);
   const { view, viewText } = platform;
 
-  if (view.version < storedVersion()) return refuse("older_platform");
+  if (view.version < storedVersion()) return stop(MESSAGES.older_platform);
   storeVersion(view.version);
 
-  if (!servedBySigner(view)) return refuse("not_signer");
+  if (!servedBySigner(view)) return stop(MESSAGES.not_signer);
 
-  if (mode === "claim") return startClaim(view, viewText, ticket);
+  if (mode === "claim") return startClaim(view, ticket);
   return startApproval(view, viewText, ticket);
 }
 
 document.addEventListener("DOMContentLoaded", () => {
-  boot().catch(() => refuse("unexpected"));
+  boot().catch(() => stop(MESSAGES.unexpected));
 });

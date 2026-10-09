@@ -171,6 +171,11 @@ class SoftwareAuthenticator {
 
   // A credential made outside the page, as one from an earlier claim.
   enroll(rpId = RP_ID) {
+    const credential = this.newCredential(rpId);
+    return { id: b64u(credential.id), spki: b64u(credential.spki) };
+  }
+
+  newCredential(rpId) {
     const pair = crypto.generateKeyPairSync("ec", { namedCurve: "P-256" });
     const credential = {
       id: crypto.randomBytes(16),
@@ -179,7 +184,7 @@ class SoftwareAuthenticator {
       spki: pair.publicKey.export({ type: "spki", format: "der" }),
     };
     this.credentials.push(credential);
-    return { id: b64u(credential.id), spki: b64u(credential.spki) };
+    return credential;
   }
 
   authData(rpId) {
@@ -204,14 +209,7 @@ class SoftwareAuthenticator {
     if (this.credentials.some((c) => excluded.includes(b64u(c.id)) && c.rpId === options.rp.id)) {
       throw new DOMException("already registered", "InvalidStateError");
     }
-    const pair = crypto.generateKeyPairSync("ec", { namedCurve: "P-256" });
-    const credential = {
-      id: crypto.randomBytes(16),
-      rpId: options.rp.id,
-      privateKey: pair.privateKey,
-      spki: pair.publicKey.export({ type: "spki", format: "der" }),
-    };
-    this.credentials.push(credential);
+    const credential = this.newCredential(options.rp.id);
     let publicKey = credential.spki;
     if (this.fault.publicKey === null) publicKey = null;
     if (this.fault.publicKey === "raw") publicKey = credential.spki.subarray(26);
@@ -302,15 +300,11 @@ class Node {
     this.children = [];
     this.own = "";
     this.listeners = {};
-    this.attributes = {};
     this.className = "";
     this.id = "";
     this.type = "";
-    this.name = "";
     this.value = "";
-    this.checked = false;
     this.disabled = false;
-    this.open = false;
     this.autocomplete = "";
   }
 
@@ -328,10 +322,6 @@ class Node {
     this.append(...nodes);
   }
 
-  remove() {
-    if (this.parent) this.parent.children = this.parent.children.filter((c) => c !== this);
-  }
-
   get textContent() {
     return this.own + this.children.map((c) => c.textContent).join("");
   }
@@ -339,15 +329,6 @@ class Node {
   set textContent(value) {
     this.children = [];
     this.own = String(value);
-  }
-
-  setAttribute(name, value) {
-    this.attributes[name] = String(value);
-    if (name in this && typeof this[name] !== "function") this[name] = value;
-  }
-
-  getAttribute(name) {
-    return name in this.attributes ? this.attributes[name] : null;
   }
 
   addEventListener(type, listener) {
@@ -362,8 +343,7 @@ class Node {
   // One line per block, for assertions and failure messages.
   lines() {
     if (this.tagName === "#TEXT") return this.own ? [this.own] : [];
-    const inline = ["SPAN", "CODE", "STRONG", "EM", "#TEXT"];
-    if (this.children.every((c) => inline.includes(c.tagName))) {
+    if (this.children.every((c) => c.tagName === "#TEXT")) {
       const t = this.textContent;
       return t ? [t] : [];
     }
@@ -604,7 +584,7 @@ async function loadPage(options = {}) {
     },
     async startClaim(ticket = TICKET, view = testView()) {
       await page.init();
-      await page.call("startClaim", view.view, view.viewText, ticket);
+      await page.call("startClaim", view.view, ticket);
     },
     async startApproval(ticket = TICKET, view = testView()) {
       await page.init();
@@ -619,22 +599,14 @@ function iso(ms) {
   return new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
-function uuid7() {
-  const b = crypto.randomBytes(16);
-  b[6] = (b[6] & 0x0f) | 0x70;
-  b[8] = (b[8] & 0x3f) | 0x80;
-  const h = b.toString("hex");
-  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
-}
-
 // shroud-go's claim routes for one ticket, with the KMS behind them answering every key
 // registration with a receipt. `api.receiptFor(registrationText, response)` may be replaced to
 // return a receipt that must fail.
 function claimApi(options = {}) {
   const now = options.now === undefined ? Date.now() : options.now;
   const api = {
-    org_id: options.org_id || uuid7(),
-    principal_id: options.principal_id || uuid7(),
+    org_id: options.org_id || crypto.randomUUID(),
+    principal_id: options.principal_id || crypto.randomUUID(),
     kind: options.kind || "root",
     state: options.state || "open",
     org_name: options.org_name || "Acme",
@@ -685,7 +657,7 @@ function claimApi(options = {}) {
       api.registrations.push({ credentialId, registrationText, registration, body: req.body });
       if (api.keysReply) return api.keysReply(registrationText);
       const response = {
-        id: uuid7(),
+        id: crypto.randomUUID(),
         principal_id: registration.payload.principal_id,
         org_id: api.org_id,
         public_key: registration.payload.public_key,
@@ -710,7 +682,7 @@ function approvalApi(options = {}) {
   const now = options.now === undefined ? Date.now() : options.now;
   const compose = options.compose;
   const api = {
-    org_id: options.org_id || uuid7(),
+    org_id: options.org_id || crypto.randomUUID(),
     org_name: "Acme",
     app_id: options.app_id,
     title: options.title || "Production",
@@ -794,7 +766,7 @@ function approvalApi(options = {}) {
       if (answer) return answer;
       const p = body.payload;
       const response = {
-        id: uuid7(),
+        id: crypto.randomUUID(),
         name: p.name,
         org_id: api.org_id,
         app_ids: p.app_ids,
@@ -819,7 +791,6 @@ module.exports = {
   contextDigest,
   iso,
   jcs,
-  uuid7,
   loadPage,
   memoryStorage,
   mintReceipt,
