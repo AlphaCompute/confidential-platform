@@ -785,6 +785,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_tls_upstream_is_a_lowercase_service_and_a_port() {
+        assert_eq!(parse_upstream(None).unwrap(), None);
+        let c = Config::parse(HASH, HASH, "https://a", None, Some("web:80")).unwrap();
+        assert_eq!(
+            c.tls_upstream,
+            Some(Upstream {
+                host: "web".into(),
+                port: 80
+            })
+        );
+        let max = parse_upstream(Some("localhost:65535")).unwrap().unwrap();
+        assert_eq!(max.to_string(), "localhost:65535");
+        for bad in [
+            "web",
+            "web:",
+            ":80",
+            "web:0",
+            "web:65536",
+            "web:+80",
+            "Web:80",
+            "../x:80",
+            "web:80:1",
+            "web/x:80",
+            " web:80x",
+        ] {
+            let Err(Error::Config(m)) = Config::parse(HASH, HASH, "https://a", None, Some(bad))
+            else {
+                panic!("{bad} was accepted");
+            };
+            assert!(m.starts_with("ALPHACOMPUTE_TLS_UPSTREAM:"), "{bad}: {m}");
+        }
+    }
+
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("alpha-runtime-{}", alpha_core::KeyId::mint()));
         std::fs::create_dir(&dir).unwrap();

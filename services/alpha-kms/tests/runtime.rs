@@ -39,7 +39,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::aws_lc_rs;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::time_provider::TimeProvider;
-use rustls::{ClientConfig, ServerConfig};
+use rustls::{ClientConfig, HandshakeKind, ServerConfig};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
@@ -931,6 +931,177 @@ async fn a_websocket_upgrade_and_an_h2_preface_pass_through() {
     drop(ws);
     drop(h2);
     assert_eq!(socket.stop().await, Exit::Drained);
+}
+
+fn leaf_serial(tls: &TlsStream<TcpStream>) -> Vec<u8> {
+    let leaf = &tls.get_ref().1.peer_certificates().unwrap()[0];
+    X509Certificate::from_der(leaf)
+        .unwrap()
+        .1
+        .raw_serial()
+        .to_vec()
+}
+
+/// The connection ends within `within`: EOF or an error, never data.
+async fn closed(tls: &mut TlsStream<TcpStream>, within: Duration) {
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(within, tls.read(&mut byte))
+        .await
+        .expect("the connection stayed open");
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+}
+
+async fn get_body(addr: SocketAddr, client: &Arc<ClientConfig>) -> String {
+    let mut tls = connect(addr, client).await.unwrap();
+    tls.write_all(b"GET / HTTP/1.1\r\nHost: app\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut reply = String::new();
+    tls.read_to_string(&mut reply).await.unwrap();
+    reply
+}
+
+#[tokio::test]
+async fn the_endpoint_serves_a_renewed_leaf_without_dropping_open_connections() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    app_with_secret(&h, b"v1").await;
+    let (port, _) = start_plain_service().await;
+    let (runtime, _) = start_runtime(&h, config_with_upstream(&h, port));
+    runtime.attest().await.unwrap();
+    let (socket, addr) = Socket::with_endpoint(runtime.clone()).await;
+    // rustls' default client keeps a session cache and resumes whenever the server lets it.
+    let client = Arc::new(hybrid_client(&h));
+
+    let mut a = connect(addr, &client).await.unwrap();
+    upgrade(&mut a).await;
+    echo(&mut a, b"before the renewal").await;
+
+    runtime.attest().await.unwrap();
+    let mut b = connect(addr, &client).await.unwrap();
+    assert_ne!(leaf_serial(&b), leaf_serial(&a));
+    assert_eq!(b.get_ref().1.handshake_kind(), Some(HandshakeKind::Full));
+    upgrade(&mut b).await;
+    echo(&mut b, b"on the new leaf").await;
+
+    echo(&mut a, b"after the renewal").await;
+
+    let c = connect(addr, &client).await.unwrap();
+    assert_eq!(c.get_ref().1.handshake_kind(), Some(HandshakeKind::Full));
+    assert_eq!(leaf_serial(&c), leaf_serial(&b));
+
+    drop((a, b, c));
+    assert_eq!(socket.stop().await, Exit::Drained);
+}
+
+#[tokio::test]
+async fn an_expired_leaf_is_not_served() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    app_with_secret(&h, b"v1").await;
+    let (port, _) = start_plain_service().await;
+    let (runtime, clock) = start_runtime(&h, config_with_upstream(&h, port));
+    runtime.attest().await.unwrap();
+    let (socket, addr) = Socket::with_endpoint(runtime.clone()).await;
+    // The client's clock stays at the leaf's birth, so only the runtime can refuse.
+    let client = Arc::new(hybrid_client(&h));
+
+    *clock.lock().unwrap() = h.now() + certs::LEAF_TTL + Duration::from_secs(1);
+    assert!(connect(addr, &client).await.is_err());
+
+    *clock.lock().unwrap() = h.now();
+    runtime.attest().await.unwrap();
+    assert!(get_body(addr, &client).await.ends_with(BODY));
+
+    assert_eq!(socket.stop().await, Exit::Drained);
+}
+
+#[tokio::test]
+async fn an_unreachable_upstream_closes_the_connection_and_the_proxy_keeps_serving() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    app_with_secret(&h, b"v1").await;
+    let spare = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = spare.local_addr().unwrap().port();
+    drop(spare);
+    let (runtime, _) = start_runtime(&h, config_with_upstream(&h, port));
+    runtime.attest().await.unwrap();
+    let (socket, addr) = Socket::with_endpoint(runtime.clone()).await;
+    let client = Arc::new(hybrid_client(&h));
+
+    let mut tls = connect(addr, &client).await.unwrap();
+    closed(&mut tls, Duration::from_secs(12)).await;
+
+    plain_service(TcpListener::bind(("127.0.0.1", port)).await.unwrap());
+    assert!(get_body(addr, &client).await.ends_with(BODY));
+
+    assert_eq!(socket.stop().await, Exit::Drained);
+}
+
+#[tokio::test]
+async fn a_revoked_revision_closes_proxied_connections() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    let (_, hash, admin) = app_with_secret(&h, b"v1").await;
+    let (port, _) = start_plain_service().await;
+    let (runtime, _) = start_runtime(&h, config_with_upstream(&h, port));
+    runtime.attest().await.unwrap();
+    let (mut socket, addr) = Socket::with_endpoint(runtime.clone()).await;
+    let client = Arc::new(hybrid_client(&h));
+    let mut ws = connect(addr, &client).await.unwrap();
+    upgrade(&mut ws).await;
+    echo(&mut ws, b"open").await;
+
+    let payload = json!({ "compose_hash": hash, "issued_at": rfc3339(h.now()) });
+    let (status, reply) = h
+        .post(
+            &format!("/v1/revisions/{hash}/revoke"),
+            h.signed(context::CONTROL, payload, &admin),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let (status, reply) = socket.get("/v1/secrets/other").await;
+    assert_eq!((status, code(&reply)), (409, "revision_revoked"), "{reply}");
+
+    let exit = tokio::time::timeout(Duration::from_secs(5), &mut socket.task)
+        .await
+        .expect("a revocation does not wait for proxied connections")
+        .unwrap();
+    assert_eq!(exit, Exit::Revoked);
+    closed(&mut ws, Duration::from_secs(5)).await;
+    assert!(TcpStream::connect(addr).await.is_err());
+}
+
+#[tokio::test]
+async fn sigterm_drains_then_closes() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    app_with_secret(&h, b"v1").await;
+    let (port, _) = start_plain_service().await;
+    let (runtime, _) = start_runtime(&h, config_with_upstream(&h, port));
+    runtime.attest().await.unwrap();
+    let (mut socket, addr) = Socket::with_endpoint(runtime.clone()).await;
+    let client = Arc::new(hybrid_client(&h));
+    let mut idle = connect(addr, &client).await.unwrap();
+    upgrade(&mut idle).await;
+    echo(&mut idle, b"open").await;
+
+    let _ = socket.shutdown.take().unwrap().send(());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(TcpStream::connect(addr).await.is_err(), "still accepting");
+    echo(&mut idle, b"draining").await;
+
+    let exit = tokio::time::timeout(Duration::from_secs(12), &mut socket.task)
+        .await
+        .expect("the drain is bounded")
+        .unwrap();
+    assert_eq!(exit, Exit::Drained);
+    closed(&mut idle, Duration::from_secs(1)).await;
 }
 
 #[tokio::test]
