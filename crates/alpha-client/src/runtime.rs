@@ -27,6 +27,12 @@ pub const SOCKET_PATH: &str = "/run/alpha/runtime.sock";
 /// CVM's 443.
 pub const TLS_PORT: u16 = 8443;
 
+/// The service the runtime proxies to, reached by name over the compose network: a key purpose
+/// whose dot-separated labels are 1 to 63 bytes, as DNS requires.
+pub fn is_upstream_host(name: &str) -> bool {
+    alpha_core::is_key_purpose(name) && name.split('.').all(|l| !l.is_empty() && l.len() <= 63)
+}
+
 /// A secret name as it becomes a path segment: no separator, no traversal.
 fn valid_secret_name(name: &str) -> bool {
     !name.is_empty()
@@ -276,6 +282,18 @@ mod tests {
     use tokio::net::UnixListener;
 
     use super::*;
+
+    #[test]
+    fn an_upstream_host_has_dns_labels() {
+        let label = "a".repeat(63);
+        for ok in ["web", "a.b", "my_db-1", label.as_str()] {
+            assert!(is_upstream_host(ok), "{ok:?}");
+        }
+        let long_label = "a".repeat(64);
+        for bad in ["", "a..b", "a.", long_label.as_str(), "Web"] {
+            assert!(!is_upstream_host(bad), "{bad:?}");
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn a_failed_or_stuck_reread_is_retried_and_only_a_lost_identity_ends_the_refresh() {

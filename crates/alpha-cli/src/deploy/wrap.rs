@@ -280,6 +280,12 @@ pub fn parse(bytes: &[u8]) -> Result<Plain, String> {
             all.len()
         )
     })?;
+    if !alpha_client::runtime::is_upstream_host(&endpoint.0) {
+        return Err(format!(
+            "services.{}: the published service is reached by name over the compose network; use dot-separated labels of 1 to 63 characters",
+            endpoint.0
+        ));
+    }
     Ok(Plain {
         services: plain_services,
         volumes,
@@ -948,6 +954,7 @@ mod tests {
             "runtime-service",
             "service-reserved",
             "service-name",
+            "endpoint-host",
             "bind-short",
             "bind-long",
             "mount-image",
@@ -1019,10 +1026,10 @@ mod tests {
 
     #[test]
     fn boundaries_of_names_and_ports() {
-        for name in ["alphaweb", &"a".repeat(64)] {
+        for name in ["alphaweb", &"a".repeat(63)] {
             parse(single(name, "\"8080:80\"").as_bytes()).unwrap();
         }
-        for name in ["alpha-web", &"a".repeat(65), "..", "Web"] {
+        for name in ["alpha-web", &"a".repeat(64), &"a".repeat(65), "..", "Web"] {
             let err = parse(single(name, "\"8080:80\"").as_bytes()).unwrap_err();
             assert!(err.contains(name), "{err}");
         }

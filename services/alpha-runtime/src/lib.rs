@@ -152,7 +152,7 @@ pub fn parse_upstream(text: Option<&str>) -> Result<Option<String>, Error> {
     let (host, port) = text
         .rsplit_once(':')
         .ok_or_else(|| refused("is not <service>:<port>"))?;
-    if !alpha_core::is_key_purpose(host) {
+    if !alpha_client::runtime::is_upstream_host(host) {
         return Err(refused("does not name a lowercase compose service"));
     }
     Some(port)
@@ -785,6 +785,7 @@ mod tests {
             "web:80:1",
             "web/x:80",
             " web:80x",
+            "a..b:80",
         ] {
             let Err(Error::Config(m)) = Config::parse(HASH, HASH, "https://a", None, Some(bad))
             else {
