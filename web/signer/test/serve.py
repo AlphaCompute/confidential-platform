@@ -7,8 +7,6 @@ import sys
 
 ASSET = re.compile(r"^[a-z_]+-[0-9a-f]{16}\.(js|wasm|css)$")
 TYPES = {"js": "text/javascript", "wasm": "application/wasm", "css": "text/css"}
-NO_CACHE = "no-cache"
-IMMUTABLE = "public, max-age=31536000, immutable"
 
 
 def main():
@@ -25,26 +23,25 @@ def main():
         def resolve(self):
             path = self.path.split("?", 1)[0]
             if path in ("/sign/claim", "/sign/approve"):
-                return dist / "index.html", "text/html; charset=utf-8", NO_CACHE
+                return dist / "index.html", "text/html; charset=utf-8"
             if path == "/sign/platform.json":
-                return platform, "application/json", NO_CACHE
+                return platform, "application/json"
             name = path.removeprefix("/sign/")
             if path.startswith("/sign/") and ASSET.match(name) and (dist / name).is_file():
-                return dist / name, TYPES[name.rsplit(".", 1)[1]], IMMUTABLE
+                return dist / name, TYPES[name.rsplit(".", 1)[1]]
             return None
 
         def answer(self, with_body):
             found = self.resolve()
             if found is None:
-                status, body, kind, cache = 404, b"not found\n", "text/plain", NO_CACHE
+                status, body, kind = 404, b"not found\n", "text/plain"
             else:
-                file, kind, cache = found
+                file, kind = found
                 status, body = 200, file.read_bytes()
             self.send_response(status)
             for name, value in headers:
                 self.send_header(name, value)
             self.send_header("Content-Type", kind)
-            self.send_header("Cache-Control", cache)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             if with_body:

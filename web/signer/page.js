@@ -355,7 +355,6 @@ function button(label, action) {
   const b = el("button", label);
   b.type = "button";
   b.addEventListener("click", async () => {
-    if (b.disabled) return;
     b.disabled = true;
     try {
       await action();
@@ -897,13 +896,9 @@ function offerApproval(a, note) {
 // The first click reads the Secret values, so its inputs are built in the click, before any await.
 function firstAction(a) {
   return () => {
-    if (a.fields.length) {
-      const taken = takeValues(a);
-      if (taken.note) return offerApproval(a, taken.note);
-      a.values = taken.values;
-    } else {
-      a.values = [];
-    }
+    const taken = takeValues(a);
+    if (taken.note) return offerApproval(a, taken.note);
+    a.values = taken.values;
     return stepAction(a, a.values[0])();
   };
 }
@@ -1035,7 +1030,6 @@ async function previousEntry(view, read) {
   return found && found.compose === compose ? found : null;
 }
 
-// What `current` claims runs today, only where its image differs from this launch's.
 // The services of the compose the service says runs today, or null when it sent none or it does
 // not parse.
 function currentServices(current) {
@@ -1046,6 +1040,7 @@ function currentServices(current) {
   }
 }
 
+// What `current` claims runs today, only where its image differs from this launch's.
 function imageChanges(before, services) {
   if (!before) return [];
   const names = [...new Set([...Object.keys(before), ...Object.keys(services)])].sort();

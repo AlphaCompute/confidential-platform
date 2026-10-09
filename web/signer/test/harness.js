@@ -686,7 +686,6 @@ function approvalApi(options = {}) {
     catalog_template_sha256: options.catalog_template_sha256 || null,
     compose: options.catalog_template_sha256 ? null : compose,
     machine: options.machine === undefined ? "tdx.medium" : options.machine,
-    secrets: options.secrets || [],
     credentials: options.credentials || [],
     current: options.current || null,
     expires_at: options.expires_at || iso(now + 24 * 3600 * 1000),
@@ -710,7 +709,6 @@ function approvalApi(options = {}) {
     "catalog_template_sha256",
     "compose",
     "machine",
-    "secrets",
     "credentials",
     "current",
     "expires_at",
@@ -772,7 +770,6 @@ function approvalApi(options = {}) {
 }
 
 module.exports = {
-  ORIGIN,
   approvalApi,
   catalogFile,
   RP_ID,

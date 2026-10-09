@@ -25,7 +25,9 @@ fn at(now_ms: f64) -> Result<SystemTime, JsError> {
 }
 
 fn parse<T: serde::de::DeserializeOwned>(what: &str, text: &str) -> Result<T, JsError> {
-    serde_json::from_str(text).map_err(|e| js(Error::Malformed(format!("{what}: {e}"))))
+    alpha_core::parse(text.as_bytes())
+        .and_then(serde_json::from_value)
+        .map_err(|e| js(Error::Malformed(format!("{what}: {e}"))))
 }
 
 fn to_json(value: &impl serde::Serialize) -> Result<String, JsError> {
@@ -68,10 +70,6 @@ pub fn compose_services(compose: &str) -> Result<String, JsError> {
     to_json(&compose::services(compose).map_err(js)?)
 }
 
-fn json_text(what: &str, text: &str) -> Result<serde_json::Value, JsError> {
-    alpha_core::parse(text.as_bytes()).map_err(|e| js(Error::Malformed(format!("{what}: {e}"))))
-}
-
 fn canonical(value: &serde_json::Value) -> Result<String, JsError> {
     alpha_core::jcs(value)
         .ok()
@@ -100,7 +98,7 @@ pub fn signing_digest(context: &str, document_json: &str) -> Result<Signable, Js
             ))));
         }
     };
-    let document = json_text("document", document_json)?;
+    let document: serde_json::Value = parse("document", document_json)?;
     let digest = alpha_core::signing_digest(context, &document)
         .map_err(|e| js(Error::Malformed(e.to_string())))?;
     Ok(Signable {
@@ -113,7 +111,7 @@ pub fn signing_digest(context: &str, document_json: &str) -> Result<Signable, Js
 /// is the `request_sha256` a KMS receipt names.
 #[wasm_bindgen(js_name = canonicalJson)]
 pub fn canonical_json(text: &str) -> Result<String, JsError> {
-    canonical(&json_text("body", text)?)
+    canonical(&parse("body", text)?)
 }
 
 fn catalog_error(e: alpha_core::catalog::CatalogError) -> JsError {
@@ -127,8 +125,7 @@ fn catalog_error(e: alpha_core::catalog::CatalogError) -> JsError {
 #[wasm_bindgen(js_name = verifyCatalog)]
 pub fn verify_catalog(text: &str, catalog_key_json: &str, app_id: &str) -> Result<String, JsError> {
     use alpha_core::catalog::{self, CatalogFile};
-    let file: CatalogFile = serde_json::from_value(json_text("catalog file", text)?)
-        .map_err(|e| js(Error::Malformed(format!("catalog file: {e}"))))?;
+    let file: CatalogFile = parse("catalog file", text)?;
     let key: alpha_core::CatalogKey = parse("catalog key", catalog_key_json)?;
     let app_id: alpha_core::AppId = app_id
         .parse()
