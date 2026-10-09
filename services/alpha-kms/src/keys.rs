@@ -115,18 +115,10 @@ pub fn verify_signature(
     signature: &SignatureObject,
     signer: Option<&Signer>,
 ) -> Result<(), ApiError> {
+    check_shape(signature).map_err(|e| ApiError::signature_invalid(e.message))?;
     match signature.algorithm.as_str() {
-        "ed25519" => {
-            if signature.authenticator_data.is_some() || signature.client_data_json.is_some() {
-                return Err(ApiError::signature_invalid(
-                    "ed25519: authenticator_data and client_data_json are not part of an ed25519 signature",
-                ));
-            }
-            if !verify_ed25519(spki, digest, &signature.signature) {
-                return Err(ApiError::signature_invalid("signature does not verify"));
-            }
-            Ok(())
-        }
+        "ed25519" if verify_ed25519(spki, digest, &signature.signature) => Ok(()),
+        "ed25519" => Err(ApiError::signature_invalid("signature does not verify")),
         webauthn::ALGORITHM => webauthn::verify(spki, digest, signature, signer),
         _ => Err(ApiError::signature_invalid("unsupported algorithm")),
     }
@@ -307,8 +299,8 @@ fn verify_document_spki(row: &KeyRow) -> Result<(), ApiError> {
 }
 
 /// A request body's signature object has the fields of its algorithm, and a wrong shape is the
-/// caller's malformed body. A stored row is never judged by shape: anything wrong there is an
-/// invalid signature.
+/// caller's malformed body. A stored row is never malformed: `verify_signature` refuses the same
+/// shape as an invalid signature.
 pub fn check_shape(signature: &SignatureObject) -> Result<(), ApiError> {
     let webauthn_fields = (
         signature.authenticator_data.is_some(),

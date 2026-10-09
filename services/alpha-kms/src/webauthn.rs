@@ -269,15 +269,6 @@ pub(crate) mod tests {
                 .to_vec()
         }
 
-        pub fn signer() -> Signer {
-            Signer {
-                origins: vec![ORIGIN.into()],
-                rp_id: "localhost".into(),
-                bundle_sha256: format!("sha256:{}", "0".repeat(64)),
-                api_origin: ORIGIN.into(),
-            }
-        }
-
         pub fn client(digest: &[u8; 32]) -> Map<String, Value> {
             json!({
                 "type": "webauthn.get", "challenge": b64(digest), "origin": ORIGIN,
@@ -334,7 +325,7 @@ pub(crate) mod tests {
 
     #[test]
     fn each_mutation_of_a_software_assertion_is_refused_by_its_rule() {
-        let (key, signer) = (software::spki(), software::signer());
+        let (key, signer) = (software::spki(), vector_signer(&vector()));
         let check = |object: &SignatureObject| verify(&key, &DIGEST, object, Some(&signer));
         check(&software::assertion(&DIGEST, 0x05, |_| {})).unwrap();
 
@@ -428,7 +419,7 @@ pub(crate) mod tests {
 
     #[test]
     fn any_sign_count_no_cross_origin_an_unknown_key_extensions_and_high_s_verify() {
-        let (key, signer) = (software::spki(), software::signer());
+        let (key, signer) = (software::spki(), vector_signer(&vector()));
         let check = |object: &SignatureObject| verify(&key, &DIGEST, object, Some(&signer));
         let cdj = serde_json::to_vec(&software::client(&DIGEST)).unwrap();
 
