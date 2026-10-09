@@ -43,7 +43,9 @@ hash covers every byte the page runs.
 The platform document names the page it trusts as `signer.bundle_sha256`. To check a served page,
 check out the commit it was built from, run the build, and compare the printed `bundle_sha256`
 with the document's value and with the SHA-256 of the `index.html` the host serves. The build is
-reproducible: paths are remapped and nothing time-dependent is written.
+reproducible: paths are remapped and nothing time-dependent is written. It is reproducible per
+host, not across hosts: a macOS build gives a different wasm, so rebuild on x86_64 Linux with the
+toolchain in `rust-toolchain.toml`, as CI does, to compare with a published `bundle_sha256`.
 
 ## Serving
 
