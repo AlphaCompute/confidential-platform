@@ -166,7 +166,6 @@ class SoftwareAuthenticator {
     // Consumed by the next ceremony: {create: "NotAllowedError"}, {publicKey: null | "raw"},
     // {algorithm: -8}, {tamper: true} (one bit of the signature), {otherChallenge: true}.
     this.fault = {};
-    this.counter = 0;
   }
 
   // A credential made outside the page, as one from an earlier claim.
@@ -188,10 +187,7 @@ class SoftwareAuthenticator {
   }
 
   authData(rpId) {
-    this.counter += 1;
-    const counter = Buffer.alloc(4);
-    counter.writeUInt32BE(this.counter);
-    return Buffer.concat([sha256(rpId), Buffer.from([this.flags]), counter]);
+    return Buffer.concat([sha256(rpId), Buffer.from([this.flags]), Buffer.alloc(4)]);
   }
 
   fail(kind) {
@@ -373,7 +369,7 @@ function memoryStorage(initial = {}) {
 }
 
 // options: routes {"METHOD /path": (req) => {status, body, headers}}, authenticator, platform
-// (text, or a function of the request), catalog {"<hex>.json": text}, origin, path, hash, framed,
+// (text, Error or null), catalog {"<hex>.json": text}, origin, path, hash, framed,
 // noPasskeys, localStorage, sessionStorage, now.
 async function loadPage(options = {}) {
   const b = bundle();
@@ -418,7 +414,7 @@ async function loadPage(options = {}) {
       const p = options.platform;
       if (p === undefined || p === null) return new Response("not found", { status: 404 });
       if (p instanceof Error) throw new TypeError("network");
-      return new Response(typeof p === "function" ? p() : p, { status: 200 });
+      return new Response(p, { status: 200 });
     }
     if (url.startsWith("./catalog/")) {
       const text = (options.catalog || {})[url.slice("./catalog/".length)];
@@ -685,7 +681,7 @@ function approvalApi(options = {}) {
     compose_hash: options.compose_hash || `sha256:${sha256(compose || "").toString("hex")}`,
     catalog_template_sha256: options.catalog_template_sha256 || null,
     compose: options.catalog_template_sha256 ? null : compose,
-    machine: options.machine === undefined ? "tdx.medium" : options.machine,
+    machine: "tdx.medium",
     credentials: options.credentials || [],
     current: options.current || null,
     expires_at: options.expires_at || iso(now + 24 * 3600 * 1000),

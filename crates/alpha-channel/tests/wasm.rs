@@ -430,9 +430,12 @@ fn signing_digest_matches_the_core_for_the_four_page_contexts() {
     assert!(m.starts_with("malformed:"), "{m}");
 }
 
-macro_rules! jcs_vector {
-    ($n:literal) => {
-        ($n, include_str!(concat!("../../../testdata/jcs/", $n)))
+macro_rules! vector {
+    ($dir:literal, $n:literal) => {
+        (
+            $n,
+            include_str!(concat!("../../../testdata/", $dir, "/", $n)),
+        )
     };
 }
 
@@ -441,15 +444,15 @@ fn canonical_json_gives_the_recorded_digest_for_every_jcs_vector() {
     let expected: BTreeMap<String, String> =
         serde_json::from_str(include_str!("../../../testdata/jcs/expected.json")).unwrap();
     let vectors = [
-        jcs_vector!("01-compose-body.json"),
-        jcs_vector!("02-nested.json"),
-        jcs_vector!("03-numbers.json"),
-        jcs_vector!("04-duplicate-key.json"),
-        jcs_vector!("05-escaped-duplicate.json"),
-        jcs_vector!("06-nested-duplicate.json"),
-        jcs_vector!("07-lone-surrogate.json"),
-        jcs_vector!("08-empty-object.json"),
-        jcs_vector!("09-empty.json"),
+        vector!("jcs", "01-compose-body.json"),
+        vector!("jcs", "02-nested.json"),
+        vector!("jcs", "03-numbers.json"),
+        vector!("jcs", "04-duplicate-key.json"),
+        vector!("jcs", "05-escaped-duplicate.json"),
+        vector!("jcs", "06-nested-duplicate.json"),
+        vector!("jcs", "07-lone-surrogate.json"),
+        vector!("jcs", "08-empty-object.json"),
+        vector!("jcs", "09-empty.json"),
     ];
     assert_eq!(vectors.len(), expected.len());
     for (name, text) in vectors {
@@ -464,12 +467,6 @@ fn canonical_json_gives_the_recorded_digest_for_every_jcs_vector() {
     }
 }
 
-macro_rules! catalog_vector {
-    ($n:literal) => {
-        ($n, include_str!(concat!("../../../testdata/catalog/", $n)))
-    };
-}
-
 #[wasm_bindgen_test]
 fn verify_catalog_gives_the_recorded_verdicts_and_the_rendered_compose() {
     let expected: Value =
@@ -477,12 +474,12 @@ fn verify_catalog_gives_the_recorded_verdicts_and_the_rendered_compose() {
     let key = expected["catalog_key"].to_string();
     let app_id = expected["app_id"].as_str().unwrap();
     let vectors = [
-        catalog_vector!("name-absent.json"),
-        catalog_vector!("name-repeated.json"),
-        catalog_vector!("signed-by-other-key.json"),
-        catalog_vector!("signed-by-release-key.json"),
-        catalog_vector!("template-tampered.json"),
-        catalog_vector!("valid.json"),
+        vector!("catalog", "name-absent.json"),
+        vector!("catalog", "name-repeated.json"),
+        vector!("catalog", "signed-by-other-key.json"),
+        vector!("catalog", "signed-by-release-key.json"),
+        vector!("catalog", "template-tampered.json"),
+        vector!("catalog", "valid.json"),
     ];
     for (name, text) in vectors {
         let verdicts = &expected["vectors"][name];

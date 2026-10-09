@@ -1054,9 +1054,7 @@ function imageChanges(before, services) {
 }
 
 function servedBySigner(view) {
-  return Boolean(
-    view.signer && Array.isArray(view.signer.origins) && view.signer.origins.includes(location.origin),
-  );
+  return Boolean(view.signer?.origins.includes(location.origin));
 }
 
 async function verifiedPlatform() {
