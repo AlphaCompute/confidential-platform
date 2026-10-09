@@ -138,23 +138,19 @@ test("a receipt that does not verify reads not confirmed", async () => {
     "no receipt": () => undefined,
   };
   for (const [name, fault] of Object.entries(faults)) {
-    const api = claimApi();
+    const { api, page } = await claimPage();
     api.receiptFor = fault;
-    const page = await loadPage({ routes: api.routes });
-    await page.startClaim();
     await page.click("Create passkey");
     await page.click("Confirm with passkey");
     const text = page.text();
     assert.ok(text.includes(NOT_CONFIRMED), `${name}: ${text}`);
     assert.ok(!text.includes(YOURS), name);
   }
-  const api = claimApi();
+  const { api, page } = await claimPage();
   api.keysReply = () => ({
     status: 502,
     body: { error: "<b>upstream</b>", error_code: "SHROUD_UPSTREAM_INVALID" },
   });
-  const page = await loadPage({ routes: api.routes });
-  await page.startClaim();
   await page.click("Create passkey");
   await page.click("Confirm with passkey");
   assert.ok(page.text().includes(NOT_CONFIRMED));
@@ -179,7 +175,6 @@ test("a cancelled or refused passkey prompt spends nothing", async () => {
     await page.click("Create passkey");
     assert.ok(page.text().includes(sentence), `${JSON.stringify(fault)}: ${page.text()}`);
     assert.equal(api.reveals, 0);
-    assert.ok(page.buttons().includes("Create passkey"));
     assert.ok(page.find((n) => n.tagName === "BUTTON" && n.textContent === "Create passkey" && !n.disabled));
   }
 });

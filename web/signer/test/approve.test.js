@@ -50,7 +50,7 @@ function organization() {
   return { laptop, credentials };
 }
 
-async function approvalPage(apiOptions = {}, pageOptions = {}) {
+async function approvalPage(apiOptions = {}, pageOptions = {}, view = undefined) {
   const { laptop, credentials } = organization();
   const api = approvalApi({ app_id: WRAP_APP, credentials, ...apiOptions });
   const page = await loadPage({
@@ -59,7 +59,7 @@ async function approvalPage(apiOptions = {}, pageOptions = {}) {
     path: "/sign/approve",
     ...pageOptions,
   });
-  await page.startApproval();
+  await page.startApproval(undefined, view);
   return { api, page, laptop, credentials };
 }
 
@@ -244,21 +244,17 @@ test("a catalog entry that does not verify is refused", async () => {
   const missing = await catalogPage({});
   assert.equal(missing.page.text(), CATALOG_REFUSED);
 
-  const { laptop, credentials } = organization();
-  const api = approvalApi({
-    app_id: CATALOG.app_id,
-    compose_hash: CATALOG.compose_hash,
-    catalog_template_sha256: VALID_FILE.entry.template_sha256,
-    credentials,
-  });
-  const page = await loadPage({
-    routes: api.routes,
-    authenticator: laptop,
-    catalog: { [`${TEMPLATE_HEX}.json`]: VALID },
-  });
   const { view } = testView();
   delete view.catalog_key;
-  await page.startApproval(undefined, { view, viewText: JSON.stringify(view) });
+  const { page } = await approvalPage(
+    {
+      app_id: CATALOG.app_id,
+      compose_hash: CATALOG.compose_hash,
+      catalog_template_sha256: VALID_FILE.entry.template_sha256,
+    },
+    { catalog: { [`${TEMPLATE_HEX}.json`]: VALID } },
+    { view, viewText: JSON.stringify(view) },
+  );
   assert.equal(page.text(), CATALOG_REFUSED);
 
   const other = await catalogPage(

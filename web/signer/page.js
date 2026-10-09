@@ -143,7 +143,7 @@ function fingerprint(spki) {
 }
 
 function issuedAt() {
-  return new Date(Date.now()).toISOString().replace(/\.\d{3}Z$/, "Z");
+  return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
 // Every JSON the page reads goes through the wasm parser, which refuses a repeated key.
