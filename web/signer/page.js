@@ -771,6 +771,12 @@ function imageLines(image) {
     : [fact("Image", image.slice(0, at)), fact("Digest", image.slice(at + 1), "digest")];
 }
 
+// The host side of a short-syntax port, `[ip:]host:container[/protocol]`.
+function hostPort(port) {
+  const parts = port.split(":");
+  return parts.length > 1 ? parts[parts.length - 2] : port;
+}
+
 function serviceBlock(name, service) {
   const block = el("div", undefined, "service");
   block.append(el("h3", name), ...imageLines(service.image));
@@ -798,6 +804,13 @@ function describeLaunch(a) {
   if (runtime) {
     const block = el("div", undefined, "service");
     block.append(el("h3", "AlphaCompute runtime"), ...imageLines(runtime.image));
+    const upstream = runtime.environment.ALPHACOMPUTE_TLS_UPSTREAM;
+    if (runtime.ports.length && upstream) {
+      const hosts = runtime.ports.map(hostPort).join(", ");
+      block.append(fact("Endpoint", `HTTPS on ${hosts}, forwarded to ${upstream}`));
+    } else if (runtime.ports.length) {
+      block.append(fact("Published ports", runtime.ports.join(", ")));
+    }
     nodes.push(block);
   }
   nodes.push(fact("Machine", launch.machine));

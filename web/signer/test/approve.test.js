@@ -78,6 +78,7 @@ test("an uploaded compose is approved only after the registration receipt verifi
     "AlphaCompute runtime",
     "Image: ghcr.io/alphacompute/alpha-runtime",
     `Digest: sha256:${"7d".repeat(32)}`,
+    "Endpoint: HTTPS on 443, forwarded to web:80",
     "Machine: tdx.medium (chosen by the service, not part of what you sign)",
   ]) {
     assert.ok(text.includes(line), `${line}\n${text}`);
@@ -118,6 +119,31 @@ test("an uploaded compose is approved only after the registration receipt verifi
   assert.equal(api.revisions.length, 1);
   assert.equal(api.revisions[0].text, expected);
   assert.ok(page.text().includes(APPROVED), page.text());
+});
+
+test("a compose whose runtime publishes no port shows no endpoint", async () => {
+  const compose = JSON.parse(withoutSecrets());
+  compose.docker_compose_file = compose.docker_compose_file
+    .replace("    ports:\n    - 443:8443\n", "")
+    .replace("      ALPHACOMPUTE_TLS_UPSTREAM: web:80\n", "");
+  assert.ok(!compose.docker_compose_file.includes("443"));
+  const { page } = await approvalPage({ compose: jcs(compose) });
+  const text = page.text();
+  assert.ok(text.includes("AlphaCompute runtime"), text);
+  assert.ok(!text.includes("Endpoint"), text);
+  assert.ok(!text.includes("Published ports"), text);
+});
+
+test("a runtime port without an upstream is shown as published", async () => {
+  const compose = JSON.parse(withoutSecrets());
+  compose.docker_compose_file = compose.docker_compose_file.replace(
+    "      ALPHACOMPUTE_TLS_UPSTREAM: web:80\n",
+    "",
+  );
+  const { page } = await approvalPage({ compose: jcs(compose) });
+  const text = page.text();
+  assert.ok(text.includes("Published ports: 443:8443"), text);
+  assert.ok(!text.includes("Endpoint"), text);
 });
 
 test("a registration receipt that does not verify never reads approved", async () => {
