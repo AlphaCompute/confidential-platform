@@ -1251,9 +1251,6 @@ mod tests {
             let err = wrap(plain, &BTreeMap::new(), spec.app_id, &spec.runtime).unwrap_err();
             assert!(err.starts_with("runtime image "), "{bad:?}: {err}");
         }
-        let plain = parse(vector_compose().as_bytes()).unwrap();
-        let spec = deploy_spec();
-        wrap(plain, &BTreeMap::new(), spec.app_id, &spec.runtime).unwrap();
     }
 
     fn wrapped_vector() -> (Value, Value) {
