@@ -705,10 +705,15 @@ fn pinned_reference(image: &str) -> bool {
         return false;
     };
     let (domain, rest) = split(name);
+    let (host, port) = domain.split_once(':').unwrap_or((domain, "443"));
     digest(d)
-        && domain
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'))
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+        && port.parse::<u16>().is_ok_and(|p| p > 0)
         && grammatical(rest).is_some()
 }
 
@@ -1241,6 +1246,8 @@ mod tests {
             format!(" {good}"),
             format!("{good} "),
             String::new(),
+            format!("registry.example:bad/app@{digest}"),
+            format!(":5000/app@{digest}"),
         ] {
             let mut spec = deploy_spec();
             spec.runtime.image = bad.clone();
