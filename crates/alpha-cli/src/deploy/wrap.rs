@@ -1251,6 +1251,7 @@ mod tests {
             format!("registry.example:bad/app@{digest}"),
             format!(":5000/app@{digest}"),
             format!("registry-.example/app@{digest}"),
+            format!("-registry.example/app@{digest}"),
         ] {
             let mut spec = deploy_spec();
             spec.runtime.image = bad.clone();
