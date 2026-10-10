@@ -301,9 +301,9 @@ pub fn wrap(
     app_id: AppId,
     runtime: &Runtime,
 ) -> Result<Wrapped, String> {
-    if !pinned(&runtime.image) {
+    if !pinned_reference(&runtime.image) {
         return Err(format!(
-            "runtime image {}: not pinned; give it as <image>@sha256:<digest>",
+            "runtime image {:?}: not one pinned image reference; give it as <image>@sha256:<digest>",
             runtime.image
         ));
     }
@@ -665,6 +665,21 @@ fn tagged(image: &str) -> Result<(Registry, String, &str), String> {
                 "{image} is a tag outside Docker Hub, ghcr.io and quay.io; pin it as <image>@sha256:<digest>"
             )
         })?;
+    let (path, tag) = grammatical(rest).ok_or_else(|| {
+        format!(
+            "{image} is not an image reference; write <repository>:<tag> in lowercase, or pin it as <image>@sha256:<digest>"
+        )
+    })?;
+    let repository = match (domain, path.contains('/')) {
+        ("docker.io", false) => format!("library/{path}"),
+        _ => path.to_owned(),
+    };
+    Ok((registry, repository, tag))
+}
+
+/// The repository path and tag (`latest` when absent) of a reference without its registry, held
+/// to Docker's grammar.
+fn grammatical(rest: &str) -> Option<(&str, &str)> {
     let (path, tag) = rest.split_once(':').unwrap_or((rest, "latest"));
     let alnum = |b: &u8| b.is_ascii_lowercase() || b.is_ascii_digit();
     let component = |c: &str| {
@@ -681,16 +696,27 @@ fn tagged(image: &str) -> Result<(Registry, String, &str), String> {
         && tag
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
-    if !path.split('/').all(component) || !tag_ok {
-        return Err(format!(
-            "{image} is not an image reference; write <repository>:<tag> in lowercase, or pin it as <image>@sha256:<digest>"
-        ));
-    }
-    let repository = match (domain, path.contains('/')) {
-        ("docker.io", false) => format!("library/{path}"),
-        _ => path.to_owned(),
+    (path.split('/').all(component) && tag_ok).then_some((path, tag))
+}
+
+/// `<image>@sha256:<hex>` whose image is one token of the grammar [`tagged`] holds tags to.
+fn pinned_reference(image: &str) -> bool {
+    let Some((name, d)) = image.split_once('@') else {
+        return false;
     };
-    Ok((registry, repository, tag))
+    let (domain, rest) = split(name);
+    let (host, port) = domain.split_once(':').unwrap_or((domain, "443"));
+    digest(d)
+        && host.split('.').all(|label| {
+            let edge = |b: Option<&u8>| b.is_some_and(u8::is_ascii_alphanumeric);
+            edge(label.as_bytes().first())
+                && edge(label.as_bytes().last())
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+        && port.parse::<u16>().is_ok_and(|p| p > 0)
+        && grammatical(rest).is_some()
 }
 
 fn pin(image: &str, digests: &BTreeMap<String, String>) -> Result<String, String> {
@@ -1210,6 +1236,29 @@ mod tests {
             err.contains("ghcr.io/alphacompute/alpha-runtime:latest"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_runtime_image_that_is_not_one_token_is_refused() {
+        let good = deploy_spec().runtime.image;
+        let (name, digest) = good.split_once('@').unwrap();
+        for bad in [
+            format!("x: y\n{good}"),
+            format!("{name}\t@{digest}"),
+            format!(" {good}"),
+            format!("{good} "),
+            String::new(),
+            format!("registry.example:bad/app@{digest}"),
+            format!(":5000/app@{digest}"),
+            format!("registry-.example/app@{digest}"),
+            format!("-registry.example/app@{digest}"),
+        ] {
+            let mut spec = deploy_spec();
+            spec.runtime.image = bad.clone();
+            let plain = parse(vector_compose().as_bytes()).unwrap();
+            let err = wrap(plain, &BTreeMap::new(), spec.app_id, &spec.runtime).unwrap_err();
+            assert!(err.starts_with("runtime image "), "{bad:?}: {err}");
+        }
     }
 
     fn wrapped_vector() -> (Value, Value) {

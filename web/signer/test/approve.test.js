@@ -78,6 +78,7 @@ test("an uploaded compose is approved only after the registration receipt verifi
     "AlphaCompute runtime",
     "Image: ghcr.io/alphacompute/alpha-runtime",
     `Digest: sha256:${"7d".repeat(32)}`,
+    "Endpoint: HTTPS on 443, forwarded to web:80",
     "Machine: tdx.medium (chosen by the service, not part of what you sign)",
   ]) {
     assert.ok(text.includes(line), `${line}\n${text}`);
@@ -118,6 +119,36 @@ test("an uploaded compose is approved only after the registration receipt verifi
   assert.equal(api.revisions.length, 1);
   assert.equal(api.revisions[0].text, expected);
   assert.ok(page.text().includes(APPROVED), page.text());
+});
+
+// The approval page's text for the vector with each `[from, to]` replaced in its compose.
+async function shown(...replacements) {
+  const compose = JSON.parse(withoutSecrets());
+  for (const [from, to] of replacements) {
+    compose.docker_compose_file = compose.docker_compose_file.replace(from, to);
+  }
+  const { page } = await approvalPage({ compose: jcs(compose) });
+  return page.text();
+}
+
+test("a runtime port is an endpoint only with an upstream, a host side and TCP", async () => {
+  const upstream = ["      ALPHACOMPUTE_TLS_UPSTREAM: web:80\n", ""];
+  const none = await shown(["    ports:\n    - 443:8443\n", ""], upstream);
+  assert.ok(none.includes("AlphaCompute runtime"), none);
+  assert.ok(!none.includes("Endpoint") && !none.includes("Published ports"), none);
+  const noUpstream = await shown(upstream);
+  assert.ok(noUpstream.includes("Published ports: 443:8443"), noUpstream);
+  assert.ok(!noUpstream.includes("Endpoint"), noUpstream);
+  for (const port of ["443:8443/udp", "8443", "443:1234"]) {
+    const text = await shown(["    - 443:8443\n", `    - ${port}\n`]);
+    assert.ok(text.includes(`Published ports: ${port}`), text);
+    assert.ok(!text.includes("Endpoint"), text);
+  }
+  const bound = await shown(["    - 443:8443\n", "    - 127.0.0.1:443:8443\n"]);
+  assert.ok(bound.includes("Endpoint: HTTPS on 127.0.0.1:443, forwarded to web:80"), bound);
+  const mixed = await shown(["    - 443:8443\n", "    - 443:8443/tcp\n    - 8444:8444/udp\n"]);
+  assert.ok(mixed.includes("Endpoint: HTTPS on 443, forwarded to web:80"), mixed);
+  assert.ok(mixed.includes("Published ports: 8444:8444/udp"), mixed);
 });
 
 test("a registration receipt that does not verify never reads approved", async () => {
