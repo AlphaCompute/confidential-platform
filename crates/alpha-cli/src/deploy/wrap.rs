@@ -708,7 +708,9 @@ fn pinned_reference(image: &str) -> bool {
     let (host, port) = domain.split_once(':').unwrap_or((domain, "443"));
     digest(d)
         && host.split('.').all(|label| {
-            !label.is_empty()
+            let edge = |b: Option<&u8>| b.is_some_and(u8::is_ascii_alphanumeric);
+            edge(label.as_bytes().first())
+                && edge(label.as_bytes().last())
                 && label
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-')
@@ -1248,6 +1250,7 @@ mod tests {
             String::new(),
             format!("registry.example:bad/app@{digest}"),
             format!(":5000/app@{digest}"),
+            format!("registry-.example/app@{digest}"),
         ] {
             let mut spec = deploy_spec();
             spec.runtime.image = bad.clone();
