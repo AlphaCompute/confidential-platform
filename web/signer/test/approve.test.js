@@ -121,33 +121,30 @@ test("an uploaded compose is approved only after the registration receipt verifi
   assert.ok(page.text().includes(APPROVED), page.text());
 });
 
-test("a compose whose runtime publishes no port shows no endpoint", async () => {
+// The approval page's text for the vector with each `[from, to]` replaced in its compose.
+async function shown(...replacements) {
   const compose = JSON.parse(withoutSecrets());
-  compose.docker_compose_file = compose.docker_compose_file
-    .replace("    ports:\n    - 443:8443\n", "")
-    .replace("      ALPHACOMPUTE_TLS_UPSTREAM: web:80\n", "");
-  assert.ok(!compose.docker_compose_file.includes("443"));
-  const { page } = await approvalPage({ compose: jcs(compose) });
-  const text = page.text();
-  assert.ok(text.includes("AlphaCompute runtime"), text);
-  assert.ok(!text.includes("Endpoint"), text);
-  assert.ok(!text.includes("Published ports"), text);
-});
-
-test("a runtime port is an endpoint only with an upstream and over TCP", async () => {
-  const shown = async (from, to) => {
-    const compose = JSON.parse(withoutSecrets());
+  for (const [from, to] of replacements) {
     compose.docker_compose_file = compose.docker_compose_file.replace(from, to);
-    const { page } = await approvalPage({ compose: jcs(compose) });
-    return page.text();
-  };
-  const noUpstream = await shown("      ALPHACOMPUTE_TLS_UPSTREAM: web:80\n", "");
+  }
+  const { page } = await approvalPage({ compose: jcs(compose) });
+  return page.text();
+}
+
+test("a runtime port is an endpoint only with an upstream, a host side and TCP", async () => {
+  const upstream = ["      ALPHACOMPUTE_TLS_UPSTREAM: web:80\n", ""];
+  const none = await shown(["    ports:\n    - 443:8443\n", ""], upstream);
+  assert.ok(none.includes("AlphaCompute runtime"), none);
+  assert.ok(!none.includes("Endpoint") && !none.includes("Published ports"), none);
+  const noUpstream = await shown(upstream);
   assert.ok(noUpstream.includes("Published ports: 443:8443"), noUpstream);
   assert.ok(!noUpstream.includes("Endpoint"), noUpstream);
-  const udp = await shown("    - 443:8443\n", "    - 443:8443/udp\n");
-  assert.ok(udp.includes("Published ports: 443:8443/udp"), udp);
-  assert.ok(!udp.includes("Endpoint"), udp);
-  const bound = await shown("    - 443:8443\n", "    - 127.0.0.1:443:8443\n");
+  for (const port of ["443:8443/udp", "8443"]) {
+    const text = await shown(["    - 443:8443\n", `    - ${port}\n`]);
+    assert.ok(text.includes(`Published ports: ${port}`), text);
+    assert.ok(!text.includes("Endpoint"), text);
+  }
+  const bound = await shown(["    - 443:8443\n", "    - 127.0.0.1:443:8443\n"]);
   assert.ok(bound.includes("Endpoint: HTTPS on 127.0.0.1:443, forwarded to web:80"), bound);
 });
 
