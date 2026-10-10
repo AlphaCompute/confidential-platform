@@ -799,14 +799,15 @@ function describeLaunch(a) {
     const block = el("div", undefined, "service");
     block.append(el("h3", "AlphaCompute runtime"), ...imageLines(runtime.image));
     const upstream = runtime.environment.ALPHACOMPUTE_TLS_UPSTREAM;
-    // A port without a host side is published on a random host port, so it names no endpoint.
-    const tcpWithHost = (p) => p.includes(":") && !p.endsWith("/udp");
-    if (upstream && runtime.ports.length && runtime.ports.every(tcpWithHost)) {
-      const hosts = runtime.ports.map((p) => p.replace(/:[^:]*$/, "")).join(", ");
-      block.append(fact("Endpoint", `HTTPS on ${hosts}, forwarded to ${upstream}`));
-    } else if (runtime.ports.length) {
-      block.append(fact("Published ports", runtime.ports.join(", ")));
+    // The runtime terminates TLS only on its container port 8443 over TCP; a port without a host
+    // side is published on a random host port, so neither names an endpoint.
+    const hostOfTls = (p) => upstream && /^(.+):8443(\/tcp)?$/.exec(p)?.[1];
+    const hosts = runtime.ports.map(hostOfTls).filter(Boolean);
+    const published = runtime.ports.filter((p) => !hostOfTls(p));
+    if (hosts.length) {
+      block.append(fact("Endpoint", `HTTPS on ${hosts.join(", ")}, forwarded to ${upstream}`));
     }
+    if (published.length) block.append(fact("Published ports", published.join(", ")));
     nodes.push(block);
   }
   nodes.push(fact("Machine", launch.machine));

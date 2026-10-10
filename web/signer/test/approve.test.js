@@ -139,13 +139,16 @@ test("a runtime port is an endpoint only with an upstream, a host side and TCP",
   const noUpstream = await shown(upstream);
   assert.ok(noUpstream.includes("Published ports: 443:8443"), noUpstream);
   assert.ok(!noUpstream.includes("Endpoint"), noUpstream);
-  for (const port of ["443:8443/udp", "8443"]) {
+  for (const port of ["443:8443/udp", "8443", "443:1234"]) {
     const text = await shown(["    - 443:8443\n", `    - ${port}\n`]);
     assert.ok(text.includes(`Published ports: ${port}`), text);
     assert.ok(!text.includes("Endpoint"), text);
   }
   const bound = await shown(["    - 443:8443\n", "    - 127.0.0.1:443:8443\n"]);
   assert.ok(bound.includes("Endpoint: HTTPS on 127.0.0.1:443, forwarded to web:80"), bound);
+  const mixed = await shown(["    - 443:8443\n", "    - 443:8443/tcp\n    - 8444:8444/udp\n"]);
+  assert.ok(mixed.includes("Endpoint: HTTPS on 443, forwarded to web:80"), mixed);
+  assert.ok(mixed.includes("Published ports: 8444:8444/udp"), mixed);
 });
 
 test("a registration receipt that does not verify never reads approved", async () => {
