@@ -134,16 +134,21 @@ test("a compose whose runtime publishes no port shows no endpoint", async () => 
   assert.ok(!text.includes("Published ports"), text);
 });
 
-test("a runtime port without an upstream is shown as published", async () => {
-  const compose = JSON.parse(withoutSecrets());
-  compose.docker_compose_file = compose.docker_compose_file.replace(
-    "      ALPHACOMPUTE_TLS_UPSTREAM: web:80\n",
-    "",
-  );
-  const { page } = await approvalPage({ compose: jcs(compose) });
-  const text = page.text();
-  assert.ok(text.includes("Published ports: 443:8443"), text);
-  assert.ok(!text.includes("Endpoint"), text);
+test("a runtime port is an endpoint only with an upstream and over TCP", async () => {
+  const shown = async (from, to) => {
+    const compose = JSON.parse(withoutSecrets());
+    compose.docker_compose_file = compose.docker_compose_file.replace(from, to);
+    const { page } = await approvalPage({ compose: jcs(compose) });
+    return page.text();
+  };
+  const noUpstream = await shown("      ALPHACOMPUTE_TLS_UPSTREAM: web:80\n", "");
+  assert.ok(noUpstream.includes("Published ports: 443:8443"), noUpstream);
+  assert.ok(!noUpstream.includes("Endpoint"), noUpstream);
+  const udp = await shown("    - 443:8443\n", "    - 443:8443/udp\n");
+  assert.ok(udp.includes("Published ports: 443:8443/udp"), udp);
+  assert.ok(!udp.includes("Endpoint"), udp);
+  const bound = await shown("    - 443:8443\n", "    - 127.0.0.1:443:8443\n");
+  assert.ok(bound.includes("Endpoint: HTTPS on 127.0.0.1:443, forwarded to web:80"), bound);
 });
 
 test("a registration receipt that does not verify never reads approved", async () => {
