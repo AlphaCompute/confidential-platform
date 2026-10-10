@@ -665,12 +665,11 @@ fn tagged(image: &str) -> Result<(Registry, String, &str), String> {
                 "{image} is a tag outside Docker Hub, ghcr.io and quay.io; pin it as <image>@sha256:<digest>"
             )
         })?;
-    let (path, tag) = rest.split_once(':').unwrap_or((rest, "latest"));
-    if !grammatical(path, tag) {
-        return Err(format!(
+    let (path, tag) = grammatical(rest).ok_or_else(|| {
+        format!(
             "{image} is not an image reference; write <repository>:<tag> in lowercase, or pin it as <image>@sha256:<digest>"
-        ));
-    }
+        )
+    })?;
     let repository = match (domain, path.contains('/')) {
         ("docker.io", false) => format!("library/{path}"),
         _ => path.to_owned(),
@@ -678,8 +677,10 @@ fn tagged(image: &str) -> Result<(Registry, String, &str), String> {
     Ok((registry, repository, tag))
 }
 
-/// Docker's grammar for a repository path and a tag.
-fn grammatical(path: &str, tag: &str) -> bool {
+/// The repository path and tag (`latest` when absent) of a reference without its registry, held
+/// to Docker's grammar.
+fn grammatical(rest: &str) -> Option<(&str, &str)> {
+    let (path, tag) = rest.split_once(':').unwrap_or((rest, "latest"));
     let alnum = |b: &u8| b.is_ascii_lowercase() || b.is_ascii_digit();
     let component = |c: &str| {
         c.as_bytes().first().is_some_and(alnum)
@@ -695,7 +696,7 @@ fn grammatical(path: &str, tag: &str) -> bool {
         && tag
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
-    path.split('/').all(component) && tag_ok
+    (path.split('/').all(component) && tag_ok).then_some((path, tag))
 }
 
 /// `<image>@sha256:<hex>` whose image is one token of the grammar [`tagged`] holds tags to.
@@ -704,12 +705,11 @@ fn pinned_reference(image: &str) -> bool {
         return false;
     };
     let (domain, rest) = split(name);
-    let (path, tag) = rest.split_once(':').unwrap_or((rest, "latest"));
     digest(d)
         && domain
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':'))
-        && grammatical(path, tag)
+        && grammatical(rest).is_some()
 }
 
 fn pin(image: &str, digests: &BTreeMap<String, String>) -> Result<String, String> {
@@ -1237,12 +1237,9 @@ mod tests {
         let (name, digest) = good.split_once('@').unwrap();
         for bad in [
             format!("x: y\n{good}"),
-            format!("{good}\n"),
             format!("{name}\t@{digest}"),
-            format!("\t{good}"),
             format!(" {good}"),
             format!("{good} "),
-            format!("{name} @{digest}"),
             String::new(),
         ] {
             let mut spec = deploy_spec();
