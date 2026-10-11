@@ -1,26 +1,40 @@
 # alpha-inference
 
-The platform's inference front: an App of its own, whose provider is RedPill. Every `/v1` route forwards to RedPill only after a live check of RedPill's gateway attestation, run in this service's own measured code, has passed for that model within the last minute; any error, timeout or mismatch answers `upstream_unverified` and sends nothing.
+The platform's inference front: an App of its own with two kinds of upstream, chosen per model by the measured environment.
+
+- **Our own model servers** (`MODEL_SERVERS`): one `alpha-model-server` App per model — an OpenAI-compatible server on a whole confidential-computing GPU in a Kata TDX pod VM — reached only over TLS pinned to this Instance's KMS CA and one of that model's Revisions, inside the handshake.
+- **The external provider** (RedPill) for every other allowlisted model: forwarded only after a live check of its gateway attestation, run in this service's own measured code, has passed for that model within the last minute.
+
+Either way, any error, timeout or mismatch answers `upstream_unverified` and sends nothing. A model never moves from one kind to the other on its own: which kind serves a model is part of the Revision.
 
 ## Configuration (environment only)
 
 | Variable | Meaning |
 |---|---|
-| `UPSTREAM_URL` | RedPill's OpenAI-compatible base, `/v1` included, `https://` only (e.g. `https://api.redpill.ai/v1`) |
 | `MODELS` | comma-separated model ids allowed through; the first is the default for `/ready` |
-| `PCCS_URL` | PCCS for DCAP collateral, fetched at most once a minute per model (`https://` only) |
-| `UPSTREAM_POLICY` | JSON of `alpha_attest::Policy` (`tcb_statuses`, `tolerated_advisories`) the report's quote must satisfy |
+| `MODEL_SERVERS` | optional JSON object, model id → `{"url": "https://host[:port]", "revisions": ["sha256:..."]}`: the allowlisted models our own model servers serve, each pinned to the KMS CA and one of its Revisions; every key must be in `MODELS`, every url an https origin without a path, every Revision list non-empty |
+| `UPSTREAM_URL` | RedPill's OpenAI-compatible base, `/v1` included, `https://` only (e.g. `https://api.redpill.ai/v1`); required only when some model in `MODELS` is not in `MODEL_SERVERS` |
+| `PCCS_URL` | PCCS for DCAP collateral, fetched at most once a minute per model (`https://` only); required as `UPSTREAM_URL` is |
+| `UPSTREAM_POLICY` | JSON of `alpha_attest::Policy` (`tcb_statuses`, `tolerated_advisories`) the report's quote must satisfy; required as `UPSTREAM_URL` is |
 
-Two Secrets, released only to this App's Revision: `redpill-api-key` (RedPill's own key; never sent to any other App, never released to a caller) and `caller-bearer` (compared by SHA-256 digest against every `/v1` request's `Authorization: Bearer` header before any upstream contact).
+Secrets, released only to this App's Revision, and read only when this Revision uses them: `caller-bearer` (always; compared by SHA-256 digest against every `/v1` request's `Authorization: Bearer` header before any upstream contact), `redpill-api-key` (when some model is RedPill's; RedPill's own key, never sent to any other App, never released to a caller) and `model-server-bearer` (when some model is ours; sent only over a model server's pinned connection, never to RedPill or a caller). Each model server declares the same value as its own Secret.
 
 ## Routes
 
-- `GET /v1/models` — the allowlisted entries of RedPill's public listing (bare `{id, object}` when RedPill lists none of them). No gateway check: it carries no conversation.
-- `GET /v1/models/{model}` — `200 {"id","object":"model","owned_by":"redpill"}` once the gateway check has passed for that model within the last minute; `404 model_not_found` outside the allowlist; `502 upstream_unverified` otherwise.
-- `POST /v1/chat/completions` — the body forwarded unchanged over the connection the gateway check pinned, the caller's bearer replaced by the RedPill key, status/content-type/stream relayed; `404 model_not_found` outside the allowlist, checked before any upstream contact; `502 upstream_unverified` when the gateway check fails; `502 upstream` when the pinned connection itself fails.
+- `GET /v1/models` — RedPill's models: the allowlisted entries of its public listing (bare `{id, object}` when RedPill lists none of them); ours: `{id, object, "owned_by": "alphacompute"}` from `MODEL_SERVERS`. No check: it carries no conversation.
+- `GET /v1/models/{model}` — `200 {"id","object":"model","owned_by":"alphacompute"|"redpill"}` once that model's check has passed within the last minute; `404 model_not_found` outside the allowlist; `502 upstream_unverified` otherwise.
+- `POST /v1/chat/completions` — the body forwarded unchanged over the model's pinned connection, the caller's bearer replaced by that upstream's own credential, status/content-type/stream relayed; `404 model_not_found` outside the allowlist, checked before any upstream contact; `502 upstream_unverified` when the check fails; `502 upstream` when the pinned connection itself fails.
 - `GET /healthz` (process only) and `GET /ready` (200 once the default model verifies) need no bearer.
 
 Errors are OpenAI-shaped: `{"error":{"message","type","code"}}`; the `upstream_unverified` message is always "The model provider did not pass verification, so nothing was sent."
+
+## Our own model servers
+
+A model server's `alpha-runtime` sidecar terminates TLS with the one-hour Instance leaf the KMS issued after appraising the pod VM's evidence, and this front pins every connection to it with `Pin::CaAndInstanceRevisions`: the chain must end at this Instance's own KMS CA (the last certificate of its own chain, already checked by its runtime against the measured CA) and the leaf must carry one of the model's `revisions`, or the handshake fails before a request byte. No report is read here — the KMS's appraisal is the check, and the leaf is its readable form.
+
+Before a model is used, and at most once a minute (one check in flight per model): `GET {url}/v1/models` with `model-server-bearer` over the pinned connection must answer 2xx and list the model. The Revision the leaf carried is logged on each passing check (`alpha-inference: model <m> served by alphacompute revision sha256:...`), so an operator can tie a model to the measured build that served it; a failure is logged by code (`handshake`, `status`, `not_served`) and model only.
+
+**What this covers:** that the server is an Instance the KMS appraised for a listed Revision of the model server. What that appraisal includes for the GPU — that the GPUs are in confidential-computing mode, their attestation report and certificate chain, driver and VBIOS measurements against reference values — is the KMS's appraisal policy for that Revision (PRD-02), not something this front re-checks. A model server Revision whose policy does not require GPU evidence would pass here too; registering such a Revision is the control.
 
 ## The gateway check
 
