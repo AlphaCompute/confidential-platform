@@ -2,6 +2,8 @@
 
 How `alpha-kms` decides to issue a Revision leaf to a Kata confidential pod on TDX with NVIDIA confidential GPUs (PRD-02). Clients see no change: the leaf, its one-hour lifetime and its SANs (`urn:alphacompute:revision:sha256:<hash>`) are what they were. The prototype profile (`alphacompute-evidence/1`) is unchanged and both coexist.
 
+> **Status: the KMS does not run this profile yet.** This document describes the appraisal in `alpha_attest` (`appraise_any`, `kata`, `gpu`) and the behaviour the KMS will have once it is wired in (PRD-02 PR 5, not written yet). Today `alpha-kms` still accepts only `alphacompute-evidence/1` and calls the prototype `appraise` (`services/alpha-kms/src/instance.rs`), so a Kata pod's evidence v2 is refused and no Kata pod gets a leaf. Sentences marked *(PR 5)* describe KMS behaviour that is pending.
+
 ## Identity: init-data and the Revision v2
 
 Kata binds the digest of the pod's init-data into the TD's `MRCONFIGID` when it launches the VM, and the Kata agent policy the pod runs under is the init-data's `policy.rego` entry. The policy pins images by digest and fixes each container's command, environment and mounts, and denies exec and log reads. So the init-data, not the pod spec the host holds, says what may run.
@@ -19,7 +21,7 @@ The Revision v2 is then a pure function of the init-data bytes:
  "initdata_sha256":"sha256:<hex>","policy_sha256":"sha256:<hex>","runtime_class":"kata-qemu-nvidia-gpu-tdx"}
 ```
 
-It is registered in its JCS form, signed by the org key or a passkey exactly like a compose (context `alphacompute/revision/v1`, document `{app_id, compose}` with the Revision v2 text as `compose`), and its hash is SHA-256 over those bytes. The KMS rebuilds it from the verified init-data and looks the hash up in the same `revisions` table. `gpu` is absent for a CPU-only pod. `gpu.count` is 1 or 8.
+It is registered in its JCS form, signed by the org key or a passkey exactly like a compose (context `alphacompute/revision/v1`, document `{app_id, compose}` with the Revision v2 text as `compose`), and its hash is SHA-256 over those bytes. *(PR 5)* The KMS rebuilds it from the verified init-data and looks the hash up in the same `revisions` table. `gpu` is absent for a CPU-only pod. `gpu.count` is 1 or 8.
 
 `MRCONFIGID` holds the init-data digest under the algorithm the document declares, zero-padded to 48 bytes; `alpha coco render` declares `sha384`, which fills it. This is open question Q10 until a golden vector from a B300 pod proves it at M1; `alpha_core::coco::InitData::mrconfigid` is the one place to change if Kata binds it differently.
 
@@ -55,7 +57,7 @@ In the plan's order (PRD-02 R5). Every step is mandatory; the order only decides
 8. The Revision v2 hash is the leaf's Revision; for a KMS node it must be in `kms_revisions`.
 9. GPUs: the evidence has exactly `gpu.count` entries; every backend the `gpu_policy` lists verified every one of them, over this nonce, in CC mode, of the Revision's model, an allowed model, at or above the minimum driver and VBIOS versions. A failure in any backend fails the attestation. The backends (NRAS is a network call) run only after steps 1 to 8 have passed and after the checks that need no backend (a `gpu_policy` exists, lists a verifier and allows the model, one evidence entry per GPU), so evidence that fails earlier costs no verifier call (`alpha_attest::appraise_any`).
 
-The KMS then requires the Revision to be registered, unrevoked and validly signed, as today. Every refusal is an audit row with its reason.
+*(PR 5)* The KMS then requires the Revision to be registered, unrevoked and validly signed, as today, and refuses a Revision v2 reached through evidence v1 or the reverse. Every refusal is an audit row with its reason. None of this is wired yet: `appraise_any` returns the reasons, but nothing in `alpha-kms` calls it.
 
 ## What the result records
 
