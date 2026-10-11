@@ -38,7 +38,7 @@ pub(crate) fn test_state(
         secrets: parking_lot::RwLock::new(crate::Secrets {
             provider_key: zeroize::Zeroizing::new(provider_key.to_string()),
             caller_bearer: zeroize::Zeroizing::new(caller_bearer.to_vec()),
-            model_server_bearer: zeroize::Zeroizing::new(String::new()),
+            model_server_bearers: std::collections::BTreeMap::new(),
             judge_bearer: zeroize::Zeroizing::new(Vec::new()),
         }),
         upstream,

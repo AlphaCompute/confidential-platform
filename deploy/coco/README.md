@@ -14,8 +14,9 @@ Revision.
 
 ## Bring-up order
 
-1. Register the model-server App and the seal Job's Revision; put `model-server-bearer` for the
-   model-server App and for alpha-inference (same value).
+1. Register the model-server App and the seal Job's Revision; for each model, put
+   `model-server-bearer-<model>` for the model-server App and for alpha-inference (same value,
+   a different one per model).
 2. Create `sealed-weights-<model>` PVCs; run `seal-weights-job.yaml` per model.
 3. Deploy `model-server.yaml` per model; register each Revision; put its hash into
    alpha-inference's `MODEL_SERVERS`.
@@ -28,10 +29,11 @@ Revision.
 
 ## Choices worth knowing
 
-- **vLLM listens on loopback only.** The pod's only way in is the runtime's TLS on 8443, pinned by
-  alpha-inference to the KMS CA and the Revision. The bearer is the second lock: today the runtime
-  terminates TLS without a client certificate, so pinning callers by App id needs a runtime change
-  (follow-up).
+- **Only alpha-inference gets in.** vLLM listens on loopback only, so the pod's only way in is the
+  runtime's TLS on 8443, which alpha-inference pins to the KMS CA and the Revision. In the other
+  direction the runtime admits a client only with an Instance leaf of alpha-inference's App
+  (`ALPHACOMPUTE_TLS_CALLER_APPS`), so vLLM's routes outside `/v1`, which its API key does not
+  cover, are closed to everyone else. Each server's own bearer is the second lock.
 - **Weights are opened into pod-VM memory** (`emptyDir: {medium: Memory}`), so size
   `POD_VM_MEMORY_MIB` for the weights, vLLM's host-side overhead and `/dev/shm`.
 - **One GPU per pod**, `Recreate` rollouts: no spare GPU is assumed.

@@ -799,7 +799,7 @@ mod tests {
                 secrets: parking_lot::RwLock::new(crate::Secrets {
                     provider_key: zeroize::Zeroizing::new("provider-key".into()),
                     caller_bearer: zeroize::Zeroizing::new(b"member".to_vec()),
-                    model_server_bearer: zeroize::Zeroizing::new(String::new()),
+                    model_server_bearers: std::collections::BTreeMap::new(),
                     judge_bearer: zeroize::Zeroizing::new(b"judge".to_vec()),
                 }),
                 own: crate::own::Servers::none(),

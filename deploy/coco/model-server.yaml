@@ -8,7 +8,11 @@
 #                   Secret file for vllm.
 #   open-weights    init: alpha-weights opens the sealed weights into pod-VM memory under the
 #                   App's KMS-derived `weights` key.
-#   vllm            stock vLLM, bound to loopback only, accepting only model-server-bearer.
+#   vllm            stock vLLM, bound to loopback only, accepting only this server's own bearer.
+#
+# Only alpha-inference reaches vLLM: the runtime admits a TLS client only with an Instance leaf of
+# the front's App (ALPHACOMPUTE_TLS_CALLER_APPS), so vLLM's routes outside /v1, which its API key
+# does not cover, are closed to everyone else too.
 #
 # Depends on PRD-02: alpha-runtime's evidence source on Kata (TDX quote + NVIDIA GPU evidence
 # instead of the dstack guest agent), and the Revision definition for a pod spec + agent policy.
@@ -59,8 +63,13 @@ spec:
             # the host and not measured, so a name could be pointed anywhere.
             - name: ALPHACOMPUTE_TLS_UPSTREAM
               value: "127.0.0.1:8000"
+            # Only an Instance of alpha-inference's App, whatever its Revision (its Revision pins
+            # this server's, so this server cannot pin it back).
+            - name: ALPHACOMPUTE_TLS_CALLER_APPS
+              value: "${INFERENCE_APP_ID}"
+            # One bearer per server, so one server's bearer opens no other.
             - name: ALPHACOMPUTE_SECRETS
-              value: '{"vllm":["model-server-bearer"]}'
+              value: '{"vllm":["model-server-bearer-${MODEL_NAME}"]}'
           ports:
             - name: https
               containerPort: 8443
@@ -87,7 +96,7 @@ spec:
           # from the Secret file into the environment, never onto the command line.
           args:
             - >-
-              export VLLM_API_KEY="$(cat /run/secrets/model-server-bearer)" &&
+              export VLLM_API_KEY="$(cat /run/secrets/model-server-bearer-${MODEL_NAME})" &&
               exec vllm serve /weights
               --served-model-name "${MODEL_ID}"
               --host 127.0.0.1 --port 8000
@@ -149,7 +158,8 @@ spec:
       alphacompute.dev/model: ${MODEL_NAME}
   policyTypes: [Ingress, Egress]
   ingress:
-    # Defence in depth only; the pin and the bearer are the control.
+    # Defence in depth only (the host enforces it); the runtime's caller pin and the bearer are
+    # the control.
     - from:
         - podSelector: { matchLabels: { app.kubernetes.io/name: alpha-inference } }
       ports: [{ port: 8443 }]

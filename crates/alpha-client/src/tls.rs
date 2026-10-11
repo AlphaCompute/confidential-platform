@@ -20,11 +20,14 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, TrustAnchor, UnixTime,
 };
-use rustls::server::danger::ClientCertVerifier;
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
 use rustls::time_provider::TimeProvider;
-use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, DistinguishedName, RootCertStore, ServerConfig,
+    SignatureScheme,
+};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
@@ -357,6 +360,107 @@ pub fn mtls_server_config(
     listener(cert, verifier)
 }
 
+/// The CA a client's chain must end at, read at every handshake: the last certificate of the
+/// listener's own current chain, which its runtime checked against the measured KMS CA. `None`
+/// (not attested, or the leaf expired) refuses every client.
+pub type CurrentCa = Arc<dyn Fn() -> Option<CertificateDer<'static>> + Send + Sync>;
+
+/// A listener's client verifier that requires a client certificate: an App Instance's leaf
+/// chained to the CA `ca` returns, of one of `apps`, whatever its Revision. A model server pins
+/// the front this way; it cannot pin the front's Revision, which names the server's own.
+pub fn instance_app_client_verifier(
+    ca: CurrentCa,
+    apps: Vec<AppId>,
+) -> Arc<dyn ClientCertVerifier> {
+    Arc::new(InstanceAppClients {
+        ca,
+        apps,
+        provider: provider(),
+    })
+}
+
+struct InstanceAppClients {
+    ca: CurrentCa,
+    apps: Vec<AppId>,
+    provider: Arc<CryptoProvider>,
+}
+
+impl std::fmt::Debug for InstanceAppClients {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstanceAppClients")
+            .field("apps", &self.apps)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ClientCertVerifier for InstanceAppClients {
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        let refuse = |m: String| rustls::Error::General(m);
+        let ca = (self.ca)().ok_or_else(|| refuse("no CA to verify a client against".into()))?;
+        let anchor = webpki::anchor_from_trusted_cert(&ca).map_err(|e| refuse(e.to_string()))?;
+        webpki::EndEntityCert::try_from(end_entity)
+            .map_err(|e| refuse(e.to_string()))?
+            .verify_for_usage(
+                self.provider.signature_verification_algorithms.all,
+                std::slice::from_ref(&anchor),
+                intermediates,
+                now,
+                webpki::KeyUsage::client_auth(),
+                None,
+                None,
+            )
+            .map_err(|e| refuse(format!("client chain does not end at the ca: {e}")))?;
+        let sans = uri_sans(end_entity).map_err(|e| refuse(e.to_string()))?;
+        let instance = parse_instance_sans(&sans).map_err(|e| refuse(e.to_string()))?;
+        if !self.apps.contains(&instance.app_id) {
+            return Err(refuse(
+                "client certificate is not an Instance of an allowed App".into(),
+            ));
+        }
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &CertificateDer<'_>,
+        _: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Err(rustls::Error::PeerIncompatible(
+            rustls::PeerIncompatible::Tls12NotOffered,
+        ))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// The certificate chain the peer presented, if any; each route decides what it needs of it.
 #[derive(Clone, Debug, Default)]
 pub struct PeerCerts(pub Vec<CertificateDer<'static>>);
@@ -629,6 +733,83 @@ mod tests {
         let (_, other_ca) = new_ca();
         let foreign = Pin::CaAndInstanceApps(other_ca.der().clone(), vec![front]);
         assert!(!pinned_handshake(&instance_of(front, "v1"), foreign).await);
+    }
+
+    /// Whether a listener requiring an Instance of `apps` under the CA `ca` returns accepts a
+    /// client presenting `client` (or nothing): judged on the server's side, since a TLS 1.3
+    /// client finishes its handshake before the server reads its certificate.
+    async fn caller_accepted(
+        server: &RuntimeIdentity,
+        ca: Option<CertificateDer<'static>>,
+        apps: Vec<AppId>,
+        client: Option<&RuntimeIdentity>,
+    ) -> bool {
+        let verifier = instance_app_client_verifier(Arc::new(move || ca.clone()), apps);
+        let config = listener(Arc::new(InstanceCert::new(server).unwrap()), verifier).unwrap();
+        let acceptor = TlsAcceptor::from(config);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            acceptor.accept(tcp).await.is_ok()
+        });
+        let identity = client.map(|c| Identity {
+            chain: CertificateDer::pem_slice_iter(c.certificate_chain.as_bytes())
+                .map(|d| d.unwrap().to_vec())
+                .collect(),
+            pkcs8: c.tls_private_key.to_vec(),
+        });
+        let pin = Pin::Ca(kms_ca(server).unwrap());
+        let config = client_config(Some(pin), identity, crate::system_time_provider()).unwrap();
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let _ = TlsConnector::from(Arc::new(config))
+            .connect(ServerName::try_from("app.example").unwrap(), tcp)
+            .await;
+        accepted.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_caller_pinned_listener_serves_only_an_instance_of_a_listed_app() {
+        let (ca_key, ca_cert) = new_ca();
+        let ca = CertificateDer::from(ca_cert.der().to_vec());
+        let front = AppId::mint();
+        let instance_of = |key: &KeyPair, cert: &rcgen::Certificate, app: AppId| {
+            leaf_with_sans(
+                key,
+                cert,
+                &[
+                    format!("alphacompute://{}/{app}/{}", OrgId::mint(), "a".repeat(64)),
+                    format!(
+                        "urn:alphacompute:revision:{}",
+                        alpha_core::compose_hash("any")
+                    ),
+                ],
+            )
+        };
+        let server = instance_of(&ca_key, &ca_cert, AppId::mint());
+        let caller = instance_of(&ca_key, &ca_cert, front);
+        let stranger = instance_of(&ca_key, &ca_cert, AppId::mint());
+        let node = leaf_with_sans(
+            &ca_key,
+            &ca_cert,
+            &[
+                KMS_SAN.into(),
+                format!(
+                    "urn:alphacompute:revision:{}",
+                    alpha_core::compose_hash("kms")
+                ),
+            ],
+        );
+        let (other_key, other_ca) = new_ca();
+        let foreign = instance_of(&other_key, &other_ca, front);
+        let apps = vec![front];
+
+        assert!(caller_accepted(&server, Some(ca.clone()), apps.clone(), Some(&caller)).await);
+        for refused in [Some(&stranger), Some(&node), Some(&foreign), None] {
+            assert!(!caller_accepted(&server, Some(ca.clone()), apps.clone(), refused).await);
+        }
+        // No CA yet (not attested, or the leaf expired): nobody.
+        assert!(!caller_accepted(&server, None, apps, Some(&caller)).await);
     }
 
     #[tokio::test]

@@ -29,7 +29,7 @@ use alpha_client::tls::{self, InstanceSans};
 use alpha_client::{
     AttestReply, AttestRequest, Client, DerivedKey, Identity, Pin, Secret, TimeProvider,
 };
-use alpha_core::ComposeHash;
+use alpha_core::{AppId, ComposeHash};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use p256::ecdsa::SigningKey;
@@ -162,8 +162,32 @@ pub fn parse_upstream(text: Option<&str>) -> Result<Option<String>, Error> {
     Ok(Some(text.to_owned()))
 }
 
+/// `ALPHACOMPUTE_TLS_CALLER_APPS`: comma-separated App ids. Set, the Endpoint serves only a client
+/// presenting an Instance leaf of one of them under the KMS CA; unset, any client (a wrapped
+/// compose's public Endpoint). It needs `ALPHACOMPUTE_TLS_UPSTREAM`, and set, it names an App.
+pub fn parse_callers(text: Option<&str>, tls_upstream: Option<&str>) -> Result<Vec<AppId>, Error> {
+    let Some(text) = text else {
+        return Ok(Vec::new());
+    };
+    let refused = |m: String| Error::Config(format!("ALPHACOMPUTE_TLS_CALLER_APPS: {m}"));
+    if tls_upstream.is_none() {
+        return Err(refused("set without ALPHACOMPUTE_TLS_UPSTREAM".into()));
+    }
+    let apps = list(text)
+        .map(|s| {
+            s.parse()
+                .map_err(|_| refused(format!("{s:?} is not an App id")))
+        })
+        .collect::<Result<Vec<AppId>, _>>()?;
+    if apps.is_empty() {
+        return Err(refused("names no App".into()));
+    }
+    Ok(apps)
+}
+
 /// The three environment variables and, when a service declared a Secret,
-/// `ALPHACOMPUTE_SECRETS`; for a wrapped compose, `ALPHACOMPUTE_TLS_UPSTREAM`.
+/// `ALPHACOMPUTE_SECRETS`; for a wrapped compose, `ALPHACOMPUTE_TLS_UPSTREAM`; for an Endpoint
+/// that serves only some Apps' Instances, `ALPHACOMPUTE_TLS_CALLER_APPS`.
 #[derive(Clone, Debug)]
 pub struct Config {
     pub kms_ca_spki_sha256: [u8; 32],
@@ -171,6 +195,8 @@ pub struct Config {
     pub kms_endpoints: Vec<String>,
     pub secrets: Secrets,
     pub tls_upstream: Option<String>,
+    /// Empty: any client. Otherwise only an Instance of one of these Apps.
+    pub tls_caller_apps: Vec<AppId>,
 }
 
 impl Config {
@@ -178,13 +204,23 @@ impl Config {
         let var = |name: &str| {
             std::env::var(name).map_err(|_| Error::Config(format!("{name} is not set")))
         };
-        Self::parse(
+        let config = Self::parse(
             &var("ALPHACOMPUTE_KMS_CA_SPKI_SHA256")?,
             &var("ALPHACOMPUTE_KMS_REVISIONS")?,
             &var("ALPHACOMPUTE_KMS_ENDPOINTS")?,
             std::env::var("ALPHACOMPUTE_SECRETS").ok().as_deref(),
             std::env::var("ALPHACOMPUTE_TLS_UPSTREAM").ok().as_deref(),
-        )
+        )?;
+        let tls_caller_apps = parse_callers(
+            std::env::var("ALPHACOMPUTE_TLS_CALLER_APPS")
+                .ok()
+                .as_deref(),
+            config.tls_upstream.as_deref(),
+        )?;
+        Ok(Self {
+            tls_caller_apps,
+            ..config
+        })
     }
 
     pub fn parse(
@@ -227,6 +263,7 @@ impl Config {
             kms_endpoints,
             secrets,
             tls_upstream,
+            tls_caller_apps: Vec::new(),
         })
     }
 
@@ -923,6 +960,29 @@ package agent_policy
             };
             assert!(m.starts_with("ALPHACOMPUTE_TLS_UPSTREAM:"), "{bad}: {m}");
         }
+    }
+
+    #[test]
+    fn the_tls_callers_are_app_ids_and_need_an_upstream() {
+        let (a, b) = (AppId::mint(), AppId::mint());
+        assert_eq!(parse_callers(None, None).unwrap(), Vec::<AppId>::new());
+        assert_eq!(
+            parse_callers(Some(&format!(" {a},, {b} ")), Some("127.0.0.1:8000")).unwrap(),
+            vec![a, b]
+        );
+        for (bad, upstream) in [
+            (a.to_string(), None),
+            (" , ".to_owned(), Some("127.0.0.1:8000")),
+            ("not-an-app".to_owned(), Some("127.0.0.1:8000")),
+            (HASH.to_owned(), Some("127.0.0.1:8000")),
+        ] {
+            let Err(Error::Config(m)) = parse_callers(Some(&bad), upstream) else {
+                panic!("{bad} was accepted");
+            };
+            assert!(m.starts_with("ALPHACOMPUTE_TLS_CALLER_APPS:"), "{bad}: {m}");
+        }
+        let c = Config::parse(HASH, HASH, "https://a", None, Some("web:80")).unwrap();
+        assert!(c.tls_caller_apps.is_empty());
     }
 
     fn temp_dir() -> PathBuf {

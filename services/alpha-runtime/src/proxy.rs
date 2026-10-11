@@ -1,5 +1,6 @@
 //! TLS for a wrapped compose: the current Instance leaf on the Endpoint, then the bytes copied
-//! both ways to the published service's plain port.
+//! both ways to the published service's plain port. With `ALPHACOMPUTE_TLS_CALLER_APPS`, only a
+//! client presenting an Instance leaf of a listed App under the KMS CA gets that far.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -35,14 +36,30 @@ impl ResolvesServerCert for CurrentLeaf {
 }
 
 fn server_config(runtime: Arc<Runtime>) -> Result<Arc<ServerConfig>, Error> {
-    let mut config = ServerConfig::builder_with_provider(alpha_client::tls::provider())
+    let builder = ServerConfig::builder_with_provider(alpha_client::tls::provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|e| Error::Socket(format!("tls: {e}")))?
-        .with_no_client_auth()
-        // ponytail: no ALPN, so a browser speaks HTTP/1.1 and HTTP/2 by prior knowledge still
-        // passes, but a client that insists on `h2` (gRPC) is not served; the upgrade is a
-        // measured opt-in that advertises `h2` for an `h2c` backend.
-        .with_cert_resolver(Arc::new(CurrentLeaf(runtime)));
+        .map_err(|e| Error::Socket(format!("tls: {e}")))?;
+    let callers = runtime.config().tls_caller_apps.clone();
+    let builder = if callers.is_empty() {
+        builder.with_no_client_auth()
+    } else {
+        // Only an Instance of a listed App, under the KMS CA this runtime's own current chain
+        // ends at (checked against the measured CA on every attestation); none while there is
+        // no valid leaf.
+        let current = runtime.clone();
+        builder.with_client_cert_verifier(alpha_client::tls::instance_app_client_verifier(
+            Arc::new(move || {
+                current
+                    .attested()
+                    .and_then(|a| a.certified.cert.last().cloned())
+            }),
+            callers,
+        ))
+    };
+    // ponytail: no ALPN, so a browser speaks HTTP/1.1 and HTTP/2 by prior knowledge still
+    // passes, but a client that insists on `h2` (gRPC) is not served; the upgrade is a
+    // measured opt-in that advertises `h2` for an `h2c` backend.
+    let mut config = builder.with_cert_resolver(Arc::new(CurrentLeaf(runtime)));
     // A resumed session presents no certificate, and each connection must prove the current leaf.
     config.send_tls13_tickets = 0;
     config.session_storage = Arc::new(NoServerSessionStorage {});
