@@ -21,8 +21,9 @@ declared. Every service and Secret name becomes a path segment, so each must be 
 purpose (`[a-z0-9][a-z0-9._-]{0,63}`); a repeated key or any other shape is refused at start.
 `ALPHACOMPUTE_TLS_UPSTREAM`, measured too, is `<service>:<port>`, the published service of a
 wrapped compose and its plain container port; the service must be a lowercase key purpose and
-the port 1 to 65535, or the runtime exits 1 at start naming the variable. Without it the runtime
-opens no TCP port at all.
+the port 1 to 65535, or the runtime exits 1 at start naming the variable. A Kata pod spec names its
+loopback by address, `127.0.0.1:<port>`, since `/etc/hosts` in a pod VM is written by the host and
+not measured. Without it the runtime opens no TCP port at all.
 
 The socket is `/run/alpha/runtime.sock`, HTTP/1.1 JSON, no authentication (access is the right
 to the socket), and comes up only after the first attestation succeeded:
