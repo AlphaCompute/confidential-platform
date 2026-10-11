@@ -72,8 +72,11 @@ pub fn identity_json(runtime: &Runtime) -> Result<Value, Error> {
         "attestation_result": attested.result,
         "app_compose": runtime.app_compose,
     });
-    if let Some(initdata) = runtime.initdata() {
-        identity["initdata"] = json!(BASE64_URL_SAFE_NO_PAD.encode(initdata));
+    if let (Some(initdata), Some(fields)) = (runtime.initdata(), identity.as_object_mut()) {
+        fields.insert(
+            "initdata".into(),
+            json!(BASE64_URL_SAFE_NO_PAD.encode(initdata)),
+        );
     }
     Ok(identity)
 }

@@ -57,7 +57,10 @@ pub fn quote(
 ) -> Result<(Vec<u8>, Vec<alpha_attest::EventLogEntry>), Error> {
     match source {
         QuoteSource::AttestationAgent => agent_quote(ATTESTATION_AGENT, report_data),
-        QuoteSource::ConfigfsTsm => Ok((tsm_quote(Path::new(TSM_REPORT_DIR), report_data)?, Vec::new())),
+        QuoteSource::ConfigfsTsm => Ok((
+            tsm_quote(Path::new(TSM_REPORT_DIR), report_data)?,
+            Vec::new(),
+        )),
     }
 }
 
@@ -78,7 +81,10 @@ fn agent_quote(
     addr: &str,
     report_data: &[u8; 64],
 ) -> Result<(Vec<u8>, Vec<alpha_attest::EventLogEntry>), Error> {
-    let path = format!("/aa/evidence?runtime_data={}", agent_runtime_data(report_data));
+    let path = format!(
+        "/aa/evidence?runtime_data={}",
+        agent_runtime_data(report_data)
+    );
     let body = tcp_get(addr, &path)?;
     let evidence: AgentTdxEvidence = serde_json::from_slice(&body)
         .map_err(|e| Error::Agent(format!("attestation agent evidence: {e}")))?;
@@ -137,7 +143,8 @@ fn tcp_get(addr: &str, path: &str) -> Result<Vec<u8>, Error> {
     stream
         .set_read_timeout(Some(TIMEOUT))
         .map_err(io("timeout".into()))?;
-    let request = format!("GET {path} HTTP/1.0\r\nHost: {addr}\r\nAccept: application/json\r\n\r\n");
+    let request =
+        format!("GET {path} HTTP/1.0\r\nHost: {addr}\r\nAccept: application/json\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .map_err(io("write to the attestation agent".into()))?;
@@ -161,7 +168,7 @@ pub fn decode_annotation(text: &str) -> Result<Vec<u8>, Error> {
         .map_err(|_| Error::Agent("init-data annotation is not base64".into()))?;
     let mut out = Vec::new();
     flate2::read::GzDecoder::new(gz.as_slice())
-        .take(alpha_core::coco::MAX_INITDATA_BYTES as u64 + 1)
+        .take((alpha_core::coco::MAX_INITDATA_BYTES as u64).saturating_add(1))
         .read_to_end(&mut out)
         .map_err(|e| Error::Agent(format!("init-data annotation is not gzip: {e}")))?;
     if out.len() > alpha_core::coco::MAX_INITDATA_BYTES {
@@ -171,7 +178,11 @@ pub fn decode_annotation(text: &str) -> Result<Vec<u8>, Error> {
 }
 
 /// One report per GPU over `nonce`, from [`GPU_EVIDENCE_HELPER`]; exactly `count` of them.
-pub fn gpu_evidence(helper: &Path, nonce: &[u8; 32], count: usize) -> Result<Vec<GpuEvidence>, Error> {
+pub fn gpu_evidence(
+    helper: &Path,
+    nonce: &[u8; 32],
+    count: usize,
+) -> Result<Vec<GpuEvidence>, Error> {
     if count == 0 {
         return Ok(Vec::new());
     }
@@ -323,8 +334,17 @@ mod tests {
         fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
         let gpus = gpu_evidence(&helper, &[0; 32], 1).unwrap();
         assert_eq!(gpus[0].evidence, [1]);
-        assert!(gpu_evidence(&helper, &[0; 32], 8).unwrap_err().to_string().contains("expects 8"));
-        assert!(gpu_evidence(Path::new("/nonexistent"), &[0; 32], 0).unwrap().is_empty());
+        assert!(
+            gpu_evidence(&helper, &[0; 32], 8)
+                .unwrap_err()
+                .to_string()
+                .contains("expects 8")
+        );
+        assert!(
+            gpu_evidence(Path::new("/nonexistent"), &[0; 32], 0)
+                .unwrap()
+                .is_empty()
+        );
         let _ = fs::remove_file(&helper);
     }
 }
