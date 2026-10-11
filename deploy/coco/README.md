@@ -17,7 +17,9 @@ Revision.
 1. Register the model-server App and the seal Job's Revision; for each model, put
    `model-server-bearer-<model>` for the model-server App and for alpha-inference (same value,
    a different one per model).
-2. Create `sealed-weights-<model>` PVCs; run `seal-weights-job.yaml` per model.
+2. Create `sealed-weights-<model>` PVCs; run `seal-weights-job.yaml` per model and put the
+   manifest digest it prints (also `MANIFEST.sha256` on the volume) into `models/<model>.env` as
+   `WEIGHTS_MANIFEST_SHA256`: the model server opens only that sealing of that model.
 3. Deploy `model-server.yaml` per model; register each Revision; put its hash into
    alpha-inference's `MODEL_SERVERS`.
 4. Put alpha-inference's `judge-bearer` and set alpha-guard's `inference-bearer` to the same value;

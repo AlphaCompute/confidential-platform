@@ -1,4 +1,5 @@
-# Seals one model's weights under the model server App's `weights` key. A Revision of the same
+# Seals one model's weights under the model server App's `weights` key, bound to MODEL_ID, and
+# prints the manifest digest the model server's open-weights requires. A Revision of the same
 # App as model-server.yaml (the key is the App's, the same for every Revision), run once per
 # model version on a confidential-GPU node so the KMS releases the key. The plain weights exist
 # only in this pod VM's memory; only the sealed copy reaches host storage.
@@ -39,7 +40,8 @@ spec:
       containers:
         - name: seal
           image: ${WEIGHTS_IMAGE}
-          args: ["seal", "/plain", "/sealed"]
+          # Bound to this model: prints the manifest digest model-server.yaml gives `open`.
+          args: ["seal", "${MODEL_ID}", "${MODEL_REPO}@${MODEL_REPO_REVISION}", "/plain", "/sealed"]
           resources:
             limits:
               nvidia.com/pgpu: 1             # the GPU is what lets the KMS release the key
