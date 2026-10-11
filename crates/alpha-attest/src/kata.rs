@@ -1,11 +1,14 @@
 //! `alphacompute-evidence/2` and the `kata-tdx/1` profile: a Kata confidential pod on TDX with
 //! the NVIDIA guest image and passed-through GPUs.
 //!
-//! The steps, after DCAP and the TCB policy that [`crate::verify_quote`] already runs:
-//! report_data binding → (event log replay, when sent) → reference values of kind `kata-tdx` →
-//! MRCONFIGID equals the init-data's digest → the init-data parses, carries a policy and our entry
-//! → the evidence's runtime class is the init-data's → every expected GPU passed → the Revision v2
-//! rebuilt from the init-data (and, for a KMS node, found in `kms_revisions`).
+//! The steps, in the plan's order (PRD-02 R5), after DCAP and the TCB policy that
+//! [`crate::verify_quote`] already runs: (event log replay, when sent) → MRTD and RTMR0..2 match a
+//! reference value of kind `kata-tdx` for the pod's runtime class → MRCONFIGID equals the
+//! init-data's digest → the init-data parses, carries a policy and our entry → the evidence's
+//! runtime class is the init-data's → report_data binds this key and nonce, last of the TD checks
+//! → the Revision v2 rebuilt from the init-data (for a KMS node, found in `kms_revisions`) → every
+//! expected GPU passed. Every step is mandatory; the order only decides which reason a refusal of
+//! evidence with several faults names.
 
 use std::time::SystemTime;
 
@@ -215,13 +218,6 @@ pub fn appraise_kata_tdx(
         advisories,
     } = verified;
 
-    let expected = report_data(runtime_pubkey_spki, nonce, node_xwing_spki);
-    if !report_data_binds(&quoted, &expected) {
-        return Err(Failed(
-            "report_data is not bound to this key and nonce".into(),
-        ));
-    }
-
     if !evidence.cpu.event_log.is_empty() {
         let [r0, r1, r2, _] = event_log::replay(&evidence.cpu.event_log);
         if [r0, r1, r2] != [measured.rtmr0, measured.rtmr1, measured.rtmr2] {
@@ -231,11 +227,15 @@ pub fn appraise_kata_tdx(
         }
     }
 
+    // The runtime class here is the pod's claim; it is held to the measured init-data's below, so
+    // a value listed for another class is never the one chosen.
+    let class = evidence.runtime_class.as_str();
     let reference = doc
         .reference_values
         .iter()
         .find(|rv| {
             rv.kind == ReferenceKind::KataTdx
+                && rv.runtime_class.as_deref().is_none_or(|c| c == class)
                 && rv.values.mrtd == measured.mrtd
                 && rv.values.rtmr0 == measured.rtmr0
                 && rv.values.rtmr1 == measured.rtmr1
@@ -243,7 +243,7 @@ pub fn appraise_kata_tdx(
         })
         .ok_or_else(|| {
             Unknown(format!(
-                "no kata-tdx reference value for mrtd {}",
+                "no kata-tdx reference value for mrtd {} and runtime class {class}",
                 measured.mrtd
             ))
         })?;
@@ -265,22 +265,14 @@ pub fn appraise_kata_tdx(
             evidence.runtime_class, revision.runtime_class
         )));
     }
-    if let Some(class) = &reference.runtime_class
-        && *class != revision.runtime_class
-    {
-        return Err(Unknown(format!(
-            "reference value {} is for runtime class {class}, not {}",
-            reference.name, revision.runtime_class
-        )));
-    }
 
-    let verified_gpus = gpu::check_gpus(
-        doc.gpu_policy.as_ref(),
-        revision.gpu.as_ref(),
-        evidence.gpus.len(),
-        gpus,
-        &gpu::gpu_nonce(&expected),
-    )?;
+    // Last of the TD checks, as the plan orders them (PRD-02 R5e).
+    let expected = report_data(runtime_pubkey_spki, nonce, node_xwing_spki);
+    if !report_data_binds(&quoted, &expected) {
+        return Err(Failed(
+            "report_data is not bound to this key and nonce".into(),
+        ));
+    }
 
     let compose_hash = revision
         .hash()
@@ -293,6 +285,14 @@ pub fn appraise_kata_tdx(
     {
         return Err(Unknown(format!("kms revision {compose_hash}")));
     }
+
+    let verified_gpus = gpu::check_gpus(
+        doc.gpu_policy.as_ref(),
+        revision.gpu.as_ref(),
+        evidence.gpus.len(),
+        gpus,
+        &gpu::gpu_nonce(&expected),
+    )?;
 
     measured.mrconfigid = Some(mrconfigid);
     let evidence_json = serde_json::to_value(evidence).map_err(|e| Failed(e.to_string()))?;
