@@ -1,6 +1,7 @@
-//! What a dstack CVM reads about itself: a TDX quote from the guest agent's socket and the
-//! event log that replays its RTMRs — the boot-time events from the CCEL ACPI table and dstack's
-//! own runtime events under `/run/log/dstack`.
+//! What a confidential guest reads about itself. Here, for the prototype CVM: a TDX quote from the
+//! guest agent's socket and the event log that replays its RTMRs — the boot-time events from the
+//! CCEL ACPI table and dstack's own runtime events under `/run/log/dstack`. For a Kata
+//! confidential pod, see [`coco`].
 
 #![cfg_attr(
     test,
@@ -12,6 +13,8 @@
         clippy::arithmetic_side_effects
     )
 )]
+
+pub mod coco;
 
 use std::fs;
 use std::io::{Read, Write};
