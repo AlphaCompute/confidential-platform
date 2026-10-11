@@ -79,7 +79,8 @@ All optional, so documents already signed still parse and keep their meaning:
   "verifiers": ["nras"],
   "nras_url": "https://nras.attestation.nvidia.com",
   "hwmodels": {"<NRAS hwmodel string for B300>": "B300"},
-  "nras_keys": {"<kid>": {"kty": "EC", "crv": "P-384", "x": "<base64url>", "y": "<base64url>"}}
+  "nras_keys": {"<kid>": {"kty": "EC", "crv": "P-384", "x": "<base64url>", "y": "<base64url>"}},
+  "nras_cc_mode": {"pointer": "<per-GPU claim confirmed at G0>", "equals": "<its CC-on value>"}
 }
 ```
 
@@ -87,9 +88,22 @@ The document, its `policy`, its reference values and `gpu_policy` refuse fields 
 
 ## GPU backends
 
-- `nras` (`alpha_attest::gpu::nras`): posts every GPU's report and certificate chain with the nonce, verifies the overall EAT and each per-GPU EAT (ES384 under the key `gpu_policy.nras_keys` pins for the token's `kid`, issuer = `nras_url`, unexpired), ties each per-GPU token to the overall token's `submods` digest, and requires the overall result, the nonce, `measres: success`, the report signature, nonce match, RIM signatures, secure boot, debug disabled and CC mode. The claim names are confirmed against a B300 reply at M-B; any missing claim refuses.
+- `nras` (`alpha_attest::gpu::nras`): posts every GPU's report and certificate chain with the nonce, verifies the overall EAT and each per-GPU EAT (ES384 under the key `gpu_policy.nras_keys` pins for the token's `kid`, issuer = `nras_url`, unexpired), ties each per-GPU token to the overall token's `submods` digest, and requires the overall result and the nonce. For every GPU it requires, by name (NVIDIA's GPU claims version 3.0, listed in `nras::claims::REQUIRED`): `measres: success`, secure boot, debug disabled, the architecture check, the report parsed, its signature verified, its nonce matching and its FWID matching the certificate chain; for the attestation report's, the driver RIM's and the VBIOS RIM's certificate chains, `x-nvidia-cert-status: valid` and `x-nvidia-cert-ocsp-status: good` (and the OCSP nonce and response checks true when sent), so a revoked GPU or RIM certificate is refused by this backend whatever NRAS's overall result says; the driver and VBIOS RIM signatures and version matches; the `ueid`, `hwmodel`, driver and VBIOS versions; and the CC-mode claim that `gpu_policy.nras_cc_mode` names. Any missing claim refuses.
 - `fortanix-ccm` (`alpha_attest::gpu::ccm`): configured like any backend and refuses every GPU until Fortanix answers F8 with an API.
 - `local`: after Dec 1.
+
+## G0 check: NRAS claim names on a B300
+
+NVIDIA publishes no claim named for CC mode (GPU claims 3.0; 4.0 adds `x-nvidia-attester-claims` with opaque values a RIM marks), so the claim that proves CC mode is not compiled in. `gpu_policy.nras_cc_mode` names it as a JSON pointer into the per-GPU claims and the value it must hold, for example `{"pointer": "/x-nvidia-attester-claims/<name>", "equals": 1}`. Until a release-signed document sets it, the `nras` backend refuses every GPU (fail closed), before it calls NRAS.
+
+At G0, on the first B300 in CC mode:
+
+1. Collect the GPU evidence in a Kata pod and post it to NRAS (`/v3/attest/gpu`) with any nonce; save the raw reply.
+2. Write the candidate `gpu_policy` (JSON) with the B300's `hwmodel` string in `hwmodels` and the chosen `nras_cc_mode`.
+3. Run `ALPHA_NRAS_REPLY=reply.json ALPHA_GPU_POLICY=gpu_policy.json cargo test -p alpha-attest --lib -- --ignored g0_nras_reply_has_every_claim_this_backend_requires --nocapture`. It prints every token's claims and fails with one line per required claim the reply lacks or that does not hold (`nras::claim_report`); without `ALPHA_GPU_POLICY` it also lists the `hwmodel` and CC-mode entries still to be chosen.
+4. Repeat with a GPU whose CC mode is off and check that the chosen claim then does not hold. Record the choice in the security review (deliverable 8) before it is signed into the platform document.
+
+If a required claim name differs on the B300, `nras::claims::REQUIRED` is the one place to change.
 
 ## What the KMS cannot see
 
