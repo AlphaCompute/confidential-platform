@@ -60,12 +60,14 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
-      # The probe is built only when the crates change; a failed probe must not lose the build.
+      # The probe is built only when what the build reads changes: the crates and the release key
+      # they compile in from services/alpha-kms (crates/alpha-channel/src/platform.rs), which the
+      # ceremony replaces. A failed probe must not lose the build.
       - id: alpha
         uses: actions/cache/restore@v4
         with:
           path: stand-bin
-          key: stand-alpha-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', 'crates/**') }}
+          key: stand-alpha-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', 'crates/**', 'services/alpha-kms/release-key.pub') }}
       - if: steps.alpha.outputs.cache-hit != 'true'
         run: |
           cargo build --release --locked -p alpha-cli
