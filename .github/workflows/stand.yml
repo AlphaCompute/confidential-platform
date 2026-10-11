@@ -1,8 +1,17 @@
 name: stand
 
-# The control plane lists a copy as running whatever its containers do, so a service that has
-# stopped is seen only by asking. This asks every fifteen minutes and fails when a copy of one
-# of the stand's Apps is not serving, which is what makes GitHub send a notification.
+# Production runs on owned hardware: Kata TDX pods on the Rafay MKS clusters, the KMS on the
+# verifier pool, collateral from our own PCCS. Every fifteen minutes this asks each of them
+# whether it is serving, and fails when one is not, which is what makes GitHub send a
+# notification. The variables name the owned endpoints; nothing here reaches the prototype.
+#
+#   STAND_SHROUD_URL        shroud-go on the owned platform
+#   STAND_APPS              the Apps whose copies must all be serving
+#   STAND_KMS_ENDPOINTS     the KMS nodes, space-separated https:// URLs (both failure domains)
+#   STAND_KMS_CA_PEM        the KMS CA: a node is up only if it answers under it, unsealed
+#   STAND_PCCS_URL          the site PCCS, https://pccs.<site>:8081
+#   STAND_SITE_CA_PEM       the site CA the PCCS certificate chains to
+#   secret STAND_LIST_KEY   API key that may list the Apps' copies
 on:
   schedule:
     - cron: "*/15 * * * *"
@@ -18,7 +27,24 @@ jobs:
           SHROUD_URL: ${{ vars.STAND_SHROUD_URL }}
           APPS: ${{ vars.STAND_APPS }}
           KEY: ${{ secrets.STAND_LIST_KEY }}
+          KMS_ENDPOINTS: ${{ vars.STAND_KMS_ENDPOINTS }}
+          KMS_CA_PEM: ${{ vars.STAND_KMS_CA_PEM }}
+          PCCS_URL: ${{ vars.STAND_PCCS_URL }}
+          SITE_CA_PEM: ${{ vars.STAND_SITE_CA_PEM }}
         run: |
+          set -u
+          [ -n "$APPS" ] || { echo "::error::STAND_APPS names no App"; exit 1; }
+          [ -n "$KMS_ENDPOINTS" ] || { echo "::error::STAND_KMS_ENDPOINTS names no KMS node"; exit 1; }
+          printf '%s\n' "$KMS_CA_PEM" > "$RUNNER_TEMP/kms-ca.pem"
+          printf '%s\n' "$SITE_CA_PEM" > "$RUNNER_TEMP/site-ca.pem"
+
+          # The KMS speaks TLS 1.3 with X25519MLKEM768 only, which the runner's OpenSSL 3.0 does
+          # not; this curl is built on OpenSSL 3.5. Pin it by digest once the first run prints it.
+          pqcurl() {
+            docker run --rm --network host -v "$RUNNER_TEMP:/w:ro" curlimages/curl:8.16.0 \
+              --curves X25519MLKEM768 --tlsv1.3 --cacert /w/kms-ca.pem -sS -f -m 30 "$@"
+          }
+
           # $1 prefixes each finding: only the last attempt's are errors.
           check() {
             down=0
@@ -32,9 +58,23 @@ jobs:
                 down=1
               fi
             done
+            # /ready checks the node's database; a sealed node answers but serves nothing.
+            for kms in $KMS_ENDPOINTS; do
+              if ! ready=$(pqcurl "$kms/ready"); then
+                echo "$1$kms: the KMS did not answer under its CA"
+                down=1
+              elif ! echo "$ready" | jq -e '.sealed == false' >/dev/null; then
+                echo "$1$kms: $ready"
+                down=1
+              fi
+            done
+            # A quote whose collateral cannot be fetched fails appraisal: the PCCS is on the path
+            # of every attestation.
+            if ! curl -sS -f -m 30 --cacert "$RUNNER_TEMP/site-ca.pem" -o /dev/null "$PCCS_URL/sgx/certification/v4/rootcacrl"; then
+              echo "$1$PCCS_URL: the PCCS did not serve the root CA CRL"
+              down=1
+            fi
             return $down
           }
-          set -- $APPS
-          [ $# -gt 0 ] || { echo "::error::STAND_APPS names no App"; exit 1; }
           # A copy does not serve for a minute while it is being redeployed.
           check "" || { sleep 120; check "::error::"; }
