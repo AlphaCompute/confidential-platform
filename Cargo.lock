@@ -52,6 +52,8 @@ dependencies = [
  "chrono",
  "dcap-qvl",
  "hex",
+ "p384",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -296,7 +298,7 @@ dependencies = [
  "ed25519-dalek 3.0.0",
  "getrandom 0.4.3",
  "hex",
- "hkdf",
+ "hkdf 0.13.0",
  "hmac 0.13.0",
  "p256 0.14.0",
  "parking_lot",
@@ -1340,6 +1342,7 @@ dependencies = [
  "elliptic-curve 0.13.8",
  "rfc6979 0.4.0",
  "signature 2.2.0",
+ "spki 0.7.3",
 ]
 
 [[package]]
@@ -1424,6 +1427,9 @@ dependencies = [
  "ff 0.13.1",
  "generic-array 0.14.9",
  "group 0.13.0",
+ "hkdf 0.12.4",
+ "pem-rfc7468 0.7.0",
+ "pkcs8 0.10.2",
  "rand_core 0.6.4",
  "sec1 0.7.3",
  "subtle",
@@ -1939,6 +1945,15 @@ dependencies = [
 
 [[package]]
 name = "hkdf"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
+dependencies = [
+ "hmac 0.12.1",
+]
+
+[[package]]
+name = "hkdf"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
@@ -1974,7 +1989,7 @@ dependencies = [
  "aes-gcm",
  "chacha20poly1305",
  "getrandom 0.4.3",
- "hkdf",
+ "hkdf 0.13.0",
  "hybrid-array",
  "ml-kem",
  "rand_core 0.10.1",
@@ -3478,6 +3493,7 @@ dependencies = [
  "base16ct 0.2.0",
  "der 0.7.10",
  "generic-array 0.14.9",
+ "pkcs8 0.10.2",
  "subtle",
  "zeroize",
 ]
@@ -3957,7 +3973,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "hex",
- "hkdf",
+ "hkdf 0.13.0",
  "hmac 0.13.0",
  "itoa",
  "log",
