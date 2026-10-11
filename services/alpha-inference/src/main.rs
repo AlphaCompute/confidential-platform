@@ -5,6 +5,7 @@
 //! it read before. All logic lives in `run`, which maps every error to a non-zero exit and never
 //! panics.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use alpha_client::runtime::RuntimeIdentity;
@@ -39,18 +40,17 @@ async fn read_text(runtime: &RuntimeSocket, name: &str) -> Result<Zeroizing<Stri
 }
 
 /// Reads only the Secrets this Revision uses: the external provider's key when some model is
-/// not ours, the model-server bearer when some model is.
+/// not ours, and each of our model servers' own bearer, under the name its entry gives.
 async fn read_secrets(runtime: &RuntimeSocket, config: &Config) -> Result<Secrets, Error> {
     let provider_key = if config.external_models().is_empty() {
         Zeroizing::new(String::new())
     } else {
         read_text(runtime, "redpill-api-key").await?
     };
-    let model_server_bearer = if config.model_servers.is_empty() {
-        Zeroizing::new(String::new())
-    } else {
-        read_text(runtime, "model-server-bearer").await?
-    };
+    let mut model_server_bearers = BTreeMap::new();
+    for (model, server) in &config.model_servers {
+        model_server_bearers.insert(model.clone(), read_text(runtime, &server.bearer).await?);
+    }
     let caller_bearer = runtime
         .secret("caller-bearer")
         .await
@@ -68,7 +68,7 @@ async fn read_secrets(runtime: &RuntimeSocket, config: &Config) -> Result<Secret
     Ok(Secrets {
         provider_key,
         caller_bearer: Zeroizing::new(caller_bearer.to_vec()),
-        model_server_bearer,
+        model_server_bearers,
         judge_bearer: Zeroizing::new(judge_bearer.to_vec()),
     })
 }
@@ -95,7 +95,8 @@ async fn run() -> Result<(), Error> {
     // `alpha-runtime` already checked against the measured KMS CA.
     let kms_ca =
         alpha_client::tls::kms_ca(&identity).map_err(|e| Error::internal(format!("tls: {e}")))?;
-    let own = own::Servers::new(&config.model_servers, &kms_ca)?;
+    // Our leaf is the client certificate: a model server admits only the front's App.
+    let own = own::Servers::new(&config.model_servers, &kms_ca, Some(&identity))?;
     let guard = guard::Guard::new(&config.guard, kms_ca, &identity)?;
 
     let secrets = read_secrets(&runtime, &config).await?;
@@ -134,8 +135,10 @@ async fn refresh(
     state: &AppState,
     identity: RuntimeIdentity,
 ) -> Result<(), Error> {
-    // The judge reads this Instance's App from its leaf: present the renewed one.
+    // The judge and our model servers read this Instance's App from its leaf: present the
+    // renewed one.
     state.guard.renew(&identity)?;
+    state.own.renew(&identity)?;
     *state.secrets.write() = read_secrets(runtime, &state.config).await?;
     Ok(())
 }

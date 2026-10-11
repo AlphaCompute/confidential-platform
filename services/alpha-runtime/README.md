@@ -72,7 +72,13 @@ A compose wrapped by `alpha compose wrap` publishes the CVM's 443 on `alpha-runt
 8443, and the published service keeps only its plain port on the compose network. With
 `ALPHACOMPUTE_TLS_UPSTREAM` set, the runtime listens on 8443 once the first attestation
 succeeded (a bind failure exits 1) and terminates TLS there: TLS 1.3 with `X25519MLKEM768` only,
-no client certificate, and the chain of the current attestation, [leaf, KMS CA]. Each accepted
+no client certificate, and the chain of the current attestation, [leaf, KMS CA]. With
+`ALPHACOMPUTE_TLS_CALLER_APPS` set (measured, comma-separated App ids, only with an upstream), a
+client certificate is required instead: an Instance leaf of one of those Apps, whatever its
+Revision, chained to the KMS CA the runtime's own current chain ends at. Any other client, or
+any client while the runtime holds no valid leaf, fails the handshake before a byte reaches the
+upstream. A model server pins the inference front this way, since the front's Revision names
+the server's own. Each accepted
 connection then opens a TCP connection to the upstream and copies bytes both ways until either
 side closes, so HTTP/1.1, keep-alive, WebSocket upgrades, HTTP/2 by prior knowledge and any other
 byte stream pass unchanged. No ALPN protocol is advertised: a browser speaks HTTP/1.1, and a

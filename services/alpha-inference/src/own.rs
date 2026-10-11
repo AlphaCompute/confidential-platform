@@ -5,7 +5,9 @@
 //! handshake itself is the verdict. Every connection is pinned inside the handshake to this
 //! Instance's own KMS CA and to one of the model's measured Revisions — the same pin the
 //! supervisor and the judge use for their peers — and a leaf of any other CA or Revision never
-//! sees a request byte.
+//! sees a request byte. This Instance's own leaf is the client certificate: a model server admits
+//! only an Instance of the front's App (`ALPHACOMPUTE_TLS_CALLER_APPS` in its runtime), so nobody
+//! else reaches any of vLLM's routes. Each server has its own bearer, a Secret named per server.
 //!
 //! Before a model is used, and at most once a minute, `/v1/models` is read over the pinned
 //! connection: the server must list the model, and the Revision the leaf carried is logged, so an
@@ -16,6 +18,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
+use alpha_client::runtime::RuntimeIdentity;
 use alpha_client::tls::Pin;
 use alpha_core::ComposeHash;
 use rustls::pki_types::CertificateDer;
@@ -38,11 +41,15 @@ pub struct ModelServer {
     pub url: String,
     /// The model server's Revisions this front will talk to, while it changes Revision.
     pub revisions: Vec<ComposeHash>,
+    /// The name of this front's Secret holding the bearer this server alone expects, so one
+    /// server's bearer opens no other.
+    pub bearer: String,
 }
 
-/// Parses `MODEL_SERVERS`: a JSON object of model id to `{url, revisions}`. Every url must be an
-/// https origin and every Revision list non-empty — an empty list would match nothing, and is
-/// refused here so the mistake shows at start rather than as a model that never verifies.
+/// Parses `MODEL_SERVERS`: a JSON object of model id to `{url, revisions, bearer}`. Every url
+/// must be an https origin, every Revision list non-empty — an empty list would match nothing,
+/// and is refused here so the mistake shows at start rather than as a model that never verifies —
+/// and every bearer a Secret name.
 pub fn parse_servers(raw: &str) -> Result<BTreeMap<String, ModelServer>, Error> {
     let servers: BTreeMap<String, ModelServer> =
         serde_json::from_str(raw).map_err(|e| Error::internal(format!("MODEL_SERVERS: {e}")))?;
@@ -69,6 +76,11 @@ pub fn parse_servers(raw: &str) -> Result<BTreeMap<String, ModelServer>, Error> 
                 "MODEL_SERVERS[{model}].revisions names no Revision"
             )));
         }
+        if !alpha_core::is_key_purpose(&server.bearer) {
+            return Err(Error::internal(format!(
+                "MODEL_SERVERS[{model}].bearer is not a lowercase Secret name"
+            )));
+        }
     }
     Ok(servers
         .into_iter()
@@ -83,7 +95,8 @@ pub fn parse_servers(raw: &str) -> Result<BTreeMap<String, ModelServer>, Error> 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reason {
     /// No handshake completed against a leaf of the KMS CA carrying a listed Revision: still
-    /// booting, still attesting, a Revision not in the list, or not ours.
+    /// booting, still attesting, a Revision not in the list, not ours, or a server that does not
+    /// admit this front's App.
     Handshake,
     /// The handshake passed but `/v1/models` did not answer 2xx.
     Status,
@@ -108,24 +121,28 @@ struct Checked {
 
 struct Server {
     origin: String,
-    client: reqwest::Client,
+    revisions: Vec<ComposeHash>,
+    /// Rebuilt with every renewed leaf of this Instance.
+    client: parking_lot::RwLock<reqwest::Client>,
     /// The single flight for this model's check, as in `upstream`.
     slot: Mutex<Option<Checked>>,
 }
 
-/// The pinned clients for our own model servers, one per model, built once at start.
+/// The pinned clients for our own model servers, one per model.
 pub struct Servers {
     servers: BTreeMap<String, Server>,
+    kms_ca: Option<CertificateDer<'static>>,
     now: Clock,
 }
 
 fn pinned_client(
     kms_ca: CertificateDer<'static>,
     revisions: Vec<ComposeHash>,
+    identity: Option<&RuntimeIdentity>,
 ) -> Result<reqwest::Client, Error> {
     let tls = alpha_client::tls::client_config(
         Some(Pin::CaAndInstanceRevisions(kms_ca, revisions)),
-        None,
+        identity.map(crate::guard::client_identity).transpose()?,
         alpha_client::system_time_provider(),
     )
     .map_err(|e| Error::internal(format!("model server tls: {e}")))?;
@@ -168,37 +185,64 @@ impl Servers {
     pub fn none() -> Self {
         Self {
             servers: BTreeMap::new(),
+            kms_ca: None,
             now: std::sync::Arc::new(SystemTime::now),
         }
     }
 
+    /// `identity` is this Instance's: its leaf is the client certificate a caller-pinning model
+    /// server admits. Without one (tests), such a server refuses the handshake.
     pub fn new(
         servers: &BTreeMap<String, ModelServer>,
         kms_ca: &CertificateDer<'static>,
+        identity: Option<&RuntimeIdentity>,
     ) -> Result<Self, Error> {
-        Self::build(servers, kms_ca, std::sync::Arc::new(SystemTime::now))
+        Self::build(
+            servers,
+            kms_ca,
+            identity,
+            std::sync::Arc::new(SystemTime::now),
+        )
     }
 
     pub fn build(
         servers: &BTreeMap<String, ModelServer>,
         kms_ca: &CertificateDer<'static>,
+        identity: Option<&RuntimeIdentity>,
         now: Clock,
     ) -> Result<Self, Error> {
         let servers = servers
             .iter()
             .map(|(model, server)| {
-                let client = pinned_client(kms_ca.clone(), server.revisions.clone())?;
+                let client = pinned_client(kms_ca.clone(), server.revisions.clone(), identity)?;
                 Ok((
                     model.clone(),
                     Server {
                         origin: server.url.clone(),
-                        client,
+                        revisions: server.revisions.clone(),
+                        client: parking_lot::RwLock::new(client),
                         slot: Mutex::new(None),
                     },
                 ))
             })
             .collect::<Result<_, Error>>()?;
-        Ok(Self { servers, now })
+        Ok(Self {
+            servers,
+            kms_ca: Some(kms_ca.clone()),
+            now,
+        })
+    }
+
+    /// Presents the renewed leaf from the next connection on.
+    pub fn renew(&self, identity: &RuntimeIdentity) -> Result<(), Error> {
+        let Some(kms_ca) = &self.kms_ca else {
+            return Ok(());
+        };
+        for server in self.servers.values() {
+            *server.client.write() =
+                pinned_client(kms_ca.clone(), server.revisions.clone(), Some(identity))?;
+        }
+        Ok(())
     }
 
     pub fn serves(&self, model: &str) -> bool {
@@ -230,8 +274,8 @@ impl Servers {
     }
 
     async fn check(server: &Server, model: &str, bearer: &str) -> Result<(), Reason> {
-        let response = server
-            .client
+        let client = server.client.read().clone();
+        let response = client
             .get(format!("{}/v1/models", server.origin))
             .bearer_auth(bearer)
             .timeout(CHECK_TIMEOUT)
@@ -275,8 +319,8 @@ impl Servers {
             .servers
             .get(model)
             .ok_or_else(|| Error::internal(format!("{model} has no model server")))?;
-        let response = server
-            .client
+        let client = server.client.read().clone();
+        let response = client
             .post(format!("{}/v1/chat/completions", server.origin))
             .bearer_auth(bearer)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -364,16 +408,21 @@ mod tests {
 
     /// An Instance-shaped leaf under `ca` carrying `rev`, as the KMS would issue it.
     fn leaf(ca_key: &KeyPair, ca_cert: &rcgen::Certificate, rev: &ComposeHash) -> RuntimeIdentity {
+        leaf_of(ca_key, ca_cert, AppId::mint(), rev)
+    }
+
+    /// As `leaf`, an Instance of `app`.
+    fn leaf_of(
+        ca_key: &KeyPair,
+        ca_cert: &rcgen::Certificate,
+        app: AppId,
+        rev: &ComposeHash,
+    ) -> RuntimeIdentity {
         let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         let issuer = Issuer::from_ca_cert_der(ca_cert.der(), ca_key).unwrap();
         let mut params = CertificateParams::default();
         params.subject_alt_names = [
-            format!(
-                "alphacompute://{}/{}/{}",
-                OrgId::mint(),
-                AppId::mint(),
-                "a".repeat(64)
-            ),
+            format!("alphacompute://{}/{app}/{}", OrgId::mint(), "a".repeat(64)),
             format!("urn:alphacompute:revision:{rev}"),
         ]
         .iter()
@@ -383,7 +432,7 @@ mod tests {
         params.not_after = (SystemTime::now() + Duration::from_secs(3600)).into();
         let cert = params.signed_by(&key, &issuer).unwrap();
         RuntimeIdentity {
-            app_id: AppId::mint(),
+            app_id: app,
             org_id: OrgId::mint(),
             compose_hash: *rev,
             certificate_chain: format!("{}\n{}", cert.pem(), ca_cert.pem()),
@@ -398,6 +447,16 @@ mod tests {
     async fn spawn_model_server(
         identity: RuntimeIdentity,
         models: &'static [&'static str],
+    ) -> (String, Arc<AtomicUsize>) {
+        spawn_model_server_for(identity, models, None).await
+    }
+
+    /// As `spawn_model_server`; with `callers`, its runtime admits only an Instance of one of
+    /// those Apps under its own KMS CA, as `ALPHACOMPUTE_TLS_CALLER_APPS` makes it.
+    async fn spawn_model_server_for(
+        identity: RuntimeIdentity,
+        models: &'static [&'static str],
+        callers: Option<Vec<AppId>>,
     ) -> (String, Arc<AtomicUsize>) {
         let hits = Arc::new(AtomicUsize::new(0));
         let counted = hits.clone();
@@ -425,7 +484,23 @@ mod tests {
                 }),
             );
         let cert = Arc::new(InstanceCert::new(&identity).unwrap());
-        let acceptor = TlsAcceptor::from(server_config(cert).unwrap());
+        let config = match callers {
+            None => server_config(cert).unwrap(),
+            Some(apps) => {
+                let ca = alpha_client::tls::kms_ca(&identity).unwrap();
+                Arc::new(
+                    rustls::ServerConfig::builder_with_provider(alpha_client::tls::provider())
+                        .with_protocol_versions(&[&rustls::version::TLS13])
+                        .unwrap()
+                        .with_client_cert_verifier(alpha_client::tls::instance_app_client_verifier(
+                            Arc::new(move || Some(ca.clone())),
+                            apps,
+                        ))
+                        .with_cert_resolver(cert),
+                )
+            }
+        };
+        let acceptor = TlsAcceptor::from(config);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -452,37 +527,58 @@ mod tests {
     }
 
     fn servers_for(url: &str, ca: &rcgen::Certificate, revs: Vec<ComposeHash>) -> Servers {
+        servers_presenting(url, ca, revs, None)
+    }
+
+    /// As `servers_for`, presenting `front`'s leaf as the client certificate.
+    fn servers_presenting(
+        url: &str,
+        ca: &rcgen::Certificate,
+        revs: Vec<ComposeHash>,
+        front: Option<&RuntimeIdentity>,
+    ) -> Servers {
         let mut map = BTreeMap::new();
         map.insert(
             "m1".to_owned(),
             ModelServer {
                 url: url.to_owned(),
                 revisions: revs,
+                bearer: "model-server-bearer-m1".to_owned(),
             },
         );
-        Servers::new(&map, &CertificateDer::from(ca.der().to_vec())).unwrap()
+        Servers::new(&map, &CertificateDer::from(ca.der().to_vec()), front).unwrap()
     }
 
     #[test]
-    fn parse_servers_refuses_a_path_an_http_url_and_an_empty_revision_list() {
+    fn parse_servers_refuses_a_path_an_http_url_an_empty_revision_list_and_a_bad_bearer() {
         let ok = format!(
-            r#"{{"m1":{{"url":"https://ms.example:8443/","revisions":["{}"]}}}}"#,
+            r#"{{"m1":{{"url":"https://ms.example:8443/","revisions":["{}"],"bearer":"model-server-bearer-m1"}}}}"#,
             revision('1')
         );
         let parsed = parse_servers(&ok).unwrap();
         assert_eq!(parsed["m1"].url, "https://ms.example:8443");
+        assert_eq!(parsed["m1"].bearer, "model-server-bearer-m1");
         for bad in [
             format!(
-                r#"{{"m1":{{"url":"https://ms.example/v1","revisions":["{}"]}}}}"#,
+                r#"{{"m1":{{"url":"https://ms.example/v1","revisions":["{}"],"bearer":"b"}}}}"#,
                 revision('1')
             ),
             format!(
-                r#"{{"m1":{{"url":"http://ms.example","revisions":["{}"]}}}}"#,
+                r#"{{"m1":{{"url":"http://ms.example","revisions":["{}"],"bearer":"b"}}}}"#,
                 revision('1')
             ),
-            r#"{"m1":{"url":"https://ms.example","revisions":[]}}"#.to_owned(),
-            r#"{"m1":{"url":"https://ms.example","revisions":["nope"]}}"#.to_owned(),
-            r#"{"m1":{"url":"https://ms.example","revisions":[],"extra":1}}"#.to_owned(),
+            format!(
+                r#"{{"m1":{{"url":"https://ms.example","revisions":["{}"]}}}}"#,
+                revision('1')
+            ),
+            format!(
+                r#"{{"m1":{{"url":"https://ms.example","revisions":["{}"],"bearer":"../b"}}}}"#,
+                revision('1')
+            ),
+            r#"{"m1":{"url":"https://ms.example","revisions":[],"bearer":"b"}}"#.to_owned(),
+            r#"{"m1":{"url":"https://ms.example","revisions":["nope"],"bearer":"b"}}"#.to_owned(),
+            r#"{"m1":{"url":"https://ms.example","revisions":[],"bearer":"b","extra":1}}"#
+                .to_owned(),
         ] {
             let err = parse_servers(&bad).unwrap_err();
             assert!(err.to_string().contains("MODEL_SERVERS"), "{bad}: {err}");
@@ -563,5 +659,49 @@ mod tests {
         servers.forget("m1").await;
         servers.verified("m1", "b").await.unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    /// A model server whose runtime pins its callers to the front's App: the front's leaf gets
+    /// through, a leaf of another App or no leaf never reaches a single route, and a renewed
+    /// leaf of the front is presented from the next connection on.
+    #[tokio::test]
+    async fn a_caller_pinning_model_server_serves_only_the_fronts_app() {
+        let (ca_key, ca_cert) = new_ca();
+        let rev = revision('1');
+        let front = AppId::mint();
+        let (url, hits) =
+            spawn_model_server_for(leaf(&ca_key, &ca_cert, &rev), &["m1"], Some(vec![front])).await;
+        let front_leaf = leaf_of(&ca_key, &ca_cert, front, &revision('f'));
+
+        let ours = servers_presenting(&url, &ca_cert, vec![rev], Some(&front_leaf));
+        assert_eq!(ours.verified("m1", "b").await, Ok(()));
+        assert!(
+            ours.complete("m1", "b", axum::body::Bytes::from_static(b"{}"))
+                .await
+                .unwrap()
+                .status()
+                .is_success()
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        let stranger = leaf_of(&ca_key, &ca_cert, AppId::mint(), &revision('f'));
+        for presenting in [Some(&stranger), None] {
+            let other = servers_presenting(&url, &ca_cert, vec![rev], presenting);
+            assert_eq!(other.verified("m1", "b").await, Err(Reason::Handshake));
+            assert!(
+                other
+                    .complete("m1", "b", axum::body::Bytes::from_static(b"{}"))
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        // Renewal swaps the client certificate: a stranger's servers renewed to the front's leaf
+        // get through.
+        let renewed = servers_presenting(&url, &ca_cert, vec![rev], Some(&stranger));
+        renewed.renew(&front_leaf).unwrap();
+        assert_eq!(renewed.verified("m1", "b").await, Ok(()));
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
     }
 }

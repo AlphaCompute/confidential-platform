@@ -161,8 +161,9 @@ impl Config {
 pub struct Secrets {
     pub provider_key: Zeroizing<String>,
     pub caller_bearer: Zeroizing<Vec<u8>>,
-    /// The bearer our own model servers expect; sent only over their pinned connections.
-    pub model_server_bearer: Zeroizing<String>,
+    /// Model id to the bearer that model's server alone expects, read from the Secret its
+    /// `MODEL_SERVERS` entry names; sent only over that server's pinned connection.
+    pub model_server_bearers: BTreeMap<String, Zeroizing<String>>,
     /// `alpha-guard`'s own bearer: its calls are not judged again, and may name only a model in
     /// `JUDGE_MODELS`. Never equal to `caller_bearer`, and never matched when empty.
     pub judge_bearer: Zeroizing<Vec<u8>>,
@@ -173,7 +174,7 @@ impl std::fmt::Debug for Secrets {
         f.debug_struct("Secrets")
             .field("provider_key", &"<redacted>")
             .field("caller_bearer", &"<redacted>")
-            .field("model_server_bearer", &"<redacted>")
+            .field("model_server_bearers", &"<redacted>")
             .field("judge_bearer", &"<redacted>")
             .finish()
     }
@@ -343,10 +344,21 @@ enum Route {
     External(reqwest::Client),
 }
 
+/// The bearer `model`'s own server expects.
+fn model_server_bearer(state: &AppState, model: &str) -> Result<Zeroizing<String>, Error> {
+    state
+        .secrets
+        .read()
+        .model_server_bearers
+        .get(model)
+        .cloned()
+        .ok_or_else(|| Error::internal(format!("{model} has no model-server bearer")))
+}
+
 /// The model's upstream, checked within the last minute; `model` must already be allowlisted.
 async fn verified_route(state: &AppState, model: &str) -> Result<Route, Error> {
     if state.own.serves(model) {
-        let bearer = state.secrets.read().model_server_bearer.clone();
+        let bearer = model_server_bearer(state, model)?;
         state
             .own
             .verified(model, bearer.as_str())
@@ -511,7 +523,7 @@ async fn hold(
 async fn send(state: &AppState, model: &str, body: Bytes) -> Result<reqwest::Response, Error> {
     match verified_route(state, model).await? {
         Route::Own => {
-            let bearer = state.secrets.read().model_server_bearer.clone();
+            let bearer = model_server_bearer(state, model)?;
             match state.own.complete(model, bearer.as_str(), body).await {
                 Ok(response) => Ok(response),
                 Err(e) => {
@@ -647,7 +659,7 @@ mod tests {
             .iter()
             .map(|m| {
                 format!(
-                    r#""{m}":{{"url":"https://ms.example:8443","revisions":["sha256:{}"]}}"#,
+                    r#""{m}":{{"url":"https://ms.example:8443","revisions":["sha256:{}"],"bearer":"b"}}"#,
                     "1".repeat(64)
                 )
             })
@@ -710,6 +722,7 @@ mod tests {
                 // Nothing listens here: the pinned handshake can never complete.
                 url: "https://127.0.0.1:1".to_string(),
                 revisions: vec![alpha_core::compose_hash("model-server")],
+                bearer: "model-server-bearer-ours".to_string(),
             },
         );
         let ca = rcgen::CertificateParams::default()
@@ -718,6 +731,7 @@ mod tests {
         let servers = own::Servers::new(
             &config.model_servers,
             &rustls::pki_types::CertificateDer::from(ca.der().to_vec()),
+            None,
         )
         .unwrap();
         let state = test_state(config, b"right-bearer", "provider-key");
@@ -726,7 +740,10 @@ mod tests {
             secrets: parking_lot::RwLock::new(Secrets {
                 provider_key: Zeroizing::new("provider-key".into()),
                 caller_bearer: Zeroizing::new(b"right-bearer".to_vec()),
-                model_server_bearer: Zeroizing::new("ms-bearer".into()),
+                model_server_bearers: BTreeMap::from([(
+                    "ours".to_string(),
+                    Zeroizing::new("ms-bearer".to_string()),
+                )]),
                 judge_bearer: Zeroizing::new(b"judge-bearer".to_vec()),
             }),
             upstream: Upstream::new(&state.config).unwrap(),
@@ -763,7 +780,7 @@ mod tests {
             secrets: parking_lot::RwLock::new(Secrets {
                 provider_key: Zeroizing::new("provider-key".into()),
                 caller_bearer: Zeroizing::new(b"member-bearer".to_vec()),
-                model_server_bearer: Zeroizing::new(String::new()),
+                model_server_bearers: BTreeMap::new(),
                 judge_bearer: Zeroizing::new(b"judge-bearer".to_vec()),
             }),
             own: own::Servers::none(),
