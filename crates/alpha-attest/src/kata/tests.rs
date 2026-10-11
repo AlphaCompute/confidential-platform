@@ -181,6 +181,7 @@ fn doc() -> PlatformDocument {
             min_vbios_version: None,
             verifiers: vec![GpuVerifierKind::Nras],
             nras_url: None,
+            hwmodels: Default::default(),
         }),
     }
 }
