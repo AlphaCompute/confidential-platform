@@ -155,22 +155,49 @@ fn check_report_data(quote: &[u8], expected: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
+/// A fresh configfs-tsm entry name. Random, not the PID (1 for most container entrypoints), so
+/// two containers of one pod VM never share an entry.
+fn tsm_entry_name() -> Result<String, Error> {
+    let mut id = [0u8; 8];
+    getrandom::fill(&mut id).map_err(|e| Error::Agent(format!("configfs-tsm entry name: {e}")))?;
+    Ok(format!("alpha-{}", hex::encode(id)))
+}
+
+/// One quote from an entry of our own, created for this report and removed after it; an entry
+/// that already exists is never reused.
 fn tsm_quote(dir: &Path, report_data: &[u8; 64]) -> Result<Vec<u8>, Error> {
-    let io = |what: String| move |e| Error::Io(what.clone(), e);
-    let entry = dir.join(format!("alpha-{}", std::process::id()));
-    match fs::create_dir(&entry) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(io(entry.display().to_string())(e)),
-    }
-    let result = (|| {
-        fs::write(entry.join("inblob"), report_data).map_err(io("inblob".into()))?;
-        let quote = fs::read(entry.join("outblob")).map_err(io("outblob".into()))?;
-        check_report_data(&quote, report_data)?;
-        Ok(quote)
-    })();
+    let entry = dir.join(tsm_entry_name()?);
+    fs::create_dir(&entry).map_err(|e| Error::Io(entry.display().to_string(), e))?;
+    let result = tsm_report(&entry, report_data);
     let _ = fs::remove_dir(&entry);
     result
+}
+
+/// Writes `inblob` and reads `outblob` in an existing entry. The kernel's `generation` counts
+/// writes to the entry: if it moved between our write and our read, someone else wrote to the
+/// entry and the quote may answer their data, so it is refused.
+fn tsm_report(entry: &Path, report_data: &[u8; 64]) -> Result<Vec<u8>, Error> {
+    let io = |what: &str| {
+        let what = format!("{}/{what}", entry.display());
+        move |e| Error::Io(what, e)
+    };
+    let generation = || -> Result<u64, Error> {
+        fs::read_to_string(entry.join("generation"))
+            .map_err(io("generation"))?
+            .trim()
+            .parse()
+            .map_err(|_| Error::Agent("configfs-tsm generation is not a number".into()))
+    };
+    fs::write(entry.join("inblob"), report_data).map_err(io("inblob"))?;
+    let written = generation()?;
+    let quote = fs::read(entry.join("outblob")).map_err(io("outblob"))?;
+    if generation()? != written {
+        return Err(Error::Agent(
+            "the configfs-tsm entry was written to while the quote was read".into(),
+        ));
+    }
+    check_report_data(&quote, report_data)?;
+    Ok(quote)
 }
 
 fn tcp_get(addr: &str, path: &str) -> Result<Vec<u8>, Error> {
@@ -426,18 +453,35 @@ mod tests {
 
     #[test]
     fn configfs_tsm_writes_inblob_and_reads_outblob() {
-        // A directory standing in for the TSM report tree: outblob already holds the quote.
-        let dir = std::env::temp_dir().join(format!("alpha-tsm-cfg-{}", std::process::id()));
-        let entry = dir.join(format!("alpha-{}", std::process::id()));
+        // A directory standing in for one TSM report entry: outblob already holds the quote.
+        let entry = std::env::temp_dir().join(format!("alpha-tsm-cfg-{}", std::process::id()));
         fs::create_dir_all(&entry).unwrap();
         let rd = [0x22u8; 64];
         fs::write(entry.join("outblob"), quote_with(&rd)).unwrap();
-        // remove_dir fails on a non-empty dir in the stand-in, which tsm_quote ignores.
-        let quote = tsm_quote(&dir, &rd).unwrap();
+        fs::write(entry.join("generation"), "7\n").unwrap();
+        let quote = tsm_report(&entry, &rd).unwrap();
         assert_eq!(fs::read(entry.join("inblob")).unwrap(), rd);
         assert_eq!(quote, quote_with(&rd));
         fs::write(entry.join("outblob"), quote_with(&[0; 64])).unwrap();
-        assert!(tsm_quote(&dir, &rd).is_err());
+        assert!(tsm_report(&entry, &rd).is_err());
+        fs::remove_file(entry.join("generation")).unwrap();
+        assert!(tsm_report(&entry, &rd).is_err());
+        let _ = fs::remove_dir_all(&entry);
+    }
+
+    #[test]
+    fn configfs_tsm_entries_are_fresh_and_random() {
+        let (a, b) = (tsm_entry_name().unwrap(), tsm_entry_name().unwrap());
+        assert_ne!(a, b);
+        assert!(
+            a.starts_with("alpha-") && a.len() == "alpha-".len() + 16,
+            "{a}"
+        );
+        // An entry that already exists is not reused: a fresh one is made in the report tree.
+        let dir = std::env::temp_dir().join(format!("alpha-tsm-tree-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        // The stand-in tree has no kernel behind it, so the report itself fails.
+        assert!(tsm_quote(&dir, &[0; 64]).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 
