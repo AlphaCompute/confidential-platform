@@ -2,7 +2,7 @@
 //! the signature under the compiled-in release key and `issued_at` not in the future. Version
 //! monotonicity is the caller's, against whatever it remembers.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use alpha_attest::PlatformDocument;
 pub use alpha_channel::NamedSignature;
@@ -23,13 +23,37 @@ pub fn verify(
         .map_err(|e| Error::Invalid(format!("platform document: document: {e}")))
 }
 
+/// The whole fetch, from connecting to the end of the body: a server that accepts the connection
+/// and never answers must not hold the caller, such as the stand's `alpha probe`, past it.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Redirects followed: an artifact URL may redirect to its storage. The signature, not the
+/// server, makes the document the reference, so where it is fetched from is not trusted anyway.
+const FETCH_REDIRECTS: usize = 5;
+
 /// The URL is untrusted; the signature is what makes the document the reference.
 pub async fn fetch(
     url: &str,
     release_key: &VerifyingKey,
     now: SystemTime,
 ) -> Result<PlatformDocument, Error> {
-    let signed: SignedDocument = reqwest::get(url)
+    fetch_within(url, release_key, now, FETCH_TIMEOUT).await
+}
+
+async fn fetch_within(
+    url: &str,
+    release_key: &VerifyingKey,
+    now: SystemTime,
+    timeout: Duration,
+) -> Result<PlatformDocument, Error> {
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(FETCH_REDIRECTS))
+        .timeout(timeout)
+        .build()
+        .map_err(|e| Error::Invalid(format!("http client: {e}")))?;
+    let signed: SignedDocument = http
+        .get(url)
+        .send()
         .await
         .and_then(|r| r.error_for_status())
         .map_err(|e| {
@@ -40,13 +64,18 @@ pub async fn fetch(
         })?
         .json()
         .await
-        .map_err(|e| Error::Invalid(format!("platform document body: {e}")))?;
+        .map_err(|e| {
+            Error::Invalid(format!(
+                "platform document body: {}",
+                crate::error_chain(&e)
+            ))
+        })?;
     verify(&signed, release_key, now)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::io::{Read, Write};
 
     use base64::Engine;
     use base64::prelude::BASE64_URL_SAFE_NO_PAD;
@@ -54,6 +83,52 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// A server on 127.0.0.1 that accepts one connection, reads the request, writes `reply` and
+    /// then holds the connection open without another byte.
+    fn stalling_server(reply: &'static [u8]) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/platform.json", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            stream.write_all(reply).unwrap();
+            std::thread::sleep(Duration::from_secs(600));
+            drop(stream);
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn a_server_that_never_answers_fails_the_fetch_within_its_bound() {
+        let url = stalling_server(b"");
+        let key = SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let fetch = fetch_within(&url, &key, SystemTime::now(), Duration::from_millis(300));
+        let error = tokio::time::timeout(Duration::from_secs(10), fetch)
+            .await
+            .expect("the fetch outlived its bound")
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("platform document fetch"), "{text}");
+        assert!(text.contains("timed out"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_body_that_never_ends_fails_the_fetch_within_its_bound() {
+        let url = stalling_server(
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 1000\r\n\r\n{",
+        );
+        let key = SigningKey::from_bytes(&[5u8; 32]).verifying_key();
+        let fetch = fetch_within(&url, &key, SystemTime::now(), Duration::from_millis(300));
+        let error = tokio::time::timeout(Duration::from_secs(10), fetch)
+            .await
+            .expect("the fetch outlived its bound")
+            .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("platform document body"), "{text}");
+        assert!(text.contains("timed out"), "{text}");
+    }
 
     #[test]
     fn verify_parses_the_full_document_after_the_signature() {
