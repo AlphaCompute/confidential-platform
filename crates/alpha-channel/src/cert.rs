@@ -35,6 +35,51 @@ pub fn uri_sans(cert: &[u8]) -> Result<Vec<String>, Error> {
         .collect())
 }
 
+/// The DNS-name SANs, in certificate order. An Instance leaf carries the two of
+/// [`app_dns_name`] and [`revision_dns_name`]; a KMS node's leaf carries none.
+pub fn dns_sans(cert: &[u8]) -> Result<Vec<String>, Error> {
+    let (_, cert) = X509Certificate::from_der(cert)
+        .map_err(|e| Error::Malformed(format!("certificate: {e}")))?;
+    Ok(cert
+        .extensions()
+        .iter()
+        .filter_map(|ext| match ext.parsed_extension() {
+            ParsedExtension::SubjectAlternativeName(san) => Some(&san.general_names),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|name| match name {
+            GeneralName::DNSName(dns) => Some((*dns).to_owned()),
+            _ => None,
+        })
+        .collect())
+}
+
+/// The suffix of an Instance leaf's DNS names. `.invalid` (RFC 6761) never resolves, so the names
+/// identify an App or a Revision and can never be a host a client connects to.
+pub const INSTANCE_DNS_SUFFIX: &str = "alphacompute.invalid";
+
+/// `<app id>.<org id>.app.alphacompute.invalid`: the App, for a peer that can match a client
+/// certificate only by a DNS name (a Fortanix DSM trusted-CA App, PRD-06 I1). It says nothing the
+/// first URI SAN does not; the KMS derives it from the same ids.
+pub fn app_dns_name(org_id: OrgId, app_id: AppId) -> String {
+    format!("{app_id}.{org_id}.app.{INSTANCE_DNS_SUFFIX}")
+}
+
+/// `<hex 1-32>.<hex 33-64>.<app id>.<org id>.revision.alphacompute.invalid`: the Revision of that
+/// App, the compose hash split in two because a DNS label holds at most 63 characters.
+pub fn revision_dns_name(org_id: OrgId, app_id: AppId, compose_hash: ComposeHash) -> String {
+    let halves: Vec<String> = compose_hash
+        .as_bytes()
+        .chunks(16)
+        .map(hex::encode)
+        .collect();
+    format!(
+        "{}.{app_id}.{org_id}.revision.{INSTANCE_DNS_SUFFIX}",
+        halves.join(".")
+    )
+}
+
 pub fn spki_of(cert: &[u8]) -> Result<Vec<u8>, Error> {
     let (_, cert) = X509Certificate::from_der(cert)
         .map_err(|e| Error::Malformed(format!("certificate: {e}")))?;
@@ -208,6 +253,35 @@ mod tests {
                 "{sans:?}"
             );
         }
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+    fn instance_dns_names_name_the_app_and_the_revision() {
+        let (org, app) = (ORG.parse().unwrap(), APP.parse().unwrap());
+        let hash = alpha_core::compose_hash("{}");
+        let hex = hash.to_string().replace("sha256:", "");
+        assert_eq!(
+            app_dns_name(org, app),
+            format!("{APP}.{ORG}.app.alphacompute.invalid")
+        );
+        let revision = revision_dns_name(org, app, hash);
+        assert_eq!(
+            revision,
+            format!(
+                "{}.{}.{APP}.{ORG}.revision.alphacompute.invalid",
+                &hex[..32],
+                &hex[32..]
+            )
+        );
+        // Every label fits DNS's 63 characters and the name its 253.
+        assert!(revision.len() <= 253);
+        assert!(revision.split('.').all(|l| !l.is_empty() && l.len() <= 63));
+        let other: AppId = "01920000-0000-7000-8000-000000000003".parse().unwrap();
+        assert_ne!(app_dns_name(org, other), app_dns_name(org, app));
+        assert_ne!(
+            revision_dns_name(org, app, alpha_core::compose_hash("{ }")),
+            revision
+        );
     }
 
     #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]

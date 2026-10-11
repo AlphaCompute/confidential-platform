@@ -306,6 +306,7 @@ dependencies = [
  "alpha-core",
  "alpha-cpu-app",
  "alpha-crypto",
+ "alpha-dsm",
  "alpha-runtime",
  "alpha-tsm",
  "axum",

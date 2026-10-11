@@ -1,5 +1,7 @@
 //! The client against a stand-in DSM: mTLS with the Instance leaf, one session reused across
-//! keys, DSM's refusals surfaced, a DSM under any other CA never reached.
+//! keys, DSM's refusals surfaced, a DSM under any other CA never reached. The stand-in's App
+//! is a trusted-CA App as `docs/fortanix-dsm-keys.md` tells the customer to configure it: the
+//! KMS CA plus one DNS name of the leaf, so another App's leaf under the same CA gets nothing.
 
 #![allow(
     clippy::unwrap_used,
@@ -11,14 +13,18 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use alpha_client::tls::{PeerCerts, certified, mtls_server_config, serve};
+use alpha_client::tls::{
+    PeerCerts, app_dns_name, certified, dns_sans, mtls_server_config, revision_dns_name, serve,
+};
+use alpha_core::{AppId, ComposeHash, OrgId};
 use alpha_dsm::{Dsm, DsmConfig, Error};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Extension, Json, Router};
-use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
+use rcgen::string::Ia5String;
+use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, SanType};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use serde_json::{Value, json};
@@ -46,13 +52,79 @@ fn ca(name: &str) -> Ca {
     }
 }
 
-fn leaf(ca: &Ca, sans: Vec<String>) -> (Vec<u8>, Vec<u8>) {
+/// A leaf under `ca` with these SANs; `(der, pkcs8)`.
+fn leaf(ca: &Ca, sans: Vec<SanType>) -> (Vec<u8>, Vec<u8>) {
     let key = KeyPair::generate().unwrap();
-    let cert = CertificateParams::new(sans)
-        .unwrap()
-        .signed_by(&key, &ca.issuer)
-        .unwrap();
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.subject_alt_names = sans;
+    let cert = params.signed_by(&key, &ca.issuer).unwrap();
     (cert.der().to_vec(), key.serialize_der())
+}
+
+fn uri(s: String) -> SanType {
+    SanType::URI(Ia5String::try_from(s).unwrap())
+}
+
+fn dns(s: String) -> SanType {
+    SanType::DnsName(Ia5String::try_from(s).unwrap())
+}
+
+/// Who an Instance leaf names.
+#[derive(Clone, Copy)]
+struct Who {
+    org: OrgId,
+    app: AppId,
+    revision: ComposeHash,
+}
+
+impl Who {
+    fn new(compose: &str) -> Self {
+        Self {
+            org: OrgId::mint(),
+            app: AppId::mint(),
+            revision: alpha_core::compose_hash(compose),
+        }
+    }
+
+    fn app_name(&self) -> String {
+        app_dns_name(self.org, self.app)
+    }
+
+    fn revision_name(&self) -> String {
+        revision_dns_name(self.org, self.app, self.revision)
+    }
+
+    fn uris(&self) -> Vec<SanType> {
+        vec![
+            uri(format!(
+                "alphacompute://{}/{}/{}",
+                self.org,
+                self.app,
+                "ab".repeat(32)
+            )),
+            uri(format!("urn:alphacompute:revision:{}", self.revision)),
+        ]
+    }
+
+    /// The SANs the KMS issues an Instance: the two URIs and the two DNS names derived from them.
+    fn kms_sans(&self) -> Vec<SanType> {
+        let mut sans = self.uris();
+        sans.extend([dns(self.app_name()), dns(self.revision_name())]);
+        sans
+    }
+}
+
+struct InstanceKey {
+    chain: Vec<Vec<u8>>,
+    pkcs8: Vec<u8>,
+}
+
+fn instance(kms_ca: &Ca, sans: Vec<SanType>) -> InstanceKey {
+    let (der, pkcs8) = leaf(kms_ca, sans);
+    InstanceKey {
+        chain: vec![der, kms_ca.der.clone()],
+        pkcs8,
+    }
 }
 
 #[derive(Debug)]
@@ -64,9 +136,22 @@ impl ResolvesServerCert for One {
     }
 }
 
-#[derive(Default)]
+/// A DSM whose App `app-1` trusts the KMS CA (checked in the handshake) and matches one DNS name
+/// of the client certificate, as a DSM trusted-CA App does.
 struct StandIn {
+    matches: String,
     sessions: AtomicUsize,
+    requests: AtomicUsize,
+}
+
+impl StandIn {
+    fn matching(name: String) -> Arc<Self> {
+        Arc::new(Self {
+            matches: name,
+            sessions: AtomicUsize::new(0),
+            requests: AtomicUsize::new(0),
+        })
+    }
 }
 
 async fn auth(
@@ -74,9 +159,15 @@ async fn auth(
     Extension(peer): Extension<PeerCerts>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    // "app-1:" in basic auth, and a client certificate under the KMS CA.
+    dsm.requests.fetch_add(1, Ordering::SeqCst);
+    // "app-1:" in basic auth, and a client certificate under the KMS CA carrying the App's name.
     let basic = headers.get("authorization").and_then(|v| v.to_str().ok());
-    if peer.0.is_empty() || basic != Some("Basic YXBwLTE6") {
+    let named = peer
+        .0
+        .first()
+        .and_then(|leaf| dns_sans(leaf).ok())
+        .is_some_and(|names| names.contains(&dsm.matches));
+    if !named || basic != Some("Basic YXBwLTE6") {
         return (StatusCode::UNAUTHORIZED, Json(json!({"message": "no"}))).into_response();
     }
     dsm.sessions.fetch_add(1, Ordering::SeqCst);
@@ -84,7 +175,12 @@ async fn auth(
         .into_response()
 }
 
-async fn export(headers: HeaderMap, Json(body): Json<Value>) -> impl IntoResponse {
+async fn export(
+    State(dsm): State<Arc<StandIn>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    dsm.requests.fetch_add(1, Ordering::SeqCst);
     if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some("Bearer t-1") {
         return (StatusCode::UNAUTHORIZED, "bad token").into_response();
     }
@@ -101,7 +197,7 @@ async fn export(headers: HeaderMap, Json(body): Json<Value>) -> impl IntoRespons
 
 /// A stand-in DSM under `dsm_ca`, accepting clients under `kms_ca`; returns its base URL.
 async fn stand_in(dsm_ca: &Ca, kms_ca: &Ca, state: Arc<StandIn>) -> String {
-    let (der, pkcs8) = leaf(dsm_ca, vec!["127.0.0.1".into()]);
+    let (der, pkcs8) = leaf(dsm_ca, vec![SanType::IpAddress([127, 0, 0, 1].into())]);
     let key = certified(vec![der.into(), dsm_ca.der.clone().into()], &pkcs8).unwrap();
     let config = mtls_server_config(Arc::new(One(key)), kms_ca.der.clone().into()).unwrap();
     let app = Router::new()
@@ -114,35 +210,25 @@ async fn stand_in(dsm_ca: &Ca, kms_ca: &Ca, state: Arc<StandIn>) -> String {
     format!("https://{addr}")
 }
 
-fn config(endpoint: &str, dsm_ca: &Ca) -> DsmConfig {
+fn config(endpoint: &str, dsm_ca: &Ca, binding: &str) -> DsmConfig {
     let text = json!({
         "endpoint": endpoint, "app_id": "app-1", "ca_pem": dsm_ca.pem,
         "keys": {"data": {"kid": "k-1"}, "index": {"name": "idx"}},
+        "binding": binding,
     })
     .to_string();
     DsmConfig::parse(Some(&text)).unwrap().unwrap()
 }
 
-fn instance(kms_ca: &Ca) -> InstanceKey {
-    let (der, pkcs8) = leaf(kms_ca, vec!["instance.example".into()]);
-    InstanceKey {
-        chain: vec![der, kms_ca.der.clone()],
-        pkcs8,
-    }
-}
-
-struct InstanceKey {
-    chain: Vec<Vec<u8>>,
-    pkcs8: Vec<u8>,
-}
-
 #[tokio::test]
 async fn fetches_declared_keys_over_mtls_with_one_session() {
     let (kms_ca, dsm_ca) = (ca("kms"), ca("dsm"));
-    let state = Arc::new(StandIn::default());
+    let who = Who::new("{}");
+    let state = StandIn::matching(who.revision_name());
     let url = stand_in(&dsm_ca, &kms_ca, state.clone()).await;
-    let me = instance(&kms_ca);
-    let dsm = Dsm::new(&config(&url, &dsm_ca), me.chain, &me.pkcs8).unwrap();
+    let me = instance(&kms_ca, who.kms_sans());
+    let dsm = Dsm::new(&config(&url, &dsm_ca, "revision"), me.chain, &me.pkcs8).unwrap();
+    assert_eq!(dsm.bound_name().unwrap(), who.revision_name());
 
     let key = dsm.key("data").await.unwrap();
     assert_eq!(&key.value[..], KEY);
@@ -163,22 +249,121 @@ async fn fetches_declared_keys_over_mtls_with_one_session() {
     assert!(dsm.declares("data") && !dsm.declares("other"));
 }
 
+/// X15: the KMS CA signs every organization's leaves. Another App's leaf under that same CA —
+/// another tenant's, or an App AlphaCompute staff deploy as an ordinary tenant — knows the
+/// customer's DSM endpoint and App uuid (both are in the plaintext compose) but does not carry
+/// the name the customer's DSM App matches, so it gets no session and no key.
+#[tokio::test]
+async fn a_foreign_leaf_under_the_same_kms_ca_gets_no_session() {
+    let (kms_ca, dsm_ca) = (ca("kms"), ca("dsm"));
+    let customer = Who::new("{}");
+
+    // Bound to the customer's Revision.
+    let state = StandIn::matching(customer.revision_name());
+    let url = stand_in(&dsm_ca, &kms_ca, state.clone()).await;
+    let same_org_other_revision = Who {
+        revision: alpha_core::compose_hash("{ }"),
+        ..customer
+    };
+    let same_org_other_app = Who {
+        app: AppId::mint(),
+        ..customer
+    };
+    for foreign in [Who::new("{}"), same_org_other_app, same_org_other_revision] {
+        for binding in ["revision", "app"] {
+            let them = instance(&kms_ca, foreign.kms_sans());
+            let dsm = Dsm::new(&config(&url, &dsm_ca, binding), them.chain, &them.pkcs8).unwrap();
+            match dsm.key("data").await.unwrap_err() {
+                Error::Refused { status, message } => {
+                    assert_eq!(status, 401);
+                    assert!(message.contains("session for the leaf named"), "{message}");
+                }
+                other => panic!("{other}"),
+            }
+        }
+    }
+    assert_eq!(state.sessions.load(Ordering::SeqCst), 0);
+
+    // Bound to the customer's App: any Revision of it, nothing of another App.
+    let state = StandIn::matching(customer.app_name());
+    let url = stand_in(&dsm_ca, &kms_ca, state.clone()).await;
+    let next = instance(&kms_ca, same_org_other_revision.kms_sans());
+    let dsm = Dsm::new(&config(&url, &dsm_ca, "app"), next.chain, &next.pkcs8).unwrap();
+    assert_eq!(&dsm.key("data").await.unwrap().value[..], KEY);
+    for foreign in [Who::new("{}"), same_org_other_app] {
+        let them = instance(&kms_ca, foreign.kms_sans());
+        let dsm = Dsm::new(&config(&url, &dsm_ca, "app"), them.chain, &them.pkcs8).unwrap();
+        assert!(matches!(
+            dsm.key("data").await,
+            Err(Error::Refused { status: 401, .. })
+        ));
+    }
+    assert_eq!(state.sessions.load(Ordering::SeqCst), 1);
+}
+
+/// The client side of X15: a leaf that does not name its App and Revision as the binding needs
+/// (one from a KMS that predates the DNS names, a KMS node's, or one whose DNS names are another
+/// App's) is never presented, so nothing reaches even a DSM App misconfigured as CA-only.
+#[tokio::test]
+async fn a_leaf_a_dsm_could_check_only_against_the_ca_is_never_presented() {
+    let (kms_ca, dsm_ca) = (ca("kms"), ca("dsm"));
+    let who = Who::new("{}");
+    let other = Who::new("{ }");
+    let state = StandIn::matching(who.revision_name());
+    let url = stand_in(&dsm_ca, &kms_ca, state.clone()).await;
+
+    let mut mismatched = who.uris();
+    mismatched.extend([dns(other.app_name()), dns(other.revision_name())]);
+    let mut app_only = who.uris();
+    app_only.push(dns(who.app_name()));
+    let node = vec![
+        uri("alphacompute://kms".into()),
+        uri(format!("urn:alphacompute:revision:{}", who.revision)),
+    ];
+    for (sans, binding) in [
+        (who.uris(), "revision"),
+        (who.uris(), "app"),
+        (mismatched.clone(), "revision"),
+        (mismatched, "app"),
+        (app_only, "revision"),
+        (node, "app"),
+    ] {
+        let me = instance(&kms_ca, sans);
+        let dsm = Dsm::new(&config(&url, &dsm_ca, binding), me.chain, &me.pkcs8).unwrap();
+        assert!(matches!(dsm.bound_name(), Err(Error::Unbound(_))));
+        assert!(matches!(dsm.key("data").await, Err(Error::Unbound(_))));
+        // An undeclared name is still a 404, whatever the leaf.
+        assert!(matches!(dsm.key("other").await, Err(Error::Undeclared(_))));
+    }
+    assert_eq!(state.requests.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn a_dsm_under_another_ca_is_never_trusted() {
     let (kms_ca, dsm_ca, pinned) = (ca("kms"), ca("dsm"), ca("pinned"));
-    let url = stand_in(&dsm_ca, &kms_ca, Arc::new(StandIn::default())).await;
-    let me = instance(&kms_ca);
-    let dsm = Dsm::new(&config(&url, &pinned), me.chain, &me.pkcs8).unwrap();
+    let who = Who::new("{}");
+    let state = StandIn::matching(who.revision_name());
+    let url = stand_in(&dsm_ca, &kms_ca, state.clone()).await;
+    let me = instance(&kms_ca, who.kms_sans());
+    let dsm = Dsm::new(&config(&url, &pinned, "revision"), me.chain, &me.pkcs8).unwrap();
     assert!(matches!(dsm.key("data").await, Err(Error::Transport(_))));
+    assert_eq!(state.requests.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
 async fn an_instance_without_a_kms_leaf_gets_no_session() {
     let (kms_ca, dsm_ca, other) = (ca("kms"), ca("dsm"), ca("other"));
-    let state = Arc::new(StandIn::default());
+    let who = Who::new("{}");
+    let state = StandIn::matching(who.revision_name());
     let url = stand_in(&dsm_ca, &kms_ca, state.clone()).await;
-    let stranger = instance(&other);
-    let dsm = Dsm::new(&config(&url, &dsm_ca), stranger.chain, &stranger.pkcs8).unwrap();
+    // The right names, under a CA that is not the KMS's.
+    let stranger = instance(&other, who.kms_sans());
+    let dsm = Dsm::new(
+        &config(&url, &dsm_ca, "revision"),
+        stranger.chain,
+        &stranger.pkcs8,
+    )
+    .unwrap();
     // The stand-in's verifier rejects a chain under another CA during the handshake.
     assert!(dsm.key("data").await.is_err());
     assert_eq!(state.sessions.load(Ordering::SeqCst), 0);

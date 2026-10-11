@@ -8,15 +8,20 @@ rather than to a host that merely answers at the right address.
 
 ## What the certificate says
 
-Two URI SANs, and nothing in the subject:
+Two URI SANs, two DNS names derived from them, and nothing in the subject:
 
 ```
 URI:alphacompute://<org id>/<app id>/<sha256 of the runtime public key>
 URI:urn:alphacompute:revision:sha256:<compose hash>
+DNS:<app id>.<org id>.app.alphacompute.invalid
+DNS:<hash hex 1-32>.<hash hex 33-64>.<app id>.<org id>.revision.alphacompute.invalid
 ```
 
-The second is the one to check: it is the Revision the Instance is running, and it is
-the same hash the tenant registered and signed. The certificate lives one hour and the
+The second URI is the one to check: it is the Revision the Instance is running, and it is
+the same hash the tenant registered and signed. The DNS names say the same thing again
+for a peer that can match a certificate only by DNS name, such as a customer's Fortanix
+DSM releasing keys to the App (`docs/fortanix-dsm-keys.md`). They end in `.invalid`, so
+they are never a host name, and a client connecting to the App ignores them. The certificate lives one hour and the
 Instance renews it, so a client that checks the chain and the SANs on every connection
 learns within the hour when an App stops being entitled to run.
 
@@ -87,7 +92,7 @@ openssl s_client -connect <host>:443 -servername <host> </dev/null 2>/dev/null \
   | openssl x509 -noout -issuer -ext subjectAltName -dates
 ```
 
-With OpenSSL 3.5 or newer this prints the issuer, the two SANs and the hour the
+With OpenSSL 3.5 or newer this prints the issuer, the SANs and the hour the
 certificate is good for. An Instance that has not attested serves no certificate at all:
 the connection is accepted by the gateway and closes with none, because there is nothing
 behind it to forward to.
