@@ -104,14 +104,49 @@ fn agent_quote(
     Ok((quote, events))
 }
 
-/// TDX quote v4: a 48-byte header, then the TD report whose `report_data` sits at offset 520.
+/// Where a TDX quote's `report_data` sits. Every TDX quote starts with a 48-byte header (version
+/// at 0, TEE type 0x81 at 4). Version 4 follows it with the TD report body, `report_data` at 520
+/// in it. Version 5 (TDX 1.5) puts a body type and a body size between the two; its TD 1.0
+/// (type 2) and TD 1.5 (type 3) bodies both keep `report_data` at 520.
+fn report_data_offset(quote: &[u8]) -> Result<usize, Error> {
+    // Header, then report_data at 520 in the body; v5 adds a 2-byte type and 4-byte size first.
+    const V4: usize = 48 + 520;
+    const V5: usize = 48 + 2 + 4 + 520;
+    const TDX: u32 = 0x81;
+    let le16 = |at: std::ops::Range<usize>| {
+        quote
+            .get(at)
+            .and_then(|b| <[u8; 2]>::try_from(b).ok())
+            .map(u16::from_le_bytes)
+    };
+    let tee = quote
+        .get(4..8)
+        .and_then(|b| <[u8; 4]>::try_from(b).ok())
+        .map(u32::from_le_bytes);
+    if tee != Some(TDX) {
+        return Err(Error::Agent("the quote is not a TDX quote".into()));
+    }
+    match le16(0..2) {
+        Some(4) => Ok(V4),
+        Some(5) => match le16(48..50) {
+            Some(2 | 3) => Ok(V5),
+            other => Err(Error::Agent(format!(
+                "TDX quote v5 body type {other:?} is not a TD report"
+            ))),
+        },
+        other => Err(Error::Agent(format!(
+            "TDX quote version {other:?} is not 4 or 5"
+        ))),
+    }
+}
+
 /// Checked here so a source that drops or reshapes our data fails at the pod, with a reason,
-/// rather than as an opaque refusal at the KMS.
+/// rather than as an opaque refusal at the KMS (which parses either quote version itself).
 fn check_report_data(quote: &[u8], expected: &[u8]) -> Result<(), Error> {
-    const OFFSET: usize = 48 + 520;
+    let offset = report_data_offset(quote)?;
     let quoted = quote
-        .get(OFFSET..OFFSET.saturating_add(64))
-        .ok_or_else(|| Error::Agent("quote is too short for a TDX v4 quote".into()))?;
+        .get(offset..offset.saturating_add(64))
+        .ok_or_else(|| Error::Agent("the quote is too short for its version".into()))?;
     if quoted != expected {
         return Err(Error::Agent(
             "the quote's report_data is not the runtime data asked for".into(),
@@ -290,9 +325,23 @@ mod tests {
 
     use super::*;
 
+    /// A TDX quote v4 shell over `report_data`.
     fn quote_with(report_data: &[u8]) -> Vec<u8> {
         let mut q = vec![0u8; 48 + 584 + 16];
+        q[0..2].copy_from_slice(&4u16.to_le_bytes());
+        q[4..8].copy_from_slice(&0x81u32.to_le_bytes());
         q[568..632].copy_from_slice(report_data);
+        q
+    }
+
+    /// A TDX quote v5 shell (TD 1.5 body, type 3) over `report_data`.
+    fn quote_v5_with(report_data: &[u8]) -> Vec<u8> {
+        let mut q = vec![0u8; 48 + 6 + 648 + 16];
+        q[0..2].copy_from_slice(&5u16.to_le_bytes());
+        q[4..8].copy_from_slice(&0x81u32.to_le_bytes());
+        q[48..50].copy_from_slice(&3u16.to_le_bytes());
+        q[50..54].copy_from_slice(&648u32.to_le_bytes());
+        q[574..638].copy_from_slice(report_data);
         q
     }
 
@@ -332,6 +381,47 @@ mod tests {
         let error = check_report_data(&quote_with(&[0; 64]), &[1; 64]).unwrap_err();
         assert!(error.to_string().contains("report_data"));
         assert!(check_report_data(&[0; 100], &[0; 64]).is_err());
+    }
+
+    #[test]
+    fn reads_report_data_from_quote_v4_and_v5() {
+        let rd = [0x44u8; 64];
+        assert!(check_report_data(&quote_with(&rd), &rd).is_ok());
+        let v5 = quote_v5_with(&rd);
+        assert!(check_report_data(&v5, &rd).is_ok());
+        // TD 1.0 body in a v5 quote: same place.
+        let mut td10 = v5.clone();
+        td10[48..50].copy_from_slice(&2u16.to_le_bytes());
+        assert!(check_report_data(&td10, &rd).is_ok());
+        // The v4 place in a v5 quote is not report_data.
+        let mut misplaced = quote_v5_with(&[0; 64]);
+        misplaced[568..632].copy_from_slice(&rd);
+        assert!(check_report_data(&misplaced, &rd).is_err());
+        // An SGX enclave body, another version, another TEE.
+        let mut sgx = v5.clone();
+        sgx[48..50].copy_from_slice(&1u16.to_le_bytes());
+        assert!(
+            check_report_data(&sgx, &rd)
+                .unwrap_err()
+                .to_string()
+                .contains("body type")
+        );
+        let mut v6 = quote_with(&rd);
+        v6[0..2].copy_from_slice(&6u16.to_le_bytes());
+        assert!(
+            check_report_data(&v6, &rd)
+                .unwrap_err()
+                .to_string()
+                .contains("version")
+        );
+        let mut sev = quote_with(&rd);
+        sev[4..8].copy_from_slice(&0u32.to_le_bytes());
+        assert!(
+            check_report_data(&sev, &rd)
+                .unwrap_err()
+                .to_string()
+                .contains("not a TDX")
+        );
     }
 
     #[test]
