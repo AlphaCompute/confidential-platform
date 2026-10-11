@@ -125,7 +125,14 @@ pub struct Measured {
 }
 
 /// The platform document (release-signed; the signature is checked by whoever fetched it).
+///
+/// It refuses fields it does not know, as do its policy and reference values: `alpha sign`
+/// validates a document through this type, so a misspelled field (a reference value's
+/// `runtime_class`, say) is refused at signing instead of being signed and ignored, and a KMS
+/// never reads past a rule it does not understand. Pages that only display a document read it
+/// through `alpha_channel::platform::PlatformView`, which tolerates new fields.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlatformDocument {
     pub version: u64,
     pub issued_at: String,
@@ -144,12 +151,14 @@ pub struct PlatformDocument {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Policy {
     pub tcb_statuses: Vec<String>,
     pub tolerated_advisories: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReferenceValue {
     pub name: String,
     /// Which evidence profile the measurements belong to; a document written before Kata had
@@ -183,6 +192,7 @@ impl ReferenceKind {
 
 /// rtmr3 is not a reference value: it holds the measured `compose_hash` and per-Instance ids.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReferenceMeasurements {
     pub mrtd: Measurement,
     pub rtmr0: Measurement,

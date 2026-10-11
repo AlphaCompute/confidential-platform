@@ -503,6 +503,44 @@ fn any_evidence_dispatches_on_format() {
 }
 
 #[test]
+fn results_accept_new_fields_and_platform_documents_refuse_them() {
+    // A result from a later KMS that adds fields still parses in a runtime built today.
+    let mut result = serde_json::to_value(Pod::gpu(1).appraise(&doc()).unwrap().coco).unwrap();
+    result["added_later"] = serde_json::json!(1);
+    result["gpus"][0]["added_later"] = serde_json::json!(true);
+    result["gpu_verifiers"][0]["added_later"] = serde_json::json!("x");
+    assert!(serde_json::from_value::<CocoAppraised>(result).is_ok());
+
+    // A misspelled field in a platform document is refused, not signed and ignored.
+    let good = serde_json::to_value(doc()).unwrap();
+    assert!(serde_json::from_value::<PlatformDocument>(good.clone()).is_ok());
+    let mut typo = good.clone();
+    let rv = typo["reference_values"][0].as_object_mut().unwrap();
+    let class = rv.remove("runtime_class").unwrap();
+    rv.insert("runtime_clas".into(), class);
+    let error = serde_json::from_value::<PlatformDocument>(typo)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("runtime_clas"), "{error}");
+    for (path, field) in [
+        ("", "gpu_polcy"),
+        ("/policy", "tcb_status"),
+        ("/reference_values/0/values", "rtmr3"),
+    ] {
+        let mut extra = good.clone();
+        extra
+            .pointer_mut(path)
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .insert(field.into(), serde_json::json!(null));
+        assert!(
+            serde_json::from_value::<PlatformDocument>(extra).is_err(),
+            "{path}/{field}"
+        );
+    }
+}
+
+#[test]
 fn report_data_forms() {
     let expected = [0x5a; 64];
     assert!(report_data_binds(&expected, &expected));
