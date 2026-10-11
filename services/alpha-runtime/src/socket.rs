@@ -1,4 +1,4 @@
-//! The four routes on the unix socket: HTTP/1.1, JSON, no authentication — access is the
+//! The five routes on the unix socket: HTTP/1.1, JSON, no authentication — access is the
 //! right to the socket. KMS errors pass through in their own envelope with their status.
 
 use std::sync::Arc;

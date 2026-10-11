@@ -7,11 +7,12 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::panic,
-    clippy::indexing_slicing
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
 )]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use alpha_client::tls::{
     PeerCerts, app_dns_name, certified, dns_sans, mtls_server_config, revision_dns_name, serve,
@@ -141,11 +142,16 @@ impl ResolvesServerCert for One {
 }
 
 /// A DSM whose App `app-1` trusts the KMS CA (checked in the handshake) and matches one DNS name
-/// of the client certificate, as a DSM trusted-CA App does.
+/// of the client certificate, as a DSM trusted-CA App does. Session `n` gets the token `t-n`.
 struct StandIn {
     matches: String,
     sessions: AtomicUsize,
     requests: AtomicUsize,
+    /// Export answers 401 to the tokens of sessions below this one, as a DSM that dropped them.
+    revoked_below: AtomicUsize,
+    /// Export answers `307` to `/moved`, which would release the key to a client that followed.
+    redirect: AtomicBool,
+    moved: AtomicUsize,
 }
 
 impl StandIn {
@@ -154,6 +160,9 @@ impl StandIn {
             matches: name,
             sessions: AtomicUsize::new(0),
             requests: AtomicUsize::new(0),
+            revoked_below: AtomicUsize::new(0),
+            redirect: AtomicBool::new(false),
+            moved: AtomicUsize::new(0),
         })
     }
 }
@@ -174,9 +183,21 @@ async fn auth(
     if !named || basic != Some("Basic YXBwLTE6") {
         return (StatusCode::UNAUTHORIZED, Json(json!({"message": "no"}))).into_response();
     }
-    dsm.sessions.fetch_add(1, Ordering::SeqCst);
-    Json(json!({"token_type": "Bearer", "access_token": "t-1", "expires_in": 600, "entity_id": "app-1"}))
+    let n = dsm.sessions.fetch_add(1, Ordering::SeqCst) + 1;
+    Json(json!({"token_type": "Bearer", "access_token": format!("t-{n}"), "expires_in": 600, "entity_id": "app-1"}))
         .into_response()
+}
+
+fn released(body: &Value) -> axum::response::Response {
+    use base64::Engine;
+    match body {
+        b if *b == json!({"kid": "k-1"}) => Json(json!({
+            "kid": "k-1", "name": "data", "obj_type": "AES",
+            "value": base64::prelude::BASE64_STANDARD.encode(KEY),
+        }))
+        .into_response(),
+        _ => (StatusCode::FORBIDDEN, "operation EXPORT is not permitted").into_response(),
+    }
 }
 
 async fn export(
@@ -185,18 +206,26 @@ async fn export(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     dsm.requests.fetch_add(1, Ordering::SeqCst);
-    if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some("Bearer t-1") {
+    let session = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer t-"))
+        .and_then(|n| n.parse::<usize>().ok());
+    let live = session.is_some_and(|n| {
+        n >= dsm.revoked_below.load(Ordering::SeqCst) && n <= dsm.sessions.load(Ordering::SeqCst)
+    });
+    if !live {
         return (StatusCode::UNAUTHORIZED, "bad token").into_response();
     }
-    use base64::Engine;
-    match body {
-        b if b == json!({"kid": "k-1"}) => Json(json!({
-            "kid": "k-1", "name": "data", "obj_type": "AES",
-            "value": base64::prelude::BASE64_STANDARD.encode(KEY),
-        }))
-        .into_response(),
-        _ => (StatusCode::FORBIDDEN, "operation EXPORT is not permitted").into_response(),
+    if dsm.redirect.load(Ordering::SeqCst) {
+        return (StatusCode::TEMPORARY_REDIRECT, [("location", "/moved")]).into_response();
     }
+    released(&body)
+}
+
+async fn moved(State(dsm): State<Arc<StandIn>>, Json(body): Json<Value>) -> impl IntoResponse {
+    dsm.moved.fetch_add(1, Ordering::SeqCst);
+    released(&body)
 }
 
 /// A stand-in DSM under `dsm_ca`, accepting clients under `kms_ca`; returns its base URL.
@@ -242,6 +271,7 @@ async fn stand_in_speaking(dsm_ca: &Ca, kms_ca: &Ca, state: Arc<StandIn>, kx: Kx
     let app = Router::new()
         .route("/sys/v1/session/auth", post(auth))
         .route("/crypto/v1/keys/export", post(export))
+        .route("/moved", post(moved))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -411,6 +441,50 @@ async fn classical_key_exchange_only_when_the_compose_allows_it() {
     let me = instance(&kms_ca, who.kms_sans());
     let dsm = Dsm::new(&parse(&allowed), me.chain, &me.pkcs8).unwrap();
     assert_eq!(&dsm.key("data").await.unwrap().value[..], KEY);
+}
+
+/// A token the DSM stopped honouring before its expiry is dropped, a new session is opened and
+/// the export retried, once: the App does not see a refusal, and a DSM that keeps answering 401
+/// is not asked in a loop.
+#[tokio::test]
+async fn a_stale_token_is_replaced_and_the_export_retried_once() {
+    let (kms_ca, dsm_ca) = (ca("kms"), ca("dsm"));
+    let who = Who::new("{}");
+    let state = StandIn::matching(who.revision_name());
+    let url = stand_in(&dsm_ca, &kms_ca, state.clone()).await;
+    let me = instance(&kms_ca, who.kms_sans());
+    let dsm = Dsm::new(&config(&url, &dsm_ca, "revision"), me.chain, &me.pkcs8).unwrap();
+
+    dsm.key("data").await.unwrap();
+    assert_eq!(state.sessions.load(Ordering::SeqCst), 1);
+    state.revoked_below.store(2, Ordering::SeqCst);
+    assert_eq!(&dsm.key("data").await.unwrap().value[..], KEY);
+    assert_eq!(state.sessions.load(Ordering::SeqCst), 2);
+
+    state.revoked_below.store(usize::MAX, Ordering::SeqCst);
+    assert!(matches!(
+        dsm.key("data").await,
+        Err(Error::Refused { status: 401, .. })
+    ));
+    assert_eq!(state.sessions.load(Ordering::SeqCst), 3);
+}
+
+/// The endpoint is the measured one: a redirect the DSM answers is not followed (and neither is a
+/// proxy an environment variable names, which the client ignores).
+#[tokio::test]
+async fn a_redirect_is_not_followed() {
+    let (kms_ca, dsm_ca) = (ca("kms"), ca("dsm"));
+    let who = Who::new("{}");
+    let state = StandIn::matching(who.revision_name());
+    state.redirect.store(true, Ordering::SeqCst);
+    let url = stand_in(&dsm_ca, &kms_ca, state.clone()).await;
+    let me = instance(&kms_ca, who.kms_sans());
+    let dsm = Dsm::new(&config(&url, &dsm_ca, "revision"), me.chain, &me.pkcs8).unwrap();
+    assert!(matches!(
+        dsm.key("data").await,
+        Err(Error::Refused { status: 307, .. })
+    ));
+    assert_eq!(state.moved.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
