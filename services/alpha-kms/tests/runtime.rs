@@ -88,6 +88,7 @@ fn config(h: &Harness, endpoints: Vec<String>) -> Config {
         kms_endpoints: endpoints,
         secrets: Secrets::new(),
         tls_upstream: None,
+        dsm: None,
     }
 }
 
