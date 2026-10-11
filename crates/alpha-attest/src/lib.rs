@@ -32,7 +32,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 pub use event_log::{EventLogEntry, compose_hash as event_log_compose_hash};
-pub use gpu::{GpuAppraisal, GpuEvidence, GpuPolicy, GpuVerifier, GpuVerifierKind, VerifiedGpu};
+pub use gpu::{
+    GpuAppraisal, GpuEvidence, GpuPolicy, GpuVerdict, GpuVerifier, GpuVerifierKind, GpuVouch,
+    VerifiedGpu,
+};
 pub use kata::{AnyEvidence, CocoAppraised, CpuEvidence, CpuKind, EvidenceV2, appraise_any};
 
 pub const EVIDENCE_FORMAT: &str = "alphacompute-evidence/1";
