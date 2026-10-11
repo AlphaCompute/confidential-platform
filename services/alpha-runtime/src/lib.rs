@@ -340,7 +340,6 @@ pub struct CocoIdentity {
 pub fn coco_identity(
     quote: alpha_tsm::coco::QuoteSource,
     initdata: Vec<u8>,
-    gpu_helper: PathBuf,
 ) -> Result<CocoIdentity, Error> {
     let parsed = alpha_core::coco::InitData::parse(&initdata)
         .map_err(|e| Error::Evidence(format!("init-data: {e}")))?;
@@ -360,7 +359,6 @@ pub fn coco_identity(
         initdata: initdata.clone(),
         runtime_class: revision.runtime_class,
         gpu_count,
-        gpu_helper,
     };
     Ok(CocoIdentity {
         initdata,
@@ -803,8 +801,7 @@ package agent_policy
     #[test]
     fn a_kata_pod_serves_the_revision_v2_its_initdata_stands_for() {
         let source = alpha_tsm::coco::QuoteSource::ConfigfsTsm;
-        let none = PathBuf::from("/nonexistent");
-        let coco = coco_identity(source, INITDATA.as_bytes().to_vec(), none.clone()).unwrap();
+        let coco = coco_identity(source, INITDATA.as_bytes().to_vec()).unwrap();
         let expected = alpha_core::coco::InitData::parse(INITDATA.as_bytes())
             .unwrap()
             .revision()
@@ -813,7 +810,7 @@ package agent_policy
         assert_eq!(coco.initdata, INITDATA.as_bytes());
         // No TSM tree here: the source fails at the pod rather than sending something partial.
         assert!((coco.evidence)(&[0; 64]).is_err());
-        assert!(coco_identity(source, b"not toml".to_vec(), none).is_err());
+        assert!(coco_identity(source, b"not toml".to_vec()).is_err());
     }
 
     #[test]

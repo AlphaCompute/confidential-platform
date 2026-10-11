@@ -1,6 +1,7 @@
 //! What a Kata confidential pod reads about itself, from inside one of its containers: a TDX quote
 //! over our `report_data`, the CCEL boot events when the source returns them, the init-data the
-//! pod booted with, and one attestation report per passed-through GPU.
+//! pod booted with, and one attestation report per passed-through GPU, which the CoCo attestation
+//! agent's NVIDIA attester collects.
 //!
 //! Nothing here is trusted by the KMS. The quote is signed by the TD; the init-data is checked
 //! against MRCONFIGID; GPU reports are verified by the GPU backend. A source that lies only makes
@@ -9,14 +10,14 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 use std::time::Duration;
 
 use alpha_attest::{CpuEvidence, CpuKind, EVIDENCE_FORMAT_V2, EvidenceV2, GpuEvidence};
 use base64::Engine;
-use base64::prelude::BASE64_STANDARD;
+use base64::prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
 use serde::Deserialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{Error, boot_events, http_body};
@@ -31,12 +32,12 @@ pub const TSM_REPORT_DIR: &str = "/sys/kernel/config/tsm/report";
 /// that `alpha coco render` declares. The host could put anything here; the KMS refuses anything
 /// that is not the digest in MRCONFIGID.
 pub const INITDATA_PATH: &str = "/run/alpha-pod/cc_init_data";
-/// Prints `[{arch, evidence, certificate}]` for every GPU in the pod for `--nonce <hex>`, through
-/// NVIDIA's attestation SDK (NVML confidential-compute report and certificate). Shipped in the
-/// runtime image for GPU pods.
-// ponytail: M-B — replace with the attestation agent's composite GPU evidence if the pinned
-// guest-components build exposes it on the REST API; the evidence shape stays the same.
-pub const GPU_EVIDENCE_HELPER: &str = "/usr/local/bin/alpha-gpu-evidence";
+/// The key under which the attestation agent's additional evidence carries NVIDIA devices (the
+/// `nvidia` TEE of guest-components' `kbs-types`).
+pub const NVIDIA_TEE: &str = "nvidia";
+/// The architecture token of an NVSwitch in NVIDIA's device evidence. Switches are not GPUs: they
+/// are left out of the GPU count and not appraised yet (protected-PCIe mode is after Dec 1).
+pub const NVSWITCH_ARCH: &str = "LS10";
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -177,30 +178,69 @@ pub fn decode_annotation(text: &str) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
-/// One report per GPU over `nonce`, from [`GPU_EVIDENCE_HELPER`]; exactly `count` of them.
-pub fn gpu_evidence(
-    helper: &Path,
+#[derive(Deserialize)]
+struct NvidiaEvidence {
+    device_evidence_list: Vec<NvidiaDevice>,
+}
+
+/// One device as the agent's NVIDIA attester reports it: NVIDIA's attestation SDK output, the
+/// report and the certificate chain base64-encoded, as NRAS takes them.
+#[derive(Deserialize)]
+struct NvidiaDevice {
+    arch: String,
+    evidence: String,
+    certificate: String,
+}
+
+/// One report per GPU over `nonce`, from the attestation agent's device evidence
+/// (`GET /aa/additional-evidence`): the agent's NVIDIA attester asks every confidential GPU for a
+/// report over the first 32 bytes of the runtime data, so the nonce is sent as the runtime data,
+/// raw (`encoding=base64`). Exactly `count` GPUs, NVSwitches left out. Untrusted, like everything
+/// here: the GPU backend verifies every report, and its nonce, at the KMS.
+pub fn agent_gpu_evidence(
+    addr: &str,
     nonce: &[u8; 32],
     count: usize,
 ) -> Result<Vec<GpuEvidence>, Error> {
     if count == 0 {
         return Ok(Vec::new());
     }
-    let output = Command::new(helper)
-        .arg("--nonce")
-        .arg(hex::encode(nonce))
-        .output()
-        .map_err(|e| Error::Io(helper.display().to_string(), e))?;
-    if !output.status.success() {
-        return Err(Error::Agent(format!(
-            "{}: {}: {}",
-            helper.display(),
-            output.status,
-            String::from_utf8_lossy(output.stderr.get(..400).unwrap_or(&output.stderr))
-        )));
+    let path = format!(
+        "/aa/additional-evidence?runtime_data={}&encoding=base64",
+        BASE64_URL_SAFE_NO_PAD.encode(nonce)
+    );
+    let body = tcp_get(addr, &path)?;
+    if body.iter().all(u8::is_ascii_whitespace) {
+        return Err(Error::Agent(
+            "the attestation agent has no device evidence; is its NVIDIA attester running?".into(),
+        ));
     }
-    let gpus: Vec<GpuEvidence> = serde_json::from_slice(&output.stdout)
-        .map_err(|e| Error::Agent(format!("GPU evidence: {e}")))?;
+    let mut devices: serde_json::Map<String, Value> = serde_json::from_slice(&body)
+        .map_err(|e| Error::Agent(format!("attestation agent device evidence: {e}")))?;
+    let nvidia: NvidiaEvidence = devices
+        .remove(NVIDIA_TEE)
+        .ok_or_else(|| Error::Agent("the attestation agent reports no NVIDIA device".into()))
+        .and_then(|v| {
+            serde_json::from_value(v)
+                .map_err(|e| Error::Agent(format!("NVIDIA device evidence: {e}")))
+        })?;
+    let decode = |what: &str, text: &str| {
+        BASE64_STANDARD
+            .decode(text.trim())
+            .map_err(|_| Error::Agent(format!("NVIDIA device {what} is not base64")))
+    };
+    let gpus = nvidia
+        .device_evidence_list
+        .into_iter()
+        .filter(|d| !d.arch.eq_ignore_ascii_case(NVSWITCH_ARCH))
+        .map(|d| {
+            Ok(GpuEvidence {
+                evidence: decode("evidence", &d.evidence)?,
+                certificate: decode("certificate", &d.certificate)?,
+                arch: d.arch,
+            })
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
     if gpus.len() != count {
         return Err(Error::Agent(format!(
             "{} GPUs reported, the init-data expects {count}",
@@ -210,20 +250,20 @@ pub fn gpu_evidence(
     Ok(gpus)
 }
 
-/// Everything a pod sends: `alphacompute-evidence/2`.
+/// Everything a pod sends: `alphacompute-evidence/2`. The quote comes from `quote`; GPU reports
+/// always come from the attestation agent, whichever source gives the quote.
 pub struct Source {
     pub quote: QuoteSource,
     pub initdata: Vec<u8>,
     pub runtime_class: String,
     pub gpu_count: usize,
-    pub gpu_helper: PathBuf,
 }
 
 impl Source {
     pub fn evidence(&self, report_data: &[u8; 64]) -> Result<EvidenceV2, Error> {
         let (quote, event_log) = quote(self.quote, report_data)?;
-        let gpus = gpu_evidence(
-            &self.gpu_helper,
+        let gpus = agent_gpu_evidence(
+            ATTESTATION_AGENT,
             &alpha_attest::gpu::gpu_nonce(report_data),
             self.gpu_count,
         )?;
@@ -245,7 +285,6 @@ impl Source {
 mod tests {
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::mpsc;
     use std::thread;
 
@@ -323,28 +362,82 @@ mod tests {
         assert!(decode_annotation(&BASE64_STANDARD.encode(b"plain")).is_err());
     }
 
+    /// A stand-in attestation agent that answers one request with `body` and hands back the
+    /// request line.
+    fn agent_once(body: String) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            // The caller may not want the request line.
+            let _ = tx.send(line);
+            (&stream)
+                .write_all(format!("HTTP/1.1 200 OK\r\n\r\n{body}").as_bytes())
+                .unwrap();
+        });
+        (addr, rx)
+    }
+
     #[test]
-    fn gpu_helper_must_report_every_expected_gpu() {
-        let helper = std::env::temp_dir().join(format!("alpha-gpu-{}.sh", std::process::id()));
-        fs::write(
-            &helper,
-            "#!/bin/sh\n[ \"$1\" = --nonce ] || exit 2\necho '[{\"arch\":\"BLACKWELL\",\"evidence\":\"AQ\",\"certificate\":\"Ag\"}]'\n",
-        )
-        .unwrap();
-        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
-        let gpus = gpu_evidence(&helper, &[0; 32], 1).unwrap();
-        assert_eq!(gpus[0].evidence, [1]);
-        assert!(
-            gpu_evidence(&helper, &[0; 32], 8)
-                .unwrap_err()
-                .to_string()
-                .contains("expects 8")
+    fn gpu_reports_come_from_the_agents_nvidia_attester_over_the_gpu_nonce() {
+        let nonce = [0x33u8; 32];
+        let device = |arch: &str, evidence: &[u8]| {
+            format!(
+                "{{\"arch\":\"{arch}\",\"uuid\":\"unknown\",\"evidence\":\"{}\",\"certificate\":\"{}\"}}",
+                BASE64_STANDARD.encode(evidence),
+                BASE64_STANDARD.encode(b"chain")
+            )
+        };
+        // Two GPUs and an NVSwitch, which is not counted.
+        let body = format!(
+            "{{\"nvidia\":{{\"device_evidence_list\":[{},{},{}]}}}}",
+            device("BLACKWELL", &[1]),
+            device("LS10", &[9]),
+            device("BLACKWELL", &[2])
         );
+        let (addr, request) = agent_once(body.clone());
+        let gpus = agent_gpu_evidence(&addr, &nonce, 2).unwrap();
+        assert_eq!(
+            gpus.iter()
+                .map(|g| (g.arch.as_str(), g.evidence.as_slice()))
+                .collect::<Vec<_>>(),
+            [("BLACKWELL", &[1u8][..]), ("BLACKWELL", &[2u8][..])]
+        );
+        assert_eq!(gpus[0].certificate, b"chain");
+        let request = request.recv().unwrap();
+        let expected = format!(
+            "GET /aa/additional-evidence?runtime_data={}&encoding=base64 ",
+            BASE64_URL_SAFE_NO_PAD.encode(nonce)
+        );
+        assert!(request.starts_with(&expected), "{request}");
+
+        // Fewer or more GPUs than the init-data expects, no NVIDIA device, no device at all.
+        let (addr, _) = agent_once(body);
+        let error = agent_gpu_evidence(&addr, &nonce, 8)
+            .unwrap_err()
+            .to_string();
         assert!(
-            gpu_evidence(Path::new("/nonexistent"), &[0; 32], 0)
+            error.contains("2 GPUs reported, the init-data expects 8"),
+            "{error}"
+        );
+        let (addr, _) = agent_once("{\"sample\":{}}".into());
+        let error = agent_gpu_evidence(&addr, &nonce, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no NVIDIA device"), "{error}");
+        let (addr, _) = agent_once(String::new());
+        let error = agent_gpu_evidence(&addr, &nonce, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("NVIDIA attester"), "{error}");
+        // A CPU-only pod asks for nothing.
+        assert!(
+            agent_gpu_evidence("127.0.0.1:1", &nonce, 0)
                 .unwrap()
                 .is_empty()
         );
-        let _ = fs::remove_file(&helper);
     }
 }
