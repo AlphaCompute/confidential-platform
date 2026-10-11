@@ -4,7 +4,8 @@
 #
 # Shape:
 #   alpha-runtime   native sidecar: attests, holds the leaf, terminates TLS on :8443 and proxies
-#                   to vllm on 127.0.0.1:8000; writes the declared Secret file for vllm.
+#                   to vllm on 127.0.0.1:8000 (an address, not a name); writes the declared
+#                   Secret file for vllm.
 #   open-weights    init: alpha-weights opens the sealed weights into pod-VM memory under the
 #                   App's KMS-derived `weights` key.
 #   vllm            stock vLLM, bound to loopback only, accepting only model-server-bearer.
@@ -43,10 +44,6 @@ spec:
       runtimeClassName: kata-qemu-nvidia-gpu-tdx
       automountServiceAccountToken: false
       enableServiceLinks: false
-      # alpha-runtime dials the upstream by service name, as in a compose.
-      hostAliases:
-        - ip: 127.0.0.1
-          hostnames: ["vllm"]
       initContainers:
         - name: alpha-runtime
           image: ${RUNTIME_IMAGE}            # ghcr.io/alphacompute/alpha-runtime@sha256:...
@@ -58,8 +55,10 @@ spec:
               value: "${KMS_CA_SPKI_SHA256}"
             - name: ALPHACOMPUTE_KMS_REVISIONS
               value: "${KMS_REVISIONS}"
+            # The loopback address itself, never a name: /etc/hosts in the pod VM is written by
+            # the host and not measured, so a name could be pointed anywhere.
             - name: ALPHACOMPUTE_TLS_UPSTREAM
-              value: "vllm:8000"
+              value: "127.0.0.1:8000"
             - name: ALPHACOMPUTE_SECRETS
               value: '{"vllm":["model-server-bearer"]}'
           ports:
@@ -103,8 +102,10 @@ spec:
             limits:
               nvidia.com/pgpu: 1             # one whole GPU in CC mode, passed through to the pod VM
           readinessProbe:
-            # vLLM's own health on loopback; alpha-inference checks /v1/models over TLS itself.
-            httpGet: { path: /health, port: 8000, host: 127.0.0.1 }
+            # The kubelet probes from the node, so 127.0.0.1 would be the node's own loopback. The
+            # runtime's TLS port is the pod's only open port and answers once attested; whether
+            # vLLM serves the model is what alpha-inference checks over TLS before any use.
+            tcpSocket: { port: 8443 }
             periodSeconds: 10
             failureThreshold: 60
           volumeMounts:

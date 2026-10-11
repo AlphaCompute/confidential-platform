@@ -898,6 +898,11 @@ package agent_policy
             parse_upstream(Some("localhost:65535")).unwrap().as_deref(),
             Some("localhost:65535")
         );
+        // A pod VM's loopback by address: /etc/hosts there is written by the host.
+        assert_eq!(
+            parse_upstream(Some("127.0.0.1:8000")).unwrap().as_deref(),
+            Some("127.0.0.1:8000")
+        );
         for bad in [
             "web",
             "web:",
