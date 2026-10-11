@@ -182,6 +182,7 @@ fn doc() -> PlatformDocument {
             verifiers: vec![GpuVerifierKind::Nras],
             nras_url: None,
             hwmodels: Default::default(),
+            nras_keys: Default::default(),
         }),
     }
 }

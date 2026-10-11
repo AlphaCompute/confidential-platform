@@ -48,6 +48,7 @@ mod tests {
             verifiers: vec![GpuVerifierKind::FortanixCcm],
             nras_url: None,
             hwmodels: Default::default(),
+            nras_keys: Default::default(),
         };
         let error = ccm.verify(&[], &[0; 32], &policy).await.unwrap_err();
         assert_eq!(error.code(), "attestation_unknown");
