@@ -20,7 +20,8 @@ another App or another CA.
   "keys": {
     "records": { "kid": "<security object uuid>" },
     "index":   { "name": "search-index-key" }
-  }
+  },
+  "binding": "revision"
 }
 ```
 
@@ -29,6 +30,8 @@ another App or another CA.
   including the system roots.
 - Each key name is a lowercase path segment, like a Secret name, and maps to a DSM security
   object by `kid` or `name`.
+- `binding` is required: `revision` or `app`, the leaf name the customer's DSM App matches (see
+  below). There is no value that binds to the KMS CA alone.
 - Unknown fields are refused. A malformed value stops the runtime at start, like any other
   config error.
 
@@ -45,6 +48,7 @@ Or `RuntimeSocket::customer_key(name)` in `alpha-client`.
 |---|---|---|
 | 404 | `not_found` | The Revision declares no such key, or no DSM at all. |
 | 403 | `dsm_refused` | The DSM answered 401 or 403: its policy does not grant this App the key. |
+| 403 | `dsm_unbound` | The leaf does not carry the DNS name `binding` needs, so nothing was sent. |
 | 502 | `dsm_unavailable` | The DSM was unreachable or answered something else. |
 | 503 | `not_attested` | There is no valid leaf yet. |
 
@@ -70,17 +74,57 @@ customer's DSM sets its own posture, and PRD-06 question F6 settles what we requ
 
 ## What the customer configures in its DSM
 
-The customer's security admin owns all of this, not AlphaCompute:
+The customer's security admin owns all of this, not AlphaCompute.
 
-- An App whose credential is certificate based and trusts the AlphaCompute KMS CA (the CA in
-  the platform document).
-- The leaf carries two URI SANs:
-  - `alphacompute://<org>/<app>/<runtime key sha256>`
-  - `urn:alphacompute:revision:<compose hash>`
+### The App's credential: the KMS CA and one leaf name, never the CA alone
 
-  Binding the DSM App to a specific App or Revision through these is the customer's choice.
-  Whether DSM can match on URI SANs is part of Fortanix question F8. Until F8 is answered,
-  assume the binding is to the KMS CA only, and scope keys per DSM App.
+The KMS CA signs the leaf of every Instance of every organization, and the KMS nodes' own leaves.
+The DSM App uuid is not a secret either: it sits in the plaintext compose, which the host and the
+signer page show. A DSM App that trusted the KMS CA alone would therefore release this App's keys
+to anyone holding any KMS leaf, including another tenant's App or an App that AlphaCompute staff
+deploy as an ordinary tenant. That breaks the PRD-06 rule that AlphaCompute never controls key
+release, so it is not supported, not even for a pilot.
+
+The DSM App is a trusted-CA App with both:
+
+- the KMS CA as its trusted CA. It comes from the release-signed platform document, and
+  `alpha sign --check` prints it;
+- one DNS name of the leaf as the subject alternative name it requires:
+
+| `binding` | DNS name the DSM App matches | Who gets the keys |
+|---|---|---|
+| `revision` | `<hash hex 1-32>.<hash hex 33-64>.<app id>.<org id>.revision.alphacompute.invalid` | Instances of this Revision only. Add the next Revision's name to the DSM App before rolling it out. |
+| `app` | `<app id>.<org id>.app.alphacompute.invalid` | Instances of any Revision of this App that the tenant signed. |
+
+The KMS writes both names into every Instance leaf. It derives them from the same ids as the
+leaf's two URI SANs, `alphacompute://<org>/<app>/<runtime key sha256>` and
+`urn:alphacompute:revision:sha256:<hex>`, so they cannot disagree. They end in `.invalid`, so they
+never name a host. The org id, App id and compose hash are the ones the tenant approved. A 401
+`dsm_refused` message names the DNS name the leaf presented.
+
+Before it sends anything, `alpha-runtime` checks that the leaf it is about to present carries the
+name `binding` asks for, computed from the leaf's own URI SANs. A leaf without it, such as one
+from a KMS older than this change, is never presented, and every read answers 403 `dsm_unbound`.
+A compose without `binding` stops the runtime at start.
+
+### Open with Fortanix (F8): no pilot until it is answered
+
+Fortanix documents trusted-CA App authentication as matching a DNS name (the default), an IP
+address or a directory name. URI SANs are not on that list, which is why the leaf also carries
+DNS names. F8 must confirm, on the pilot customer's DSM version:
+
+1. that a trusted-CA App accepts a client certificate when any one of its DNS-name SANs equals
+   the configured name, even though the certificate also carries URI SANs and a second DNS name;
+2. that one App can list several names, so a new Revision can be added before the old one is
+   removed (Fortanix's DSM 5.6 release notes, February 2026, say it can).
+
+If DSM can match only a directory name, the KMS puts the same names in the leaf's subject instead,
+a small change in `issue_leaf`. If it can match neither, a per-organization issuing CA is needed
+before any pilot. No customer is onboarded until F8 confirms one of these, and trusting the KMS CA
+alone is never the fallback.
+
+### Permissions and onboarding checks
+
 - The EXPORT permission on each declared key, for that App only.
 - Onboarding checks, from PRD-06 "customer-controlled tenancy", verified at onboarding and
   quarterly:
