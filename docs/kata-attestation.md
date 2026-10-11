@@ -78,15 +78,16 @@ All optional, so documents already signed still parse and keep their meaning:
   "min_vbios_version": "97.00.82.00.01",
   "verifiers": ["nras"],
   "nras_url": "https://nras.attestation.nvidia.com",
-  "hwmodels": {"<NRAS hwmodel string for B300>": "B300"}
+  "hwmodels": {"<NRAS hwmodel string for B300>": "B300"},
+  "nras_keys": {"<kid>": {"kty": "EC", "crv": "P-384", "x": "<base64url>", "y": "<base64url>"}}
 }
 ```
 
-The document, its `policy`, its reference values and `gpu_policy` refuse fields they do not know, so `alpha sign` refuses a misspelled field (a reference value's `runtime_class`, say) rather than signing it to be ignored. The attestation result goes the other way: `coco` and its GPU entries accept fields they do not know, so runtimes keep renewing across a KMS upgrade that adds one. A reference value without `kind` is `prototype-tdx` and never matches Kata evidence (and vice versa). `verifiers` takes `nras`, `local` (after Dec 1) and `fortanix-ccm` (D1); every listed backend must pass. `hwmodels` maps NRAS's `hwmodel` claim to the model names above; a GPU whose string is not listed is refused, so the B300 string is added from the first capture rather than guessed.
+The document, its `policy`, its reference values and `gpu_policy` refuse fields they do not know, so `alpha sign` refuses a misspelled field (a reference value's `runtime_class`, say) rather than signing it to be ignored. The attestation result goes the other way: `coco` and its GPU entries accept fields they do not know, so runtimes keep renewing across a KMS upgrade that adds one. A reference value without `kind` is `prototype-tdx` and never matches Kata evidence (and vice versa). `verifiers` takes `nras`, `local` (after Dec 1) and `fortanix-ccm` (D1); every listed backend must pass. `hwmodels` maps NRAS's `hwmodel` claim to the model names above; a GPU whose string is not listed is refused, so the B300 string is added from the first capture rather than guessed. `nras_keys` pins NRAS's signing keys by `kid`, copied from NVIDIA's JWKS when the document is prepared: an NRAS token whose `kid` is not pinned, or that names none, is refused, and with no pinned key the `nras` backend refuses every GPU before calling NRAS. The backend never fetches NRAS's JWKS, so trust in a GPU verdict rests on the release signature, not on web-PKI TLS; when NRAS rotates its key, a new platform document pins the new one.
 
 ## GPU backends
 
-- `nras` (`alpha_attest::gpu::nras`): posts every GPU's report and certificate chain with the nonce, verifies the overall EAT and each per-GPU EAT (ES384 under NRAS's JWKS, issuer = `nras_url`, unexpired), ties each per-GPU token to the overall token's `submods` digest, and requires the overall result, the nonce, `measres: success`, the report signature, nonce match, RIM signatures, secure boot, debug disabled and CC mode. The claim names are confirmed against a B300 reply at M-B; any missing claim refuses.
+- `nras` (`alpha_attest::gpu::nras`): posts every GPU's report and certificate chain with the nonce, verifies the overall EAT and each per-GPU EAT (ES384 under the key `gpu_policy.nras_keys` pins for the token's `kid`, issuer = `nras_url`, unexpired), ties each per-GPU token to the overall token's `submods` digest, and requires the overall result, the nonce, `measres: success`, the report signature, nonce match, RIM signatures, secure boot, debug disabled and CC mode. The claim names are confirmed against a B300 reply at M-B; any missing claim refuses.
 - `fortanix-ccm` (`alpha_attest::gpu::ccm`): configured like any backend and refuses every GPU until Fortanix answers F8 with an API.
 - `local`: after Dec 1.
 
