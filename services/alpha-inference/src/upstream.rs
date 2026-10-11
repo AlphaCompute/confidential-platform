@@ -188,10 +188,11 @@ impl Upstream {
     /// `now` and `report_timeout` are injected so tests never wait out a real clock or a real
     /// network timeout.
     pub fn build(config: &Config, now: Clock, report_timeout: Duration) -> Result<Self, Error> {
+        // Only the models the external provider serves get a slot; ours are checked by `own`.
         let slots = config
-            .models
-            .iter()
-            .map(|model| (model.clone(), Mutex::new(None)))
+            .external_models()
+            .into_iter()
+            .map(|model| (model, Mutex::new(None)))
             .collect();
         Ok(Self {
             upstream_url: config.upstream_url.clone(),

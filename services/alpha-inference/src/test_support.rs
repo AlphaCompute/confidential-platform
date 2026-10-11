@@ -38,8 +38,10 @@ pub(crate) fn test_state(
         secrets: parking_lot::RwLock::new(crate::Secrets {
             provider_key: zeroize::Zeroizing::new(provider_key.to_string()),
             caller_bearer: zeroize::Zeroizing::new(caller_bearer.to_vec()),
+            model_server_bearer: zeroize::Zeroizing::new(String::new()),
         }),
         upstream,
+        own: crate::own::Servers::none(),
     })
 }
 
@@ -54,6 +56,7 @@ pub(crate) fn test_config(upstream_url: &str, models: &[&str]) -> crate::Config 
             tcb_statuses: vec!["UpToDate".into()],
             tolerated_advisories: vec![],
         },
+        model_servers: std::collections::BTreeMap::new(),
     }
 }
 
