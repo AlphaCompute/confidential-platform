@@ -32,7 +32,12 @@ pub async fn fetch(
     let signed: SignedDocument = reqwest::get(url)
         .await
         .and_then(|r| r.error_for_status())
-        .map_err(|e| Error::Connect(format!("platform document fetch: {e}")))?
+        .map_err(|e| {
+            Error::Connect(format!(
+                "platform document fetch: {}",
+                crate::error_chain(&e)
+            ))
+        })?
         .json()
         .await
         .map_err(|e| Error::Invalid(format!("platform document body: {e}")))?;

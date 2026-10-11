@@ -547,6 +547,22 @@ pub enum Probe {
     Silent(String),
 }
 
+/// The error and every cause under it: an HTTP client says why TLS refused a chain, or why the
+/// connection failed, only in a cause.
+pub fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = e.to_string();
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        let text = c.to_string();
+        if !out.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        cause = c.source();
+    }
+    out
+}
+
 /// One attempt, with its own short timeout; the deadline over many attempts is the caller's.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -567,7 +583,7 @@ pub async fn probe_instance(
         .map_err(|e| Error::Invalid(format!("http client: {e}")))?;
     let response = match http.get(url).send().await {
         Ok(response) => response,
-        Err(e) => return Ok(Probe::Silent(format!("{url}: {e}"))),
+        Err(e) => return Ok(Probe::Silent(format!("{url}: {}", error_chain(&e)))),
     };
     let leaf = response
         .extensions()
@@ -624,6 +640,29 @@ pub async fn fetch_node_evidence(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_error_chain_names_each_cause_once() {
+        #[derive(Debug)]
+        struct Layer(&'static str, Option<Box<Layer>>);
+        impl std::fmt::Display for Layer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Layer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_deref().map(|l| l as _)
+            }
+        }
+        let refused = Layer("connection refused", None);
+        let repeated = Layer("connect: connection refused", Some(Box::new(refused)));
+        let top = Layer("error sending request", Some(Box::new(repeated)));
+        assert_eq!(
+            super::error_chain(&top),
+            "error sending request: connect: connection refused"
+        );
+    }
+
     #[test]
     fn a_bearer_matches_only_itself() {
         assert!(super::bearer_matches(b"right", b"right"));

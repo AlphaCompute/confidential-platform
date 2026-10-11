@@ -18,6 +18,7 @@ pub mod deploy;
 pub mod instances;
 pub mod keyfile;
 pub mod node;
+pub mod probe;
 pub mod request;
 pub mod sign;
 

@@ -185,6 +185,19 @@ enum Command {
         method: reqwest::Method,
         path: String,
     },
+    /// Whether KMS nodes and App Endpoints are serving, judged as a client judges them: TLS 1.3
+    /// with X25519MLKEM768 and the chain pinned to the platform document's KMS CA, never the host
+    /// name. Prints `{"kms": [...], "apps": [...]}`; exits 1 when any target is not serving.
+    Probe {
+        /// KMS node URLs, whitespace-separated, repeatable: each must answer `/ready` unsealed with
+        /// a leaf naming the KMS and one of the document's `kms_revisions`.
+        #[arg(long, value_name = "URLS", required_unless_present = "app")]
+        kms: Vec<String>,
+        /// App Endpoints, whitespace-separated, repeatable, each `<url>=<revision>[,<revision>...]`:
+        /// each must present an Instance leaf from the KMS CA naming one of its Revisions.
+        #[arg(long, value_name = "ENDPOINTS", required_unless_present = "kms")]
+        app: Vec<String>,
+    },
     /// Hand one custodian's share to an attested sealed node.
     Unseal {
         #[arg(long)]
@@ -601,6 +614,22 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             }
             Ok(out)
         }
+        Command::Probe { kms, app } => {
+            let targets = alpha_cli::probe::targets(&kms, &app).map_err(Exit::Usage)?;
+            let doc = platform_document(config, now).await?;
+            let revisions = doc.kms_revisions.iter().map(|r| r.compose_hash).collect();
+            let (out, failed) = alpha_cli::probe::run(
+                &targets,
+                &doc.kms_ca_pem,
+                revisions,
+                alpha_client::system_time_provider(),
+            )
+            .await?;
+            if failed {
+                return Err(Exit::Partial(out));
+            }
+            Ok(out)
+        }
         Command::Unseal {
             share,
             key,
@@ -739,6 +768,27 @@ mod tests {
         assert!(!wrap(
             &[&["--app-id", "not-a-uuid"][..], &platform, &runtime].concat()
         ));
+    }
+
+    #[test]
+    fn probe_takes_kms_nodes_or_app_endpoints() {
+        let probe = |flags: &[&str]| Cli::try_parse_from(["alpha", "probe"].iter().chain(flags));
+        let app = format!("https://a.example=sha256:{}", "0".repeat(64));
+        assert!(probe(&["--kms", "https://kms.example"]).is_ok());
+        assert!(probe(&["--app", &app]).is_ok());
+        assert!(
+            probe(&[
+                "--kms",
+                "https://a https://b",
+                "--kms",
+                "https://c",
+                "--app",
+                &app
+            ])
+            .is_ok()
+        );
+        assert!(probe(&["--platform-document-url", "https://d", "--kms", ""]).is_ok());
+        assert!(probe(&[]).is_err());
     }
 
     #[test]
