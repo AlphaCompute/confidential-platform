@@ -51,6 +51,11 @@ impl IntoResponse for Error {
             Error::Dsm(alpha_dsm::Error::Undeclared(_)) => {
                 envelope(StatusCode::NOT_FOUND, "not_found", self.to_string())
             }
+            // The leaf does not name this App or Revision as the DSM App binds to: nothing was
+            // sent, because a DSM could check the leaf only against the shared KMS CA.
+            Error::Dsm(alpha_dsm::Error::Unbound(_)) => {
+                envelope(StatusCode::FORBIDDEN, "dsm_unbound", self.to_string())
+            }
             // The customer's DSM said no: its policy does not grant this Revision the key.
             Error::Dsm(alpha_dsm::Error::Refused { status, .. })
                 if status == 401 || status == 403 =>
@@ -136,6 +141,7 @@ mod dsm_tests {
         use alpha_dsm::Error::*;
         let status = |e: alpha_dsm::Error| Error::Dsm(e).into_response().status();
         assert_eq!(status(Undeclared("x".into())), StatusCode::NOT_FOUND);
+        assert_eq!(status(Unbound("no name".into())), StatusCode::FORBIDDEN);
         for refused in [401, 403] {
             let e = Refused {
                 status: refused,
