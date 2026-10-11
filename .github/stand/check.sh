@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# The stand's checks, one per job of .github/workflows/stand.yml. Each asks whether what it
-# watches is serving and fails when something is not, which is what makes GitHub send a
-# notification. A failing round is retried once after STAND_RETRY_SECONDS (120), because a copy
-# does not serve for a minute while it is being redeployed; only the second round's findings are
-# errors.
+# The stand's checks, one per job: prototype and owned in .github/workflows/stand.yml, site in
+# .github/workflows/stand-site.yml, apart because its self-hosted runner may keep it waiting. Each
+# asks whether what it watches is serving and fails when something is not, which is what makes
+# GitHub send a notification. A failing round is retried once after STAND_RETRY_SECONDS (120),
+# because a copy does not serve for a minute while it is being redeployed; only the second round's
+# findings are errors.
 #
 #   check.sh prototype  until M-D: every copy of each App in STAND_APPS serving, as the
 #                       prototype's shroud-go (STAND_SHROUD_URL) lists them under STAND_LIST_KEY
@@ -15,7 +16,7 @@
 #                       (STAND_PCCS_URL) serves the root CA CRL under the site CA
 #                       (STAND_SITE_CA_PEM)
 #
-# STAND_TARGET says which of them the workflow runs: prototype (the default), both, or owned.
+# STAND_TARGET says which of them the workflows run: prototype (the default), both, or owned.
 set -u -o pipefail
 # Lists are split on whitespace and never globbed.
 set -f

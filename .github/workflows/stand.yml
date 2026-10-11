@@ -25,11 +25,10 @@ name: stand
 #                                 shroud-go, ...), whitespace-separated, each
 #                                 <url>=<revision>[,<revision>...]: list a deploy's next Revision
 #                                 before it starts and drop the old one after
-# site, from M-D, from a self-hosted runner at the site, the only place the PCCS answers:
-#   STAND_SITE_RUNNER             the runner's label. The repository is public, so the runner's
-#                                 group must admit only this workflow on main
-#   STAND_PCCS_URL                the site PCCS, https://pccs.<site>:8081
-#   STAND_SITE_CA_PEM             the site CA the PCCS certificate chains to
+# site, from M-D: the PCCS check is stand-site.yml, a workflow of its own, because it runs on a
+# self-hosted runner at the site. A job waiting for a runner keeps its whole run in progress, and
+# GitHub notifies only when a run completes, so here an offline site runner would hold back the
+# alarms of both jobs above for up to a day. Every job in this workflow runs on a hosted runner.
 on:
   schedule:
     - cron: "*/15 * * * *"
@@ -85,19 +84,3 @@ jobs:
           STAND_KMS_ENDPOINTS: ${{ vars.STAND_KMS_ENDPOINTS }}
           STAND_APP_ENDPOINTS: ${{ vars.STAND_APP_ENDPOINTS }}
         run: bash .github/stand/check.sh owned
-
-  site:
-    if: vars.STAND_TARGET == 'owned' || vars.STAND_TARGET == 'both'
-    # Without the label this runs on a hosted runner only to fail and name the missing variable.
-    runs-on: ${{ vars.STAND_SITE_RUNNER || 'ubuntu-latest' }}
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - env:
-          STAND_TARGET: ${{ vars.STAND_TARGET }}
-          STAND_SITE_RUNNER: ${{ vars.STAND_SITE_RUNNER }}
-          STAND_PCCS_URL: ${{ vars.STAND_PCCS_URL }}
-          STAND_SITE_CA_PEM: ${{ vars.STAND_SITE_CA_PEM }}
-        run: bash .github/stand/check.sh site

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # check.sh against stand-ins for curl and alpha on PATH, with no network and no wait between
-# rounds: the variable guards, the retry, and what each check reports and runs. Needs bash and jq.
+# rounds: the variable guards, the retry, and what each check reports and runs; then which
+# workflow runs which check on which runner. Needs bash and jq.
 set -u -o pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -256,6 +257,20 @@ reply curl 1 7 "" "curl: (7) Failed to connect"
 run "${site[@]}" bash "$here/check.sh" site
 expect "a PCCS back within the retry passes" 0 "the PCCS did not serve the root CA CRL: curl: (7)"
 refute "  without an error" "::error::"
+
+# --- the workflows ------------------------------------------------------------------------------
+# A job waiting for a runner keeps its whole run in progress, and GitHub notifies only when a run
+# completes, so only stand-site.yml may wait for the self-hosted site runner.
+stand_yml=$(cat "$here/../workflows/stand.yml")
+site_yml=$(cat "$here/../workflows/stand-site.yml")
+that "every stand.yml job runs on a hosted runner" \
+  [ "$(grep 'runs-on:' <<<"$stand_yml" | sort -u)" = "    runs-on: ubuntu-latest" ]
+that "  and the site check is not one of them" lacks "$stand_yml" "check.sh site"
+that "stand-site.yml runs the site check" has "$site_yml" "run: bash .github/stand/check.sh site"
+that "  on the site runner's label" has "$site_yml" \
+  "runs-on: \${{ vars.STAND_SITE_RUNNER || 'ubuntu-latest' }}"
+that "  with at most one run waiting for it" has "$site_yml" \
+  $'concurrency:\n  group: stand-site\n  cancel-in-progress: true'
 
 echo
 if [ "$failures" -gt 0 ]; then

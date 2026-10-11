@@ -1,0 +1,51 @@
+name: stand-site
+
+# The stand's PCCS check, apart from the others in stand.yml because it is the one that runs on a
+# self-hosted runner at the site, the only place the PCCS answers. A job waiting for a runner
+# keeps its whole workflow run in progress, and GitHub notifies only when a run completes; beside
+# the hosted jobs, an offline, busy or not yet admitted site runner would hold back their alarms
+# too. Here only this check waits, and at most one run waits: a newer run cancels the waiting
+# one. A runner that never picks the job up raises no alarm of its own, so the infra pool's
+# monitoring must watch the runner itself.
+#
+# Every fifteen minutes the job asks whether the site PCCS serves the root CA CRL and fails when
+# it does not, which is what makes GitHub send a notification. The check is
+# .github/stand/check.sh site; a failing round is retried once after two minutes and only the
+# second round's findings are errors. The PCCS is on the path of every attestation: a quote whose
+# collateral cannot be fetched fails appraisal.
+#
+# It runs when STAND_TARGET (see stand.yml) is `both` or `owned`. Every variable must then be set;
+# an empty or whitespace-only one fails the run.
+#   STAND_SITE_RUNNER   the runner's label. The repository is public, so the runner's group must
+#                       admit only this workflow on main, as "Selected workflows":
+#                       AlphaCompute/confidential-platform/.github/workflows/stand-site.yml@refs/heads/main
+#                       and never pull_request workflows from forks
+#   STAND_PCCS_URL      the site PCCS, https://pccs.<site>:8081
+#   STAND_SITE_CA_PEM   the site CA the PCCS certificate chains to
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: stand-site
+  cancel-in-progress: true
+
+jobs:
+  site:
+    if: vars.STAND_TARGET == 'owned' || vars.STAND_TARGET == 'both'
+    # Without the label this runs on a hosted runner only to fail and name the missing variable.
+    runs-on: ${{ vars.STAND_SITE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          STAND_TARGET: ${{ vars.STAND_TARGET }}
+          STAND_SITE_RUNNER: ${{ vars.STAND_SITE_RUNNER }}
+          STAND_PCCS_URL: ${{ vars.STAND_PCCS_URL }}
+          STAND_SITE_CA_PEM: ${{ vars.STAND_SITE_CA_PEM }}
+        run: bash .github/stand/check.sh site
