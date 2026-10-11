@@ -3,7 +3,7 @@
 //! cases the KMS itself must refuse; exec, log reads and container changes are refused inside the
 //! guest by the agent policy and are tested on a live pod (PRD-02 §4).
 
-use alpha_core::coco::{InitData, REVISION_FORMAT};
+use alpha_core::coco::{CPU_RUNTIME_CLASS, GPU_RUNTIME_CLASS, InitData, REVISION_FORMAT};
 use alpha_core::{AppId, KmsRevision};
 
 use std::sync::Arc;
@@ -16,18 +16,19 @@ const SPKI: &[u8] = b"runtime spki";
 const NONCE: [u8; 32] = [3; 32];
 const XWING: &[u8] = b"node xwing";
 const APP: &str = "01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b";
-const CLASS: &str = "kata-qemu-nvidia-gpu-tdx";
+const CLASS: &str = GPU_RUNTIME_CLASS;
+const CPU_CLASS: &str = CPU_RUNTIME_CLASS;
 
 fn m(byte: u8) -> Measurement {
     Measurement([byte; 48])
 }
 
-fn initdata_text(policy: &str, gpu: Option<u32>) -> String {
+fn initdata_text(class: &str, policy: &str, gpu: Option<u32>) -> String {
     let gpu = gpu
         .map(|n| format!("\"gpu\":{{\"count\":{n},\"model\":\"B300\"}},"))
         .unwrap_or_default();
     format!(
-        "algorithm = \"sha384\"\nversion = \"0.1.0\"\n\n[data]\n\"policy.rego\" = '''\n{policy}'''\n\"alpha.json\" = '''{{\"app_id\":\"{APP}\",\"format\":\"alphacompute-initdata/1\",{gpu}\"runtime_class\":\"{CLASS}\"}}'''\n"
+        "algorithm = \"sha384\"\nversion = \"0.1.0\"\n\n[data]\n\"policy.rego\" = '''\n{policy}'''\n\"alpha.json\" = '''{{\"app_id\":\"{APP}\",\"format\":\"alphacompute-initdata/1\",{gpu}\"runtime_class\":\"{class}\"}}'''\n"
     )
 }
 
@@ -35,6 +36,7 @@ const POLICY: &str = "package agent_policy\ndefault ExecProcessRequest := false\
 
 struct Pod {
     initdata: String,
+    class: &'static str,
     gpus: u32,
     node: bool,
     aa_report_data: bool,
@@ -43,10 +45,32 @@ struct Pod {
 impl Pod {
     fn gpu(gpus: u32) -> Self {
         Self {
-            initdata: initdata_text(POLICY, Some(gpus)),
+            initdata: initdata_text(CLASS, POLICY, Some(gpus)),
+            class: CLASS,
             gpus,
             node: false,
             aa_report_data: false,
+        }
+    }
+
+    /// A CPU-only pod (KMS, broker, signer, guard, front, supervisor): no GPU section, no GPU.
+    fn cpu() -> Self {
+        Self {
+            initdata: initdata_text(CPU_CLASS, POLICY, None),
+            class: CPU_CLASS,
+            gpus: 0,
+            node: false,
+            aa_report_data: false,
+        }
+    }
+
+    /// MRTD and RTMR0..2 of the guest image the pod's runtime class boots: the CPU class's guest
+    /// has another kernel and initrd than the NVIDIA guest.
+    fn registers(&self) -> [Measurement; 4] {
+        if self.class == CPU_CLASS {
+            [m(1), m(2), m(13), m(14)]
+        } else {
+            [m(1), m(2), m(3), m(4)]
         }
     }
 
@@ -74,7 +98,7 @@ impl Pod {
                 })
                 .collect(),
             initdata: self.initdata.clone().into_bytes(),
-            runtime_class: CLASS.into(),
+            runtime_class: self.class.into(),
         }
     }
 
@@ -87,13 +111,14 @@ impl Pod {
         } else {
             expected
         };
+        let [mrtd, rtmr0, rtmr1, rtmr2] = self.registers();
         VerifiedQuote {
             report_data,
             measured: Measured {
-                mrtd: m(1),
-                rtmr0: m(2),
-                rtmr1: m(3),
-                rtmr2: m(4),
+                mrtd,
+                rtmr0,
+                rtmr1,
+                rtmr2,
                 rtmr3: m(5),
                 mrconfigid: None,
             },
@@ -160,17 +185,30 @@ fn doc() -> PlatformDocument {
             tcb_statuses: vec!["UpToDate".into()],
             tolerated_advisories: Vec::new(),
         },
-        reference_values: vec![ReferenceValue {
-            name: "nvidia-uvm-tdx/b300x8".into(),
-            kind: ReferenceKind::KataTdx,
-            runtime_class: Some(CLASS.into()),
-            values: ReferenceMeasurements {
-                mrtd: m(1),
-                rtmr0: m(2),
-                rtmr1: m(3),
-                rtmr2: m(4),
+        reference_values: vec![
+            ReferenceValue {
+                name: "nvidia-uvm-tdx/b300x8".into(),
+                kind: ReferenceKind::KataTdx,
+                runtime_class: Some(CLASS.into()),
+                values: ReferenceMeasurements {
+                    mrtd: m(1),
+                    rtmr0: m(2),
+                    rtmr1: m(3),
+                    rtmr2: m(4),
+                },
             },
-        }],
+            ReferenceValue {
+                name: "kata-tdx/cpu".into(),
+                kind: ReferenceKind::KataTdx,
+                runtime_class: Some(CPU_CLASS.into()),
+                values: ReferenceMeasurements {
+                    mrtd: m(1),
+                    rtmr0: m(2),
+                    rtmr1: m(13),
+                    rtmr2: m(14),
+                },
+            },
+        ],
         kms_ca_pem: String::new(),
         kms_revisions: Vec::new(),
         signer: None,
@@ -240,16 +278,26 @@ fn attestation_agent_report_data_form_binds_too() {
 }
 
 #[test]
-fn cpu_only_pod_needs_no_gpu_policy() {
-    let pod = Pod {
-        initdata: initdata_text(POLICY, None),
-        ..Pod::gpu(0)
-    };
+fn cpu_class_pod_is_appraised_to_its_revision_v2_without_a_gpu_policy() {
+    let pod = Pod::cpu();
     let mut doc = doc();
     doc.gpu_policy = None;
     let appraised = pod.appraise(&doc).unwrap();
+    assert_eq!(appraised.compose_hash, pod.revision_hash());
+    assert_eq!(appraised.os_image, "kata-tdx/cpu");
     let coco = appraised.coco.unwrap();
+    assert_eq!(coco.runtime_class, CPU_CLASS);
     assert!(coco.gpus.is_empty() && coco.gpu_verifiers.is_empty());
+    let revision = InitData::parse(pod.initdata.as_bytes())
+        .unwrap()
+        .revision()
+        .unwrap();
+    assert_eq!(revision.gpu, None);
+    let app: AppId = APP.parse().unwrap();
+    assert_eq!(
+        alpha_core::check_registration(&revision.canonical().unwrap(), app).unwrap(),
+        appraised.compose_hash
+    );
 }
 
 #[test]
@@ -286,7 +334,7 @@ fn init_data_swapped_after_policy_generation_is_refused() {
         format!("{POLICY}mounts := [\"/host\"]\n"),
     ] {
         let mut evidence = pod.evidence();
-        evidence.initdata = initdata_text(&changed, Some(1)).into_bytes();
+        evidence.initdata = initdata_text(CLASS, &changed, Some(1)).into_bytes();
         refused(
             pod.appraise_with(&evidence, pod.quote(), &doc(), &pod.gpu_results()),
             "attestation_failed",
@@ -418,7 +466,7 @@ fn several_faults_are_refused_for_the_first_in_the_plans_order() {
     let mut quote = pod.quote();
     quote.report_data = report_data(SPKI, &[4; 32], None);
     let mut evidence = pod.evidence();
-    evidence.initdata = initdata_text("package other\n", Some(1)).into_bytes();
+    evidence.initdata = initdata_text(CLASS, "package other\n", Some(1)).into_bytes();
     refused(
         pod.appraise_with(&evidence, quote, &doc(), &pod.gpu_results()),
         "attestation_failed",
@@ -618,6 +666,7 @@ async fn gpu_backends_run_only_after_every_td_check_passed() {
     );
     let mut swapped = pod.evidence();
     swapped.initdata = initdata_text(
+        CLASS,
         "package other
 ",
         Some(8),
@@ -652,10 +701,7 @@ async fn gpu_backends_run_only_after_every_td_check_passed() {
     assert_eq!(calls(), 1);
 
     // A CPU-only pod never calls a backend.
-    let cpu = Pod {
-        initdata: initdata_text(POLICY, None),
-        ..Pod::gpu(0)
-    };
+    let cpu = Pod::cpu();
     run(cpu.evidence(), cpu.quote(), doc()).await.unwrap();
     assert_eq!(calls(), 1);
 }
