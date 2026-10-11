@@ -9,8 +9,9 @@
 //!
 //! Before a model is used, and at most once a minute, `/v1/models` is read over the pinned
 //! connection: the server must list the model, and the Revision the leaf carried is logged, so an
-//! operator can see which measured build served the model. A failure leaves the model unverified
-//! until the next check; nothing falls back to another provider on its own.
+//! operator can see which measured build served the model. Every completion logs the Revision of
+//! the leaf on its own connection too. A failure leaves the model unverified until the next
+//! check; nothing falls back to another provider on its own.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -22,8 +23,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::Error;
 use crate::upstream::Clock;
+use crate::{COMPLETION_TIMEOUT, Error};
 
 /// A check is trusted for one minute, as for the external provider.
 const VERIFIED_TTL: Duration = Duration::from_secs(60);
@@ -261,7 +262,9 @@ impl Servers {
     }
 
     /// `POST /v1/chat/completions` on `model`'s server over the pinned client, the body as the
-    /// caller sent it and the model-server bearer in place of the caller's.
+    /// caller sent it and the model-server bearer in place of the caller's. The whole exchange,
+    /// body included, ends after [`COMPLETION_TIMEOUT`]; the Revision of the leaf that served it
+    /// is logged.
     pub async fn complete(
         &self,
         model: &str,
@@ -272,15 +275,23 @@ impl Servers {
             .servers
             .get(model)
             .ok_or_else(|| Error::internal(format!("{model} has no model server")))?;
-        server
+        let response = server
             .client
             .post(format!("{}/v1/chat/completions", server.origin))
             .bearer_auth(bearer)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .timeout(COMPLETION_TIMEOUT)
             .body(body)
             .send()
             .await
-            .map_err(|_| Error::Upstream)
+            .map_err(|_| Error::Upstream)?;
+        // Fixed labels only, as for the check: the model, the Revision and the status.
+        eprintln!(
+            "alpha-inference: model {model} completion served by alphacompute revision {} status={}",
+            served_revision(&response).map_or_else(|| "unknown".to_owned(), |r| r.to_string()),
+            response.status().as_u16()
+        );
+        Ok(response)
     }
 }
 
@@ -490,6 +501,8 @@ mod tests {
             .await
             .unwrap();
         assert!(response.status().is_success());
+        // What the per-completion log line names: the Revision of this connection's leaf.
+        assert_eq!(served_revision(&response), Some(rev));
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
