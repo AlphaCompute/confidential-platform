@@ -48,16 +48,38 @@ async fn run() -> Result<Exit, Error> {
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).map_err(|e| Error::Key(format!("rng: {e}")))?;
     let key = SigningKey::from_bytes(&seed.into()).map_err(|e| Error::Key(e.to_string()))?;
-    let app_compose =
-        alpha_tsm::app_compose().map_err(|e| Error::Evidence(format!("app_compose: {e}")))?;
+    let guest = alpha_runtime::parse_guest(
+        std::env::var(alpha_runtime::QUOTE_SOURCE_ENV).ok().as_deref(),
+    )?;
+    let (app_compose, evidence, initdata) = match guest {
+        alpha_runtime::Guest::Prototype => (
+            alpha_tsm::app_compose().map_err(|e| Error::Evidence(format!("app_compose: {e}")))?,
+            alpha_runtime::tsm_evidence(),
+            None,
+        ),
+        alpha_runtime::Guest::Coco(source) => {
+            let initdata =
+                alpha_tsm::coco::initdata(Path::new(alpha_tsm::coco::INITDATA_PATH))
+                    .map_err(|e| Error::Evidence(format!("init-data: {e}")))?;
+            let coco = alpha_runtime::coco_identity(
+                source,
+                initdata,
+                PathBuf::from(alpha_tsm::coco::GPU_EVIDENCE_HELPER),
+            )?;
+            (coco.revision, coco.evidence, Some(coco.initdata))
+        }
+    };
     let runtime = Runtime::new(
         config,
         &key,
         Arc::new(SystemTime::now),
-        alpha_runtime::tsm_evidence(),
+        evidence,
         alpha_client::system_time_provider(),
         app_compose,
     )?;
+    if let Some(initdata) = initdata {
+        runtime.set_initdata(initdata);
+    }
     let attested = runtime.attest().await?;
     eprintln!(
         "alpha-runtime: attested as app {} revision {} until {}",

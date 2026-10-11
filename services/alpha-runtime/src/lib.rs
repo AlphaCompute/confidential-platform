@@ -21,10 +21,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use alpha_attest::{AttestationResult, EVIDENCE_FORMAT, Evidence};
+use alpha_attest::{AnyEvidence, AttestationResult, EVIDENCE_FORMAT, Evidence};
 use alpha_client::tls::{self, InstanceSans};
 use alpha_client::{
     AttestReply, AttestRequest, Client, DerivedKey, Identity, Pin, Secret, TimeProvider,
@@ -290,16 +290,87 @@ pub enum Delivery {
 
 pub type Clock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 
-/// A quote over `report_data` and the event log behind it; the guest agent in `main`, a capture in tests.
-pub type EvidenceSource = Arc<dyn Fn(&[u8; 64]) -> Result<Evidence, String> + Send + Sync>;
+/// A quote over `report_data` and the evidence behind it; the guest in `main`, a capture in tests.
+pub type EvidenceSource = Arc<dyn Fn(&[u8; 64]) -> Result<AnyEvidence, String> + Send + Sync>;
 
+/// The prototype CVM: the guest agent's quote and the replayable event log.
 pub fn tsm_evidence() -> EvidenceSource {
     Arc::new(|report_data| {
         Ok(Evidence {
             format: EVIDENCE_FORMAT.into(),
             quote: alpha_tsm::quote(report_data).map_err(|e| e.to_string())?,
             event_log: alpha_tsm::event_log().map_err(|e| e.to_string())?,
-        })
+        }
+        .into())
+    })
+}
+
+/// `ALPHACOMPUTE_QUOTE_SOURCE`: unset or `dstack` for the prototype CVM, `coco-aa` or `coco-tsm`
+/// for a Kata confidential pod. The agent policy pins it with the rest of the container's env.
+pub const QUOTE_SOURCE_ENV: &str = "ALPHACOMPUTE_QUOTE_SOURCE";
+
+/// Which guest this runtime is in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Guest {
+    Prototype,
+    Coco(alpha_tsm::coco::QuoteSource),
+}
+
+pub fn parse_guest(var: Option<&str>) -> Result<Guest, Error> {
+    use alpha_tsm::coco::QuoteSource::*;
+    match var {
+        None | Some("dstack") => Ok(Guest::Prototype),
+        Some("coco-aa") => Ok(Guest::Coco(AttestationAgent)),
+        Some("coco-tsm") => Ok(Guest::Coco(ConfigfsTsm)),
+        Some(other) => Err(Error::Config(format!(
+            "{QUOTE_SOURCE_ENV}={other:?} is not dstack, coco-aa or coco-tsm"
+        ))),
+    }
+}
+
+/// What a Kata pod's runtime knows about itself before attesting: the init-data it booted with,
+/// the Revision v2 that init-data stands for (served as `app_compose`, whose hash the leaf must
+/// name), and its evidence source.
+pub struct CocoIdentity {
+    pub initdata: Vec<u8>,
+    pub revision: String,
+    pub evidence: EvidenceSource,
+}
+
+pub fn coco_identity(
+    quote: alpha_tsm::coco::QuoteSource,
+    initdata: Vec<u8>,
+    gpu_helper: PathBuf,
+) -> Result<CocoIdentity, Error> {
+    let parsed = alpha_core::coco::InitData::parse(&initdata)
+        .map_err(|e| Error::Evidence(format!("init-data: {e}")))?;
+    let revision = parsed
+        .revision()
+        .map_err(|e| Error::Evidence(format!("init-data: {e}")))?;
+    let canonical = revision
+        .canonical()
+        .map_err(|e| Error::Evidence(e.to_string()))?;
+    let gpu_count = revision
+        .gpu
+        .as_ref()
+        .map_or(Ok(0), |g| usize::try_from(g.count))
+        .map_err(|_| Error::Evidence("gpu count".into()))?;
+    let source = alpha_tsm::coco::Source {
+        quote,
+        initdata: initdata.clone(),
+        runtime_class: revision.runtime_class,
+        gpu_count,
+        gpu_helper,
+    };
+    Ok(CocoIdentity {
+        initdata,
+        revision: canonical,
+        evidence: Arc::new(move |report_data| {
+            source
+                .evidence(report_data)
+                .map(Into::into)
+                .map_err(|e| e.to_string())
+        }),
     })
 }
 
@@ -331,8 +402,11 @@ pub struct Runtime {
     clock: Clock,
     time: TimeProvider,
     evidence: EvidenceSource,
-    /// The guest agent's; served to the tenant's services only once a leaf names its hash.
+    /// The guest agent's (prototype) or the Revision v2 rebuilt from the init-data (Kata); served
+    /// to the tenant's services only once a leaf names its hash.
     app_compose: String,
+    /// A Kata pod's init-data, served beside `app_compose` in `/v1/identity`.
+    initdata: OnceLock<Vec<u8>>,
     kms: Client,
     attested: RwLock<Option<Arc<Attested>>>,
     revoked: watch::Sender<bool>,
@@ -368,6 +442,7 @@ impl Runtime {
             time,
             evidence,
             app_compose,
+            initdata: OnceLock::new(),
             kms,
             attested: RwLock::new(None),
             revoked: watch::Sender::new(false),
@@ -388,6 +463,15 @@ impl Runtime {
 
     pub fn tls_private_key(&self) -> &[u8] {
         &self.pkcs8
+    }
+
+    /// Records a Kata pod's init-data for `/v1/identity`; set once, before serving.
+    pub fn set_initdata(&self, initdata: Vec<u8>) {
+        let _ = self.initdata.set(initdata);
+    }
+
+    pub fn initdata(&self) -> Option<&[u8]> {
+        self.initdata.get().map(Vec::as_slice)
     }
 
     pub fn is_revoked(&self) -> bool {
@@ -462,7 +546,7 @@ impl Runtime {
             .map_err(alpha_client::Error::from)?;
         if alpha_core::compose_hash(&self.app_compose) != identity.compose_hash {
             return Err(Error::Certificate(
-                "the guest agent's app_compose is not the leaf's Revision".into(),
+                "this guest's app_compose (compose or Revision v2) is not the leaf's Revision".into(),
             ));
         }
         let certified =
@@ -687,6 +771,43 @@ mod tests {
     use super::*;
 
     const HASH: &str = "sha256:ee097e09c4824eb6424202fe20ed882d19a33a563f3b3dd5988f3ff8ee1b8335";
+
+    #[test]
+    fn quote_source_selects_the_guest() {
+        use alpha_tsm::coco::QuoteSource::*;
+        assert_eq!(parse_guest(None).unwrap(), Guest::Prototype);
+        assert_eq!(parse_guest(Some("dstack")).unwrap(), Guest::Prototype);
+        assert_eq!(parse_guest(Some("coco-aa")).unwrap(), Guest::Coco(AttestationAgent));
+        assert_eq!(parse_guest(Some("coco-tsm")).unwrap(), Guest::Coco(ConfigfsTsm));
+        let error = parse_guest(Some("tdx")).unwrap_err().to_string();
+        assert!(error.contains(QUOTE_SOURCE_ENV), "{error}");
+    }
+
+    const INITDATA: &str = r#"algorithm = "sha384"
+version = "0.1.0"
+
+[data]
+"policy.rego" = '''
+package agent_policy
+'''
+"alpha.json" = '''{"app_id":"01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b","format":"alphacompute-initdata/1","gpu":{"count":8,"model":"B300"},"runtime_class":"kata-qemu-nvidia-gpu-tdx"}'''
+"#;
+
+    #[test]
+    fn a_kata_pod_serves_the_revision_v2_its_initdata_stands_for() {
+        let source = alpha_tsm::coco::QuoteSource::ConfigfsTsm;
+        let none = PathBuf::from("/nonexistent");
+        let coco = coco_identity(source, INITDATA.as_bytes().to_vec(), none.clone()).unwrap();
+        let expected = alpha_core::coco::InitData::parse(INITDATA.as_bytes())
+            .unwrap()
+            .revision()
+            .unwrap();
+        assert_eq!(coco.revision, expected.canonical().unwrap());
+        assert_eq!(coco.initdata, INITDATA.as_bytes());
+        // No TSM tree here: the source fails at the pod rather than sending something partial.
+        assert!((coco.evidence)(&[0; 64]).is_err());
+        assert!(coco_identity(source, b"not toml".to_vec(), none).is_err());
+    }
 
     #[test]
     fn config_parses_the_three_variables_and_refuses_empty_or_malformed_ones() {
