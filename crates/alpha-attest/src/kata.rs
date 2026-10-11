@@ -1,25 +1,29 @@
-//! `alphacompute-evidence/2` and the `kata-tdx/1` profile: a Kata confidential pod on TDX with
-//! the NVIDIA guest image and passed-through GPUs.
+//! `alphacompute-evidence/2` and the `kata-tdx/1` profile: a Kata confidential pod on TDX, either
+//! CPU-only (`kata-qemu-tdx`) or with the NVIDIA guest image and passed-through GPUs
+//! (`kata-qemu-nvidia-gpu-tdx`).
 //!
 //! The steps, in the plan's order (PRD-02 R5), after DCAP and the TCB policy that
-//! [`crate::verify_quote`] already runs: (event log replay, when sent) → MRTD and RTMR0..2 match a
-//! reference value of kind `kata-tdx` for the pod's runtime class → MRCONFIGID equals the
-//! init-data's digest → the init-data parses, carries a policy and our entry → the evidence's
-//! runtime class is the init-data's → report_data binds this key and nonce, last of the TD checks
-//! → the Revision v2 rebuilt from the init-data (for a KMS node, found in `kms_revisions`) → every
-//! expected GPU passed. Every step is mandatory; the order only decides which reason a refusal of
-//! evidence with several faults names.
+//! [`crate::verify_quote`] already runs: (event log replay, when sent) → the pod's runtime class
+//! is one a Revision v2 may name → MRTD and RTMR0..2 match a reference value of kind `kata-tdx`
+//! captured for that runtime class → MRCONFIGID equals the init-data's digest → the init-data
+//! parses, carries a policy and our entry → the evidence's runtime class is the init-data's →
+//! report_data binds this key and nonce, last of the TD checks → the Revision v2 rebuilt from the
+//! init-data (for a KMS node, found in `kms_revisions`) → GPUs by runtime class: on the GPU class
+//! every expected GPU passed, on the CPU class no GPU was presented or verified. Every step is
+//! mandatory; the order only decides which reason a refusal of evidence with several faults names.
 
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use alpha_core::ComposeHash;
-use alpha_core::coco::{GpuShape, InitData};
+use alpha_core::coco::{CPU_RUNTIME_CLASS, GpuShape, InitData, RuntimeClass};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::gpu::{self, GpuAppraisal, GpuEvidence, GpuPolicy, GpuVerifier, GpuVouch, VerifiedGpu};
+use crate::gpu::{
+    self, CheckedGpus, GpuAppraisal, GpuEvidence, GpuPolicy, GpuVerifier, GpuVouch, VerifiedGpu,
+};
 use crate::{
     AppraisalError, Appraised, Collateral, EVIDENCE_FORMAT, EVIDENCE_FORMAT_V2, EventLogEntry,
     Evidence, Measurement, PlatformDocument, ReferenceKind, VerifiedQuote, base64url, event_log,
@@ -138,8 +142,9 @@ pub struct CocoAppraised {
 
 /// The appraisal of either evidence format. For `alphacompute-evidence/2` every TD check runs
 /// first; the GPU backends (the one network step, e.g. NRAS) are called only after they all pass
-/// and only when the Revision expects GPUs, so evidence that fails on the CPU side never costs a
-/// verifier call. v1 evidence has no GPUs and never calls a backend.
+/// and only for a pod on the GPU runtime class, so evidence that fails on the CPU side never costs
+/// a verifier call and a CPU-class pod never causes one. v1 evidence has no GPUs and never calls a
+/// backend.
 #[allow(clippy::too_many_arguments)]
 pub async fn appraise_any(
     evidence: &AnyEvidence,
@@ -205,8 +210,8 @@ pub fn report_data_binds(quoted: &[u8; 64], expected: &[u8; 64]) -> bool {
 }
 
 /// `kata-tdx/1` over a quote [`crate::verify_quote`] has already verified: [`appraise_kata_cpu`],
-/// then, only if it passed and the Revision expects GPUs, every backend the `gpu_policy` lists,
-/// then [`CpuAppraised::finish`].
+/// then, only if it passed and the pod is on the GPU runtime class, every backend the
+/// `gpu_policy` lists, then [`CpuAppraised::finish`].
 pub async fn appraise_kata_tdx(
     evidence: &EvidenceV2,
     verified: VerifiedQuote,
@@ -239,15 +244,35 @@ pub async fn appraise_kata_tdx(
 #[derive(Debug)]
 pub struct CpuAppraised {
     appraised: Appraised,
-    gpu: Option<GpuShape>,
+    gpus: ClassGpus,
     gpu_evidence: usize,
     gpu_nonce: [u8; 32],
 }
 
+/// The GPUs the pod's runtime class (from the measured init-data) allows: none on the CPU class,
+/// exactly the Revision's on the GPU class. No other combination can be built.
+#[derive(Debug)]
+enum ClassGpus {
+    Cpu,
+    Gpu(GpuShape),
+}
+
 impl CpuAppraised {
-    /// The GPUs the Revision expects; `None` means no GPU backend is to run.
+    /// The pod's runtime class, as its measured init-data names it.
+    pub fn runtime_class(&self) -> RuntimeClass {
+        match self.gpus {
+            ClassGpus::Cpu => RuntimeClass::Cpu,
+            ClassGpus::Gpu(_) => RuntimeClass::Gpu,
+        }
+    }
+
+    /// The GPUs the Revision expects. `None` only for the CPU runtime class, and then no GPU
+    /// backend is to run.
     pub fn gpu_shape(&self) -> Option<&GpuShape> {
-        self.gpu.as_ref()
+        match &self.gpus {
+            ClassGpus::Cpu => None,
+            ClassGpus::Gpu(shape) => Some(shape),
+        }
     }
 
     /// What every GPU report must be over: [`gpu::gpu_nonce`] of the verified `report_data`.
@@ -255,20 +280,24 @@ impl CpuAppraised {
         &self.gpu_nonce
     }
 
-    /// The GPU decision over the backends' results ([`gpu::check_gpus`], pure), completing the
-    /// appraisal.
+    /// The GPU decision over the backends' results, completing the appraisal. On the GPU class
+    /// it is [`gpu::check_gpus`] (pure) over the Revision's shape. The CPU class is the only one
+    /// whose GPU checks are skipped: there is no GPU to check, and GPU evidence from the pod, or
+    /// a GPU a backend verified for it, is refused, never ignored.
     pub fn finish(
         self,
         policy: Option<&GpuPolicy>,
         gpus: &[GpuAppraisal],
     ) -> Result<Appraised, AppraisalError> {
-        let checked = gpu::check_gpus(
-            policy,
-            self.gpu.as_ref(),
-            self.gpu_evidence,
-            gpus,
-            &self.gpu_nonce,
-        )?;
+        let checked = match &self.gpus {
+            ClassGpus::Cpu => {
+                no_gpus(self.gpu_evidence, gpus)?;
+                CheckedGpus::default()
+            }
+            ClassGpus::Gpu(shape) => {
+                gpu::check_gpus(policy, shape, self.gpu_evidence, gpus, &self.gpu_nonce)?
+            }
+        };
         let mut appraised = self.appraised;
         if let Some(coco) = appraised.coco.as_mut() {
             coco.gpus = checked.gpus;
@@ -308,15 +337,25 @@ pub fn appraise_kata_cpu(
         }
     }
 
-    // The runtime class here is the pod's claim; it is held to the measured init-data's below, so
-    // a value listed for another class is never the one chosen.
-    let class = evidence.runtime_class.as_str();
+    // The runtime class here is the pod's claim, held to the measured init-data's below. It must
+    // be a class a Revision v2 may name: it picks the reference value and decides whether GPUs
+    // are checked.
+    let class = RuntimeClass::from_name(&evidence.runtime_class).ok_or_else(|| {
+        Failed(format!(
+            "runtime class {:?} is not supported",
+            evidence.runtime_class
+        ))
+    })?;
+    // The guest image must be one captured for that class. A value for the other class, or one
+    // that names no class, never stands in, so a TD booted from the NVIDIA guest image cannot pass
+    // as the CPU class (whose GPU checks are skipped), nor the CPU guest as the GPU class, provided
+    // the two guests' captured registers differ (confirmed at capture).
     let reference = doc
         .reference_values
         .iter()
         .find(|rv| {
             rv.kind == ReferenceKind::KataTdx
-                && rv.runtime_class.as_deref().is_none_or(|c| c == class)
+                && rv.runtime_class.as_deref() == Some(class.name())
                 && rv.values.mrtd == measured.mrtd
                 && rv.values.rtmr0 == measured.rtmr0
                 && rv.values.rtmr1 == measured.rtmr1
@@ -324,8 +363,9 @@ pub fn appraise_kata_cpu(
         })
         .ok_or_else(|| {
             Unknown(format!(
-                "no kata-tdx reference value for mrtd {} and runtime class {class}",
-                measured.mrtd
+                "no kata-tdx reference value for mrtd {} and runtime class {}",
+                measured.mrtd,
+                class.name()
             ))
         })?;
 
@@ -346,6 +386,23 @@ pub fn appraise_kata_cpu(
             evidence.runtime_class, revision.runtime_class
         )));
     }
+    // The class decides the GPUs. `InitData::revision` already holds each class to its gpu
+    // section; held again here, so nothing can turn the GPU class's checks into the CPU class's.
+    let gpus = match (class, &revision.gpu) {
+        (RuntimeClass::Cpu, None) => ClassGpus::Cpu,
+        (RuntimeClass::Gpu, Some(shape)) => ClassGpus::Gpu(shape.clone()),
+        (RuntimeClass::Cpu, Some(_)) => {
+            return Err(Failed(format!(
+                "init-data: runtime class {CPU_RUNTIME_CLASS} runs no GPU"
+            )));
+        }
+        (RuntimeClass::Gpu, None) => {
+            return Err(Failed(format!(
+                "init-data: runtime class {} names no GPU",
+                class.name()
+            )));
+        }
+    };
 
     // Last of the TD checks, as the plan orders them (PRD-02 R5e).
     let expected = report_data(runtime_pubkey_spki, nonce, node_xwing_spki);
@@ -397,10 +454,28 @@ pub fn appraise_kata_cpu(
     };
     Ok(CpuAppraised {
         appraised,
-        gpu: revision.gpu,
+        gpus,
         gpu_evidence: evidence.gpus.len(),
         gpu_nonce: gpu::gpu_nonce(&expected),
     })
+}
+
+/// The CPU runtime class runs no GPU. GPU evidence from such a pod, or a GPU a backend verified
+/// for it, is a device its Revision does not expect: refused, never ignored.
+fn no_gpus(evidence_count: usize, appraisals: &[GpuAppraisal]) -> Result<(), AppraisalError> {
+    if evidence_count != 0 {
+        return Err(AppraisalError::Failed(format!(
+            "{evidence_count} GPU evidence entries from a pod of runtime class {CPU_RUNTIME_CLASS}, which runs no GPU"
+        )));
+    }
+    if let Some(appraisal) = appraisals.iter().find(|a| !a.gpus.is_empty()) {
+        return Err(AppraisalError::Failed(format!(
+            "gpu verifier {:?} verified {} GPUs for a pod of runtime class {CPU_RUNTIME_CLASS}, which runs no GPU",
+            appraisal.verifier,
+            appraisal.gpus.len()
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

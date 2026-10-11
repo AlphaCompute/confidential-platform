@@ -147,7 +147,7 @@ pub struct PlatformDocument {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_key: Option<CatalogKey>,
     /// What a GPU must prove before a Kata pod that expects GPUs gets a leaf. Absent, no Revision
-    /// with a `gpu` shape can attest.
+    /// on the GPU runtime class can attest; pods on the CPU class never need it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_policy: Option<GpuPolicy>,
 }
@@ -167,8 +167,9 @@ pub struct ReferenceValue {
     /// none, and every value in it is a prototype guest's.
     #[serde(default, skip_serializing_if = "ReferenceKind::is_prototype")]
     pub kind: ReferenceKind,
-    /// For a Kata guest: the runtime class whose guest image these are. A Revision naming another
-    /// class does not match.
+    /// For a Kata guest: the runtime class whose guest image these are (`kata-qemu-tdx` or
+    /// `kata-qemu-nvidia-gpu-tdx`). Required for `kata-tdx`: a value without one, or naming
+    /// another class, never matches a pod, since the class decides whether GPUs are checked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_class: Option<String>,
     pub values: ReferenceMeasurements,
@@ -180,7 +181,7 @@ pub enum ReferenceKind {
     /// The prototype CVM guest: `alphacompute-evidence/1`.
     #[default]
     PrototypeTdx,
-    /// A Kata pod VM on TDX with the NVIDIA guest image: `kata-tdx/1`.
+    /// A Kata pod VM on TDX, the CPU guest or the NVIDIA guest per `runtime_class`: `kata-tdx/1`.
     KataTdx,
     /// A Kata pod VM on SEV-SNP (PRD-02 P2; no profile appraises it yet).
     KataSnp,

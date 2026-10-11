@@ -53,13 +53,15 @@ Any other class is refused at registration and at appraisal (`kata-qemu-nvidia-g
 }
 ```
 
-`event_log` (the CCEL boot events) is optional; when sent, RTMR0..2 must replay from it. `runtime_class` is the pod's own claim and is refused unless it equals the measured init-data's. `kind: "snp"` is refused until the `kata-snp/1` profile exists.
+`event_log` (the CCEL boot events) is optional; when sent, RTMR0..2 must replay from it. `runtime_class` is the pod's own claim: a class no Revision v2 may name is refused, and any other claim is refused unless it equals the measured init-data's. `kind: "snp"` is refused until the `kata-snp/1` profile exists.
+
+A pod on `kata-qemu-tdx` sends no GPU evidence (`gpus` empty or absent). If it sends any, the appraisal refuses it once the TD checks have passed, without calling a GPU backend, and it refuses a GPU that a backend verified for such a pod the same way: GPU evidence from a CPU pod is refused, never ignored. *(PR 5)* The KMS will refuse it through `appraise_any`.
 
 The quote's `report_data` binds the runtime key and the KMS nonce exactly as for the prototype (`SHA-256(SPKI ‖ nonce)`, then `SHA-256(xwing)` or zeros). Two encodings are accepted: the 64 bytes themselves (configfs-tsm), or the 64 ASCII bytes of lowercase hex `SHA-256(report_data)`, which is how runtime data passes through the CoCo attestation agent's REST API. Both need the same preimage.
 
 Every GPU report is bound to `SHA-256("alphacompute/gpu-nonce/v1" ‖ report_data)`.
 
-In the pod, `alpha-runtime` (`alpha_tsm::coco`) takes the quote from the CoCo attestation agent's REST API (`GET /aa/evidence`, `ALPHACOMPUTE_QUOTE_SOURCE=coco-aa`) or from configfs-tsm (`coco-tsm`). GPU reports always come from the attestation agent: `GET /aa/additional-evidence` with the GPU nonce as the runtime data, sent raw (`encoding=base64`), returns `{"nvidia": {"device_evidence_list": [{"arch", "evidence", "certificate"}, …]}}` from the agent's NVIDIA attester, which asks every confidential GPU for a report over the first 32 bytes of the runtime data through NVIDIA's attestation SDK. guest-components v0.21.0 has that attester (`nvidia-attester`) and endpoint; Kata 4.0.0's guest init starts the NVIDIA-attester build of the agent when a GPU is passed through. NVSwitch entries (`arch: LS10`) are left out of the GPU count and are not appraised yet. Nothing the agent returns is trusted: the KMS's GPU backend verifies every report and its nonce. To confirm at M-B on the pinned stack: that the endpoint is enabled in NVIDIA's guest image (Q11) and that the agent's NVIDIA attester runs in GPU pods.
+In the pod, `alpha-runtime` (`alpha_tsm::coco`) takes the quote from the CoCo attestation agent's REST API (`GET /aa/evidence`, `ALPHACOMPUTE_QUOTE_SOURCE=coco-aa`) or from configfs-tsm (`coco-tsm`). A pod on `kata-qemu-tdx` asks for no GPU report. On the GPU class, GPU reports always come from the attestation agent: `GET /aa/additional-evidence` with the GPU nonce as the runtime data, sent raw (`encoding=base64`), returns `{"nvidia": {"device_evidence_list": [{"arch", "evidence", "certificate"}, …]}}` from the agent's NVIDIA attester, which asks every confidential GPU for a report over the first 32 bytes of the runtime data through NVIDIA's attestation SDK. guest-components v0.21.0 has that attester (`nvidia-attester`) and endpoint; Kata 4.0.0's guest init starts the NVIDIA-attester build of the agent when a GPU is passed through. NVSwitch entries (`arch: LS10`) are left out of the GPU count and are not appraised yet. Nothing the agent returns is trusted: the KMS's GPU backend verifies every report and its nonce. To confirm at M-B on the pinned stack: that the endpoint is enabled in NVIDIA's guest image (Q11) and that the agent's NVIDIA attester runs in GPU pods.
 
 ## Appraisal steps
 
@@ -67,19 +69,22 @@ In the plan's order (PRD-02 R5). Every step is mandatory; the order only decides
 
 1. DCAP verification and the TCB policy (unchanged, `verify_quote`).
 2. If an event log was sent, it replays to the quoted RTMR0..2.
-3. `MRTD` and `RTMR0..2` match a reference value of kind `kata-tdx` listed for the pod's runtime class (or for any class, when the value names none). The same registers may be listed under several classes; the value for the pod's class is the one chosen.
-4. `MRCONFIGID` is the digest of the init-data sent.
-5. The init-data parses, has `policy.rego` and a valid `alpha.json`.
-6. The evidence's `runtime_class` is the init-data's.
-7. `report_data` binds this runtime key and nonce, last of the TD checks.
-8. The Revision v2 hash is the leaf's Revision; for a KMS node it must be in `kms_revisions`.
-9. GPUs: the evidence has exactly `gpu.count` entries; every backend the `gpu_policy` lists verified every one of them, over this nonce, in CC mode, of the Revision's model, an allowed model, at or above the minimum driver and VBIOS versions. A failure in any backend fails the attestation. The backends (NRAS is a network call) run only after steps 1 to 8 have passed and after the checks that need no backend (a `gpu_policy` exists, lists a verifier and allows the model, one evidence entry per GPU), so evidence that fails earlier costs no verifier call (`alpha_attest::appraise_any`).
+3. The evidence's `runtime_class` is a class a Revision v2 may name (`kata-qemu-tdx` or `kata-qemu-nvidia-gpu-tdx`). Any other is refused before a reference value is looked up.
+4. `MRTD` and `RTMR0..2` match a reference value of kind `kata-tdx` captured for that runtime class. A value for the other class, or one that names no class, never matches. The same registers may be listed under both classes; the value for the pod's class is the one chosen. Provided the two guests' captured registers differ (confirmed when they are captured, see below), a TD booted from the NVIDIA guest image therefore cannot pass as a CPU pod and skip step 10's GPU checks, and the CPU guest cannot pass as a GPU pod. Where they are the same, step 7 still holds the claim to the class of the measured init-data.
+5. `MRCONFIGID` is the digest of the init-data sent.
+6. The init-data parses, has `policy.rego` and a valid `alpha.json`: a supported runtime class, with the `gpu` section that class requires.
+7. The evidence's `runtime_class` is the init-data's.
+8. `report_data` binds this runtime key and nonce, last of the TD checks.
+9. The Revision v2 hash is the leaf's Revision; for a KMS node it must be in `kms_revisions`.
+10. GPUs, by the runtime class:
+    - `kata-qemu-nvidia-gpu-tdx`: the evidence has exactly `gpu.count` (1 or 8) entries; every backend the `gpu_policy` lists verified every one of them, over this nonce, in CC mode, of the Revision's model, an allowed model, at or above the minimum driver and VBIOS versions. A failure in any backend fails the attestation. The backends (NRAS is a network call) run only after steps 1 to 9 have passed and after the checks that need no backend (a `gpu_policy` exists, lists a verifier and allows the model, one evidence entry per GPU), so evidence that fails earlier costs no verifier call (`alpha_attest::appraise_any`).
+    - `kata-qemu-tdx`: no GPU evidence, and no GPU verified by any backend. No backend is called and `gpu_policy` is not consulted, so a document without one still attests CPU pods. This is the only class whose GPU checks are skipped.
 
 *(PR 5)* The KMS then requires the Revision to be registered, unrevoked and validly signed, as today, and refuses a Revision v2 reached through evidence v1 or the reverse. Every refusal is an audit row with its reason. None of this is wired yet: `appraise_any` returns the reasons, but nothing in `alpha-kms` calls it.
 
 ## What the result records
 
-`AttestationResult.coco` (absent for the prototype profile) carries the profile, `initdata_sha256`, `policy_sha256`, `runtime_class`, every verified GPU (`index`, `device_id`, `model`, driver and VBIOS versions, `cc_mode`, `nonce`) and `gpu_verifiers`: one `{"verifier", "token_sha256"}` per backend the `gpu_policy` lists, naming who vouched for the GPUs and the digest of the signed result it verified. `device_id` is the device's identity as the backend verified it (NRAS's `ueid`); two GPUs of one pod may not share it, so eight copies of one GPU's report cannot pass for eight GPUs.
+`AttestationResult.coco` (absent for the prototype profile) carries the profile, `initdata_sha256`, `policy_sha256`, `runtime_class`, every verified GPU (`index`, `device_id`, `model`, driver and VBIOS versions, `cc_mode`, `nonce`; none for a CPU-class pod) and `gpu_verifiers` (also empty for a CPU-class pod): one `{"verifier", "token_sha256"}` per backend the `gpu_policy` lists, naming who vouched for the GPUs and the digest of the signed result it verified. `device_id` is the device's identity as the backend verified it (NRAS's `ueid`); two GPUs of one pod may not share it, so eight copies of one GPU's report cannot pass for eight GPUs.
 
 ## Platform document additions
 
@@ -88,6 +93,8 @@ All optional, so documents already signed still parse and keep their meaning:
 ```json
 "reference_values": [
   {"name": "nvidia-uvm-tdx/b300x8", "kind": "kata-tdx", "runtime_class": "kata-qemu-nvidia-gpu-tdx",
+   "values": {"mrtd": "sha384:…", "rtmr0": "sha384:…", "rtmr1": "sha384:…", "rtmr2": "sha384:…"}},
+  {"name": "kata-tdx/cpu-4c-8g", "kind": "kata-tdx", "runtime_class": "kata-qemu-tdx",
    "values": {"mrtd": "sha384:…", "rtmr0": "sha384:…", "rtmr1": "sha384:…", "rtmr2": "sha384:…"}}
 ],
 "gpu_policy": {
@@ -102,7 +109,7 @@ All optional, so documents already signed still parse and keep their meaning:
 }
 ```
 
-The document, its `policy`, its reference values and `gpu_policy` refuse fields they do not know, so `alpha sign` refuses a misspelled field (a reference value's `runtime_class`, say) rather than signing it to be ignored. The attestation result goes the other way: `coco` and its GPU entries accept fields they do not know, so runtimes keep renewing across a KMS upgrade that adds one. A reference value without `kind` is `prototype-tdx` and never matches Kata evidence (and vice versa). `verifiers` takes `nras`, `local` (after Dec 1) and `fortanix-ccm` (D1); every listed backend must pass. `hwmodels` maps NRAS's `hwmodel` claim to the model names above; a GPU whose string is not listed is refused, so the B300 string is added from the first capture rather than guessed. `nras_keys` pins NRAS's signing keys by `kid`, copied from NVIDIA's JWKS when the document is prepared: an NRAS token whose `kid` is not pinned, or that names none, is refused, and with no pinned key the `nras` backend refuses every GPU before calling NRAS. The backend never fetches NRAS's JWKS, so trust in a GPU verdict rests on the release signature, not on web-PKI TLS; when NRAS rotates its key, a new platform document pins the new one.
+The document, its `policy`, its reference values and `gpu_policy` refuse fields they do not know, so `alpha sign` refuses a misspelled field (a reference value's `runtime_class`, say) rather than signing it to be ignored. The attestation result goes the other way: `coco` and its GPU entries accept fields they do not know, so runtimes keep renewing across a KMS upgrade that adds one. A reference value without `kind` is `prototype-tdx` and never matches Kata evidence (and vice versa). A `kata-tdx` value must name the `runtime_class` whose guest image it was captured from; one without it matches no pod (documents signed before Kata have no `kata-tdx` values). Each class is captured from its own guest image, for every VM size its pods use, and the capture confirms that the CPU guest's registers differ from the NVIDIA guest's. `verifiers` takes `nras`, `local` (after Dec 1) and `fortanix-ccm` (D1); every listed backend must pass. `hwmodels` maps NRAS's `hwmodel` claim to the model names above; a GPU whose string is not listed is refused, so the B300 string is added from the first capture rather than guessed. `nras_keys` pins NRAS's signing keys by `kid`, copied from NVIDIA's JWKS when the document is prepared: an NRAS token whose `kid` is not pinned, or that names none, is refused, and with no pinned key the `nras` backend refuses every GPU before calling NRAS. The backend never fetches NRAS's JWKS, so trust in a GPU verdict rests on the release signature, not on web-PKI TLS; when NRAS rotates its key, a new platform document pins the new one.
 
 ## GPU backends
 
