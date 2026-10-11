@@ -1,12 +1,13 @@
 //! The client side of every platform TLS hop: TLS 1.3 with `X25519MLKEM768` and the server
 //! pinned by value — a CA plus a Revision allowlist (join), the CA's SPKI hash plus a Revision
-//! allowlist (the runtime, which holds only the hash), a CA alone (the admin CLI) or one exact
+//! allowlist (the runtime, which holds only the hash), a CA plus an App allowlist (a judge that
+//! cannot pin the Revision of a peer which pins its own), a CA alone (the admin CLI) or one exact
 //! SPKI (the custodian CLI on a sealed node). The host name is only routing.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use alpha_core::ComposeHash;
+use alpha_core::{AppId, ComposeHash};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::server::graceful::GracefulShutdown;
@@ -47,6 +48,10 @@ pub enum Pin {
     /// The chain ends at this CA and the leaf is an App Instance's carrying one of these
     /// Revisions; an empty list matches nothing.
     CaAndInstanceRevisions(CertificateDer<'static>, Vec<ComposeHash>),
+    /// The chain ends at this CA and the leaf is an Instance's of one of these Apps, whatever its
+    /// Revision; an empty list matches nothing. For a peer whose Revision cannot be pinned
+    /// because it pins this side's own Revision (no pair of Revisions could name each other).
+    CaAndInstanceApps(CertificateDer<'static>, Vec<AppId>),
     /// The chain ends at a CA the server presents whose SPKI SHA-256 is these bytes, and the
     /// leaf carries one of these Revisions; an empty list matches nothing.
     CaSpkiAndRevisions([u8; 32], Vec<ComposeHash>),
@@ -77,13 +82,16 @@ struct PinnedServer {
 impl PinnedServer {
     fn new(pin: Option<Pin>) -> Result<Self, Error> {
         let anchor = match &pin {
-            Some(Pin::Ca(ca) | Pin::CaAndRevisions(ca, _) | Pin::CaAndInstanceRevisions(ca, _)) => {
-                Some(
-                    webpki::anchor_from_trusted_cert(ca)
-                        .map_err(|e| Error::Invalid(format!("pinned ca: {e}")))?
-                        .to_owned(),
-                )
-            }
+            Some(
+                Pin::Ca(ca)
+                | Pin::CaAndRevisions(ca, _)
+                | Pin::CaAndInstanceRevisions(ca, _)
+                | Pin::CaAndInstanceApps(ca, _),
+            ) => Some(
+                webpki::anchor_from_trusted_cert(ca)
+                    .map_err(|e| Error::Invalid(format!("pinned ca: {e}")))?
+                    .to_owned(),
+            ),
             Some(Pin::CaSpkiAndRevisions(..) | Pin::Spki(_)) | None => None,
         };
         Ok(Self {
@@ -109,7 +117,10 @@ impl ServerCertVerifier for PinnedServer {
         };
         let presented;
         let anchor = match pin {
-            Pin::Ca(_) | Pin::CaAndRevisions(..) | Pin::CaAndInstanceRevisions(..) => Some(
+            Pin::Ca(_)
+            | Pin::CaAndRevisions(..)
+            | Pin::CaAndInstanceRevisions(..)
+            | Pin::CaAndInstanceApps(..) => Some(
                 self.anchor
                     .as_ref()
                     .ok_or_else(|| refuse("pinned ca is not an anchor".into()))?,
@@ -168,6 +179,15 @@ impl ServerCertVerifier for PinnedServer {
                 if !revisions.contains(&instance.compose_hash) {
                     return Err(refuse(
                         "server certificate carries no allowed App revision".into(),
+                    ));
+                }
+            }
+            Pin::CaAndInstanceApps(_, apps) => {
+                let sans = uri_sans(end_entity).map_err(|e| refuse(e.to_string()))?;
+                let instance = parse_instance_sans(&sans).map_err(|e| refuse(e.to_string()))?;
+                if !apps.contains(&instance.app_id) {
+                    return Err(refuse(
+                        "server certificate is not an Instance of an allowed App".into(),
                     ));
                 }
             }
@@ -567,6 +587,48 @@ mod tests {
         let (_, other_ca) = new_ca();
         let foreign = Pin::CaAndInstanceRevisions(other_ca.der().clone(), vec![revision]);
         assert!(!pinned_handshake(&app, foreign).await);
+    }
+
+    #[tokio::test]
+    async fn an_instance_app_pin_accepts_any_revision_of_a_listed_app_and_nothing_else() {
+        let (ca_key, ca_cert) = new_ca();
+        let ca = CertificateDer::from(ca_cert.der().to_vec());
+        let front = AppId::mint();
+        let instance_of = |app: AppId, revision: &str| {
+            leaf_with_sans(
+                &ca_key,
+                &ca_cert,
+                &[
+                    format!("alphacompute://{}/{app}/{}", OrgId::mint(), "a".repeat(64)),
+                    format!(
+                        "urn:alphacompute:revision:{}",
+                        alpha_core::compose_hash(revision)
+                    ),
+                ],
+            )
+        };
+        let node = leaf_with_sans(
+            &ca_key,
+            &ca_cert,
+            &[
+                KMS_SAN.into(),
+                format!(
+                    "urn:alphacompute:revision:{}",
+                    alpha_core::compose_hash("kms")
+                ),
+            ],
+        );
+        let pin = |apps| Pin::CaAndInstanceApps(ca.clone(), apps);
+
+        // Every Revision of the listed App: the pin names no Revision, so none can cycle.
+        assert!(pinned_handshake(&instance_of(front, "v1"), pin(vec![front])).await);
+        assert!(pinned_handshake(&instance_of(front, "v2"), pin(vec![front])).await);
+        assert!(!pinned_handshake(&instance_of(AppId::mint(), "v1"), pin(vec![front])).await);
+        assert!(!pinned_handshake(&instance_of(front, "v1"), pin(vec![])).await);
+        assert!(!pinned_handshake(&node, pin(vec![front])).await);
+        let (_, other_ca) = new_ca();
+        let foreign = Pin::CaAndInstanceApps(other_ca.der().clone(), vec![front]);
+        assert!(!pinned_handshake(&instance_of(front, "v1"), foreign).await);
     }
 
     #[tokio::test]

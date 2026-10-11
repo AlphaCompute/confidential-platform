@@ -76,7 +76,7 @@ async fn setup(front: Front, caller: AppId) -> Router {
     router(Arc::new(AppState {
         config: Config {
             inference_url: base,
-            inference_revisions: vec![alpha_core::compose_hash("front")],
+            inference_apps: vec![AppId::mint()],
             caller_apps: vec![caller],
         },
         inference_bearer: parking_lot::RwLock::new(Zeroizing::new("front-bearer".into())),
@@ -90,7 +90,7 @@ fn unreachable_front(caller: AppId) -> Router {
     router(Arc::new(AppState {
         config: Config {
             inference_url: "http://127.0.0.1:9".into(),
-            inference_revisions: vec![],
+            inference_apps: vec![],
             caller_apps: vec![caller],
         },
         inference_bearer: parking_lot::RwLock::new(Zeroizing::new("b".into())),
@@ -123,21 +123,34 @@ async fn call(
 }
 
 #[test]
-fn config_needs_an_https_origin_revisions_and_caller_apps() {
+fn config_needs_an_https_origin_the_fronts_app_and_caller_apps() {
     let app = AppId::mint();
-    let revision = alpha_core::compose_hash("front");
+    let front = AppId::mint();
     let env = |url: &'static str| {
         move |name: &str| match name {
             "INFERENCE_URL" => Some(url.to_owned()),
-            "INFERENCE_REVISIONS" => Some(format!("{revision}, ")),
+            "INFERENCE_APPS" => Some(format!("{front}, ")),
             "CALLER_APPS" => Some(app.to_string()),
             _ => None,
         }
     };
     let config = Config::build(env("https://front.example:8443/")).unwrap();
     assert_eq!(config.inference_url, "https://front.example:8443");
-    assert_eq!(config.inference_revisions, vec![revision]);
+    assert_eq!(config.inference_apps, vec![front]);
     assert_eq!(config.caller_apps, vec![app]);
+    // The front pins this judge's Revision; pinning the front's back would be a cycle no pair
+    // of Revisions satisfies, so a leftover Revision list refuses to start.
+    let stale = |name: &str| match name {
+        "INFERENCE_REVISIONS" => Some(alpha_core::compose_hash("front").to_string()),
+        other => env("https://front.example")(other),
+    };
+    let err = Config::build(stale).unwrap_err();
+    assert!(err.to_string().contains("INFERENCE_APPS"), "{err}");
+    let bad = |name: &str| match name {
+        "INFERENCE_APPS" => Some(alpha_core::compose_hash("front").to_string()),
+        other => env("https://front.example")(other),
+    };
+    assert!(Config::build(bad).is_err());
     for url in [
         "http://front.example",
         "https://front.example/v1",
@@ -155,7 +168,7 @@ fn config_needs_an_https_origin_revisions_and_caller_apps() {
             }
         }
     };
-    for missing in ["INFERENCE_REVISIONS", "CALLER_APPS"] {
+    for missing in ["INFERENCE_APPS", "CALLER_APPS"] {
         let err = Config::build(without(missing)).unwrap_err();
         assert!(err.to_string().contains(missing), "{err}");
     }

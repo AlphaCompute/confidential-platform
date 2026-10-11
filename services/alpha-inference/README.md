@@ -41,7 +41,7 @@ For a member's request (`caller-bearer`), before any upstream contact: the new t
 
 Within one completion there is no streaming under moderation: a caller asking for `stream: true` gets the whole event stream at once, after the judge.
 
-The judge is dialled as any caller dials it: this Instance's leaf as the client certificate (renewed with every refresh), the connection pinned to the KMS CA and one of `GUARD_REVISIONS`. `alpha-guard`'s `CALLER_APPS` must therefore list this front's App. Its own calls back here present `judge-bearer` and are not judged again; they may name only a model in `JUDGE_MODELS`. Logs carry the phase, the outcome, the model and the elapsed time — never the text.
+The judge is dialled as any caller dials it: this Instance's leaf as the client certificate (renewed with every refresh), the connection pinned to the KMS CA and one of `GUARD_REVISIONS`. `alpha-guard`'s `CALLER_APPS` must therefore list this front's App. In the other direction `alpha-guard` pins this front by App (its `INFERENCE_APPS`), never by Revision: this front's Revision contains `GUARD_REVISIONS`, so a judge that pinned this front's Revision back could never be registered (each Revision would contain the other's hash). Register the judge first, then this front with the judge's Revision in `GUARD_REVISIONS`. Its own calls back here present `judge-bearer` and are not judged again; they may name only a model in `JUDGE_MODELS`. Logs carry the phase, the outcome, the model and the elapsed time — never the text.
 
 **What this leaves open:** image and audio parts of a request are not judged; the judge sees only text.
 
