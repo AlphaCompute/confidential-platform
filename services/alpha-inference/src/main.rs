@@ -7,9 +7,10 @@
 
 use std::sync::Arc;
 
+use alpha_client::runtime::RuntimeIdentity;
 use alpha_client::runtime::{RuntimeSocket, refresh_forever};
 use alpha_client::tls::{InstanceCert, serve, server_config};
-use alpha_inference::{AppState, Config, Error, Secrets, Upstream, own, router};
+use alpha_inference::{AppState, Config, Error, Secrets, Upstream, guard, own, router};
 use tokio::net::TcpListener;
 use zeroize::Zeroizing;
 
@@ -54,10 +55,21 @@ async fn read_secrets(runtime: &RuntimeSocket, config: &Config) -> Result<Secret
         .secret("caller-bearer")
         .await
         .map_err(|e| Error::internal(format!("secret caller-bearer: {e}")))?;
+    let judge_bearer = runtime
+        .secret("judge-bearer")
+        .await
+        .map_err(|e| Error::internal(format!("secret judge-bearer: {e}")))?;
+    // A judge bearer that is empty or equal to the members' would let a member skip moderation.
+    if judge_bearer.is_empty() || judge_bearer.as_slice() == caller_bearer.as_slice() {
+        return Err(Error::internal(
+            "judge-bearer must be set and differ from caller-bearer",
+        ));
+    }
     Ok(Secrets {
         provider_key,
         caller_bearer: Zeroizing::new(caller_bearer.to_vec()),
         model_server_bearer,
+        judge_bearer: Zeroizing::new(judge_bearer.to_vec()),
     })
 }
 
@@ -84,6 +96,7 @@ async fn run() -> Result<(), Error> {
     let kms_ca =
         alpha_client::tls::kms_ca(&identity).map_err(|e| Error::internal(format!("tls: {e}")))?;
     let own = own::Servers::new(&config.model_servers, &kms_ca)?;
+    let guard = guard::Guard::new(&config.guard, kms_ca, &identity)?;
 
     let secrets = read_secrets(&runtime, &config).await?;
     let upstream = Upstream::new(&config)?;
@@ -92,6 +105,7 @@ async fn run() -> Result<(), Error> {
         secrets: parking_lot::RwLock::new(secrets),
         upstream,
         own,
+        guard,
     });
     let app = router(state.clone());
 
@@ -106,7 +120,7 @@ async fn run() -> Result<(), Error> {
         tokio::select! {
             _ = term.recv() => {}
             _ = tokio::signal::ctrl_c() => {}
-            failed = refresh_forever(&runtime, &cert, |_| refresh(&runtime, &state)) => {
+            failed = refresh_forever(&runtime, &cert, |identity| refresh(&runtime, &state, identity)) => {
                 outcome = Err(Error::internal(format!("refresh: {failed}")));
             }
         }
@@ -115,7 +129,13 @@ async fn run() -> Result<(), Error> {
     outcome
 }
 
-async fn refresh(runtime: &RuntimeSocket, state: &AppState) -> Result<(), Error> {
+async fn refresh(
+    runtime: &RuntimeSocket,
+    state: &AppState,
+    identity: RuntimeIdentity,
+) -> Result<(), Error> {
+    // The judge reads this Instance's App from its leaf: present the renewed one.
+    state.guard.renew(&identity)?;
     *state.secrets.write() = read_secrets(runtime, &state.config).await?;
     Ok(())
 }

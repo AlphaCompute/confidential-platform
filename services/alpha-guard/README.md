@@ -10,7 +10,7 @@ The platform's content judge: an App of its own that an attested Instance calls 
 | `INFERENCE_REVISIONS` | comma-separated `sha256:` Revisions of the front this judge will talk to |
 | `CALLER_APPS` | comma-separated App ids whose Instances may ask for a verdict |
 
-One Secret, released only to this App's Revision: `inference-bearer`, the bearer the front expects.
+One Secret, released only to this App's Revision: `inference-bearer`, the bearer the front expects. Since the front judges every member's request through this service, this must be the front's `judge-bearer`, not its `caller-bearer`: the front does not judge the judge's own calls, and accepts them only for a model in its `JUDGE_MODELS`. `CALLER_APPS` must list the front's own App, which asks for a verdict on every turn and every completion.
 
 ## Routes
 

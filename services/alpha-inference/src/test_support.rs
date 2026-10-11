@@ -39,9 +39,11 @@ pub(crate) fn test_state(
             provider_key: zeroize::Zeroizing::new(provider_key.to_string()),
             caller_bearer: zeroize::Zeroizing::new(caller_bearer.to_vec()),
             model_server_bearer: zeroize::Zeroizing::new(String::new()),
+            judge_bearer: zeroize::Zeroizing::new(Vec::new()),
         }),
         upstream,
         own: crate::own::Servers::none(),
+        guard: crate::guard::Guard::fixed(Ok(()), Ok(())),
     })
 }
 
@@ -57,6 +59,15 @@ pub(crate) fn test_config(upstream_url: &str, models: &[&str]) -> crate::Config 
             tolerated_advisories: vec![],
         },
         model_servers: std::collections::BTreeMap::new(),
+        guard: crate::guard::GuardConfig {
+            url: "https://guard.example".to_string(),
+            revisions: vec![alpha_core::compose_hash("guard")],
+            policy: crate::guard::Policy {
+                model: "guard".to_string(),
+                categories: vec!["Violence".to_string()],
+            },
+            judge_models: vec!["guard".to_string()],
+        },
     }
 }
 

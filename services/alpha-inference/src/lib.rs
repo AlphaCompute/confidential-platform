@@ -6,6 +6,10 @@
 //! process's own measured code, that the connection it will forward over terminates inside the
 //! provider's attested gateway. Neither kind is ever used on a stale check, an error, or for a
 //! caller without its bearer, and neither falls back to the other on its own.
+//!
+//! Whatever the model, a member's turn is judged by `alpha-guard` before it reaches an upstream
+//! and the completion is judged before it is released (`guard`); only the judge's own calls,
+//! under their own bearer, are exempt.
 
 #![cfg_attr(
     test,
@@ -18,6 +22,7 @@
     )
 )]
 
+pub mod guard;
 pub mod own;
 pub mod upstream;
 
@@ -44,6 +49,8 @@ const COMPLETIONS_BODY_LIMIT: usize = 16 * 1024 * 1024;
 /// A completion, from connecting to the last byte of its body, gets this long on either kind
 /// of upstream; a stuck upstream then answers `502 upstream` instead of holding a task forever.
 pub const COMPLETION_TIMEOUT: Duration = Duration::from_secs(600);
+/// A completion is held whole while it is judged; one larger than this is not released.
+const COMPLETION_HOLD_LIMIT: usize = 16 * 1024 * 1024;
 
 /// The measured environment, read once at startup and never mutated.
 #[derive(Clone, Debug)]
@@ -59,6 +66,8 @@ pub struct Config {
     /// The allowlisted models served by our own model servers; the rest go to the external
     /// provider.
     pub model_servers: BTreeMap<String, own::ModelServer>,
+    /// The judge every member's turn and completion goes through.
+    pub guard: guard::GuardConfig,
 }
 
 impl Config {
@@ -118,12 +127,14 @@ impl Config {
                 tolerated_advisories: Vec::new(),
             },
         };
+        let guard = guard::GuardConfig::build(&get, &models)?;
         Ok(Config {
             upstream_url: upstream_url.trim_end_matches('/').to_owned(),
             models,
             pccs_url: pccs_url.trim_end_matches('/').to_owned(),
             upstream_policy,
             model_servers,
+            guard,
         })
     }
 
@@ -152,6 +163,9 @@ pub struct Secrets {
     pub caller_bearer: Zeroizing<Vec<u8>>,
     /// The bearer our own model servers expect; sent only over their pinned connections.
     pub model_server_bearer: Zeroizing<String>,
+    /// `alpha-guard`'s own bearer: its calls are not judged again, and may name only a model in
+    /// `JUDGE_MODELS`. Never equal to `caller_bearer`, and never matched when empty.
+    pub judge_bearer: Zeroizing<Vec<u8>>,
 }
 
 impl std::fmt::Debug for Secrets {
@@ -160,6 +174,7 @@ impl std::fmt::Debug for Secrets {
             .field("provider_key", &"<redacted>")
             .field("caller_bearer", &"<redacted>")
             .field("model_server_bearer", &"<redacted>")
+            .field("judge_bearer", &"<redacted>")
             .finish()
     }
 }
@@ -172,6 +187,7 @@ pub struct AppState {
     pub upstream: Upstream,
     /// Our own model servers, pinned by the KMS CA and each model's Revisions.
     pub own: own::Servers,
+    pub guard: guard::Guard,
 }
 
 /// Every error this service answers with, OpenAI-shaped on the wire. Messages never carry a
@@ -186,6 +202,12 @@ pub enum Error {
     UpstreamUnverified,
     #[error("the model provider could not be reached")]
     Upstream,
+    #[error("The content was blocked by the moderation policy.")]
+    ContentBlocked,
+    #[error("Moderation is unavailable, so nothing was sent or released.")]
+    ModerationUnavailable,
+    #[error("The content is too large to be moderated.")]
+    ContentTooLarge,
     #[error("{0}")]
     Internal(String),
 }
@@ -213,6 +235,21 @@ impl Error {
                 "upstream_unverified",
             ),
             Error::Upstream => (StatusCode::BAD_GATEWAY, "upstream_error", "upstream"),
+            Error::ContentBlocked => (
+                StatusCode::FORBIDDEN,
+                "invalid_request_error",
+                "content_blocked",
+            ),
+            Error::ModerationUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "upstream_error",
+                "moderation_unavailable",
+            ),
+            Error::ContentTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "invalid_request_error",
+                "content_too_large",
+            ),
             Error::Internal(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
@@ -236,8 +273,13 @@ impl IntoResponse for Error {
     }
 }
 
-/// Proof of the caller's bearer, extracted before any handler runs.
-pub struct AuthedCaller;
+/// Proof of the caller's bearer, extracted before any handler runs: a member's (`caller-bearer`),
+/// whose completions are judged, or the judge's own (`judge-bearer`), whose are not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AuthedCaller {
+    Member,
+    Judge,
+}
 
 impl FromRequestParts<Arc<AppState>> for AuthedCaller {
     type Rejection = Error;
@@ -252,8 +294,13 @@ impl FromRequestParts<Arc<AppState>> for AuthedCaller {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
             .ok_or(Error::Unauthorized)?;
-        if alpha_client::bearer_matches(presented.as_bytes(), &state.secrets.read().caller_bearer) {
-            Ok(AuthedCaller)
+        let secrets = state.secrets.read();
+        if alpha_client::bearer_matches(presented.as_bytes(), &secrets.caller_bearer) {
+            Ok(AuthedCaller::Member)
+        } else if !secrets.judge_bearer.is_empty()
+            && alpha_client::bearer_matches(presented.as_bytes(), &secrets.judge_bearer)
+        {
+            Ok(AuthedCaller::Judge)
         } else {
             Err(Error::Unauthorized)
         }
@@ -373,7 +420,7 @@ async fn get_model(
 
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    _: AuthedCaller,
+    caller: AuthedCaller,
     body: Bytes,
 ) -> Result<Response, Error> {
     let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
@@ -385,8 +432,58 @@ async fn chat_completions(
     if !state.config.allows(&model) {
         return Err(Error::ModelNotFound(model));
     }
-    let upstream_response = send(&state, &model, body).await?;
-    relay(upstream_response)
+    match caller {
+        // The judge's own call: a judge model only, and not judged again.
+        AuthedCaller::Judge => {
+            if !state.config.guard.judge_models.contains(&model) {
+                return Err(Error::ModelNotFound(model));
+            }
+            relay(send(&state, &model, body).await?)
+        }
+        AuthedCaller::Member => {
+            let input = guard::turn_input(&parsed);
+            state.guard.check_input(&model, &input).await?;
+            let upstream_response = send(&state, &model, body).await?;
+            let (status, content_type, held) = hold(upstream_response).await?;
+            // An upstream refusal carries no completion; it is relayed as it came.
+            if status.is_success() {
+                let output = guard::completion_text(&held);
+                state.guard.check_output(&model, &input, &output).await?;
+            }
+            Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, content_type)
+                .body(axum::body::Body::from(held))
+                .map_err(|e| Error::internal(format!("response: {e}")))
+        }
+    }
+}
+
+/// The upstream's whole answer, held so it can be judged before any byte is released. Streams
+/// are held too: within one completion there is no streaming under moderation.
+async fn hold(
+    upstream_response: reqwest::Response,
+) -> Result<(StatusCode, header::HeaderValue, Bytes), Error> {
+    let status = StatusCode::from_u16(upstream_response.status().as_u16())
+        .unwrap_or(StatusCode::BAD_GATEWAY);
+    let content_type = upstream_response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .cloned()
+        .unwrap_or_else(|| header::HeaderValue::from_static("text/event-stream"));
+    let mut held: Vec<u8> = Vec::new();
+    let mut upstream_response = upstream_response;
+    while let Some(chunk) = upstream_response
+        .chunk()
+        .await
+        .map_err(|_| Error::Upstream)?
+    {
+        if held.len().saturating_add(chunk.len()) > COMPLETION_HOLD_LIMIT {
+            return Err(Error::ContentTooLarge);
+        }
+        held.extend_from_slice(&chunk);
+    }
+    Ok((status, content_type, Bytes::from(held)))
 }
 
 /// Forwards `body` for an allowlisted `model` over its verified upstream, the upstream's own
@@ -459,8 +556,19 @@ mod tests {
     use super::*;
     use crate::test_support::{answering, spawn_fake_upstream, test_config, test_state};
 
+    fn guard_env(name: &str) -> Option<String> {
+        match name {
+            "GUARD_URL" => Some("https://guard.example:8443".to_string()),
+            "GUARD_REVISIONS" => Some(format!("sha256:{}", "3".repeat(64))),
+            "GUARD_POLICY" => Some(r#"{"model":"m2","categories":["Violence"]}"#.to_string()),
+            "JUDGE_MODELS" => Some("m2".to_string()),
+            _ => None,
+        }
+    }
+
     fn valid_env(name: &str) -> Option<String> {
         match name {
+            "GUARD_URL" | "GUARD_REVISIONS" | "GUARD_POLICY" | "JUDGE_MODELS" => guard_env(name),
             "UPSTREAM_URL" => Some("https://api.redpill.ai/v1".to_string()),
             "MODELS" => Some("m1,m2".to_string()),
             "PCCS_URL" => Some("https://pccs.example".to_string()),
@@ -534,7 +642,7 @@ mod tests {
         let config = Config::build(|n| match n {
             "MODELS" => Some("m1,m2".to_string()),
             "MODEL_SERVERS" => Some(servers.clone()),
-            _ => None,
+            other => guard_env(other),
         })
         .unwrap();
         assert!(config.external_models().is_empty());
@@ -547,7 +655,7 @@ mod tests {
         let err = Config::build(|n| match n {
             "MODELS" => Some("m1,m2".to_string()),
             "MODEL_SERVERS" => Some(servers.clone()),
-            _ => None,
+            other => guard_env(other),
         })
         .unwrap_err();
         assert!(err.to_string().contains("UPSTREAM_URL"), "{err}");
@@ -600,9 +708,11 @@ mod tests {
                 provider_key: Zeroizing::new("provider-key".into()),
                 caller_bearer: Zeroizing::new(b"right-bearer".to_vec()),
                 model_server_bearer: Zeroizing::new("ms-bearer".into()),
+                judge_bearer: Zeroizing::new(b"judge-bearer".to_vec()),
             }),
             upstream: Upstream::new(&state.config).unwrap(),
             own: servers,
+            guard: guard::Guard::fixed(Ok(()), Ok(())),
         });
         let app = router(state);
 
@@ -621,6 +731,121 @@ mod tests {
         assert_eq!(parsed["error"]["code"], "upstream_unverified");
         assert_eq!(report_hits.load(Ordering::SeqCst), 0);
         assert_eq!(completions_hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// `test_state` with `guard`, the judge's own bearer set, and the fake upstream at `base`
+    /// answering completions for `m1` and the judge model `guard`.
+    fn guarded_state(base: &str, guard: guard::Guard) -> Arc<AppState> {
+        let config = test_config(base, &["m1", "guard"]);
+        Arc::new(AppState {
+            upstream: Upstream::new(&config).unwrap(),
+            config,
+            secrets: parking_lot::RwLock::new(Secrets {
+                provider_key: Zeroizing::new("provider-key".into()),
+                caller_bearer: Zeroizing::new(b"member-bearer".to_vec()),
+                model_server_bearer: Zeroizing::new(String::new()),
+                judge_bearer: Zeroizing::new(b"judge-bearer".to_vec()),
+            }),
+            own: own::Servers::none(),
+            guard,
+        })
+    }
+
+    fn completion_request(bearer: &str, model: &str) -> Request<Body> {
+        let body = json!({ "model": model, "messages": [{"role": "user", "content": "hi"}] });
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn error_code(response: Response) -> (StatusCode, Value) {
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        (status, parsed["error"]["code"].clone())
+    }
+
+    #[tokio::test]
+    async fn a_blocked_or_unjudged_turn_never_reaches_any_upstream() {
+        for (refusal, status, code) in [
+            (
+                guard::Refusal::Blocked,
+                StatusCode::FORBIDDEN,
+                "content_blocked",
+            ),
+            (
+                guard::Refusal::Unavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "moderation_unavailable",
+            ),
+        ] {
+            let (base, report_hits, completions_hits) =
+                spawn_fake_upstream(answering(StatusCode::OK, "{}")).await;
+            let app = router(guarded_state(
+                &base,
+                guard::Guard::fixed(Err(refusal), Ok(())),
+            ));
+            let response = app
+                .oneshot(completion_request("member-bearer", "m1"))
+                .await
+                .unwrap();
+            assert_eq!(error_code(response).await, (status, json!(code)));
+            assert_eq!(report_hits.load(Ordering::SeqCst), 0);
+            assert_eq!(completions_hits.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_judges_own_bearer_may_name_only_a_judge_model() {
+        let (base, report_hits, _completions_hits) =
+            spawn_fake_upstream(answering(StatusCode::INTERNAL_SERVER_ERROR, "")).await;
+        // A guard that blocks everything: the judge's call must not be judged at all.
+        let app = router(guarded_state(
+            &base,
+            guard::Guard::fixed(Err(guard::Refusal::Blocked), Err(guard::Refusal::Blocked)),
+        ));
+        let response = app
+            .clone()
+            .oneshot(completion_request("judge-bearer", "m1"))
+            .await
+            .unwrap();
+        assert_eq!(
+            error_code(response).await,
+            (StatusCode::NOT_FOUND, json!("model_not_found"))
+        );
+        assert_eq!(report_hits.load(Ordering::SeqCst), 0);
+
+        // The judge model passes the guard untouched and goes on to the upstream's own check,
+        // which this fake fails.
+        let response = app
+            .oneshot(completion_request("judge-bearer", "guard"))
+            .await
+            .unwrap();
+        assert_eq!(
+            error_code(response).await,
+            (StatusCode::BAD_GATEWAY, json!("upstream_unverified"))
+        );
+        assert_eq!(report_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_empty_judge_bearer_never_authenticates() {
+        let state = test_state(
+            test_config("https://example.invalid", &["m1"]),
+            b"member-bearer",
+            "key",
+        );
+        let request = Request::builder()
+            .uri("/v1/models")
+            .header(header::AUTHORIZATION, "Bearer ")
+            .body(Body::empty())
+            .unwrap();
+        let response = router(state).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

@@ -620,6 +620,19 @@ mod tests {
         Arc<AtomicUsize>,
         Arc<parking_lot::Mutex<Option<String>>>,
     ) {
+        spawn_tls_fake_answering(cert, key, "").await
+    }
+
+    /// As `spawn_tls_fake`, every request answered `200` with `body`.
+    async fn spawn_tls_fake_answering(
+        cert: CertificateDer<'static>,
+        key: PrivatePkcs8KeyDer<'static>,
+        body: &'static str,
+    ) -> (
+        String,
+        Arc<AtomicUsize>,
+        Arc<parking_lot::Mutex<Option<String>>>,
+    ) {
         let server_config =
             rustls::ServerConfig::builder_with_provider(alpha_client::tls::provider())
                 .with_protocol_versions(&[&rustls::version::TLS13])
@@ -660,7 +673,9 @@ mod tests {
                                     .map(String::from);
                                 async move {
                                     Ok::<_, std::convert::Infallible>(hyper::Response::new(
-                                        http_body_util::Full::new(hyper::body::Bytes::new()),
+                                        http_body_util::Full::new(hyper::body::Bytes::from_static(
+                                            body.as_bytes(),
+                                        )),
                                     ))
                                 }
                             },
@@ -739,6 +754,60 @@ mod tests {
         assert_eq!(last_auth.lock().as_deref(), Some("Bearer the-provider-key"));
     }
 
+    /// A verified upstream answers; what the judge thinks of the answer decides whether a
+    /// single byte of it reaches the caller.
+    #[tokio::test]
+    async fn a_completion_is_released_whole_only_when_the_judge_allows_it() {
+        const COMPLETION: &str =
+            r#"{"choices":[{"message":{"role":"assistant","content":"the answer"}}]}"#;
+        for (output, status) in [
+            (Ok(()), reqwest::StatusCode::OK),
+            (
+                Err(crate::guard::Refusal::Blocked),
+                reqwest::StatusCode::FORBIDDEN,
+            ),
+            (
+                Err(crate::guard::Refusal::Unavailable),
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let (cert, key, spki) = self_signed_leaf();
+            let (base, hits, _last_auth) = spawn_tls_fake_answering(cert, key, COMPLETION).await;
+            let config = test_config(&base, &["m1"]);
+            let state = Arc::new(crate::AppState {
+                upstream: Upstream::new(&config).unwrap(),
+                config,
+                secrets: parking_lot::RwLock::new(crate::Secrets {
+                    provider_key: zeroize::Zeroizing::new("provider-key".into()),
+                    caller_bearer: zeroize::Zeroizing::new(b"member".to_vec()),
+                    model_server_bearer: zeroize::Zeroizing::new(String::new()),
+                    judge_bearer: zeroize::Zeroizing::new(b"judge".to_vec()),
+                }),
+                own: crate::own::Servers::none(),
+                guard: crate::guard::Guard::fixed(Ok(()), output),
+            });
+            *state.upstream.slots.get("m1").unwrap().lock().await = Some(Checked {
+                at: SystemTime::now(),
+                outcome: Ok(pinned_client(&spki).unwrap()),
+            });
+            let base = spawn_router(crate::router(state)).await;
+            let response = reqwest::Client::new()
+                .post(format!("{base}/v1/chat/completions"))
+                .header(reqwest::header::AUTHORIZATION, "Bearer member")
+                .json(&serde_json::json!({
+                    "model": "m1",
+                    "messages": [{"role": "user", "content": "q"}],
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            let body = response.text().await.unwrap();
+            assert_eq!(body.contains("the answer"), status.is_success(), "{body}");
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
+    }
+
     fn live_config() -> crate::Config {
         crate::Config::build(|name| match name {
             "UPSTREAM_URL" => Some("https://api.redpill.ai/v1".to_string()),
@@ -749,6 +818,13 @@ mod tests {
             "UPSTREAM_POLICY" => {
                 Some(r#"{"tcb_statuses":["UpToDate"],"tolerated_advisories":[]}"#.to_string())
             }
+            "GUARD_URL" => Some("https://guard.example".to_string()),
+            "GUARD_REVISIONS" => Some(format!("sha256:{}", "3".repeat(64))),
+            "GUARD_POLICY" => Some(
+                r#"{"model":"nvidia/nemotron-3.5-lightning","categories":["Violence"]}"#
+                    .to_string(),
+            ),
+            "JUDGE_MODELS" => Some("nvidia/nemotron-3.5-lightning".to_string()),
             _ => None,
         })
         .unwrap()
