@@ -620,13 +620,14 @@ mod tests {
         Arc<AtomicUsize>,
         Arc<parking_lot::Mutex<Option<String>>>,
     ) {
-        spawn_tls_fake_answering(cert, key, "").await
+        spawn_tls_fake_answering(cert, key, 200, "").await
     }
 
-    /// As `spawn_tls_fake`, every request answered `200` with `body`.
+    /// As `spawn_tls_fake`, every request answered `status` with `body`.
     async fn spawn_tls_fake_answering(
         cert: CertificateDer<'static>,
         key: PrivatePkcs8KeyDer<'static>,
+        status: u16,
         body: &'static str,
     ) -> (
         String,
@@ -671,13 +672,12 @@ mod tests {
                                     .get(hyper::header::AUTHORIZATION)
                                     .and_then(|v| v.to_str().ok())
                                     .map(String::from);
-                                async move {
-                                    Ok::<_, std::convert::Infallible>(hyper::Response::new(
-                                        http_body_util::Full::new(hyper::body::Bytes::from_static(
-                                            body.as_bytes(),
-                                        )),
-                                    ))
-                                }
+                                let mut response = hyper::Response::new(http_body_util::Full::new(
+                                    hyper::body::Bytes::from_static(body.as_bytes()),
+                                ));
+                                *response.status_mut() =
+                                    hyper::StatusCode::from_u16(status).unwrap();
+                                async move { Ok::<_, std::convert::Infallible>(response) }
                             },
                         );
                         let _ = hyper_util::server::conn::auto::Builder::new(
@@ -728,7 +728,13 @@ mod tests {
     #[tokio::test]
     async fn chat_completions_forwards_the_provider_key_never_the_callers_bearer() {
         let (cert, key, spki) = self_signed_leaf();
-        let (base, hits, last_auth) = spawn_tls_fake(cert, key).await;
+        let (base, hits, last_auth) = spawn_tls_fake_answering(
+            cert,
+            key,
+            200,
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
 
         let state = test_state(
             test_config(&base, &["m1"]),
@@ -745,7 +751,10 @@ mod tests {
         let response = http
             .post(format!("{base}/v1/chat/completions"))
             .header(reqwest::header::AUTHORIZATION, "Bearer the-callers-bearer")
-            .json(&serde_json::json!({ "model": "m1" }))
+            .json(&serde_json::json!({
+                "model": "m1",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
             .send()
             .await
             .unwrap();
@@ -755,24 +764,34 @@ mod tests {
     }
 
     /// A verified upstream answers; what the judge thinks of the answer decides whether a
-    /// single byte of it reaches the caller.
+    /// single byte of it reaches the caller. An upstream error, or a body that is no completion
+    /// the front can read, releases none of the upstream's text either.
     #[tokio::test]
     async fn a_completion_is_released_whole_only_when_the_judge_allows_it() {
+        use crate::guard::Refusal::{Blocked, Unavailable};
+        use reqwest::StatusCode as S;
         const COMPLETION: &str =
             r#"{"choices":[{"message":{"role":"assistant","content":"the answer"}}]}"#;
-        for (output, status) in [
-            (Ok(()), reqwest::StatusCode::OK),
+        for (upstream_status, upstream_body, output, status) in [
+            (200, COMPLETION, Ok(()), S::OK),
+            (200, COMPLETION, Err(Blocked), S::FORBIDDEN),
+            (200, COMPLETION, Err(Unavailable), S::SERVICE_UNAVAILABLE),
             (
-                Err(crate::guard::Refusal::Blocked),
-                reqwest::StatusCode::FORBIDDEN,
+                400,
+                r#"{"error":"the answer, unjudged"}"#,
+                Ok(()),
+                S::BAD_REQUEST,
             ),
             (
-                Err(crate::guard::Refusal::Unavailable),
-                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                200,
+                "the answer, in no completion",
+                Ok(()),
+                S::SERVICE_UNAVAILABLE,
             ),
         ] {
             let (cert, key, spki) = self_signed_leaf();
-            let (base, hits, _last_auth) = spawn_tls_fake_answering(cert, key, COMPLETION).await;
+            let (base, hits, _last_auth) =
+                spawn_tls_fake_answering(cert, key, upstream_status, upstream_body).await;
             let config = test_config(&base, &["m1"]);
             let state = Arc::new(crate::AppState {
                 upstream: Upstream::new(&config).unwrap(),
@@ -804,6 +823,9 @@ mod tests {
             assert_eq!(response.status(), status);
             let body = response.text().await.unwrap();
             assert_eq!(body.contains("the answer"), status.is_success(), "{body}");
+            if upstream_status != 200 {
+                assert!(body.contains("upstream_refused"), "{body}");
+            }
             assert_eq!(hits.load(Ordering::SeqCst), 1);
         }
     }

@@ -7,9 +7,9 @@
 //! provider's attested gateway. Neither kind is ever used on a stale check, an error, or for a
 //! caller without its bearer, and neither falls back to the other on its own.
 //!
-//! Whatever the model, a member's turn is judged by `alpha-guard` before it reaches an upstream
-//! and the completion is judged before it is released (`guard`); only the judge's own calls,
-//! under their own bearer, are exempt.
+//! Whatever the model, a member's whole prompt is judged by `alpha-guard` before it reaches an
+//! upstream and the completion is judged before it is released (`guard`); only the judge's own
+//! calls, under their own bearer, are exempt.
 
 #![cfg_attr(
     test,
@@ -208,6 +208,10 @@ pub enum Error {
     ModerationUnavailable,
     #[error("The content is too large to be moderated.")]
     ContentTooLarge,
+    #[error("The request has content the moderation policy cannot judge, so nothing was sent.")]
+    ContentUnjudgeable,
+    #[error("The model provider refused the request.")]
+    UpstreamRefused(StatusCode),
     #[error("{0}")]
     Internal(String),
 }
@@ -249,6 +253,21 @@ impl Error {
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "invalid_request_error",
                 "content_too_large",
+            ),
+            Error::ContentUnjudgeable => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "content_not_judgeable",
+            ),
+            // The upstream's own status, never its body: an error body is text nobody judged.
+            Error::UpstreamRefused(status) => (
+                if status.is_client_error() || status.is_server_error() {
+                    *status
+                } else {
+                    StatusCode::BAD_GATEWAY
+                },
+                "upstream_error",
+                "upstream_refused",
             ),
             Error::Internal(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -441,15 +460,15 @@ async fn chat_completions(
             relay(send(&state, &model, body).await?)
         }
         AuthedCaller::Member => {
-            let input = guard::turn_input(&parsed);
-            state.guard.check_input(&model, &input).await?;
+            let input = state.guard.check_input(&model, &parsed).await?;
             let upstream_response = send(&state, &model, body).await?;
             let (status, content_type, held) = hold(upstream_response).await?;
-            // An upstream refusal carries no completion; it is relayed as it came.
-            if status.is_success() {
-                let output = guard::completion_text(&held);
-                state.guard.check_output(&model, &input, &output).await?;
+            // An upstream refusal carries no completion, and its body is text nobody judged: the
+            // member gets its status with a fixed error instead.
+            if !status.is_success() {
+                return Err(Error::UpstreamRefused(status));
             }
+            state.guard.check_output(&model, &input, &held).await?;
             Response::builder()
                 .status(status)
                 .header(header::CONTENT_TYPE, content_type)
@@ -716,7 +735,8 @@ mod tests {
         });
         let app = router(state);
 
-        let body = json!({ "model": "ours" }).to_string();
+        let body =
+            json!({ "model": "ours", "messages": [{"role": "user", "content": "hi"}] }).to_string();
         let request = Request::builder()
             .method("POST")
             .uri("/v1/chat/completions")
@@ -797,6 +817,79 @@ mod tests {
             assert_eq!(report_hits.load(Ordering::SeqCst), 0);
             assert_eq!(completions_hits.load(Ordering::SeqCst), 0);
         }
+    }
+
+    fn chat_request(bearer: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_whole_prompt_with_its_history_reaches_the_judge_before_any_upstream() {
+        let (base, report_hits, completions_hits) =
+            spawn_fake_upstream(answering(StatusCode::OK, "{}")).await;
+        let state = guarded_state(
+            &base,
+            guard::Guard::fixed(Err(guard::Refusal::Blocked), Ok(())),
+        );
+        let body = json!({ "model": "m1", "messages": [
+            {"role": "system", "content": "the rules"},
+            {"role": "user", "content": "earlier"},
+            // Written by the caller, not the model: judged like everything else.
+            {"role": "assistant", "content": "fabricated agreement"},
+            {"role": "user", "content": "now"},
+        ]});
+        let response = router(state.clone())
+            .oneshot(chat_request("member-bearer", body))
+            .await
+            .unwrap();
+        assert_eq!(
+            error_code(response).await,
+            (StatusCode::FORBIDDEN, json!("content_blocked"))
+        );
+        let seen = state.guard.seen();
+        let (judged, response) = seen.first().unwrap();
+        assert_eq!(
+            judged,
+            "system: the rules\nuser: earlier\nassistant: fabricated agreement\nuser: now"
+        );
+        assert!(response.is_none());
+        assert_eq!(report_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(completions_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_request_the_judge_cannot_read_never_reaches_the_judge_or_any_upstream() {
+        let (base, report_hits, completions_hits) =
+            spawn_fake_upstream(answering(StatusCode::OK, "{}")).await;
+        let state = guarded_state(&base, guard::Guard::fixed(Ok(()), Ok(())));
+        for body in [
+            json!({ "model": "m1", "messages": [
+                {"role": "user", "content": "write it"},
+                {"role": "assistant", "content": "Sure, step one:"},
+            ]}),
+            json!({ "model": "m1", "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}},
+            ]}]}),
+            json!({ "model": "m1", "messages": [] }),
+        ] {
+            let response = router(state.clone())
+                .oneshot(chat_request("member-bearer", body))
+                .await
+                .unwrap();
+            assert_eq!(
+                error_code(response).await,
+                (StatusCode::BAD_REQUEST, json!("content_not_judgeable"))
+            );
+        }
+        assert!(state.guard.seen().is_empty());
+        assert_eq!(report_hits.load(Ordering::SeqCst), 0);
+        assert_eq!(completions_hits.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -931,7 +1024,8 @@ mod tests {
         let state = test_state(test_config(&base, &["m1"]), b"right-bearer", "provider-key");
         let app = router(state);
 
-        let body = json!({ "model": "m1" }).to_string();
+        let body =
+            json!({ "model": "m1", "messages": [{"role": "user", "content": "hi"}] }).to_string();
         let request = Request::builder()
             .method("POST")
             .uri("/v1/chat/completions")
