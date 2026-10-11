@@ -258,7 +258,8 @@ struct NvidiaDevice {
 /// (`GET /aa/additional-evidence`): the agent's NVIDIA attester asks every confidential GPU for a
 /// report over the first 32 bytes of the runtime data, so the nonce is sent as the runtime data,
 /// raw (`encoding=base64`). Exactly `count` GPUs, NVSwitches left out. Untrusted, like everything
-/// here: the GPU backend verifies every report, and its nonce, at the KMS.
+/// here: the GPU backend verifies every report, and its nonce, at the KMS. A pod on the CPU class
+/// (`kata-qemu-tdx`) has a Revision without GPUs, so `count` is 0 and the agent is not asked.
 pub fn agent_gpu_evidence(
     addr: &str,
     nonce: &[u8; 32],
