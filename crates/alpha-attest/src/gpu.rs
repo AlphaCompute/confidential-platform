@@ -8,7 +8,10 @@
 //! platform document's policy and the Revision's GPU shape to them. That last step is pure and is
 //! the one that decides, so which backend ran never changes what a leaf means.
 
-use std::collections::BTreeSet;
+pub mod ccm;
+pub mod nras;
+
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -60,6 +63,10 @@ pub struct GpuPolicy {
     /// NRAS's base URL; NVIDIA's public service when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nras_url: Option<String>,
+    /// A verifier's hardware model string (NRAS's `hwmodel`) to the model name used here, e.g.
+    /// the B300's string to `B300`. Release-signed, so no backend guesses what a GPU is.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hwmodels: BTreeMap<String, String>,
 }
 
 /// What a backend proved about one GPU, after its own cryptographic checks passed. Part of the
@@ -346,6 +353,7 @@ mod tests {
             min_vbios_version: Some("97.00.82.00.01".into()),
             verifiers: vec![GpuVerifierKind::Nras],
             nras_url: None,
+            hwmodels: BTreeMap::new(),
         }
     }
 

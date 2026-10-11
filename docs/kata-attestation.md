@@ -77,11 +77,18 @@ All optional, so documents already signed still parse and keep their meaning:
   "min_driver_version": "570.124.06",
   "min_vbios_version": "97.00.82.00.01",
   "verifiers": ["nras"],
-  "nras_url": "https://nras.attestation.nvidia.com"
+  "nras_url": "https://nras.attestation.nvidia.com",
+  "hwmodels": {"<NRAS hwmodel string for B300>": "B300"}
 }
 ```
 
-The document, its `policy`, its reference values and `gpu_policy` refuse fields they do not know, so `alpha sign` refuses a misspelled field (a reference value's `runtime_class`, say) rather than signing it to be ignored. The attestation result goes the other way: `coco` and its GPU entries accept fields they do not know, so runtimes keep renewing across a KMS upgrade that adds one. A reference value without `kind` is `prototype-tdx` and never matches Kata evidence (and vice versa). `verifiers` takes `nras`, `local` (after Dec 1) and `fortanix-ccm` (D1); every listed backend must pass.
+The document, its `policy`, its reference values and `gpu_policy` refuse fields they do not know, so `alpha sign` refuses a misspelled field (a reference value's `runtime_class`, say) rather than signing it to be ignored. The attestation result goes the other way: `coco` and its GPU entries accept fields they do not know, so runtimes keep renewing across a KMS upgrade that adds one. A reference value without `kind` is `prototype-tdx` and never matches Kata evidence (and vice versa). `verifiers` takes `nras`, `local` (after Dec 1) and `fortanix-ccm` (D1); every listed backend must pass. `hwmodels` maps NRAS's `hwmodel` claim to the model names above; a GPU whose string is not listed is refused, so the B300 string is added from the first capture rather than guessed.
+
+## GPU backends
+
+- `nras` (`alpha_attest::gpu::nras`): posts every GPU's report and certificate chain with the nonce, verifies the overall EAT and each per-GPU EAT (ES384 under NRAS's JWKS, issuer = `nras_url`, unexpired), ties each per-GPU token to the overall token's `submods` digest, and requires the overall result, the nonce, `measres: success`, the report signature, nonce match, RIM signatures, secure boot, debug disabled and CC mode. The claim names are confirmed against a B300 reply at M-B; any missing claim refuses.
+- `fortanix-ccm` (`alpha_attest::gpu::ccm`): configured like any backend and refuses every GPU until Fortanix answers F8 with an API.
+- `local`: after Dec 1.
 
 ## What the KMS cannot see
 
