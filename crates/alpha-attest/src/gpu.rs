@@ -62,9 +62,9 @@ pub struct GpuPolicy {
     pub nras_url: Option<String>,
 }
 
-/// What a backend proved about one GPU, after its own cryptographic checks passed.
+/// What a backend proved about one GPU, after its own cryptographic checks passed. Part of the
+/// attestation result, so it accepts fields it does not know (see [`crate::CocoAppraised`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct VerifiedGpu {
     /// Position in the evidence's `gpus`.
     pub index: u32,
