@@ -72,6 +72,11 @@ pub struct GpuPolicy {
     /// fetching NRAS's JWKS over web-PKI TLS. Empty, the `nras` backend refuses every GPU.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub nras_keys: BTreeMap<String, nras::NrasKey>,
+    /// The per-GPU NRAS claim that shows CC mode is on, and its value: confirmed on a B300 reply
+    /// at G0, since NVIDIA publishes no claim of that name. Absent, the `nras` backend refuses
+    /// every GPU.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nras_cc_mode: Option<nras::NrasClaim>,
 }
 
 /// What a backend proved about one GPU, after its own cryptographic checks passed. Part of the
@@ -360,6 +365,7 @@ mod tests {
             nras_url: None,
             hwmodels: BTreeMap::new(),
             nras_keys: BTreeMap::new(),
+            nras_cc_mode: None,
         }
     }
 

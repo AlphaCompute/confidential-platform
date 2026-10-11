@@ -49,6 +49,7 @@ mod tests {
             nras_url: None,
             hwmodels: Default::default(),
             nras_keys: Default::default(),
+            nras_cc_mode: None,
         };
         let error = ccm.verify(&[], &[0; 32], &policy).await.unwrap_err();
         assert_eq!(error.code(), "attestation_unknown");

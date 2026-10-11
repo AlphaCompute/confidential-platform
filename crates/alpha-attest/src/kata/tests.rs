@@ -183,6 +183,7 @@ fn doc() -> PlatformDocument {
             nras_url: None,
             hwmodels: Default::default(),
             nras_keys: Default::default(),
+            nras_cc_mode: None,
         }),
     }
 }

@@ -29,31 +29,186 @@ const ATTEST_PATH: &str = "/v3/attest/gpu";
 const CLOCK_SKEW: Duration = Duration::from_secs(60);
 const TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The per-GPU claims this backend requires, named as NRAS emits them.
-// ponytail: confirm every name against an NRAS reply for a B300 at M-B; `CC_MODE` especially, whose
-// name is not in NVIDIA's published claim list we have. A missing claim refuses (fail closed).
-mod claims {
+/// The claims this backend requires, named as NVIDIA's GPU claims version 3.0 lists them (4.0
+/// only adds to 3.0). Every per-GPU requirement is a JSON pointer into that GPU's EAT claims.
+// ponytail: G0 — `g0_nras_reply_has_every_claim_this_backend_requires` (docs/kata-attestation.md,
+// "G0 check") runs these against a captured B300 reply before M-B. A missing claim refuses.
+pub mod claims {
     pub const OVERALL_RESULT: &str = "x-nvidia-overall-att-result";
     pub const NONCE: &str = "eat_nonce";
     pub const SUBMODS: &str = "submods";
-    pub const MEASUREMENTS: &str = "measres";
-    pub const MEASUREMENTS_OK: &str = "success";
-    pub const REQUIRED_TRUE: [&str; 6] = [
-        "x-nvidia-gpu-arch-check",
-        "x-nvidia-gpu-attestation-report-signature-verified",
-        "x-nvidia-gpu-attestation-report-nonce-match",
-        "x-nvidia-gpu-driver-rim-signature-verified",
-        "x-nvidia-gpu-vbios-rim-signature-verified",
-        "secboot",
-    ];
-    pub const DEBUG: &str = "dbgstat";
-    pub const DEBUG_OFF: &str = "disabled";
     pub const HWMODEL: &str = "hwmodel";
     pub const UEID: &str = "ueid";
     pub const DRIVER: &str = "x-nvidia-gpu-driver-version";
     pub const VBIOS: &str = "x-nvidia-gpu-vbios-version";
-    pub const CC_MODE: &str = "x-nvidia-cc-mode";
-    pub const CC_MODE_ON: &str = "ON";
+    /// Per-GPU text claims that must be present; read into [`super::VerifiedGpu`].
+    pub const TEXT: [&str; 4] = [HWMODEL, UEID, DRIVER, VBIOS];
+
+    /// What a required per-GPU claim must hold.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Expect {
+        True,
+        Text(&'static str),
+        /// Must be true when NRAS sends it; older replies may leave it out.
+        TrueIfPresent,
+    }
+
+    use Expect::*;
+
+    /// The report, its certificate chain and revocation (OCSP), the driver and VBIOS RIMs with
+    /// their certificate chains and revocation, the measurements, secure boot and debug.
+    pub const REQUIRED: [(&str, Expect); 26] = [
+        ("/measres", Text("success")),
+        ("/secboot", True),
+        ("/dbgstat", Text("disabled")),
+        ("/x-nvidia-gpu-arch-check", True),
+        ("/x-nvidia-gpu-attestation-report-parsed", True),
+        ("/x-nvidia-gpu-attestation-report-signature-verified", True),
+        ("/x-nvidia-gpu-attestation-report-nonce-match", True),
+        (
+            "/x-nvidia-gpu-attestation-report-cert-chain-fwid-match",
+            True,
+        ),
+        (
+            "/x-nvidia-gpu-attestation-report-cert-chain/x-nvidia-cert-status",
+            Text("valid"),
+        ),
+        (
+            "/x-nvidia-gpu-attestation-report-cert-chain/x-nvidia-cert-ocsp-status",
+            Text("good"),
+        ),
+        (
+            "/x-nvidia-gpu-attestation-report-cert-chain/x-nvidia-cert-ocsp-nonce-matches",
+            TrueIfPresent,
+        ),
+        (
+            "/x-nvidia-gpu-attestation-report-cert-chain/x-nvidia-cert-ocsp-response-valid",
+            TrueIfPresent,
+        ),
+        ("/x-nvidia-gpu-driver-rim-signature-verified", True),
+        ("/x-nvidia-gpu-driver-rim-version-match", True),
+        (
+            "/x-nvidia-gpu-driver-rim-cert-chain/x-nvidia-cert-status",
+            Text("valid"),
+        ),
+        (
+            "/x-nvidia-gpu-driver-rim-cert-chain/x-nvidia-cert-ocsp-status",
+            Text("good"),
+        ),
+        (
+            "/x-nvidia-gpu-driver-rim-cert-chain/x-nvidia-cert-ocsp-nonce-matches",
+            TrueIfPresent,
+        ),
+        (
+            "/x-nvidia-gpu-driver-rim-cert-chain/x-nvidia-cert-ocsp-response-valid",
+            TrueIfPresent,
+        ),
+        ("/x-nvidia-gpu-vbios-rim-signature-verified", True),
+        ("/x-nvidia-gpu-vbios-rim-version-match", True),
+        (
+            "/x-nvidia-gpu-vbios-rim-cert-chain/x-nvidia-cert-status",
+            Text("valid"),
+        ),
+        (
+            "/x-nvidia-gpu-vbios-rim-cert-chain/x-nvidia-cert-ocsp-status",
+            Text("good"),
+        ),
+        (
+            "/x-nvidia-gpu-vbios-rim-cert-chain/x-nvidia-cert-ocsp-nonce-matches",
+            TrueIfPresent,
+        ),
+        (
+            "/x-nvidia-gpu-vbios-rim-cert-chain/x-nvidia-cert-ocsp-response-valid",
+            TrueIfPresent,
+        ),
+        ("/x-nvidia-gpu-vbios-index-no-conflict", True),
+        ("/x-nvidia-gpu-driver-rim-measurements-available", True),
+    ];
+}
+
+/// The per-GPU claim that shows the GPU is in confidential-computing mode, and the value it must
+/// hold, as the release-signed `gpu_policy.nras_cc_mode` names it. NVIDIA's published GPU claims
+/// (version 3.0) have no claim of that name, so it is not compiled in: it is confirmed on a B300
+/// reply at G0 (docs/kata-attestation.md, "G0 check") and signed into the policy. Until then the
+/// `nras` backend refuses every GPU.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NrasClaim {
+    /// RFC 6901 JSON pointer into the per-GPU EAT claims, e.g. `/x-nvidia-attester-claims/<name>`.
+    pub pointer: String,
+    /// The JSON value that means CC mode is on.
+    pub equals: Value,
+}
+
+fn expect_failure(claims: &Value, pointer: &str, expect: claims::Expect) -> Option<String> {
+    use claims::Expect::*;
+    let found = claims.pointer(pointer);
+    let holds = match (expect, found) {
+        (TrueIfPresent, None) => true,
+        (True | TrueIfPresent, Some(v)) => v.as_bool() == Some(true),
+        (Text(want), Some(v)) => v.as_str() == Some(want),
+        (_, None) => false,
+    };
+    if holds {
+        return None;
+    }
+    let want = match expect {
+        True | TrueIfPresent => "true".to_owned(),
+        Text(want) => format!("{want:?}"),
+    };
+    Some(match found {
+        None => format!("claim {pointer} is missing"),
+        Some(v) => format!("claim {pointer} is {v}, not {want}"),
+    })
+}
+
+/// Whether the GPU is in CC mode by the policy's claim; `Err` when the policy names none or the
+/// GPU's claims lack it (fail closed: a GPU is never reported in CC mode on a guess).
+fn cc_mode(claims: &Value, policy: &GpuPolicy) -> Result<bool, String> {
+    let claim = policy
+        .nras_cc_mode
+        .as_ref()
+        .ok_or_else(|| "gpu_policy.nras_cc_mode names no CC-mode claim (G0 check)".to_owned())?;
+    claims
+        .pointer(&claim.pointer)
+        .map(|v| *v == claim.equals)
+        .ok_or_else(|| format!("CC-mode claim {} is missing", claim.pointer))
+}
+
+/// Every requirement this backend has of one GPU's EAT claims, checked without stopping at the
+/// first failure: one line per claim that is missing or does not hold, and an empty list when
+/// the claims would pass. Signatures, the nonce and the `submods` binding are not checked here.
+/// The G0 check runs it over a captured B300 reply; [`parse_reply`] refuses on the first line.
+pub fn claim_report(claims: &Value, policy: &GpuPolicy) -> Vec<String> {
+    let mut out: Vec<String> = claims::REQUIRED
+        .iter()
+        .filter_map(|(pointer, expect)| expect_failure(claims, pointer, *expect))
+        .collect();
+    for name in claims::TEXT {
+        if claims.get(name).and_then(Value::as_str).is_none() {
+            out.push(format!("claim /{name} is missing"));
+        }
+    }
+    if let Some(hwmodel) = claims.get(claims::HWMODEL).and_then(Value::as_str)
+        && !policy.hwmodels.contains_key(hwmodel)
+    {
+        out.push(format!("hwmodel {hwmodel:?} is not in gpu_policy.hwmodels"));
+    }
+    match cc_mode(claims, policy) {
+        Ok(true) => {}
+        Ok(false) => {
+            if let Some(claim) = &policy.nras_cc_mode {
+                out.push(format!(
+                    "CC-mode claim {} is {}, not {}",
+                    claim.pointer,
+                    claims.pointer(&claim.pointer).unwrap_or(&Value::Null),
+                    claim.equals
+                ));
+            }
+        }
+        Err(e) => out.push(e),
+    }
+    out
 }
 
 /// NRAS over HTTPS; the URL comes from the release-signed `gpu_policy`, NVIDIA's by default.
@@ -126,10 +281,16 @@ impl GpuVerifier for Nras {
         policy: &'a GpuPolicy,
     ) -> GpuFuture<'a> {
         Box::pin(async move {
-            // Checked before any call: with no pinned key, nothing NRAS answers could be trusted.
+            // Checked before any call: with no pinned key nothing NRAS answers could be trusted,
+            // and with no CC-mode claim no GPU could pass.
             if policy.nras_keys.is_empty() {
                 return Err(AppraisalError::Unknown(
                     "gpu_policy.nras_keys pins no NRAS signing key".into(),
+                ));
+            }
+            if policy.nras_cc_mode.is_none() {
+                return Err(AppraisalError::Unknown(
+                    "gpu_policy.nras_cc_mode names no CC-mode claim (G0 check)".into(),
                 ));
             }
             let base = policy
@@ -310,28 +471,23 @@ pub fn parse_reply(
                 "{name} token is not the one the overall result names"
             )));
         }
-        let c = verify_jwt(token, &policy.nras_keys, issuer, now)?;
+        let c = Value::Object(verify_jwt(token, &policy.nras_keys, issuer, now)?);
         let text = |claim: &str| -> Result<String, AppraisalError> {
             c.get(claim)
                 .and_then(Value::as_str)
                 .map(str::to_owned)
-                .ok_or_else(|| bad(format!("{name}: no {claim}")))
+                .ok_or_else(|| bad(format!("{name}: claim /{claim} is missing")))
         };
         if c.get(claims::NONCE).and_then(Value::as_str) != Some(nonce_hex.as_str()) {
             return Err(bad(format!("{name}: token is not over this nonce")));
         }
-        if text(claims::MEASUREMENTS)? != claims::MEASUREMENTS_OK {
-            return Err(bad(format!("{name}: measurements do not match the RIMs")));
-        }
-        if let Some(claim) = claims::REQUIRED_TRUE
+        if let Some(failure) = claims::REQUIRED
             .iter()
-            .find(|claim| c.get(**claim).and_then(Value::as_bool) != Some(true))
+            .find_map(|(pointer, expect)| expect_failure(&c, pointer, *expect))
         {
-            return Err(bad(format!("{name}: {claim} is not true")));
+            return Err(bad(format!("{name}: {failure}")));
         }
-        if text(claims::DEBUG)? != claims::DEBUG_OFF {
-            return Err(bad(format!("{name}: debug is not disabled")));
-        }
+        let cc_mode = cc_mode(&c, policy).map_err(|e| bad(format!("{name}: {e}")))?;
         let hwmodel = text(claims::HWMODEL)?;
         let model = policy.hwmodels.get(&hwmodel).cloned().ok_or_else(|| {
             bad(format!(
@@ -344,10 +500,7 @@ pub fn parse_reply(
             model,
             driver_version: text(claims::DRIVER)?,
             vbios_version: text(claims::VBIOS)?,
-            cc_mode: c
-                .get(claims::CC_MODE)
-                .and_then(Value::as_str)
-                .is_some_and(|m| m.eq_ignore_ascii_case(claims::CC_MODE_ON)),
+            cc_mode,
             nonce: *nonce,
         });
     }
@@ -396,16 +549,38 @@ mod tests {
         UNIX_EPOCH + Duration::from_secs(1_800_000_000)
     }
 
+    /// The CC-mode claim the tests' policy names; a stand-in, not a claim NRAS is known to send.
+    const CC_CLAIM: &str = "/x-test-cc-mode";
+
+    /// Sets the claim at a two-level JSON pointer, creating the object it sits in.
+    fn set(c: &mut Value, pointer: &str, value: Value) {
+        let mut parts = pointer.trim_start_matches('/').split('/');
+        let (first, second) = (parts.next().unwrap(), parts.next());
+        match second {
+            None => c[first] = value,
+            Some(second) => {
+                if c.get(first).is_none() {
+                    c[first] = json!({});
+                }
+                c[first][second] = value;
+            }
+        }
+    }
+
     fn gpu_claims() -> Value {
         let mut c = json!({
             "iss": ISS, "exp": 1_800_000_600u64, "iat": 1_800_000_000u64,
-            "eat_nonce": hex::encode(NONCE), "measres": "success", "dbgstat": "disabled",
-            "ueid": "ueid-0",
+            "eat_nonce": hex::encode(NONCE), "ueid": "ueid-0",
             "hwmodel": "GB110 A01 GSP BROM", "x-nvidia-gpu-driver-version": "575.51.03",
-            "x-nvidia-gpu-vbios-version": "97.00.9A.00.01", "x-nvidia-cc-mode": "ON",
+            "x-nvidia-gpu-vbios-version": "97.00.9A.00.01", "x-test-cc-mode": "ON",
         });
-        for claim in claims::REQUIRED_TRUE {
-            c[claim] = json!(true);
+        for (pointer, expect) in claims::REQUIRED {
+            match expect {
+                claims::Expect::True | claims::Expect::TrueIfPresent => {
+                    set(&mut c, pointer, json!(true))
+                }
+                claims::Expect::Text(want) => set(&mut c, pointer, json!(want)),
+            }
         }
         c
     }
@@ -443,6 +618,10 @@ mod tests {
             nras_url: Some(ISS.into()),
             hwmodels: [("GB110 A01 GSP BROM".to_owned(), "B300".to_owned())].into(),
             nras_keys: [("k1".to_owned(), pinned(&key()))].into(),
+            nras_cc_mode: Some(NrasClaim {
+                pointer: CC_CLAIM.into(),
+                equals: json!("ON"),
+            }),
         }
     }
 
@@ -472,45 +651,182 @@ mod tests {
 
     #[test]
     fn refuses_what_nras_did_not_vouch_for() {
-        let with = |claim: &str, value: Value| {
+        let with = |pointer: &str, value: Value| {
             let mut c = gpu_claims();
-            c[claim] = value;
+            set(&mut c, pointer, value);
+            reply(&[c])
+        };
+        let without = |pointer: &str| {
+            let mut c = gpu_claims();
+            let (parent, last) = pointer.rsplit_once('/').unwrap();
+            let parent = if parent.is_empty() {
+                &mut c
+            } else {
+                c.pointer_mut(parent).unwrap()
+            };
+            parent.as_object_mut().unwrap().remove(last);
             reply(&[c])
         };
         for (case, r, reason) in [
-            ("measurements", with("measres", json!("fail")), "RIMs"),
+            ("measurements", with("/measres", json!("fail")), "/measres"),
             (
                 "nonce",
-                with("eat_nonce", json!(hex::encode([1u8; 32]))),
+                with("/eat_nonce", json!(hex::encode([1u8; 32]))),
                 "nonce",
             ),
-            ("debug", with("dbgstat", json!("enabled")), "debug"),
+            ("debug", with("/dbgstat", json!("enabled")), "/dbgstat"),
             (
                 "rim",
-                with("x-nvidia-gpu-driver-rim-signature-verified", json!(false)),
-                "rim",
+                with("/x-nvidia-gpu-driver-rim-signature-verified", json!(false)),
+                "driver-rim-signature-verified",
             ),
+            (
+                "revoked report certificate",
+                with(
+                    "/x-nvidia-gpu-attestation-report-cert-chain/x-nvidia-cert-status",
+                    json!("revoked"),
+                ),
+                "attestation-report-cert-chain/x-nvidia-cert-status is \"revoked\"",
+            ),
+            (
+                "report certificate OCSP unknown",
+                with(
+                    "/x-nvidia-gpu-attestation-report-cert-chain/x-nvidia-cert-ocsp-status",
+                    json!("unknown"),
+                ),
+                "x-nvidia-cert-ocsp-status",
+            ),
+            (
+                "revoked VBIOS RIM certificate",
+                with(
+                    "/x-nvidia-gpu-vbios-rim-cert-chain/x-nvidia-cert-ocsp-status",
+                    json!("revoked"),
+                ),
+                "vbios-rim-cert-chain",
+            ),
+            (
+                "invalid OCSP response",
+                with(
+                    "/x-nvidia-gpu-driver-rim-cert-chain/x-nvidia-cert-ocsp-response-valid",
+                    json!(false),
+                ),
+                "ocsp-response-valid",
+            ),
+            (
+                "no driver RIM certificate chain",
+                without("/x-nvidia-gpu-driver-rim-cert-chain"),
+                "driver-rim-cert-chain/x-nvidia-cert-status is missing",
+            ),
+            (
+                "no FWID match",
+                without("/x-nvidia-gpu-attestation-report-cert-chain-fwid-match"),
+                "fwid-match is missing",
+            ),
+            ("no device identity", without("/ueid"), "/ueid is missing"),
             (
                 "model",
-                with("hwmodel", json!("GH100 A01 GSP BROM")),
+                with("/hwmodel", json!("GH100 A01 GSP BROM")),
                 "hwmodels",
             ),
-            ("expired", with("exp", json!(1_700_000_000u64)), "expired"),
+            ("expired", with("/exp", json!(1_700_000_000u64)), "expired"),
             (
                 "issuer",
-                with("iss", json!("https://evil.example")),
+                with("/iss", json!("https://evil.example")),
                 "issuer",
+            ),
+            (
+                "no CC-mode claim",
+                without(CC_CLAIM),
+                "CC-mode claim /x-test-cc-mode is missing",
             ),
         ] {
             let error = parse(&r, 1).unwrap_err().to_string();
             assert!(error.contains(reason), "{case}: {error}");
         }
+        // The optional OCSP claims may be absent.
+        assert!(
+            parse(
+                &without("/x-nvidia-gpu-vbios-rim-cert-chain/x-nvidia-cert-ocsp-nonce-matches"),
+                1
+            )
+            .is_ok()
+        );
         // CC mode off is reported, and check_gpus refuses it.
-        let out = parse(&with("x-nvidia-cc-mode", json!("OFF")), 1).unwrap();
+        let out = parse(&with(CC_CLAIM, json!("OFF")), 1).unwrap();
         assert!(!out[0].cc_mode);
-        let mut no_cc = gpu_claims();
-        no_cc.as_object_mut().unwrap().remove("x-nvidia-cc-mode");
-        assert!(!parse(&reply(&[no_cc]), 1).unwrap()[0].cc_mode);
+        // A policy that names no CC-mode claim refuses every GPU.
+        let mut unset = policy();
+        unset.nras_cc_mode = None;
+        let error = parse_reply(&reply(&[gpu_claims()]), ISS, 1, &NONCE, &unset, now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("nras_cc_mode"), "{error}");
+    }
+
+    #[test]
+    fn claim_report_lists_every_claim_a_reply_lacks() {
+        assert!(claim_report(&gpu_claims(), &policy()).is_empty());
+        // A reply in the claims 2.0 shape: booleans where 3.0 has certificate-chain objects.
+        let mut old = gpu_claims();
+        for chain in ["attestation-report", "driver-rim", "vbios-rim"] {
+            old.as_object_mut()
+                .unwrap()
+                .remove(&format!("x-nvidia-gpu-{chain}-cert-chain"));
+        }
+        old.as_object_mut().unwrap().remove("x-test-cc-mode");
+        old["hwmodel"] = json!("GB999 unknown");
+        let report = claim_report(&old, &policy());
+        assert_eq!(report.len(), 8, "{report:#?}");
+        assert!(report.iter().any(|l| l.contains("GB999")));
+        assert!(report.iter().any(|l| l.contains("CC-mode claim")));
+        let mut unset = policy();
+        unset.nras_cc_mode = None;
+        assert_eq!(
+            claim_report(&gpu_claims(), &unset),
+            ["gpu_policy.nras_cc_mode names no CC-mode claim (G0 check)"]
+        );
+    }
+
+    /// The G0 check (docs/kata-attestation.md): run against a reply NRAS gave for a B300 pod's
+    /// GPUs. `ALPHA_NRAS_REPLY` is the reply's path; `ALPHA_GPU_POLICY` optionally the candidate
+    /// `gpu_policy` (JSON) whose `hwmodels` and `nras_cc_mode` are to be confirmed. Signatures are
+    /// not checked here, only that every claim this backend requires is present and holds.
+    #[test]
+    #[ignore = "G0: needs a captured B300 NRAS reply (ALPHA_NRAS_REPLY)"]
+    fn g0_nras_reply_has_every_claim_this_backend_requires() {
+        let read = |var: &str| {
+            std::env::var(var)
+                .ok()
+                .map(|path| std::fs::read(&path).unwrap_or_else(|e| panic!("{var}={path}: {e}")))
+        };
+        let reply: Value = serde_json::from_slice(
+            &read("ALPHA_NRAS_REPLY").expect("set ALPHA_NRAS_REPLY to a captured NRAS reply"),
+        )
+        .unwrap();
+        let policy: GpuPolicy = read("ALPHA_GPU_POLICY")
+            .map(|b| serde_json::from_slice(&b).unwrap())
+            .unwrap_or_else(|| GpuPolicy {
+                nras_cc_mode: None,
+                hwmodels: Default::default(),
+                ..policy()
+            });
+        let payload = |token: &str| -> Value {
+            let p = token.split('.').nth(1).unwrap();
+            serde_json::from_slice(&BASE64_URL_SAFE_NO_PAD.decode(p).unwrap()).unwrap()
+        };
+        let overall = payload(reply[0][1].as_str().unwrap());
+        println!("overall claims: {overall:#}");
+        let mut failures = Vec::new();
+        for (name, token) in reply[1].as_object().unwrap() {
+            let claims = payload(token.as_str().unwrap());
+            println!("{name} claims: {claims:#}");
+            failures.extend(
+                claim_report(&claims, &policy)
+                    .into_iter()
+                    .map(|l| format!("{name}: {l}")),
+            );
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     #[test]
