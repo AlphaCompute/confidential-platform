@@ -1,9 +1,11 @@
 //! `kata-tdx/1` over synthetic verified quotes: the DCAP step is exercised by the real captures in
-//! `tests/vectors.rs`, and a B300 Kata capture joins them at M1. These are the malicious-host
-//! cases the KMS itself must refuse; exec, log reads and container changes are refused inside the
-//! guest by the agent policy and are tested on a live pod (PRD-02 §4).
+//! `tests/vectors.rs`, and B300 Kata captures (CPU and GPU class) join them at M1. These are the
+//! malicious-host cases the KMS itself must refuse; exec, log reads and container changes are
+//! refused inside the guest by the agent policy and are tested on a live pod (PRD-02 §4).
 
-use alpha_core::coco::{CPU_RUNTIME_CLASS, GPU_RUNTIME_CLASS, InitData, REVISION_FORMAT};
+use alpha_core::coco::{
+    CPU_RUNTIME_CLASS, GPU_RUNTIME_CLASS, InitData, REVISION_FORMAT, RuntimeClass,
+};
 use alpha_core::{AppId, KmsRevision};
 
 use std::sync::Arc;
@@ -226,6 +228,16 @@ fn doc() -> PlatformDocument {
     }
 }
 
+/// `quote` as a TD booted from another guest image would produce it: its MRTD and RTMR0..2.
+fn with_registers(
+    mut quote: VerifiedQuote,
+    [mrtd, rtmr0, rtmr1, rtmr2]: [Measurement; 4],
+) -> VerifiedQuote {
+    let m = &mut quote.measured;
+    (m.mrtd, m.rtmr0, m.rtmr1, m.rtmr2) = (mrtd, rtmr0, rtmr1, rtmr2);
+    quote
+}
+
 fn refused(result: Result<Appraised, AppraisalError>, code: &str, reason: &str) {
     let error = result
         .err()
@@ -302,21 +314,21 @@ fn cpu_class_pod_is_appraised_to_its_revision_v2_without_a_gpu_policy() {
 
 #[test]
 fn kms_node_revision_must_be_in_the_platform_document() {
-    let pod = Pod {
-        node: true,
-        ..Pod::gpu(1)
-    };
-    refused(pod.appraise(&doc()), "attestation_unknown", "kms revision");
-    let mut doc = doc();
-    doc.kms_revisions.push(KmsRevision {
-        compose_hash: pod.revision_hash(),
-        build: "b".into(),
-        source_url: "u".into(),
-    });
-    assert_eq!(
-        pod.appraise(&doc).unwrap().compose_hash,
-        pod.revision_hash()
-    );
+    // The KMS on Kata runs on the CPU class; a node on the GPU class is checked the same way.
+    for pod in [Pod::cpu(), Pod::gpu(1)] {
+        let pod = Pod { node: true, ..pod };
+        refused(pod.appraise(&doc()), "attestation_unknown", "kms revision");
+        let mut doc = doc();
+        doc.kms_revisions.push(KmsRevision {
+            compose_hash: pod.revision_hash(),
+            build: "b".into(),
+            source_url: "u".into(),
+        });
+        assert_eq!(
+            pod.appraise(&doc).unwrap().compose_hash,
+            pod.revision_hash()
+        );
+    }
 }
 
 #[test]
@@ -412,27 +424,183 @@ fn wrong_gpu_count_and_gpu_not_in_cc_mode_are_refused() {
 }
 
 #[test]
-fn runtime_class_must_be_the_init_datas_and_the_reference_values() {
+fn runtime_class_must_be_supported_the_init_datas_and_the_reference_values() {
     let pod = Pod::gpu(1);
+    // A class no Revision v2 may name is refused before any reference value is looked up, even
+    // one listed for that class.
     let mut evidence = pod.evidence();
     evidence.runtime_class = "kata-qemu-nvidia-gpu-snp".into();
-    // No reference value is listed for the class the pod claims.
+    let mut listed = doc();
+    listed.reference_values[0].runtime_class = Some("kata-qemu-nvidia-gpu-snp".into());
+    for doc in [doc(), listed] {
+        refused(
+            pod.appraise_with(&evidence, pod.quote(), &doc, &pod.gpu_results()),
+            "attestation_failed",
+            "runtime class \"kata-qemu-nvidia-gpu-snp\" is not supported",
+        );
+    }
+    // A supported claim is held to the measured init-data's class: a GPU pod claims the CPU class
+    // in a TD whose registers are the CPU guest's, so a CPU-class value matches first.
+    let mut evidence = pod.evidence();
+    evidence.runtime_class = CPU_CLASS.into();
+    let quote = with_registers(pod.quote(), Pod::cpu().registers());
     refused(
-        pod.appraise_with(&evidence, pod.quote(), &doc(), &pod.gpu_results()),
-        "attestation_unknown",
-        "runtime class kata-qemu-nvidia-gpu-snp",
-    );
-    // A reference value for any class still holds the claim to the measured init-data's.
-    let mut any_class = doc();
-    any_class.reference_values[0].runtime_class = None;
-    refused(
-        pod.appraise_with(&evidence, pod.quote(), &any_class, &pod.gpu_results()),
+        pod.appraise_with(&evidence, quote, &doc(), &pod.gpu_results()),
         "attestation_failed",
         "is not the init-data's",
     );
+    // No value is listed for the pod's own class.
     let mut doc = doc();
     doc.reference_values[0].runtime_class = Some("kata-qemu-other".into());
-    refused(pod.appraise(&doc), "attestation_unknown", "runtime class");
+    refused(
+        pod.appraise(&doc),
+        "attestation_unknown",
+        "runtime class kata-qemu-nvidia-gpu-tdx",
+    );
+}
+
+#[test]
+fn reference_values_match_per_runtime_class() {
+    let (cpu, gpu) = (Pod::cpu(), Pod::gpu(1));
+
+    // A CPU-class init-data in a TD booted from the NVIDIA guest image: it would skip the GPU
+    // checks, so it is unknown rather than matched to the GPU class's value.
+    let quote = with_registers(cpu.quote(), gpu.registers());
+    refused(
+        cpu.appraise_with(&cpu.evidence(), quote, &doc(), &[]),
+        "attestation_unknown",
+        "runtime class kata-qemu-tdx",
+    );
+    // A GPU-class init-data in a TD booted from the CPU guest image.
+    let quote = with_registers(gpu.quote(), cpu.registers());
+    refused(
+        gpu.appraise_with(&gpu.evidence(), quote, &doc(), &gpu.gpu_results()),
+        "attestation_unknown",
+        "runtime class kata-qemu-nvidia-gpu-tdx",
+    );
+
+    // Two classes captured with the same registers: each pod matches its own class's value,
+    // whichever comes first in the document.
+    let mut same = doc();
+    same.reference_values[1].values = same.reference_values[0].values.clone();
+    let quote = with_registers(cpu.quote(), gpu.registers());
+    let appraised = cpu
+        .appraise_with(&cpu.evidence(), quote, &same, &[])
+        .unwrap();
+    assert_eq!(appraised.os_image, "kata-tdx/cpu");
+    assert_eq!(
+        gpu.appraise(&same).unwrap().os_image,
+        "nvidia-uvm-tdx/b300x8"
+    );
+
+    // A kata-tdx value that names no runtime class matches no pod, whatever its registers.
+    let mut classless = doc();
+    for rv in &mut classless.reference_values {
+        rv.runtime_class = None;
+    }
+    for pod in [cpu, gpu] {
+        refused(
+            pod.appraise(&classless),
+            "attestation_unknown",
+            "kata-tdx reference value",
+        );
+    }
+}
+
+#[test]
+fn each_class_is_held_to_its_gpu_section_at_appraisal() {
+    // What registration refuses, the appraisal refuses too: a GPU-class pod with no GPU or zero
+    // GPUs, and a CPU-class pod whose init-data names GPUs.
+    for (class, gpu, gpus, why) in [
+        (CLASS, None, 0, "needs a gpu section"),
+        (CLASS, Some(0), 0, "gpu.count 0"),
+        (CPU_CLASS, Some(1), 1, "runs no GPU"),
+        (CPU_CLASS, Some(0), 0, "runs no GPU"),
+    ] {
+        let pod = Pod {
+            initdata: initdata_text(class, POLICY, gpu),
+            class,
+            gpus,
+            ..Pod::gpu(1)
+        };
+        refused(pod.appraise(&doc()), "attestation_failed", why);
+    }
+}
+
+#[test]
+fn only_the_cpu_class_skips_the_gpu_checks() {
+    let appraise = |pod: &Pod| {
+        appraise_kata_cpu(&pod.evidence(), pod.quote(), &NONCE, SPKI, None, &doc()).unwrap()
+    };
+    let cpu = appraise(&Pod::cpu());
+    assert_eq!(cpu.runtime_class(), RuntimeClass::Cpu);
+    assert_eq!(cpu.gpu_shape(), None);
+    for count in [1, 8] {
+        let gpu = appraise(&Pod::gpu(count));
+        assert_eq!(gpu.runtime_class(), RuntimeClass::Gpu);
+        assert_eq!(gpu.gpu_shape().map(|shape| shape.count), Some(count));
+    }
+}
+
+#[test]
+fn cpu_pod_presenting_gpu_evidence_is_refused() {
+    // A GPU passed through to a CPU-class pod, or a report the pod got elsewhere: its Revision
+    // expects no GPU, so it gets no leaf, with or without a backend's passing result for that GPU.
+    let liar = Pod {
+        gpus: 1,
+        ..Pod::cpu()
+    };
+    let evidence = liar.evidence();
+    assert_eq!(evidence.gpus.len(), 1);
+    for results in [Vec::new(), liar.gpu_results()] {
+        refused(
+            liar.appraise_with(&evidence, liar.quote(), &doc(), &results),
+            "attestation_failed",
+            "1 GPU evidence entries from a pod of runtime class kata-qemu-tdx",
+        );
+    }
+    // A GPU a backend verified for a CPU pod that sent no GPU evidence is refused too, never
+    // ignored, whoever ran that backend.
+    let pod = Pod::cpu();
+    refused(
+        pod.appraise_with(&pod.evidence(), pod.quote(), &doc(), &liar.gpu_results()),
+        "attestation_failed",
+        "verified 1 GPUs for a pod of runtime class kata-qemu-tdx",
+    );
+}
+
+#[test]
+fn the_runtime_class_claim_cannot_skip_or_borrow_gpu_checks() {
+    // A GPU pod that claims the CPU class and sends no GPU evidence, in its own NVIDIA guest: no
+    // CPU-class value is listed for those registers.
+    let pod = Pod::gpu(8);
+    let mut evidence = pod.evidence();
+    evidence.runtime_class = CPU_CLASS.into();
+    evidence.gpus.clear();
+    refused(
+        pod.appraise_with(&evidence, pod.quote(), &doc(), &[]),
+        "attestation_unknown",
+        "runtime class kata-qemu-tdx",
+    );
+    // Even where the two guests' registers are the same, the measured init-data's class (the GPU
+    // class) refuses the claim.
+    let mut same = doc();
+    same.reference_values[1].values = same.reference_values[0].values.clone();
+    refused(
+        pod.appraise_with(&evidence, pod.quote(), &same, &[]),
+        "attestation_failed",
+        "is not the init-data's",
+    );
+    // A CPU pod cannot claim the GPU class either.
+    let pod = Pod::cpu();
+    let mut evidence = pod.evidence();
+    evidence.runtime_class = CLASS.into();
+    let quote = with_registers(pod.quote(), Pod::gpu(1).registers());
+    refused(
+        pod.appraise_with(&evidence, quote, &doc(), &[]),
+        "attestation_failed",
+        "is not the init-data's",
+    );
 }
 
 #[test]
@@ -700,8 +868,36 @@ async fn gpu_backends_run_only_after_every_td_check_passed() {
     assert_eq!(appraised.coco.unwrap().gpus.len(), 8);
     assert_eq!(calls(), 1);
 
-    // A CPU-only pod never calls a backend.
+    // A CPU-only pod never calls a backend, with or without a gpu_policy in the document.
     let cpu = Pod::cpu();
     run(cpu.evidence(), cpu.quote(), doc()).await.unwrap();
+    let mut no_policy = doc();
+    no_policy.gpu_policy = None;
+    let appraised = run(cpu.evidence(), cpu.quote(), no_policy).await.unwrap();
+    assert!(appraised.coco.unwrap().gpus.is_empty());
+    assert_eq!(calls(), 1);
+
+    // Nor does a CPU pod presenting GPU evidence: it is refused without asking a backend, though
+    // this backend would vouch for the GPU.
+    let liar = Pod {
+        gpus: 8,
+        ..Pod::cpu()
+    };
+    refused(
+        run(liar.evidence(), liar.quote(), doc()).await,
+        "attestation_failed",
+        "runs no GPU",
+    );
+    // Nor a GPU pod that claims the CPU class and hides its GPU evidence.
+    let mut hidden = pod.evidence();
+    hidden.runtime_class = CPU_CLASS.into();
+    hidden.gpus.clear();
+    let mut same = doc();
+    same.reference_values[1].values = same.reference_values[0].values.clone();
+    refused(
+        run(hidden, pod.quote(), same).await,
+        "attestation_failed",
+        "is not the init-data's",
+    );
     assert_eq!(calls(), 1);
 }
