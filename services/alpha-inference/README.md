@@ -7,6 +7,8 @@ The platform's inference front: an App of its own with two kinds of upstream, ch
 
 Either way, any error, timeout or mismatch answers `upstream_unverified` and sends nothing. A model never moves from one kind to the other on its own: which kind serves a model is part of the Revision.
 
+Whatever the model, every member's turn is judged by `alpha-guard` before it reaches an upstream, and every completion is judged before it is released (see *Moderation*). Only the judge's own calls are exempt.
+
 ## Configuration (environment only)
 
 | Variable | Meaning |
@@ -16,17 +18,32 @@ Either way, any error, timeout or mismatch answers `upstream_unverified` and sen
 | `UPSTREAM_URL` | RedPill's OpenAI-compatible base, `/v1` included, `https://` only (e.g. `https://api.redpill.ai/v1`); required only when some model in `MODELS` is not in `MODEL_SERVERS` |
 | `PCCS_URL` | PCCS for DCAP collateral, fetched at most once a minute per model (`https://` only); required as `UPSTREAM_URL` is |
 | `UPSTREAM_POLICY` | JSON of `alpha_attest::Policy` (`tcb_statuses`, `tolerated_advisories`) the report's quote must satisfy; required as `UPSTREAM_URL` is |
+| `GUARD_URL` | `alpha-guard`'s origin, `https://host[:port]`, no path; required |
+| `GUARD_REVISIONS` | comma-separated `sha256:` Revisions of the judge this front asks; required |
+| `GUARD_POLICY` | JSON `{"model": "...", "categories": ["..."]}`, 1 to 32 one-line categories without `<`: what this front refuses, judged by `model`; required, and changing it is a new Revision |
+| `JUDGE_MODELS` | comma-separated models the judge's own bearer may name, each in `MODELS`; must include `GUARD_POLICY`'s model; required |
 
-Secrets, released only to this App's Revision, and read only when this Revision uses them: `caller-bearer` (always; compared by SHA-256 digest against every `/v1` request's `Authorization: Bearer` header before any upstream contact), `redpill-api-key` (when some model is RedPill's; RedPill's own key, never sent to any other App, never released to a caller) and `model-server-bearer` (when some model is ours; sent only over a model server's pinned connection, never to RedPill or a caller). Each model server declares the same value as its own Secret.
+Secrets, released only to this App's Revision, and read only when this Revision uses them: `judge-bearer` (always; the bearer `alpha-guard` presents as its own `inference-bearer`; must be set and differ from `caller-bearer`, or the front refuses to start), `caller-bearer` (always; compared by SHA-256 digest against every `/v1` request's `Authorization: Bearer` header before any upstream contact), `redpill-api-key` (when some model is RedPill's; RedPill's own key, never sent to any other App, never released to a caller) and `model-server-bearer` (when some model is ours; sent only over a model server's pinned connection, never to RedPill or a caller). Each model server declares the same value as its own Secret.
 
 ## Routes
 
 - `GET /v1/models` — RedPill's models: the allowlisted entries of its public listing (bare `{id, object}` when RedPill lists none of them); ours: `{id, object, "owned_by": "alphacompute"}` from `MODEL_SERVERS`. No check: it carries no conversation.
 - `GET /v1/models/{model}` — `200 {"id","object":"model","owned_by":"alphacompute"|"redpill"}` once that model's check has passed within the last minute; `404 model_not_found` outside the allowlist; `502 upstream_unverified` otherwise.
 - `POST /v1/chat/completions` — the body forwarded unchanged over the model's pinned connection, the caller's bearer replaced by that upstream's own credential, status/content-type/stream relayed; `404 model_not_found` outside the allowlist, checked before any upstream contact; `502 upstream_unverified` when the check fails; `502 upstream` when the pinned connection itself fails, or when the completion has not ended 600 seconds after the request started (body included).
+- `POST /v1/chat/completions` also answers, for a member: `403 content_blocked` when the turn or the completion is blocked, `503 moderation_unavailable` when the judge gives no verdict, `413 content_too_large` when there is more than the judge can be asked about. With the judge's bearer, a model outside `JUDGE_MODELS` answers `404 model_not_found`.
 - `GET /healthz` (process only) and `GET /ready` (200 once the default model verifies) need no bearer.
 
 Errors are OpenAI-shaped: `{"error":{"message","type","code"}}`; the `upstream_unverified` message is always "The model provider did not pass verification, so nothing was sent."
+
+## Moderation
+
+For a member's request (`caller-bearer`), before any upstream contact: the new turn — every message after the last assistant message, all of them on the first turn, as `role: text` — goes to `alpha-guard`'s `POST /v1/check` with `GUARD_POLICY`. Then the upstream's answer is held whole (up to 16 MiB), its text, reasoning and tool calls are read from the JSON body or the event stream's deltas, and judged with the last 16 KiB of the turn as context. Only on `allow` is the held answer released, byte for byte, with the upstream's status and content type; an upstream error with no completion is relayed as it came. Text over the judge's 128 KiB is judged in windows (120 KiB for the turn, 104 KiB for the completion), at most 16 per phase.
+
+Within one completion there is no streaming under moderation: a caller asking for `stream: true` gets the whole event stream at once, after the judge.
+
+The judge is dialled as any caller dials it: this Instance's leaf as the client certificate (renewed with every refresh), the connection pinned to the KMS CA and one of `GUARD_REVISIONS`. `alpha-guard`'s `CALLER_APPS` must therefore list this front's App. Its own calls back here present `judge-bearer` and are not judged again; they may name only a model in `JUDGE_MODELS`. Logs carry the phase, the outcome, the model and the elapsed time — never the text.
+
+**What this leaves open:** image and audio parts of a request are not judged; the judge sees only text.
 
 ## Our own model servers
 
