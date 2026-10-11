@@ -814,6 +814,27 @@ package agent_policy
     }
 
     #[test]
+    fn a_cpu_class_pod_serves_a_revision_v2_without_gpus() {
+        let source = alpha_tsm::coco::QuoteSource::AttestationAgent;
+        let cpu = INITDATA
+            .replace(r#""gpu":{"count":8,"model":"B300"},"#, "")
+            .replace("kata-qemu-nvidia-gpu-tdx", "kata-qemu-tdx");
+        let coco = coco_identity(source, cpu.into_bytes()).unwrap();
+        let revision: alpha_core::coco::CocoRevision =
+            serde_json::from_str(&coco.revision).unwrap();
+        assert_eq!(revision.runtime_class, alpha_core::coco::CPU_RUNTIME_CLASS);
+        assert_eq!(revision.gpu, None);
+
+        // A CPU-class init-data that expects GPUs fails at the pod, before it asks for a leaf.
+        let with_gpus = INITDATA.replace("kata-qemu-nvidia-gpu-tdx", "kata-qemu-tdx");
+        let error = coco_identity(source, with_gpus.into_bytes())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("runs no GPU"), "{error}");
+    }
+
+    #[test]
     fn config_parses_the_three_variables_and_refuses_empty_or_malformed_ones() {
         let c = Config::parse(
             &format!(" {HASH} "),

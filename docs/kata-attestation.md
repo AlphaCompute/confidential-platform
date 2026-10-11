@@ -1,6 +1,6 @@
 # Attesting a Kata confidential pod (`kata-tdx/1`)
 
-How `alpha-kms` decides to issue a Revision leaf to a Kata confidential pod on TDX with NVIDIA confidential GPUs (PRD-02). Clients see no change: the leaf, its one-hour lifetime and its SANs (`urn:alphacompute:revision:sha256:<hash>`) are what they were. The prototype profile (`alphacompute-evidence/1`) is unchanged and both coexist.
+How `alpha-kms` decides to issue a Revision leaf to a Kata confidential pod on TDX, CPU-only or with NVIDIA confidential GPUs (PRD-02). Clients see no change: the leaf, its one-hour lifetime and its SANs (`urn:alphacompute:revision:sha256:<hash>`) are what they were. The prototype profile (`alphacompute-evidence/1`) is unchanged and both coexist.
 
 > **Status: the KMS does not run this profile yet.** This document describes the appraisal in `alpha_attest` (`appraise_any`, `kata`, `gpu`) and the behaviour the KMS will have once it is wired in (PRD-02 PR 5, not written yet). Today `alpha-kms` still accepts only `alphacompute-evidence/1` and calls the prototype `appraise` (`services/alpha-kms/src/instance.rs`), so a Kata pod's evidence v2 is refused and no Kata pod gets a leaf. Sentences marked *(PR 5)* describe KMS behaviour that is pending.
 
@@ -21,7 +21,23 @@ The Revision v2 is then a pure function of the init-data bytes:
  "initdata_sha256":"sha256:<hex>","policy_sha256":"sha256:<hex>","runtime_class":"kata-qemu-nvidia-gpu-tdx"}
 ```
 
-It is registered in its JCS form, signed by the org key or a passkey exactly like a compose (context `alphacompute/revision/v1`, document `{app_id, compose}` with the Revision v2 text as `compose`), and its hash is SHA-256 over those bytes. *(PR 5)* The KMS rebuilds it from the verified init-data and looks the hash up in the same `revisions` table. `gpu` is absent for a CPU-only pod. `gpu.count` is 1 or 8.
+It is registered in its JCS form, signed by the org key or a passkey exactly like a compose (context `alphacompute/revision/v1`, document `{app_id, compose}` with the Revision v2 text as `compose`), and its hash is SHA-256 over those bytes. *(PR 5)* The KMS rebuilds it from the verified init-data and looks the hash up in the same `revisions` table.
+
+### Runtime classes
+
+A Revision v2 names one of two runtime classes, both Kata on TDX. The class decides the `gpu` section, in `alpha.json` and in the Revision alike:
+
+| `runtime_class` | Pods | `gpu` |
+|---|---|---|
+| `kata-qemu-tdx` | CPU-only confidential pods: the KMS, broker, signer, guard, inference front and Corpus supervisor | Absent. Any `gpu` section is refused, even one with `count: 0`, so one pod has exactly one Revision. |
+| `kata-qemu-nvidia-gpu-tdx` | Pods with whole B300 GPUs in CC mode (`nvidia.com/pgpu`) | Required: `count` 1 or 8 and an upper-case `model`. A GPU-class Revision without GPUs is refused. |
+
+Any other class is refused at registration and at appraisal (`kata-qemu-nvidia-gpu-snp` waits for the `kata-snp/1` profile). A CPU-only pod's entries:
+
+```json
+{"app_id":"<uuid>","format":"alphacompute-initdata/1","runtime_class":"kata-qemu-tdx"}
+{"app_id":"<uuid>","format":"alphacompute-coco-revision/1","initdata_sha256":"sha256:<hex>","policy_sha256":"sha256:<hex>","runtime_class":"kata-qemu-tdx"}
+```
 
 `MRCONFIGID` holds the init-data digest under the algorithm the document declares, zero-padded to 48 bytes; `alpha coco render` declares `sha384`, which fills it. This is open question Q10 until a golden vector from a B300 pod proves it at M1; `alpha_core::coco::InitData::mrconfigid` is the one place to change if Kata binds it differently.
 

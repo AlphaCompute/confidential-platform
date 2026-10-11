@@ -3,10 +3,11 @@
 //! Kata binds the digest of the init-data document into the TD's MRCONFIGID at launch, and the
 //! agent policy the pod runs under is one of its entries. So the init-data, and nothing the host
 //! controls, says what may run in the pod. Our own entry, `alpha.json`, names the App, the runtime
-//! class and the GPUs the pod expects; every field of the Revision v2 document is therefore either
-//! inside the measured init-data or a digest of it, and the Revision v2 is a pure function of the
-//! init-data bytes. The KMS rebuilds it from verified evidence and looks its hash up exactly as it
-//! looks up a compose hash today: same `revisions` table, same signature, same leaf SAN.
+//! class and the GPUs the pod expects (none on the CPU class); every field of the Revision v2
+//! document is therefore either inside the measured init-data or a digest of it, and the Revision
+//! v2 is a pure function of the init-data bytes. The KMS rebuilds it from verified evidence and
+//! looks its hash up exactly as it looks up a compose hash today: same `revisions` table, same
+//! signature, same leaf SAN.
 
 use std::collections::BTreeMap;
 
@@ -26,13 +27,50 @@ pub const ALPHA_ENTRY: &str = "alpha.json";
 pub const POLICY_ENTRY: &str = "policy.rego";
 /// The only init-data document version the pinned Kata reads.
 pub const INITDATA_VERSION: &str = "0.1.0";
+/// The confidential runtime class for pods with GPUs: a Kata TD on TDX with the NVIDIA guest image
+/// and whole GPUs in CC mode passed through (`nvidia.com/pgpu`).
+pub const GPU_RUNTIME_CLASS: &str = "kata-qemu-nvidia-gpu-tdx";
+/// The confidential runtime class for CPU-only pods: a Kata TD on TDX with no device passed
+/// through (the KMS, broker, signer, guard, inference front and Corpus supervisor).
+pub const CPU_RUNTIME_CLASS: &str = "kata-qemu-tdx";
 /// The runtime classes a Revision v2 may name; `kata-qemu-nvidia-gpu-snp` waits for the
 /// `kata-snp/1` profile (PRD-02, P2).
-pub const RUNTIME_CLASSES: [&str; 1] = ["kata-qemu-nvidia-gpu-tdx"];
+pub const RUNTIME_CLASSES: [&str; 2] = [GPU_RUNTIME_CLASS, CPU_RUNTIME_CLASS];
 /// Whole GPUs only (no MIG in CC mode), one or a full eight-GPU node.
 pub const GPU_COUNTS: [u32; 2] = [1, 8];
 /// Init-data larger than this is refused before it is parsed.
 pub const MAX_INITDATA_BYTES: usize = 512 * 1024;
+
+/// A runtime class a Revision v2 may name, and what it says about GPUs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeClass {
+    /// [`CPU_RUNTIME_CLASS`]: no GPU, so a Revision on it has no `gpu` section.
+    Cpu,
+    /// [`GPU_RUNTIME_CLASS`]: a `gpu` section with [`GPU_COUNTS`] whole GPUs of one model.
+    Gpu,
+}
+
+impl RuntimeClass {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            CPU_RUNTIME_CLASS => Some(Self::Cpu),
+            GPU_RUNTIME_CLASS => Some(Self::Gpu),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Cpu => CPU_RUNTIME_CLASS,
+            Self::Gpu => GPU_RUNTIME_CLASS,
+        }
+    }
+
+    /// Whether a pod of this class runs with GPUs passed through, and so must prove them.
+    pub fn has_gpus(self) -> bool {
+        self == Self::Gpu
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum CocoError {
@@ -173,6 +211,7 @@ pub struct AlphaEntry {
     pub format: String,
     pub app_id: AppId,
     pub runtime_class: String,
+    /// Required on [`GPU_RUNTIME_CLASS`], refused on [`CPU_RUNTIME_CLASS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu: Option<GpuShape>,
 }
@@ -195,26 +234,40 @@ pub struct GpuShape {
     pub model: String,
 }
 
+/// The runtime class decides the GPU section: none on the CPU class (not even a zero count, so one
+/// pod has one Revision), and one or eight GPUs of one model on the GPU class.
 fn check_shape(runtime_class: &str, gpu: Option<&GpuShape>) -> Result<(), String> {
-    if !RUNTIME_CLASSES.contains(&runtime_class) {
-        return Err(format!("runtime_class {runtime_class:?} is not supported"));
-    }
-    if let Some(gpu) = gpu {
-        if !GPU_COUNTS.contains(&gpu.count) {
-            return Err(format!("gpu.count {} is not 1 or 8", gpu.count));
-        }
-        let model_ok = !gpu.model.is_empty()
-            && gpu.model.len() <= 32
-            && gpu
-                .model
-                .bytes()
-                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-');
-        if !model_ok {
+    let class = RuntimeClass::from_name(runtime_class)
+        .ok_or_else(|| format!("runtime_class {runtime_class:?} is not supported"))?;
+    let gpu = match (class, gpu) {
+        (RuntimeClass::Cpu, None) => return Ok(()),
+        (RuntimeClass::Cpu, Some(gpu)) => {
             return Err(format!(
-                "gpu.model {:?} is not an upper-case model name",
-                gpu.model
+                "runtime_class {CPU_RUNTIME_CLASS} runs no GPU, so a gpu section (count {}) is not allowed",
+                gpu.count
             ));
         }
+        (RuntimeClass::Gpu, None) => {
+            return Err(format!(
+                "runtime_class {GPU_RUNTIME_CLASS} needs a gpu section with count 1 or 8"
+            ));
+        }
+        (RuntimeClass::Gpu, Some(gpu)) => gpu,
+    };
+    if !GPU_COUNTS.contains(&gpu.count) {
+        return Err(format!("gpu.count {} is not 1 or 8", gpu.count));
+    }
+    let model_ok = !gpu.model.is_empty()
+        && gpu.model.len() <= 32
+        && gpu
+            .model
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-');
+    if !model_ok {
+        return Err(format!(
+            "gpu.model {:?} is not an upper-case model name",
+            gpu.model
+        ));
     }
     Ok(())
 }
@@ -243,6 +296,12 @@ impl CocoRevision {
 
     pub fn hash(&self) -> Result<ComposeHash, CocoError> {
         Ok(crate::compose_hash(&self.canonical()?))
+    }
+
+    /// The runtime class this Revision names; `None` only for a document that was built by hand
+    /// rather than by [`InitData::revision`] or [`Self::check_registered`].
+    pub fn class(&self) -> Option<RuntimeClass> {
+        RuntimeClass::from_name(&self.runtime_class)
     }
 
     /// A registered Revision v2: well formed, of `app_id`, and exactly its own canonical bytes, so
@@ -289,11 +348,24 @@ mod tests {
         )
     }
 
-    fn alpha(gpu: &str) -> String {
+    fn alpha_on(class: &str, gpu: &str) -> String {
         format!(
-            "{{\"app_id\":\"{APP}\",\"format\":\"alphacompute-initdata/1\",{gpu}\"runtime_class\":\"kata-qemu-nvidia-gpu-tdx\"}}"
+            "{{\"app_id\":\"{APP}\",\"format\":\"alphacompute-initdata/1\",{gpu}\"runtime_class\":\"{class}\"}}"
         )
     }
+
+    /// `alpha.json` on the GPU class.
+    fn alpha(gpu: &str) -> String {
+        alpha_on(GPU_RUNTIME_CLASS, gpu)
+    }
+
+    /// `alpha.json` on the CPU class, which has no `gpu` section.
+    fn cpu_alpha() -> String {
+        alpha_on(CPU_RUNTIME_CLASS, "")
+    }
+
+    const GPU1: &str = "\"gpu\":{\"count\":1,\"model\":\"B300\"},";
+    const GPU0: &str = "\"gpu\":{\"count\":0,\"model\":\"B300\"},";
 
     #[test]
     fn revision_is_a_function_of_the_initdata_bytes() {
@@ -337,7 +409,7 @@ mod tests {
 
     #[test]
     fn mrconfigid_pads_sha256_and_fills_with_sha384() {
-        let a = alpha("");
+        let a = cpu_alpha();
         let t256 = initdata("sha256", &a);
         let m = InitData::parse(t256.as_bytes()).unwrap().mrconfigid();
         assert_eq!(&m[..32], Sha256::digest(t256.as_bytes()).as_slice());
@@ -349,7 +421,7 @@ mod tests {
 
     #[test]
     fn refuses_malformed_initdata_and_entries() {
-        let a = alpha("");
+        let a = cpu_alpha();
         assert!(matches!(
             InitData::parse(initdata("sha512", &a).as_bytes()),
             Err(CocoError::Algorithm(_))
@@ -383,6 +455,13 @@ mod tests {
                 alpha("").replace("kata-qemu-nvidia-gpu-tdx", "runc"),
                 "runtime_class",
             ),
+            (alpha_on("kata-qemu-tdx-2", ""), "runtime_class"),
+            (alpha_on("kata-qemu-snp", ""), "runtime_class"),
+            // The GPU class with no GPU, and the CPU class with any gpu section at all.
+            (alpha(""), "needs a gpu section"),
+            (alpha(GPU0), "gpu.count 0"),
+            (alpha_on(CPU_RUNTIME_CLASS, GPU1), "runs no GPU"),
+            (alpha_on(CPU_RUNTIME_CLASS, GPU0), "runs no GPU"),
             (alpha("").replace("initdata/1", "initdata/9"), "format"),
             (alpha("\"extra\":1,"), "unknown field"),
             (
@@ -398,7 +477,7 @@ mod tests {
 
     #[test]
     fn registration_refuses_another_app_and_non_canonical_bytes() {
-        let init = InitData::parse(initdata("sha384", &alpha("")).as_bytes()).unwrap();
+        let init = InitData::parse(initdata("sha384", &cpu_alpha()).as_bytes()).unwrap();
         let canonical = init.revision().unwrap().canonical().unwrap();
         let app: AppId = APP.parse().unwrap();
         let other = AppId::mint();
@@ -415,5 +494,127 @@ mod tests {
                 .to_string()
                 .contains("canonical")
         );
+    }
+
+    #[test]
+    fn cpu_class_revision_has_no_gpu_section() {
+        let text = initdata("sha384", &cpu_alpha());
+        let revision = InitData::parse(text.as_bytes())
+            .unwrap()
+            .revision()
+            .unwrap();
+        assert_eq!(revision.runtime_class, CPU_RUNTIME_CLASS);
+        assert_eq!(revision.class(), Some(RuntimeClass::Cpu));
+        assert_eq!(revision.gpu, None);
+        let canonical = revision.canonical().unwrap();
+        assert!(!canonical.contains("gpu"), "{canonical}");
+        assert!(
+            canonical.ends_with("\"runtime_class\":\"kata-qemu-tdx\"}"),
+            "{canonical}"
+        );
+        let app: AppId = APP.parse().unwrap();
+        assert_eq!(
+            CocoRevision::check_registered(&canonical, app).unwrap(),
+            revision
+        );
+
+        // The same pod on the GPU class is a different Revision.
+        let gpu = InitData::parse(initdata("sha384", &alpha(GPU1)).as_bytes())
+            .unwrap()
+            .revision()
+            .unwrap();
+        assert_eq!(gpu.class(), Some(RuntimeClass::Gpu));
+        assert_ne!(gpu.hash().unwrap(), revision.hash().unwrap());
+    }
+
+    /// The Revision v2 bytes and hash, pinned for one pod of each class from fixed init-data.
+    /// `alpha coco render`, the Rafay plugin and the signer page must produce exactly these; the
+    /// GPU-class value is the one this crate produced before the CPU class existed.
+    #[test]
+    fn revision_v2_canonical_bytes_and_hash_are_pinned() {
+        const POLICY: &str = "package agent_policy\ndefault ExecProcessRequest := false\n";
+        let init = |alpha: &str| {
+            format!(
+                "algorithm = \"sha384\"\nversion = \"0.1.0\"\n\n[data]\n\"policy.rego\" = '''\n{POLICY}'''\n\"alpha.json\" = '''{alpha}'''\n"
+            )
+        };
+        let gpu8 = init(
+            r#"{"app_id":"01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b","format":"alphacompute-initdata/1","gpu":{"count":8,"model":"B300"},"runtime_class":"kata-qemu-nvidia-gpu-tdx"}"#,
+        );
+        let cpu = init(
+            r#"{"app_id":"01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b","format":"alphacompute-initdata/1","runtime_class":"kata-qemu-tdx"}"#,
+        );
+        let app: AppId = APP.parse().unwrap();
+        for (text, canonical, hash) in [
+            (
+                gpu8,
+                r#"{"app_id":"01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b","format":"alphacompute-coco-revision/1","gpu":{"count":8,"model":"B300"},"initdata_sha256":"sha256:8532ca9f7ef14d40f1d7db617501a593bbfd8875e67d5604cb6bd62627975fed","policy_sha256":"sha256:08e5cddd39ec034ef3d1d88c739baf4e1bfb9f261cf1c7d489d98a414156ff34","runtime_class":"kata-qemu-nvidia-gpu-tdx"}"#,
+                "sha256:e8bc4961b8bcd0d0d48804c5e8ae0d1e6c296cd1c02846d4e263f362bf39e851",
+            ),
+            (
+                cpu,
+                r#"{"app_id":"01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b","format":"alphacompute-coco-revision/1","initdata_sha256":"sha256:2dd2fc499fa19fe358c137e82b2a4099a680454048341517385b2282186f81b0","policy_sha256":"sha256:08e5cddd39ec034ef3d1d88c739baf4e1bfb9f261cf1c7d489d98a414156ff34","runtime_class":"kata-qemu-tdx"}"#,
+                "sha256:ddf58ccc19f168abd767f70e0ed46dba42c07d0830dbeede37a4944256ec2575",
+            ),
+        ] {
+            let revision = InitData::parse(text.as_bytes())
+                .unwrap()
+                .revision()
+                .unwrap();
+            assert_eq!(revision.canonical().unwrap(), canonical);
+            assert_eq!(revision.hash().unwrap().to_string(), hash);
+            assert_eq!(
+                crate::check_registration(canonical, app)
+                    .unwrap()
+                    .to_string(),
+                hash
+            );
+        }
+    }
+
+    #[test]
+    fn registration_holds_each_class_to_its_gpu_section() {
+        let app = AppId::mint();
+        let revision = |class: &str, gpu: Option<u32>| CocoRevision {
+            format: REVISION_FORMAT.into(),
+            app_id: app,
+            initdata_sha256: crate::compose_hash("initdata"),
+            policy_sha256: crate::compose_hash("policy"),
+            runtime_class: class.into(),
+            gpu: gpu.map(|count| GpuShape {
+                count,
+                model: "B300".into(),
+            }),
+        };
+        let registered = |r: CocoRevision| {
+            let text = r.canonical().unwrap();
+            CocoRevision::check_registered(&text, app).map_err(|e| e.to_string())
+        };
+        assert!(registered(revision(CPU_RUNTIME_CLASS, None)).is_ok());
+        assert!(registered(revision(GPU_RUNTIME_CLASS, Some(1))).is_ok());
+        assert!(registered(revision(GPU_RUNTIME_CLASS, Some(8))).is_ok());
+        for (class, gpu, why) in [
+            (CPU_RUNTIME_CLASS, Some(1), "runs no GPU"),
+            (CPU_RUNTIME_CLASS, Some(8), "runs no GPU"),
+            (CPU_RUNTIME_CLASS, Some(0), "runs no GPU"),
+            (GPU_RUNTIME_CLASS, None, "needs a gpu section"),
+            (GPU_RUNTIME_CLASS, Some(0), "gpu.count 0"),
+            (GPU_RUNTIME_CLASS, Some(2), "gpu.count 2"),
+        ] {
+            let error = registered(revision(class, gpu)).unwrap_err();
+            assert!(error.contains(why), "{class} {gpu:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn runtime_class_names_round_trip() {
+        for class in [RuntimeClass::Cpu, RuntimeClass::Gpu] {
+            assert_eq!(RuntimeClass::from_name(class.name()), Some(class));
+            assert!(RUNTIME_CLASSES.contains(&class.name()));
+        }
+        assert!(RuntimeClass::Gpu.has_gpus());
+        assert!(!RuntimeClass::Cpu.has_gpus());
+        assert_eq!(RuntimeClass::from_name("kata-qemu-nvidia-gpu-snp"), None);
+        assert_eq!(RuntimeClass::from_name("KATA-QEMU-TDX"), None);
     }
 }
