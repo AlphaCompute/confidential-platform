@@ -29,6 +29,8 @@ jobs:
             dockerfile: images/broker/Dockerfile
           - name: alpha-guard
             dockerfile: images/guard/Dockerfile
+          - name: alpha-weights
+            dockerfile: images/weights/Dockerfile
           - name: alpha-cpu-app
             dockerfile: images/cpu-app/Dockerfile
     steps:

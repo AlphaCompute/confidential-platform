@@ -1,0 +1,56 @@
+# Seals one model's weights under the model server App's `weights` key. A Revision of the same
+# App as model-server.yaml (the key is the App's, the same for every Revision), run once per
+# model version on a confidential-GPU node so the KMS releases the key. The plain weights exist
+# only in this pod VM's memory; only the sealed copy reaches host storage.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seal-weights-${MODEL_NAME}
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      annotations:
+        io.katacontainers.config.hypervisor.default_memory: "${POD_VM_MEMORY_MIB}"
+        io.katacontainers.config.agent.policy: "${SEAL_AGENT_POLICY_B64}"
+    spec:
+      runtimeClassName: kata-qemu-nvidia-gpu-tdx
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      initContainers:
+        - name: alpha-runtime
+          image: ${RUNTIME_IMAGE}
+          restartPolicy: Always
+          env:
+            - { name: ALPHACOMPUTE_KMS_ENDPOINTS, value: "${KMS_ENDPOINTS}" }
+            - { name: ALPHACOMPUTE_KMS_CA_SPKI_SHA256, value: "${KMS_CA_SPKI_SHA256}" }
+            - { name: ALPHACOMPUTE_KMS_REVISIONS, value: "${KMS_REVISIONS}" }
+          volumeMounts:
+            - { name: runtime-socket, mountPath: /run/alpha }
+        - name: fetch
+          image: ${FETCH_IMAGE}              # a pinned huggingface_hub image
+          command: ["/bin/sh", "-c"]
+          args:
+            - >-
+              hf download "${MODEL_REPO}" --revision "${MODEL_REPO_REVISION}"
+              --local-dir /plain
+          volumeMounts:
+            - { name: plain, mountPath: /plain }
+      containers:
+        - name: seal
+          image: ${WEIGHTS_IMAGE}
+          args: ["seal", "/plain", "/sealed"]
+          resources:
+            limits:
+              nvidia.com/pgpu: 1             # the GPU is what lets the KMS release the key
+          volumeMounts:
+            - { name: runtime-socket, mountPath: /run/alpha }
+            - { name: plain, mountPath: /plain, readOnly: true }
+            - { name: sealed-weights, mountPath: /sealed }
+      volumes:
+        - { name: runtime-socket, emptyDir: { medium: Memory } }
+        - name: plain
+          emptyDir: { medium: Memory, sizeLimit: "${WEIGHTS_SIZE}" }
+        - name: sealed-weights
+          persistentVolumeClaim:
+            claimName: sealed-weights-${MODEL_NAME}
