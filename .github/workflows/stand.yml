@@ -1,17 +1,35 @@
 name: stand
 
-# Production runs on owned hardware: Kata TDX pods on the Rafay MKS clusters, the KMS on the
-# verifier pool, collateral from our own PCCS. Every fifteen minutes this asks each of them
-# whether it is serving, and fails when one is not, which is what makes GitHub send a
-# notification. The variables name the owned endpoints; nothing here reaches the prototype.
+# Every fifteen minutes each job asks whether what it watches is serving and fails when something
+# is not, which is what makes GitHub send a notification. The checks are .github/stand/check.sh;
+# a failing round is retried once after two minutes and only the second round's findings are
+# errors.
 #
-#   STAND_SHROUD_URL        shroud-go on the owned platform
-#   STAND_APPS              the Apps whose copies must all be serving
-#   STAND_KMS_ENDPOINTS     the KMS nodes, space-separated https:// URLs (both failure domains)
-#   STAND_KMS_CA_PEM        the KMS CA: a node is up only if it answers under it, unsealed
-#   STAND_PCCS_URL          the site PCCS, https://pccs.<site>:8081
-#   STAND_SITE_CA_PEM       the site CA the PCCS certificate chains to
-#   secret STAND_LIST_KEY   API key that may list the Apps' copies
+# STAND_TARGET says what is watched: unset (or `prototype`) until M-D, `both` while the owned
+# platform runs beside the prototype, `owned` once the prototype is retired. Every variable a
+# watched part needs must then be set; an empty or whitespace-only one fails the run.
+#
+# prototype, until M-D, from a GitHub-hosted runner (unchanged from before PRD-01):
+#   STAND_SHROUD_URL              the prototype's shroud-go
+#   STAND_APPS                    the Apps whose copies must all be serving
+#   secret STAND_LIST_KEY         API key that may list the Apps' copies
+# owned, from M-D, from a GitHub-hosted runner, as a client on the internet reaches the platform.
+# Each probe is the alpha CLI's own pinned TLS: the chain must end at the KMS CA of the
+# release-signed platform document and the leaf must name an allowed Revision; the host name is
+# only routing, since KMS-issued leaves carry URI SANs and no DNS name.
+#   STAND_PLATFORM_DOCUMENT_URL   the release-signed platform document: its KMS CA and node
+#                                 Revisions are the pins
+#   STAND_KMS_ENDPOINTS           the KMS nodes of both failure domains, https:// URLs,
+#                                 whitespace-separated; each must answer /ready unsealed
+#   STAND_APP_ENDPOINTS           the platform services' public Endpoints (broker, front, signer,
+#                                 shroud-go, ...), whitespace-separated, each
+#                                 <url>=<revision>[,<revision>...]: list a deploy's next Revision
+#                                 before it starts and drop the old one after
+# site, from M-D, from a self-hosted runner at the site, the only place the PCCS answers:
+#   STAND_SITE_RUNNER             the runner's label. The repository is public, so the runner's
+#                                 group must admit only this workflow on main
+#   STAND_PCCS_URL                the site PCCS, https://pccs.<site>:8081
+#   STAND_SITE_CA_PEM             the site CA the PCCS certificate chains to
 on:
   schedule:
     - cron: "*/15 * * * *"
@@ -20,61 +38,64 @@ on:
 permissions: {}
 
 jobs:
-  serving:
+  prototype:
+    if: vars.STAND_TARGET != 'owned'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
+      - uses: actions/checkout@v4
       - env:
-          SHROUD_URL: ${{ vars.STAND_SHROUD_URL }}
-          APPS: ${{ vars.STAND_APPS }}
-          KEY: ${{ secrets.STAND_LIST_KEY }}
-          KMS_ENDPOINTS: ${{ vars.STAND_KMS_ENDPOINTS }}
-          KMS_CA_PEM: ${{ vars.STAND_KMS_CA_PEM }}
-          PCCS_URL: ${{ vars.STAND_PCCS_URL }}
-          SITE_CA_PEM: ${{ vars.STAND_SITE_CA_PEM }}
+          STAND_TARGET: ${{ vars.STAND_TARGET }}
+          STAND_SHROUD_URL: ${{ vars.STAND_SHROUD_URL }}
+          STAND_APPS: ${{ vars.STAND_APPS }}
+          STAND_LIST_KEY: ${{ secrets.STAND_LIST_KEY }}
+        run: bash .github/stand/check.sh prototype
+
+  owned:
+    if: vars.STAND_TARGET == 'owned' || vars.STAND_TARGET == 'both'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      # The probe is built only when the crates change; a failed probe must not lose the build.
+      - id: alpha
+        uses: actions/cache/restore@v4
+        with:
+          path: stand-bin
+          key: stand-alpha-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml', 'crates/**') }}
+      - if: steps.alpha.outputs.cache-hit != 'true'
         run: |
-          set -u
-          [ -n "$APPS" ] || { echo "::error::STAND_APPS names no App"; exit 1; }
-          [ -n "$KMS_ENDPOINTS" ] || { echo "::error::STAND_KMS_ENDPOINTS names no KMS node"; exit 1; }
-          printf '%s\n' "$KMS_CA_PEM" > "$RUNNER_TEMP/kms-ca.pem"
-          printf '%s\n' "$SITE_CA_PEM" > "$RUNNER_TEMP/site-ca.pem"
+          cargo build --release --locked -p alpha-cli
+          mkdir -p stand-bin
+          cp target/release/alpha stand-bin/alpha
+      - if: steps.alpha.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: stand-bin
+          key: ${{ steps.alpha.outputs.cache-primary-key }}
+      - env:
+          STAND_TARGET: ${{ vars.STAND_TARGET }}
+          STAND_ALPHA: stand-bin/alpha
+          STAND_PLATFORM_DOCUMENT_URL: ${{ vars.STAND_PLATFORM_DOCUMENT_URL }}
+          STAND_KMS_ENDPOINTS: ${{ vars.STAND_KMS_ENDPOINTS }}
+          STAND_APP_ENDPOINTS: ${{ vars.STAND_APP_ENDPOINTS }}
+        run: bash .github/stand/check.sh owned
 
-          # The KMS speaks TLS 1.3 with X25519MLKEM768 only, which the runner's OpenSSL 3.0 does
-          # not; this curl is built on OpenSSL 3.5. Pin it by digest once the first run prints it.
-          pqcurl() {
-            docker run --rm --network host -v "$RUNNER_TEMP:/w:ro" curlimages/curl:8.16.0 \
-              --curves X25519MLKEM768 --tlsv1.3 --cacert /w/kms-ca.pem -sS -f -m 30 "$@"
-          }
-
-          # $1 prefixes each finding: only the last attempt's are errors.
-          check() {
-            down=0
-            for app in $APPS; do
-              if ! list=$(printf 'header = "Authorization: Bearer %s"\n' "$KEY" |
-                curl -sS -f -m 30 -K - "$SHROUD_URL/v1/apps/$app/instances"); then
-                echo "$1$app: the list did not answer"
-                down=1
-              elif ! echo "$list" | jq -e '.instances | length > 0 and all(.serving == true)' >/dev/null; then
-                echo "$1$app: $(echo "$list" | jq -c '[.instances[] | {id, state, serving}]')"
-                down=1
-              fi
-            done
-            # /ready checks the node's database; a sealed node answers but serves nothing.
-            for kms in $KMS_ENDPOINTS; do
-              if ! ready=$(pqcurl "$kms/ready"); then
-                echo "$1$kms: the KMS did not answer under its CA"
-                down=1
-              elif ! echo "$ready" | jq -e '.sealed == false' >/dev/null; then
-                echo "$1$kms: $ready"
-                down=1
-              fi
-            done
-            # A quote whose collateral cannot be fetched fails appraisal: the PCCS is on the path
-            # of every attestation.
-            if ! curl -sS -f -m 30 --cacert "$RUNNER_TEMP/site-ca.pem" -o /dev/null "$PCCS_URL/sgx/certification/v4/rootcacrl"; then
-              echo "$1$PCCS_URL: the PCCS did not serve the root CA CRL"
-              down=1
-            fi
-            return $down
-          }
-          # A copy does not serve for a minute while it is being redeployed.
-          check "" || { sleep 120; check "::error::"; }
+  site:
+    if: vars.STAND_TARGET == 'owned' || vars.STAND_TARGET == 'both'
+    # Without the label this runs on a hosted runner only to fail and name the missing variable.
+    runs-on: ${{ vars.STAND_SITE_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          STAND_TARGET: ${{ vars.STAND_TARGET }}
+          STAND_SITE_RUNNER: ${{ vars.STAND_SITE_RUNNER }}
+          STAND_PCCS_URL: ${{ vars.STAND_PCCS_URL }}
+          STAND_SITE_CA_PEM: ${{ vars.STAND_SITE_CA_PEM }}
+        run: bash .github/stand/check.sh site

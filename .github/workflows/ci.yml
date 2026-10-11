@@ -84,3 +84,14 @@ jobs:
             echo "no service crate yet; skipping"
           fi
       - run: cargo test --workspace
+
+  # The stand's checks against stand-ins for curl and the alpha CLI; the probe itself is tested by
+  # `cargo test -p alpha-kms --test stand`.
+  stand:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck .github/stand/*.sh
+      - run: bash .github/stand/test.sh
