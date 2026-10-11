@@ -261,8 +261,12 @@ impl Dsm {
                 PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8.to_vec())),
             )
             .map_err(|e| Error::Config(format!("client identity: {e}")))?;
+        // Environment variables are not measured, so no proxy they name and no redirect the
+        // server answers moves a request off the measured endpoint.
         let http = reqwest::Client::builder()
             .tls_backend_preconfigured(tls)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(|e| Error::Config(format!("http client: {e}")))?;
@@ -320,6 +324,14 @@ impl Dsm {
         self.bound.as_deref().unwrap_or("nothing")
     }
 
+    /// Drops `token` unless another call already replaced it.
+    fn forget(&self, token: &Arc<Zeroizing<String>>) {
+        let mut held = self.token.lock();
+        if held.as_ref().is_some_and(|(t, _)| Arc::ptr_eq(t, token)) {
+            *held = None;
+        }
+    }
+
     /// The declared key `name`, fetched from DSM now; the caller caches it with the leaf. Nothing
     /// is sent unless the leaf carries the binding's name.
     pub async fn key(&self, name: &str) -> Result<CustomerKey, Error> {
@@ -328,19 +340,28 @@ impl Dsm {
             .get(name)
             .ok_or_else(|| Error::Undeclared(name.to_owned()))?;
         self.bound_name()?;
-        let token = self.token().await?;
-        let reply = self
-            .http
-            .post(format!("{}/crypto/v1/keys/export", self.endpoint))
-            .bearer_auth(token.as_str())
-            .json(descriptor)
-            .send()
-            .await
-            .map_err(|e| Error::Transport(e.to_string()))?;
-        if reply.status().as_u16() == 401 {
-            // A token DSM no longer honours; the next call authenticates afresh.
-            *self.token.lock() = None;
-        }
+        let mut retried = false;
+        let reply = loop {
+            let token = self.token().await?;
+            let reply = self
+                .http
+                .post(format!("{}/crypto/v1/keys/export", self.endpoint))
+                .bearer_auth(token.as_str())
+                .json(descriptor)
+                .send()
+                .await
+                .map_err(|e| Error::Transport(e.to_string()))?;
+            if reply.status() != reqwest::StatusCode::UNAUTHORIZED {
+                break reply;
+            }
+            // A token DSM no longer honours: drop it, then authenticate afresh and retry once,
+            // so a token revoked before its expiry does not reach the App as a refusal.
+            self.forget(&token);
+            if retried {
+                break reply;
+            }
+            retried = true;
+        };
         let exported: Exported = read(reply).await?;
         let value = exported
             .value

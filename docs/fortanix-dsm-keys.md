@@ -6,11 +6,26 @@ one-hour leaf; `alpha-runtime` then authenticates to the customer's DSM with tha
 for the keys the Revision declares. The customer's DSM policy decides whether to release them.
 AlphaCompute holds no DSM role and no copy of the keys.
 
+**Status.** I1 is PRD-06 work for after December 1, built early. It ships behind
+`ALPHACOMPUTE_DSM`. No customer is onboarded before Fortanix answers F8 (what a DSM App can match,
+below) and F6 (TLS), and before the pilot plan (PRD-06 deliverable 22) settles both.
+
 ## Declaring it in the compose
 
 `ALPHACOMPUTE_DSM` is set on the runtime service. It is part of the compose, so it is measured
 and the tenant signs it with the Revision: an operator cannot point an Instance at another DSM,
 another App or another CA.
+
+**No tool writes it yet.** `alpha compose wrap` builds the `alpha-runtime` service's environment
+itself and takes no DSM input, and `alpha coco render` (PRD-02) does not exist yet. Until one of
+them takes a DSM input, `ALPHACOMPUTE_DSM` reaches the runtime only from a compose written by hand.
+
+**On Kata, the value counts only if the agent policy pins it.** The host writes a Kata pod's
+environment, so there the value is measured only when the init-data's agent policy fixes the
+runtime container's `ALPHACOMPUTE_DSM` to exactly what the tenant signed, as PRD-02 does for
+`ALPHACOMPUTE_QUOTE_SOURCE`. Without that pin, a host could point the Instance at a DSM and a CA
+of its choosing and hand the App keys the host knows. `alpha coco render` will write that policy.
+Until it does, a Kata Instance does not declare a DSM.
 
 ```json
 {
@@ -67,8 +82,13 @@ The calls come from the DSM REST API:
    chain, and the DSM App uuid is the basic-auth user. The bearer token is reused until 30 seconds
    before `expires_in`.
 2. `POST /crypto/v1/keys/export` with the descriptor (`{"kid": …}` or `{"name": …}`). The
-   object's `value` comes back in standard base64. A 401 here drops the token so the next call
-   authenticates again.
+   object's `value` comes back in standard base64. A 401 here drops the token; the runtime then
+   opens a new session and retries the export once, so a token the DSM revoked early does not
+   reach the App as a refusal. A second 401 answers 403 `dsm_refused`.
+
+The client ignores `HTTPS_PROXY` and the other proxy variables, and follows no redirect.
+Environment variables are not measured, and a redirect would move the request off the measured
+endpoint. A redirect answers 502 `dsm_unavailable`.
 
 ### TLS to the DSM
 
@@ -128,9 +148,9 @@ DNS names. F8 must confirm, on the pilot customer's DSM version:
 2. that one App can list several names, so a new Revision can be added before the old one is
    removed (Fortanix's DSM 5.6 release notes, February 2026, say it can).
 
-If DSM can match only a directory name, the KMS puts the same names in the leaf's subject instead,
-a small change in `issue_leaf`. If it can match neither, a per-organization issuing CA is needed
-before any pilot. No customer is onboarded until F8 confirms one of these, and trusting the KMS CA
+If DSM can match only a directory name, the KMS puts the same ids in the leaf's subject instead
+(organization, organizational unit and common name), a small change in `issue_leaf`. If it can
+match neither, a per-organization issuing CA is needed before any pilot. No customer is onboarded until F8 confirms one of these, and trusting the KMS CA
 alone is never the fallback.
 
 ### Permissions and onboarding checks
