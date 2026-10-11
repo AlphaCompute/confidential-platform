@@ -6,7 +6,8 @@
 //! every per-GPU result claim, and reduces each GPU to [`VerifiedGpu`].
 //!
 //! Development uses NRAS free of charge; a paid service needs NVIDIA's licence (L1, F9).
-//! Results are accepted for one attestation, i.e. the life of one leaf (Q12).
+//! Results are accepted for one attestation, i.e. the life of one leaf (Q12). A call NRAS does
+//! not answer is retried with backoff inside one bounded budget ([`Retry`]), then refused.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -27,7 +28,60 @@ use crate::AppraisalError;
 pub const DEFAULT_URL: &str = "https://nras.attestation.nvidia.com";
 const ATTEST_PATH: &str = "/v3/attest/gpu";
 const CLOCK_SKEW: Duration = Duration::from_secs(60);
-const TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How the call to NRAS is retried (Q12, risk R4): only when NRAS gave no answer (no connection,
+/// a timeout, `429`, `408` or a `5xx`), with a doubling backoff plus jitter, and everything inside
+/// one `budget`, after which the attestation fails closed. An answer NRAS gave (a `4xx`, a body
+/// that is not JSON, or any reply the checks refuse) is a verdict and is never retried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Retry {
+    /// Calls at most, the first included.
+    pub attempts: u32,
+    /// Each call's own limit.
+    pub per_attempt: Duration,
+    /// The wait before the second call, doubled before each later one; a jitter of up to half of
+    /// it, drawn from the GPU nonce, keeps a fleet of renewals from retrying in step.
+    pub backoff: Duration,
+    /// Calls and waits together end within this.
+    pub budget: Duration,
+}
+
+impl Default for Retry {
+    /// Three calls of at most 15 s, 1 s then 2 s apart, all within 40 s: inside a renewal's
+    /// window, and the KMS caller may pass a tighter one ([`Nras::with_retry`]).
+    fn default() -> Self {
+        Self {
+            attempts: 3,
+            per_attempt: Duration::from_secs(15),
+            backoff: Duration::from_secs(1),
+            budget: Duration::from_secs(40),
+        }
+    }
+}
+
+/// Why one call to NRAS did not return a reply.
+enum Attempt {
+    /// NRAS gave no answer; worth another call.
+    Transient(String),
+    /// NRAS answered; final.
+    Final(AppraisalError),
+}
+
+/// Up to half of `wait`, from the nonce byte for this attempt.
+fn jitter(nonce: &[u8; 32], attempt: u32, wait: Duration) -> Duration {
+    let byte = usize::try_from(attempt)
+        .ok()
+        .and_then(|i| i.checked_rem(nonce.len()))
+        .and_then(|i| nonce.get(i))
+        .copied()
+        .unwrap_or(0);
+    let ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
+    Duration::from_millis(
+        ms.saturating_mul(u64::from(byte))
+            .checked_div(510)
+            .unwrap_or(0),
+    )
+}
 
 /// The claims this backend requires, named as NVIDIA's GPU claims version 3.0 lists them (4.0
 /// only adds to 3.0). Every per-GPU requirement is a JSON pointer into that GPU's EAT claims.
@@ -215,17 +269,23 @@ pub fn claim_report(claims: &Value, policy: &GpuPolicy) -> Vec<String> {
 pub struct Nras {
     http: reqwest::Client,
     clock: fn() -> SystemTime,
+    retry: Retry,
 }
 
 impl Nras {
     pub fn new() -> Result<Self, AppraisalError> {
+        Self::with_retry(Retry::default())
+    }
+
+    pub fn with_retry(retry: Retry) -> Result<Self, AppraisalError> {
+        // Each attempt is bounded by `retry.per_attempt` and the budget in `call`.
         let http = reqwest::Client::builder()
-            .timeout(TIMEOUT)
             .build()
             .map_err(|e| AppraisalError::Failed(format!("nras client: {e}")))?;
         Ok(Self {
             http,
             clock: SystemTime::now,
+            retry,
         })
     }
 
@@ -235,8 +295,6 @@ impl Nras {
         gpus: &[GpuEvidence],
         nonce: &[u8; 32],
     ) -> Result<Value, AppraisalError> {
-        let failed =
-            |what: &str, e: reqwest::Error| AppraisalError::Failed(format!("nras {what}: {e}"));
         let arch = gpus
             .first()
             .map(|g| g.arch.clone())
@@ -254,18 +312,69 @@ impl Nras {
                 "certificate": BASE64_STANDARD.encode(&g.certificate),
             })).collect::<Vec<_>>(),
         });
-        let reply: Value = self
+        let url = format!("{base}{ATTEST_PATH}");
+        let Retry {
+            attempts,
+            per_attempt,
+            backoff,
+            budget,
+        } = self.retry;
+        let start = tokio::time::Instant::now();
+        let deadline = start.checked_add(budget).unwrap_or(start);
+        let mut wait = backoff;
+        let mut last = "no call made".to_owned();
+        let mut made = 0u32;
+        for attempt in 0..attempts {
+            if attempt > 0 {
+                let pause = wait.saturating_add(jitter(nonce, attempt, wait));
+                let resume = tokio::time::Instant::now().checked_add(pause);
+                if resume.is_none_or(|at| at >= deadline) {
+                    break;
+                }
+                tokio::time::sleep(pause).await;
+                wait = wait.saturating_mul(2);
+            }
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            made = made.saturating_add(1);
+            match tokio::time::timeout(left.min(per_attempt), self.attempt(&url, &body)).await {
+                Ok(Ok(reply)) => return Ok(reply),
+                Ok(Err(Attempt::Final(e))) => return Err(e),
+                Ok(Err(Attempt::Transient(e))) => last = e,
+                Err(_) => last = format!("no reply within {:?}", left.min(per_attempt)),
+            }
+        }
+        Err(AppraisalError::Failed(format!(
+            "nras attest: {last} ({made} attempts within {budget:?})"
+        )))
+    }
+
+    async fn attempt(&self, url: &str, body: &Value) -> Result<Value, Attempt> {
+        let response = self
             .http
-            .post(format!("{base}{ATTEST_PATH}"))
-            .json(&body)
+            .post(url)
+            .json(body)
             .send()
             .await
-            .and_then(|r| r.error_for_status())
-            .map_err(|e| failed("attest", e))?
+            .map_err(|e| Attempt::Transient(e.to_string()))?;
+        let status = response.status();
+        if status.is_server_error()
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        {
+            return Err(Attempt::Transient(format!("status {status}")));
+        }
+        if !status.is_success() {
+            return Err(Attempt::Final(AppraisalError::Failed(format!(
+                "nras attest: status {status}"
+            ))));
+        }
+        response
             .json()
             .await
-            .map_err(|e| failed("attest reply", e))?;
-        Ok(reply)
+            .map_err(|e| Attempt::Final(AppraisalError::Failed(format!("nras attest reply: {e}"))))
     }
 }
 
@@ -922,6 +1031,129 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("not EC P-384"), "{error}");
+    }
+
+    /// A stand-in NRAS that answers each connection with the next status in `script` (the last
+    /// one repeating) and `[]` as the body of a 200; `None` holds the connection without
+    /// answering. Returns its base URL and the number of calls it took.
+    fn stand_in(
+        script: Vec<Option<u16>>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let n = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let step = script.get(n).or(script.last()).copied().flatten();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                let _ = reader.read_exact(&mut body);
+                match step {
+                    None => {
+                        std::thread::sleep(Duration::from_secs(5));
+                    }
+                    Some(status) => {
+                        let body = if status == 200 { "[]" } else { "" };
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                    }
+                }
+            }
+        });
+        (base, calls)
+    }
+
+    fn quick(attempts: u32, budget: Duration) -> Nras {
+        Nras::with_retry(Retry {
+            attempts,
+            per_attempt: Duration::from_millis(300),
+            backoff: Duration::from_millis(20),
+            budget,
+        })
+        .unwrap()
+    }
+
+    fn evidence() -> [GpuEvidence; 1] {
+        [GpuEvidence {
+            arch: "BLACKWELL".into(),
+            evidence: vec![1],
+            certificate: vec![2],
+        }]
+    }
+
+    #[tokio::test]
+    async fn nras_is_retried_only_when_it_gave_no_answer() {
+        let long = Duration::from_secs(10);
+        // Two unavailable answers, then a reply.
+        let (base, calls) = stand_in(vec![Some(503), Some(502), Some(200)]);
+        let reply = quick(3, long)
+            .call(&base, &evidence(), &NONCE)
+            .await
+            .unwrap();
+        assert_eq!(reply, json!([]));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        // An answer NRAS gave is final.
+        let (base, calls) = stand_in(vec![Some(400)]);
+        let error = quick(3, long)
+            .call(&base, &evidence(), &NONCE)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("400"), "{error}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Unavailable every time: refused after the last attempt, fail closed.
+        let (base, calls) = stand_in(vec![Some(503)]);
+        let error = quick(3, long)
+            .call(&base, &evidence(), &NONCE)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "attestation_failed");
+        assert!(error.to_string().contains("3 attempts"), "{error}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn retries_end_within_the_budget() {
+        // NRAS accepts the connection and never answers; ten attempts would take 3 s, the budget
+        // is 700 ms.
+        let (base, calls) = stand_in(vec![None]);
+        let started = std::time::Instant::now();
+        let error = quick(10, Duration::from_millis(700))
+            .call(&base, &evidence(), &NONCE)
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(1500));
+        assert!(error.to_string().contains("no reply within"), "{error}");
+        assert!(calls.load(std::sync::atomic::Ordering::SeqCst) < 10);
+    }
+
+    #[test]
+    fn jitter_is_at_most_half_the_wait() {
+        let wait = Duration::from_secs(2);
+        assert_eq!(jitter(&[0; 32], 1, wait), Duration::ZERO);
+        assert_eq!(jitter(&[255; 32], 1, wait), Duration::from_secs(1));
+        let mut nonce = [0; 32];
+        nonce[2] = 51;
+        assert_eq!(jitter(&nonce, 2, wait), Duration::from_millis(200));
+        assert_eq!(jitter(&nonce, 34, wait), Duration::from_millis(200));
     }
 
     #[tokio::test]
