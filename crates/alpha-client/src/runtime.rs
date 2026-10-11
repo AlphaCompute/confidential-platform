@@ -148,6 +148,28 @@ impl RuntimeSocket {
             .map_err(|_| Error::Invalid("key is not 32 bytes".into()))
     }
 
+    /// A key the App's Revision declared in `ALPHACOMPUTE_DSM`, released by the customer's
+    /// Fortanix DSM to this Instance's leaf. `name` becomes a path segment, so it is checked
+    /// before any request is made.
+    pub async fn customer_key(&self, name: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
+        if !alpha_core::is_key_purpose(name) {
+            return Err(Error::Invalid(format!(
+                "customer key name {name:?} is invalid"
+            )));
+        }
+        let (status, body) = self.get(&format!("/v1/customer-keys/{name}")).await?;
+        if !status.is_success() {
+            return Err(crate::api_error("runtime", status, &body));
+        }
+        #[derive(Deserialize)]
+        struct Wire {
+            value: Zeroizing<String>,
+        }
+        let wire: Wire = serde_json::from_slice(&body)
+            .map_err(|e| Error::Invalid(format!("customer key: {e}")))?;
+        decode("value", &wire.value).map(Zeroizing::new)
+    }
+
     /// Polls `/healthz` every two seconds until the runtime reports this Instance attested.
     pub async fn wait_attested(&self) {
         loop {

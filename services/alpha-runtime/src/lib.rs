@@ -82,6 +82,9 @@ pub enum Error {
     NotAttested,
     #[error("socket: {0}")]
     Socket(String),
+    /// The customer's Fortanix DSM (PRD-06, I1); its policy, not ours, decides release.
+    #[error("{0}")]
+    Dsm(#[from] alpha_dsm::Error),
 }
 
 impl Error {
@@ -216,6 +219,8 @@ pub struct Config {
     pub tls_upstream: Option<String>,
     pub tls_callers: Vec<AppId>,
     pub tls_ready: Option<String>,
+    /// `ALPHACOMPUTE_DSM`: the customer's DSM and the keys this Revision may fetch from it.
+    pub dsm: Option<alpha_dsm::DsmConfig>,
 }
 
 impl Config {
@@ -223,7 +228,7 @@ impl Config {
         let var = |name: &str| {
             std::env::var(name).map_err(|_| Error::Config(format!("{name} is not set")))
         };
-        Self::parse(
+        Ok(Self::parse(
             &var("ALPHACOMPUTE_KMS_CA_SPKI_SHA256")?,
             &var("ALPHACOMPUTE_KMS_REVISIONS")?,
             &var("ALPHACOMPUTE_KMS_ENDPOINTS")?,
@@ -235,7 +240,15 @@ impl Config {
             std::env::var("ALPHACOMPUTE_TLS_UPSTREAM_READY")
                 .ok()
                 .as_deref(),
-        )
+        )?
+        .with_dsm(alpha_dsm::DsmConfig::parse(
+            std::env::var("ALPHACOMPUTE_DSM").ok().as_deref(),
+        )?))
+    }
+
+    pub fn with_dsm(mut self, dsm: Option<alpha_dsm::DsmConfig>) -> Self {
+        self.dsm = dsm;
+        self
     }
 
     pub fn parse(
@@ -284,6 +297,7 @@ impl Config {
             tls_upstream,
             tls_callers,
             tls_ready,
+            dsm: None,
         })
     }
 
@@ -413,6 +427,9 @@ pub struct Attested {
     client: Client,
     secrets: Mutex<HashMap<String, Secret>>,
     keys: Mutex<HashMap<String, DerivedKey>>,
+    /// The customer's DSM, authenticated by this leaf; `None` when the Revision declares none.
+    dsm: Option<alpha_dsm::Dsm>,
+    customer_keys: Mutex<HashMap<String, alpha_dsm::CustomerKey>>,
 }
 
 pub struct Runtime {
@@ -564,6 +581,12 @@ impl Runtime {
         let not_after = chrono::DateTime::parse_from_rfc3339(&reply.not_after)
             .map_err(|e| Error::Certificate(format!("not_after: {e}")))?
             .into();
+        let dsm = self
+            .config
+            .dsm
+            .as_ref()
+            .map(|config| alpha_dsm::Dsm::new(config, chain.clone(), &self.pkcs8))
+            .transpose()?;
         let client = Client::configured(
             self.config.kms_endpoints.clone(),
             self.config.pin(),
@@ -582,6 +605,8 @@ impl Runtime {
             client,
             secrets: Mutex::new(HashMap::new()),
             keys: Mutex::new(HashMap::new()),
+            dsm,
+            customer_keys: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -619,6 +644,26 @@ impl Runtime {
         if keys.len() < CACHED_KEYS {
             keys.insert(purpose.to_owned(), key.clone());
         }
+        Ok(key)
+    }
+
+    /// A declared key from the customer's DSM, authenticated by the current leaf and cached
+    /// with it, so a renewal (and a revocation, which stops renewal) re-asks the customer's DSM
+    /// within the hour.
+    pub async fn customer_key(&self, name: &str) -> Result<alpha_dsm::CustomerKey, Error> {
+        let attested = self.attested().ok_or(Error::NotAttested)?;
+        let dsm = attested
+            .dsm
+            .as_ref()
+            .ok_or_else(|| alpha_dsm::Error::Undeclared(name.to_owned()))?;
+        if let Some(key) = attested.customer_keys.lock().get(name) {
+            return Ok(key.clone());
+        }
+        let key = dsm.key(name).await?;
+        attested
+            .customer_keys
+            .lock()
+            .insert(name.to_owned(), key.clone());
         Ok(key)
     }
 
