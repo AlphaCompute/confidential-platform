@@ -1,7 +1,9 @@
-//! `alpha-weights seal <plain dir> <sealed dir>` and `alpha-weights open <sealed dir> <plain dir>`,
-//! run inside an attested Instance of the model server's App: wait for the runtime to attest,
-//! read the App's key for purpose `weights` from its socket, and do the work. Every failure is a
-//! non-zero exit naming the step; nothing is left half-written under a final name.
+//! `alpha-weights seal <model id> <source> <plain dir> <sealed dir>` and
+//! `alpha-weights open <model id> <manifest sha256:hex> <sealed dir> <plain dir>`, run inside an
+//! attested Instance of the model server's App: wait for the runtime to attest, read the App's
+//! key for purpose `weights` from its socket, and do the work. `seal` prints the manifest's
+//! digest, which the model server's measured spec gives `open`. Every failure is a non-zero exit
+//! naming the step; nothing is left half-written under a final name.
 
 use alpha_client::runtime::RuntimeSocket;
 use alpha_weights::{Error, KEY_PURPOSE, open_dir, seal_dir};
@@ -23,7 +25,7 @@ async fn main() {
 
 async fn run() -> Result<String, Error> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let [mode, from, to] = args.as_slice() else {
+    let [mode, model, bound, from, to] = args.as_slice() else {
         return Err(Error::Usage);
     };
     if mode != "seal" && mode != "open" {
@@ -35,15 +37,26 @@ async fn run() -> Result<String, Error> {
         .key(KEY_PURPOSE)
         .await
         .map_err(|e| Error::Key(e.to_string()))?;
-    let (from, to, sealing) = (from.clone(), to.clone(), mode == "seal");
+    let (model, bound, from, to, sealing) = (
+        model.clone(),
+        bound.clone(),
+        from.clone(),
+        to.clone(),
+        mode == "seal",
+    );
     tokio::task::spawn_blocking(move || {
         if sealing {
-            seal_dir(&key, from.as_ref(), to.as_ref())
+            seal_dir(&key, &model, &bound, from.as_ref(), to.as_ref()).map(|s| {
+                format!(
+                    "seal: {} files of {model}, manifest {}",
+                    s.files, s.manifest_sha256
+                )
+            })
         } else {
-            open_dir(&key, from.as_ref(), to.as_ref())
+            open_dir(&key, &model, &bound, from.as_ref(), to.as_ref())
+                .map(|n| format!("open: {n} files of {model}"))
         }
     })
     .await
     .map_err(|e| Error::Io(format!("worker: {e}")))?
-    .map(|n| format!("{mode}: {n} files"))
 }
