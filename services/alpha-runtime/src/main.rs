@@ -49,7 +49,9 @@ async fn run() -> Result<Exit, Error> {
     getrandom::fill(&mut seed).map_err(|e| Error::Key(format!("rng: {e}")))?;
     let key = SigningKey::from_bytes(&seed.into()).map_err(|e| Error::Key(e.to_string()))?;
     let guest = alpha_runtime::parse_guest(
-        std::env::var(alpha_runtime::QUOTE_SOURCE_ENV).ok().as_deref(),
+        std::env::var(alpha_runtime::QUOTE_SOURCE_ENV)
+            .ok()
+            .as_deref(),
     )?;
     let (app_compose, evidence, initdata) = match guest {
         alpha_runtime::Guest::Prototype => (
@@ -58,9 +60,8 @@ async fn run() -> Result<Exit, Error> {
             None,
         ),
         alpha_runtime::Guest::Coco(source) => {
-            let initdata =
-                alpha_tsm::coco::initdata(Path::new(alpha_tsm::coco::INITDATA_PATH))
-                    .map_err(|e| Error::Evidence(format!("init-data: {e}")))?;
+            let initdata = alpha_tsm::coco::initdata(Path::new(alpha_tsm::coco::INITDATA_PATH))
+                .map_err(|e| Error::Evidence(format!("init-data: {e}")))?;
             let coco = alpha_runtime::coco_identity(
                 source,
                 initdata,

@@ -546,7 +546,8 @@ impl Runtime {
             .map_err(alpha_client::Error::from)?;
         if alpha_core::compose_hash(&self.app_compose) != identity.compose_hash {
             return Err(Error::Certificate(
-                "this guest's app_compose (compose or Revision v2) is not the leaf's Revision".into(),
+                "this guest's app_compose (compose or Revision v2) is not the leaf's Revision"
+                    .into(),
             ));
         }
         let certified =
@@ -777,8 +778,14 @@ mod tests {
         use alpha_tsm::coco::QuoteSource::*;
         assert_eq!(parse_guest(None).unwrap(), Guest::Prototype);
         assert_eq!(parse_guest(Some("dstack")).unwrap(), Guest::Prototype);
-        assert_eq!(parse_guest(Some("coco-aa")).unwrap(), Guest::Coco(AttestationAgent));
-        assert_eq!(parse_guest(Some("coco-tsm")).unwrap(), Guest::Coco(ConfigfsTsm));
+        assert_eq!(
+            parse_guest(Some("coco-aa")).unwrap(),
+            Guest::Coco(AttestationAgent)
+        );
+        assert_eq!(
+            parse_guest(Some("coco-tsm")).unwrap(),
+            Guest::Coco(ConfigfsTsm)
+        );
         let error = parse_guest(Some("tdx")).unwrap_err().to_string();
         assert!(error.contains(QUOTE_SOURCE_ENV), "{error}");
     }
