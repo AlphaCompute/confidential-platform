@@ -32,6 +32,8 @@ another App or another CA.
   object by `kid` or `name`.
 - `binding` is required: `revision` or `app`, the leaf name the customer's DSM App matches (see
   below). There is no value that binds to the KMS CA alone.
+- `key_exchange` is optional: `hybrid`, the default, or `classical-allowed` (see "TLS to the
+  DSM" below).
 - Unknown fields are refused. A malformed value stops the runtime at start, like any other
   config error.
 
@@ -68,9 +70,17 @@ The calls come from the DSM REST API:
    object's `value` comes back in standard base64. A 401 here drops the token so the next call
    authenticates again.
 
-TLS to the DSM uses the standard aws-lc-rs provider: TLS 1.2 or 1.3, hybrid ML-KEM key
-exchange preferred, classical key exchange accepted. The KMS hops stay hybrid-only. The
-customer's DSM sets its own posture, and PRD-06 question F6 settles what we require.
+### TLS to the DSM
+
+TLS to the DSM is TLS 1.3 with the `X25519MLKEM768` hybrid key exchange only, as on every other
+hop of the platform. A DSM that cannot do the hybrid gets no handshake, and every read answers
+502 `dsm_unavailable`.
+
+PRD-06 question F6 asks Fortanix what its key-release path supports. Until it is answered, a
+tenant whose DSM cannot do the hybrid can set `"key_exchange": "classical-allowed"`. Classical
+groups and TLS 1.2 are then accepted, with the hybrid still preferred. The setting is part of the
+measured compose, so the tenant signs it with the Revision, and nothing else turns it on. F6
+decides whether the setting stays.
 
 ## What the customer configures in its DSM
 

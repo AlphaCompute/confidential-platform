@@ -10,6 +10,10 @@
 //! checks that the leaf it is about to present carries the name the configured binding needs,
 //! and it never presents one that a DSM could check only against the CA.
 //!
+//! TLS to the DSM is TLS 1.3 with the `X25519MLKEM768` hybrid only, as on every platform hop,
+//! unless the tenant's measured compose says `"key_exchange": "classical-allowed"`; PRD-06
+//! question F6 settles whether that setting survives.
+//!
 //! Wire calls, from the DSM REST API: `POST /sys/v1/session/auth` over mTLS with the App's
 //! uuid as the basic-auth user gives a bearer token; `POST /crypto/v1/keys/export` with a
 //! security-object descriptor (`{"kid": …}` or `{"name": …}`) returns the object, its `value`
@@ -63,6 +67,19 @@ pub enum Error {
     Unbound(String),
 }
 
+/// The key exchange the client offers the DSM.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KeyExchange {
+    /// TLS 1.3 with `X25519MLKEM768` only, the provider every platform hop uses. A DSM without
+    /// the hybrid gets no handshake.
+    #[default]
+    Hybrid,
+    /// The aws-lc-rs defaults: the hybrid preferred, classical groups and TLS 1.2 accepted. Only
+    /// until F6 is answered, and only because the tenant wrote it into the measured compose.
+    ClassicalAllowed,
+}
+
 /// Which of the leaf's DNS names the customer's DSM App matches, beside the KMS CA. There is no
 /// CA-only choice (see the crate docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
@@ -108,6 +125,9 @@ pub struct DsmConfig {
     pub keys: BTreeMap<String, KeyRef>,
     /// Required: what the DSM App matches on the leaf. A config without it is refused at start.
     pub binding: Binding,
+    /// Absent means [`KeyExchange::Hybrid`].
+    #[serde(default)]
+    pub key_exchange: KeyExchange,
 }
 
 impl DsmConfig {
@@ -225,20 +245,22 @@ impl Dsm {
     /// waits on DSM; every [`Dsm::key`] then fails with [`Error::Unbound`] before any request.
     pub fn new(config: &DsmConfig, chain: Vec<Vec<u8>>, pkcs8: &[u8]) -> Result<Self, Error> {
         let bound = bound_name(config.binding, chain.first().map(Vec::as_slice));
-        // The default aws-lc-rs provider, not the KMS hops' hybrid-only one: a customer's DSM
-        // decides its own TLS posture (F6), and refusing classical key exchange would only
-        // fail closed against it.
-        let tls = ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::aws_lc_rs::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .map_err(|e| Error::Config(format!("tls: {e}")))?
-        .with_root_certificates(roots(&config.ca_pem)?)
-        .with_client_auth_cert(
-            chain.into_iter().map(CertificateDer::from).collect(),
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8.to_vec())),
-        )
-        .map_err(|e| Error::Config(format!("client identity: {e}")))?;
+        let versions = match config.key_exchange {
+            KeyExchange::Hybrid => ClientConfig::builder_with_provider(tls::provider())
+                .with_protocol_versions(&[&rustls::version::TLS13]),
+            KeyExchange::ClassicalAllowed => ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_safe_default_protocol_versions(),
+        };
+        let tls = versions
+            .map_err(|e| Error::Config(format!("tls: {e}")))?
+            .with_root_certificates(roots(&config.ca_pem)?)
+            .with_client_auth_cert(
+                chain.into_iter().map(CertificateDer::from).collect(),
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8.to_vec())),
+            )
+            .map_err(|e| Error::Config(format!("client identity: {e}")))?;
         let http = reqwest::Client::builder()
             .tls_backend_preconfigured(tls)
             .timeout(REQUEST_TIMEOUT)
@@ -380,12 +402,33 @@ mod tests {
         assert_eq!(c.keys["data"], KeyRef::Kid("k-1".into()));
         assert_eq!(c.keys["index"], KeyRef::Name("idx".into()));
         assert_eq!(c.binding, Binding::Revision);
+        assert_eq!(c.key_exchange, KeyExchange::Hybrid);
         assert_eq!(DsmConfig::parse(None).unwrap(), None);
         let app = config("").replace(r#""binding":"revision""#, r#""binding":"app""#);
         assert_eq!(
             DsmConfig::parse(Some(&app)).unwrap().unwrap().binding,
             Binding::App
         );
+    }
+
+    #[test]
+    fn classical_key_exchange_is_only_an_explicit_setting() {
+        let explicit =
+            |v: &str| DsmConfig::parse(Some(&config(&format!(r#","key_exchange":{v}"#))));
+        assert_eq!(
+            explicit(r#""hybrid""#).unwrap().unwrap().key_exchange,
+            KeyExchange::Hybrid
+        );
+        assert_eq!(
+            explicit(r#""classical-allowed""#)
+                .unwrap()
+                .unwrap()
+                .key_exchange,
+            KeyExchange::ClassicalAllowed
+        );
+        for bad in [r#""classical""#, r#""tls12""#, "true", "null"] {
+            assert!(explicit(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

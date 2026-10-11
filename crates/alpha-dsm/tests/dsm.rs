@@ -25,8 +25,12 @@ use axum::routing::post;
 use axum::{Extension, Json, Router};
 use rcgen::string::Ia5String;
 use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, SanType};
-use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::crypto::CryptoProvider;
+use rustls::crypto::aws_lc_rs::{self, kx_group};
+use rustls::pki_types::CertificateDer;
+use rustls::server::{ClientHello, ResolvesServerCert, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
+use rustls::{RootCertStore, ServerConfig};
 use serde_json::{Value, json};
 
 const KEY: &[u8] = b"customer data key, 32 bytes long";
@@ -197,9 +201,44 @@ async fn export(
 
 /// A stand-in DSM under `dsm_ca`, accepting clients under `kms_ca`; returns its base URL.
 async fn stand_in(dsm_ca: &Ca, kms_ca: &Ca, state: Arc<StandIn>) -> String {
+    stand_in_speaking(dsm_ca, kms_ca, state, Kx::Hybrid).await
+}
+
+/// What a stand-in DSM's TLS offers.
+enum Kx {
+    /// The platform's listener: TLS 1.3, `X25519MLKEM768` only.
+    Hybrid,
+    /// A DSM without ML-KEM: TLS 1.2 or 1.3 over classical X25519 only.
+    ClassicalOnly,
+}
+
+async fn stand_in_speaking(dsm_ca: &Ca, kms_ca: &Ca, state: Arc<StandIn>, kx: Kx) -> String {
     let (der, pkcs8) = leaf(dsm_ca, vec![SanType::IpAddress([127, 0, 0, 1].into())]);
     let key = certified(vec![der.into(), dsm_ca.der.clone().into()], &pkcs8).unwrap();
-    let config = mtls_server_config(Arc::new(One(key)), kms_ca.der.clone().into()).unwrap();
+    let kms_ca: CertificateDer<'static> = kms_ca.der.clone().into();
+    let config = match kx {
+        Kx::Hybrid => mtls_server_config(Arc::new(One(key)), kms_ca).unwrap(),
+        Kx::ClassicalOnly => {
+            let provider = Arc::new(CryptoProvider {
+                kx_groups: vec![kx_group::X25519],
+                ..aws_lc_rs::default_provider()
+            });
+            let mut roots = RootCertStore::empty();
+            roots.add(kms_ca).unwrap();
+            let verifier =
+                WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+                    .allow_unauthenticated()
+                    .build()
+                    .unwrap();
+            Arc::new(
+                ServerConfig::builder_with_provider(provider)
+                    .with_safe_default_protocol_versions()
+                    .unwrap()
+                    .with_client_cert_verifier(verifier)
+                    .with_cert_resolver(Arc::new(One(key))),
+            )
+        }
+    };
     let app = Router::new()
         .route("/sys/v1/session/auth", post(auth))
         .route("/crypto/v1/keys/export", post(export))
@@ -210,14 +249,22 @@ async fn stand_in(dsm_ca: &Ca, kms_ca: &Ca, state: Arc<StandIn>) -> String {
     format!("https://{addr}")
 }
 
-fn config(endpoint: &str, dsm_ca: &Ca, binding: &str) -> DsmConfig {
-    let text = json!({
+fn settings(endpoint: &str, dsm_ca: &Ca, binding: &str) -> Value {
+    json!({
         "endpoint": endpoint, "app_id": "app-1", "ca_pem": dsm_ca.pem,
         "keys": {"data": {"kid": "k-1"}, "index": {"name": "idx"}},
         "binding": binding,
     })
-    .to_string();
-    DsmConfig::parse(Some(&text)).unwrap().unwrap()
+}
+
+fn parse(settings: &Value) -> DsmConfig {
+    DsmConfig::parse(Some(&settings.to_string()))
+        .unwrap()
+        .unwrap()
+}
+
+fn config(endpoint: &str, dsm_ca: &Ca, binding: &str) -> DsmConfig {
+    parse(&settings(endpoint, dsm_ca, binding))
 }
 
 #[tokio::test]
@@ -336,6 +383,34 @@ async fn a_leaf_a_dsm_could_check_only_against_the_ca_is_never_presented() {
         assert!(matches!(dsm.key("other").await, Err(Error::Undeclared(_))));
     }
     assert_eq!(state.requests.load(Ordering::SeqCst), 0);
+}
+
+/// Y26: key release is post-quantum by default. A DSM that cannot do the hybrid gets no
+/// handshake unless the tenant's measured compose allows classical key exchange (until F6).
+#[tokio::test]
+async fn classical_key_exchange_only_when_the_compose_allows_it() {
+    let (kms_ca, dsm_ca) = (ca("kms"), ca("dsm"));
+    let who = Who::new("{}");
+    let state = StandIn::matching(who.revision_name());
+    let url = stand_in_speaking(&dsm_ca, &kms_ca, state.clone(), Kx::ClassicalOnly).await;
+
+    let me = instance(&kms_ca, who.kms_sans());
+    let dsm = Dsm::new(&config(&url, &dsm_ca, "revision"), me.chain, &me.pkcs8).unwrap();
+    assert!(matches!(dsm.key("data").await, Err(Error::Transport(_))));
+    assert_eq!(state.requests.load(Ordering::SeqCst), 0);
+
+    let mut allowed = settings(&url, &dsm_ca, "revision");
+    allowed["key_exchange"] = json!("classical-allowed");
+    let me = instance(&kms_ca, who.kms_sans());
+    let dsm = Dsm::new(&parse(&allowed), me.chain, &me.pkcs8).unwrap();
+    assert_eq!(&dsm.key("data").await.unwrap().value[..], KEY);
+
+    // The hybrid is still what a classical-allowed client prefers.
+    let hybrid = stand_in(&dsm_ca, &kms_ca, StandIn::matching(who.revision_name())).await;
+    allowed["endpoint"] = json!(hybrid);
+    let me = instance(&kms_ca, who.kms_sans());
+    let dsm = Dsm::new(&parse(&allowed), me.chain, &me.pkcs8).unwrap();
+    assert_eq!(&dsm.key("data").await.unwrap().value[..], KEY);
 }
 
 #[tokio::test]
