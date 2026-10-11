@@ -130,6 +130,35 @@ pub async fn verify_gpus(
     Ok(out)
 }
 
+/// The checks that need no backend result: the policy exists, lists a verifier and allows the
+/// Revision's model, and the pod sent one evidence entry per expected GPU. Run before any backend
+/// is called, so a pod that cannot pass costs no verifier call, and again by [`check_gpus`].
+pub fn precheck<'a>(
+    policy: Option<&'a GpuPolicy>,
+    shape: &GpuShape,
+    evidence_count: usize,
+) -> Result<&'a GpuPolicy, AppraisalError> {
+    use AppraisalError::*;
+
+    let policy = policy.ok_or_else(|| Unknown("the platform document has no gpu_policy".into()))?;
+    if policy.verifiers.is_empty() {
+        return Err(PolicyDenied("gpu_policy lists no verifier".into()));
+    }
+    if !policy.allowed_models.contains(&shape.model) {
+        return Err(PolicyDenied(format!(
+            "gpu model {} is not allowed",
+            shape.model
+        )));
+    }
+    if usize::try_from(shape.count).ok() != Some(evidence_count) {
+        return Err(Failed(format!(
+            "{evidence_count} GPUs attested, the Revision expects {}",
+            shape.count
+        )));
+    }
+    Ok(policy)
+}
+
 /// The decision over the backends' results: the Revision's GPU shape, the policy, and the nonce.
 /// `expected` is the Revision's `gpu`; `evidence_count` is how many GPUs the pod sent evidence for.
 pub fn check_gpus(
@@ -149,23 +178,8 @@ pub fn check_gpus(
         }
         return Ok(Vec::new());
     };
-    let policy = policy.ok_or_else(|| Unknown("the platform document has no gpu_policy".into()))?;
-    if policy.verifiers.is_empty() {
-        return Err(PolicyDenied("gpu_policy lists no verifier".into()));
-    }
-    if !policy.allowed_models.contains(&shape.model) {
-        return Err(PolicyDenied(format!(
-            "gpu model {} is not allowed",
-            shape.model
-        )));
-    }
+    let policy = precheck(policy, shape, evidence_count)?;
     let count = usize::try_from(shape.count).map_err(|_| Failed("gpu count".into()))?;
-    if evidence_count != count {
-        return Err(Failed(format!(
-            "{evidence_count} GPUs attested, the Revision expects {}",
-            shape.count
-        )));
-    }
     for kind in &policy.verifiers {
         let appraisal = appraisals
             .iter()
