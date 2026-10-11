@@ -26,6 +26,7 @@ mod test_support;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, State};
@@ -40,6 +41,9 @@ use zeroize::Zeroizing;
 pub use upstream::Upstream;
 
 const COMPLETIONS_BODY_LIMIT: usize = 16 * 1024 * 1024;
+/// A completion, from connecting to the last byte of its body, gets this long on either kind
+/// of upstream; a stuck upstream then answers `502 upstream` instead of holding a task forever.
+pub const COMPLETION_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// The measured environment, read once at startup and never mutated.
 #[derive(Clone, Debug)]
@@ -406,6 +410,7 @@ async fn send(state: &AppState, model: &str, body: Bytes) -> Result<reqwest::Res
                 .post(format!("{}/chat/completions", state.config.upstream_url))
                 .bearer_auth(provider_key.as_str())
                 .header(header::CONTENT_TYPE, "application/json")
+                .timeout(COMPLETION_TIMEOUT)
                 .body(body)
                 .send()
                 .await;
