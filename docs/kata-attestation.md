@@ -43,15 +43,17 @@ Every GPU report is bound to `SHA-256("alphacompute/gpu-nonce/v1" ‖ report_dat
 
 ## Appraisal steps
 
+In the plan's order (PRD-02 R5). Every step is mandatory; the order only decides which reason is named when evidence has several faults.
+
 1. DCAP verification and the TCB policy (unchanged, `verify_quote`).
-2. `report_data` binds this runtime key and nonce.
-3. If an event log was sent, it replays to the quoted RTMR0..2.
-4. `MRTD` and `RTMR0..2` match a reference value of kind `kata-tdx` (and its `runtime_class`, when set).
-5. `MRCONFIGID` is the digest of the init-data sent.
-6. The init-data parses, has `policy.rego` and a valid `alpha.json`.
-7. The evidence's `runtime_class` is the init-data's.
-8. GPUs: the evidence has exactly `gpu.count` entries; every backend the `gpu_policy` lists verified every one of them, over this nonce, in CC mode, of the Revision's model, an allowed model, at or above the minimum driver and VBIOS versions. A failure in any backend fails the attestation.
-9. The Revision v2 hash is the leaf's Revision; for a KMS node it must be in `kms_revisions`.
+2. If an event log was sent, it replays to the quoted RTMR0..2.
+3. `MRTD` and `RTMR0..2` match a reference value of kind `kata-tdx` listed for the pod's runtime class (or for any class, when the value names none). The same registers may be listed under several classes; the value for the pod's class is the one chosen.
+4. `MRCONFIGID` is the digest of the init-data sent.
+5. The init-data parses, has `policy.rego` and a valid `alpha.json`.
+6. The evidence's `runtime_class` is the init-data's.
+7. `report_data` binds this runtime key and nonce, last of the TD checks.
+8. The Revision v2 hash is the leaf's Revision; for a KMS node it must be in `kms_revisions`.
+9. GPUs: the evidence has exactly `gpu.count` entries; every backend the `gpu_policy` lists verified every one of them, over this nonce, in CC mode, of the Revision's model, an allowed model, at or above the minimum driver and VBIOS versions. A failure in any backend fails the attestation.
 
 The KMS then requires the Revision to be registered, unrevoked and validly signed, as today. Every refusal is an audit row with its reason.
 
