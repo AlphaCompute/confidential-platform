@@ -67,6 +67,11 @@ pub struct GpuPolicy {
     /// the B300's string to `B300`. Release-signed, so no backend guesses what a GPU is.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub hwmodels: BTreeMap<String, String>,
+    /// NRAS's signing keys, pinned by `kid`: the only keys an NRAS token may be signed with.
+    /// Release-signed with the rest of the policy, so trust in a GPU verdict never rests on
+    /// fetching NRAS's JWKS over web-PKI TLS. Empty, the `nras` backend refuses every GPU.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub nras_keys: BTreeMap<String, nras::NrasKey>,
 }
 
 /// What a backend proved about one GPU, after its own cryptographic checks passed. Part of the
@@ -354,6 +359,7 @@ mod tests {
             verifiers: vec![GpuVerifierKind::Nras],
             nras_url: None,
             hwmodels: BTreeMap::new(),
+            nras_keys: BTreeMap::new(),
         }
     }
 

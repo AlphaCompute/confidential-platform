@@ -1,19 +1,21 @@
 //! The NVIDIA Remote Attestation Service backend. NRAS verifies each GPU's SPDM report, its
 //! certificate chain and revocation, and the driver and VBIOS RIMs, and answers with an overall
-//! EAT plus one EAT per GPU, all ES384 JWTs under NVIDIA's JWKS. This backend checks those
-//! signatures, binds the per-GPU tokens to the overall one through its `submods` digests, checks
-//! the nonce and every per-GPU result claim, and reduces each GPU to [`VerifiedGpu`].
+//! EAT plus one EAT per GPU, all ES384 JWTs. This backend checks those signatures under the NRAS
+//! keys the release-signed `gpu_policy` pins by `kid` (never under a key fetched at run time),
+//! binds the per-GPU tokens to the overall one through its `submods` digests, checks the nonce and
+//! every per-GPU result claim, and reduces each GPU to [`VerifiedGpu`].
 //!
 //! Development uses NRAS free of charge; a paid service needs NVIDIA's licence (L1, F9).
 //! Results are accepted for one attestation, i.e. the life of one leaf (Q12).
 
+use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
 use p384::ecdsa::signature::Verifier;
 use p384::ecdsa::{Signature, VerifyingKey};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
@@ -24,7 +26,6 @@ use crate::AppraisalError;
 
 pub const DEFAULT_URL: &str = "https://nras.attestation.nvidia.com";
 const ATTEST_PATH: &str = "/v3/attest/gpu";
-const JWKS_PATH: &str = "/.well-known/jwks.json";
 const CLOCK_SKEW: Duration = Duration::from_secs(60);
 const TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -78,7 +79,7 @@ impl Nras {
         base: &str,
         gpus: &[GpuEvidence],
         nonce: &[u8; 32],
-    ) -> Result<(Value, Jwks), AppraisalError> {
+    ) -> Result<Value, AppraisalError> {
         let failed =
             |what: &str, e: reqwest::Error| AppraisalError::Failed(format!("nras {what}: {e}"));
         let arch = gpus
@@ -109,17 +110,7 @@ impl Nras {
             .json()
             .await
             .map_err(|e| failed("attest reply", e))?;
-        let jwks: Jwks = self
-            .http
-            .get(format!("{base}{JWKS_PATH}"))
-            .send()
-            .await
-            .and_then(|r| r.error_for_status())
-            .map_err(|e| failed("jwks", e))?
-            .json()
-            .await
-            .map_err(|e| failed("jwks reply", e))?;
-        Ok((reply, jwks))
+        Ok(reply)
     }
 }
 
@@ -135,73 +126,63 @@ impl GpuVerifier for Nras {
         policy: &'a GpuPolicy,
     ) -> GpuFuture<'a> {
         Box::pin(async move {
+            // Checked before any call: with no pinned key, nothing NRAS answers could be trusted.
+            if policy.nras_keys.is_empty() {
+                return Err(AppraisalError::Unknown(
+                    "gpu_policy.nras_keys pins no NRAS signing key".into(),
+                ));
+            }
             let base = policy
                 .nras_url
                 .as_deref()
                 .unwrap_or(DEFAULT_URL)
                 .trim_end_matches('/');
-            let (reply, jwks) = self.call(base, gpus, nonce).await?;
-            parse_reply(
-                &reply,
-                &jwks,
-                base,
-                gpus.len(),
-                nonce,
-                policy,
-                (self.clock)(),
-            )
+            let reply = self.call(base, gpus, nonce).await?;
+            parse_reply(&reply, base, gpus.len(), nonce, policy, (self.clock)())
         })
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct Jwks {
-    pub keys: Vec<Jwk>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct Jwk {
-    #[serde(default)]
-    pub kid: Option<String>,
+/// One NRAS signing key as `gpu_policy.nras_keys` pins it under its `kid`: the EC P-384 public
+/// key exactly as NRAS's JWKS publishes it (`x` and `y` base64url). Copied into the platform
+/// document from NVIDIA's JWKS when the document is prepared and release-signed with it; NRAS
+/// rotating a key therefore means a new platform document, never a key fetched at run time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NrasKey {
     pub kty: String,
-    #[serde(default)]
-    pub crv: Option<String>,
-    #[serde(default)]
-    pub x: Option<String>,
-    #[serde(default)]
-    pub y: Option<String>,
+    pub crv: String,
+    pub x: String,
+    pub y: String,
 }
 
-impl Jwks {
-    fn key(&self, kid: Option<&str>) -> Result<VerifyingKey, AppraisalError> {
-        let bad = |m: &str| AppraisalError::Failed(format!("nras jwks: {m}"));
-        let jwk = self
-            .keys
-            .iter()
-            .find(|k| kid.is_none() || k.kid.as_deref() == kid)
-            .ok_or_else(|| bad("no key for the token's kid"))?;
-        if jwk.kty != "EC" || jwk.crv.as_deref() != Some("P-384") {
+impl NrasKey {
+    fn verifying_key(&self, kid: &str) -> Result<VerifyingKey, AppraisalError> {
+        let bad = |m: &str| AppraisalError::Failed(format!("gpu_policy.nras_keys {kid:?}: {m}"));
+        if self.kty != "EC" || self.crv != "P-384" {
             return Err(bad("key is not EC P-384"));
         }
-        let coord = |c: &Option<String>| -> Result<[u8; 48], AppraisalError> {
-            c.as_deref()
-                .and_then(|c| BASE64_URL_SAFE_NO_PAD.decode(c).ok())
+        let coord = |c: &str| -> Result<[u8; 48], AppraisalError> {
+            BASE64_URL_SAFE_NO_PAD
+                .decode(c)
+                .ok()
                 .and_then(|b| <[u8; 48]>::try_from(b).ok())
                 .ok_or_else(|| bad("coordinate is not 48 bytes base64url"))
         };
         let point = p384::EncodedPoint::from_affine_coordinates(
-            &coord(&jwk.x)?.into(),
-            &coord(&jwk.y)?.into(),
+            &coord(&self.x)?.into(),
+            &coord(&self.y)?.into(),
             false,
         );
         VerifyingKey::from_encoded_point(&point).map_err(|_| bad("not a P-384 point"))
     }
 }
 
-/// An ES384 JWT's claims after its signature and lifetime are checked.
+/// An ES384 JWT's claims after its signature (under the key pinned for its `kid`) and lifetime
+/// are checked. A token with no `kid`, or one whose `kid` is not pinned, is refused.
 fn verify_jwt(
     token: &str,
-    jwks: &Jwks,
+    keys: &BTreeMap<String, NrasKey>,
     issuer: &str,
     now: SystemTime,
 ) -> Result<Map<String, Value>, AppraisalError> {
@@ -222,7 +203,14 @@ fn verify_jwt(
     if header.get("alg").and_then(Value::as_str) != Some("ES384") {
         return Err(bad("alg is not ES384".into()));
     }
-    let key = jwks.key(header.get("kid").and_then(Value::as_str))?;
+    let kid = header
+        .get("kid")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad("names no kid".into()))?;
+    let key = keys
+        .get(kid)
+        .ok_or_else(|| bad(format!("kid {kid:?} is not pinned in gpu_policy.nras_keys")))?
+        .verifying_key(kid)?;
     let signature =
         Signature::from_slice(&decode("signature", s)?).map_err(|_| bad("signature".into()))?;
     key.verify(format!("{h}.{p}").as_bytes(), &signature)
@@ -252,11 +240,11 @@ fn verify_jwt(
     Ok(claims)
 }
 
-/// The pure half of the backend, over NRAS's reply and JWKS. The verdict's digest is over the
-/// overall EAT, which binds every per-GPU token through its `submods`.
+/// The pure half of the backend, over NRAS's reply, with the keys `policy.nras_keys` pins. The
+/// verdict's digest is over the overall EAT, which binds every per-GPU token through its
+/// `submods`.
 pub fn parse_reply(
     reply: &Value,
-    jwks: &Jwks,
     issuer: &str,
     count: usize,
     nonce: &[u8; 32],
@@ -284,7 +272,7 @@ pub fn parse_reply(
         .ok_or_else(|| bad("no per-GPU tokens".into()))?;
 
     let token_sha256: [u8; 32] = Sha256::digest(overall.as_bytes()).into();
-    let overall = verify_jwt(overall, jwks, issuer, now)?;
+    let overall = verify_jwt(overall, &policy.nras_keys, issuer, now)?;
     if overall.get(claims::OVERALL_RESULT).and_then(Value::as_bool) != Some(true) {
         return Err(bad("overall attestation result is not true".into()));
     }
@@ -322,7 +310,7 @@ pub fn parse_reply(
                 "{name} token is not the one the overall result names"
             )));
         }
-        let c = verify_jwt(token, jwks, issuer, now)?;
+        let c = verify_jwt(token, &policy.nras_keys, issuer, now)?;
         let text = |claim: &str| -> Result<String, AppraisalError> {
             c.get(claim)
                 .and_then(Value::as_str)
@@ -383,24 +371,25 @@ mod tests {
         SigningKey::from_slice(&[0x42; 48]).unwrap()
     }
 
-    fn jwks() -> Jwks {
-        let point = key().verifying_key().to_encoded_point(false);
-        Jwks {
-            keys: vec![Jwk {
-                kid: Some("k1".into()),
-                kty: "EC".into(),
-                crv: Some("P-384".into()),
-                x: Some(BASE64_URL_SAFE_NO_PAD.encode(point.x().unwrap())),
-                y: Some(BASE64_URL_SAFE_NO_PAD.encode(point.y().unwrap())),
-            }],
+    fn pinned(key: &SigningKey) -> NrasKey {
+        let point = key.verifying_key().to_encoded_point(false);
+        NrasKey {
+            kty: "EC".into(),
+            crv: "P-384".into(),
+            x: BASE64_URL_SAFE_NO_PAD.encode(point.x().unwrap()),
+            y: BASE64_URL_SAFE_NO_PAD.encode(point.y().unwrap()),
         }
     }
 
-    fn jwt(claims: &Value) -> String {
-        let h = BASE64_URL_SAFE_NO_PAD.encode(br#"{"alg":"ES384","kid":"k1"}"#);
+    fn signed(header: &str, claims: &Value, key: &SigningKey) -> String {
+        let h = BASE64_URL_SAFE_NO_PAD.encode(header);
         let p = BASE64_URL_SAFE_NO_PAD.encode(claims.to_string());
-        let sig: Signature = key().sign(format!("{h}.{p}").as_bytes());
+        let sig: Signature = key.sign(format!("{h}.{p}").as_bytes());
         format!("{h}.{p}.{}", BASE64_URL_SAFE_NO_PAD.encode(sig.to_bytes()))
+    }
+
+    fn jwt(claims: &Value) -> String {
+        signed(r#"{"alg":"ES384","kid":"k1"}"#, claims, &key())
     }
 
     fn now() -> SystemTime {
@@ -453,17 +442,18 @@ mod tests {
             verifiers: vec![GpuVerifierKind::Nras],
             nras_url: Some(ISS.into()),
             hwmodels: [("GB110 A01 GSP BROM".to_owned(), "B300".to_owned())].into(),
+            nras_keys: [("k1".to_owned(), pinned(&key()))].into(),
         }
     }
 
     fn parse(reply: &Value, count: usize) -> Result<Vec<VerifiedGpu>, AppraisalError> {
-        parse_reply(reply, &jwks(), ISS, count, &NONCE, &policy(), now()).map(|v| v.gpus)
+        parse_reply(reply, ISS, count, &NONCE, &policy(), now()).map(|v| v.gpus)
     }
 
     #[test]
     fn eight_signed_gpu_tokens_reduce_to_verified_gpus() {
         let r = reply(&vec![gpu_claims(); 8]);
-        let verdict = parse_reply(&r, &jwks(), ISS, 8, &NONCE, &policy(), now()).unwrap();
+        let verdict = parse_reply(&r, ISS, 8, &NONCE, &policy(), now()).unwrap();
         let overall = r[0][1].as_str().unwrap();
         assert_eq!(
             verdict.token_sha256,
@@ -574,5 +564,67 @@ mod tests {
         );
         overall["alg"] = json!(null);
         assert!(parse(&json!({}), 1).is_err());
+    }
+
+    #[test]
+    fn only_keys_pinned_in_the_policy_are_trusted() {
+        let good = reply(&[gpu_claims()]);
+        // A validly formed token from a key NRAS might publish, but the policy does not pin.
+        let rogue = SigningKey::from_slice(&[0x44; 48]).unwrap();
+        let mut unknown_kid = good.clone();
+        unknown_kid[0][1] = json!(signed(
+            r#"{"alg":"ES384","kid":"k2"}"#,
+            &json!({"iss": ISS, "exp": 1_800_000_600u64}),
+            &rogue
+        ));
+        let error = parse(&unknown_kid, 1).unwrap_err().to_string();
+        assert!(error.contains("\"k2\" is not pinned"), "{error}");
+        let mut no_kid = good.clone();
+        no_kid[0][1] = json!(signed(
+            r#"{"alg":"ES384"}"#,
+            &json!({"iss": ISS, "exp": 1_800_000_600u64}),
+            &key()
+        ));
+        let error = parse(&no_kid, 1).unwrap_err().to_string();
+        assert!(error.contains("no kid"), "{error}");
+        // The rogue key pinned under the kid the token names is still not the key it signed with
+        // when the policy pins another key there.
+        let mut policy = policy();
+        policy.nras_keys.insert("k1".into(), pinned(&rogue));
+        let error = parse_reply(&good, ISS, 1, &NONCE, &policy, now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not verify"), "{error}");
+        policy.nras_keys.insert(
+            "k1".into(),
+            NrasKey {
+                kty: "RSA".into(),
+                ..pinned(&key())
+            },
+        );
+        let error = parse_reply(&good, ISS, 1, &NONCE, &policy, now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not EC P-384"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn no_pinned_key_refuses_before_calling_nras() {
+        let mut policy = policy();
+        policy.nras_keys.clear();
+        // Nothing listens there; the refusal must come before any connection is tried.
+        policy.nras_url = Some("http://127.0.0.1:9".into());
+        let gpus = [GpuEvidence {
+            arch: "BLACKWELL".into(),
+            evidence: vec![1],
+            certificate: vec![2],
+        }];
+        let error = Nras::new()
+            .unwrap()
+            .verify(&gpus, &NONCE, &policy)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "attestation_unknown");
+        assert!(error.to_string().contains("nras_keys"), "{error}");
     }
 }
