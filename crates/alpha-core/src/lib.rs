@@ -12,6 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 pub mod catalog;
+pub mod coco;
 pub mod compose;
 pub mod id;
 pub mod phala;
