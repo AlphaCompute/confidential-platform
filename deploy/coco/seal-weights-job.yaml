@@ -3,21 +3,34 @@
 # App as model-server.yaml (the key is the App's, the same for every Revision), run once per
 # model version on a confidential-GPU node so the KMS releases the key. The plain weights exist
 # only in this pod VM's memory; only the sealed copy reaches host storage.
+#
+# INTERIM: rendered by render-interim.py with its own reviewed agent policy, as model-server.yaml
+# is, until `alpha coco render` emits it: the policy and alpha.json in the init-data annotation,
+# no other Kata annotation, the pod VM sized from the containers' limits.
 apiVersion: batch/v1
 kind: Job
 metadata:
   name: seal-weights-${MODEL_NAME}
+  labels:
+    app.kubernetes.io/name: alpha-seal-weights
+    alphacompute.io/model: ${MODEL_NAME}
 spec:
   backoffLimit: 0
   template:
     metadata:
+      labels:
+        app.kubernetes.io/name: alpha-seal-weights
+        alphacompute.io/model: ${MODEL_NAME}
+        alphacompute.io/tenant: ${TENANT}
+        alphacompute.io/app: ${APP_ID}
       annotations:
-        io.katacontainers.config.hypervisor.default_memory: "${POD_VM_MEMORY_MIB}"
-        io.katacontainers.config.agent.policy: "${SEAL_AGENT_POLICY_B64}"
+        # The only Kata annotation: the init-data (agent policy + alpha.json), set by the renderer.
+        io.katacontainers.config.hypervisor.cc_init_data: "${CC_INIT_DATA}"
     spec:
       runtimeClassName: kata-qemu-nvidia-gpu-tdx
       restartPolicy: Never
       automountServiceAccountToken: false
+      enableServiceLinks: false
       initContainers:
         - name: alpha-runtime
           image: ${RUNTIME_IMAGE}
@@ -26,8 +39,10 @@ spec:
             - { name: ALPHACOMPUTE_KMS_ENDPOINTS, value: "${KMS_ENDPOINTS}" }
             - { name: ALPHACOMPUTE_KMS_CA_SPKI_SHA256, value: "${KMS_CA_SPKI_SHA256}" }
             - { name: ALPHACOMPUTE_KMS_REVISIONS, value: "${KMS_REVISIONS}" }
+            - { name: ALPHACOMPUTE_QUOTE_SOURCE, value: "coco-aa" }
           volumeMounts:
             - { name: runtime-socket, mountPath: /run/alpha }
+            - { name: pod-initdata, mountPath: /run/alpha-pod, readOnly: true }
         - name: fetch
           image: ${FETCH_IMAGE}              # a pinned huggingface_hub image
           command: ["/bin/sh", "-c"]
@@ -43,14 +58,25 @@ spec:
           # Bound to this model: prints the manifest digest model-server.yaml gives `open`.
           args: ["seal", "${MODEL_ID}", "${MODEL_REPO}@${MODEL_REPO_REVISION}", "/plain", "/sealed"]
           resources:
+            # The pod VM is sized from these limits: the plain weights in memory and the sealing.
             limits:
               nvidia.com/pgpu: 1             # the GPU is what lets the KMS release the key
+              cpu: "${POD_VM_VCPUS}"
+              memory: "${POD_VM_MEMORY_MIB}Mi"
           volumeMounts:
             - { name: runtime-socket, mountPath: /run/alpha }
             - { name: plain, mountPath: /plain, readOnly: true }
             - { name: sealed-weights, mountPath: /sealed }
       volumes:
         - { name: runtime-socket, emptyDir: { medium: Memory } }
+        # The pod's own init-data, which the runtime sends with its evidence; the KMS refuses
+        # any that is not the digest in MRCONFIGID.
+        - name: pod-initdata
+          downwardAPI:
+            items:
+              - path: cc_init_data
+                fieldRef:
+                  fieldPath: metadata.annotations['io.katacontainers.config.hypervisor.cc_init_data']
         - name: plain
           emptyDir: { medium: Memory, sizeLimit: "${WEIGHTS_SIZE}" }
         - name: sealed-weights
