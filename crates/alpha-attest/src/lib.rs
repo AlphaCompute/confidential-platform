@@ -1,6 +1,8 @@
 //! Verifier for the evidence an Instance sends to the KMS: DCAP through `dcap-qvl`, then the
 //! checks that are ours — `report_data` binding, RTMR replay, reference values, the measured
-//! `compose_hash`. Pure over its arguments except [`fetch_collateral`].
+//! `compose_hash`, and for a Kata pod its init-data and GPUs. Pure over its arguments except
+//! [`fetch_collateral`] and the GPU backends: [`gpu::nras`] calls NRAS over HTTPS, and
+//! [`kata::appraise_any`] calls the backends it is given.
 
 #![cfg_attr(
     test,
