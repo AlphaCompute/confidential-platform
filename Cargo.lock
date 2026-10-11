@@ -356,6 +356,7 @@ dependencies = [
  "alpha-core",
  "base64 0.23.1",
  "flate2",
+ "getrandom 0.4.3",
  "hex",
  "serde",
  "serde_json",
