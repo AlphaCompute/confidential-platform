@@ -227,6 +227,45 @@ mod tests {
     }
 
     #[test]
+    fn registration_takes_a_cpu_class_revision_v2_without_gpus_only() {
+        use crate::coco::{CPU_RUNTIME_CLASS, CocoRevision, GPU_RUNTIME_CLASS, GpuShape};
+        let app_id = AppId::mint();
+        let revision = |class: &str, gpu: Option<u32>| {
+            CocoRevision {
+                format: crate::coco::REVISION_FORMAT.into(),
+                app_id,
+                initdata_sha256: compose_hash("initdata"),
+                policy_sha256: compose_hash("policy"),
+                runtime_class: class.into(),
+                gpu: gpu.map(|count| GpuShape {
+                    count,
+                    model: "B300".into(),
+                }),
+            }
+            .canonical()
+            .unwrap()
+        };
+
+        // A CPU-only confidential pod (KMS, broker, signer, guard, front, supervisor).
+        let cpu = revision(CPU_RUNTIME_CLASS, None);
+        assert_eq!(
+            check_registration(&cpu, app_id).unwrap(),
+            compose_hash(&cpu)
+        );
+
+        for (text, why) in [
+            (revision(CPU_RUNTIME_CLASS, Some(1)), "runs no GPU"),
+            (revision(CPU_RUNTIME_CLASS, Some(0)), "runs no GPU"),
+            (revision(GPU_RUNTIME_CLASS, None), "needs a gpu section"),
+            (revision(GPU_RUNTIME_CLASS, Some(0)), "gpu.count 0"),
+        ] {
+            let error = check_registration(&text, app_id).unwrap_err();
+            assert_eq!(error.code(), "malformed");
+            assert!(error.to_string().contains(why), "{why}: {error}");
+        }
+    }
+
+    #[test]
     fn compose_hash_round_trips_through_text_and_json() {
         let hash = compose_hash("{}");
         assert_eq!(hash.to_string().parse::<ComposeHash>().unwrap(), hash);
