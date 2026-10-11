@@ -55,9 +55,10 @@ Delete it, and render with `alpha coco render`, once that exists.
 3. Render and deploy `model-server.yaml` per model; register each Revision; put its hash into
    alpha-inference's `MODEL_SERVERS`.
 4. Put alpha-inference's `judge-bearer` and set alpha-guard's `inference-bearer` to the same value;
-   add alpha-inference's App to alpha-guard's `CALLER_APPS`.
-5. Deploy alpha-inference with `env/alpha-inference.env`, then alpha-guard with
-   `env/alpha-guard.env`. Confirm in alpha-inference's log:
+   name alpha-inference's App in alpha-guard's `INFERENCE_APPS` and `CALLER_APPS`.
+5. Register alpha-guard with `env/alpha-guard.env` first: it names the front only by App, so its
+   Revision does not depend on the front's. Then register alpha-inference with that Revision in
+   `GUARD_REVISIONS` (`env/alpha-inference.env`) and deploy both. Confirm in alpha-inference's log:
    `model <id> served by alphacompute revision sha256:...` for both models.
 6. Point corpus-supervisor's `INFERENCE_URL`/`INFERENCE_REVISIONS` at this alpha-inference.
 
