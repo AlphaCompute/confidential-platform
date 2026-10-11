@@ -8,6 +8,7 @@
 //! platform document's policy and the Revision's GPU shape to them. That last step is pure and is
 //! the one that decides, so which backend ran never changes what a leaf means.
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -67,6 +68,9 @@ pub struct GpuPolicy {
 pub struct VerifiedGpu {
     /// Position in the evidence's `gpus`.
     pub index: u32,
+    /// The device's identity as the backend verified it (NRAS: the EAT `ueid`). No two GPUs of
+    /// one pod may share it, so eight copies of one GPU's report cannot stand for eight GPUs.
+    pub device_id: String,
     /// Normalized to the policy's model names, e.g. `B300`.
     pub model: String,
     pub driver_version: String,
@@ -77,11 +81,39 @@ pub struct VerifiedGpu {
     pub nonce: [u8; 32],
 }
 
+/// What one backend returns: every GPU it fully verified, and the digest of the signed result it
+/// verified them from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpuVerdict {
+    pub gpus: Vec<VerifiedGpu>,
+    /// SHA-256 of the vendor's signed result the backend checked (NRAS: the overall EAT, which
+    /// binds every per-GPU token), so the attestation result names what vouched.
+    pub token_sha256: [u8; 32],
+}
+
 /// One backend's result over all of a pod's GPUs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GpuAppraisal {
     pub verifier: GpuVerifierKind,
     pub gpus: Vec<VerifiedGpu>,
+    pub token_sha256: [u8; 32],
+}
+
+/// Who vouched for a pod's GPUs, as the attestation result records it: one entry per backend the
+/// `gpu_policy` lists, in its order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GpuVouch {
+    pub verifier: GpuVerifierKind,
+    /// `sha256:<hex>` of the signed result that backend verified.
+    pub token_sha256: String,
+}
+
+/// The GPU decision: the verified GPUs in index order (the first listed backend's claims) and
+/// every backend that vouched for them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CheckedGpus {
+    pub gpus: Vec<VerifiedGpu>,
+    pub vouched: Vec<GpuVouch>,
 }
 
 /// The 32-byte nonce every GPU report is bound to: SHA-256 of the quote's `report_data`, so a GPU
@@ -95,7 +127,7 @@ pub fn gpu_nonce(report_data: &[u8; 64]) -> [u8; 32] {
 }
 
 pub type GpuFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<Vec<VerifiedGpu>, AppraisalError>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<GpuVerdict, AppraisalError>> + Send + 'a>>;
 
 /// A GPU verifier backend. It must fail rather than return a GPU it could not fully verify;
 /// [`check_gpus`] then applies policy to what it returns.
@@ -122,9 +154,11 @@ pub async fn verify_gpus(
         let backend = backends.iter().find(|b| b.kind() == *kind).ok_or_else(|| {
             AppraisalError::Unknown(format!("gpu verifier {kind:?} is not configured"))
         })?;
+        let verdict = backend.verify(gpus, nonce, policy).await?;
         out.push(GpuAppraisal {
             verifier: *kind,
-            gpus: backend.verify(gpus, nonce, policy).await?,
+            gpus: verdict.gpus,
+            token_sha256: verdict.token_sha256,
         });
     }
     Ok(out)
@@ -167,7 +201,7 @@ pub fn check_gpus(
     evidence_count: usize,
     appraisals: &[GpuAppraisal],
     nonce: &[u8; 32],
-) -> Result<Vec<VerifiedGpu>, AppraisalError> {
+) -> Result<CheckedGpus, AppraisalError> {
     use AppraisalError::*;
 
     let Some(shape) = expected else {
@@ -176,10 +210,11 @@ pub fn check_gpus(
                 "{evidence_count} GPU evidence entries for a Revision that expects no GPU"
             )));
         }
-        return Ok(Vec::new());
+        return Ok(CheckedGpus::default());
     };
     let policy = precheck(policy, shape, evidence_count)?;
     let count = usize::try_from(shape.count).map_err(|_| Failed("gpu count".into()))?;
+    let mut vouched = Vec::with_capacity(policy.verifiers.len());
     for kind in &policy.verifiers {
         let appraisal = appraisals
             .iter()
@@ -193,6 +228,7 @@ pub fn check_gpus(
             )));
         }
         let mut seen = vec![false; count];
+        let mut devices = BTreeSet::new();
         for gpu in &appraisal.gpus {
             let slot = usize::try_from(gpu.index)
                 .ok()
@@ -201,8 +237,24 @@ pub fn check_gpus(
             if std::mem::replace(slot, true) {
                 return Err(Failed(format!("gpu index {} verified twice", gpu.index)));
             }
+            if gpu.device_id.is_empty() {
+                return Err(Failed(format!(
+                    "gpu {}: verifier {kind:?} named no device",
+                    gpu.index
+                )));
+            }
+            if !devices.insert(gpu.device_id.as_str()) {
+                return Err(Failed(format!(
+                    "gpu {}: device {} is reported for another GPU of this pod too",
+                    gpu.index, gpu.device_id
+                )));
+            }
             check_gpu(policy, shape, gpu, nonce)?;
         }
+        vouched.push(GpuVouch {
+            verifier: *kind,
+            token_sha256: format!("sha256:{}", hex::encode(appraisal.token_sha256)),
+        });
     }
     let first = policy
         .verifiers
@@ -214,7 +266,7 @@ pub fn check_gpus(
         .map(|a| a.gpus.clone())
         .unwrap_or_default();
     gpus.sort_by_key(|g| g.index);
-    Ok(gpus)
+    Ok(CheckedGpus { gpus, vouched })
 }
 
 fn check_gpu(
@@ -300,6 +352,7 @@ mod tests {
     fn gpu(index: u32) -> VerifiedGpu {
         VerifiedGpu {
             index,
+            device_id: format!("ueid-{index}"),
             model: "B300".into(),
             driver_version: "575.51.03".into(),
             vbios_version: "97.00.9a.00.01".into(),
@@ -319,6 +372,7 @@ mod tests {
         vec![GpuAppraisal {
             verifier: GpuVerifierKind::Nras,
             gpus,
+            token_sha256: [0xaa; 32],
         }]
     }
 
@@ -344,10 +398,21 @@ mod tests {
         gpus.reverse();
         let out = check_gpus(Some(&policy()), Some(&shape(8)), 8, &nras(gpus), &NONCE).unwrap();
         assert_eq!(
-            out.iter().map(|g| g.index).collect::<Vec<_>>(),
+            out.gpus.iter().map(|g| g.index).collect::<Vec<_>>(),
             (0..8).collect::<Vec<_>>()
         );
-        assert!(check_gpus(None, None, 0, &[], &NONCE).unwrap().is_empty());
+        // The result names who vouched, with the digest of the signed result it verified.
+        assert_eq!(
+            out.vouched,
+            vec![GpuVouch {
+                verifier: GpuVerifierKind::Nras,
+                token_sha256: format!("sha256:{}", "aa".repeat(32)),
+            }]
+        );
+        assert_eq!(
+            check_gpus(None, None, 0, &[], &NONCE).unwrap(),
+            CheckedGpus::default()
+        );
     }
 
     #[test]
@@ -404,6 +469,17 @@ mod tests {
                 denied(Some(shape(1)), 1, nras(vec![gpu(3)])),
             ),
             ("GPU on a CPU Revision", denied(None, 1, vec![])),
+            (
+                "no device identity",
+                denied(
+                    Some(shape(1)),
+                    1,
+                    nras(vec![VerifiedGpu {
+                        device_id: String::new(),
+                        ..gpu(0)
+                    }]),
+                ),
+            ),
             ("verifier did not run", denied(Some(shape(1)), 1, vec![])),
         ] {
             assert!(
@@ -437,8 +513,24 @@ mod tests {
         appraisals.push(GpuAppraisal {
             verifier: GpuVerifierKind::FortanixCcm,
             gpus: vec![gpu(0)],
+            token_sha256: [0xcc; 32],
         });
-        assert!(check_gpus(Some(&both), Some(&shape(1)), 1, &appraisals, &NONCE).is_ok());
+        let out = check_gpus(Some(&both), Some(&shape(1)), 1, &appraisals, &NONCE).unwrap();
+        let named: Vec<_> = out
+            .vouched
+            .iter()
+            .map(|v| (v.verifier, v.token_sha256.clone()))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                (GpuVerifierKind::Nras, format!("sha256:{}", "aa".repeat(32))),
+                (
+                    GpuVerifierKind::FortanixCcm,
+                    format!("sha256:{}", "cc".repeat(32))
+                ),
+            ]
+        );
 
         let h100 = GpuShape {
             count: 1,
@@ -448,6 +540,17 @@ mod tests {
         assert_eq!(error.code(), "policy_denied");
         let error = check_gpus(None, Some(&shape(1)), 1, &[], &NONCE).unwrap_err();
         assert_eq!(error.code(), "attestation_unknown");
+    }
+
+    #[test]
+    fn eight_copies_of_one_gpus_report_do_not_pass_for_eight_gpus() {
+        // A compromised collector repeats one GPU's report (same device) at every index.
+        let copies: Vec<_> = (0..8)
+            .map(|index| VerifiedGpu { index, ..gpu(0) })
+            .collect();
+        let (code, reason) = denied(Some(shape(8)), 8, nras(copies));
+        assert_eq!(code, "attestation_failed");
+        assert!(reason.contains("device ueid-0"), "{reason}");
     }
 
     #[test]
@@ -483,7 +586,14 @@ mod tests {
             _: &'a [u8; 32],
             _: &'a GpuPolicy,
         ) -> GpuFuture<'a> {
-            let out = self.1.clone().map_err(AppraisalError::Failed);
+            let out = self
+                .1
+                .clone()
+                .map(|gpus| GpuVerdict {
+                    gpus,
+                    token_sha256: [0xaa; 32],
+                })
+                .map_err(AppraisalError::Failed);
             Box::pin(async move { out })
         }
     }

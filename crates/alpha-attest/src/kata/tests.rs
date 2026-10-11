@@ -111,9 +111,11 @@ impl Pod {
         let nonce = gpu_nonce(&self.expected_report_data());
         vec![GpuAppraisal {
             verifier: GpuVerifierKind::Nras,
+            token_sha256: [0xab; 32],
             gpus: (0..self.gpus)
                 .map(|index| VerifiedGpu {
                     index,
+                    device_id: format!("ueid-{index}"),
                     model: "B300".into(),
                     driver_version: "575.51.03".into(),
                     vbios_version: "97.00.9a.00.01".into(),
@@ -206,6 +208,13 @@ fn eight_gpu_pod_is_appraised_to_its_revision_v2() {
     assert_eq!(coco.runtime_class, CLASS);
     assert_eq!(coco.gpus.len(), 8);
     assert_eq!(coco.policy_sha256, alpha_core::compose_hash(POLICY));
+    // The result names who vouched for the GPUs.
+    assert_eq!(coco.gpu_verifiers.len(), 1);
+    assert_eq!(coco.gpu_verifiers[0].verifier, GpuVerifierKind::Nras);
+    assert_eq!(
+        coco.gpu_verifiers[0].token_sha256,
+        format!("sha256:{}", "ab".repeat(32))
+    );
 
     // The registered bytes are this init-data's Revision v2, for this App.
     let init = InitData::parse(pod.initdata.as_bytes()).unwrap();
@@ -236,7 +245,8 @@ fn cpu_only_pod_needs_no_gpu_policy() {
     let mut doc = doc();
     doc.gpu_policy = None;
     let appraised = pod.appraise(&doc).unwrap();
-    assert!(appraised.coco.unwrap().gpus.is_empty());
+    let coco = appraised.coco.unwrap();
+    assert!(coco.gpus.is_empty() && coco.gpu_verifiers.is_empty());
 }
 
 #[test]
@@ -527,8 +537,11 @@ impl GpuVerifier for Counting {
         _: &'a GpuPolicy,
     ) -> gpu::GpuFuture<'a> {
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let gpus = self.gpus.clone();
-        Box::pin(async move { Ok(gpus) })
+        let verdict = gpu::GpuVerdict {
+            gpus: self.gpus.clone(),
+            token_sha256: [0xab; 32],
+        };
+        Box::pin(async move { Ok(verdict) })
     }
 }
 
