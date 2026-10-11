@@ -10,15 +10,16 @@
 //! expected GPU passed. Every step is mandatory; the order only decides which reason a refusal of
 //! evidence with several faults names.
 
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use alpha_core::ComposeHash;
-use alpha_core::coco::InitData;
+use alpha_core::coco::{GpuShape, InitData};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::gpu::{self, GpuAppraisal, GpuEvidence, VerifiedGpu};
+use crate::gpu::{self, GpuAppraisal, GpuEvidence, GpuPolicy, GpuVerifier, VerifiedGpu};
 use crate::{
     AppraisalError, Appraised, Collateral, EVIDENCE_FORMAT, EVIDENCE_FORMAT_V2, EventLogEntry,
     Evidence, Measurement, PlatformDocument, ReferenceKind, VerifiedQuote, base64url, event_log,
@@ -130,18 +131,19 @@ pub struct CocoAppraised {
     pub gpus: Vec<VerifiedGpu>,
 }
 
-/// The appraisal of either evidence format. `gpus` are the GPU backends' results, run by the
-/// caller (the one network step) over `evidence.gpus()` with
-/// [`gpu::gpu_nonce`]`(report_data(..))`; empty for v1 evidence.
+/// The appraisal of either evidence format. For `alphacompute-evidence/2` every TD check runs
+/// first; the GPU backends (the one network step, e.g. NRAS) are called only after they all pass
+/// and only when the Revision expects GPUs, so evidence that fails on the CPU side never costs a
+/// verifier call. v1 evidence has no GPUs and never calls a backend.
 #[allow(clippy::too_many_arguments)]
-pub fn appraise_any(
+pub async fn appraise_any(
     evidence: &AnyEvidence,
     nonce: &[u8; 32],
     runtime_pubkey_spki: &[u8],
     node_xwing_spki: Option<&[u8]>,
     doc: &PlatformDocument,
     collateral: &Collateral,
-    gpus: &[GpuAppraisal],
+    gpu_backends: &[Arc<dyn GpuVerifier>],
     now: SystemTime,
 ) -> Result<Appraised, AppraisalError> {
     match evidence {
@@ -164,8 +166,9 @@ pub fn appraise_any(
                 runtime_pubkey_spki,
                 node_xwing_spki,
                 doc,
-                gpus,
+                gpu_backends,
             )
+            .await
         }
     }
 }
@@ -196,17 +199,89 @@ pub fn report_data_binds(quoted: &[u8; 64], expected: &[u8; 64]) -> bool {
     quoted.as_slice() == digest.as_bytes()
 }
 
-/// `kata-tdx/1` over a quote [`crate::verify_quote`] has already verified. Pure, so the
-/// malicious-host cases are tests over synthetic quotes.
-pub fn appraise_kata_tdx(
+/// `kata-tdx/1` over a quote [`crate::verify_quote`] has already verified: [`appraise_kata_cpu`],
+/// then, only if it passed and the Revision expects GPUs, every backend the `gpu_policy` lists,
+/// then [`CpuAppraised::finish`].
+pub async fn appraise_kata_tdx(
     evidence: &EvidenceV2,
     verified: VerifiedQuote,
     nonce: &[u8; 32],
     runtime_pubkey_spki: &[u8],
     node_xwing_spki: Option<&[u8]>,
     doc: &PlatformDocument,
-    gpus: &[GpuAppraisal],
+    gpu_backends: &[Arc<dyn GpuVerifier>],
 ) -> Result<Appraised, AppraisalError> {
+    let cpu = appraise_kata_cpu(
+        evidence,
+        verified,
+        nonce,
+        runtime_pubkey_spki,
+        node_xwing_spki,
+        doc,
+    )?;
+    let gpus = match cpu.gpu_shape() {
+        None => Vec::new(),
+        Some(shape) => {
+            let policy = gpu::precheck(doc.gpu_policy.as_ref(), shape, evidence.gpus.len())?;
+            gpu::verify_gpus(gpu_backends, &evidence.gpus, cpu.gpu_nonce(), policy).await?
+        }
+    };
+    cpu.finish(doc.gpu_policy.as_ref(), &gpus)
+}
+
+/// What `kata-tdx/1` established about the TD before any GPU backend ran: everything but the GPU
+/// decision. Only [`CpuAppraised::finish`] turns it into an [`Appraised`].
+#[derive(Debug)]
+pub struct CpuAppraised {
+    appraised: Appraised,
+    gpu: Option<GpuShape>,
+    gpu_evidence: usize,
+    gpu_nonce: [u8; 32],
+}
+
+impl CpuAppraised {
+    /// The GPUs the Revision expects; `None` means no GPU backend is to run.
+    pub fn gpu_shape(&self) -> Option<&GpuShape> {
+        self.gpu.as_ref()
+    }
+
+    /// What every GPU report must be over: [`gpu::gpu_nonce`] of the verified `report_data`.
+    pub fn gpu_nonce(&self) -> &[u8; 32] {
+        &self.gpu_nonce
+    }
+
+    /// The GPU decision over the backends' results ([`gpu::check_gpus`], pure), completing the
+    /// appraisal.
+    pub fn finish(
+        self,
+        policy: Option<&GpuPolicy>,
+        gpus: &[GpuAppraisal],
+    ) -> Result<Appraised, AppraisalError> {
+        let verified_gpus = gpu::check_gpus(
+            policy,
+            self.gpu.as_ref(),
+            self.gpu_evidence,
+            gpus,
+            &self.gpu_nonce,
+        )?;
+        let mut appraised = self.appraised;
+        if let Some(coco) = appraised.coco.as_mut() {
+            coco.gpus = verified_gpus;
+        }
+        Ok(appraised)
+    }
+}
+
+/// The TD half of `kata-tdx/1`, over a quote [`crate::verify_quote`] has already verified. Pure,
+/// so the malicious-host cases are tests over synthetic quotes.
+pub fn appraise_kata_cpu(
+    evidence: &EvidenceV2,
+    verified: VerifiedQuote,
+    nonce: &[u8; 32],
+    runtime_pubkey_spki: &[u8],
+    node_xwing_spki: Option<&[u8]>,
+    doc: &PlatformDocument,
+) -> Result<CpuAppraised, AppraisalError> {
     use AppraisalError::*;
 
     check_cpu_kind(evidence)?;
@@ -286,17 +361,9 @@ pub fn appraise_kata_tdx(
         return Err(Unknown(format!("kms revision {compose_hash}")));
     }
 
-    let verified_gpus = gpu::check_gpus(
-        doc.gpu_policy.as_ref(),
-        revision.gpu.as_ref(),
-        evidence.gpus.len(),
-        gpus,
-        &gpu::gpu_nonce(&expected),
-    )?;
-
     measured.mrconfigid = Some(mrconfigid);
     let evidence_json = serde_json::to_value(evidence).map_err(|e| Failed(e.to_string()))?;
-    Ok(Appraised {
+    let appraised = Appraised {
         measured,
         tcb_status,
         advisories,
@@ -318,8 +385,14 @@ pub fn appraise_kata_tdx(
             initdata_sha256: revision.initdata_sha256,
             policy_sha256: revision.policy_sha256,
             runtime_class: revision.runtime_class,
-            gpus: verified_gpus,
+            gpus: Vec::new(),
         }),
+    };
+    Ok(CpuAppraised {
+        appraised,
+        gpu: revision.gpu,
+        gpu_evidence: evidence.gpus.len(),
+        gpu_nonce: gpu::gpu_nonce(&expected),
     })
 }
 

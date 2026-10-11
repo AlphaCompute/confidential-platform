@@ -6,8 +6,10 @@
 use alpha_core::coco::{InitData, REVISION_FORMAT};
 use alpha_core::{AppId, KmsRevision};
 
+use std::sync::Arc;
+
 use super::*;
-use crate::gpu::{GpuPolicy, GpuVerifierKind, gpu_nonce};
+use crate::gpu::{GpuPolicy, GpuVerifier, GpuVerifierKind, gpu_nonce};
 use crate::{Measured, Policy, ReferenceMeasurements, ReferenceValue};
 
 const SPKI: &[u8] = b"runtime spki";
@@ -131,6 +133,7 @@ impl Pod {
             .unwrap()
     }
 
+    /// `kata-tdx/1` over these GPU backend results: the TD checks, then the GPU decision.
     fn appraise_with(
         &self,
         evidence: &EvidenceV2,
@@ -138,7 +141,8 @@ impl Pod {
         doc: &PlatformDocument,
         gpus: &[GpuAppraisal],
     ) -> Result<Appraised, AppraisalError> {
-        appraise_kata_tdx(evidence, quote, &NONCE, SPKI, self.xwing(), doc, gpus)
+        appraise_kata_cpu(evidence, quote, &NONCE, SPKI, self.xwing(), doc)?
+            .finish(doc.gpu_policy.as_ref(), gpus)
     }
 
     fn appraise(&self, doc: &PlatformDocument) -> Result<Appraised, AppraisalError> {
@@ -310,15 +314,15 @@ fn stale_nonce_and_replayed_quote_are_refused() {
         "report_data",
     );
     // A quote for another runtime key (a replay from another pod) fails the same way.
-    let replay = appraise_kata_tdx(
+    let replay = appraise_kata_cpu(
         &pod.evidence(),
         pod.quote(),
         &NONCE,
         b"another key",
         None,
         &doc(),
-        &pod.gpu_results(),
-    );
+    )
+    .and_then(|cpu| cpu.finish(doc().gpu_policy.as_ref(), &pod.gpu_results()));
     refused(replay, "attestation_failed", "report_data");
 }
 
@@ -503,4 +507,101 @@ fn report_data_forms() {
         &expected
     ));
     assert!(!report_data_binds(&[0x5b; 64], &expected));
+}
+
+/// A GPU backend that counts its calls and vouches for every GPU it is given.
+struct Counting {
+    calls: std::sync::atomic::AtomicUsize,
+    gpus: Vec<VerifiedGpu>,
+}
+
+impl GpuVerifier for Counting {
+    fn kind(&self) -> GpuVerifierKind {
+        GpuVerifierKind::Nras
+    }
+
+    fn verify<'a>(
+        &'a self,
+        _: &'a [GpuEvidence],
+        _: &'a [u8; 32],
+        _: &'a GpuPolicy,
+    ) -> gpu::GpuFuture<'a> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let gpus = self.gpus.clone();
+        Box::pin(async move { Ok(gpus) })
+    }
+}
+
+#[tokio::test]
+async fn gpu_backends_run_only_after_every_td_check_passed() {
+    let pod = Pod::gpu(8);
+    let counting = Arc::new(Counting {
+        calls: Default::default(),
+        gpus: pod.gpu_results().remove(0).gpus,
+    });
+    let backends: Vec<Arc<dyn GpuVerifier>> = vec![counting.clone()];
+    let run = |evidence: EvidenceV2, quote: VerifiedQuote, doc: PlatformDocument| {
+        let backends = backends.clone();
+        async move { appraise_kata_tdx(&evidence, quote, &NONCE, SPKI, None, &doc, &backends).await }
+    };
+    let calls = || counting.calls.load(std::sync::atomic::Ordering::SeqCst);
+
+    // A stale nonce, an unlisted guest image, a swapped init-data, too few GPU entries and a
+    // model the policy does not allow are refused without a verifier call.
+    let mut stale = pod.quote();
+    stale.report_data = report_data(SPKI, &[4; 32], None);
+    refused(
+        run(pod.evidence(), stale, doc()).await,
+        "attestation_failed",
+        "report_data",
+    );
+    let mut unlisted = pod.quote();
+    unlisted.measured.rtmr2 = m(9);
+    refused(
+        run(pod.evidence(), unlisted, doc()).await,
+        "attestation_unknown",
+        "reference value",
+    );
+    let mut swapped = pod.evidence();
+    swapped.initdata = initdata_text(
+        "package other
+",
+        Some(8),
+    )
+    .into_bytes();
+    refused(
+        run(swapped, pod.quote(), doc()).await,
+        "attestation_failed",
+        "MRCONFIGID",
+    );
+    let mut short = pod.evidence();
+    short.gpus.truncate(7);
+    refused(
+        run(short, pod.quote(), doc()).await,
+        "attestation_failed",
+        "Revision expects 8",
+    );
+    let mut no_b300 = doc();
+    if let Some(policy) = no_b300.gpu_policy.as_mut() {
+        policy.allowed_models = vec!["H200".into()];
+    }
+    refused(
+        run(pod.evidence(), pod.quote(), no_b300).await,
+        "policy_denied",
+        "not allowed",
+    );
+    assert_eq!(calls(), 0);
+
+    // A pod that passes every TD check gets one call per listed backend.
+    let appraised = run(pod.evidence(), pod.quote(), doc()).await.unwrap();
+    assert_eq!(appraised.coco.unwrap().gpus.len(), 8);
+    assert_eq!(calls(), 1);
+
+    // A CPU-only pod never calls a backend.
+    let cpu = Pod {
+        initdata: initdata_text(POLICY, None),
+        ..Pod::gpu(0)
+    };
+    run(cpu.evidence(), cpu.quote(), doc()).await.unwrap();
+    assert_eq!(calls(), 1);
 }

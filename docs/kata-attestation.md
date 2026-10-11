@@ -53,7 +53,7 @@ In the plan's order (PRD-02 R5). Every step is mandatory; the order only decides
 6. The evidence's `runtime_class` is the init-data's.
 7. `report_data` binds this runtime key and nonce, last of the TD checks.
 8. The Revision v2 hash is the leaf's Revision; for a KMS node it must be in `kms_revisions`.
-9. GPUs: the evidence has exactly `gpu.count` entries; every backend the `gpu_policy` lists verified every one of them, over this nonce, in CC mode, of the Revision's model, an allowed model, at or above the minimum driver and VBIOS versions. A failure in any backend fails the attestation.
+9. GPUs: the evidence has exactly `gpu.count` entries; every backend the `gpu_policy` lists verified every one of them, over this nonce, in CC mode, of the Revision's model, an allowed model, at or above the minimum driver and VBIOS versions. A failure in any backend fails the attestation. The backends (NRAS is a network call) run only after steps 1 to 8 have passed and after the checks that need no backend (a `gpu_policy` exists, lists a verifier and allows the model, one evidence entry per GPU), so evidence that fails earlier costs no verifier call (`alpha_attest::appraise_any`).
 
 The KMS then requires the Revision to be registered, unrevoked and validly signed, as today. Every refusal is an audit row with its reason.
 
