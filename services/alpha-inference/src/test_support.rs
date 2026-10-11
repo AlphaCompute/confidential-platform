@@ -67,6 +67,7 @@ pub(crate) fn test_config(upstream_url: &str, models: &[&str]) -> crate::Config 
                 categories: vec!["Violence".to_string()],
             },
             judge_models: vec!["guard".to_string()],
+            allow: crate::guard::Allow::default(),
         },
     }
 }
