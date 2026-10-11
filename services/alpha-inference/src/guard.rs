@@ -9,7 +9,9 @@
 //!
 //! The judge is dialled as every caller dials it: this Instance's own leaf as the client
 //! certificate, the connection pinned to the KMS CA and one of `GUARD_REVISIONS` inside the
-//! handshake. The leaf is renewed hourly, so the client is rebuilt on every refresh.
+//! handshake. The leaf is renewed hourly, so the client is rebuilt on every refresh. The judge
+//! pins this front back by App, not by Revision: this front's Revision names the judge's, so the
+//! judge's cannot name this front's.
 //!
 //! Log lines carry the phase, the outcome, the model and the elapsed time — never the text.
 

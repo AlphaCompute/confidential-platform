@@ -1,7 +1,9 @@
 //! The platform's content judge: an App of its own that an attested Instance of a listed App
 //! calls with its own policy and a piece of conversation, and that answers allow or block. The
-//! judging model is reached only through the inference front, pinned by the front's Revision, so
-//! which provider serves the model is the front's business. The caller enforces the verdict;
+//! judging model is reached only through the inference front, pinned by the KMS CA and the
+//! front's App — not its Revision: the front pins this judge's Revision, and no pair of Revisions
+//! can name each other — so which provider serves the model is the front's business. The caller
+//! enforces the verdict;
 //! this service never sees the rest of the caller's traffic and keeps nothing.
 
 #![cfg_attr(
@@ -21,7 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alpha_client::tls::{PeerCerts, Pin};
-use alpha_core::{AppId, ComposeHash};
+use alpha_core::AppId;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, FromRequestParts, State};
 use axum::http::StatusCode;
@@ -43,7 +45,8 @@ const JUDGE_TIMEOUT: Duration = Duration::from_secs(60);
 pub struct Config {
     /// The front's origin, `https://host[:port]`, without a path.
     pub inference_url: String,
-    pub inference_revisions: Vec<ComposeHash>,
+    /// The front's App: an Instance of any of its Revisions the KMS issued a leaf to.
+    pub inference_apps: Vec<AppId>,
     /// The Apps whose Instances may ask for a verdict.
     pub caller_apps: Vec<AppId>,
 }
@@ -85,9 +88,16 @@ impl Config {
                 "INFERENCE_URL must be an https origin without a path",
             ));
         }
+        // The front pins this judge's Revision, so this judge cannot pin the front's; a Revision
+        // list left in the environment would describe a pin that no longer exists.
+        if get("INFERENCE_REVISIONS").is_some() {
+            return Err(Error::internal(
+                "INFERENCE_REVISIONS is no longer read; name the front's App in INFERENCE_APPS",
+            ));
+        }
         Ok(Config {
             inference_url: url.as_str().trim_end_matches('/').to_owned(),
-            inference_revisions: list("INFERENCE_REVISIONS", get("INFERENCE_REVISIONS"))?,
+            inference_apps: list("INFERENCE_APPS", get("INFERENCE_APPS"))?,
             caller_apps: list("CALLER_APPS", get("CALLER_APPS"))?,
         })
     }
@@ -98,16 +108,17 @@ pub struct AppState {
     /// The bearer the front expects; behind a lock so a rotated one takes effect without a
     /// restart.
     pub inference_bearer: parking_lot::RwLock<Zeroizing<String>>,
-    /// Pinned to the front: the KMS CA and one of `inference_revisions`, inside the handshake.
+    /// Pinned to the front: the KMS CA and an Instance of one of `inference_apps`, inside the
+    /// handshake.
     pub front: reqwest::Client,
 }
 
 pub fn front_client(
     kms_ca: CertificateDer<'static>,
-    revisions: Vec<ComposeHash>,
+    apps: Vec<AppId>,
 ) -> Result<reqwest::Client, Error> {
     let tls = alpha_client::tls::client_config(
-        Some(Pin::CaAndInstanceRevisions(kms_ca, revisions)),
+        Some(Pin::CaAndInstanceApps(kms_ca, apps)),
         None,
         alpha_client::system_time_provider(),
     )
