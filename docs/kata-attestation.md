@@ -57,6 +57,10 @@ In the plan's order (PRD-02 R5). Every step is mandatory; the order only decides
 
 The KMS then requires the Revision to be registered, unrevoked and validly signed, as today. Every refusal is an audit row with its reason.
 
+## What the result records
+
+`AttestationResult.coco` (absent for the prototype profile) carries the profile, `initdata_sha256`, `policy_sha256`, `runtime_class`, every verified GPU (`index`, `device_id`, `model`, driver and VBIOS versions, `cc_mode`, `nonce`) and `gpu_verifiers`: one `{"verifier", "token_sha256"}` per backend the `gpu_policy` lists, naming who vouched for the GPUs and the digest of the signed result it verified. `device_id` is the device's identity as the backend verified it (NRAS's `ueid`); two GPUs of one pod may not share it, so eight copies of one GPU's report cannot pass for eight GPUs.
+
 ## Platform document additions
 
 All optional, so documents already signed still parse and keep their meaning:

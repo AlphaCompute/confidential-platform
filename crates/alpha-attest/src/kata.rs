@@ -19,7 +19,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::gpu::{self, GpuAppraisal, GpuEvidence, GpuPolicy, GpuVerifier, VerifiedGpu};
+use crate::gpu::{self, GpuAppraisal, GpuEvidence, GpuPolicy, GpuVerifier, GpuVouch, VerifiedGpu};
 use crate::{
     AppraisalError, Appraised, Collateral, EVIDENCE_FORMAT, EVIDENCE_FORMAT_V2, EventLogEntry,
     Evidence, Measurement, PlatformDocument, ReferenceKind, VerifiedQuote, base64url, event_log,
@@ -129,6 +129,10 @@ pub struct CocoAppraised {
     pub runtime_class: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gpus: Vec<VerifiedGpu>,
+    /// Who vouched for `gpus`: every GPU backend the `gpu_policy` lists, each with the digest of
+    /// the signed result it verified (e.g. NRAS's overall EAT). Empty for a CPU-only pod.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gpu_verifiers: Vec<GpuVouch>,
 }
 
 /// The appraisal of either evidence format. For `alphacompute-evidence/2` every TD check runs
@@ -257,7 +261,7 @@ impl CpuAppraised {
         policy: Option<&GpuPolicy>,
         gpus: &[GpuAppraisal],
     ) -> Result<Appraised, AppraisalError> {
-        let verified_gpus = gpu::check_gpus(
+        let checked = gpu::check_gpus(
             policy,
             self.gpu.as_ref(),
             self.gpu_evidence,
@@ -266,7 +270,8 @@ impl CpuAppraised {
         )?;
         let mut appraised = self.appraised;
         if let Some(coco) = appraised.coco.as_mut() {
-            coco.gpus = verified_gpus;
+            coco.gpus = checked.gpus;
+            coco.gpu_verifiers = checked.vouched;
         }
         Ok(appraised)
     }
@@ -386,6 +391,7 @@ pub fn appraise_kata_cpu(
             policy_sha256: revision.policy_sha256,
             runtime_class: revision.runtime_class,
             gpus: Vec::new(),
+            gpu_verifiers: Vec::new(),
         }),
     };
     Ok(CpuAppraised {
