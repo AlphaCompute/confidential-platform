@@ -351,14 +351,62 @@ fn runtime_class_must_be_the_init_datas_and_the_reference_values() {
     let pod = Pod::gpu(1);
     let mut evidence = pod.evidence();
     evidence.runtime_class = "kata-qemu-nvidia-gpu-snp".into();
+    // No reference value is listed for the class the pod claims.
     refused(
         pod.appraise_with(&evidence, pod.quote(), &doc(), &pod.gpu_results()),
+        "attestation_unknown",
+        "runtime class kata-qemu-nvidia-gpu-snp",
+    );
+    // A reference value for any class still holds the claim to the measured init-data's.
+    let mut any_class = doc();
+    any_class.reference_values[0].runtime_class = None;
+    refused(
+        pod.appraise_with(&evidence, pod.quote(), &any_class, &pod.gpu_results()),
         "attestation_failed",
-        "runtime class",
+        "is not the init-data's",
     );
     let mut doc = doc();
     doc.reference_values[0].runtime_class = Some("kata-qemu-other".into());
     refused(pod.appraise(&doc), "attestation_unknown", "runtime class");
+}
+
+#[test]
+fn reference_value_is_chosen_for_the_pods_runtime_class() {
+    // The same guest registers listed for two runtime classes: the pod gets the value for its own
+    // class, whichever is listed first.
+    let pod = Pod::gpu(1);
+    let mut doc = doc();
+    let mut other = doc.reference_values[0].clone();
+    other.name = "kata-tdx/cpu".into();
+    other.runtime_class = Some("kata-qemu-tdx".into());
+    doc.reference_values.insert(0, other);
+    let appraised = pod.appraise(&doc).unwrap();
+    assert_eq!(appraised.os_image, "nvidia-uvm-tdx/b300x8");
+}
+
+#[test]
+fn several_faults_are_refused_for_the_first_in_the_plans_order() {
+    // A stale nonce and a guest image that is not listed: the reference values come first and
+    // report_data last (PRD-02 R5e).
+    let pod = Pod::gpu(1);
+    let mut quote = pod.quote();
+    quote.report_data = report_data(SPKI, &[4; 32], None);
+    quote.measured.rtmr1 = m(9);
+    refused(
+        pod.appraise_with(&pod.evidence(), quote, &doc(), &pod.gpu_results()),
+        "attestation_unknown",
+        "kata-tdx reference value",
+    );
+    // A stale nonce and a swapped init-data: MRCONFIGID first.
+    let mut quote = pod.quote();
+    quote.report_data = report_data(SPKI, &[4; 32], None);
+    let mut evidence = pod.evidence();
+    evidence.initdata = initdata_text("package other\n", Some(1)).into_bytes();
+    refused(
+        pod.appraise_with(&evidence, quote, &doc(), &pod.gpu_results()),
+        "attestation_failed",
+        "MRCONFIGID",
+    );
 }
 
 #[test]
