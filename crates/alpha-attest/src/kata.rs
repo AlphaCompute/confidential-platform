@@ -119,9 +119,10 @@ impl<'de> Deserialize<'de> for AnyEvidence {
     }
 }
 
-/// What `kata-tdx/1` found, reported in the attestation result.
+/// What `kata-tdx/1` found, reported in the attestation result. Like the rest of the result it
+/// accepts fields it does not know, so a runtime built before a KMS upgrade that adds one keeps
+/// renewing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct CocoAppraised {
     pub profile: String,
     pub initdata_sha256: ComposeHash,
