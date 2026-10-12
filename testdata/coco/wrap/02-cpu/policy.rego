@@ -109,6 +109,9 @@ CreateContainerRequest := {"ops": ops, "allowed": true} if {
     print("CreateContainerRequest: p Readonly =", p_oci.Root.Readonly, "i Readonly =", i_oci.Root.Readonly)
     p_oci.Root.Readonly == i_oci.Root.Readonly
 
+    # alpha: the guest pulls the image this policy was generated for.
+    allow_guest_pull_image(p_oci, i_oci, i_storages)
+
     allow_anno(p_container, i_oci)
 
     p_storages := p_container.storages
@@ -129,6 +132,46 @@ CreateContainerRequest := {"ops": ops, "allowed": true} if {
     ops := concat_op_if_not_null(ret.ops, add_p_container_to_state)
 
     print("CreateContainerRequest: true")
+}
+
+# alpha: genpolicy 4.1.0 checks neither the image_guest_pull storage's source, which is the
+# reference the agent pulls, nor the io.kubernetes.cri.image-name annotation, so without these
+# rules the host could run any image whose process fields match.
+CRI_IMAGE_NAME_KEY := "io.kubernetes.cri.image-name"
+
+allow_guest_pull_image(p_oci, i_oci, i_storages) if {
+    p_oci.Annotations["io.kubernetes.cri.container-type"] == "container"
+
+    p_image := p_oci.Annotations[CRI_IMAGE_NAME_KEY]
+    print("allow_guest_pull_image 1: p_image =", p_image)
+    i_oci.Annotations[CRI_IMAGE_NAME_KEY] == p_image
+
+    i_pulls := [s | some s in i_storages; s.driver == "image_guest_pull"]
+    count(i_pulls) == 1
+    i_pulls[0].source == p_image
+    not guest_pull_is_sandbox(i_pulls[0])
+
+    print("allow_guest_pull_image 1: true")
+}
+allow_guest_pull_image(p_oci, i_oci, i_storages) if {
+    # The pause container: the agent unpacks the guest's own pause image when, and only when,
+    # the storage's metadata names a sandbox; otherwise it would pull the storage's source.
+    p_oci.Annotations["io.kubernetes.cri.container-type"] == "sandbox"
+
+    i_pulls := [s | some s in i_storages; s.driver == "image_guest_pull"]
+    count(i_pulls) == 1
+    guest_pull_is_sandbox(i_pulls[0])
+
+    print("allow_guest_pull_image 2: true")
+}
+
+# The agent's is_sandbox() over the image_guest_pull metadata.
+guest_pull_is_sandbox(i_storage) if {
+    some option in i_storage.driver_options
+    startswith(option, "image_guest_pull=")
+    volume := json.unmarshal(substring(option, count("image_guest_pull="), -1))
+    some key in ["io.kubernetes.cri.container-type", "io.kubernetes.cri-o.ContainerType"]
+    volume.metadata[key] == "sandbox"
 }
 
 allow_create_container_input if {
@@ -842,6 +885,7 @@ allow_process(p_process, i_process, s_name, s_namespace) if {
 
     allow_args(p_process, i_process, s_name)
     allow_process_common(p_process, i_process, s_name, s_namespace)
+    allow_env_complete(p_process, i_process)
     allow_caps(p_process.Capabilities, i_process.Capabilities)
     p_process.Terminal == i_process.Terminal
 
@@ -934,6 +978,23 @@ allow_arg(i, i_arg, p_process, s_name) if {
     p_arg3 == i_arg
 
     print("allow_arg 3: true")
+}
+
+# alpha: allow_env only checks that every variable set is one the policy allows, so without this
+# the host could unset any of them. Variables whose value the host supplies ($(host-name) and the
+# like) are left to allow_env.
+allow_env_complete(p_process, i_process) if {
+    every p_var in p_process.Env {
+        env_var_set(p_var, i_process.Env)
+    }
+}
+
+env_var_set(p_var, i_env) if {
+    contains(p_var, "$(")
+}
+env_var_set(p_var, i_env) if {
+    not contains(p_var, "$(")
+    p_var in i_env
 }
 
 # OCI process.Env field
@@ -1812,7 +1873,7 @@ policy_data := {
   "containers": [
     {
       "OCI": {
-        "Version": "1.3.0",
+        "Version": "1.1.0",
         "Process": {
           "Terminal": false,
           "User": {
@@ -1985,7 +2046,7 @@ policy_data := {
     },
     {
       "OCI": {
-        "Version": "1.3.0",
+        "Version": "1.1.0",
         "Process": {
           "Terminal": false,
           "User": {
@@ -2247,7 +2308,7 @@ policy_data := {
     },
     {
       "OCI": {
-        "Version": "1.3.0",
+        "Version": "1.1.0",
         "Process": {
           "Terminal": false,
           "User": {
@@ -2575,6 +2636,14 @@ policy_data := {
     "CreateContainerRequest": {
       "allow_env_regex": [
         "^HOSTNAME=$(dns_label)$",
+        "^KUBERNETES_PORT_$(ip_p)_TCP=tcp://$(ipv4_a):$(ip_p)$",
+        "^KUBERNETES_PORT_$(ip_p)_TCP_PROTO=tcp$",
+        "^KUBERNETES_PORT_$(ip_p)_TCP_PORT=$(ip_p)$",
+        "^KUBERNETES_PORT_$(ip_p)_TCP_ADDR=$(ipv4_a)$",
+        "^KUBERNETES_SERVICE_HOST=$(ipv4_a)$",
+        "^KUBERNETES_SERVICE_PORT=$(ip_p)$",
+        "^KUBERNETES_SERVICE_PORT_HTTPS=$(ip_p)$",
+        "^KUBERNETES_PORT=tcp://$(ipv4_a):$(ip_p)$",
         "^ALPHACOMPUTE_KMS_ENDPOINTS=https://[a-z0-9.-]{1,253}(:[0-9]{1,5})?(,https://[a-z0-9.-]{1,253}(:[0-9]{1,5})?){0,7}$"
       ]
     },

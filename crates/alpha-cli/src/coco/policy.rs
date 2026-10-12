@@ -24,25 +24,53 @@ pub const GENPOLICY_PATH: &str = "/opt/kata/bin/genpolicy";
 /// SHA-256 of that `genpolicy` binary; any other file at the path is refused before it runs.
 pub const GENPOLICY_SHA256: &str =
     "c32ad5371d0c348100edf76758ce56682b2868fb250b883d2c7f0a68c342aa59";
-/// genpolicy 4.1.0's `rules.rego` (from the same tarball), which every accepted policy starts
-/// with.
-pub const RULES: &str = include_str!("genpolicy/rules.rego");
-/// genpolicy 4.1.0's default `genpolicy-settings.json`; [`settings`] applies the baseline to it.
+/// genpolicy 4.1.0's `rules.rego` (from the same tarball), as released.
+#[cfg(test)]
+const UPSTREAM_RULES: &str = include_str!("genpolicy/rules.rego");
+/// The Alpha rules patch (`alpha-rules.patch`, byte for byte as in #82's
+/// `testdata/agent-policy/`, which holds its regression tests): the guest pulls exactly the image
+/// the policy names (`allow_guest_pull_image`), and every variable the policy lists is set
+/// (`allow_env_complete`).
+pub const RULES_PATCH: &str = include_str!("genpolicy/alpha-rules.patch");
+/// genpolicy 4.1.0's `rules.rego` with [`RULES_PATCH`] applied, which every accepted policy
+/// starts with.
+pub const RULES: &str = include_str!("genpolicy/alpha-rules.rego");
+/// genpolicy 4.1.0's default `genpolicy-settings.json`, as released.
 const UPSTREAM_SETTINGS: &str = include_str!("genpolicy/genpolicy-settings.json");
+/// The settings drop-ins genpolicy applies to its defaults (RFC 6902 patches, in name order):
+/// #82's Alpha baseline, byte for byte, and the KMS endpoints variable.
+pub const SETTINGS_DROP_INS: [(&str, &str); 2] = [
+    (
+        "30-alpha-baseline.json",
+        include_str!("genpolicy/genpolicy-settings.d/30-alpha-baseline.json"),
+    ),
+    (
+        "40-alpha-kms-endpoints.json",
+        include_str!("genpolicy/genpolicy-settings.d/40-alpha-kms-endpoints.json"),
+    ),
+];
 /// What genpolicy prints between the rules and the data.
 const DATA_PREFIX: &str = "\npolicy_data := ";
-/// The OCI runtime-spec version the policy expects in every container's bundle.
-// ponytail: G0 — containerd 2.3.x on the pinned stack; genpolicy's own drop-ins put containerd
-// 2.2.x at 1.3.0. A wrong value refuses every container (fails closed), it never admits one.
-pub const OCI_VERSION: &str = "1.3.0";
 /// `ALPHACOMPUTE_KMS_ENDPOINTS` comes from the namespace's `alpha-kms` ConfigMap, not the policy:
 /// the endpoints are only where to connect, since the runtime pins the KMS CA and Revisions. The
-/// policy admits the variable only as a list of `https://host[:port]`.
+/// policy admits the variable only as a list of `https://host[:port]` (the `40-` drop-in).
 pub const KMS_ENDPOINTS_ENV_REGEX: &str = "^ALPHACOMPUTE_KMS_ENDPOINTS=https://[a-z0-9.-]{1,253}(:[0-9]{1,5})?(,https://[a-z0-9.-]{1,253}(:[0-9]{1,5})?){0,7}$";
 /// The only environment variables the host may add to a container beyond those the policy
-/// lists: the pod's hostname (set by the runtime) and the KMS endpoints. Kubernetes service links
-/// and the cloud identity variables genpolicy admits by default are not among them.
-pub const ALLOWED_ENV_REGEX: [&str; 2] = ["^HOSTNAME=$(dns_label)$", KMS_ENDPOINTS_ENV_REGEX];
+/// lists: the pod's hostname, the API server's `KUBERNETES_*` (the baseline drop-in), and the KMS
+/// endpoints. Service links and the cloud identity variables genpolicy admits by default are not
+/// among them. A policy may admit fewer.
+pub const ALLOWED_ENV_REGEX: [&str; 10] = [
+    "^HOSTNAME=$(dns_label)$",
+    "^KUBERNETES_PORT_$(ip_p)_TCP=tcp://$(ipv4_a):$(ip_p)$",
+    "^KUBERNETES_PORT_$(ip_p)_TCP_PROTO=tcp$",
+    "^KUBERNETES_PORT_$(ip_p)_TCP_PORT=$(ip_p)$",
+    "^KUBERNETES_PORT_$(ip_p)_TCP_ADDR=$(ipv4_a)$",
+    "^KUBERNETES_SERVICE_HOST=$(ipv4_a)$",
+    "^KUBERNETES_SERVICE_PORT=$(ip_p)$",
+    "^KUBERNETES_SERVICE_PORT_HTTPS=$(ip_p)$",
+    "^KUBERNETES_PORT=tcp://$(ipv4_a):$(ip_p)$",
+    KMS_ENDPOINTS_ENV_REGEX,
+];
 /// Mounts genpolicy admits by default for a host-provided identity token; a confidential pod
 /// takes none.
 const TOKEN_MOUNTS: [&str; 2] = [
@@ -60,6 +88,11 @@ const REFUSED_REQUESTS: [&str; 5] = [
 /// The one place the host may copy files into the guest: the per-container shared files
 /// (resolv.conf, hosts, the downward-API init-data), each bound to one container's bundle.
 const COPY_FILE_PATHS: [&str; 1] = ["$(sfprefix)"];
+/// Rules the patch adds; a policy without them is genpolicy's unpatched rules.
+const PATCH_RULES: [&str; 2] = [
+    "\nallow_guest_pull_image(p_oci, i_oci, i_storages) if {\n",
+    "\nallow_env_complete(p_process, i_process) if {\n",
+];
 const IMAGE_ANNOTATION: &str = "io.kubernetes.cri.image-name";
 const NAME_ANNOTATION: &str = "io.kubernetes.cri.container-name";
 const TYPE_ANNOTATION: &str = "io.kubernetes.cri.container-type";
@@ -68,49 +101,16 @@ const MAX_GENPOLICY_BYTES: u64 = 64 << 20;
 /// genpolicy's own output stays under the init-data limit.
 const MAX_OUTPUT_BYTES: usize = alpha_core::coco::MAX_INITDATA_BYTES;
 
-/// genpolicy's settings with the baseline applied: no exec (not even for probes), no log or
-/// stdin streams, copies only under the shared-files prefix, no host-added environment beyond
-/// [`ALLOWED_ENV_REGEX`], no token mounts, guest pull. Every path changed must exist upstream,
-/// so a settings file of another shape is refused instead of half-applied.
-pub fn settings() -> Result<String, String> {
-    let mut s: Value =
-        serde_json::from_str(UPSTREAM_SETTINGS).map_err(|e| format!("genpolicy settings: {e}"))?;
-    let mut set = |pointer: &str, value: Value| {
-        let slot = s
-            .pointer_mut(pointer)
-            .ok_or_else(|| format!("genpolicy settings have no {pointer}"))?;
-        *slot = value;
-        Ok::<(), String>(())
-    };
-    set(
-        "/request_defaults/ExecProcessRequest",
-        json!({ "allowed_commands": [], "regex": [] }),
-    )?;
-    for request in REFUSED_REQUESTS {
-        set(&format!("/request_defaults/{request}"), json!(false))?;
-    }
-    set("/request_defaults/CopyFileRequest", json!(COPY_FILE_PATHS))?;
-    set(
-        "/request_defaults/CreateContainerRequest/allow_env_regex",
-        json!(ALLOWED_ENV_REGEX),
-    )?;
-    set("/cluster_config/guest_pull", json!(true))?;
-    set("/kata_config/oci_version", json!(OCI_VERSION))?;
-    let mounts = s
-        .pointer_mut("/other_container/Mounts")
-        .and_then(Value::as_array_mut)
-        .ok_or("genpolicy settings have no other_container.Mounts")?;
-    mounts.retain(|m| {
-        !m.get("destination")
-            .and_then(Value::as_str)
-            .is_some_and(|d| TOKEN_MOUNTS.contains(&d))
-    });
-    let destinations = s
-        .pointer_mut("/mount_destinations")
-        .and_then(Value::as_array_mut)
-        .ok_or("genpolicy settings have no mount_destinations")?;
-    destinations.retain(|d| !d.as_str().is_some_and(|d| TOKEN_MOUNTS.contains(&d)));
-    serde_json::to_string_pretty(&s).map_err(|e| e.to_string())
+/// genpolicy's settings directory, as (path, contents): its default `genpolicy-settings.json`
+/// and the drop-ins under `genpolicy-settings.d/`, which genpolicy applies itself.
+pub fn settings_files() -> Vec<(String, &'static str)> {
+    let mut files = vec![("genpolicy-settings.json".to_owned(), UPSTREAM_SETTINGS)];
+    files.extend(
+        SETTINGS_DROP_INS
+            .iter()
+            .map(|(name, text)| (format!("genpolicy-settings.d/{name}"), *text)),
+    );
+    files
 }
 
 /// One container the policy lets the host create, as the policy pins it.
@@ -137,7 +137,11 @@ pub fn verify(policy: &str) -> Result<Verified, String> {
         .strip_prefix(RULES)
         .and_then(|rest| rest.strip_prefix(DATA_PREFIX))
         .ok_or_else(|| {
-            bad("not genpolicy 4.1.0's rules.rego followed by policy_data; regenerate it with `alpha coco genpolicy-settings` and genpolicy 4.1.0 rather than editing the rules")
+            if PATCH_RULES.iter().any(|r| !policy.contains(r)) {
+                bad("its rules lack the Alpha rules patch (allow_guest_pull_image, allow_env_complete); regenerate it with the rules `alpha coco genpolicy-settings` writes")
+            } else {
+                bad("not genpolicy 4.1.0's rules.rego with the Alpha patch, followed by policy_data; regenerate it with `alpha coco genpolicy-settings` and genpolicy 4.1.0 rather than editing the rules")
+            }
         })?;
     let data = data.strip_suffix('\n').unwrap_or(data);
     let data = alpha_core::parse(data.as_bytes()).map_err(|e| bad(&format!("policy_data: {e}")))?;
@@ -159,9 +163,13 @@ pub fn verify(policy: &str) -> Result<Verified, String> {
             "CopyFileRequest allows paths outside the shared-files prefix",
         ));
     }
-    if *at("/request_defaults/CreateContainerRequest/allow_env_regex") != json!(ALLOWED_ENV_REGEX) {
+    let admitted_env = at("/request_defaults/CreateContainerRequest/allow_env_regex");
+    if !admitted_env.as_array().is_some_and(|list| {
+        list.iter()
+            .all(|r| r.as_str().is_some_and(|r| ALLOWED_ENV_REGEX.contains(&r)))
+    }) {
         return Err(bad(
-            "allow_env_regex admits host-provided environment variables beyond HOSTNAME and the KMS endpoints",
+            "allow_env_regex admits host-provided environment variables beyond HOSTNAME, KUBERNETES_* and the KMS endpoints",
         ));
     }
     if *at("/cluster_config/guest_pull") != json!(true) {
@@ -179,6 +187,16 @@ pub fn verify(policy: &str) -> Result<Verified, String> {
             return Err(bad(
                 "a container allows exec commands (an exec probe or hook)",
             ));
+        }
+        let token = container
+            .pointer("/OCI/Mounts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m.get("destination").and_then(Value::as_str))
+            .find(|d| TOKEN_MOUNTS.contains(d));
+        if let Some(token) = token {
+            return Err(bad(&format!("a container may mount the token at {token}")));
         }
         let annotation = |key: &str| {
             container
@@ -301,10 +319,11 @@ impl Genpolicy {
         };
         std::fs::create_dir(&settings_dir)
             .map_err(|e| failed(format!("{}: {e}", settings_dir.display())))?;
-        write(
-            &settings_dir.join("genpolicy-settings.json"),
-            &settings().map_err(failed)?,
-        )?;
+        std::fs::create_dir(settings_dir.join("genpolicy-settings.d"))
+            .map_err(|e| failed(format!("{}: {e}", settings_dir.display())))?;
+        for (path, text) in settings_files() {
+            write(&settings_dir.join(path), text)?;
+        }
         write(&dir.0.join("rules.rego"), RULES)?;
         write(&dir.0.join("resource.yaml"), resource_yaml)?;
         let run = tokio::process::Command::new(&self.path)
@@ -429,8 +448,62 @@ mod tests {
         )
     }
 
+    /// genpolicy's settings once it has applied the drop-ins (RFC 6902; the operations they use).
+    pub(crate) fn effective_settings() -> Value {
+        let mut s: Value = serde_json::from_str(UPSTREAM_SETTINGS).unwrap();
+        for (_, text) in SETTINGS_DROP_INS {
+            let ops: Vec<Value> = serde_json::from_str(text).unwrap();
+            for op in ops {
+                let path = op["path"].as_str().unwrap();
+                let (parent, last) = path.rsplit_once('/').unwrap();
+                match op["op"].as_str().unwrap() {
+                    "test" => assert_eq!(s.pointer(path).unwrap(), &op["value"], "{path}"),
+                    "replace" => *s.pointer_mut(path).unwrap() = op["value"].clone(),
+                    "remove" => {
+                        let list = s.pointer_mut(parent).unwrap().as_array_mut().unwrap();
+                        list.remove(last.parse().unwrap());
+                    }
+                    "add" if last == "-" => s
+                        .pointer_mut(parent)
+                        .unwrap()
+                        .as_array_mut()
+                        .unwrap()
+                        .push(op["value"].clone()),
+                    other => panic!("{other}"),
+                }
+            }
+        }
+        s
+    }
+
+    /// `patch` for a unified diff that only adds lines, as `alpha-rules.patch` does.
+    fn apply(original: &str, patch: &str) -> String {
+        let lines: Vec<&str> = original.split_inclusive('\n').collect();
+        let (mut out, mut at, mut in_hunk) = (String::new(), 0, false);
+        for line in patch.split_inclusive('\n') {
+            if let Some(header) = line.strip_prefix("@@ -") {
+                let start: usize = header.split([',', ' ']).next().unwrap().parse().unwrap();
+                while at + 1 < start {
+                    out.push_str(lines[at]);
+                    at += 1;
+                }
+                in_hunk = true;
+            } else if !in_hunk {
+                continue;
+            } else if let Some(added) = line.strip_prefix('+') {
+                out.push_str(added);
+            } else {
+                assert_eq!(lines[at], &line[1..], "context");
+                out.push_str(lines[at]);
+                at += 1;
+            }
+        }
+        lines[at..].iter().for_each(|l| out.push_str(l));
+        out
+    }
+
     pub(crate) fn data() -> Value {
-        let settings: Value = serde_json::from_str(&settings().unwrap()).unwrap();
+        let settings = effective_settings();
         let container = |kind: &str, name: &str, image: &str| {
             json!({
                 "OCI": {"Annotations": {
@@ -454,9 +527,22 @@ mod tests {
         // The tarball's files, so a vendored edit is a deliberate change to these digests.
         let sha = |s: &str| hex::encode(Sha256::digest(s.as_bytes()));
         assert_eq!(
-            sha(RULES),
+            sha(UPSTREAM_RULES),
             "a1ad4280a7d1db83649de18640fb30f08cc160fadd7f4360d1dde09977b090b7"
         );
+        // #82's files, byte for byte (its testdata/SHA256SUMS), and the patch applied.
+        assert_eq!(
+            sha(RULES_PATCH),
+            "970cf8d718ccb660c76c08cdcdafbffdc0a71e4638d1cd819bce9f28808a1e59"
+        );
+        assert_eq!(
+            sha(SETTINGS_DROP_INS[0].1),
+            "da88e7dec050a4f30407bf60c81c5ba37e93beff0f3350909cbc56a877bd4247"
+        );
+        assert_eq!(apply(UPSTREAM_RULES, RULES_PATCH), RULES);
+        for rule in PATCH_RULES {
+            assert!(RULES.contains(rule) && !UPSTREAM_RULES.contains(rule));
+        }
         assert_eq!(
             sha(UPSTREAM_SETTINGS),
             "46bf9ac5460393f626ff2ed6fa2501ec5a82893da57c06e5c53a8f8e50e9dfa0"
@@ -475,7 +561,7 @@ mod tests {
 
     #[test]
     fn settings_apply_the_baseline() {
-        let s: Value = serde_json::from_str(&settings().unwrap()).unwrap();
+        let s = effective_settings();
         let defaults = &s["request_defaults"];
         assert_eq!(
             defaults["ExecProcessRequest"]["allowed_commands"],
@@ -486,10 +572,9 @@ mod tests {
             defaults["CreateContainerRequest"]["allow_env_regex"],
             json!(ALLOWED_ENV_REGEX)
         );
-        assert_eq!(s["kata_config"]["oci_version"], json!(OCI_VERSION));
-        let text = s.to_string();
+        let mounts = s["other_container"]["Mounts"].to_string();
         for token in TOKEN_MOUNTS {
-            assert!(!text.contains(token), "{token}");
+            assert!(!mounts.contains(token), "{token}");
         }
         // Everything else is genpolicy's default.
         let upstream: Value = serde_json::from_str(UPSTREAM_SETTINGS).unwrap();
@@ -508,7 +593,7 @@ mod tests {
     #[test]
     fn verify_refuses_every_loosening() {
         type Change = fn(&mut Value);
-        let cases: [(&str, Change); 11] = [
+        let cases: [(&str, Change); 12] = [
             ("ExecProcessRequest", |d| {
                 d["request_defaults"]["ExecProcessRequest"]["allowed_commands"] = json!([["sh"]])
             }),
@@ -547,6 +632,13 @@ mod tests {
             ("no container", |d| {
                 d["containers"].as_array_mut().unwrap().truncate(1);
             }),
+            (
+                "token",
+                |d| {
+                    d["containers"][1]["OCI"]["Mounts"] =
+                        json!([{ "destination": "/var/run/secrets/kubernetes.io/serviceaccount" }])
+                },
+            ),
         ];
         for (why, change) in cases {
             let mut d = data();
@@ -562,6 +654,13 @@ mod tests {
             1,
         );
         assert!(verify(&edited).unwrap_err().contains("rules.rego"));
+        // genpolicy's own rules, without the Alpha patch.
+        let unpatched = good.replacen(RULES, UPSTREAM_RULES, 1);
+        assert!(
+            verify(&unpatched)
+                .unwrap_err()
+                .contains("Alpha rules patch")
+        );
         assert!(verify(&format!("{good}\nExecProcessRequest := true\n")).is_err());
         let duplicate = good.replacen(
             "\"containers\": [",
@@ -569,6 +668,22 @@ mod tests {
             1,
         );
         assert!(verify(&duplicate).is_err());
+    }
+
+    /// #82's fixtures (`testdata/agent-policy/*/policy.rego` on `prd02/13-malicious-host-full`),
+    /// when `ALPHA_TEST_AGENT_POLICY` names a directory holding them: real genpolicy output under
+    /// the same baseline, which `verify` accepts.
+    #[test]
+    fn verify_accepts_the_malicious_host_suites_policies() {
+        let Some(dir) = std::env::var_os("ALPHA_TEST_AGENT_POLICY") else {
+            return;
+        };
+        for pod in ["cpu-app", "gpu-model-server"] {
+            let text =
+                std::fs::read_to_string(PathBuf::from(&dir).join(pod).join("policy.rego")).unwrap();
+            let verified = verify(&text).unwrap_or_else(|e| panic!("{pod}: {e}"));
+            assert!(!verified.containers.is_empty());
+        }
     }
 
     #[test]
