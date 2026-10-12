@@ -95,7 +95,7 @@ test("the view refuses unless the platform document lets this portal frame it", 
 });
 
 // Firefox has no location.ancestorOrigins: the host's frame-ancestors is then the only check
-// (QUESTION(PRD-03 Q17)), and the view runs.
+// (QUESTION(PRD-03 Q78)), and the view runs.
 test("without ancestorOrigins the view relies on frame-ancestors", async () => {
   const { page } = await embedPage({ ancestorOrigins: undefined });
   await page.startEmbed(TICKET, embedView());
