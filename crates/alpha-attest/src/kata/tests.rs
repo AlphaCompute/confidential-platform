@@ -225,6 +225,7 @@ fn doc() -> PlatformDocument {
             nras_keys: Default::default(),
             nras_cc_mode: None,
         }),
+        pccs_url: None,
     }
 }
 

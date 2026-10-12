@@ -103,7 +103,8 @@ the platform-document URL are served; the signed document lists the Revision.
    URLs, `https://<app id>-8443s.<gateway base>`, so provision the second CVM first to learn its
    app id: the values are not measured, but a later env update rewrites the stored
    `allowed_envs` and changes what the CVM measures, see "Deploying the dev node"),
-   `ALPHACOMPUTE_PCCS_URL`, `ALPHACOMPUTE_PLATFORM_DOCUMENT_URL`, and after the commit check that
+   `ALPHACOMPUTE_PCCS_URL` (read only while the platform document names no `pccs_url`),
+   `ALPHACOMPUTE_PLATFORM_DOCUMENT_URL`, and after the commit check that
    the stored compose still hashes to `manifest.json`'s `compose_hash`. The node comes up
    `sealed`: `GET /ready` answers 503 `{"sealed": true}`.
 3. **Bootstrap** on the first node: `alpha bootstrap --custodians c1.pub c2.pub c3.pub

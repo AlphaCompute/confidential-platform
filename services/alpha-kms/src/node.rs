@@ -313,7 +313,7 @@ async fn join_inner(
             alpha_attest::node::appraise_kata_node(evidence, verified, &nonce, spki, xwing, &doc)?
         }
         (evidence, None) => {
-            let collateral = collateral(node, evidence.quote()).await?;
+            let collateral = collateral(node, &doc, evidence.quote()).await?;
             alpha_attest::node::appraise_node(
                 evidence,
                 &nonce,
