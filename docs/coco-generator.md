@@ -51,15 +51,18 @@ All services share the pod's network namespace. They reach each other at `127.0.
 
 ### Agent policy
 
-wrap runs genpolicy 4.1.0 on exactly the pod spec it prints, wrapped in the Deployment the adapter creates (`app-<App id>` in namespace `app-<App id>`; genpolicy pins the sandbox's name and namespace to it). Three things are left out of genpolicy's input: `automountServiceAccountToken` and `enableServiceLinks`, which genpolicy 4.1.0 does not take and which only take things away, and the KMS endpoints variable, which the policy admits by pattern.
+wrap runs genpolicy 4.1.0 on exactly the pod spec it prints, wrapped in the Deployment the adapter creates (`app-<App id>` in namespace `app-<App id>`; genpolicy pins the sandbox's name and namespace to it). Some things are left out of genpolicy's input. `automountServiceAccountToken`, `enableServiceLinks` and a claim's `readOnly` are fields genpolicy 4.1.0 refuses. The emitted pod spec still sets `automountServiceAccountToken: false`, and the settings admit no token mount. The KMS endpoints variable is also left out, because the policy admits it by pattern.
 
 - **Binary.** genpolicy is `/opt/kata/bin/genpolicy` from kata-containers 4.1.0's `kata-tools-static-4.1.0-amd64.tar.zst` (sha256 `58fd1660…8f30`). Its own sha256 (`c32ad537…aa59`, `coco::policy::GENPOLICY_SHA256`) is checked before every run, and any other file there is refused. It runs in a fresh directory with an empty environment and a 100-second limit. It needs the network: it downloads every image layer to read `/etc/passwd` and `/etc/group`, and it reads the pause image's configuration from `mcr.microsoft.com`. A large image therefore takes a large share of the two minutes.
-- **Rules and settings.** The rules are genpolicy 4.1.0's `rules.rego`, vendored byte for byte (`crates/alpha-cli/src/coco/genpolicy/`). The settings are its `genpolicy-settings.json` with the baseline applied by `coco::policy::settings()`. `alpha coco genpolicy-settings --out <dir>` writes both, for running genpolicy by hand.
+- **Rules and settings: the Alpha baseline of #82.** The files live in `crates/alpha-cli/src/coco/genpolicy/`. #82's `testdata/agent-policy/` holds the regression tests that evaluate them with regorus against a hostile host.
+  - **Rules.** genpolicy 4.1.0's `rules.rego` with `alpha-rules.patch` applied (`alpha-rules.rego`). The patch is vendored byte for byte from #82, and a test applies it again and compares. It adds `allow_guest_pull_image`: the guest pulls exactly the image the policy names, and the pause container comes from the guest image. It also adds `allow_env_complete`: every variable the policy lists is set. Stock genpolicy 4.1.0 checks neither, so a host could otherwise run another image under the same policy or unset a variable.
+  - **Settings.** genpolicy's default `genpolicy-settings.json` plus drop-ins that genpolicy applies itself. `30-alpha-baseline.json` is #82's, byte for byte. `40-alpha-kms-endpoints.json` is ours and adds only the KMS endpoints pattern.
+  - `alpha coco genpolicy-settings --out <dir>` writes the settings directory and the patched rules, for running genpolicy by hand.
 - **Guest-pulled users.** With guest pull, genpolicy refuses a container whose user or groups come from the image, because containerd might not reproduce them. wrap then sets exactly the values genpolicy names and runs it again: the container's `runAsUser` and `runAsGroup`, and the image's supplementary groups as the pod's `supplementalGroups`. These are the image's own values, so the container runs as it would have, and the policy now pins them. Kubernetes has no per-container supplementary groups, so the groups apply to every container in the pod.
 
 ### The baseline (PRD-02 P0)
 
-`coco::policy::verify` accepts a policy only as genpolicy 4.1.0's rules followed by `policy_data`. Nothing may follow the data, and the rules' own defaults refuse every request the data does not allow. The data must:
+`coco::policy::verify` accepts a policy only as the patched rules above followed by `policy_data`. A policy with genpolicy's unpatched rules is refused by name. Nothing may follow the data, and the rules' own defaults refuse every request the data does not allow. The data must:
 
 | Request | Baseline |
 |---|---|
@@ -68,15 +71,14 @@ wrap runs genpolicy 4.1.0 on exactly the pod spec it prints, wrapped in the Depl
 | `GetDiagnosticDataRequest`, `UpdateEphemeralMountsRequest` | refused |
 | `CopyFileRequest` | only `$(sfprefix)`, the per-container shared files (hosts, resolv.conf, the downward-API init-data) |
 | `CreateContainerRequest` | only the listed containers, each by image digest (`io.kubernetes.cri.image-name`) with its command, environment and mounts as genpolicy pinned them, and images pulled in the guest (`guest_pull`) |
-| host-added environment | only `HOSTNAME` and `ALPHACOMPUTE_KMS_ENDPOINTS` (as above). Service links and cloud-identity variables are refused |
-| token mounts | none: the service-account and Azure token mounts are removed from the settings |
+| host-added environment | only `HOSTNAME`, the API server's `KUBERNETES_*` and `ALPHACOMPUTE_KMS_ENDPOINTS` (as above), or fewer. Service links, `AZURE_*` and `TERM` are refused. The patched rules also refuse a container that lacks any variable the policy lists |
+| token mounts | none: no container in the policy mounts the service-account or Azure token |
 
 wrap also requires that the policy admits exactly the pod's containers and images. `render --policy` holds its input to the same baseline, and requires that the policy admits exactly the containers and images of the rendered spec's pod templates. A policy that edits the rules, or whose data loosens any line above, is refused. It is never repaired.
 
 Known limits, for the security review:
 
-- genpolicy's rules check that a container's environment is a subset of the policy's (`allow_env`). A host can therefore leave a listed variable out, but it cannot add or change one. A service should refuse to start without the configuration it needs.
-- `kata_config.oci_version` is set to 1.3.0 (*ponytail*, G0: confirm on containerd 2.3.x). A wrong value refuses every container, so it fails closed.
+- `kata_config.oci_version` stays genpolicy's 1.1.0, as in #82's fixtures (*ponytail*, G0: confirm on containerd 2.3.x). A wrong value refuses every container, so it fails closed.
 
 ## `alpha coco render`
 
