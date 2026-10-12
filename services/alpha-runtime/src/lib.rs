@@ -309,6 +309,21 @@ pub fn tsm_evidence() -> EvidenceSource {
 /// for a Kata confidential pod. The agent policy pins it with the rest of the container's env.
 pub const QUOTE_SOURCE_ENV: &str = "ALPHACOMPUTE_QUOTE_SOURCE";
 
+/// PRD-06 I1 on a Kata pod: the host writes the pod's environment, so a customer DSM declared in
+/// [`alpha_core::coco::policy::DSM_ENV`] counts only if the init-data's agent policy pins that
+/// exact value. Checked against the init-data this runtime attests with: a host that hands it
+/// other init-data gets no leaf, and without a leaf no DSM session.
+pub fn check_coco_dsm(initdata: &[u8], dsm: Option<&str>) -> Result<(), Error> {
+    let Some(value) = dsm else {
+        return Ok(());
+    };
+    let refused = |m: String| Error::Config(m);
+    let init = alpha_core::coco::InitData::parse(initdata)
+        .map_err(|e| refused(format!("init-data: {e}")))?;
+    let policy = init.policy().map_err(|e| refused(e.to_string()))?;
+    alpha_core::coco::policy::dsm_pinned(policy, value).map_err(refused)
+}
+
 /// When the Endpoint's TLS listener opens.
 pub enum Tls {
     /// No upstream: no listener.
@@ -848,6 +863,54 @@ package agent_policy
         // No TSM tree here: the source fails at the pod rather than sending something partial.
         assert!((coco.evidence)(&[0; 64]).is_err());
         assert!(coco_identity(source, b"not toml".to_vec()).is_err());
+    }
+
+    #[test]
+    fn a_kata_pod_uses_a_dsm_only_as_its_measured_policy_pins_it() {
+        use alpha_core::coco::policy::{DSM_ENV, RULES};
+        let dsm = r#"{"binding":"app","endpoint":"https://dsm.example"}"#;
+        // The baseline's request defaults, and one container that lists `env`.
+        let initdata = |env: &str| {
+            let data = serde_json::json!({
+                "containers": [{
+                    "OCI": {
+                        "Annotations": {
+                            "io.kubernetes.cri.container-type": "container",
+                            "io.kubernetes.cri.container-name": "alpha-runtime",
+                            "io.kubernetes.cri.image-name": format!("r@sha256:{}", "ab".repeat(32)),
+                        },
+                        "Process": { "Env": [env] },
+                    },
+                    "exec_commands": [],
+                }],
+                "request_defaults": {
+                    "ExecProcessRequest": { "allowed_commands": [], "regex": [] },
+                    "CopyFileRequest": alpha_core::coco::policy::COPY_FILE_PATHS,
+                    "CreateContainerRequest": {
+                        "allow_env_regex": alpha_core::coco::policy::ALLOWED_ENV_REGEX,
+                    },
+                    "ReadStreamRequest": false, "WriteStreamRequest": false,
+                    "CloseStdinRequest": false, "GetDiagnosticDataRequest": false,
+                    "UpdateEphemeralMountsRequest": false,
+                },
+                "cluster_config": { "guest_pull": true },
+            });
+            INITDATA.replace(
+                "package agent_policy\n",
+                &format!("{RULES}\npolicy_data := {data:#}\n"),
+            )
+        };
+        let pinned = initdata(&format!("{DSM_ENV}={dsm}"));
+        check_coco_dsm(pinned.as_bytes(), Some(dsm)).unwrap();
+        check_coco_dsm(pinned.as_bytes(), None).unwrap();
+        let unpinned = initdata("PATH=/bin");
+        check_coco_dsm(unpinned.as_bytes(), None).unwrap();
+        let error = check_coco_dsm(unpinned.as_bytes(), Some(dsm))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not pin"), "{error}");
+        let other = dsm.replace("dsm.example", "attacker.example");
+        assert!(check_coco_dsm(pinned.as_bytes(), Some(&other)).is_err());
     }
 
     #[test]

@@ -62,6 +62,12 @@ async fn run() -> Result<Exit, Error> {
         alpha_runtime::Guest::Coco(source) => {
             let initdata = alpha_tsm::coco::initdata(Path::new(alpha_tsm::coco::INITDATA_PATH))
                 .map_err(|e| Error::Evidence(format!("init-data: {e}")))?;
+            alpha_runtime::check_coco_dsm(
+                &initdata,
+                std::env::var(alpha_core::coco::policy::DSM_ENV)
+                    .ok()
+                    .as_deref(),
+            )?;
             let coco = alpha_runtime::coco_identity(source, initdata)?;
             (coco.revision, coco.evidence, Some(coco.initdata))
         }

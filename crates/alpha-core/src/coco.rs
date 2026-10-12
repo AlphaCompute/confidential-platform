@@ -9,6 +9,8 @@
 //! looks its hash up exactly as it looks up a compose hash today: same `revisions` table, same
 //! signature, same leaf SAN.
 
+pub mod policy;
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};

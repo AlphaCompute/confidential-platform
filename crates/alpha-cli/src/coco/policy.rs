@@ -14,6 +14,12 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+pub use alpha_core::coco::policy::{
+    ALLOWED_ENV_REGEX, COPY_FILE_PATHS, DSM_ENV, KMS_ENDPOINTS_ENV_REGEX, PolicyContainer,
+    REFUSED_REQUESTS, RULES, Verified, dsm_pinned, verify,
+};
+#[cfg(test)]
+use alpha_core::coco::policy::{DATA_PREFIX, IMAGE_ANNOTATION, NAME_ANNOTATION, TYPE_ANNOTATION};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -24,45 +30,18 @@ pub const GENPOLICY_PATH: &str = "/opt/kata/bin/genpolicy";
 /// SHA-256 of that `genpolicy` binary; any other file at the path is refused before it runs.
 pub const GENPOLICY_SHA256: &str =
     "c32ad5371d0c348100edf76758ce56682b2868fb250b883d2c7f0a68c342aa59";
-/// genpolicy 4.1.0's `rules.rego` (from the same tarball), which every accepted policy starts
-/// with.
-pub const RULES: &str = include_str!("genpolicy/rules.rego");
 /// genpolicy 4.1.0's default `genpolicy-settings.json`; [`settings`] applies the baseline to it.
 const UPSTREAM_SETTINGS: &str = include_str!("genpolicy/genpolicy-settings.json");
-/// What genpolicy prints between the rules and the data.
-const DATA_PREFIX: &str = "\npolicy_data := ";
 /// The OCI runtime-spec version the policy expects in every container's bundle.
 // ponytail: G0 — containerd 2.3.x on the pinned stack; genpolicy's own drop-ins put containerd
 // 2.2.x at 1.3.0. A wrong value refuses every container (fails closed), it never admits one.
 pub const OCI_VERSION: &str = "1.3.0";
-/// `ALPHACOMPUTE_KMS_ENDPOINTS` comes from the namespace's `alpha-kms` ConfigMap, not the policy:
-/// the endpoints are only where to connect, since the runtime pins the KMS CA and Revisions. The
-/// policy admits the variable only as a list of `https://host[:port]`.
-pub const KMS_ENDPOINTS_ENV_REGEX: &str = "^ALPHACOMPUTE_KMS_ENDPOINTS=https://[a-z0-9.-]{1,253}(:[0-9]{1,5})?(,https://[a-z0-9.-]{1,253}(:[0-9]{1,5})?){0,7}$";
-/// The only environment variables the host may add to a container beyond those the policy
-/// lists: the pod's hostname (set by the runtime) and the KMS endpoints. Kubernetes service links
-/// and the cloud identity variables genpolicy admits by default are not among them.
-pub const ALLOWED_ENV_REGEX: [&str; 2] = ["^HOSTNAME=$(dns_label)$", KMS_ENDPOINTS_ENV_REGEX];
 /// Mounts genpolicy admits by default for a host-provided identity token; a confidential pod
 /// takes none.
 const TOKEN_MOUNTS: [&str; 2] = [
     "/var/run/secrets/kubernetes.io/serviceaccount",
     "/var/run/secrets/azure/tokens",
 ];
-/// Requests the baseline refuses outright (logs, stdin, diagnostics, remounts).
-const REFUSED_REQUESTS: [&str; 5] = [
-    "ReadStreamRequest",
-    "WriteStreamRequest",
-    "CloseStdinRequest",
-    "GetDiagnosticDataRequest",
-    "UpdateEphemeralMountsRequest",
-];
-/// The one place the host may copy files into the guest: the per-container shared files
-/// (resolv.conf, hosts, the downward-API init-data), each bound to one container's bundle.
-const COPY_FILE_PATHS: [&str; 1] = ["$(sfprefix)"];
-const IMAGE_ANNOTATION: &str = "io.kubernetes.cri.image-name";
-const NAME_ANNOTATION: &str = "io.kubernetes.cri.container-name";
-const TYPE_ANNOTATION: &str = "io.kubernetes.cri.container-type";
 /// genpolicy reads the binary at most this large.
 const MAX_GENPOLICY_BYTES: u64 = 64 << 20;
 /// genpolicy's own output stays under the init-data limit.
@@ -111,115 +90,6 @@ pub fn settings() -> Result<String, String> {
         .ok_or("genpolicy settings have no mount_destinations")?;
     destinations.retain(|d| !d.as_str().is_some_and(|d| TOKEN_MOUNTS.contains(&d)));
     serde_json::to_string_pretty(&s).map_err(|e| e.to_string())
-}
-
-/// One container the policy lets the host create, as the policy pins it.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PolicyContainer {
-    pub name: String,
-    pub image: String,
-}
-
-/// A policy that holds the baseline, and the containers it admits (the sandbox's pause
-/// container left out).
-#[derive(Debug)]
-pub struct Verified {
-    pub containers: BTreeSet<PolicyContainer>,
-    /// `policy_data`, parsed, for checks that belong to one caller.
-    pub data: Value,
-}
-
-/// Accepts `policy` only as genpolicy 4.1.0's rules followed by `policy_data` that holds the
-/// baseline; a single trailing newline, which an editor adds, is allowed.
-pub fn verify(policy: &str) -> Result<Verified, String> {
-    let bad = |m: &str| format!("agent policy: {m}");
-    let data = policy
-        .strip_prefix(RULES)
-        .and_then(|rest| rest.strip_prefix(DATA_PREFIX))
-        .ok_or_else(|| {
-            bad("not genpolicy 4.1.0's rules.rego followed by policy_data; regenerate it with `alpha coco genpolicy-settings` and genpolicy 4.1.0 rather than editing the rules")
-        })?;
-    let data = data.strip_suffix('\n').unwrap_or(data);
-    let data = alpha_core::parse(data.as_bytes()).map_err(|e| bad(&format!("policy_data: {e}")))?;
-    let at = |pointer: &str| data.pointer(pointer).unwrap_or(&Value::Null);
-
-    if *at("/request_defaults/ExecProcessRequest") != json!({ "allowed_commands": [], "regex": [] })
-    {
-        return Err(bad(
-            "ExecProcessRequest allows commands; exec must be refused",
-        ));
-    }
-    for request in REFUSED_REQUESTS {
-        if *at(&format!("/request_defaults/{request}")) != json!(false) {
-            return Err(bad(&format!("{request} is not refused")));
-        }
-    }
-    if *at("/request_defaults/CopyFileRequest") != json!(COPY_FILE_PATHS) {
-        return Err(bad(
-            "CopyFileRequest allows paths outside the shared-files prefix",
-        ));
-    }
-    if *at("/request_defaults/CreateContainerRequest/allow_env_regex") != json!(ALLOWED_ENV_REGEX) {
-        return Err(bad(
-            "allow_env_regex admits host-provided environment variables beyond HOSTNAME and the KMS endpoints",
-        ));
-    }
-    if *at("/cluster_config/guest_pull") != json!(true) {
-        return Err(bad(
-            "images are not pulled in the guest, so their digests would not bind the root filesystems",
-        ));
-    }
-    let containers = at("/containers")
-        .as_array()
-        .ok_or_else(|| bad("policy_data has no containers"))?;
-    let mut admitted = BTreeSet::new();
-    for container in containers {
-        let commands = container.get("exec_commands").unwrap_or(&Value::Null);
-        if !commands.as_array().is_some_and(Vec::is_empty) {
-            return Err(bad(
-                "a container allows exec commands (an exec probe or hook)",
-            ));
-        }
-        let annotation = |key: &str| {
-            container
-                .pointer(&format!("/OCI/Annotations/{}", key.replace('/', "~1")))
-                .and_then(Value::as_str)
-        };
-        if annotation(TYPE_ANNOTATION) == Some("sandbox") {
-            continue;
-        }
-        let name =
-            annotation(NAME_ANNOTATION).ok_or_else(|| bad("a container has no name annotation"))?;
-        let image = annotation(IMAGE_ANNOTATION)
-            .ok_or_else(|| bad(&format!("container {name} has no image annotation")))?;
-        if !pinned(image) {
-            return Err(bad(&format!(
-                "container {name}'s image {image} is not pinned by digest"
-            )));
-        }
-        if !admitted.insert(PolicyContainer {
-            name: name.to_owned(),
-            image: image.to_owned(),
-        }) {
-            return Err(bad(&format!("container {name} is listed twice")));
-        }
-    }
-    if admitted.is_empty() {
-        return Err(bad("admits no container"));
-    }
-    Ok(Verified {
-        containers: admitted,
-        data,
-    })
-}
-
-fn pinned(image: &str) -> bool {
-    image.split_once('@').is_some_and(|(name, digest)| {
-        !name.is_empty()
-            && digest
-                .strip_prefix("sha256:")
-                .is_some_and(|hex| alpha_core::hex_bytes::<32>(hex).is_some())
-    })
 }
 
 /// Why genpolicy did not produce a policy.
@@ -405,12 +275,20 @@ impl Drop for TempDir {
 /// genpolicy prints, for tests that need one without running genpolicy.
 #[cfg(test)]
 pub(crate) fn test_policy(containers: &[(&str, &str)]) -> String {
+    let with_env: Vec<_> = containers.iter().map(|(n, i)| (*n, *i, &[][..])).collect();
+    test_policy_env(&with_env)
+}
+
+/// As [`test_policy`], each container also listing an environment.
+#[cfg(test)]
+pub(crate) fn test_policy_env(containers: &[(&str, &str, &[&str])]) -> String {
     let mut data = tests::data();
     let mut list = vec![data["containers"][0].clone()];
-    for (name, image) in containers {
+    for (name, image, env) in containers {
         let mut c = data["containers"][1].clone();
         c["OCI"]["Annotations"][NAME_ANNOTATION] = json!(name);
         c["OCI"]["Annotations"][IMAGE_ANNOTATION] = json!(image);
+        c["OCI"]["Process"] = json!({ "Env": env });
         list.push(c);
     }
     data["containers"] = json!(list);

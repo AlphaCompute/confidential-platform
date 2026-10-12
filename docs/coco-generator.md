@@ -78,6 +78,16 @@ Known limits, for the security review:
 - genpolicy's rules check that a container's environment is a subset of the policy's (`allow_env`). A host can therefore leave a listed variable out, but it cannot add or change one. A service should refuse to start without the configuration it needs.
 - `kata_config.oci_version` is set to 1.3.0 (*ponytail*, G0: confirm on containerd 2.3.x). A wrong value refuses every container, so it fails closed.
 
+### Customer DSM declarations (PRD-06 I1)
+
+A Kata Instance declares a customer's Fortanix DSM the same way as the compose path: through `ALPHACOMPUTE_DSM` on `alpha-runtime` (#72, `alpha_dsm::DsmConfig`). On Kata the host writes the pod's environment, so the declaration counts only as the agent policy pins it. Three places enforce this:
+
+- **The policy.** Under the baseline, `allow_env_regex` admits nothing but `HOSTNAME` and the KMS endpoints. A host can neither add `ALPHACOMPUTE_DSM` to a container nor change it. All it can do is drop a declared one, which takes the customer's keys away (denial of service) and releases nothing.
+- **The generators.** `render` takes a DSM only as a literal `value` of `ALPHACOMPUTE_DSM` on the `alpha-runtime` container, with a `binding` of `revision` or `app`. It refuses `valueFrom`, `envFrom` on the runtime, and the variable on any other container. The policy must pin exactly the values the spec declares, and none when it declares none. `wrap` has no DSM input yet, so it refuses a compose that sets the variable, and it requires a policy that pins none.
+- **The runtime.** In a pod, `alpha-runtime` refuses to start when `ALPHACOMPUTE_DSM` is set unless the init-data it attests with holds a baseline policy that lists exactly that value, with no genpolicy placeholder (`alpha_core::coco::policy::dsm_pinned`). A host that hands it other init-data gets no leaf, because the KMS checks the init-data against `MRCONFIGID`, and without a leaf the DSM opens no session. So the check holds even for a Revision whose policy was not made by these tools.
+
+No KMS-side check is needed. The KMS never sees the DSM declaration, and the DSM authenticates the leaf, whose Revision already binds the measured policy.
+
 ## `alpha coco render`
 
 ```
