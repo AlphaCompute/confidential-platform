@@ -36,8 +36,8 @@ uuid = "1"
 zeroize = "1"
 
 [features]
-# Expose verify_kata_node as `pub` for cross-crate integration tests.
-# Never enable in production. Enabled transitively by alpha-kms's test-seams feature.
+# Adds `node::verify_kata_node`, the DCAP-bypass seam alpha-kms's Kata node tests use. alpha-kms
+# turns it on through its dev-dependency on this crate; production builds never have it.
 test-seams = []
 
 [dev-dependencies]
