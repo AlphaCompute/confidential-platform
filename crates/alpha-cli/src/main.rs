@@ -10,6 +10,7 @@ use alpha_cli::deploy::{Shroud, wrap};
 use alpha_cli::keyfile::{self, Algorithm};
 use alpha_cli::request::Call;
 use alpha_cli::{instances, node, sign};
+mod coco;
 use alpha_client::platform::SignedDocument;
 use alpha_client::{Client, Pin};
 use alpha_core::{AppId, KeyId, OrgId, PrincipalId};
@@ -203,6 +204,38 @@ enum Command {
         #[arg(long)]
         endpoint: String,
     },
+    /// CoCo Kubernetes pod-spec rendering (init-data, Kata annotation, Revision v2).
+    Coco {
+        #[command(subcommand)]
+        command: CocoCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CocoCommand {
+    /// Render a CoCo pod-spec template with init-data and the Revision v2, or prepare it for
+    /// genpolicy. Prints the rendered manifest to stdout; revision info to stderr.
+    ///
+    /// Workflow:
+    ///   1. alpha coco render --spec pod.yaml --for-genpolicy --env cluster.env > for_genpolicy.yaml
+    ///   2. Run genpolicy 4.1.0 on for_genpolicy.yaml → policy.rego; review and tighten the policy.
+    ///   3. alpha coco render --spec pod.yaml --policy policy.rego --env cluster.env
+    Render {
+        /// The YAML spec template (`${VARIABLE}` placeholders filled from --env files).
+        #[arg(long)]
+        spec: PathBuf,
+        /// The reviewed agent policy (genpolicy 4.1.0 output with exec and log-read rules removed).
+        /// Required unless --for-genpolicy is set.
+        #[arg(long, conflicts_with = "for_genpolicy")]
+        policy: Option<PathBuf>,
+        /// Render with an empty CC_INIT_DATA annotation for genpolicy input (no policy needed).
+        #[arg(long)]
+        for_genpolicy: bool,
+        /// KEY=VALUE files (# comments; values must not contain \" \' ` \\ $ or newlines).
+        /// APP_ID (lower-case UUID) and, when the spec requests GPUs, GPU_MODEL must be set.
+        #[arg(long = "env", value_name = "FILE")]
+        env_files: Vec<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -281,6 +314,8 @@ enum Exit {
     Usage(String),
     /// Printed like a success, but some part of it failed.
     Partial(Value),
+    /// The command wrote its own output; the main loop prints nothing.
+    Silent,
 }
 
 impl From<String> for Exit {
@@ -642,6 +677,44 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                     .await?,
             )
         }
+        Command::Coco {
+            command:
+                CocoCommand::Render {
+                    spec,
+                    policy,
+                    for_genpolicy,
+                    env_files,
+                },
+        } => {
+            let template = fs::read_to_string(&spec)
+                .map_err(|e| Exit::Usage(format!("{}: {e}", spec.display())))?;
+            let paths: Vec<&Path> = env_files.iter().map(PathBuf::as_path).collect();
+            let env =
+                coco::read_env_files(&paths).map_err(|e| Exit::Refused(e))?;
+
+            if for_genpolicy {
+                let out = coco::render_for_genpolicy(&template, &env)
+                    .map_err(|e| Exit::Refused(e))?;
+                print!("{out}");
+                return Err(Exit::Silent);
+            }
+
+            let policy_path =
+                policy.ok_or_else(|| Exit::Usage("--policy is required unless --for-genpolicy is set".into()))?;
+            let policy_text = fs::read_to_string(&policy_path)
+                .map_err(|e| Exit::Usage(format!("{}: {e}", policy_path.display())))?;
+
+            let out = coco::render(&template, &policy_text, &env)
+                .map_err(|e| Exit::Refused(e))?;
+            print!("{}", out.manifest);
+            eprintln!(
+                "init-data {}, policy {}",
+                out.revision.initdata_sha256, out.revision.policy_sha256
+            );
+            eprintln!("revision {}", out.revision_canonical);
+            eprintln!("revision hash {}", out.revision_hash);
+            Err(Exit::Silent)
+        }
     }
 }
 
@@ -662,6 +735,7 @@ async fn main() {
             println!("{value:#}");
             std::process::exit(1);
         }
+        Err(Exit::Silent) => {}
     }
 }
 
