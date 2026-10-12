@@ -1,0 +1,16 @@
+[package]
+name = "alpha-volume"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+alpha-client = { path = "../../crates/alpha-client" }
+alpha-core = { path = "../../crates/alpha-core" }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+zeroize = "1"

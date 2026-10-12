@@ -19,6 +19,7 @@ alpha-client = { path = "../alpha-client" }
 alpha-core = { path = "../alpha-core" }
 alpha-crypto = { path = "../alpha-crypto" }
 base64 = "0.23"
+flate2 = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = { version = "3", features = ["pkcs8", "alloc"] }
@@ -31,11 +32,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
 sha2 = "0.11"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "process", "rt-multi-thread", "time"] }
 uuid = "1"
 zeroize = "1"
 
 [dev-dependencies]
+alpha-tsm = { path = "../alpha-tsm" }
 axum = { version = "0.8", default-features = false }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }

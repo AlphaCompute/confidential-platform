@@ -136,11 +136,13 @@ dependencies = [
  "alpha-client",
  "alpha-core",
  "alpha-crypto",
+ "alpha-tsm",
  "axum",
  "base64 0.23.1",
  "chrono",
  "clap",
  "ed25519-dalek 3.0.0",
+ "flate2",
  "getrandom 0.4.3",
  "hex",
  "rcgen",
@@ -363,6 +365,18 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "thiserror",
+]
+
+[[package]]
+name = "alpha-volume"
+version = "0.1.0"
+dependencies = [
+ "alpha-client",
+ "alpha-core",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]

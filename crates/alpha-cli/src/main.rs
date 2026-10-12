@@ -1,3 +1,13 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )
+)]
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::IsTerminal;
@@ -9,7 +19,7 @@ use alpha_cli::call::Route;
 use alpha_cli::deploy::{Shroud, wrap};
 use alpha_cli::keyfile::{self, Algorithm};
 use alpha_cli::request::Call;
-use alpha_cli::{custodians, instances, node, sign};
+use alpha_cli::{coco, custodians, instances, node, sign};
 use alpha_client::platform::SignedDocument;
 use alpha_client::{Client, Pin};
 use alpha_core::{AppId, KeyId, OrgId, PrincipalId};
@@ -209,6 +219,78 @@ enum Command {
         #[command(subcommand)]
         command: CustodiansCommand,
     },
+    /// CoCo Kubernetes pod-spec rendering (init-data, Kata annotation, Revision v2).
+    Coco {
+        #[command(subcommand)]
+        command: CocoCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CocoCommand {
+    /// Render a CoCo pod-spec template with init-data and the Revision v2, or prepare it for
+    /// genpolicy. Prints the rendered manifest to stdout; revision info to stderr.
+    ///
+    /// Workflow:
+    ///   1. alpha coco render --spec pod.yaml --for-genpolicy --env cluster.env > for_genpolicy.yaml
+    ///   2. alpha coco genpolicy-settings --out gp; genpolicy -y for_genpolicy.yaml -p gp/rules.rego -j gp -r > policy.rego
+    ///   3. alpha coco render --spec pod.yaml --policy policy.rego --env cluster.env
+    Render {
+        /// The YAML spec template (`${VARIABLE}` placeholders filled from --env files).
+        #[arg(long)]
+        spec: PathBuf,
+        /// The agent policy genpolicy 4.1.0 printed under `genpolicy-settings`; refused unless it
+        /// holds the baseline and admits exactly the spec's containers. Required unless
+        /// --for-genpolicy is set.
+        #[arg(long, conflicts_with = "for_genpolicy")]
+        policy: Option<PathBuf>,
+        /// Render with an empty CC_INIT_DATA annotation for genpolicy input (no policy needed).
+        #[arg(long)]
+        for_genpolicy: bool,
+        /// KEY=VALUE files (# comments; values must not contain \" \' ` \\ $ or newlines).
+        /// APP_ID (lower-case UUID) and, when the spec requests GPUs, GPU_MODEL must be set.
+        #[arg(long = "env", value_name = "FILE")]
+        env_files: Vec<PathBuf>,
+        /// An encrypted persistent volume, `<name>:<size>:<container>:<mount path>`: adds its
+        /// block-mode claim, the alpha-volume init container and the container's mount.
+        #[arg(long = "volume", value_name = "VOLUME")]
+        volumes: Vec<String>,
+        /// The alpha-volume image, pinned by digest; required with --volume.
+        #[arg(long)]
+        volume_image: Option<String>,
+    },
+    /// A customer's docker-compose as one Kata confidential pod of a shape. Prints
+    /// `{revision, revision_hash, initdata, pod_spec, secrets}`; runs genpolicy 4.1.0 from
+    /// /opt/kata/bin/genpolicy (pinned by digest) for the agent policy.
+    Wrap {
+        #[arg(long)]
+        app_id: AppId,
+        /// The signed platform document, as `alpha compose wrap` reads it.
+        #[arg(long)]
+        platform: PathBuf,
+        /// The `alpha-runtime` image, pinned as `<image>@sha256:<digest>`.
+        #[arg(long)]
+        runtime_image: String,
+        /// `{"runtime_class", "gpu": {"model", "count"}, "cpu", "memory_mib"}`; no `gpu` for
+        /// `kata-qemu-tdx`.
+        #[arg(long)]
+        shape: PathBuf,
+        /// Refuse every tag instead of asking its registry for the digest.
+        #[arg(long)]
+        no_resolve: bool,
+        /// The `alpha-volume` image, pinned by digest, for a compose that declares persistent
+        /// volumes (`x-alphacompute-volumes`); without it such a compose is refused.
+        #[arg(long)]
+        volume_image: Option<String>,
+        compose: PathBuf,
+    },
+    /// Writes genpolicy's settings directory (genpolicy 4.1.0's defaults plus the Alpha baseline
+    /// drop-ins) and the patched rules.rego into a directory, for running genpolicy by hand before
+    /// `render --policy`.
+    GenpolicySettings {
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 /// What every custodian command takes beside its own flags.
@@ -399,6 +481,8 @@ enum Exit {
     Usage(String),
     /// Printed like a success, but some part of it failed.
     Partial(Value),
+    /// The command wrote its own output; the main loop prints nothing.
+    Silent,
 }
 
 impl From<String> for Exit {
@@ -757,6 +841,123 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             }
             Ok(out)
         }
+        Command::Coco {
+            command:
+                CocoCommand::Render {
+                    spec,
+                    policy,
+                    for_genpolicy,
+                    env_files,
+                    volumes,
+                    volume_image,
+                },
+        } => {
+            let volumes = coco::Volumes {
+                image: volume_image,
+                volumes: volumes
+                    .iter()
+                    .map(|v| coco::RenderVolume::parse(v))
+                    .collect::<Result<_, _>>()
+                    .map_err(Exit::Usage)?,
+            };
+            let template = fs::read_to_string(&spec)
+                .map_err(|e| Exit::Usage(format!("{}: {e}", spec.display())))?;
+            let paths: Vec<&Path> = env_files.iter().map(PathBuf::as_path).collect();
+            let env = coco::read_env_files(&paths).map_err(Exit::Refused)?;
+
+            if for_genpolicy {
+                let out = coco::render_volumes_for_genpolicy(&template, &env, &volumes)
+                    .map_err(Exit::Refused)?;
+                print!("{out}");
+                return Err(Exit::Silent);
+            }
+
+            let policy_path = policy.ok_or_else(|| {
+                Exit::Usage("--policy is required unless --for-genpolicy is set".into())
+            })?;
+            let policy_text = fs::read_to_string(&policy_path)
+                .map_err(|e| Exit::Usage(format!("{}: {e}", policy_path.display())))?;
+
+            let out = coco::render_volumes(&template, &policy_text, &env, &volumes)
+                .map_err(Exit::Refused)?;
+            print!("{}", out.manifest);
+            eprintln!(
+                "init-data {}, policy {}",
+                out.revision.initdata_sha256, out.revision.policy_sha256
+            );
+            eprintln!("revision {}", out.revision_canonical);
+            eprintln!("revision hash {}", out.revision_hash);
+            Err(Exit::Silent)
+        }
+        Command::Coco {
+            command:
+                CocoCommand::Wrap {
+                    app_id,
+                    platform,
+                    runtime_image,
+                    shape,
+                    no_resolve,
+                    volume_image,
+                    compose,
+                },
+        } => {
+            let bytes = fs::read(&compose)
+                .map_err(|e| Exit::Usage(format!("{}: {e}", compose.display())))?;
+            let shape =
+                fs::read(&shape).map_err(|e| Exit::Usage(format!("{}: {e}", shape.display())))?;
+            let shape = coco::wrap::Shape::parse(&shape).map_err(Exit::Usage)?;
+            let plain = wrap::parse(&bytes)?;
+            let persistent = coco::wrap::Persistent {
+                volumes: coco::wrap::persistent_volumes(&bytes)?,
+                image: volume_image,
+            };
+            let artifact: SignedDocument = serde_json::from_value(read_json(&platform)?)
+                .map_err(|e| Exit::Refused(format!("artifact: {e}")))?;
+            let runtime =
+                wrap::runtime(&artifact, &alpha_cli::release_key()?, now, &runtime_image)?;
+            let digests = if no_resolve {
+                BTreeMap::new()
+            } else {
+                let http = wrap::registry_client_builder()
+                    .build()
+                    .map_err(|e| Exit::Refused(format!("registry client: {e}")))?;
+                wrap::resolve_all(&http, &plain).await?
+            };
+            let genpolicy = coco::policy::Genpolicy::pinned();
+            // A refusal is about the compose and exits 1; anything on our side exits 2, so the
+            // adapter shows its own message instead of ours.
+            let wrapped = coco::wrap::wrap(
+                plain,
+                &digests,
+                app_id,
+                &runtime,
+                &shape,
+                &persistent,
+                &genpolicy,
+            )
+            .await;
+            match wrapped {
+                Ok(wrapped) => Ok(json!(wrapped)),
+                Err(coco::wrap::WrapError::Refused(m)) => Err(Exit::Refused(m)),
+                Err(coco::wrap::WrapError::Failed(m)) => Err(Exit::Usage(m)),
+            }
+        }
+        Command::Coco {
+            command: CocoCommand::GenpolicySettings { out },
+        } => {
+            let write = |name: &str, text: &str| {
+                let path = out.join(name);
+                fs::write(&path, text)
+                    .map_err(|e| Exit::Refused(format!("{}: {e}", path.display())))
+            };
+            fs::create_dir_all(out.join("genpolicy-settings.d"))
+                .map_err(|e| Exit::Refused(format!("{}: {e}", out.display())))?;
+            for (path, text) in coco::policy::settings_files() {
+                write(&path, text)?;
+            }
+            write("rules.rego", coco::policy::RULES)?;
+            Ok(json!({ "dir": out, "genpolicy_sha256": coco::policy::GENPOLICY_SHA256 }))
+        }
         Command::Custodians { command } => custodians_command(config, command, now).await,
     }
 }
@@ -863,6 +1064,7 @@ async fn main() {
             println!("{value:#}");
             std::process::exit(1);
         }
+        Err(Exit::Silent) => {}
     }
 }
 
@@ -940,6 +1142,29 @@ mod tests {
         assert!(!wrap(
             &[&["--app-id", "not-a-uuid"][..], &platform, &runtime].concat()
         ));
+    }
+
+    #[test]
+    fn coco_wrap_takes_the_adapters_flags() {
+        let image = format!("r@sha256:{}", "7d".repeat(32));
+        let wrap = |flags: &[&str]| {
+            let args = ["alpha", "coco", "wrap"];
+            Cli::try_parse_from(args.iter().chain(flags).chain(&["c.yaml"])).is_ok()
+        };
+        let all = [
+            "--app-id",
+            "0199a1b2-0000-7000-8000-000000000001",
+            "--platform",
+            "p.json",
+            "--runtime-image",
+            image.as_str(),
+            "--shape",
+            "s.json",
+        ];
+        assert!(wrap(&all));
+        assert!(wrap(&[&all[..], &["--no-resolve"]].concat()));
+        assert!(!wrap(&all[..6]));
+        assert!(!wrap(&all[2..]));
     }
 
     #[test]
