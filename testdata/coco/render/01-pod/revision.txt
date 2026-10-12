@@ -1,2 +1,2 @@
-{"app_id":"01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b","format":"alphacompute-coco-revision/1","initdata_sha256":"sha256:89150d91dd2e3d3c80b0877d47fe5294447e46ade5c20028ab0519d4c0ff3713","policy_sha256":"sha256:48df8f7fb2ba194998b8ad5cfefe3807ccfc0b5d90d9e60a293f71f6ce8dbc98","runtime_class":"kata-qemu-tdx"}
-sha256:37fdadd9b6f3a87a4c45299dbe5ef5fb74e057c22bc5ab59b4e5b33c8fd03bd8
+{"app_id":"01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b","format":"alphacompute-coco-revision/1","initdata_sha256":"sha256:ea02bcc40f4b4c2462727cbeefea359816e64848cf4c453437865fc74e7f7a01","policy_sha256":"sha256:51c1d982241a759bfc6bf20136273df3fc9a668d7babd1eb3efb40f33529bee4","runtime_class":"kata-qemu-tdx"}
+sha256:ed5e8a137c6156c20b2f737bc13a878a0164192e4a9b1c66924384d0c340cbdb

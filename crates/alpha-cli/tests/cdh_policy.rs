@@ -403,6 +403,14 @@ impl Pod {
                 )
             })
             .collect();
+        // containerd sets HOSTNAME, the pod's name, in every container, whether or not the
+        // policy lists it (the generators' policies do not).
+        if !env
+            .iter()
+            .any(|e| e.as_str().unwrap().starts_with("HOSTNAME="))
+        {
+            env.push(json!(format!("HOSTNAME={}", self.pod_name)));
+        }
         if !sandbox {
             env.push(json!("KUBERNETES_SERVICE_HOST=10.96.0.1"));
             env.push(json!("KUBERNETES_SERVICE_PORT=443"));
@@ -647,6 +655,7 @@ fn the_host_cannot_change_the_sealed_secret() {
     for pod in pods() {
         let legit = pod.create_container(pod.app());
         let at = sealed_index(&legit);
+        let pod_name = pod.pod_name.clone();
         let cases: Vec<(&str, Change)> = vec![
             (
                 "another of this App's sealed secrets in its place",
@@ -674,6 +683,16 @@ fn the_host_cannot_change_the_sealed_secret() {
                     for e in env_mut(r).iter_mut() {
                         if e.as_str().unwrap().starts_with("HOSTNAME=") {
                             *e = json!(format!("HOSTNAME={}", sealed("db_password")));
+                        }
+                    }
+                }),
+            ),
+            (
+                "a sealed value with the pod's name as the pod's hostname",
+                Box::new(move |r| {
+                    for e in env_mut(r).iter_mut() {
+                        if e.as_str().unwrap().starts_with("HOSTNAME=") {
+                            *e = json!(format!("HOSTNAME={}.{pod_name}", sealed("db_password")));
                         }
                     }
                 }),
@@ -819,7 +838,7 @@ fn no_container_reaches_the_guest_components() {
     }
 }
 
-/// Why the generators pin `HOSTNAME` and narrow its pattern: under genpolicy's own output for the
+/// Why the generators take `HOSTNAME` out of the policy and narrow its pattern: under genpolicy's own output for the
 /// same pod (`policy.rego`), the host may set it to a sealed value copied from the policy, and the
 /// agent would have CDH unseal the App's Secret into the container's environment.
 #[test]

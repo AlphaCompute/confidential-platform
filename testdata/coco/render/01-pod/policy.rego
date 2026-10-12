@@ -2645,7 +2645,7 @@ policy_data := {
         "^KUBERNETES_SERVICE_PORT=$(ip_p)$",
         "^KUBERNETES_SERVICE_PORT_HTTPS=$(ip_p)$",
         "^KUBERNETES_PORT=tcp://$(ipv4_a):$(ip_p)$",
-        "^ALPHACOMPUTE_KMS_ENDPOINTS=https://[a-z0-9.-]{1,253}(:[0-9]{1,5})?(,https://[a-z0-9.-]{1,253}(:[0-9]{1,5})?){0,7}$"
+        "^ALPHACOMPUTE_KMS_ENDPOINTS=https://[a-z0-9.-]{1,253}(:[1-9][0-9]{0,3}|:[1-5][0-9]{4}|:6[0-4][0-9]{3}|:65[0-4][0-9]{2}|:655[0-2][0-9]|:6553[0-5])?(,https://[a-z0-9.-]{1,253}(:[1-9][0-9]{0,3}|:[1-5][0-9]{4}|:6[0-4][0-9]{3}|:65[0-4][0-9]{2}|:655[0-2][0-9]|:6553[0-5])?){0,7}$"
       ]
     },
     "CopyFileRequest": [

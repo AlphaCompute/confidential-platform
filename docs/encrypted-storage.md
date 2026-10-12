@@ -77,10 +77,10 @@ Envelope secrets and other KMS providers are refused, since they would have CDH 
 
 A sealed value is not secret: anyone who reads the policy can copy it. genpolicy's own output would let the host set `HOSTNAME` to any value (its rules accept anything for `$(host-name)`, and its `$(dns_label)` pattern accepts dots). A host could then put the App's sealed value in `HOSTNAME` and have the agent unseal the Secret into a container that was never given it. `tests/cdh_policy.rs` (`genpolicys_policy_alone_lets_…`) shows this. The generators close it in two ways:
 
-- they rewrite genpolicy's `HOSTNAME=$(host-name)` to `HOSTNAME=$(sandbox-name)`, which the rules match against the policy's sandbox-name pattern;
-- the `50-alpha-hostname.json` settings drop-in narrows the host-settable `HOSTNAME` to one lowercase DNS label.
+- they take genpolicy's `HOSTNAME=$(host-name)` out of every container's environment (`coco::policy::pin_hostname`). Listing it as `HOSTNAME=$(sandbox-name)` instead would not do: the rules match the sandbox's name as an unanchored pattern, so any value that contains the pod's name passes, `sealed.<JWS>.<pod name>` included;
+- the `50-alpha-hostname.json` settings drop-in narrows the host-settable `HOSTNAME` to one lowercase DNS label, which is then the only way the host can set it, and never a value with a dot.
 
-The baseline refuses any policy that still lists `$(host-name)`, `$(node-name)` or `$(pod-uid)`, or that admits genpolicy's `HOSTNAME` pattern.
+The baseline refuses any policy that still lists `$(host-name)`, `$(node-name)` or `$(pod-uid)`, lists `HOSTNAME` with any placeholder, or admits genpolicy's `HOSTNAME` pattern. #82's `agent_policy` suite holds each half of this to a hostile host.
 
 ## The resource contract with Trustee's KBS
 

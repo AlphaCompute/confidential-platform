@@ -97,27 +97,6 @@ pub fn scratch_volume(name: &str, size: &str) -> Value {
     json!({ "name": name, "emptyDir": { "sizeLimit": size } })
 }
 
-/// genpolicy's `HOSTNAME=$(host-name)`, which its rules let the host set to anything (a sealed
-/// value copied from the policy included), pinned to the sandbox's name: the rules then match it
-/// against the policy's sandbox-name pattern. Kubernetes sets a pod's `HOSTNAME` to the pod's
-/// name, which is the sandbox's.
-// ponytail: G0 — confirm containerd 2.3.x sets HOSTNAME to the full pod name on the pinned
-// stack; a pod name over 63 characters is truncated and would refuse every container (closed).
-/// Anything but the Alpha rules followed by data is returned as it is, for `verify` to refuse.
-pub fn pin_hostname(policy: &str) -> String {
-    use alpha_core::coco::policy::{DATA_PREFIX, RULES};
-    match policy
-        .strip_prefix(RULES)
-        .and_then(|rest| rest.strip_prefix(DATA_PREFIX))
-    {
-        Some(data) => {
-            let data = data.replace("\"HOSTNAME=$(host-name)\"", "\"HOSTNAME=$(sandbox-name)\"");
-            format!("{RULES}{DATA_PREFIX}{data}")
-        }
-        None => policy.to_owned(),
-    }
-}
-
 /// What a sealed secret refers to.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Sealed {
