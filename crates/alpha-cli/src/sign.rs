@@ -10,10 +10,20 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::Serialize;
 use serde_json::Value;
 
-/// Signing garbage is refused: the document must already be a platform document.
+/// Signing garbage is refused: the document must already be a platform document, and every
+/// `alpha_volume_images` entry one pinned image reference.
 pub fn sign(document: Value, key: &SigningKey) -> Result<SignedDocument, String> {
-    serde_json::from_value::<PlatformDocument>(document.clone())
+    let parsed = serde_json::from_value::<PlatformDocument>(document.clone())
         .map_err(|e| format!("document: {e}"))?;
+    if let Some(bad) = parsed
+        .alpha_volume_images
+        .iter()
+        .find(|i| !crate::deploy::wrap::pinned_reference(i))
+    {
+        return Err(format!(
+            "document: alpha_volume_images: {bad:?} is not <image>@sha256:<digest>"
+        ));
+    }
     platform::sign(document, key).map_err(|e| e.to_string())
 }
 
@@ -23,6 +33,9 @@ pub struct Summary {
     pub version: u64,
     pub kms_ca_spki_sha256: Option<String>,
     pub kms_revisions: Vec<ComposeHash>,
+    /// The `alpha-volume` images `alpha coco render` and `wrap` may run privileged.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub alpha_volume_images: Vec<String>,
 }
 
 pub fn check(
@@ -39,6 +52,7 @@ pub fn check(
             .iter()
             .map(|r| r.compose_hash)
             .collect(),
+        alpha_volume_images: document.alpha_volume_images,
     })
 }
 
@@ -76,7 +90,8 @@ mod tests {
             Summary {
                 version: 4,
                 kms_ca_spki_sha256: None,
-                kms_revisions: vec![hash]
+                kms_revisions: vec![hash],
+                alpha_volume_images: Vec::new(),
             }
         );
         let other = SigningKey::from_bytes(&[9u8; 32]);
@@ -104,5 +119,27 @@ mod tests {
         assert!(sign(document.clone(), &key).is_ok());
         document["signer"]["origins"][0] = json!("https://sign.example/path");
         assert!(sign(document, &key).is_err());
+    }
+
+    #[test]
+    fn sign_holds_alpha_volume_images_to_pinned_references() {
+        let key = SigningKey::from_bytes(&[8u8; 32]);
+        let image = format!(
+            "ghcr.io/alphacompute/alpha-volume@sha256:{}",
+            "1".repeat(64)
+        );
+        let mut document = json!({
+            "version": 4, "issued_at": "2026-09-14T00:00:00Z",
+            "policy": { "tcb_statuses": ["UpToDate"], "tolerated_advisories": [] },
+            "reference_values": [], "kms_ca_pem": "", "kms_revisions": [],
+            "alpha_volume_images": [image],
+        });
+        let artifact = sign(document.clone(), &key).unwrap();
+        let summary = check(&artifact, &key.verifying_key(), SystemTime::now()).unwrap();
+        assert_eq!(summary.alpha_volume_images, [image]);
+        for bad in ["ghcr.io/alphacompute/alpha-volume:latest", "sha256:abc"] {
+            document["alpha_volume_images"] = json!([bad]);
+            assert!(sign(document.clone(), &key).is_err(), "{bad}");
+        }
     }
 }

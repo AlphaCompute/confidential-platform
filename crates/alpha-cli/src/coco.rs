@@ -381,8 +381,12 @@ pub fn render_volumes_for_genpolicy(
 /// after the template's, the pod's volumes, and the mount in the container that uses it.
 #[derive(Clone, Debug, Default)]
 pub struct Volumes {
+    /// `--volume-image`: one of `listed`.
     pub image: Option<String>,
     pub volumes: Vec<RenderVolume>,
+    /// The `alpha-volume` images the release-signed platform document lists
+    /// ([`volume::listed_images`]); empty without `--platform`, which refuses every volume.
+    pub listed: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -434,6 +438,7 @@ impl Volumes {
         if !crate::deploy::wrap::pinned_reference(image) {
             return Err(format!("--volume-image {image:?} is not pinned by digest"));
         }
+        volume::check_image(image, &self.listed)?;
         let to_yaml = |v: serde_json::Value| serde_yaml_ng::to_value(v).map_err(|e| e.to_string());
         let mut docs = Vec::new();
         for document in serde_yaml_ng::Deserializer::from_str(rendered) {
@@ -548,7 +553,7 @@ pub fn render_volumes(
     let for_shape = render_volumes_for_genpolicy(template, env, volumes)?;
     let (runtime_class, gpu_count) = extract_shape(&for_shape)?;
     let policy_text = &volume::propagate(&policy::pin_hostname(policy_text), &volumes.names())?;
-    let verified = policy::verify(policy_text)?;
+    let verified = policy::verify_with_volumes(policy_text, &volumes.listed)?;
     let containers = manifest_containers(&for_shape)?;
     let running = admitted(&containers);
     if verified.containers != running {
@@ -558,14 +563,12 @@ pub fn render_volumes(
         ));
     }
     check_dsm(&containers, &verified)?;
-    let volume_containers = running
-        .iter()
-        .filter(|c| {
-            c.name
-                .starts_with(alpha_core::coco::policy::VOLUME_CONTAINER_PREFIX)
-        })
-        .cloned()
-        .collect();
+    // The ones --volume added, with the listed image: not every container the template names
+    // alpha-volume-*.
+    let volume_containers = volume::containers(
+        volumes.volumes.iter().map(|v| &v.name),
+        volumes.image.as_deref(),
+    );
     volume::check_elevated(&verified, &volume_containers)?;
 
     let app_id_str = env
@@ -840,14 +843,16 @@ spec:
     /// printed under `genpolicy-settings` for its `--for-genpolicy` rendering. Under
     /// `WRITE_VECTORS=1` with `ALPHA_TEST_GENPOLICY` naming genpolicy 4.1.0, the policy is
     /// generated again.
+    /// A public image standing in for `alpha-volume`, listed as a platform document would.
+    const VOLUME_IMAGE: &str =
+        "busybox@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e";
+
     fn vector_volumes(name: &str) -> Volumes {
         match name {
             "02-volume" => Volumes {
-                image: Some(
-                    "busybox@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
-                        .into(),
-                ),
+                image: Some(VOLUME_IMAGE.into()),
                 volumes: vec![RenderVolume::parse("pgdata:20Gi:app:/var/lib/data").unwrap()],
+                listed: BTreeSet::from([VOLUME_IMAGE.to_owned()]),
             },
             _ => Volumes::default(),
         }
@@ -937,5 +942,47 @@ spec:
                 .unwrap_err()
                 .contains("--volume-image")
         );
+    }
+
+    /// ACC-FD-100: `--volume-image` chooses among the images the platform document lists. An
+    /// unlisted one, pinned by digest or not, is refused before genpolicy sees the spec and
+    /// again at the final render; and the recorded policy, whose volume container runs the
+    /// stand-in image, is refused once that image is not listed.
+    #[test]
+    fn render_runs_only_a_listed_volume_image() {
+        let dir = vector("02-volume");
+        let template = std::fs::read_to_string(dir.join("spec.yaml")).unwrap();
+        let env = read_env_files(&[dir.join("values.env").as_path()]).unwrap();
+        let policy_text = std::fs::read_to_string(dir.join("policy.rego")).unwrap();
+        let attacker = format!(
+            "registry.example/attacker/volume@sha256:{}",
+            "ab".repeat(32)
+        );
+        let mut volumes = vector_volumes("02-volume");
+        volumes.image = Some(attacker.clone());
+        let error = render_volumes_for_genpolicy(&template, &env, &volumes).unwrap_err();
+        assert!(error.contains("not an alpha-volume image"), "{error}");
+        let error = render_volumes(&template, &policy_text, &env, &volumes).unwrap_err();
+        assert!(error.contains("not an alpha-volume image"), "{error}");
+        // The attacker's image listed in place of the stand-in: the policy names the stand-in.
+        volumes.listed = BTreeSet::from([attacker]);
+        assert!(render_volumes(&template, &policy_text, &env, &volumes).is_err());
+        // No platform document: no list, no volume.
+        let mut unlisted = vector_volumes("02-volume");
+        unlisted.listed.clear();
+        let error = render_volumes(&template, &policy_text, &env, &unlisted).unwrap_err();
+        assert!(error.contains("lists no alpha-volume image"), "{error}");
+        // The stand-in listed, but the policy checked without the list.
+        let pinned = volume::propagate(
+            &policy::pin_hostname(&policy_text),
+            &BTreeSet::from(["pgdata".to_owned()]),
+        )
+        .unwrap();
+        assert!(
+            policy::verify(&pinned)
+                .unwrap_err()
+                .contains("not an alpha-volume image")
+        );
+        policy::verify_with_volumes(&pinned, &vector_volumes("02-volume").listed).unwrap();
     }
 }

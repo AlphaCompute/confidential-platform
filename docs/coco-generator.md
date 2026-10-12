@@ -32,7 +32,7 @@ The compose is checked first with the same allowlist and the same platform-docum
 - **Start order.** The sidecar's startup probe is a TCP check of 8443. In a pod, the runtime opens 8443 only after it has attested and written every declared Secret (`alpha_runtime::Tls::AfterSecrets`). Kubernetes starts the services only after that probe passes, so a service never starts without its Secret files. This is the pod's equivalent of the compose health check. The probe waits up to 24 hours, as the compose does.
 - **One container per service**, in the compose's order, with `image` pinned by digest, `entrypoint` as `command`, `command` as `args`, `environment`, named-volume mounts and a numeric `user` (as `runAsUser` and `runAsGroup`). A string command is split on spaces. A command that needs quoting must be written as a list, so that what runs is exactly what the policy pins.
 - **Size.** Kata sizes the TD from the containers' limits, and RTMR0's reference value is captured per shape. So the regular containers' CPU and memory limits add up to the shape exactly, with requests equal to limits. The shape is split evenly and the first service takes the remainder. The sidecar sets no limits, so it adds nothing to the TD's size. The published service takes all of the shape's `nvidia.com/pgpu`.
-- **Volumes.** Named volumes, the Secret volumes and the socket volume are `emptyDir` with `medium: Memory`, so they live in TD memory and are not persistent. A named volume listed under the compose's top-level `x-alphacompute-volumes` (`{<volume>: {size: 10Gi}}`) is an encrypted persistent volume instead (see below). The adapter must pass `--volume-image`, the `alpha-volume` image pinned by digest; without it such a compose is refused.
+- **Volumes.** Named volumes, the Secret volumes and the socket volume are `emptyDir` with `medium: Memory`, so they live in TD memory and are not persistent. A named volume listed under the compose's top-level `x-alphacompute-volumes` (`{<volume>: {size: 10Gi}}`) is an encrypted persistent volume instead (see below). The adapter must pass `--volume-image`, the `alpha-volume` image pinned by digest, and it must be one that the platform document lists in `alpha_volume_images`; without it such a compose is refused.
 - **No service-account token** (`automountServiceAccountToken: false`) and no service links (`enableServiceLinks: false`).
 - **KMS endpoints.** `ALPHACOMPUTE_KMS_ENDPOINTS` comes from the namespace's `alpha-kms` ConfigMap (key `endpoints`) and is not measured. The endpoints only say where to connect: the runtime pins the KMS CA's SPKI hash and the KMS Revisions, which are measured. The policy admits the variable only as a list of `https://host[:port]`. *ponytail*: the adapter's manifest does not create this ConfigMap yet. Until the adapter or the PRD-01 blueprint creates it, the runtime container does not start, so the pod fails closed.
 
@@ -83,20 +83,28 @@ Known limits, for the security review:
 
 ### Encrypted persistent volumes (PRD-02 deliverable 25, Option A)
 
-For each persistent volume `<name>`, `wrap` (from `x-alphacompute-volumes`) and `render` (from `--volume <name>:<size>:<container>:<mount path>` with `--volume-image`) add four things to the pod:
+For each persistent volume `<name>`, `wrap` (from `x-alphacompute-volumes`) and `render` (from `--volume <name>:<size>:<container>:<mount path>` with `--volume-image` and `--platform`) add four things to the pod:
 
 - a block-mode claim `alpha-volume-<name>`, in the cluster's default storage class. `render` appends it as a document. `wrap` prints it under `volume_claims`, a sixth output key present only then. An adapter that does not create claims refuses the output, so it fails closed.
 - the init container `alpha-volume-<name>` (`services/alpha-volume`), after the runtime sidecar has attested. It reads the App's key for `volume.<name>`. It formats a device that carries no LUKS header, opens one labelled for this volume, and refuses anything else, so it never formats over a header. It then mounts the filesystem on a memory `emptyDir` named `<name>` with `Bidirectional` propagation. It runs privileged inside the TD (device-mapper, mount), with the claim as a `volumeDevice`.
 - that `emptyDir` and the claim as pod volumes.
 - in every container that mounts `<name>`, `mountPropagation: HostToContainer`, so the container sees the opened filesystem.
 
-The agent policy is genpolicy's, with one change. genpolicy 4.1.0 writes every `emptyDir` bind as `rprivate`, whatever the spec's propagation. `coco::volume::propagate` sets exactly the init container's mount of the volume to `rshared` and every other container's mount of it to `rslave`, which is what containerd sends for these specs. Each mount must be found and must have been `rprivate`. The baseline (`verify`) lets only `alpha-volume-*` containers be privileged or have an `rshared` mount. `render` and `wrap` also require that the privileged containers are exactly the volume containers they added, with the image they were given.
+The agent policy is genpolicy's, with one change. genpolicy 4.1.0 writes every `emptyDir` bind as `rprivate`, whatever the spec's propagation. `coco::volume::propagate` sets exactly the init container's mount of the volume to `rshared` and every other container's mount of it to `rslave`, which is what containerd sends for these specs. Each mount must be found and must have been `rprivate`. The baseline (`verify`) lets only `alpha-volume-*` containers be privileged or have an `rshared` mount, and the name alone grants nothing (Hacktron ACC-FD-100). `verify_with_volumes` admits a container under that name only as exactly the volume opener:
+
+- its image is one the release-signed platform document lists in `alpha_volume_images`, which `alpha sign` holds to `<image>@sha256:<digest>`. `--volume-image` chooses among those images and cannot add one. A document that lists none admits no volume, and plain `verify` (for example the runtime's DSM check) admits none either;
+- its args are `open <name> /dev/alpha-volume /run/alpha-volume`, after the image's `/alpha-volume` entrypoint or alone;
+- its environment is only the image's `PATH`;
+- it takes `/dev/alpha-volume` and no other device;
+- besides genpolicy's standard mounts, it mounts only the runtime socket (`alpha-run` at `/run/alpha`) and the volume's own `emptyDir` at `/run/alpha-volume`, and only that `emptyDir` is `rshared`.
+
+`render` and `wrap` refuse an unlisted image before genpolicy runs. They also require that the privileged containers are exactly the volume containers they added, with the listed image.
 
 To confirm at G0 on the pinned guest:
 - that Kata propagates the init container's mount through the guest's `emptyDir` to the App's container;
 - that a privileged container in the TD gets device-mapper but no host devices (`privileged_without_host_devices`).
 
-rafay-plugins' `checkPodSpec` refuses privileged containers today, so `wrap` volumes deploy through Rafay only once the adapter admits `alpha-volume-*` pinned by digest.
+rafay-plugins' `checkPodSpec` refuses privileged containers today, so `wrap` volumes deploy through Rafay only once the adapter admits `alpha-volume-*` with an image that the platform document lists.
 
 ### Customer DSM declarations (PRD-06 I1)
 

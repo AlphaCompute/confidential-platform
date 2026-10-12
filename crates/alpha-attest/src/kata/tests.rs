@@ -226,6 +226,7 @@ fn doc() -> PlatformDocument {
             nras_keys: Default::default(),
             nras_cc_mode: None,
         }),
+        alpha_volume_images: Vec::new(),
     }
 }
 
