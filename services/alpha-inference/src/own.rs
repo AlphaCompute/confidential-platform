@@ -241,7 +241,9 @@ impl Servers {
             .map_err(|_| Reason::Handshake)?;
         let revision = served_revision(&response);
         if revision.is_none() {
-            eprintln!("alpha-inference: warning: model {model} check: served revision not available in TLS extension (KPI-6 audit gap)");
+            eprintln!(
+                "alpha-inference: warning: model {model} check: served revision not available in TLS extension (KPI-6 audit gap)"
+            );
         }
         if !response.status().is_success() {
             return Err(Reason::Status);
@@ -292,7 +294,9 @@ impl Servers {
         // Fixed labels only, as for the check: the model, the Revision and the status.
         let revision = served_revision(&response);
         if revision.is_none() {
-            eprintln!("alpha-inference: warning: model {model} completion: served revision not available in TLS extension (KPI-6 audit gap)");
+            eprintln!(
+                "alpha-inference: warning: model {model} completion: served revision not available in TLS extension (KPI-6 audit gap)"
+            );
         }
         eprintln!(
             "alpha-inference: model {model} completion served by alphacompute revision {} status={}",
