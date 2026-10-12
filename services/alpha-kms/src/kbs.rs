@@ -242,7 +242,10 @@ fn auth_inner(node: &Node, body: &[u8]) -> Result<Value, ApiError> {
     }
     if let Some(param) = request.extra_params.get("supported-hash-algorithms") {
         let supported = param.as_array().ok_or_else(|| {
-            ApiError::new("policy_denied", "supported-hash-algorithms must be an array")
+            ApiError::new(
+                "policy_denied",
+                "supported-hash-algorithms must be an array",
+            )
         })?;
         if !supported.iter().any(|a| a.as_str() == Some(HASH_ALGORITHM)) {
             return Err(ApiError::new(
