@@ -271,8 +271,31 @@ const IMAGE_FAILURES: [&str; 4] = [
 pub struct Genpolicy {
     pub path: PathBuf,
     pub sha256: String,
+    /// The directory holding the release's `rules.rego` and `genpolicy-settings.json` beside the
+    /// binary, checked against [`RELEASE_FILES`] so the image ships the 4.1.0 release that the
+    /// embedded Alpha baseline was made from. `None` skips the check (tests that run a binary
+    /// from elsewhere).
+    pub defaults: Option<PathBuf>,
     pub timeout: Duration,
 }
+
+/// Where the adapter image (rafay-plugins' `rafay-integration/Dockerfile`) ships genpolicy's
+/// release rules and settings, at Kata's own paths.
+pub const GENPOLICY_DEFAULTS: &str = "/opt/kata/share/defaults/kata-containers";
+/// The release files there and their sha256, the Dockerfile's pins. genpolicy runs with the
+/// copies embedded in `alpha` with the Alpha baseline applied (the patched rules and the
+/// drop-ins), which are made from exactly these bytes; the image's files are checked, not read
+/// into the policy, so the image needs no baseline files of its own.
+pub const RELEASE_FILES: [(&str, &str); 2] = [
+    (
+        "rules.rego",
+        "a1ad4280a7d1db83649de18640fb30f08cc160fadd7f4360d1dde09977b090b7",
+    ),
+    (
+        "genpolicy-settings.json",
+        "46bf9ac5460393f626ff2ed6fa2501ec5a82893da57c06e5c53a8f8e50e9dfa0",
+    ),
+];
 
 impl Genpolicy {
     /// The pinned binary at [`GENPOLICY_PATH`]. The adapter gives the whole wrap two minutes;
@@ -282,6 +305,7 @@ impl Genpolicy {
         Self {
             path: PathBuf::from(GENPOLICY_PATH),
             sha256: GENPOLICY_SHA256.to_owned(),
+            defaults: Some(PathBuf::from(GENPOLICY_DEFAULTS)),
             timeout: Duration::from_secs(100),
         }
     }
@@ -312,6 +336,21 @@ impl Genpolicy {
             )));
         }
         drop(binary);
+        for (name, pinned) in self
+            .defaults
+            .iter()
+            .flat_map(|d| RELEASE_FILES.map(|(n, h)| (d.join(n), h)))
+        {
+            let bytes =
+                std::fs::read(&name).map_err(|e| failed(format!("{}: {e}", name.display())))?;
+            let digest = hex::encode(Sha256::digest(&bytes));
+            if digest != pinned {
+                return Err(failed(format!(
+                    "{} has sha256 {digest}, not the pinned {pinned}",
+                    name.display()
+                )));
+            }
+        }
         let dir = TempDir::new().map_err(failed)?;
         let settings_dir = dir.0.join("settings");
         let write = |path: &Path, text: &str| {
@@ -707,8 +746,9 @@ mod tests {
         let fake = dir.0.join("genpolicy");
         std::fs::write(&fake, b"#!/bin/sh\necho policy\n").unwrap();
         let g = Genpolicy {
-            path: fake,
+            path: fake.clone(),
             sha256: GENPOLICY_SHA256.into(),
+            defaults: None,
             timeout: Duration::from_secs(5),
         };
         match g.run("kind: Pod\n").await {
@@ -723,5 +763,30 @@ mod tests {
             missing.run("kind: Pod\n").await,
             Err(GenpolicyError::Failed(_))
         ));
+        // The right binary but release files of another digest beside it.
+        let digest = hex::encode(Sha256::digest(std::fs::read(&fake).unwrap()));
+        let defaults = dir.0.join("defaults");
+        std::fs::create_dir(&defaults).unwrap();
+        std::fs::write(defaults.join("rules.rego"), UPSTREAM_RULES).unwrap();
+        std::fs::write(defaults.join("genpolicy-settings.json"), "{}").unwrap();
+        let g = Genpolicy {
+            path: fake,
+            sha256: digest,
+            defaults: Some(defaults),
+            timeout: Duration::from_secs(5),
+        };
+        match g.run("kind: Pod\n").await {
+            Err(GenpolicyError::Failed(m)) => {
+                assert!(m.contains("genpolicy-settings.json has sha256"), "{m}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_release_pins_are_the_embedded_files() {
+        let sha = |s: &str| hex::encode(Sha256::digest(s.as_bytes()));
+        assert_eq!(RELEASE_FILES[0].1, sha(UPSTREAM_RULES));
+        assert_eq!(RELEASE_FILES[1].1, sha(UPSTREAM_SETTINGS));
     }
 }
