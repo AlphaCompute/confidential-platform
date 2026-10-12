@@ -24,7 +24,7 @@ const MISMATCH =
 const UNREADABLE =
   "This page cannot read what the service asked you to approve, so it cannot show it to you. Nothing was signed.";
 const NO_INITDATA =
-  "The service did not send this pod's init-data, so this page cannot show its images or agent policy. Approving registers them by the digests under Technical details.";
+  "The service did not send this pod's init-data, so this page cannot show its images or agent policy. Nothing was signed.";
 
 const INITDATA = testdata("coco/b300x1/initdata.toml");
 const REVISION = testdata("coco/b300x1/revision.json");
@@ -117,22 +117,10 @@ test("a Revision v2 with its init-data shows the pod and registers the Revision"
   assert.ok(page.text().includes(APPROVED), page.text());
 });
 
-test("without init-data the Revision is shown by its digests and can still be approved", async () => {
-  const { api, page } = await revisionPage();
-  const text = page.text();
-  for (const line of [
-    "Runtime class: kata-qemu-nvidia-gpu-tdx",
-    "GPUs: 1 × B300, in confidential computing mode",
-    NO_INITDATA,
-  ]) {
-    assert.ok(text.includes(line), `${line}\n${text}`);
-  }
-  for (const absent of ["Images the agent policy names", "exec", "Image:"]) {
-    assert.ok(!text.includes(absent), `${absent}\n${text}`);
-  }
-  await page.click("Approve with passkey");
-  assert.equal(api.revisions[0].body.payload.compose, REVISION);
-  assert.ok(page.text().includes(APPROVED), page.text());
+test("without init-data the Revision approval is refused", async () => {
+  const { page } = await revisionPage();
+  assert.equal(page.text(), NO_INITDATA);
+  assert.deepEqual(page.buttons(), []);
 });
 
 test("a CPU-class Revision names no GPU", async () => {
@@ -197,10 +185,10 @@ test("init-data that does not rebuild the Revision is refused before any prompt"
     [{ compose_hash: label("other") }, MISMATCH],
     [{ initdata: "not base64!" }, UNREADABLE],
     [{ initdata: 7 }, UNREADABLE],
-    // What check_registration refuses.
-    [{ compose: REVISION.replace(",", ", ") }, UNREADABLE],
-    [{ app_id: "01920000-0000-7000-8000-000000000002" }, UNREADABLE],
-    [{ compose: REVISION.replace('"count":1', '"count":2') }, UNREADABLE],
+    // What check_registration refuses (initdata provided so the WASM is reached).
+    [{ compose: REVISION.replace(",", ", "), initdata: b64(INITDATA) }, UNREADABLE],
+    [{ app_id: "01920000-0000-7000-8000-000000000002", initdata: b64(INITDATA) }, UNREADABLE],
+    [{ compose: REVISION.replace('"count":1', '"count":2'), initdata: b64(INITDATA) }, UNREADABLE],
     [edited("package agent_policy", "package other"), UNREADABLE],
   ];
   for (const [options, sentence] of refusals) {
