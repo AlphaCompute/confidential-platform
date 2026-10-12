@@ -267,3 +267,47 @@ async fn a_kata_pod_whose_revision_or_gpu_backends_do_not_pass_is_refused_and_au
     )
     .await;
 }
+
+#[tokio::test]
+async fn a_gpu_pod_whose_gpu_nonce_does_not_match_is_refused() {
+    // Lenient FakeGpu: reports the wrong nonce from the GPU evidence, the KMS's own check_gpu
+    // catches it.  This exercises the primary GPU anti-replay guarantee end-to-end.
+    let gpu = FakeGpu::new();
+    let Some(h) = kata_harness(&gpu).await else {
+        return;
+    };
+    let admin = h.register_key(&h.root, 35).await;
+    let mut pod = Pod::gpu(AppId::mint(), 1);
+    pod.register(&h, &admin).await;
+
+    // Inject a wrong nonce into the GPU's SPDM report.
+    pod.gpus[0].nonce = Some([0xff; 32]);
+    refused(
+        &h,
+        pod.attest(&h).await,
+        "attestation_failed",
+        "not over this nonce",
+    )
+    .await;
+    // The backend ran (it does not check the nonce in lenient mode), but check_gpu refused it.
+    assert_eq!(gpu.calls(), 1);
+
+    // Strict FakeGpu: the backend itself refuses the mismatched nonce, as real NRAS does.
+    let strict_gpu = FakeGpu::new_strict();
+    let Some(h2) = kata_harness(&strict_gpu).await else {
+        return;
+    };
+    let admin2 = h2.register_key(&h2.root, 35).await;
+    let mut pod2 = Pod::gpu(AppId::mint(), 1);
+    pod2.register(&h2, &admin2).await;
+
+    pod2.gpus[0].nonce = Some([0xff; 32]);
+    refused(
+        &h2,
+        pod2.attest(&h2).await,
+        "attestation_failed",
+        "nonce",
+    )
+    .await;
+    assert_eq!(strict_gpu.calls(), 1);
+}

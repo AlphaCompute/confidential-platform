@@ -188,6 +188,15 @@ pub async fn attest(
 /// after DCAP, the audit row included. No route reaches it. The KMS's tests run the Kata pod's
 /// cases through it over synthetic quotes, as `alpha_attest::kata` tests its profile, until B300
 /// Kata captures exist (M1).
+#[cfg(feature = "test-seams")]
+pub async fn attest_verified(
+    node: &Node,
+    request: &AttestRequest,
+    verified: VerifiedQuote,
+) -> Result<Value, ApiError> {
+    attest_audited(node, request, Some(verified)).await
+}
+#[cfg(not(feature = "test-seams"))]
 pub(crate) async fn attest_verified(
     node: &Node,
     request: &AttestRequest,

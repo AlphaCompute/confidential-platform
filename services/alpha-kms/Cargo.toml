@@ -9,6 +9,9 @@ workspace = true
 
 [features]
 dev-root = []
+## Widens the visibility of seams used only by the integration tests (attest_verified,
+## check_platform); not for production builds.
+test-seams = []
 
 [dependencies]
 aes-gcm = "0.11"

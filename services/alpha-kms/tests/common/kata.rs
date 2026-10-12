@@ -14,7 +14,10 @@ use alpha_attest::{
     GpuVerdict, GpuVerifier, GpuVerifierKind, Measured, Measurement, VerifiedGpu, VerifiedQuote,
     report_data,
 };
-use alpha_core::coco::{CPU_RUNTIME_CLASS, CocoRevision, GPU_RUNTIME_CLASS, InitData};
+use alpha_core::coco::{
+    ALPHA_ENTRY_FORMAT, AlphaEntry, CPU_RUNTIME_CLASS, CocoRevision, GPU_RUNTIME_CLASS, GpuShape,
+    InitData,
+};
 use alpha_core::{AppId, ComposeHash, KeyId, context};
 use alpha_kms::error::ApiError;
 use alpha_kms::instance::{self, AttestRequest};
@@ -44,13 +47,24 @@ pub fn registers(class: &str) -> [Measurement; 4] {
 }
 
 /// The init-data `alpha coco render` writes: the agent policy and our `alpha.json`.
+///
+/// Uses [`AlphaEntry`] serialized via JCS so the field order and format always match the real
+/// renderer rather than a hard-coded string template.
 pub fn initdata(app: AppId, class: &str, gpus: Option<u32>, policy: &str) -> String {
-    let gpu = gpus
-        .map(|n| format!("\"gpu\":{{\"count\":{n},\"model\":\"B300\"}},"))
-        .unwrap_or_default();
-    format!(
-        "algorithm = \"sha384\"\nversion = \"0.1.0\"\n\n[data]\n\"policy.rego\" = '''\n{policy}'''\n\"alpha.json\" = '''{{\"app_id\":\"{app}\",\"format\":\"alphacompute-initdata/1\",{gpu}\"runtime_class\":\"{class}\"}}'''\n"
+    let entry = AlphaEntry {
+        format: ALPHA_ENTRY_FORMAT.into(),
+        app_id: app,
+        runtime_class: class.into(),
+        gpu: gpus.map(|n| GpuShape {
+            count: n,
+            model: "B300".into(),
+        }),
+    };
+    let alpha_json = String::from_utf8(
+        alpha_core::jcs(&serde_json::to_value(&entry).unwrap()).unwrap(),
     )
+    .unwrap();
+    format!("algorithm = \"sha384\"\nversion = \"0.1.0\"\n\n[data]\n\"policy.rego\" = '''\n{policy}'''\n\"alpha.json\" = '''{alpha_json}'''\n")
 }
 
 /// A `kata-tdx` reference value for `class`'s guest image.
@@ -305,16 +319,29 @@ pub async fn refused(h: &Harness, result: Result<Value, ApiError>, code: &str, r
 }
 
 /// A GPU verifier backend standing in for NRAS: it reports every GPU as its report describes it,
-/// the nonce it is over included. NRAS also refuses a report over another nonce itself; this one
-/// does not, so the KMS's own checks are what refuse it.
+/// the nonce it is over included. NRAS also refuses a report over another nonce itself; in
+/// [`FakeGpu::new`] mode the KMS's own `check_gpu` is what refuses it; in
+/// [`FakeGpu::new_strict`] mode the backend-level enforcement is also exercised.
 #[derive(Default)]
 pub struct FakeGpu {
     calls: AtomicUsize,
+    /// When true, refuse any GPU whose reported nonce does not match the expected nonce:
+    /// simulates NRAS's own nonce check rather than relying on the KMS's `check_gpu`.
+    strict_nonce: bool,
 }
 
 impl FakeGpu {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// A [`FakeGpu`] that rejects at the backend level any GPU whose reported nonce does not
+    /// match the expected derivation (`gpu_nonce(report_data)`), mirroring NRAS behaviour.
+    pub fn new_strict() -> Arc<Self> {
+        Arc::new(Self {
+            calls: AtomicUsize::new(0),
+            strict_nonce: true,
+        })
     }
 
     pub fn calls(&self) -> usize {
@@ -330,10 +357,11 @@ impl GpuVerifier for FakeGpu {
     fn verify<'a>(
         &'a self,
         gpus: &'a [GpuEvidence],
-        _nonce: &'a [u8; 32],
+        nonce: &'a [u8; 32],
         _policy: &'a GpuPolicy,
     ) -> GpuFuture<'a> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        let strict_nonce = self.strict_nonce;
         Box::pin(async move {
             let gpus = gpus
                 .iter()
@@ -341,6 +369,12 @@ impl GpuVerifier for FakeGpu {
                 .map(|(entry, index)| {
                     let gpu: Gpu = serde_json::from_slice(&entry.evidence)
                         .map_err(|e| AppraisalError::Failed(format!("gpu report: {e}")))?;
+                    let reported_nonce = gpu.nonce.unwrap_or_default();
+                    if strict_nonce && reported_nonce != *nonce {
+                        return Err(AppraisalError::Failed(format!(
+                            "gpu {index}: report nonce does not match expected nonce (strict)"
+                        )));
+                    }
                     Ok(VerifiedGpu {
                         index,
                         device_id: gpu.device,
@@ -348,7 +382,7 @@ impl GpuVerifier for FakeGpu {
                         driver_version: "575.51.03".into(),
                         vbios_version: "97.00.9a.00.01".into(),
                         cc_mode: gpu.mode == "cc",
-                        nonce: gpu.nonce.unwrap_or_default(),
+                        nonce: reported_nonce,
                     })
                 })
                 .collect::<Result<Vec<_>, AppraisalError>>()?;
