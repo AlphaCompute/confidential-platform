@@ -269,6 +269,17 @@ async fn await_database(node: Arc<Node>) {
                 for row in &held {
                     let _ = node.audit(row.audit()).await;
                 }
+                let dropped = node
+                    .held_dropped
+                    .swap(0, std::sync::atomic::Ordering::Relaxed);
+                if dropped > 0 {
+                    let row = audit::node(
+                        "audit.held_dropped",
+                        "error",
+                        json!({ "refusals": dropped }),
+                    );
+                    let _ = node.audit(row).await;
+                }
                 let _ = node
                     .audit(audit::node("node.unseal", e.outcome(), e.details()))
                     .await;

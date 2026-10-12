@@ -43,7 +43,7 @@ The node then:
    - the Revision v2 rebuilt from the init-data listed in the platform document's `db_revisions` with `"kind": "kata-tdx"`.
 5. Answers `{key_hpke}`: the key HPKE-sealed (X-Wing) to `xwing_pubkey` under `alphacompute/db-volume-key/v1`, its aad this node's runtime-key hash.
 
-Every release and refusal writes a `db.key` audit row naming the Revision, its policy digest and the X-Wing key's hash. While the node waits for its database the row is held in memory and appended, sealed, before the node serves, with `held_at`.
+Every release and refusal writes a `db.key` audit row naming the Revision, its policy digest and the X-Wing key's hash. While the node waits for its database the row is held in memory and appended, sealed, before the node serves, with `held_at`. The queue is bounded (Hacktron ACC-FD-107): at most 1,000 held refusals, past which refusals are only counted (one `audit.held_dropped` row with the count when the node serves), and 1,024 rows in all, past which a release is refused (`rate_limited`) rather than made without its row. Unauthenticated `db-key` calls therefore cannot grow the node's memory while the database is down, nor crowd out a release's row.
 
 `db_revisions` is a new optional field of the release-signed platform document, the same shape as `kms_revisions`:
 
