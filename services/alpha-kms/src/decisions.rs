@@ -1,12 +1,10 @@
-//! PRD-06 P1 "Evidence to the customer", the Alpha side: an organization reads the KMS's
+//! PRD-06 P1 "Evidence to the customer", the Alpha side (draft): an organization reads the KMS's
 //! own decisions about its Instances — every attestation, Secret release and key derivation the
 //! KMS recorded for it, granted or refused — directly, under its own signing key, with the node's
 //! receipt over the whole answer.
 //!
 //! `POST /v1/decisions/export`, body `{payload, signature}` signed under
-//! [`context::DECISIONS_EXPORT`] by any active key of the organization: a member key, or a
-//! read-only auditor key (PRD-06 Q88, [`alpha_core::KeyKind`]), which signs this and nothing else.
-//! Payload
+//! [`context::DECISIONS_EXPORT`] by any active key of the organization. Payload
 //! `{after_seq, limit, issued_at}`: the rows after audit sequence number `after_seq`, at most
 //! `limit` (1 to [`MAX_ROWS`]), in sequence order. The answer echoes the request, so the receipt
 //! alone lets an auditor check it offline (`alpha_client::decisions::verify`).
@@ -15,10 +13,10 @@
 //! account and is read there, not through here: `docs/customer-evidence.md`.
 //!
 //! What the export cannot prove yet:
-//! - TODO(PRD-06 Q89): completeness. The receipt proves the KMS returned these rows, not that it
+//! - TODO(draft): completeness. The receipt proves the KMS returned these rows, not that it
 //!   returned every row; that needs the hash-chained audit log (confidential-platform #95) and a
 //!   chain head in the receipt. QUESTION(PRD-06 Q89).
-//! - TODO(PRD-06 Q89): refusals the KMS could not attribute. A failed attestation, or a refused
+//! - TODO(draft): refusals the KMS could not attribute. A failed attestation, or a refused
 //!   Control call, is recorded with no organization (the KMS never learned whose it was), so it is
 //!   not in any organization's export. QUESTION(PRD-06 Q89).
 
@@ -74,10 +72,9 @@ async fn export_inner(node: &Node, body: &Signed, request: &Value) -> Result<Val
         return Err(ApiError::malformed(format!("limit: 1 to {MAX_ROWS}")));
     }
     let at = within_window(p.issued_at, node.now_utc())?;
-    // PRD-06 Q88: any active key of the organization may read its decisions. A member key keeps
-    // the export, since it can already do more than read; an auditor key (`kind: "auditor"` in
-    // its registration) can do this and no Control write, so a customer's auditor holds no key
-    // that can register a Revision or put a Secret. `keys::verify_signed` enforces the kind.
+    // QUESTION(PRD-06 Q88): any active key of the organization may read its decisions. A
+    // read-only auditor key kind (so a customer's auditor holds no key that can register a
+    // Revision or put a Secret) is not built.
     let chain = authorize(node, &keys, context::DECISIONS_EXPORT, body, at).await?;
     let org_id: Uuid = chain.key.org_id;
     let fetch = p
@@ -132,7 +129,7 @@ async fn export_inner(node: &Node, body: &Signed, request: &Value) -> Result<Val
         org_id: Some(org_id),
         object: None,
         outcome: "ok",
-        details: json!({ "after_seq": p.after_seq, "rows": rows.len(), "kind": chain.key.kind()? }),
+        details: json!({ "after_seq": p.after_seq, "rows": rows.len() }),
         evidence_sha256: None,
     }
     .insert(&node.pool)

@@ -1,4 +1,4 @@
-# Evidence to the customer (PRD-06)
+# Evidence to the customer (PRD-06, draft)
 
 PRD-06 P1: "Evidence to the customer: CCM attestation records and DSM key-release logs reachable
 by the customer directly." A customer who uses Fortanix next to the Alpha stack has two sets of
@@ -9,14 +9,14 @@ decisions to show an auditor:
 
 Neither set goes through AlphaCompute staff. This page says where each one is read.
 
-The Alpha side has code (below). The Fortanix side is the customer's own account, and what it
-exposes is Fortanix question F5.
+**Draft.** The Alpha side has code (below). The Fortanix side is the customer's own account, and
+what it exposes is Fortanix question F5.
 
 ## What the customer reads, and where
 
 | What | Where | Who can read it | Verifiable offline? |
 |---|---|---|---|
-| The KMS's decisions about the organization's Instances: every `attest`, `secret.get` and `key.derive`, granted or refused, plus every earlier export | `POST /v1/decisions/export` on the KMS (`alpha evidence decisions`) | Any active key of the organization, including a read-only auditor key | Yes: the node's receipt under the KMS CA; `alpha evidence verify-decisions` |
+| The KMS's decisions about the organization's Instances: every `attest`, `secret.get` and `key.derive`, granted or refused, plus every earlier export | `POST /v1/decisions/export` on the KMS (`alpha evidence decisions`) | Any active key of the organization | Yes: the node's receipt under the KMS CA; `alpha evidence verify-decisions` |
 | One Instance's attestation: the request, the KMS receipt and the leaf, with which verifiers attested it (Alpha, NVIDIA, Fortanix) | `GET /v1/evidence-bundle` on the runtime socket (clear claims, #90); the App decides whom to show it | Whoever the App shows it to | Yes: `alpha_client::attestation::verify_bundle` |
 | Fresh TDX + GPU evidence of a running pod over a nonce the customer chooses | `GET /v1/evidence` on the runtime socket (I2, #92; off unless the measured config enables it) | Whoever the App shows it to | It is evidence, appraised like the KMS appraises it |
 | CCM attestation records | The customer's own CCM account | The customer's CCM users | F5 |
@@ -31,11 +31,6 @@ either.
 - **Request.** A body signed under `alphacompute/decisions-export/v1` by any active key of the
   organization. Payload: `{after_seq, limit, issued_at}`, where `limit` is 1 to 500 and
   `issued_at` is within 5 minutes.
-- **Who signs it.** A member key (any ordinary key of the organization) or an **auditor key**.
-  An auditor key is read-only: it signs the export and nothing else. The KMS refuses it, as
-  `forbidden` (403), on every Control write: registering or revoking a Revision, putting a
-  Secret, registering or revoking a key. It also cannot register keys of its own. Secrets and
-  derived keys go only to attested Instances, never to a principal key of any kind.
 - **Answer.** `alphacompute-kms-decisions/1`:
   - `org_id`;
   - `request`, the body exactly as the KMS received it;
@@ -54,20 +49,9 @@ either.
 - **Audited.** Every export, and every refused export, is itself an audit row. The organization
   sees each time its record was read.
 
-An existing member key registers the customer's auditor key with an ordinary key registration
-(`POST /v1/keys`, signed under `alphacompute/principal-key/v1`), with `"kind": "auditor"` in the
-payload. The kind sits in the document the registering key signs, so the chain walk re-reads it on
-every call and nobody can change it in the database. The registration is audited
-(`key.register`, `details.kind`), and so is every export (`decisions.export`, `details.kind`).
-
 ```sh
-# A member key registers the auditor's key. auditor-key.json is the payload:
-#   {"principal_id": "<auditor uuid>", "public_key": "<the auditor key's SPKI, base64url>",
-#    "label": "auditor", "kind": "auditor"}
-alpha call register-key --key org.key --key-id <uuid> auditor-key.json
-# The auditor exports with it:
-alpha evidence decisions --key auditor.key --key-id <auditor key id> > decisions-0.json
-alpha evidence decisions --key auditor.key --key-id <auditor key id> --after-seq <next_after_seq> > decisions-1.json
+alpha evidence decisions --key org.key --key-id <uuid> > decisions-0.json
+alpha evidence decisions --key org.key --key-id <uuid> --after-seq <next_after_seq> > decisions-1.json
 # The auditor, with the signed platform document:
 alpha evidence verify-decisions --platform platform.signed.json decisions-0.json
 ```
@@ -94,21 +78,20 @@ alpha evidence verify-decisions --platform platform.signed.json decisions-0.json
   without Fortanix online; and how a DSM key-release log entry names the client (the leaf's DNS
   name, its serial, or the DSM App only). The last one decides whether an auditor can line up
   a DSM release with the KMS `attest` row of the same Instance.
-- TODO(PRD-06 Q90): once F5 and F8 are answered, add a short "line them up" procedure: KMS `attest`
+- TODO(draft): once F5 and F8 are answered, add a short "line them up" procedure: KMS `attest`
   row → leaf → DSM log entry for that leaf → CCM record for the same evidence (I2).
 
 ## Open questions
 
-Numbered program-wide; the same numbers are in `QUESTION(PRD-06 Qn)` in the code and in the PR.
+Numbered program-wide; the same numbers are in `QUESTION(PRD-06 Qn)` in the code and in the draft PR.
 
 - **Q87 (Ryan Tharp)** Which audit actions count as decisions. Today: `attest`, `secret.get`,
   `key.derive` and the exports. Proposed: add the organization's own Control rows
   (`revision.register`, `revision.revoke`, `secret.put`, `key.register`, `key.revoke`) in a
   follow-up, because they show who approved what.
-- **Q88 (Ryan Tharp, security sign-off)** Who may export. Implemented as proposed, subject to
-  sign-off: any active key of the organization. That includes a read-only auditor key kind (above),
-  so the customer's auditor holds no key that can register a Revision or put a Secret. Member keys
-  keep the export, because a key that can already write can also read.
+- **Q88 (Ryan Tharp)** Who may export. Today: any active key of the organization. Proposed: a
+  read-only auditor key kind before the pilot. The customer's auditor would then hold no key that
+  can register a Revision or put a Secret.
 - **Q89 (Ryan Tharp)** What the export cannot prove: completeness and unattributed refusals.
   - Completeness. Proposed: once the chained audit log (#95) lands, the answer carries each row's
     chain hash and the receipt names the chain head, so a verifier can check that consecutive
