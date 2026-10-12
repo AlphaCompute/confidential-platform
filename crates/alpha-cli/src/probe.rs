@@ -144,18 +144,24 @@ fn client(pin: Option<Pin>, time: &TimeProvider) -> Result<reqwest::Client, Stri
         .map_err(|e| format!("http client: {e}"))
 }
 
-/// The KMS error envelope as `code: message`; any other body as its first 200 characters.
+/// The KMS error envelope as `code: message`; any other body, such as an ingress's HTML error
+/// page, as its first 200 characters. Either is one line, since it goes into a finding: each run
+/// of whitespace, line breaks included, reads as one space, before the body is cut.
 fn body_text(bytes: &[u8]) -> String {
     let value: Option<Value> = serde_json::from_slice(bytes).ok();
     if let Some(error) = value.as_ref().and_then(|v| v.get("error")) {
         let field = |name: &str| error.get(name).and_then(Value::as_str).unwrap_or("?");
-        return format!("{}: {}", field("code"), field("message"));
+        return one_line(&format!("{}: {}", field("code"), field("message")));
     }
-    String::from_utf8_lossy(bytes)
-        .trim()
+    one_line(&String::from_utf8_lossy(bytes))
         .chars()
         .take(200)
         .collect()
+}
+
+/// `text` with each run of whitespace as one space and none at either end.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 struct Answer {
@@ -432,5 +438,22 @@ mod tests {
         assert_eq!(body_text(envelope), "internal: database: down");
         assert_eq!(body_text(b"  plain\n"), "plain");
         assert_eq!(body_text("x".repeat(500).as_bytes()).len(), 200);
+    }
+
+    #[test]
+    fn a_body_reads_as_one_line() {
+        let page = b"<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n\
+            <center><h1>502 Bad Gateway</h1></center>\r\n</body>\r\n</html>\r\n";
+        assert_eq!(
+            body_text(page),
+            "<html> <head><title>502 Bad Gateway</title></head> <body> \
+             <center><h1>502 Bad Gateway</h1></center> </body> </html>"
+        );
+        // Collapsed before the cut, so the 200 characters are all the body's own.
+        let spread = format!("\n\n{}", "a\n\t \n".repeat(300));
+        assert_eq!(body_text(spread.as_bytes()), "a ".repeat(100));
+        let envelope = br#"{"error":{"code":"internal","message":"database:\n  down"}}"#;
+        assert_eq!(body_text(envelope), "internal: database: down");
+        assert_eq!(body_text("ready\u{a0}\u{2028}now".as_bytes()), "ready now");
     }
 }
