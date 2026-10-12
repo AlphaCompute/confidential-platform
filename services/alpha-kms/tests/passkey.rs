@@ -217,6 +217,34 @@ async fn a_passkey_signed_revision_attests_reads_its_secret_and_derives_its_key(
 }
 
 #[tokio::test]
+async fn a_passkey_registers_a_revision_v2_whose_kata_pod_attests() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    set_signer(&h, 2, &[&origin()]).await;
+    let mut doc = common::kata::kata_document(3);
+    doc["signer"] = json!(h.node.platform_document().unwrap().signer);
+    common::kata::publish(&h, doc).await;
+    let PasskeyOrg { org, admin, .. } = passkey_org(&h, 65).await;
+    let pod = common::kata::Pod::cpu(AppId::mint());
+    let payload = json!({ "app_id": pod.app, "compose": pod.revision().canonical().unwrap() });
+    let (status, reply) = h
+        .post(
+            "/v1/revisions",
+            admin.1.signed(context::REVISION, payload, Some(admin.0)),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    assert_eq!(reply["compose_hash"], json!(pod.hash()));
+
+    let reply = pod.attest(&h).await.unwrap();
+    assert_eq!(
+        reply["attestation_result"]["revision"],
+        json!({ "compose_hash": pod.hash(), "app_id": pod.app, "org_id": org })
+    );
+}
+
+#[tokio::test]
 async fn a_second_passkey_signs_every_control_route() {
     let Some(h) = harness().await else {
         return;

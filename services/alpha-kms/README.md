@@ -16,6 +16,7 @@ Control bodies are signed `ed25519` or `webauthn-es256`, a passkey's WebAuthn as
 | `ALPHACOMPUTE_KMS_ENDPOINTS` | comma-separated `https://…` of the KMS nodes; walked on a sealed start to `join` |
 | `ALPHACOMPUTE_PCCS_URL` | PCCS for DCAP collateral, fetched per attestation |
 | `ALPHACOMPUTE_PLATFORM_DOCUMENT_URL` | the release-signed platform document, fetched on start and every five minutes |
+| `ALPHACOMPUTE_FORTANIX_CCM_URL` | optional `https://` endpoint of the Fortanix CCM GPU backend, which refuses every GPU until F8; unset, a `gpu_policy` listing `fortanix-ccm` refuses every GPU pod |
 | `ALPHACOMPUTE_KMS_DEV_ROOT_KEK` | `dev-root` feature only: 64 hex digits used as the root KEK instead of the custodians' shares |
 
 `alpha-kms migrate` applies `migrations/` (expand-only) and returns; run it as the schema owner. The service then reads its event log from the CCEL table and `/run/log/dstack`, generates its P-256 runtime key and X-Wing key, and comes up sealed: it joins the first ready endpoint or waits for two `unseal` shares (or, on an empty database, a `bootstrap`).
@@ -29,6 +30,8 @@ The image is `images/kms/Dockerfile` (`alpha-kms`, or `alpha-kms-dev` with `--bu
 `cargo test -p alpha-kms` runs the unit tests always and `tests/db.rs` when `DATABASE_URL` points at a Postgres the tests may `create database` in (each test makes its own). The db tests attest with real Phala quotes from `testdata/attest/*-keyed`, pinned to the capture's time, nonce key and collateral, and cover the server side of every route: bootstrap once, unseal with one and two shares, join only for an attested, listed, requesting node; the Control API's checks and idempotency; sealed puts and their refusals; attestation, release, revocation on the next call, the derived key's stability across Revisions and separation across Apps with an audit row for every refusal, re-verification of a tampered row, the anchor and chain rules, `cert_invalid` for a self-signed client certificate; the monotone platform document; and the append-only audit role.
 
 `tests/passkey.rs`, on the same database, covers passkey signatures: a captured iCloud Keychain assertion claiming an organization, software passkeys on every Control route, attestation, secret read and key derivation, and the refusals without a signer, on a dropped origin, under another organization's key and for a stored row missing its fields.
+
+`tests/kata.rs`, on the same database, covers Kata confidential pods (`docs/kata-attestation.md`) over synthetic quotes: Revision v2 registration, a GPU pod's and a CPU pod's leaf naming their Revision v2, evidence v2 through the route reaching DCAP, and an audit row for an unregistered or revoked Revision v2, a GPU backend the node does not run or that refuses, and a failed TD or GPU check.
 
 `tests/cli.rs` drives `alpha-cli`'s library functions against the same in-process node (`crates/alpha-cli/README.md`).
 
