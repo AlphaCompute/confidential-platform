@@ -1,8 +1,10 @@
 # alpha-kms
 
-The key broker of the trust plane: six tables, fourteen `/v1` routes on one TLS port (`:8443`, TLS 1.3, `X25519MLKEM768`), plus `GET /healthz` (process only) and `GET /ready` (database checked, `{"sealed": …}`).
+The key broker of the trust plane: seven tables, seventeen `/v1` routes on one TLS port (`:8443`, TLS 1.3, `X25519MLKEM768`), plus `GET /healthz` (process only) and `GET /ready` (database checked, `{"sealed": …}`).
 
 The Instance API is `POST /v1/attest/nonce`, `POST /v1/attest`, and two routes that need the Instance's leaf as a client certificate: `GET /v1/secrets/{name}` and `POST /v1/keys/derive`. The last answers `{"key"}`, 32 bytes derived from the organization's `org_key` and the leaf's App id for the requested `purpose`, the same for every Revision of the App; it is how an App holds a key no person ever sees, and nothing but an attested Instance reaches it.
+
+`POST /v1/attest/ccm` issues a Fortanix CCM-attested workload a leaf of its own kind (PRD-06 I5, `docs/fortanix-ccm-identities.md`), only inside a CCM zone the platform document's `fortanix_ccm` pins and for an identity its organization allow-listed with `POST /v1/ccm-identities` (revoked with `POST /v1/ccm-identities/{id}/revoke`). That leaf names no Revision, so the two Instance routes above refuse it; until Fortanix answers F5 and F8 the route refuses every CCM certificate.
 
 `POST /v1/channel` answers an inner-channel handshake with the node's leaf and a ticket, and `PUT /v1/secrets/{name}` then takes the value either as `value` or as `sealed: {ticket, frame}`, whose plaintext begins with the signing digest of the put's payload, so a relay sees only ciphertext; any node of the deployment opens the ticket within ten minutes.
 
@@ -31,7 +33,7 @@ The image is `images/kms/Dockerfile` (`alpha-kms`, or `alpha-kms-dev` with `--bu
 
 `tests/passkey.rs`, on the same database, covers passkey signatures: a captured iCloud Keychain assertion claiming an organization, software passkeys on every Control route, attestation, secret read and key derivation, and the refusals without a signer, on a dropped origin, under another organization's key and for a stored row missing its fields.
 
-`tests/kata.rs`, on the same database, covers Kata confidential pods (`docs/kata-attestation.md`) over synthetic quotes: Revision v2 registration, a GPU pod's and a CPU pod's leaf naming their Revision v2, evidence v2 through the route reaching DCAP, and an audit row for an unregistered or revoked Revision v2, a GPU backend the node does not run or that refuses, and a failed TD or GPU check. `tests/malicious_host.rs` is the malicious-host core suite (`docs/kata-attestation.md`): every case a hostile host can try on a Kata pod's attestation, each refused with its named reason and audit row; CI runs it as its own step.
+`tests/kata.rs`, on the same database, covers Kata confidential pods (`docs/kata-attestation.md`) over synthetic quotes: Revision v2 registration, a GPU pod's and a CPU pod's leaf naming their Revision v2, evidence v2 through the route reaching DCAP, and an audit row for an unregistered or revoked Revision v2, a GPU backend the node does not run or that refuses, and a failed TD or GPU check. `tests/ccm.rs` covers PRD-06 I5: no leaf without a pinned zone, an allow-listing, its signature or after its revocation, a CCM leaf that the Instance routes refuse, and the route refusing a valid CCM chain at the identity step until F5. `tests/malicious_host.rs` is the malicious-host core suite (`docs/kata-attestation.md`): every case a hostile host can try on a Kata pod's attestation, each refused with its named reason and audit row; CI runs it as its own step.
 
 `tests/cli.rs` drives `alpha-cli`'s library functions against the same in-process node (`crates/alpha-cli/README.md`).
 
