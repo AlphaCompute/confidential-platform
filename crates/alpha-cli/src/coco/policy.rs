@@ -38,8 +38,9 @@ pub const RULES: &str = include_str!("genpolicy/alpha-rules.rego");
 /// genpolicy 4.1.0's default `genpolicy-settings.json`, as released.
 const UPSTREAM_SETTINGS: &str = include_str!("genpolicy/genpolicy-settings.json");
 /// The settings drop-ins genpolicy applies to its defaults (RFC 6902 patches, in name order):
-/// #82's Alpha baseline, byte for byte, and the KMS endpoints variable.
-pub const SETTINGS_DROP_INS: [(&str, &str); 2] = [
+/// #82's Alpha baseline, byte for byte, the KMS endpoints variable, and `HOSTNAME` held to a DNS
+/// label (#82's too, byte for byte).
+pub const SETTINGS_DROP_INS: [(&str, &str); 3] = [
     (
         "30-alpha-baseline.json",
         include_str!("genpolicy/genpolicy-settings.d/30-alpha-baseline.json"),
@@ -48,6 +49,10 @@ pub const SETTINGS_DROP_INS: [(&str, &str); 2] = [
         "40-alpha-kms-endpoints.json",
         include_str!("genpolicy/genpolicy-settings.d/40-alpha-kms-endpoints.json"),
     ),
+    (
+        "50-alpha-hostname.json",
+        include_str!("genpolicy/genpolicy-settings.d/50-alpha-hostname.json"),
+    ),
 ];
 /// What genpolicy prints between the rules and the data.
 const DATA_PREFIX: &str = "\npolicy_data := ";
@@ -55,12 +60,25 @@ const DATA_PREFIX: &str = "\npolicy_data := ";
 /// the endpoints are only where to connect, since the runtime pins the KMS CA and Revisions. The
 /// policy admits the variable only as a list of `https://host[:port]` (the `40-` drop-in).
 pub const KMS_ENDPOINTS_ENV_REGEX: &str = "^ALPHACOMPUTE_KMS_ENDPOINTS=https://[a-z0-9.-]{1,253}(:[1-9][0-9]{0,3}|:[1-5][0-9]{4}|:6[0-4][0-9]{3}|:65[0-4][0-9]{2}|:655[0-2][0-9]|:6553[0-5])?(,https://[a-z0-9.-]{1,253}(:[1-9][0-9]{0,3}|:[1-5][0-9]{4}|:6[0-4][0-9]{3}|:65[0-4][0-9]{2}|:655[0-2][0-9]|:6553[0-5])?){0,7}$";
+/// `HOSTNAME` as the host may set it: the pod's name, one lowercase DNS label (the `50-` settings
+/// drop-in). genpolicy's `$(dns_label)` also admits `.` and `_`, so a host could set
+/// `HOSTNAME=sealed.<JWS>` copied from the policy and have the agent unseal one of the App's
+/// Secrets into a container that was never given it (Option B, sealed secrets).
+pub const HOSTNAME_ENV_REGEX: &str = "^HOSTNAME=[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$";
+/// Placeholders genpolicy's rules (`allow_var`, "always_allowed") let the host fill with any
+/// value at all. genpolicy writes `HOSTNAME=$(host-name)` into every container; a host could
+/// then set `HOSTNAME=sealed.<JWS>` copied from the policy and have the agent unseal one of the
+/// App's Secrets into a container never given it. The generators pin `HOSTNAME` to the sandbox's
+/// name instead (`$(sandbox-name)`, see [`pin_hostname`]).
+pub const ANY_VALUE_PLACEHOLDERS: [&str; 3] = ["$(host-name)", "$(node-name)", "$(pod-uid)"];
+/// genpolicy 4.1.0's own `HOSTNAME` pattern, which the `50-` drop-in replaces.
+const GENPOLICY_HOSTNAME_ENV_REGEX: &str = "^HOSTNAME=$(dns_label)$";
 /// The only environment variables the host may add to a container beyond those the policy
 /// lists: the pod's hostname, the API server's `KUBERNETES_*` (the baseline drop-in), and the KMS
 /// endpoints. Service links and the cloud identity variables genpolicy admits by default are not
-/// among them. A policy may admit fewer.
+/// among them, and none admits a value that starts `sealed.`. A policy may admit fewer.
 pub const ALLOWED_ENV_REGEX: [&str; 10] = [
-    "^HOSTNAME=$(dns_label)$",
+    HOSTNAME_ENV_REGEX,
     "^KUBERNETES_PORT_$(ip_p)_TCP=tcp://$(ipv4_a):$(ip_p)$",
     "^KUBERNETES_PORT_$(ip_p)_TCP_PROTO=tcp$",
     "^KUBERNETES_PORT_$(ip_p)_TCP_PORT=$(ip_p)$",
@@ -129,6 +147,26 @@ pub struct Verified {
     pub data: Value,
 }
 
+/// genpolicy's `HOSTNAME=$(host-name)`, which its rules let the host set to anything (a sealed
+/// value copied from the policy included), pinned to the sandbox's name: the rules then match it
+/// against the sandbox's name, which the policy's sandbox-name pattern holds. Kubernetes sets a
+/// pod's `HOSTNAME` to the pod's name, which is the sandbox's.
+// ponytail: G0 — confirm containerd 2.3.x sets HOSTNAME to the full pod name on the pinned
+// stack; a pod name over 63 characters is truncated and would refuse every container (closed).
+/// Anything but the Alpha rules followed by data is returned as it is, for `verify` to refuse.
+pub fn pin_hostname(policy: &str) -> String {
+    match policy
+        .strip_prefix(RULES)
+        .and_then(|rest| rest.strip_prefix(DATA_PREFIX))
+    {
+        Some(data) => {
+            let data = data.replace("\"HOSTNAME=$(host-name)\"", "\"HOSTNAME=$(sandbox-name)\"");
+            format!("{RULES}{DATA_PREFIX}{data}")
+        }
+        None => policy.to_owned(),
+    }
+}
+
 /// Accepts `policy` only as genpolicy 4.1.0's rules followed by `policy_data` that holds the
 /// baseline; a single trailing newline, which an editor adds, is allowed.
 pub fn verify(policy: &str) -> Result<Verified, String> {
@@ -164,6 +202,14 @@ pub fn verify(policy: &str) -> Result<Verified, String> {
         ));
     }
     let admitted_env = at("/request_defaults/CreateContainerRequest/allow_env_regex");
+    if admitted_env
+        .as_array()
+        .is_some_and(|list| list.contains(&json!(GENPOLICY_HOSTNAME_ENV_REGEX)))
+    {
+        return Err(bad(
+            "allow_env_regex admits genpolicy's HOSTNAME pattern, under which the host may set HOSTNAME to a sealed secret; regenerate it with the 50-alpha-hostname.json drop-in `alpha coco genpolicy-settings` writes",
+        ));
+    }
     if !admitted_env.as_array().is_some_and(|list| {
         list.iter()
             .all(|r| r.as_str().is_some_and(|r| ALLOWED_ENV_REGEX.contains(&r)))
@@ -203,6 +249,18 @@ pub fn verify(policy: &str) -> Result<Verified, String> {
                 .pointer(&format!("/OCI/Annotations/{}", key.replace('/', "~1")))
                 .and_then(Value::as_str)
         };
+        let any_value = container
+            .pointer("/OCI/Process/Env")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .find(|e| ANY_VALUE_PLACEHOLDERS.iter().any(|p| e.contains(p)));
+        if let Some(var) = any_value {
+            return Err(bad(&format!(
+                "{var} lets the host set any value; regenerate it with alpha coco render or wrap"
+            )));
+        }
         if annotation(TYPE_ANNOTATION) == Some("sandbox") {
             continue;
         }
@@ -578,6 +636,10 @@ mod tests {
             sha(SETTINGS_DROP_INS[0].1),
             "da88e7dec050a4f30407bf60c81c5ba37e93beff0f3350909cbc56a877bd4247"
         );
+        assert_eq!(
+            sha(SETTINGS_DROP_INS[2].1),
+            "795746447fd4a2ddb29d2b95899066467c2618ef4225be8ca1010e64c9cbb1eb"
+        );
         assert_eq!(apply(UPSTREAM_RULES, RULES_PATCH), RULES);
         for rule in PATCH_RULES {
             assert!(RULES.contains(rule) && !UPSTREAM_RULES.contains(rule));
@@ -632,7 +694,7 @@ mod tests {
     #[test]
     fn verify_refuses_every_loosening() {
         type Change = fn(&mut Value);
-        let cases: [(&str, Change); 12] = [
+        let cases: [(&str, Change); 15] = [
             ("ExecProcessRequest", |d| {
                 d["request_defaults"]["ExecProcessRequest"]["allowed_commands"] = json!([["sh"]])
             }),
@@ -653,7 +715,18 @@ mod tests {
             }),
             ("allow_env_regex", |d| {
                 d["request_defaults"]["CreateContainerRequest"]["allow_env_regex"] =
-                    json!(["^HOSTNAME=$(dns_label)$", "^.*$"])
+                    json!([HOSTNAME_ENV_REGEX, "^.*$"])
+            }),
+            ("genpolicy's HOSTNAME pattern", |d| {
+                d["request_defaults"]["CreateContainerRequest"]["allow_env_regex"][0] =
+                    json!("^HOSTNAME=$(dns_label)$")
+            }),
+            ("lets the host set any value", |d| {
+                d["containers"][1]["OCI"]["Process"] =
+                    json!({ "Env": ["PATH=/bin", "HOSTNAME=$(host-name)"] })
+            }),
+            ("lets the host set any value", |d| {
+                d["containers"][0]["OCI"]["Process"] = json!({ "Env": ["UID=$(pod-uid)"] })
             }),
             ("guest", |d| {
                 d["cluster_config"]["guest_pull"] = json!(false)
@@ -707,6 +780,39 @@ mod tests {
             1,
         );
         assert!(verify(&duplicate).is_err());
+    }
+
+    #[test]
+    fn hostname_is_pinned_to_the_sandbox_name() {
+        let mut d = data();
+        d["containers"][1]["OCI"]["Process"] =
+            json!({ "Env": ["PATH=/bin", "HOSTNAME=$(host-name)"] });
+        let generated = policy(&d);
+        assert!(
+            verify(&generated)
+                .unwrap_err()
+                .contains("HOSTNAME=$(host-name) lets the host set any value")
+        );
+        let pinned = pin_hostname(&generated);
+        assert_eq!(
+            pinned,
+            generated.replace("\"HOSTNAME=$(host-name)\"", "\"HOSTNAME=$(sandbox-name)\"")
+        );
+        let verified = verify(&pinned).unwrap();
+        assert_eq!(
+            verified.data["containers"][1]["OCI"]["Process"]["Env"],
+            json!(["PATH=/bin", "HOSTNAME=$(sandbox-name)"])
+        );
+        // The rules, which name $(host-name) themselves, are left alone, and so is anything that
+        // is not the Alpha rules followed by data.
+        assert!(pinned.starts_with(RULES) && RULES.contains("\"$(host-name)\""));
+        let unpatched = generated.replacen(RULES, UPSTREAM_RULES, 1);
+        assert_eq!(pin_hostname(&unpatched), unpatched);
+        // Under the drop-ins, the host may set HOSTNAME only to one lowercase DNS label.
+        let settings = effective_settings();
+        let admitted = &settings["request_defaults"]["CreateContainerRequest"]["allow_env_regex"];
+        assert_eq!(admitted[0], json!(HOSTNAME_ENV_REGEX));
+        assert!(!admitted.to_string().contains("HOSTNAME=$(dns_label)"));
     }
 
     /// #82's fixtures (`testdata/agent-policy/*/policy.rego` on `prd02/13-malicious-host-full`),
