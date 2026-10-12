@@ -18,6 +18,7 @@
 mod event_log;
 pub mod gpu;
 pub mod kata;
+pub mod node;
 
 use std::fmt;
 use std::str::FromStr;

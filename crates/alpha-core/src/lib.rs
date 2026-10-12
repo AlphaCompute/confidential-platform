@@ -24,7 +24,7 @@ pub use compose::{
     hex_bytes,
 };
 pub use id::{AppId, KeyId, OrgId, PrincipalId, RequestId, SecretId};
-pub use platform::{CatalogKey, KmsRevision, Signer};
+pub use platform::{CatalogKey, KmsRevision, KmsRevisionKind, Signer};
 pub use signing::{context, jcs, parse, signing_digest};
 
 /// `{algorithm, signature}`, the signature in base64url.

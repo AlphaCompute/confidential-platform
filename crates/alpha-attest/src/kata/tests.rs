@@ -6,7 +6,7 @@
 use alpha_core::coco::{
     CPU_RUNTIME_CLASS, GPU_RUNTIME_CLASS, InitData, REVISION_FORMAT, RuntimeClass,
 };
-use alpha_core::{AppId, KmsRevision};
+use alpha_core::{AppId, KmsRevision, KmsRevisionKind};
 
 use std::sync::Arc;
 
@@ -323,6 +323,7 @@ fn kms_node_revision_must_be_in_the_platform_document() {
             compose_hash: pod.revision_hash(),
             build: "b".into(),
             source_url: "u".into(),
+            kind: KmsRevisionKind::KataTdx,
         });
         assert_eq!(
             pod.appraise(&doc).unwrap().compose_hash,
