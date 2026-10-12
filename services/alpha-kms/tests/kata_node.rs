@@ -30,12 +30,17 @@ use alpha_client::{JoinReply, NodeEvidence, Pin, tls as client_tls};
 use alpha_core::coco::{CPU_RUNTIME_CLASS, GPU_RUNTIME_CLASS};
 use alpha_core::{AppId, ComposeHash};
 use alpha_crypto::PrivateKey;
-use alpha_kms::{Clock, CollateralSource, Config, Node, NodeGuest, certs, node, platform, tls};
+use alpha_kms::{
+    Clock, CollateralSource, Config, Intermediates, Node, NodeGuest, audit, certs, db_auth,
+    instance, node, platform, tls,
+};
 use common::kata::{POLICY, Pod, fresh_nonce, initdata, kata_document, publish};
 use common::*;
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 /// The KMS App's init-data on the CPU class: what `alpha coco render` makes of
 /// `deploy/coco/platform/alpha-kms.yaml`.
@@ -86,6 +91,27 @@ async fn start_kata_node(
     release: &ReleaseServer,
     initdata: &str,
 ) -> (Arc<Node>, String, tokio::sync::oneshot::Sender<()>) {
+    start_kata_node_with(pool, release, initdata, false).await
+}
+
+/// [`start_kata_node`], in client-cert mode (D10) when `client_cert`: as `main.rs` sets it up, on
+/// a pool of its own whose connections carry no certificate until the node holds the volume key,
+/// with `pool`'s options as the base.
+async fn start_kata_node_with(
+    pool: PgPool,
+    release: &ReleaseServer,
+    initdata: &str,
+    client_cert: bool,
+) -> (Arc<Node>, String, tokio::sync::oneshot::Sender<()>) {
+    let base = (*pool.connect_options()).clone();
+    let pool = if client_cert {
+        PgPoolOptions::new()
+            .max_connections(4)
+            .acquire_timeout(std::time::Duration::from_secs(10))
+            .connect_lazy_with(base.clone())
+    } else {
+        pool
+    };
     let collateral = serde_json::from_slice(&read(KEYED, "collateral.json")).unwrap();
     let config = Config {
         kms_endpoints: vec![],
@@ -107,6 +133,9 @@ async fn start_kata_node(
         release.key.verifying_key(),
     )
     .unwrap();
+    if client_cert {
+        db_auth::enable(&node, base);
+    }
     platform::start(&node).await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("https://{}", listener.local_addr().unwrap());
@@ -407,11 +436,13 @@ async fn a_kata_node_joins_a_prototype_node_and_serves_under_the_same_ca() {
     }
     assert!(joiner.is_sealed());
 
-    // Appraised but never asked for: no node.join.request row for this key.
+    // Appraised but never asked for: no node.join.request row for this key. In `url` mode the
+    // joiner writes its own row and the request asks nothing of the serving node (D10).
     let nonce = fresh_nonce(&h);
     let request = node::join_request(&joiner, b64(&nonce), &h.url)
         .await
         .unwrap();
+    assert!(!request.db_client_cert);
     let stranger = p256::ecdsa::SigningKey::from_bytes((&[5u8; 32]).into()).unwrap();
     let stranger_spki = p256::pkcs8::EncodePublicKey::to_public_key_der(stranger.verifying_key())
         .unwrap()
@@ -443,6 +474,11 @@ async fn a_kata_node_joins_a_prototype_node_and_serves_under_the_same_ca() {
     let head = h.node.chain.floor().unwrap();
     assert_eq!(head.seq, h.audit_rows().await.last().unwrap().seq);
     assert_eq!(reply.audit_head, Some(head.to_wire()));
+    let requests = h.audit("node.join.request").await;
+    let (_, outcome, details) = requests.last().unwrap();
+    assert_eq!(outcome, "ok");
+    assert_eq!(details["endpoint"], json!(h.url));
+    assert!(details.get("recorded_by").is_none(), "{details}");
     node::finish_join(&joiner, &reply).await.unwrap();
     assert!(!joiner.is_sealed());
     assert_eq!(joiner.chain.floor().unwrap().seq, head.seq);
@@ -503,4 +539,239 @@ fn a_kms_node_identity_is_the_revision_v2_of_cpu_class_init_data_only() {
         .unwrap();
     assert!(err.contains("a KMS node runs on kata-qemu-tdx"), "{err}");
     assert!(NodeGuest::coco_with(b"not toml", synthetic_source(String::new())).is_err());
+}
+
+/// The `node.join.request` rows that name `spki`.
+fn requests_for(rows: &[(i64, String, Value)], spki: &[u8]) -> Vec<Value> {
+    let actor = alpha_kms::keys::sha256_hex(spki);
+    rows.iter()
+        .filter(|(_, _, details)| details["runtime_pubkey_sha256"] == json!(actor))
+        .map(|(_, _, details)| details.clone())
+        .collect()
+}
+
+/// D10, PRD-05 Q46: a Kata node in client-cert mode cannot reach the database before the join
+/// reply, so it writes no `node.join.request`; the serving node writes it once the joiner is
+/// appraised as a listed kata-tdx build, and for nothing else. The shared Postgres takes no client
+/// certificate, so the joiner pins the derived CA and never reaches it here; the cert-auth test
+/// below runs the same join to a serving joiner.
+#[tokio::test]
+async fn a_client_cert_kata_node_has_its_join_request_written_by_the_serving_node() {
+    let Some(h) = harness_with_clock(Arc::new(SystemTime::now)).await else {
+        return;
+    };
+    let initdata = kms_initdata();
+    let revision = kms_revision(&initdata);
+    publish(&h, kata_document(2)).await;
+    let (joiner, _joiner_url, _joiner) =
+        start_kata_node_with(h.pool.clone(), &h.release, &initdata, true).await;
+    // Refused by the database, it still holds the document in memory to pin the serving node.
+    assert!(db_auth::client_cert_mode(&joiner));
+    assert!(joiner.platform_document().is_some());
+
+    // The build is not listed: the appraisal refuses it, and no row is written for it.
+    let nonce = fresh_nonce(&h);
+    let request = node::join_request(&joiner, b64(&nonce), &h.url)
+        .await
+        .unwrap();
+    assert!(request.db_client_cert);
+    assert!(requests_for(&h.audit("node.join.request").await, &joiner.runtime_spki).is_empty());
+    let quote = Pod::quote_of(
+        &initdata,
+        CPU_RUNTIME_CLASS,
+        report_data(
+            &joiner.runtime_spki,
+            &nonce,
+            Some(request.xwing_pubkey.as_bytes()),
+        ),
+    );
+    let error = node::join_verified(&h.node, &joiner.runtime_spki, &request, quote)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, "attestation_unknown", "{}", error.message);
+    assert!(requests_for(&h.audit("node.join.request").await, &joiner.runtime_spki).is_empty());
+    assert_eq!(last_join(&h).await.0, "denied");
+
+    // Prototype evidence asking the serving node to write its row is refused before appraisal:
+    // a prototype node's env is not measured, so it writes its own.
+    let pkcs8 = read(KEYED, "runtime.key.pkcs8.der");
+    let cert = certs::self_signed(&certs::key_pair(&pkcs8).unwrap(), h.now()).unwrap();
+    let identity = format!("{}{}", text(KEYED, "runtime.key.pem"), certs::pem(&cert));
+    let (status, reply) = send(
+        client_with(&identity)
+            .post(format!("{}/v1/node/join", h.url))
+            .json(&json!({
+                "nonce": b64(&fresh_nonce(&h)),
+                "evidence": evidence(KEYED, "node"),
+                "xwing_pubkey": PrivateKey::generate().unwrap().public(),
+                "db_client_cert": true,
+            })),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::FORBIDDEN, "{reply}");
+    assert_eq!(code(&reply), "policy_denied");
+    let spki = certs::spki_of(&cert).unwrap();
+    assert!(requests_for(&h.audit("node.join.request").await, &spki).is_empty());
+
+    // Listed as a Kata build: the serving node writes the row, then hands over the intermediates
+    // with the volume key, from which the joiner's database certificate comes.
+    publish(&h, listing(kata_document(3), revision, "kata-tdx")).await;
+    let reply = join(&h, &joiner, &initdata, None).await.unwrap();
+    let requests = requests_for(&h.audit("node.join.request").await, &joiner.runtime_spki);
+    assert_eq!(
+        requests,
+        [json!({
+            "runtime_pubkey_sha256": alpha_kms::keys::sha256_hex(&joiner.runtime_spki),
+            "compose_hash": revision,
+            "recorded_by": "serving node",
+            "database_auth": "client-cert",
+        })]
+    );
+    let (outcome, details) = last_join(&h).await;
+    assert_eq!(outcome, "ok");
+    assert_eq!(details["compose_hash"], json!(revision));
+    let reply: JoinReply = serde_json::from_value(reply).unwrap();
+    let volume = h.node.db_volume_key().unwrap();
+    assert_eq!(reply.db_volume_key, Some(b64(volume.as_slice())));
+
+    // The joiner pins the database to the CA derived from that key, which this Postgres does not
+    // hold: it sends nothing and stays sealed.
+    assert!(node::finish_join(&joiner, &reply).await.is_err());
+    assert!(joiner.is_sealed());
+}
+
+/// The volume key `tests/db_auth.rs`'s `write_postgres_side` sets the cert-auth Postgres up for.
+const CERT_PG_VOLUME_KEY: [u8; 32] = [0x5a; 32];
+
+/// D10 end to end on a Postgres that admits KMS nodes by client certificate only, set up as
+/// `docs/db-client-auth.md` says ("Trying it"; CI's db-tests job starts one): skipped unless
+/// `ALPHACOMPUTE_DB_AUTH_ADMIN_URL` (a password login for migrations and for the prototype node,
+/// in `url` mode as during the migration) and `ALPHACOMPUTE_DB_AUTH_URL` (`alpha_kms_node`) are
+/// set. A client-cert Kata node joins a prototype node whose database has that volume key: the
+/// serving node writes its `node.join.request`, and the joiner issues itself a leaf from the
+/// derived CA and serves on that database. An unlisted Kata node gets no row and no key.
+#[tokio::test]
+async fn a_client_cert_kata_node_joins_and_serves_on_a_cert_auth_postgres() {
+    let (Ok(admin_url), Ok(node_url)) = (
+        std::env::var("ALPHACOMPUTE_DB_AUTH_ADMIN_URL"),
+        std::env::var("ALPHACOMPUTE_DB_AUTH_URL"),
+    ) else {
+        eprintln!("ALPHACOMPUTE_DB_AUTH_ADMIN_URL or ALPHACOMPUTE_DB_AUTH_URL unset; skipped");
+        return;
+    };
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await
+        .unwrap();
+    let name = format!("alpha_test_{}", Uuid::now_v7().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("create database {name}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let on_test_db = |url: &str| url.parse::<PgConnectOptions>().unwrap().database(&name);
+    let pool = PgPoolOptions::new()
+        .max_connections(4)
+        .connect_with(on_test_db(&admin_url))
+        .await
+        .unwrap();
+    alpha_kms::migrate(&pool).await.unwrap();
+
+    // The serving prototype node, on a database whose volume key the Postgres's CA comes from.
+    let initdata = kms_initdata();
+    let revision = kms_revision(&initdata);
+    let release = ReleaseServer::start(listing(kata_document(2), revision, "kata-tdx")).await;
+    let (serving, serving_url, _serving) = start_node(
+        pool.clone(),
+        &release.url,
+        &release.key,
+        Arc::new(SystemTime::now),
+    )
+    .await;
+    let (ca_key, ca_cert) = certs::new_ca(serving.now()).unwrap();
+    let keys = Intermediates::new(
+        Zeroizing::new(alpha_kms::random().unwrap()),
+        Zeroizing::new(ca_key),
+        ca_cert,
+    )
+    .unwrap()
+    .with_db_volume(Some(Zeroizing::new(CERT_PG_VOLUME_KEY)));
+    serving.start_serving(keys).await.unwrap();
+    let keys = serving.intermediates().unwrap();
+    let requests = || {
+        let (pool, metadata) = (&pool, &keys.metadata);
+        async move {
+            let mut rows = Vec::new();
+            audit::verify(pool, metadata, audit::Checkpoint::default(), |row| {
+                if row.entry.action == "node.join.request" {
+                    rows.push((row.seq, row.entry.outcome, row.entry.details));
+                }
+            })
+            .await
+            .unwrap();
+            rows
+        }
+    };
+
+    let node_pool = PgPoolOptions::new().connect_lazy_with(on_test_db(&node_url));
+    let join_with = |joiner: Arc<Node>, initdata: String| {
+        let (serving, serving_url) = (serving.clone(), serving_url.clone());
+        async move {
+            let nonce = instance::mint_nonce(&serving.nonce_key, serving.now()).unwrap();
+            let request = node::join_request(&joiner, b64(&nonce), &serving_url)
+                .await
+                .unwrap();
+            assert!(request.db_client_cert);
+            let quote = Pod::quote_of(
+                &initdata,
+                CPU_RUNTIME_CLASS,
+                report_data(
+                    &joiner.runtime_spki,
+                    &nonce,
+                    Some(request.xwing_pubkey.as_bytes()),
+                ),
+            );
+            node::join_verified(&serving, &joiner.runtime_spki, &request, quote).await
+        }
+    };
+
+    // An unlisted Kata build: refused, no row, no key, and the database still refuses it.
+    let app: AppId = "01a09f07-8d09-7640-94c1-bbdb74200a1f".parse().unwrap();
+    let unlisted = common::kata::initdata(app, CPU_RUNTIME_CLASS, None, POLICY);
+    let (stranger, _, _stranger) =
+        start_kata_node_with(node_pool.clone(), &release, &unlisted, true).await;
+    let error = join_with(stranger.clone(), unlisted).await.unwrap_err();
+    assert_eq!(error.code, "attestation_unknown", "{}", error.message);
+    assert!(requests_for(&requests().await, &stranger.runtime_spki).is_empty());
+    assert!(stranger.is_sealed());
+    assert!(
+        sqlx::query("select 1")
+            .execute(&stranger.pool)
+            .await
+            .is_err()
+    );
+
+    // The listed build joins: the serving node writes its row, the joiner's leaf from the derived
+    // CA reaches Postgres as alpha_kms_node, and it serves under the same CA.
+    let (joiner, _, _joiner) =
+        start_kata_node_with(node_pool.clone(), &release, &initdata, true).await;
+    assert!(joiner.platform_document().is_some());
+    let reply = join_with(joiner.clone(), initdata.clone()).await.unwrap();
+    let rows = requests_for(&requests().await, &joiner.runtime_spki);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["recorded_by"], "serving node");
+    let reply: JoinReply = serde_json::from_value(reply).unwrap();
+    node::finish_join(&joiner, &reply).await.unwrap();
+    assert!(!joiner.is_sealed());
+    assert_eq!(
+        joiner.intermediates().unwrap().ca_pem(),
+        serving.intermediates().unwrap().ca_pem()
+    );
+    let user: String = sqlx::query_scalar("select current_user::text")
+        .fetch_one(&joiner.pool)
+        .await
+        .unwrap();
+    assert_eq!(user, db_auth::ROLE);
+    // It reads and locks the stored platform document as any serving node does.
+    platform::reload(&joiner).await.unwrap();
 }

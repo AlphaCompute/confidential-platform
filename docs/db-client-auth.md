@@ -1,6 +1,6 @@
-# D10 (draft): how a KMS node authenticates to the trust-zone Postgres
+# D10 (proposed): how a KMS node authenticates to the trust-zone Postgres
 
-**Status: draft for Ryan Tharp's security sign-off. Nothing here has run in a Kata pod.** Code: `services/alpha-kms/src/db_auth.rs`, wired into `main.rs`, `db_volume::enter`, `node::bootstrap`, `node::join_request` / `finish_join` and the platform tick. Tests: the unit tests in `db_auth.rs`, and `services/alpha-kms/tests/db_auth.rs` against a real cert-auth Postgres (below).
+**Status: proposed, awaiting Ryan Tharp's security sign-off. Nothing here has run in a Kata pod.** Code: `services/alpha-kms/src/db_auth.rs`, wired into `main.rs`, `db_volume::enter`, `node::bootstrap`, `node::join_request` / `finish_join` and the platform tick. Tests: the unit tests in `db_auth.rs`; `services/alpha-kms/tests/db_auth.rs` and the client-cert join in `services/alpha-kms/tests/kata_node.rs` against a real cert-auth Postgres (below; CI's db-tests job starts one).
 
 ## The problem
 
@@ -45,13 +45,23 @@ alpha-kms  /^kms-node-[0-9a-f]{16}$     alpha_kms_node
 
 `ALPHACOMPUTE_DATABASE_AUTH=client-cert` and a URL without a password, e.g. `postgres://alpha_kms_node@postgres.alpha-verifier.svc:5432/alpha`. The node refuses a URL with a password, an `sslmode` other than `verify-full`, `sslcert`/`sslkey`/`sslrootcert`, and a user other than `alpha_kms_node`. In the default `url` mode a Kata node (`ALPHACOMPUTE_QUOTE_SOURCE` set) still refuses a URL with a password.
 
+### Join
+
+A joining node used to write its own `node.join.request` row before the join, and the serving node refuses a join without one: the row proved the joiner reaches *this* deployment's database. A client-cert joiner has no database credential until the join reply hands it the volume key, so it cannot write it. Q46 is implemented as proposed (subject to Ryan Tharp's sign-off):
+
+1. A Kata node in client-cert mode writes no row; its `POST /v1/node/join` request sets `db_client_cert: true`. In `url` mode the field is left out and the joiner writes its row as before, so that request is unchanged on the wire.
+2. The serving node refuses `db_client_cert` with prototype evidence (`policy_denied`, before appraisal): a prototype node's env is not measured, so it always writes its own row. A prototype node in client-cert mode refuses to join for the same reason.
+3. Otherwise the serving node appraises the joiner as before. Only once it is an attested Kata node whose Revision v2 is a `kata-tdx` entry of the release-signed `kms_revisions` does the serving node write the `node.join.request` row itself (`recorded_by: "serving node"`, `database_auth: "client-cert"`, the joiner's runtime key and Revision, sealed like any serving node's row). The row's job moves into attestation: the joiner's database URL, auth mode and KMS endpoints are measured env, fixed by that Revision. A joiner the appraisal refuses gets no row and no key.
+4. The reply carries the volume key as before. The joiner derives the CA, issues itself a leaf, points its pool at it (`finish_join`) and serves.
+
+An older serving node refuses `db_client_cert` as an unknown field, so a client-cert Kata node joins only a serving node from this release on.
+
 ## What is not done
 
-- **Join.** A joining node writes `node.join.request` before the join reply gives it the volume key, so in client-cert mode it has no credential to write it with. `join_request` refuses with an explicit error (open question Q46). Custodian unseal and genesis work.
 - **Migrations.** `alpha-kms migrate` needs a connection before any node holds the volume key; in client-cert mode it refuses (open question Q49).
 - **The Postgres pod side.** `alpha-volume open-db` (the init container, separate PRD-05 draft PR) opens the volume; it should also write `root.crt`, `server.crt` and `server.key` with `issue_server`, and `postgresql.conf` should name them. Not wired.
 - **Databases from before M2(a)** have no volume key, so client-cert mode cannot reach them; the share files must carry `db_volume_wrapped` (`enter` refuses otherwise).
-- **No in-process node test** of client-cert mode: the shared CI Postgres uses passwords, so only the certificate path is tested against a real server, locally.
+- **No in-process test of cold start in client-cert mode** (custodian unseal → wait → leaf → serve) against the cert-auth Postgres; join is tested end to end there, and the leaf path by itself.
 
 ## Open questions
 
@@ -59,7 +69,7 @@ Numbered program-wide (Q44–Q50); the numbers match `QUESTION(PRD-05 Qn)` in th
 
 - **Q44.** Which CA issues the client certificate? Proposed: the CA derived from the volume key, not the KMS CA, whose key lives in the database it would unlock (M4) and which also signs every tenant leaf.
 - **Q45.** Rotation? Proposed: node leaves one hour, renewed on the tick; the server certificate bounded at 30 days, renewed on pod restart; the CA never rotates.
-- **Q46.** What replaces `node.join.request` for a client-cert joiner? Proposed: the serving node writes it when it appraises the joiner.
+- **Q46.** What replaces `node.join.request` for a client-cert joiner? Implemented as proposed, subject to sign-off: the serving node writes it once it has appraised the joiner as a listed `kata-tdx` build ("Join" above).
 - **Q47.** Does Postgres verify the KMS's attestation or trust the CA? Proposed: trust the CA (possession of it is the attestation proxy).
 - **Q48.** Should a Kata node refuse `url` mode outright once D10 is decided? Proposed: yes.
 - **Q49.** Who runs migrations against the client-cert Postgres? Proposed: a serving node, at `start_serving`, under an advisory lock.
@@ -74,9 +84,14 @@ ALPHACOMPUTE_DB_AUTH_PG_DIR=$D cargo test -p alpha-kms --test db_auth write_post
 docker run -d --name pg-cert -p 127.0.0.1:55433:5432 -e POSTGRES_USER=alpha -e POSTGRES_PASSWORD=alpha \
   -e POSTGRES_DB=alpha -v $D:/certs-src:ro -v $D/init:/docker-entrypoint-initdb.d:ro --entrypoint bash postgres:18 \
   -c 'mkdir -p /certs && cp /certs-src/*.* /certs/ && chown -R postgres /certs && chmod 600 /certs/server.key &&
-      exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key
-      -c ssl_ca_file=/certs/root.crt -c hba_file=/certs/pg_hba.conf -c ident_file=/certs/pg_ident.conf
+      exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key \
+      -c ssl_ca_file=/certs/root.crt -c hba_file=/certs/pg_hba.conf -c ident_file=/certs/pg_ident.conf \
       -c ssl_min_protocol_version=TLSv1.3 -c log_connections=authentication'
-ALPHACOMPUTE_DB_AUTH_URL=postgres://alpha_kms_node@localhost:55433/alpha cargo test -p alpha-kms --test db_auth
+export ALPHACOMPUTE_DB_AUTH_URL=postgres://alpha_kms_node@localhost:55433/alpha
+export ALPHACOMPUTE_DB_AUTH_ADMIN_URL='postgres://alpha:alpha@localhost:55433/alpha?sslmode=require'
+cargo test -p alpha-kms --test db_auth
+cargo test -p alpha-kms --test kata_node client_cert   # with DATABASE_URL set as for the other db tests
 docker logs pg-cert 2>&1 | grep 'method=cert'   # identity="CN=kms-node-…"
 ```
+
+The `pg_hba.conf` the test writes adds a password login for `alpha` over TLS: the test's migrations, and the serving prototype node in `url` mode, as prototype nodes run during the migration.

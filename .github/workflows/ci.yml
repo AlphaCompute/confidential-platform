@@ -83,6 +83,28 @@ jobs:
           else
             echo "no service crate yet; skipping"
           fi
+      # D10: a second Postgres admitting KMS nodes by client certificate only, set up as
+      # docs/db-client-auth.md says, for alpha-kms's tests/db_auth.rs and kata_node.rs (client-cert
+      # join). Its key is the fixed test volume key; nothing else uses it.
+      - name: cert-auth Postgres (D10)
+        shell: bash
+        run: |
+          D="$RUNNER_TEMP/pg-cert"
+          mkdir -p "$D/init"
+          echo "create role alpha_kms nologin; create role alpha_kms_node login in role alpha_kms;" > "$D/init/01-role.sql"
+          ALPHACOMPUTE_DB_AUTH_PG_DIR="$D" cargo test -p alpha-kms --test db_auth write_postgres_side
+          docker run -d --name pg-cert -p 127.0.0.1:55433:5432 \
+            -e POSTGRES_USER=alpha -e POSTGRES_PASSWORD=alpha -e POSTGRES_DB=alpha \
+            -v "$D":/certs-src:ro -v "$D/init":/docker-entrypoint-initdb.d:ro --entrypoint bash postgres:18 \
+            -c 'mkdir -p /certs && cp /certs-src/*.* /certs/ && chown -R postgres /certs && chmod 600 /certs/server.key && exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key -c ssl_ca_file=/certs/root.crt -c hba_file=/certs/pg_hba.conf -c ident_file=/certs/pg_ident.conf -c ssl_min_protocol_version=TLSv1.3 -c log_connections=authentication'
+          # Over TCP: the entrypoint's init server listens on its socket only.
+          for _ in $(seq 60); do
+            docker exec -e PGPASSWORD=alpha pg-cert psql -h 127.0.0.1 -U alpha -d alpha -c 'select 1' >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec -e PGPASSWORD=alpha pg-cert psql -h 127.0.0.1 -U alpha -d alpha -c 'select 1'
+          echo "ALPHACOMPUTE_DB_AUTH_URL=postgres://alpha_kms_node@localhost:55433/alpha" >> "$GITHUB_ENV"
+          echo "ALPHACOMPUTE_DB_AUTH_ADMIN_URL=postgres://alpha:alpha@localhost:55433/alpha?sslmode=require" >> "$GITHUB_ENV"
       # PRD-02 deliverable 7, named so its result shows on its own; the workspace run repeats it.
       - name: malicious-host core suite
         run: cargo test -p alpha-kms --test malicious_host

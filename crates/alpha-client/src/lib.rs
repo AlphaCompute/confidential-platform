@@ -423,6 +423,13 @@ pub struct JoinRequest {
     /// `alphacompute-evidence/1` from a prototype node, `/2` from a Kata node.
     pub evidence: AnyEvidence,
     pub xwing_pubkey: PublicKey,
+    /// Set by a Kata node that reaches Postgres by client certificate (D10, PRD-05 Q46). Such a
+    /// node has no database credential until the join reply hands it the volume key, so it cannot
+    /// write its own `node.join.request` row; the serving node writes it once the joiner is
+    /// appraised as a listed `kata-tdx` build. Left out in `url` mode, so that request is
+    /// unchanged on the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub db_client_cert: bool,
 }
 
 pub const ROTATION_FORMAT: &str = "alphacompute-custodian-rotation/1";

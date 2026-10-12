@@ -452,6 +452,9 @@ async fn join_inner(
         .platform_document()
         .ok_or_else(|| ApiError::new("attestation_unknown", "no platform document"))?;
     let xwing = request.xwing_pubkey.as_bytes();
+    if request.db_client_cert {
+        crate::db_auth::check_serving_node_may_record(&request.evidence)?;
+    }
     let appraised = match (&request.evidence, verified) {
         (AnyEvidence::V1(_), Some(_)) => {
             return Err(ApiError::internal(
@@ -477,6 +480,24 @@ async fn join_inner(
             )?
         }
     };
+    if request.db_client_cert {
+        // D10, PRD-05 Q46: a client-cert Kata joiner holds no database credential before the
+        // reply, so this node writes its row, now that it is appraised as a listed kata-tdx build
+        // whose measured env fixes its database (`db_auth::JoinRow`). Nothing is written for a
+        // joiner the appraisal above refused.
+        node.audit(audit::node(
+            "node.join.request",
+            "ok",
+            json!({
+                "runtime_pubkey_sha256": keys::sha256_hex(spki),
+                "compose_hash": appraised.compose_hash,
+                "recorded_by": "serving node",
+                "database_auth": "client-cert",
+            }),
+        ))
+        .await?;
+        return Ok(appraised);
+    }
     let requested = sqlx::query_scalar!(
         "select exists(select 1 from audit_log
            where action = 'node.join.request' and outcome = 'ok'
@@ -495,8 +516,9 @@ async fn join_inner(
     Ok(appraised)
 }
 
-/// The start rule: sealed → the first endpoint whose `/ready` is 200 gets a
-/// `node.join.request` row and a join; nothing ready → wait for unseal.
+/// The start rule: sealed → the first endpoint whose `/ready` is 200 gets a join, after a
+/// `node.join.request` row (this node's in `url` mode, the serving node's for a client-cert Kata
+/// node); nothing ready → wait for unseal.
 pub async fn try_join(node: &Node) -> Result<(), ApiError> {
     let doc = node
         .platform_document()
@@ -523,27 +545,36 @@ async fn join_via(node: &Node, client: &Client, endpoint: &str) -> Result<(), Ap
     finish_join(node, &reply).await
 }
 
-/// The joining side's request over the serving node's `nonce`: a `node.join.request` row, which
-/// the serving node requires, then this node's evidence with its X-Wing key bound.
+/// The joining side's request over the serving node's `nonce`: this node's evidence with its
+/// X-Wing key bound, and the `node.join.request` row the serving node requires. In `url` mode this
+/// node writes the row; a Kata node in client-cert mode cannot reach the database yet, so it asks
+/// the serving node to write it ([`crate::db_auth::JoinRow`]).
 pub async fn join_request(
     node: &Node,
     nonce: String,
     endpoint: &str,
 ) -> Result<JoinRequest, ApiError> {
-    crate::db_auth::check_can_join(node)?;
     let raw = decode32("nonce", &nonce)?;
-    node.audit(audit::node(
-        "node.join.request",
-        "ok",
-        json!({ "runtime_pubkey_sha256": keys::sha256_hex(&node.runtime_spki), "endpoint": endpoint }),
-    ))
-    .await?;
     let xwing = node.xwing_key.public();
     let rd = report_data(&node.runtime_spki, &raw, Some(xwing.as_bytes()));
+    let evidence = node.guest.evidence(&rd)?;
+    let db_client_cert = match crate::db_auth::join_row(node, &evidence)? {
+        crate::db_auth::JoinRow::Joiner => {
+            node.audit(audit::node(
+                "node.join.request",
+                "ok",
+                json!({ "runtime_pubkey_sha256": keys::sha256_hex(&node.runtime_spki), "endpoint": endpoint }),
+            ))
+            .await?;
+            false
+        }
+        crate::db_auth::JoinRow::ServingNode => true,
+    };
     Ok(JoinRequest {
         nonce,
-        evidence: node.guest.evidence(&rd)?,
+        evidence,
         xwing_pubkey: xwing,
+        db_client_cert,
     })
 }
 

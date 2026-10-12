@@ -1,7 +1,7 @@
 //! D10 (draft): a KMS node's client certificate against a real Postgres configured as
 //! `docs/db-client-auth.md` says. Both tests are skipped unless their variable is set; the shared
-//! CI Postgres uses password authentication, so CI runs neither. `docs/db-client-auth.md`, "Trying
-//! it", starts the cert-auth Postgres they need.
+//! CI Postgres uses password authentication, so CI's db-tests job starts a second, cert-auth one
+//! with them, as `docs/db-client-auth.md`, "Trying it", does.
 
 #![allow(clippy::unwrap_used)]
 
@@ -16,6 +16,7 @@ const KEY: [u8; 32] = [0x5a; 32];
 
 /// With `ALPHACOMPUTE_DB_AUTH_PG_DIR`, writes the Postgres pod's side for [`KEY`] there:
 /// `root.crt` (the derived CA), `server.crt`, `server.key`, `pg_hba.conf`, `pg_ident.conf`.
+/// `services/alpha-kms/tests/kata_node.rs` joins a client-cert node on a database of this key.
 #[test]
 fn write_postgres_side() {
     let Ok(dir) = std::env::var("ALPHACOMPUTE_DB_AUTH_PG_DIR") else {
@@ -33,7 +34,13 @@ fn write_postgres_side() {
     )
     .unwrap();
     std::fs::write(dir.join("server.key"), key_pem).unwrap();
-    std::fs::write(dir.join("pg_hba.conf"), db_auth::PG_HBA).unwrap();
+    // Test only: the `alpha` password login runs migrations and stands for a prototype node in
+    // `url` mode, as during the migration (`kata_node.rs`, `ALPHACOMPUTE_DB_AUTH_ADMIN_URL`).
+    let hba = format!(
+        "{}hostssl all  alpha  0.0.0.0/0  scram-sha-256\nhostssl all  alpha  ::/0  scram-sha-256\n",
+        db_auth::PG_HBA
+    );
+    std::fs::write(dir.join("pg_hba.conf"), hba).unwrap();
     std::fs::write(dir.join("pg_ident.conf"), db_auth::PG_IDENT).unwrap();
 }
 

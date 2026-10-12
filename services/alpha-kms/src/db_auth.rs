@@ -36,6 +36,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use alpha_attest::AnyEvidence;
 use hkdf::Hkdf;
 use p256::pkcs8::EncodePrivateKey;
 use parking_lot::Mutex;
@@ -469,29 +470,58 @@ pub fn renew_if_due(node: &Node) {
     }
 }
 
-/// The joining side of `node.join.request` in client-cert mode.
+/// Who writes a joiner's `node.join.request` row, which the serving node requires before it
+/// hands over the intermediates.
 ///
-/// A joining node writes its `node.join.request` row *before* the join reply hands it the volume
-/// key, and the serving node refuses a join without that row. In client-cert mode the joining node
-/// has no database credential until the reply, so the row cannot be written.
-///
-/// QUESTION(PRD-05 Q46): what replaces the row for a client-cert joiner? Proposed: the serving node
-/// writes `node.join.request` itself when it mints the join nonce for an attested, listed Kata
-/// node, because the row's job (proof that the joiner holds the database credential) is exactly
-/// what D10 (a) moves into attestation. Until that is decided this refuses, so a client-cert node
-/// can be unsealed by custodians but cannot join.
-pub fn check_can_join(node: &Node) -> Result<(), ApiError> {
-    let Some(state) = node.db_auth.lock().clone() else {
-        return Ok(());
-    };
-    if state.installed(node.now()) {
-        return Ok(());
+/// In `url` mode the joiner writes it, with its own database credential, as before D10: the row
+/// proves the joiner reaches *this* deployment's database. A client-cert joiner has no database
+/// credential until the join reply hands it the volume key, so it cannot. For a Kata joiner the
+/// row's job moves into attestation (PRD-05 Q46, implemented as proposed; Ryan Tharp's sign-off
+/// pending): its database URL, its `ALPHACOMPUTE_DATABASE_AUTH` and its KMS endpoints are measured
+/// env, fixed by the Revision v2 the release-signed `kms_revisions` lists. So the serving node
+/// writes the row itself, after the joiner is appraised as a listed `kata-tdx` build and before
+/// it releases anything, and only then. A joiner that fails the appraisal gets neither a row nor
+/// a key. A prototype node's env is not measured, so it always writes its own row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JoinRow {
+    /// `url` mode: the joiner writes the row, and the join request says nothing more.
+    Joiner,
+    /// Client-cert mode on a Kata node: the request sets `db_client_cert`, and the serving node
+    /// writes the row once it has appraised the joiner.
+    ServingNode,
+}
+
+/// The joining side: who writes `node`'s `node.join.request`, given the evidence it is about to
+/// send. A prototype node in client-cert mode is refused here, as the serving node would refuse it
+/// ([`check_serving_node_may_record`]).
+pub fn join_row(node: &Node, evidence: &AnyEvidence) -> Result<JoinRow, ApiError> {
+    join_row_for(client_cert_mode(node), evidence)
+}
+
+fn join_row_for(client_cert: bool, evidence: &AnyEvidence) -> Result<JoinRow, ApiError> {
+    match (client_cert, evidence) {
+        (false, _) => Ok(JoinRow::Joiner),
+        (true, AnyEvidence::V2(_)) => Ok(JoinRow::ServingNode),
+        (true, AnyEvidence::V1(_)) => Err(ApiError::internal(format!(
+            "client-cert mode: a prototype node cannot join, because its env is not measured and \
+             it has no database credential to write its own node.join.request; unseal it with \
+             custodians, or run it with {MODE_ENV}=url"
+        ))),
     }
-    Err(ApiError::internal(
-        "client-cert mode: a joining node has no database credential before the join reply, so \
-         it cannot write node.join.request (TODO(draft), QUESTION(PRD-05 Q46)); unseal this node \
-         with custodians instead",
-    ))
+}
+
+/// The serving side, before appraisal: a request asking this node to write the joiner's row
+/// (`db_client_cert`) must carry Kata evidence v2. The appraisal that follows then holds it to a
+/// `kata-tdx` entry of `kms_revisions`.
+pub fn check_serving_node_may_record(evidence: &AnyEvidence) -> Result<(), ApiError> {
+    match evidence {
+        AnyEvidence::V2(_) => Ok(()),
+        AnyEvidence::V1(_) => Err(ApiError::new(
+            "policy_denied",
+            "db_client_cert: only a Kata node, whose database settings are measured, may have \
+             the serving node write its node.join.request; a prototype node writes its own",
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -586,6 +616,68 @@ mod tests {
             .checked_add(CLIENT_TTL + Duration::from_secs(1))
             .unwrap();
         assert!(crate::certs::verify_to_ca(verifier.as_ref(), &chain, after).is_err());
+    }
+
+    fn prototype_evidence() -> AnyEvidence {
+        alpha_attest::Evidence {
+            format: alpha_attest::EVIDENCE_FORMAT.into(),
+            quote: b"quote".to_vec(),
+            event_log: Vec::new(),
+        }
+        .into()
+    }
+
+    fn kata_evidence() -> AnyEvidence {
+        alpha_attest::EvidenceV2 {
+            format: alpha_attest::EVIDENCE_FORMAT_V2.into(),
+            cpu: alpha_attest::CpuEvidence {
+                kind: alpha_attest::CpuKind::Tdx,
+                quote: b"quote".to_vec(),
+                event_log: Vec::new(),
+            },
+            gpus: Vec::new(),
+            initdata: b"initdata".to_vec(),
+            runtime_class: alpha_core::coco::CPU_RUNTIME_CLASS.into(),
+        }
+        .into()
+    }
+
+    #[test]
+    fn a_url_mode_joiner_writes_its_own_row_and_a_client_cert_kata_joiner_asks_the_server() {
+        for evidence in [prototype_evidence(), kata_evidence()] {
+            assert_eq!(join_row_for(false, &evidence).unwrap(), JoinRow::Joiner);
+        }
+        assert_eq!(
+            join_row_for(true, &kata_evidence()).unwrap(),
+            JoinRow::ServingNode
+        );
+        // A prototype node's env is not measured: it never has its row written for it.
+        let refused = join_row_for(true, &prototype_evidence()).unwrap_err();
+        assert!(refused.message.contains("prototype node cannot join"));
+        assert!(check_serving_node_may_record(&kata_evidence()).is_ok());
+        let refused = check_serving_node_may_record(&prototype_evidence()).unwrap_err();
+        assert_eq!(refused.code, "policy_denied");
+    }
+
+    #[test]
+    fn a_url_mode_join_request_is_unchanged_on_the_wire() {
+        let xwing = alpha_crypto::PrivateKey::generate().unwrap().public();
+        let request = |db_client_cert| alpha_client::JoinRequest {
+            nonce: "n".into(),
+            evidence: kata_evidence(),
+            xwing_pubkey: xwing.clone(),
+            db_client_cert,
+        };
+        let url = serde_json::to_value(request(false)).unwrap();
+        let mut fields = url.as_object().unwrap().keys().collect::<Vec<_>>();
+        fields.sort();
+        assert_eq!(fields, ["evidence", "nonce", "xwing_pubkey"]);
+        let parsed: alpha_client::JoinRequest = serde_json::from_value(url).unwrap();
+        assert!(!parsed.db_client_cert);
+        let cert = serde_json::to_value(request(true)).unwrap();
+        assert_eq!(cert["db_client_cert"], true);
+        let parsed: alpha_client::JoinRequest = serde_json::from_value(cert).unwrap();
+        assert!(parsed.db_client_cert);
     }
 
     #[test]
