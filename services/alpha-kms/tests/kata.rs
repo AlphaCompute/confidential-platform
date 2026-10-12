@@ -172,6 +172,44 @@ async fn evidence_v2_through_the_route_is_dcap_verified_and_audited() {
 }
 
 #[tokio::test]
+async fn a_node_running_the_local_verifier_refuses_every_gpu_until_the_policy_pins_it() {
+    let gpu = FakeGpu::new();
+    let Some(h) = kata_harness_with_local(&gpu).await else {
+        return;
+    };
+    let admin = h.register_key(&h.root, 35).await;
+    let pod = Pod::gpu(AppId::mint(), 8);
+    pod.register(&h, &admin).await;
+
+    // Listed, configured, but nothing pinned: every GPU pod is refused, and audited.
+    let mut doc = kata_document(3);
+    doc["gpu_policy"]["verifiers"] = json!(["local"]);
+    publish(&h, doc).await;
+    refused(
+        &h,
+        pod.attest(&h).await,
+        "attestation_unknown",
+        "gpu_policy.local is not set (G0 check); the local verifier refuses every GPU",
+    )
+    .await;
+    // Partly pinned, after NRAS: still refused, naming the first field missing.
+    let mut doc = kata_document(4);
+    doc["gpu_policy"]["verifiers"] = json!(["nras", "local"]);
+    doc["gpu_policy"]["local"] = json!({"ocsp_max_age_secs": 86400});
+    publish(&h, doc).await;
+    refused(
+        &h,
+        pod.attest(&h).await,
+        "attestation_unknown",
+        "gpu_policy.local.device_roots is not set (G0 check)",
+    )
+    .await;
+    // A policy that does not list it is unaffected by the node running it.
+    publish(&h, kata_document(5)).await;
+    pod.attest(&h).await.unwrap();
+}
+
+#[tokio::test]
 async fn a_kata_pod_whose_revision_or_gpu_backends_do_not_pass_is_refused_and_audited() {
     let gpu = FakeGpu::new();
     let Some(h) = kata_harness(&gpu).await else {
@@ -192,8 +230,8 @@ async fn a_kata_pod_whose_revision_or_gpu_backends_do_not_pass_is_refused_and_au
     .await;
     let hash = pod.register(&h, &admin).await;
 
-    // A backend the gpu_policy lists must run here: `local` never does, Fortanix CCM refuses
-    // until F8.
+    // A backend the gpu_policy lists must run here: `local` does not on this node (no RIM cache
+    // configured), Fortanix CCM refuses until F8.
     let mut doc = kata_document(3);
     doc["gpu_policy"]["verifiers"] = json!(["local"]);
     publish(&h, doc).await;

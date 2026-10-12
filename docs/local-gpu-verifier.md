@@ -137,7 +137,7 @@ Release-signed in the platform document, refusing unknown fields like the rest o
 
 ## RIM cache
 
-The KMS never canonicalises XML, and never fetches a RIM. The cache is a JSON file the operator refreshes offline and the KMS reads at start (`ALPHACOMPUTE_GPU_RIM_CACHE`):
+The KMS never canonicalises XML, and never fetches a RIM. The cache is a JSON file the operator refreshes offline and the KMS reads at start (`ALPHACOMPUTE_GPU_RIM_CACHE`; the `local` backend runs only when it is set, and a cache the node cannot read stops it at start):
 
 ```json
 {"format": "alphacompute-gpu-rim-cache/1",
@@ -150,7 +150,7 @@ The KMS never canonicalises XML, and never fetches a RIM. The cache is a JSON fi
 - **Canonicalisation stays out of the trusted path.** `testdata/gpu/tools/canonicalize.py` (lxml and `cryptography`) produces an entry from a RIM file or a RIM service reply and checks it before writing; a wrong canonicalisation can only produce an entry that fails. No XML-DSig canonicaliser is hand-written.
 - **Freshness.** The OCSP responses for the RIM signing chains, and for the device CAs, are in the cache; each must be younger than `ocsp_max_age_secs` and not past its `nextUpdate`. A stale cache refuses every GPU, so the refresh runs at least daily.
 - **Expired signers.** A RIM whose signing certificate has expired is refused; the refresh takes the RIM service's current copy.
-- **Refresh.** For each RIM ID the release pins: fetch `https://rim.attestation.nvidia.com/v1/rim/<id>`, run `canonicalize.py`, fetch OCSP for each certificate of its chain but the root, and for the device chain's CAs; write the file atomically; restart or reload the KMS. A refresh tool that does this end to end is part of the KMS integration.
+- **Refresh.** `deploy/gpu-rims/refresh.py --rim-service <url> --ocsp <url> --rim <id>… [--device-chain <pem>…] --out <file>`: for each RIM ID the release pins, it fetches the RIM, makes its entry with `canonicalize.py`, and fetches OCSP for each certificate of its signing chain but the root; for each device chain given, OCSP for its CAs. It writes the file atomically; the KMS reads it at start. `cargo test -p alpha-attest --test gpu_local_vectors -- --ignored g0_rim_cache` (with `ALPHA_GPU_RIM_CACHE`) checks a cache against NVIDIA's roots and prints each RIM's digest to pin. Run 2026-10-12 against NVIDIA's services for `NV_GPU_CC_DRIVER_GB110_595.58.03`, the whole path verified in Rust (chain, live OCSP, signature, digest, 19 active measurements).
 
 ## OCSP
 

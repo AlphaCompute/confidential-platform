@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use alpha_attest::gpu::ccm::FortanixCcm;
+use alpha_attest::gpu::local::{Local, RimCache};
 use alpha_attest::gpu::{GpuFuture, gpu_nonce};
 use alpha_attest::{
     AppraisalError, CpuEvidence, CpuKind, EVIDENCE_FORMAT_V2, EvidenceV2, GpuEvidence, GpuPolicy,
@@ -95,6 +96,19 @@ pub async fn kata_harness(gpu: &Arc<FakeGpu>) -> Option<Harness> {
         Arc::new(FortanixCcm {
             endpoint: "https://ccm.example".into(),
         }),
+    ];
+    let h = harness_with(Arc::new(move || now), backends).await?;
+    publish(&h, kata_document(2)).await;
+    Some(h)
+}
+
+/// [`kata_harness`] whose node also runs the local verifier (option 3) over an empty RIM cache, as
+/// `ALPHACOMPUTE_GPU_RIM_CACHE` would configure it.
+pub async fn kata_harness_with_local(gpu: &Arc<FakeGpu>) -> Option<Harness> {
+    let now = captured_at(KEYED);
+    let backends: Vec<Arc<dyn GpuVerifier>> = vec![
+        gpu.clone(),
+        Arc::new(Local::new(RimCache::default()).unwrap()),
     ];
     let h = harness_with(Arc::new(move || now), backends).await?;
     publish(&h, kata_document(2)).await;

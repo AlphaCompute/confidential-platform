@@ -45,23 +45,23 @@ def parse(raw):
     return etree.fromstring(raw, parser)
 
 
-def main():
-    path = sys.argv[1]
-    raw = open(path, "rb").read()
-    rim_id = sys.argv[2] if len(sys.argv) > 2 else None
+def entry(raw, rim_id):
+    """The cache entry for one RIM: raw XML bytes, or a RIM service reply (JSON)."""
     if raw.lstrip().startswith(b"{"):
         reply = json.loads(raw)  # NVIDIA RIM service: {"id", "rim": base64, ...}
+        if rim_id is not None and reply.get("id") != rim_id:
+            raise ValueError(f"the RIM service answered {reply.get('id')!r} for {rim_id!r}")
         rim_id = rim_id or reply["id"]
         raw = base64.b64decode(reply["rim"])
     root = parse(raw)
     signatures = root.findall(f".//{{{DS}}}Signature")
     if len(signatures) != 1 or signatures[0].getparent() is not root:
-        sys.exit("expected exactly one enveloped ds:Signature under the root")
+        raise ValueError("expected exactly one enveloped ds:Signature under the root")
     signature = signatures[0]
     for element in [root, signature]:
         for attr in ("id", "base"):
             if element.get(f"{{{XML_NS}}}{attr}") is not None:
-                sys.exit(f"xml:{attr} on an ancestor: Canonical XML 1.0 and 1.1 differ here")
+                raise ValueError(f"xml:{attr} on an ancestor: Canonical XML 1.0 and 1.1 differ")
     signed_info = etree.tostring(signature.find(f"{{{DS}}}SignedInfo"), method="c14n",
                                  exclusive=False, with_comments=False)
     value = base64.b64decode("".join(signature.findtext(f"{{{DS}}}SignatureValue").split()))
@@ -83,7 +83,7 @@ def main():
 
     digest = base64.b64decode(parse(signed_info).findtext(f".//{{{DS}}}DigestValue"))
     if hashlib.sha384(document).digest() != digest:
-        sys.exit("canonical document does not match the signed DigestValue")
+        raise ValueError("canonical document does not match the signed DigestValue")
     signer = x509.load_der_x509_certificate(certificates[0])
     half = len(value) // 2
     der_signature = encode_dss_signature(int.from_bytes(value[:half], "big"),
@@ -91,13 +91,19 @@ def main():
     signer.public_key().verify(der_signature, signed_info, ec.ECDSA(hashes.SHA384()))
 
     b64 = lambda b: base64.b64encode(b).decode()
-    json.dump({
+    return {
         "id": rim_id,
         "signed_info": b64(signed_info),
         "document": b64(document),
         "signature": b64(value),
         "certificates": [b64(c) for c in certificates],
-    }, sys.stdout, indent=1)
+    }
+
+
+def main():
+    raw = open(sys.argv[1], "rb").read()
+    rim_id = sys.argv[2] if len(sys.argv) > 2 else None
+    json.dump(entry(raw, rim_id), sys.stdout, indent=1)
     sys.stdout.write("\n")
 
 

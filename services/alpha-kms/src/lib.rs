@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use alpha_attest::gpu::ccm::FortanixCcm;
+use alpha_attest::gpu::local::{Local, RimCache};
 use alpha_attest::gpu::nras::Nras;
 use alpha_attest::{Collateral, EventLogEntry, GpuVerifier, PlatformDocument};
 use alpha_core::ComposeHash;
@@ -68,7 +69,10 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .collect(),
             platform_document_url: env("ALPHACOMPUTE_PLATFORM_DOCUMENT_URL")?,
-            gpu_backends: gpu_backends(std::env::var("ALPHACOMPUTE_FORTANIX_CCM_URL").ok())?,
+            gpu_backends: gpu_backends(
+                std::env::var("ALPHACOMPUTE_FORTANIX_CCM_URL").ok(),
+                std::env::var("ALPHACOMPUTE_GPU_RIM_CACHE").ok(),
+            )?,
             #[cfg(feature = "dev-root")]
             dev_root_kek: std::env::var("ALPHACOMPUTE_KMS_DEV_ROOT_KEK")
                 .ok()
@@ -82,13 +86,22 @@ impl Config {
     }
 }
 
-/// The GPU verifier backends this node runs: NRAS always (it refuses every GPU until the release-signed
-/// `gpu_policy` pins NRAS's keys and names the CC-mode claim), Fortanix CCM when `ccm_url` names its
-/// endpoint (it refuses every GPU until F8), and never `local`, which is built after Dec 1. A backend
-/// the `gpu_policy` lists that is not here refuses every GPU pod.
+/// The GPU verifier backends this node runs:
+/// - NRAS, always. It refuses every GPU until the release-signed `gpu_policy` pins NRAS's keys and
+///   names the CC-mode claim.
+/// - Fortanix CCM, when `ccm_url` names its endpoint. It refuses every GPU until F8.
+/// - The local verifier (`alpha_attest::gpu::local`, option 3), only when `rim_cache` names the
+///   offline-refreshed RIM cache file. Never by default. It refuses every GPU until a release-signed
+///   `gpu_policy.local` pins the device and RIM roots, the RIMs, the FWIDs, the CC-mode indicator
+///   and the OCSP maximum age (G0). A cache that is unreadable or malformed stops the node at start.
+///
+/// A backend the `gpu_policy` lists that is not here refuses every GPU pod.
 // ponytail: F8 — whether the CCM endpoint stays node configuration or moves into the release-signed
 // `gpu_policy`, as `nras_url` is, is settled with Fortanix's API.
-pub fn gpu_backends(ccm_url: Option<String>) -> Result<Vec<Arc<dyn GpuVerifier>>, String> {
+pub fn gpu_backends(
+    ccm_url: Option<String>,
+    rim_cache: Option<String>,
+) -> Result<Vec<Arc<dyn GpuVerifier>>, String> {
     let nras = Nras::new().map_err(|e| e.to_string())?;
     let mut backends: Vec<Arc<dyn GpuVerifier>> = vec![Arc::new(nras)];
     if let Some(endpoint) = ccm_url {
@@ -96,6 +109,13 @@ pub fn gpu_backends(ccm_url: Option<String>) -> Result<Vec<Arc<dyn GpuVerifier>>
             return Err("ALPHACOMPUTE_FORTANIX_CCM_URL is not an https:// URL".into());
         }
         backends.push(Arc::new(FortanixCcm { endpoint }));
+    }
+    if let Some(path) = rim_cache {
+        let bytes =
+            std::fs::read(&path).map_err(|e| format!("ALPHACOMPUTE_GPU_RIM_CACHE {path}: {e}"))?;
+        let cache = RimCache::from_json(&bytes)
+            .map_err(|e| format!("ALPHACOMPUTE_GPU_RIM_CACHE {path}: {e}"))?;
+        backends.push(Arc::new(Local::new(cache).map_err(|e| e.to_string())?));
     }
     Ok(backends)
 }
@@ -336,15 +356,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gpu_backends_are_nras_and_fortanix_ccm_when_named_never_local() {
+    fn gpu_backends_are_nras_then_ccm_and_local_only_when_configured() {
         let kinds = |backends: Vec<Arc<dyn GpuVerifier>>| {
             backends.iter().map(|b| b.kind()).collect::<Vec<_>>()
         };
-        assert_eq!(kinds(gpu_backends(None).unwrap()), [GpuVerifierKind::Nras]);
         assert_eq!(
-            kinds(gpu_backends(Some("https://ccm.example".into())).unwrap()),
+            kinds(gpu_backends(None, None).unwrap()),
+            [GpuVerifierKind::Nras]
+        );
+        assert_eq!(
+            kinds(gpu_backends(Some("https://ccm.example".into()), None).unwrap()),
             [GpuVerifierKind::Nras, GpuVerifierKind::FortanixCcm]
         );
-        assert!(gpu_backends(Some("http://ccm.example".into())).is_err());
+        assert!(gpu_backends(Some("http://ccm.example".into()), None).is_err());
+
+        let dir = std::env::temp_dir().join(format!("alpha-rim-cache-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cache.json");
+        std::fs::write(&path, r#"{"format": "alphacompute-gpu-rim-cache/1"}"#).unwrap();
+        let path = path.to_str().unwrap().to_owned();
+        assert_eq!(
+            kinds(gpu_backends(None, Some(path.clone())).unwrap()),
+            [GpuVerifierKind::Nras, GpuVerifierKind::Local]
+        );
+        // A cache the node cannot use stops it at start rather than refusing pods later.
+        std::fs::write(&path, r#"{"format": "other"}"#).unwrap();
+        let error = gpu_backends(None, Some(path.clone())).err().unwrap();
+        assert!(error.contains("ALPHACOMPUTE_GPU_RIM_CACHE"), "{error}");
+        assert!(gpu_backends(None, Some(dir.join("missing").display().to_string())).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

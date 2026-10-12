@@ -17,6 +17,7 @@ Control bodies are signed `ed25519` or `webauthn-es256`, a passkey's WebAuthn as
 | `ALPHACOMPUTE_PCCS_URL` | PCCS for DCAP collateral, fetched per attestation |
 | `ALPHACOMPUTE_PLATFORM_DOCUMENT_URL` | the release-signed platform document, fetched on start and every five minutes |
 | `ALPHACOMPUTE_FORTANIX_CCM_URL` | optional `https://` endpoint of the Fortanix CCM GPU backend, which refuses every GPU until F8; unset, a `gpu_policy` listing `fortanix-ccm` refuses every GPU pod |
+| `ALPHACOMPUTE_GPU_RIM_CACHE` | optional path of the local GPU verifier's RIM cache (`deploy/gpu-rims/refresh.py`, refreshed at least daily); set, the node runs the `local` backend, which refuses every GPU until a release-signed `gpu_policy.local` pins its roots, RIMs, firmware IDs, CC-mode indicator and OCSP maximum age (`docs/local-gpu-verifier.md`); unset, a `gpu_policy` listing `local` refuses every GPU pod; unreadable or malformed, the node does not start |
 | `ALPHACOMPUTE_KMS_DEV_ROOT_KEK` | `dev-root` feature only: 64 hex digits used as the root KEK instead of the custodians' shares |
 
 `alpha-kms migrate` applies `migrations/` (expand-only) and returns; run it as the schema owner. The service then reads its event log from the CCEL table and `/run/log/dstack`, generates its P-256 runtime key and X-Wing key, and comes up sealed: it joins the first ready endpoint or waits for two `unseal` shares (or, on an empty database, a `bootstrap`).

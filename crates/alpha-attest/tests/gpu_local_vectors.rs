@@ -541,3 +541,49 @@ fn nvidia_blackwell_sample_reaches_rim_selection_through_the_backend() {
         .to_string();
     assert!(error.contains("FSP responder"), "{error}");
 }
+
+/// G0 (and every refresh): checks a RIM cache built by `deploy/gpu-rims/refresh.py` against
+/// NVIDIA's roots in `testdata/gpu/nvidia` at the current time, one line per RIM, and prints
+/// the `sha384:` digest to pin in `gpu_policy.local.rims`.
+/// `ALPHA_GPU_RIM_CACHE=cache.json cargo test -p alpha-attest --test gpu_local_vectors -- --ignored --nocapture`
+#[test]
+#[ignore = "G0: needs a refreshed RIM cache (ALPHA_GPU_RIM_CACHE)"]
+fn g0_rim_cache_verifies_against_nvidias_roots() {
+    let path = std::env::var("ALPHA_GPU_RIM_CACHE").expect("set ALPHA_GPU_RIM_CACHE");
+    let cache =
+        alpha_attest::gpu::local::RimCache::from_json(&std::fs::read(path).unwrap()).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let fresh = Freshness {
+        max_age: Duration::from_secs(86_400),
+        accept_certificate_hold: false,
+    };
+    let mut failures = Vec::new();
+    for r in &cache.rims {
+        let result = (|| -> Result<rim::Rim, String> {
+            cert::verify_chain(&r.certificates, &rim_root(), now).map_err(|e| e.0)?;
+            for pair in r.certificates.windows(2) {
+                ocsp::require_good(cache.ocsp.iter(), &pair[0], &pair[1], now, fresh)
+                    .map_err(|e| e.0)?;
+            }
+            let key = cert::p384_key(&r.certificates[0]).map_err(|e| e.0)?;
+            let digest =
+                rim::verify_signed_info(&r.signed_info, &r.signature, &key).map_err(|e| e.0)?;
+            rim::parse_document(&r.document, &digest).map_err(|e| e.0)
+        })();
+        match result {
+            Ok(v) => println!(
+                "{}: {:?} {} for {}, {} active measurements, sha384:{}",
+                r.id,
+                v.kind,
+                v.version,
+                v.platform_model,
+                v.measurements.values().filter(|g| g.active).count(),
+                hex::encode(v.digest)
+            ),
+            Err(e) => failures.push(format!("{}: {e}", r.id)),
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
