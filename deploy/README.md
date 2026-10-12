@@ -144,6 +144,12 @@ then the custodians whose share files remember a later head unseal with
 `alpha unseal --accept-audit-rollback`, which goes in the ceremony record
 (`docs/metadata-encryption.md`, "Rollback of the whole database").
 
+**Custodians witness the audit head.** At least two custodians run `alpha witness --share
+share-N.json --endpoint https://<node>` daily and after any revocation or Secret change that
+matters. It records the head a serving node has seen in their share file, and their next unseal
+refuses a database restored from before it. A full cold restart onto a copy newer than every
+witnessed head is not caught.
+
 ## The broker's database
 
 `alpha-broker` keeps its connections in its own database on the same trust-zone Postgres, and no
