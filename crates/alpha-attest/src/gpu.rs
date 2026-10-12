@@ -9,6 +9,7 @@
 //! the one that decides, so which backend ran never changes what a leaf means.
 
 pub mod ccm;
+pub mod local;
 pub mod nras;
 
 use std::collections::{BTreeMap, BTreeSet};

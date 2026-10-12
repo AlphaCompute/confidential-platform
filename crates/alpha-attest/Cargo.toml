@@ -11,14 +11,18 @@ workspace = true
 alpha-core = { path = "../alpha-core" }
 base64 = "0.23"
 dcap-qvl = "=0.6.3"
+der = { version = "0.7.10", features = ["alloc", "derive", "oid", "std"] }
 hex = { version = "0.4", features = ["serde"] }
 p384 = { version = "0.13", features = ["ecdsa"] }
+roxmltree = "=0.21.1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 thiserror = "2"
 tokio = { version = "1", features = ["time"] }
+x509-cert = { version = "=0.2.5", default-features = false, features = ["std"] }
+x509-ocsp = "=0.2.1"
 
 [dev-dependencies]
 chrono = { version = "0.4", default-features = false }

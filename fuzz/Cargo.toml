@@ -1,0 +1,68 @@
+# Fuzz targets for the local GPU verifier's parsers (`alpha_attest::gpu::local`), which read
+# attacker-supplied bytes. Run with cargo-fuzz on a nightly toolchain, from this directory:
+#
+#   cargo +nightly fuzz run spdm -- -max_total_time=600
+#
+# Seeds: `testdata/gpu` (see fuzz/README.md). Not run in CI; `alpha-attest`'s
+# `gpu_local_vectors` and module tests run truncations and bit flips of the same inputs on
+# stable in every CI run.
+[package]
+name = "alpha-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+alpha-attest = { path = "../crates/alpha-attest" }
+libfuzzer-sys = "=0.4.10"
+x509-cert = { version = "=0.2.5", default-features = false, features = ["std"] }
+sha2 = "0.11"
+
+# Its own workspace: never built by the repository's `cargo` commands.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "spdm"
+path = "fuzz_targets/spdm.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "opaque"
+path = "fuzz_targets/opaque.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cert_chain"
+path = "fuzz_targets/cert_chain.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ocsp"
+path = "fuzz_targets/ocsp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rim_signed_info"
+path = "fuzz_targets/rim_signed_info.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rim_document"
+path = "fuzz_targets/rim_document.rs"
+test = false
+doc = false
+bench = false
