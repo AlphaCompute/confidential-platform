@@ -224,6 +224,7 @@ fn doc() -> PlatformDocument {
             hwmodels: Default::default(),
             nras_keys: Default::default(),
             nras_cc_mode: None,
+            local: None,
         }),
     }
 }

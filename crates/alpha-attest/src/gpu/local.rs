@@ -16,11 +16,23 @@
 //! - [`rim`]: NVIDIA's signed reference integrity manifests (SWID), verified without
 //!   canonicalising XML in the KMS.
 
+pub mod appraise;
+pub mod backend;
+pub mod cache;
 pub mod cert;
 pub mod ocsp;
 pub mod opaque;
+pub mod policy;
 pub mod rim;
 pub mod spdm;
+#[cfg(test)]
+mod testkit;
+#[cfg(test)]
+mod tests_appraise;
+
+pub use backend::Local;
+pub use cache::RimCache;
+pub use policy::{CcModeRule, CcSource, LocalPolicy};
 
 use std::fmt;
 

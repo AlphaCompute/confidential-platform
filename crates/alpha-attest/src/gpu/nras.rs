@@ -731,6 +731,7 @@ mod tests {
                 pointer: CC_CLAIM.into(),
                 equals: json!("ON"),
             }),
+            local: None,
         }
     }
 

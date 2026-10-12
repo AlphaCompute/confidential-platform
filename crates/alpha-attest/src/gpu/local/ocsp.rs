@@ -46,6 +46,42 @@ pub struct Freshness {
     pub accept_certificate_hold: bool,
 }
 
+/// What a reliable response says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Status {
+    Good,
+    /// Revoked (beyond an accepted hold) or unknown, with the reason.
+    Bad(String),
+}
+
+/// Whether `cert` (issued by `issuer`) is good by the responses given: refused if any reliable
+/// response about it says revoked or unknown, accepted if at least one says good, refused
+/// otherwise with the reason the last response could not be relied on.
+pub fn require_good<'a>(
+    responses: impl IntoIterator<Item = &'a Response>,
+    cert: &Certificate,
+    issuer: &Certificate,
+    now: Duration,
+    freshness: Freshness,
+) -> Result<()> {
+    let mut good = false;
+    let mut last = None;
+    for response in responses {
+        if !response.is_about(cert, issuer) {
+            continue;
+        }
+        match response.status(cert, issuer, now, freshness) {
+            Ok(Status::Good) => good = true,
+            Ok(Status::Bad(why)) => return refuse(why),
+            Err(e) => last = Some(e),
+        }
+    }
+    if good {
+        return Ok(());
+    }
+    Err(last.unwrap_or_else(|| super::Refused(format!("ocsp: no status for {}", describe(cert)))))
+}
+
 /// A parsed response: its basic response, ready to be checked for any certificate.
 #[derive(Clone, Debug)]
 pub struct Response {
@@ -85,6 +121,17 @@ pub fn parse(der: &[u8]) -> Result<Response> {
 }
 
 impl Response {
+    /// How long ago the responder produced this response.
+    pub fn age(&self, now: Duration) -> Duration {
+        now.saturating_sub(
+            self.basic
+                .tbs_response_data
+                .produced_at
+                .0
+                .to_unix_duration(),
+        )
+    }
+
     /// The nonce the response echoes, if any.
     pub fn nonce(&self) -> Option<Vec<u8>> {
         self.basic.nonce().map(|n| n.0.as_bytes().to_vec())
@@ -107,6 +154,21 @@ impl Response {
         now: Duration,
         freshness: Freshness,
     ) -> Result<()> {
+        match self.status(cert, issuer, now, freshness)? {
+            Status::Good => Ok(()),
+            Status::Bad(why) => Err(super::Refused(why)),
+        }
+    }
+
+    /// What this response, once its signature, `CertID` and freshness hold, says of `cert`:
+    /// `Err` when it cannot be relied on at all, [`Status::Bad`] when it reliably refuses.
+    pub fn status(
+        &self,
+        cert: &Certificate,
+        issuer: &Certificate,
+        now: Duration,
+        freshness: Freshness,
+    ) -> Result<Status> {
         let who = describe(cert);
         let mut matching = self
             .basic
@@ -145,21 +207,23 @@ impl Response {
         {
             return refuse(format!("ocsp: status for {who} is past its nextUpdate"));
         }
-        match &single.cert_status {
-            CertStatus::Good(_) => Ok(()),
+        Ok(match &single.cert_status {
+            CertStatus::Good(_) => Status::Good,
             CertStatus::Revoked(info)
                 if info.revocation_reason == Some(CrlReason::CertificateHold)
                     && freshness.accept_certificate_hold =>
             {
-                Ok(())
+                Status::Good
             }
-            CertStatus::Revoked(info) => refuse(format!(
+            CertStatus::Revoked(info) => Status::Bad(format!(
                 "ocsp: {who} is revoked ({})",
                 info.revocation_reason
                     .map_or_else(|| "no reason given".to_owned(), |r| format!("{r:?}"))
             )),
-            CertStatus::Unknown(_) => refuse(format!("ocsp: {who} is unknown to its responder")),
-        }
+            CertStatus::Unknown(_) => {
+                Status::Bad(format!("ocsp: {who} is unknown to its responder"))
+            }
+        })
     }
 
     /// The response is signed by `issuer` or by a responder `issuer` delegated OCSP signing to.

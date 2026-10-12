@@ -42,7 +42,8 @@ pub struct GpuEvidence {
 pub enum GpuVerifierKind {
     /// NVIDIA Remote Attestation Service.
     Nras,
-    /// NVIDIA's verifier run by the KMS with cached RIMs and OCSP (after Dec 1).
+    /// NVIDIA's evidence appraised by the KMS itself, with cached RIMs and OCSP (option 3,
+    /// `gpu::local`; after Dec 1).
     Local,
     /// Fortanix Confidential Computing Manager (D1; awaits F1, F2, F8, F9).
     FortanixCcm,
@@ -78,6 +79,10 @@ pub struct GpuPolicy {
     /// every GPU.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nras_cc_mode: Option<nras::NrasClaim>,
+    /// What the `local` backend trusts and requires (`docs/local-gpu-verifier.md`). Absent or
+    /// incomplete, the `local` backend refuses every GPU.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local: Option<local::LocalPolicy>,
 }
 
 /// What a backend proved about one GPU, after its own cryptographic checks passed. Part of the
@@ -370,6 +375,7 @@ mod tests {
             hwmodels: BTreeMap::new(),
             nras_keys: BTreeMap::new(),
             nras_cc_mode: None,
+            local: None,
         }
     }
 

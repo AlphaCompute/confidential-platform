@@ -445,3 +445,99 @@ fn parsers_survive_truncations_and_bit_flips_of_real_inputs() {
         let _ = rim::parse_document(b, &digest);
     });
 }
+
+fn real_policy(rim: &str) -> alpha_attest::GpuPolicy {
+    use alpha_attest::gpu::local::{CcModeRule, CcSource, LocalPolicy};
+    let b64 = |v: Vec<Vec<u8>>| v.iter().map(|d| BASE64_STANDARD.encode(d)).collect();
+    let doc = entry(rim).document;
+    alpha_attest::GpuPolicy {
+        allowed_models: vec!["B200".into()],
+        min_driver_version: None,
+        min_vbios_version: None,
+        verifiers: vec![alpha_attest::GpuVerifierKind::Local],
+        nras_url: None,
+        hwmodels: [("GB100 A01 GSP BROM".to_owned(), "B200".to_owned())].into(),
+        nras_keys: Default::default(),
+        nras_cc_mode: None,
+        local: Some(LocalPolicy {
+            device_roots: b64(device_root()),
+            rim_roots: b64(rim_root()),
+            rims: [(
+                format!(
+                    "sha384:{}",
+                    hex::encode(<sha2::Sha384 as sha2::Digest>::digest(&doc))
+                ),
+                "hopper vbios".to_owned(),
+            )]
+            .into(),
+            fwids: vec![format!("sha384:{BLACKWELL_FWID}")],
+            cc_mode: Some(CcModeRule {
+                source: CcSource::Measurement,
+                index: 1,
+                values: vec!["00".into()],
+            }),
+            ocsp_max_age_secs: Some(86_400),
+            ocsp_url: None,
+            accept_certificate_hold: false,
+        }),
+    }
+}
+
+/// NVIDIA's Blackwell sample through the whole backend with NVIDIA's roots and live OCSP: it
+/// passes the chain, revocation, TcbInfo, signature, nonce and FWID steps and stops only at the
+/// RIMs, since no NVIDIA driver RIM exists for its pre-release driver (575.32).
+#[test]
+fn nvidia_blackwell_sample_reaches_rim_selection_through_the_backend() {
+    use alpha_attest::gpu::local::{RimCache, appraise};
+    let rim = "rim/NV_GPU_VBIOS_1010_0200_882_96005E0001.json";
+    let ocsp: Vec<String> = [
+        "blackwell-brom",
+        "blackwell-provisioner-ica",
+        "blackwell-identity",
+    ]
+    .iter()
+    .map(|f| BASE64_STANDARD.encode(read(&format!("ocsp/{f}.der"))))
+    .collect();
+    let mut cache = RimCache::from_json(
+        serde_json::json!({
+            "format": "alphacompute-gpu-rim-cache/1",
+            "rims": [serde_json::from_slice::<Value>(&read(rim)).unwrap()],
+            "ocsp": ocsp,
+        })
+        .to_string()
+        .as_bytes(),
+    )
+    .unwrap();
+    let gpus = [alpha_attest::GpuEvidence {
+        arch: "BLACKWELL".into(),
+        evidence: hex_file("nvidia/blackwellAttestationReport.txt"),
+        certificate: read("nvidia/blackwellCertChain.txt"),
+    }];
+    let nonce: [u8; 32] = hex::decode(BLACKWELL_NONCE).unwrap().try_into().unwrap();
+    let now = std::time::UNIX_EPOCH + OCSP_NOW;
+    let policy = real_policy(rim);
+    let error = appraise::appraise(&gpus, &nonce, &policy, &cache, &[], now)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("no pinned Driver RIM for GB100"), "{error}");
+    // Without the device chain's OCSP responses it stops at revocation instead.
+    cache.ocsp.clear();
+    let error = appraise::appraise(&gpus, &nonce, &policy, &cache, &[], now)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("no status"), "{error}");
+    // Over another nonce, it stops at the nonce.
+    let error = appraise::appraise(&gpus, &[0; 32], &policy, &cache, &[], now);
+    assert!(error.is_err());
+
+    // The FSP responder is refused by name.
+    let fsp = [alpha_attest::GpuEvidence {
+        arch: "BLACKWELL".into(),
+        evidence: hex_file("nvidia/blackwellFspAttestationReport.txt"),
+        certificate: read("nvidia/blackwellFspCertChain.txt"),
+    }];
+    let error = appraise::appraise(&fsp, &nonce, &policy, &cache, &[], now)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("FSP responder"), "{error}");
+}
