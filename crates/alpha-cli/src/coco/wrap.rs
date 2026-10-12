@@ -44,7 +44,7 @@ pub const MAX_SECRETS: usize = 16;
 /// as `alpha compose wrap`'s health check does with its 24-hour start period.
 const STARTUP_PROBE_PERIOD: u32 = 5;
 const STARTUP_PROBE_FAILURES: u32 = 17_280;
-const SOCKET_VOLUME: &str = "alpha-run";
+pub(crate) const SOCKET_VOLUME: &str = "alpha-run";
 const POD_VOLUME: &str = "alpha-pod";
 const SECRETS_VOLUME_PREFIX: &str = "alpha-secrets-";
 /// alpha-runtime's `SECRETS_DIR`: it writes each declaring service's files under
@@ -111,6 +111,51 @@ pub struct Wrapped {
     pub initdata: String,
     pub pod_spec: Value,
     pub secrets: BTreeSet<String>,
+    /// The block-mode claims of the compose's persistent volumes. Absent when there are none, so
+    /// a compose without them prints exactly the five keys of the adapter's contract; an adapter
+    /// that does not know this key refuses the output, and so deploys no volume it cannot create.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub volume_claims: Vec<Value>,
+}
+
+/// The compose's persistent volumes (PRD-02 deliverable 25), by name and size, and the
+/// `alpha-volume` image that opens them.
+#[derive(Clone, Debug, Default)]
+pub struct Persistent {
+    pub volumes: BTreeMap<String, String>,
+    pub image: Option<String>,
+}
+
+/// The compose's top-level extension that makes named volumes persistent and encrypted:
+/// `x-alphacompute-volumes: {<volume>: {size: 10Gi}}`. `alpha compose wrap` ignores `x-` keys.
+pub const PERSISTENT_KEY: &str = "x-alphacompute-volumes";
+
+/// Reads [`PERSISTENT_KEY`] from the compose's bytes, which `parse` has already accepted.
+pub fn persistent_volumes(compose: &[u8]) -> Result<BTreeMap<String, String>, String> {
+    let root: Yaml = serde_yaml_ng::from_slice(compose).map_err(|e| format!("compose: {e}"))?;
+    let Some(section) = root.get(PERSISTENT_KEY) else {
+        return Ok(BTreeMap::new());
+    };
+    let place = PERSISTENT_KEY;
+    let section = section
+        .as_mapping()
+        .ok_or_else(|| format!("{place}: not a mapping; write <volume>: {{size: 10Gi}}"))?;
+    let mut out = BTreeMap::new();
+    for (name, spec) in section {
+        let name = name
+            .as_str()
+            .ok_or_else(|| format!("{place}: {} is not a volume name", shown(name)))?;
+        super::volume::check_name(name, place)?;
+        let size = spec
+            .as_mapping()
+            .filter(|m| m.len() == 1)
+            .and_then(|m| m.get("size"))
+            .and_then(Yaml::as_str)
+            .ok_or_else(|| format!("{place}.{name}: write {{size: <n>Gi}} and nothing else"))?;
+        super::volume::check_size(size).map_err(|e| format!("{place}.{name}: {e}"))?;
+        out.insert(name.to_owned(), size.to_owned());
+    }
+    Ok(out)
 }
 
 /// Why `wrap` produced nothing.
@@ -163,6 +208,7 @@ pub async fn wrap(
     app_id: AppId,
     runtime: &Runtime,
     shape: &Shape,
+    persistent: &Persistent,
     source: &impl PolicySource,
 ) -> Result<Wrapped, WrapError> {
     let secrets: BTreeSet<String> = plain.secrets.values().flatten().cloned().collect();
@@ -172,7 +218,7 @@ pub async fn wrap(
             secrets.len()
         )));
     }
-    let mut spec = pod_spec(&plain, digests, runtime, shape)?;
+    let mut spec = pod_spec(&plain, digests, runtime, shape, persistent)?;
     let expected = containers(&spec);
     let mut attempts = expected.len().saturating_add(1);
     let policy = loop {
@@ -203,6 +249,8 @@ pub async fn wrap(
         }
     };
     let failed = |m: String| WrapError::Failed(m);
+    let names: BTreeSet<String> = persistent.volumes.keys().cloned().collect();
+    let policy = super::volume::propagate(&policy, &names).map_err(failed)?;
     let verified = policy::verify(&policy).map_err(failed)?;
     if verified.containers != expected {
         return Err(failed(format!(
@@ -219,6 +267,15 @@ pub async fn wrap(
         .map_err(|e| failed(e.to_string()))?;
     // wrap has no DSM input: a compose cannot declare one (PRD-06 I1), so the policy pins none.
     super::check_dsm(&containers, &verified).map_err(failed)?;
+    let volume_containers = expected
+        .iter()
+        .filter(|c| {
+            c.name
+                .starts_with(alpha_core::coco::policy::VOLUME_CONTAINER_PREFIX)
+        })
+        .cloned()
+        .collect();
+    super::volume::check_elevated(&verified, &volume_containers).map_err(failed)?;
 
     let gpu = shape.gpu.clone();
     let alpha = super::alpha_json(app_id, &shape.runtime_class, gpu.clone()).map_err(failed)?;
@@ -237,6 +294,11 @@ pub async fn wrap(
         initdata: BASE64_STANDARD.encode(&initdata),
         pod_spec: spec,
         secrets,
+        volume_claims: persistent
+            .volumes
+            .iter()
+            .map(|(name, size)| super::volume::claim(name, size))
+            .collect(),
     })
 }
 
@@ -249,6 +311,7 @@ fn pod_spec(
     digests: &BTreeMap<String, String>,
     runtime: &Runtime,
     shape: &Shape,
+    persistent: &Persistent,
 ) -> Result<Value, String> {
     if !pinned_reference(&runtime.image) {
         return Err(format!(
@@ -270,10 +333,33 @@ fn pod_spec(
             "fieldRef": { "fieldPath": format!("metadata.annotations['{INITDATA_ANNOTATION}']") },
         }]}}),
     ];
+    for name in persistent.volumes.keys() {
+        if !plain.volumes.contains(name) {
+            return Err(format!(
+                "{PERSISTENT_KEY}.{name}: not a volume of this compose; declare it under top-level volumes"
+            ));
+        }
+    }
+    let mut volume_inits = Vec::new();
     for name in &plain.volumes {
         label(name, "volumes")?;
-        // In the TD's memory: a volume on the host's disk would be readable by the host.
-        volumes.push(json!({ "name": name, "emptyDir": { "medium": "Memory" } }));
+        if persistent.volumes.contains_key(name) {
+            let image = persistent.image.as_deref().ok_or_else(|| {
+                format!(
+                    "{PERSISTENT_KEY}.{name}: persistent volumes are not available for this App yet"
+                )
+            })?;
+            if !pinned_reference(image) {
+                return Err(format!(
+                    "volume image {image:?}: not one pinned image reference; give it as <image>@sha256:<digest>"
+                ));
+            }
+            volumes.extend(super::volume::pod_volumes(name));
+            volume_inits.push(super::volume::init_container(name, image, SOCKET_VOLUME));
+        } else {
+            // In the TD's memory: a volume on the host's disk would be readable by the host.
+            volumes.push(json!({ "name": name, "emptyDir": { "medium": "Memory" } }));
+        }
     }
     let mut runtime_mounts = vec![
         json!({ "name": SOCKET_VOLUME, "mountPath": "/run/alpha" }),
@@ -312,7 +398,38 @@ fn pod_spec(
                 json!({ "name": volume, "mountPath": "/run/secrets", "readOnly": true }),
             );
         }
+        for mount in container
+            .get_mut("volumeMounts")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            let persistent_mount = mount
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|v| persistent.volumes.contains_key(v));
+            if let (true, Some(m)) = (persistent_mount, mount.as_object_mut()) {
+                m.insert(
+                    "mountPropagation".into(),
+                    json!(super::volume::APP_PROPAGATION),
+                );
+            }
+        }
         regular.push(Value::Object(container));
+    }
+    for name in persistent.volumes.keys() {
+        let mounted = regular.iter().any(|c| {
+            c.get("volumeMounts")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|m| m.get("name").and_then(Value::as_str) == Some(name))
+        });
+        if !mounted {
+            return Err(format!(
+                "{PERSISTENT_KEY}.{name}: no service mounts it; mount it or remove it"
+            ));
+        }
     }
 
     let mut env = vec![
@@ -362,7 +479,7 @@ fn pod_spec(
         "runtimeClassName": shape.runtime_class,
         "automountServiceAccountToken": false,
         "enableServiceLinks": false,
-        "initContainers": [sidecar],
+        "initContainers": std::iter::once(sidecar).chain(volume_inits).collect::<Vec<_>>(),
         "containers": regular,
         "volumes": volumes,
     }))
@@ -765,6 +882,10 @@ mod tests {
         }
     }
 
+    /// A public image standing in for `alpha-volume`, as alpine does for the runtime.
+    const VOLUME_IMAGE: &str =
+        "busybox@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e";
+
     fn app_id() -> AppId {
         "01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b".parse().unwrap()
     }
@@ -877,12 +998,17 @@ mod tests {
         let compose = fs::read(out.join("compose.yaml")).unwrap();
         let shape = Shape::parse(&fs::read(out.join("shape.json")).unwrap()).unwrap();
         let source = Recorded::new(out.clone());
+        let persistent = Persistent {
+            volumes: persistent_volumes(&compose).unwrap(),
+            image: Some(VOLUME_IMAGE.into()),
+        };
         let wrapped = wrap(
             parse(&compose).unwrap(),
             &BTreeMap::new(),
             app_id(),
             &runtime(),
             &shape,
+            &persistent,
             &source,
         )
         .await
@@ -1122,9 +1248,17 @@ mod tests {
     async fn wrap_with(compose: &[u8], shape: &Shape, source: &impl PolicySource) -> WrapError {
         match parse(compose) {
             Err(e) => WrapError::Refused(e),
-            Ok(plain) => wrap(plain, &BTreeMap::new(), app_id(), &runtime(), shape, source)
-                .await
-                .unwrap_err(),
+            Ok(plain) => wrap(
+                plain,
+                &BTreeMap::new(),
+                app_id(),
+                &runtime(),
+                shape,
+                &Persistent::default(),
+                source,
+            )
+            .await
+            .unwrap_err(),
         }
     }
 
@@ -1214,6 +1348,142 @@ mod tests {
             error.contains("services.app: the user its image runs as"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn wrap_reproduces_the_volume_vector() {
+        let (w, shape) = wrap_vector("03-volume").await;
+        let spec = &w.pod_spec;
+        let inits = spec["initContainers"].as_array().unwrap();
+        let names: Vec<_> = inits.iter().map(|c| c["name"].as_str().unwrap()).collect();
+        assert_eq!(names, [RUNTIME_SERVICE, "alpha-volume-pgdata"]);
+        let volume = &inits[1];
+        assert_eq!(volume["image"], json!(VOLUME_IMAGE));
+        assert_eq!(
+            volume["args"],
+            json!(["open", "pgdata", "/dev/alpha-volume", "/run/alpha-volume"])
+        );
+        assert_eq!(volume["securityContext"], json!({ "privileged": true }));
+        assert!(
+            volume["resources"].is_null(),
+            "adds nothing to the TD's size"
+        );
+        assert_eq!(
+            spec["containers"][0]["volumeMounts"],
+            json!([{ "name": "pgdata", "mountPath": "/var/lib/data", "mountPropagation": "HostToContainer" }])
+        );
+        assert_eq!(
+            w.volume_claims,
+            [json!({
+                "apiVersion": "v1",
+                "kind": "PersistentVolumeClaim",
+                "metadata": { "name": "alpha-volume-pgdata" },
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "volumeMode": "Block",
+                    "resources": { "requests": { "storage": "20Gi" } },
+                },
+            })]
+        );
+        // The policy: the init container privileged with the claim's device, its mount shared
+        // back to the guest, the App's slaved to it, and nothing else elevated.
+        let initdata = BASE64_STANDARD.decode(&w.initdata).unwrap();
+        let text = InitData::parse(&initdata).unwrap().data["policy.rego"].clone();
+        let verified = policy::verify(&text).unwrap();
+        assert_eq!(
+            verified.elevated,
+            BTreeSet::from(["alpha-volume-pgdata".to_owned()])
+        );
+        let containers = verified.data["containers"].as_array().unwrap();
+        let mount = |name: &str, dest: &str| {
+            containers
+                .iter()
+                .find(|c| {
+                    c["OCI"]["Annotations"]["io.kubernetes.cri.container-name"] == json!(name)
+                })
+                .unwrap()["OCI"]["Mounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["destination"] == json!(dest))
+                .unwrap()["options"]
+                .clone()
+        };
+        assert_eq!(
+            mount("alpha-volume-pgdata", "/run/alpha-volume"),
+            json!(["rbind", "rshared", "rw"])
+        );
+        assert_eq!(
+            mount("db", "/var/lib/data"),
+            json!(["rbind", "rslave", "rw"])
+        );
+        // The adapter's contract has five keys; the claims make a sixth, which an adapter that
+        // does not create claims refuses.
+        let out: Value = serde_json::to_value(&w).unwrap();
+        assert!(out.get("volume_claims").is_some());
+        let _ = shape;
+    }
+
+    #[tokio::test]
+    async fn persistent_volumes_are_refused_without_an_image_or_a_mount() {
+        let shape = Shape::parse(&fs::read(dir("coco/wrap/02-cpu/shape.json")).unwrap()).unwrap();
+        let compose = fs::read(dir("coco/wrap/03-volume/compose.yaml")).unwrap();
+        let volumes = persistent_volumes(&compose).unwrap();
+        let refuse = |persistent: Persistent, compose: Vec<u8>| {
+            let shape = shape.clone();
+            async move {
+                wrap(
+                    parse(&compose).unwrap(),
+                    &BTreeMap::new(),
+                    app_id(),
+                    &runtime(),
+                    &shape,
+                    &persistent,
+                    &Fixed(String::new()),
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+            }
+        };
+        let no_image = Persistent {
+            volumes: volumes.clone(),
+            image: None,
+        };
+        assert!(
+            refuse(no_image, compose.clone())
+                .await
+                .contains("not available for this App yet")
+        );
+        let unmounted = String::from_utf8(compose.clone())
+            .unwrap()
+            .replace("    volumes:\n      - pgdata:/var/lib/data\n", "");
+        let persistent = Persistent {
+            volumes,
+            image: Some(VOLUME_IMAGE.into()),
+        };
+        assert!(
+            refuse(persistent, unmounted.into_bytes())
+                .await
+                .contains("no service mounts it")
+        );
+        for (bad, why) in [
+            (
+                "x-alphacompute-volumes: {pgdata: {size: 1G}}",
+                "at least 1Gi",
+            ),
+            (
+                "x-alphacompute-volumes: {pgdata: {size: 2Gi, ro: true}}",
+                "nothing else",
+            ),
+            (
+                "x-alphacompute-volumes: {pg.data: {size: 2Gi}}",
+                "persistent volume's name",
+            ),
+        ] {
+            let error = persistent_volumes(bad.as_bytes()).unwrap_err();
+            assert!(error.contains(why), "{why}: {error}");
+        }
     }
 
     #[test]

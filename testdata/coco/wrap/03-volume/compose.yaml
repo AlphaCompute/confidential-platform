@@ -1,0 +1,14 @@
+# A database whose data persists across pods: `pgdata` is an encrypted persistent volume, opened
+# by the alpha-volume init container under the App's key for `volume.pgdata`.
+services:
+  db:
+    image: nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+    ports:
+      - "443:80"
+    volumes:
+      - pgdata:/var/lib/data
+volumes:
+  pgdata: {}
+x-alphacompute-volumes:
+  pgdata:
+    size: 20Gi

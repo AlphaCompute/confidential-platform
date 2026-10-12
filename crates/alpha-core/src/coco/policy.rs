@@ -77,6 +77,12 @@ pub const TYPE_ANNOTATION: &str = "io.kubernetes.cri.container-type";
 /// App, its CA, the keys and the required `binding`. On a Kata pod the host writes the
 /// environment, so the value counts only as the agent policy pins it ([`dsm_pinned`]).
 pub const DSM_ENV: &str = "ALPHACOMPUTE_DSM";
+/// The init containers that open encrypted persistent volumes (`alpha-volume`, PRD-02
+/// deliverable 25), the only ones the baseline lets run privileged in the TD and share a mount
+/// back to the guest (the opened volume, which the App's container then mounts).
+pub const VOLUME_CONTAINER_PREFIX: &str = "alpha-volume-";
+/// genpolicy's capability set for an unprivileged container.
+const DEFAULT_CAPS: &str = "$(default_caps)";
 /// genpolicy's placeholders, which let a listed variable take a value the policy does not spell
 /// out (the sandbox's name, the pod's IP, ...).
 const PLACEHOLDER: &str = "$(";
@@ -95,6 +101,9 @@ pub struct Verified {
     pub containers: BTreeSet<PolicyContainer>,
     /// Each admitted container's environment as the policy lists it, by container name.
     pub env: BTreeMap<String, Vec<String>>,
+    /// The containers with more than the default capabilities (privileged), by name: only
+    /// `alpha-volume-*`, which opens a LUKS volume with device-mapper inside the TD.
+    pub elevated: BTreeSet<String>,
     /// `policy_data`, parsed, for checks that belong to one caller.
     pub data: Value,
 }
@@ -152,6 +161,7 @@ pub fn verify(policy: &str) -> Result<Verified, String> {
         .ok_or_else(|| bad("policy_data has no containers"))?;
     let mut admitted = BTreeSet::new();
     let mut env = BTreeMap::new();
+    let mut elevated = BTreeSet::new();
     for container in containers {
         let commands = container.get("exec_commands").unwrap_or(&Value::Null);
         if !commands.as_array().is_some_and(Vec::is_empty) {
@@ -194,6 +204,28 @@ pub fn verify(policy: &str) -> Result<Verified, String> {
             .filter_map(|v| v.as_str().map(str::to_owned))
             .collect();
         env.insert(name.to_owned(), listed);
+        let bounding = container
+            .pointer("/OCI/Process/Capabilities/Bounding")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten();
+        let is_elevated = bounding.clone().any(|c| c.as_str() != Some(DEFAULT_CAPS));
+        let shares_mounts = container
+            .pointer("/OCI/Mounts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m.get("options").and_then(Value::as_array))
+            .flatten()
+            .any(|o| o.as_str() == Some("rshared"));
+        if (is_elevated || shares_mounts) && !name.starts_with(VOLUME_CONTAINER_PREFIX) {
+            return Err(bad(&format!(
+                "container {name} is privileged or shares mounts back to the guest; only {VOLUME_CONTAINER_PREFIX}* may"
+            )));
+        }
+        if is_elevated {
+            elevated.insert(name.to_owned());
+        }
         if !admitted.insert(PolicyContainer {
             name: name.to_owned(),
             image: image.to_owned(),
@@ -207,6 +239,7 @@ pub fn verify(policy: &str) -> Result<Verified, String> {
     Ok(Verified {
         containers: admitted,
         env,
+        elevated,
         data,
     })
 }
@@ -314,6 +347,27 @@ mod tests {
         }
         lines[at..].iter().for_each(|l| out.push_str(l));
         out
+    }
+
+    #[test]
+    fn only_a_volume_container_runs_privileged_or_shares_a_mount() {
+        let caps = r#""Process": { "Capabilities": { "Bounding": ["$(privileged_caps)"] }, "#;
+        let base = policy(&["PATH=/bin"]);
+        let as_volume = base
+            .replace("\"alpha-runtime\"", "\"alpha-volume-pg\"")
+            .replace("\"Process\": {", caps);
+        let verified = verify(&as_volume).unwrap();
+        assert_eq!(
+            verified.elevated,
+            BTreeSet::from(["alpha-volume-pg".to_owned()])
+        );
+        let as_app = base.replace("\"Process\": {", caps);
+        assert!(verify(&as_app).unwrap_err().contains("privileged"));
+        let shared = base.replace(
+            "\"Process\": {",
+            r#""Mounts": [{ "destination": "/data", "options": ["rbind", "rshared", "rw"] }], "Process": {"#,
+        );
+        assert!(verify(&shared).unwrap_err().contains("shares mounts"));
     }
 
     #[test]

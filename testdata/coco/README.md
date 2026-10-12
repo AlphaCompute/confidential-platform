@@ -14,9 +14,15 @@ The KMS pins are those of `testdata/manifest/05-deploy`.
   `policy.rego` what it printed, and `genpolicy-runs.json` every run by the SHA-256 of its input:
   the first asked for the runtime image's groups, which the second input pins.
 - `wrap/02-cpu` — one service on a `kata-qemu-tdx` shape: no GPU in the pod or the Revision.
+- `wrap/03-volume` — one service with an encrypted persistent volume (`x-alphacompute-volumes`)
+  on a CPU shape, `busybox` standing in for the `alpha-volume` image: the init container, the
+  claim under `volume_claims`, and the policy with the two mounts' propagation set.
 - `wrap-refusals/cases.yaml` — one compose per refusal `coco wrap` adds to `compose wrap`'s
   (`testdata/manifest/09-wrap-refusals`), with a substring of the line the customer sees,
   among them a compose that tries to declare a customer DSM.
 - `render/01-pod` — `spec.yaml` and `values.env` for `alpha coco render`; `policy.rego` is
   genpolicy's output for the `--for-genpolicy` rendering, `manifest.yaml` the rendered spec and
   `revision.txt` the Revision v2 and its hash.
+- `render/02-volume` — `01-pod`'s spec and values rendered with
+  `--volume pgdata:20Gi:app:/var/lib/data`: the claim appended as a document, the init
+  container and the mount added, and genpolicy's policy for that rendering.

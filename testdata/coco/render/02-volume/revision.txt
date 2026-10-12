@@ -1,0 +1,2 @@
+{"app_id":"01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b","format":"alphacompute-coco-revision/1","initdata_sha256":"sha256:78f79bd5f9bcdebca56e6d1e3af81a7643ab1fa12478096011e0a5726bdeb6de","policy_sha256":"sha256:b9e41ce710bbfc25a1662122c36741d87cd0dedd0ac2fa9eb16d5dbee87fd88b","runtime_class":"kata-qemu-tdx"}
+sha256:9af2c61edcb8891494e4edae719a8316f24878c81e11d044a422ce9b02732b87

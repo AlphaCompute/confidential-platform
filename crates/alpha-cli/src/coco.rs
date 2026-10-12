@@ -11,6 +11,7 @@
 //! See also: `deploy/coco/render-interim.py` (the Python script this replaces).
 
 pub mod policy;
+pub mod volume;
 pub mod wrap;
 
 use std::collections::{BTreeSet, HashMap};
@@ -361,9 +362,168 @@ pub fn render_for_genpolicy(
     template: &str,
     env: &HashMap<String, String>,
 ) -> Result<String, String> {
+    render_volumes_for_genpolicy(template, env, &Volumes::default())
+}
+
+/// As [`render_for_genpolicy`], with encrypted persistent volumes added to the pod.
+pub fn render_volumes_for_genpolicy(
+    template: &str,
+    env: &HashMap<String, String>,
+    volumes: &Volumes,
+) -> Result<String, String> {
     let mut values = env.clone();
     values.insert("CC_INIT_DATA".to_owned(), String::new());
-    substitute(template, &values)
+    volumes.inject(&substitute(template, &values)?)
+}
+
+/// Encrypted persistent volumes `render` adds to the spec's one pod (PRD-02 deliverable 25):
+/// per volume, the block-mode claim as a document of its own, the `alpha-volume` init container
+/// after the template's, the pod's volumes, and the mount in the container that uses it.
+#[derive(Clone, Debug, Default)]
+pub struct Volumes {
+    pub image: Option<String>,
+    pub volumes: Vec<RenderVolume>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RenderVolume {
+    pub name: String,
+    pub size: String,
+    pub container: String,
+    pub path: String,
+}
+
+impl RenderVolume {
+    /// `<name>:<size>:<container>:<mount path>`.
+    pub fn parse(flag: &str) -> Result<Self, String> {
+        let parts: Vec<&str> = flag.splitn(4, ':').collect();
+        let [name, size, container, path] = parts.as_slice() else {
+            return Err(format!(
+                "--volume {flag}: write <name>:<size>:<container>:<mount path>"
+            ));
+        };
+        volume::check_name(name, "--volume")?;
+        volume::check_size(size)?;
+        if !path.starts_with('/') {
+            return Err(format!("--volume {flag}: the mount path is absolute"));
+        }
+        Ok(Self {
+            name: (*name).to_owned(),
+            size: (*size).to_owned(),
+            container: (*container).to_owned(),
+            path: (*path).to_owned(),
+        })
+    }
+}
+
+impl Volumes {
+    fn names(&self) -> BTreeSet<String> {
+        self.volumes.iter().map(|v| v.name.clone()).collect()
+    }
+
+    /// The rendered manifest with the volumes added; unchanged, comments and all, without any.
+    fn inject(&self, rendered: &str) -> Result<String, String> {
+        use serde_yaml_ng::Value as Yaml;
+        if self.volumes.is_empty() {
+            return Ok(rendered.to_owned());
+        }
+        let image = self
+            .image
+            .as_deref()
+            .ok_or("--volume needs --volume-image, the alpha-volume image pinned by digest")?;
+        if !crate::deploy::wrap::pinned_reference(image) {
+            return Err(format!("--volume-image {image:?} is not pinned by digest"));
+        }
+        let to_yaml = |v: serde_json::Value| serde_yaml_ng::to_value(v).map_err(|e| e.to_string());
+        let mut docs = Vec::new();
+        for document in serde_yaml_ng::Deserializer::from_str(rendered) {
+            docs.push(Yaml::deserialize(document).map_err(|e| format!("spec: not YAML: {e}"))?);
+        }
+        let mut pods: Vec<&mut serde_yaml_ng::Mapping> = Vec::new();
+        for doc in &mut docs {
+            pod_specs(doc, &mut pods);
+        }
+        let [pod] = pods.as_mut_slice() else {
+            return Err(format!(
+                "--volume: the spec has {} pod templates; volumes go into a spec with one",
+                pods.len()
+            ));
+        };
+        let socket = crate::coco::wrap::SOCKET_VOLUME;
+        for v in &self.volumes {
+            let volumes = sequence(pod, "volumes")?;
+            if volumes
+                .iter()
+                .any(|x| x.get("name").and_then(Yaml::as_str) == Some(&v.name))
+            {
+                return Err(format!(
+                    "--volume {}: the spec already has a volume of that name",
+                    v.name
+                ));
+            }
+            for item in volume::pod_volumes(&v.name) {
+                volumes.push(to_yaml(item)?);
+            }
+            sequence(pod, "initContainers")?
+                .push(to_yaml(volume::init_container(&v.name, image, socket))?);
+            let container = sequence(pod, "containers")?
+                .iter_mut()
+                .find(|c| c.get("name").and_then(Yaml::as_str) == Some(&v.container))
+                .and_then(Yaml::as_mapping_mut)
+                .ok_or_else(|| {
+                    format!(
+                        "--volume {}: the spec has no container {}",
+                        v.name, v.container
+                    )
+                })?;
+            sequence(container, "volumeMounts")?.push(to_yaml(serde_json::json!({
+                "name": v.name, "mountPath": v.path, "mountPropagation": volume::APP_PROPAGATION,
+            }))?);
+        }
+        let mut out = String::new();
+        let claims = self
+            .volumes
+            .iter()
+            .map(|v| to_yaml(volume::claim(&v.name, &v.size)));
+        for doc in docs.into_iter().map(Ok).chain(claims) {
+            out.push_str("---\n");
+            out.push_str(&serde_yaml_ng::to_string(&doc?).map_err(|e| e.to_string())?);
+        }
+        Ok(out)
+    }
+}
+
+/// The sequence under `key` in `map`, made empty if it is absent.
+fn sequence<'a>(
+    map: &'a mut serde_yaml_ng::Mapping,
+    key: &str,
+) -> Result<&'a mut Vec<serde_yaml_ng::Value>, String> {
+    use serde_yaml_ng::Value as Yaml;
+    if map.get(key).is_none_or(Yaml::is_null) {
+        map.insert(key.into(), Yaml::Sequence(Vec::new()));
+    }
+    map.get_mut(key)
+        .and_then(Yaml::as_sequence_mut)
+        .ok_or_else(|| format!("spec: {key} is not a list"))
+}
+
+/// Every mapping that holds a pod's `containers`.
+fn pod_specs<'a>(
+    value: &'a mut serde_yaml_ng::Value,
+    out: &mut Vec<&'a mut serde_yaml_ng::Mapping>,
+) {
+    use serde_yaml_ng::Value as Yaml;
+    match value {
+        Yaml::Mapping(map) => {
+            if map.get("containers").is_some_and(Yaml::is_sequence) {
+                out.push(map);
+            } else {
+                map.values_mut().for_each(|v| pod_specs(v, out));
+            }
+        }
+        Yaml::Sequence(items) => items.iter_mut().for_each(|v| pod_specs(v, out)),
+        _ => {}
+    }
 }
 
 /// Full render: init-data from `policy_text` and the env's `APP_ID` / `GPU_MODEL`, then the
@@ -373,8 +533,21 @@ pub fn render(
     policy_text: &str,
     env: &HashMap<String, String>,
 ) -> Result<RenderOutput, String> {
-    let for_shape = render_for_genpolicy(template, env)?;
+    render_volumes(template, policy_text, env, &Volumes::default())
+}
+
+/// As [`render`], with encrypted persistent volumes added to the pod. `policy_text` is
+/// genpolicy's output for [`render_volumes_for_genpolicy`]; the init-data carries it with the
+/// volumes' mount propagation set ([`volume::propagate`]).
+pub fn render_volumes(
+    template: &str,
+    policy_text: &str,
+    env: &HashMap<String, String>,
+    volumes: &Volumes,
+) -> Result<RenderOutput, String> {
+    let for_shape = render_volumes_for_genpolicy(template, env, volumes)?;
     let (runtime_class, gpu_count) = extract_shape(&for_shape)?;
+    let policy_text = &volume::propagate(policy_text, &volumes.names())?;
     let verified = policy::verify(policy_text)?;
     let containers = manifest_containers(&for_shape)?;
     let running = admitted(&containers);
@@ -385,6 +558,15 @@ pub fn render(
         ));
     }
     check_dsm(&containers, &verified)?;
+    let volume_containers = running
+        .iter()
+        .filter(|c| {
+            c.name
+                .starts_with(alpha_core::coco::policy::VOLUME_CONTAINER_PREFIX)
+        })
+        .cloned()
+        .collect();
+    volume::check_elevated(&verified, &volume_containers)?;
 
     let app_id_str = env
         .get("APP_ID")
@@ -411,7 +593,7 @@ pub fn render(
 
     let mut values = env.clone();
     values.insert("CC_INIT_DATA".to_owned(), annotation);
-    let manifest = substitute(template, &values)?;
+    let manifest = volumes.inject(&substitute(template, &values)?)?;
 
     let initdata = alpha_core::coco::InitData::parse(&initdata_bytes).map_err(|e| e.to_string())?;
     let revision = initdata.revision().map_err(|e| e.to_string())?;
@@ -658,38 +840,101 @@ spec:
     /// printed under `genpolicy-settings` for its `--for-genpolicy` rendering. Under
     /// `WRITE_VECTORS=1` with `ALPHA_TEST_GENPOLICY` naming genpolicy 4.1.0, the policy is
     /// generated again.
-    #[tokio::test]
-    async fn render_reproduces_the_vector() {
-        let dir = vector("01-pod");
+    fn vector_volumes(name: &str) -> Volumes {
+        match name {
+            "02-volume" => Volumes {
+                image: Some(
+                    "busybox@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e"
+                        .into(),
+                ),
+                volumes: vec![RenderVolume::parse("pgdata:20Gi:app:/var/lib/data").unwrap()],
+            },
+            _ => Volumes::default(),
+        }
+    }
+
+    /// `testdata/coco/render/<name>`: a template, its values, and the policy genpolicy 4.1.0
+    /// printed under `genpolicy-settings` for its `--for-genpolicy` rendering. Under
+    /// `WRITE_VECTORS=1` with `ALPHA_TEST_GENPOLICY` naming genpolicy 4.1.0, the policy is
+    /// generated again.
+    async fn render_vector(name: &str) -> RenderOutput {
+        let dir = vector(name);
         let template = std::fs::read_to_string(dir.join("spec.yaml")).unwrap();
         let env = read_env_files(&[dir.join("values.env").as_path()]).unwrap();
+        let volumes = vector_volumes(name);
         let write = std::env::var_os("WRITE_VECTORS").is_some();
         if let (true, Some(path)) = (write, std::env::var_os("ALPHA_TEST_GENPOLICY")) {
             let genpolicy = policy::Genpolicy {
                 path: path.into(),
                 ..policy::Genpolicy::pinned()
             };
-            let input = render_for_genpolicy(&template, &env).unwrap();
+            let input = render_volumes_for_genpolicy(&template, &env, &volumes).unwrap();
             let text = genpolicy.run(&input).await.unwrap();
             std::fs::write(dir.join("policy.rego"), text).unwrap();
         }
         let policy_text = std::fs::read_to_string(dir.join("policy.rego")).unwrap();
-        let out = render(&template, &policy_text, &env).unwrap();
+        let out = render_volumes(&template, &policy_text, &env, &volumes).unwrap();
         let expected = format!("{}\n{}\n", out.revision_canonical, out.revision_hash);
         if write {
             std::fs::write(dir.join("manifest.yaml"), &out.manifest).unwrap();
             std::fs::write(dir.join("revision.txt"), &expected).unwrap();
-            return;
+        } else {
+            assert_eq!(
+                out.manifest,
+                std::fs::read_to_string(dir.join("manifest.yaml")).unwrap()
+            );
+            assert_eq!(
+                expected,
+                std::fs::read_to_string(dir.join("revision.txt")).unwrap()
+            );
         }
-        assert_eq!(
-            out.manifest,
-            std::fs::read_to_string(dir.join("manifest.yaml")).unwrap()
-        );
-        assert_eq!(
-            expected,
-            std::fs::read_to_string(dir.join("revision.txt")).unwrap()
-        );
+        out
+    }
+
+    #[tokio::test]
+    async fn render_reproduces_the_vector() {
+        let out = render_vector("01-pod").await;
         assert_eq!(out.revision.runtime_class, "kata-qemu-tdx");
         assert_eq!(out.revision.gpu, None);
+    }
+
+    #[tokio::test]
+    async fn render_adds_an_encrypted_volume() {
+        let out = render_vector("02-volume").await;
+        let docs: Vec<serde_yaml_ng::Value> = serde_yaml_ng::Deserializer::from_str(&out.manifest)
+            .map(|d| serde_yaml_ng::Value::deserialize(d).unwrap())
+            .collect();
+        assert_eq!(docs.len(), 2);
+        assert_eq!(
+            docs[1]["kind"],
+            serde_yaml_ng::Value::from("PersistentVolumeClaim")
+        );
+        assert_eq!(
+            docs[1]["spec"]["volumeMode"],
+            serde_yaml_ng::Value::from("Block")
+        );
+        let pod = &docs[0]["spec"]["template"]["spec"];
+        assert_eq!(
+            pod["initContainers"][1]["name"],
+            serde_yaml_ng::Value::from("alpha-volume-pgdata")
+        );
+        assert_eq!(
+            pod["containers"][0]["volumeMounts"][0]["mountPropagation"],
+            serde_yaml_ng::Value::from("HostToContainer")
+        );
+        // Without --volume the same policy admits a container the spec does not run.
+        let dir = vector("02-volume");
+        let template = std::fs::read_to_string(dir.join("spec.yaml")).unwrap();
+        let env = read_env_files(&[dir.join("values.env").as_path()]).unwrap();
+        let policy_text = std::fs::read_to_string(dir.join("policy.rego")).unwrap();
+        assert!(render(&template, &policy_text, &env).is_err());
+        // A volume init container without the volume's shared mount is refused by the baseline.
+        let mut volumes = vector_volumes("02-volume");
+        volumes.image = None;
+        assert!(
+            render_volumes(&template, &policy_text, &env, &volumes)
+                .unwrap_err()
+                .contains("--volume-image")
+        );
     }
 }

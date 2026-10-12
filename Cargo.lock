@@ -367,6 +367,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "alpha-volume"
+version = "0.1.0"
+dependencies = [
+ "alpha-client",
+ "alpha-core",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
