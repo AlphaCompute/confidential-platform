@@ -3,12 +3,14 @@
 //! HTTP server standing in for the release artifact URL, and a bootstrapped organization.
 #![allow(dead_code)]
 
+pub mod kata;
+
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use alpha_attest::{EVIDENCE_FORMAT, EventLogEntry, Evidence};
+use alpha_attest::{EVIDENCE_FORMAT, EventLogEntry, Evidence, GpuVerifier};
 use alpha_channel::receipt::{self, Expected};
 use alpha_cli::node::{NodeIdentity, ShareFile};
 use alpha_client::{Client, Pin};
@@ -219,12 +221,24 @@ pub async fn start_node(
     release_key: &SigningKey,
     clock: Clock,
 ) -> (Arc<Node>, String, tokio::sync::oneshot::Sender<()>) {
+    start_node_with(pool, release_url, release_key, clock, Vec::new()).await
+}
+
+/// [`start_node`] with these GPU verifier backends.
+pub async fn start_node_with(
+    pool: PgPool,
+    release_url: &str,
+    release_key: &SigningKey,
+    clock: Clock,
+    gpu_backends: Vec<Arc<dyn GpuVerifier>>,
+) -> (Arc<Node>, String, tokio::sync::oneshot::Sender<()>) {
     let event_log: Vec<EventLogEntry> =
         serde_json::from_slice(&read(KEYED, "event_log.json")).unwrap();
     let collateral = serde_json::from_slice(&read(KEYED, "collateral.json")).unwrap();
     let config = Config {
         kms_endpoints: vec![],
         platform_document_url: release_url.to_owned(),
+        gpu_backends,
         #[cfg(feature = "dev-root")]
         dev_root_kek: None,
     };
@@ -265,9 +279,24 @@ pub async fn harness() -> Option<Harness> {
 }
 
 pub async fn harness_with_clock(clock: Clock) -> Option<Harness> {
+    harness_with(clock, Vec::new()).await
+}
+
+/// [`harness_with_clock`] on a node with these GPU verifier backends.
+pub async fn harness_with(
+    clock: Clock,
+    gpu_backends: Vec<Arc<dyn GpuVerifier>>,
+) -> Option<Harness> {
     let pool = fresh_database().await?;
     let release = ReleaseServer::start(platform_document(KEYED)).await;
-    let (node, base, shutdown) = start_node(pool.clone(), &release.url, &release.key, clock).await;
+    let (node, base, shutdown) = start_node_with(
+        pool.clone(),
+        &release.url,
+        &release.key,
+        clock,
+        gpu_backends,
+    )
+    .await;
     let custodians: Vec<PrivateKey> = (0..3).map(|_| PrivateKey::generate().unwrap()).collect();
     let dir = std::env::temp_dir().join(format!("alpha-harness-{}", Uuid::now_v7()));
     fs::create_dir_all(&dir).unwrap();
