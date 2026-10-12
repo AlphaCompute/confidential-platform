@@ -85,9 +85,9 @@ Delete it, and render with `alpha coco render`, once that exists.
   shape.
 - **One GPU per pod**, `Recreate` rollouts: no spare GPU is assumed.
 
-## Depends on PRD-02
+## Requires PRD-02
 
-The runtime's CoCo evidence source (`ALPHACOMPUTE_QUOTE_SOURCE`, the init-data at
-`/run/alpha-pod/cc_init_data`, GPU evidence) and the KMS's Revision v2 appraisal are PRD-02's; the
-runtime on this branch still reads the dstack guest agent and ignores the variable. These specs
-are written for the PRD-02 runtime, and nothing here has run on Kata, a GPU or the KMS.
+This stack is built on PRD-02. `ALPHACOMPUTE_QUOTE_SOURCE=coco-aa` is required and active: the
+runtime reads TDX evidence from the CoCo attestation agent, not the dstack guest agent. The KMS
+appraises Revision v2 from the pod's init-data. Nothing here has run on real Kata hardware, a GPU
+or the KMS yet — that is the M1 milestone.
