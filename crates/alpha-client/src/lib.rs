@@ -12,6 +12,7 @@
         clippy::arithmetic_side_effects
     )
 )]
+pub mod db_key;
 pub mod platform;
 pub mod runtime;
 pub mod tls;
@@ -342,6 +343,10 @@ pub struct NodeSignature {
 pub struct BootstrapPayload {
     pub shares_hpke: Vec<Sealed>,
     pub kms_ca_pem: String,
+    /// The database's volume key wrapped under the root KEK (M2(a)), for every share file: what
+    /// lets custodians unseal a node while the database is still closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db_volume_wrapped: Option<String>,
 }
 
 impl BootstrapReply {
@@ -369,6 +374,14 @@ impl BootstrapReply {
 #[serde(deny_unknown_fields)]
 pub struct UnsealRequest {
     pub share_hpke: Sealed,
+    /// From the share file: the database's volume key under the root KEK, which the node opens
+    /// with the combined root when the database is not reachable yet (M2(a)).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db_volume_wrapped: Option<String>,
+    /// The platform document version the custodian verified the node against; a node unsealed
+    /// before its database opens appraises nothing under an older document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform_document_version: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -427,6 +440,9 @@ pub struct Rotation {
     pub id: String,
     pub proposal: RotationProposal,
     pub shares_hpke: Vec<Sealed>,
+    /// The database's volume key re-wrapped under the new root, for the new share files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db_volume_wrapped: Option<String>,
     pub receipt: Value,
 }
 
@@ -455,6 +471,27 @@ pub struct JoinReply {
     pub tenant_kek_root: String,
     pub ca_key: String,
     pub ca_cert: String,
+    /// The database's volume key, when the database has one (M2(a)).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db_volume_key: Option<String>,
+}
+
+/// The Postgres pod's request for the database's volume key: Kata evidence v2 whose
+/// `report_data` is `report_data(xwing_pubkey, nonce, None)`, over a nonce of the KMS node.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DbKeyRequest {
+    pub nonce: String,
+    pub evidence: AnyEvidence,
+    pub xwing_pubkey: PublicKey,
+}
+
+/// The volume key sealed to the request's X-Wing key under `INFO_DB_VOLUME_KEY`, its aad the
+/// node's runtime-key hash.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DbKeyReply {
+    pub key_hpke: Sealed,
 }
 
 pub struct Client {
@@ -614,6 +651,15 @@ impl Client {
 
     pub async fn join(&self, body: &JoinRequest) -> Result<JoinReply, Error> {
         self.post("/v1/node/join", body).await
+    }
+
+    /// A nonce from the Node API, which a node answers before it serves.
+    pub async fn node_nonce(&self) -> Result<Nonce, Error> {
+        self.request(Method::POST, "/v1/node/nonce", None).await
+    }
+
+    pub async fn db_key(&self, body: &DbKeyRequest) -> Result<DbKeyReply, Error> {
+        self.post("/v1/node/db-key", body).await
     }
 
     pub async fn rotate_custodians(&self, body: &RotateRequest) -> Result<RotateReply, Error> {

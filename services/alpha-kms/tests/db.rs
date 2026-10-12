@@ -120,7 +120,10 @@ async fn bootstrap_once_unseal_with_two_shares_and_sealed_gate() {
     let (status, reply) = post(unseal(&h.shares[0])).await;
     assert_eq!(
         (status, reply),
-        (StatusCode::OK, json!({ "sealed": false, "shares": 2 }))
+        (
+            StatusCode::OK,
+            json!({ "sealed": false, "shares": 2, "database": "open" })
+        )
     );
     assert!(!node2.is_sealed());
     assert_eq!(

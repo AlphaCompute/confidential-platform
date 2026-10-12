@@ -1,4 +1,4 @@
-//! The key broker: seven tables, sixteen routes on one TLS port, one process-wide state.
+//! The key broker: seven tables, eighteen routes on one TLS port, one process-wide state.
 
 #![cfg_attr(
     test,
@@ -17,6 +17,7 @@ pub mod certs;
 pub mod channel;
 pub mod control;
 pub mod custodians;
+pub mod db_volume;
 pub mod error;
 pub mod instance;
 pub mod keys;
@@ -197,12 +198,13 @@ pub enum CollateralSource {
 }
 
 /// The two intermediates in memory after unseal, join or bootstrap, and the database's keys
-/// derived from the first.
+/// derived from the first; the database's volume key (M2(a)) when the database has one.
 pub struct Intermediates {
     pub tenant_kek_root: Zeroizing<[u8; 32]>,
     pub ca_key_der: Zeroizing<Vec<u8>>,
     pub ca_cert_der: Vec<u8>,
     pub metadata: store::MetadataKeys,
+    pub db_volume: Option<Zeroizing<[u8; 32]>>,
 }
 
 impl Intermediates {
@@ -216,7 +218,13 @@ impl Intermediates {
             tenant_kek_root,
             ca_key_der,
             ca_cert_der,
+            db_volume: None,
         })
+    }
+
+    pub fn with_db_volume(mut self, key: Option<Zeroizing<[u8; 32]>>) -> Self {
+        self.db_volume = key;
+        self
     }
 
     pub fn ca_key(&self) -> Result<rcgen::KeyPair, ApiError> {
@@ -229,7 +237,13 @@ impl Intermediates {
 }
 
 pub enum Phase {
-    Sealed { shares: Vec<Vec<u8>> },
+    Sealed {
+        shares: Vec<Vec<u8>>,
+    },
+    /// Unsealed by custodians while the database is closed (M2(a)): the node holds the root KEK
+    /// and the database's volume key, answers only the Node API and waits for the database
+    /// ([`db_volume`]).
+    Unsealed(Arc<db_volume::Unsealed>),
     Serving(Arc<Intermediates>),
 }
 
@@ -259,6 +273,10 @@ pub struct Node {
     pub audit_chain: Mutex<Result<audit::Checkpoint, String>>,
     /// The approvals of a custodian rotation counted so far ([`custodians`]).
     pub pending_rotation: Mutex<Option<custodians::Pending>>,
+    /// What custodians' unseal requests carried beside their shares (M2(a)).
+    pub unseal_extras: Mutex<db_volume::UnsealExtras>,
+    /// Audit rows of a node waiting for its database, appended once it serves.
+    pub held_audit: Mutex<Vec<db_volume::Held>>,
     bucket: Mutex<(f64, Instant)>,
 }
 
@@ -307,6 +325,8 @@ impl Node {
             server_cert,
             audit_chain: Mutex::new(Ok(audit::Checkpoint::default())),
             pending_rotation: Mutex::new(None),
+            unseal_extras: Mutex::new(db_volume::UnsealExtras::default()),
+            held_audit: Mutex::new(Vec::new()),
             bucket: Mutex::new((BUCKET_CAPACITY, Instant::now())),
         }))
     }
@@ -327,11 +347,32 @@ impl Node {
         match &*self.phase.read() {
             Phase::Serving(keys) => Ok(keys.clone()),
             Phase::Sealed { .. } => Err(ApiError::new("sealed", "node is sealed")),
+            Phase::Unsealed(_) => Err(ApiError::new(
+                "sealed",
+                "node is unsealed but waits for its database",
+            )),
         }
     }
 
+    /// No custodian has unsealed this node, nor has it joined one.
     pub fn is_sealed(&self) -> bool {
         matches!(&*self.phase.read(), Phase::Sealed { .. })
+    }
+
+    pub fn is_serving(&self) -> bool {
+        matches!(&*self.phase.read(), Phase::Serving(_))
+    }
+
+    /// The database's volume key, while unsealed or serving.
+    pub fn db_volume_key(&self) -> Result<Zeroizing<[u8; 32]>, ApiError> {
+        match &*self.phase.read() {
+            Phase::Serving(keys) => keys
+                .db_volume
+                .clone()
+                .ok_or_else(|| ApiError::not_found("this database has no db-volume key")),
+            Phase::Unsealed(unsealed) => Ok(unsealed.db_volume.clone()),
+            Phase::Sealed { .. } => Err(ApiError::new("sealed", "node is sealed")),
+        }
     }
 
     /// An audit row in a transaction of its own: sealed while serving, a node fact otherwise.
@@ -339,6 +380,24 @@ impl Node {
         let keys = self.intermediates().ok();
         row.insert_now(&self.pool, keys.as_ref().map(|k| &k.metadata))
             .await
+    }
+
+    /// A node fact through [`Node::audit`], or, while the node waits for its database, held in
+    /// memory and appended once it serves.
+    pub async fn audit_or_hold(
+        &self,
+        action: &str,
+        outcome: &str,
+        details: serde_json::Value,
+    ) -> Result<(), ApiError> {
+        if matches!(&*self.phase.read(), Phase::Unsealed(_)) {
+            let held = db_volume::Held::new(action, outcome, details, self.now_utc());
+            self.held_audit.lock().push(held);
+            return Ok(());
+        }
+        self.audit(audit::node(action, outcome, details))
+            .await
+            .map(|_| ())
     }
 
     /// Enters the serving phase: unseal → the database's keys → every plaintext row sealed → serve,
@@ -350,6 +409,18 @@ impl Node {
             eprintln!("sealed plaintext rows: {sealed:?}");
         }
         self.issue_own_leaf(&keys)?;
+        // What the node did while it waited for its database goes into the chain, sealed,
+        // before it serves.
+        let held: Vec<db_volume::Held> = std::mem::take(&mut *self.held_audit.lock());
+        for row in &held {
+            if let Err(e) = row
+                .audit()
+                .insert_now(&self.pool, Some(&keys.metadata))
+                .await
+            {
+                eprintln!("held audit row {}: {}", row.action, e.message);
+            }
+        }
         *self.phase.write() = Phase::Serving(Arc::new(keys));
         Ok(())
     }
@@ -425,7 +496,7 @@ async fn gate(State(node): State<Arc<Node>>, request: Request, next: Next) -> Re
     }
     let path = request.uri().path();
     let exempt = path.starts_with("/v1/node/") || path == "/healthz" || path == "/ready";
-    if !exempt && node.is_sealed() {
+    if !exempt && !node.is_serving() {
         return ApiError::new("sealed", "node is sealed").into_response();
     }
     next.run(request).await
@@ -460,12 +531,18 @@ pub fn router(node: Arc<Node>) -> Router {
             "/v1/node/custodians/rotation",
             get(custodians::last_rotation),
         )
+        .route("/v1/node/nonce", post(instance::nonce))
+        .route("/v1/node/db-key", post(db_volume::db_key))
         .layer(middleware::from_fn_with_state(node.clone(), gate))
         .fallback(|| async { ApiError::not_found("no such route").into_response() })
         .with_state(node)
 }
 
 async fn ready(State(node): State<Arc<Node>>) -> Response {
+    if !node.is_sealed() && !node.is_serving() {
+        let body = axum::Json(serde_json::json!({ "sealed": false, "database": "waiting" }));
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response();
+    }
     if let Err(e) = sqlx::query("select 1").execute(&node.pool).await {
         return ApiError::internal(format!("database: {e}")).into_response();
     }

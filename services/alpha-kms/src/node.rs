@@ -21,6 +21,7 @@ use zeroize::Zeroizing;
 
 use crate::audit;
 use crate::body::Body;
+use crate::db_volume::{self, DB_VOLUME};
 use crate::error::ApiError;
 use crate::instance::{check_nonce, collateral, decode32};
 use crate::keys::{self, aead_open, aead_seal};
@@ -81,29 +82,51 @@ pub async fn bootstrap(
 
     let root = root_kek(&node)?;
     let tenant_kek_root = Zeroizing::new(random()?);
+    let db_volume = Zeroizing::new(random::<32>()?);
     let (ca_key_der, ca_cert_der) = certs::new_ca(now)?;
     let ca_key_der = Zeroizing::new(ca_key_der);
     let wrapped_tenant = aead_seal(&root, b"tenant-kek-root", tenant_kek_root.as_slice())?;
     let wrapped_ca = aead_seal(&root, b"ca", &ca_key_der)?;
-    let keys = Intermediates::new(tenant_kek_root, ca_key_der, ca_cert_der)?;
-    let mut tx = node.pool.begin().await?;
-    let inserted = sqlx::query!(
-        "insert into intermediate_keys (purpose, wrapped, public_part) values
-           ('tenant-kek-root', $1, null), ('ca', $2, $3) on conflict (purpose) do nothing",
-        wrapped_tenant,
-        wrapped_ca,
-        keys.ca_cert_der,
-    )
-    .execute(&mut *tx)
-    .await?
-    .rows_affected();
-    if inserted != 2 {
-        return Err(ApiError::new("already_exists", "database is not empty"));
-    }
-    audit::node("node.bootstrap", "ok", json!({}))
-        .insert(&mut tx, Some(&keys.metadata))
-        .await?;
-    tx.commit().await?;
+    let wrapped_db = aead_seal(&root, DB_VOLUME.as_bytes(), db_volume.as_slice())?;
+    let keys = Intermediates::new(tenant_kek_root, ca_key_der, ca_cert_der)?
+        .with_db_volume(Some(db_volume.clone()));
+    // With the database closed (M2(a) genesis: its volume key is made here), the rows wait in
+    // memory until it opens; otherwise they are written before the shares leave.
+    let kms_ca_pem = keys.ca_pem();
+    let keys = if db_volume::database_closed(&node).await {
+        let genesis = db_volume::Genesis {
+            rows: vec![
+                ("tenant-kek-root", wrapped_tenant, None),
+                ("ca", wrapped_ca, Some(keys.ca_cert_der.clone())),
+                (DB_VOLUME, wrapped_db.clone(), None),
+            ],
+            keys,
+        };
+        db_volume::bootstrap_waiting(&node, root.clone(), db_volume, genesis);
+        None
+    } else {
+        let mut tx = node.pool.begin().await?;
+        let inserted = sqlx::query!(
+            "insert into intermediate_keys (purpose, wrapped, public_part) values
+               ('tenant-kek-root', $1, null), ('ca', $2, $3), ('db-volume', $4, null)
+               on conflict (purpose) do nothing",
+            wrapped_tenant,
+            wrapped_ca,
+            keys.ca_cert_der,
+            wrapped_db,
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if inserted != 3 {
+            return Err(ApiError::new("already_exists", "database is not empty"));
+        }
+        audit::node("node.bootstrap", "ok", json!({}))
+            .insert(&mut tx, Some(&keys.metadata))
+            .await?;
+        tx.commit().await?;
+        Some(keys)
+    };
 
     let shares = Gf256::split_bytes(
         2,
@@ -121,11 +144,14 @@ pub async fn bootstrap(
     drop(root);
     let payload = json!({
         "shares_hpke": shares_hpke,
-        "kms_ca_pem": keys.ca_pem(),
+        "kms_ca_pem": kms_ca_pem,
+        "db_volume_wrapped": BASE64_URL_SAFE_NO_PAD.encode(&wrapped_db),
     });
     let digest = signing_digest(context::NODE_BOOTSTRAP, &payload)
         .map_err(|e| ApiError::internal(format!("payload: {e}")))?;
-    node.start_serving(keys).await?;
+    if let Some(keys) = keys {
+        node.start_serving(keys).await?;
+    }
     let signature: p256::ecdsa::Signature = node.runtime_key.sign(&digest);
     Ok(Json(json!({
         "payload": payload,
@@ -144,7 +170,8 @@ fn root_kek(_node: &Node) -> Result<Zeroizing<[u8; 32]>, ApiError> {
     Ok(Zeroizing::new(random()?))
 }
 
-/// Unwraps both rows under `root`.
+/// Unwraps every row under `root`: both intermediates, and the database's volume key when the
+/// database has one.
 pub async fn unwrap_intermediates(node: &Node, root: &[u8; 32]) -> Result<Intermediates, ApiError> {
     let unwrap = |purpose: &str, wrapped: Option<Vec<u8>>| {
         wrapped
@@ -166,11 +193,24 @@ pub async fn unwrap_intermediates(node: &Node, root: &[u8; 32]) -> Result<Interm
         .map(Zeroizing::new)
         .map_err(|_| ApiError::internal("tenant-kek-root is not 32 bytes"))?;
     let ca_key_der = unwrap("ca", ca.as_ref().map(|r| r.wrapped.clone()))?;
-    Intermediates::new(
+    let db_volume =
+        sqlx::query_scalar!("select wrapped from intermediate_keys where purpose = 'db-volume'")
+            .fetch_optional(&node.pool)
+            .await?
+            .map(|wrapped| {
+                unwrap(DB_VOLUME, Some(wrapped)).and_then(|key| {
+                    <[u8; 32]>::try_from(key.as_slice())
+                        .map(Zeroizing::new)
+                        .map_err(|_| ApiError::internal("db-volume is not 32 bytes"))
+                })
+            })
+            .transpose()?;
+    Ok(Intermediates::new(
         tenant_kek_root,
         ca_key_der,
         ca.and_then(|r| r.public_part).unwrap_or_default(),
-    )
+    )?
+    .with_db_volume(db_volume))
 }
 
 pub async fn unseal(
@@ -185,6 +225,12 @@ pub async fn unseal(
         &request.share_hpke,
     )
     .map_err(|e| ApiError::malformed(format!("share_hpke: {e}")))?;
+    let wrapped = request
+        .db_volume_wrapped
+        .as_deref()
+        .map(|w| alpha_client::decode("db_volume_wrapped", w))
+        .transpose()
+        .map_err(|e| ApiError::malformed(e.to_string()))?;
     let collected = {
         let mut phase = node.phase.write();
         let Phase::Sealed { shares } = &mut *phase else {
@@ -193,6 +239,13 @@ pub async fn unseal(
         if !shares.contains(&*share) {
             shares.push(share.to_vec());
         }
+        let mut extras = node.unseal_extras.lock();
+        if wrapped.is_some() {
+            extras.db_volume_wrapped = wrapped;
+        }
+        extras.document_version = extras
+            .document_version
+            .max(request.platform_document_version.unwrap_or(0));
         shares.clone()
     };
     if collected.len() < 2 {
@@ -204,21 +257,31 @@ pub async fn unseal(
             .and_then(|r| <[u8; 32]>::try_from(r.as_slice()).ok())
             .map(Zeroizing::new)
             .ok_or_else(|| ApiError::malformed("shares do not combine"))?;
-        let keys = unwrap_intermediates(&node, &root).await?;
-        node.start_serving(keys).await
+        db_volume::enter(&node, root).await
     }
     .await;
-    if let Err(e) = outcome {
-        if let Phase::Sealed { shares } = &mut *node.phase.write() {
-            shares.clear();
+    let entered = match outcome {
+        Ok(entered) => entered,
+        Err(e) => {
+            if let Phase::Sealed { shares } = &mut *node.phase.write() {
+                shares.clear();
+            }
+            *node.unseal_extras.lock() = db_volume::UnsealExtras::default();
+            let _ = node
+                .audit(audit::node("node.unseal", "denied", e.details()))
+                .await;
+            return Err(e);
         }
-        node.audit(audit::node("node.unseal", "denied", e.details()))
-            .await?;
-        return Err(e);
-    }
-    node.audit(audit::node("node.unseal", "ok", json!({})))
+    };
+    let database = match entered {
+        db_volume::Entered::Serving => "open",
+        db_volume::Entered::Waiting => "waiting",
+    };
+    node.audit_or_hold("node.unseal", "ok", json!({ "database": database }))
         .await?;
-    Ok(Json(json!({ "sealed": false, "shares": 2 })))
+    Ok(Json(
+        json!({ "sealed": false, "shares": 2, "database": database }),
+    ))
 }
 
 pub async fn join(
@@ -271,11 +334,18 @@ async fn join_audited(
         .await?;
     result?;
     let keys = node.intermediates()?;
-    Ok(json!({
+    let mut reply = json!({
         "tenant_kek_root": BASE64_URL_SAFE_NO_PAD.encode(keys.tenant_kek_root.as_slice()),
         "ca_key": BASE64_URL_SAFE_NO_PAD.encode(keys.ca_key_der.as_slice()),
         "ca_cert": BASE64_URL_SAFE_NO_PAD.encode(&keys.ca_cert_der),
-    }))
+    });
+    if let (Some(key), Value::Object(fields)) = (&keys.db_volume, &mut reply) {
+        fields.insert(
+            "db_volume_key".into(),
+            json!(BASE64_URL_SAFE_NO_PAD.encode(key.as_slice())),
+        );
+    }
+    Ok(reply)
 }
 
 /// The joining node's appraisal is the one a custodian's CLI runs before unsealing
@@ -398,11 +468,21 @@ pub async fn finish_join(node: &Node, reply: &JoinReply) -> Result<(), ApiError>
         <[u8; 32]>::try_from(field("tenant_kek_root", &reply.tenant_kek_root)?.as_slice())
             .map_err(|_| ApiError::internal("join reply: tenant_kek_root"))?,
     );
+    let db_volume = reply
+        .db_volume_key
+        .as_deref()
+        .map(|key| {
+            <[u8; 32]>::try_from(field("db_volume_key", key)?.as_slice())
+                .map(Zeroizing::new)
+                .map_err(|_| ApiError::internal("join reply: db_volume_key"))
+        })
+        .transpose()?;
     let keys = Intermediates::new(
         tenant_kek_root,
         Zeroizing::new(field("ca_key", &reply.ca_key)?),
         field("ca_cert", &reply.ca_cert)?,
-    )?;
+    )?
+    .with_db_volume(db_volume);
     node.start_serving(keys).await
 }
 

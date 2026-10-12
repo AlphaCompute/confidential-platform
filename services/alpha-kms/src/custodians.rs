@@ -22,6 +22,8 @@ use alpha_client::{
 use alpha_crypto::{INFO_CUSTODIAN_APPROVAL, INFO_UNSEAL_SHARE, Sealed};
 use axum::Json;
 use axum::extract::State;
+use base64::Engine;
+use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -209,6 +211,7 @@ pub async fn rotate_root(
     .fetch_all(&mut *tx)
     .await?;
     let mut rewrapped = Vec::new();
+    let mut db_volume_wrapped = None;
     for row in &rows {
         let purpose = row.purpose.as_bytes();
         let plain = aead_open(old_root, purpose, &row.wrapped).ok_or_else(|| {
@@ -235,6 +238,9 @@ pub async fn rotate_root(
         )
         .execute(&mut *tx)
         .await?;
+        if row.purpose == crate::db_volume::DB_VOLUME {
+            db_volume_wrapped = Some(wrapped);
+        }
         rewrapped.push(row.purpose.clone());
     }
     for required in ["ca", "tenant-kek-root"] {
@@ -274,6 +280,7 @@ pub async fn rotate_root(
             .map(sealed_sha256).collect::<Result<Vec<_>, _>>().map_err(malformed)?,
         "approved_by_shares": approved_by,
         "rewrapped": rewrapped,
+        "db_volume_wrapped_sha256": db_volume_wrapped.as_deref().map(sha256_label),
     });
     let request = serde_json::to_value(proposal).map_err(malformed)?;
     let receipt = control::receipt(node, ROTATION_ROUTE, &request, response.clone())?;
@@ -281,6 +288,9 @@ pub async fn rotate_root(
         id: id.to_string(),
         proposal: proposal.clone(),
         shares_hpke,
+        db_volume_wrapped: db_volume_wrapped
+            .as_deref()
+            .map(|w| BASE64_URL_SAFE_NO_PAD.encode(w)),
         receipt,
     };
     let stored = sqlx::query!(

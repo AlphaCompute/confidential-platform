@@ -1,6 +1,6 @@
 # The trust-zone Postgres as an untrusted store (D4, M2)
 
-`alpha-kms` keeps its state in the trust-zone Postgres, which runs on AlphaCompute's own disks. Secret values were always ciphertext under each organization's `org_key`. Everything around them was not: who the organizations are, their keys and labels, their Apps and composes, their Secrets' names and grants, and an audit log of every call. AlphaCompute's operators must not be able to read any of it. This is M2 option (b), PRD-05 decision D4: app-level encryption of the plaintext columns and the audit log under KMS intermediates. Option (a), a volume key for the database itself, is designed at the end and not built.
+`alpha-kms` keeps its state in the trust-zone Postgres, which runs on AlphaCompute's own disks. Secret values were always ciphertext under each organization's `org_key`. Everything around them was not: who the organizations are, their keys and labels, their Apps and composes, their Secrets' names and grants, and an audit log of every call. AlphaCompute's operators must not be able to read any of it. This is M2 option (b), PRD-05 decision D4: app-level encryption of the plaintext columns and the audit log under KMS intermediates. Option (a), a volume key for the database itself, is in `docs/db-volume-key.md`.
 
 Code: `services/alpha-kms/src/store.rs` (keys, blind indexes, sealed rows, the plaintext migration) and `src/audit.rs` (the chain). Schema: `migrations/20261012000000_sealed_metadata.sql`. Tests: `tests/sealed_store.rs`.
 
@@ -79,7 +79,7 @@ The Instance read no longer filters on `app_ids` in SQL. It opens the row and re
 | Column | Class | Why |
 |---|---|---|
 | `platform_document.*` | clear | The release-signed document is public: it is served at an unauthenticated URL, and every stored copy is re-verified against the release key. |
-| `intermediate_keys.wrapped` | already ciphertext | Under the root KEK. A custodian rotation re-wraps it under a new root (`docs/custodian-rotation.md`); what it wraps, and so every key derived here, is unchanged. |
+| `intermediate_keys.wrapped` | already ciphertext | Under the root KEK: tenant-kek-root, the CA key and the database's volume key (`db-volume`). A custodian rotation re-wraps it under a new root (`docs/custodian-rotation.md`); what it wraps, and so every key derived here, is unchanged. |
 | `intermediate_keys.public_part` | clear | The CA certificate, pinned in the platform document. |
 | `custodian_rotations.rotation` | clear, its shares already ciphertext | The proposal (the custodians' X-Wing public keys, a spent nonce, the node's key hash), the new shares HPKE-sealed to the custodians, and the node's receipt. No tenant appears in it, and the custodians verify the receipt rather than trust the row. |
 
@@ -139,18 +139,9 @@ The same pass runs on every platform tick. Rows an older node writes during an u
 - Stop the older nodes once the first node of this release serves. Clients that pin both KMS Revisions fail over.
 - The change is one-way: there is no path back to plaintext.
 
-## M2(a): a volume key for the Postgres data volume (designed, not built)
+## M2(a): a volume key for the Postgres data volume
 
-Defence in depth under (b): the host should not even see row counts, sizes or the compose hashes. The circularity is that the KMS serves from Postgres, so Postgres's volume key cannot come through the normal path. `alpha-volume` (#86) asks `alpha-runtime` for `keys/derive`, which needs an attested Instance whose Revision is in the `revisions` table, which lives in the database being opened.
-
-The design:
-1. **The key.** A `db-volume` intermediate: a random 256-bit key wrapped under the root KEK. Unlike the other intermediates it is stored outside the database it opens: in a Kubernetes Secret or a small file volume beside the KMS, holding only ciphertext. Bootstrap creates it, and unseal unwraps it beside the others. A joining node receives it in the join reply, which needs a new optional field in `JoinReply`.
-2. **The Postgres pod.** A Kata pod on the CPU class. Its Revision v2 is listed in the release-signed platform document (`db_revisions`, with the same `kind` rule as `kms_revisions`), not in the `revisions` table. The KMS can then appraise it with no database: DCAP and the TCB policy, `kata-tdx/1`, the init-data's Revision v2 listed.
-3. **The route.** `POST /v1/node/db-key` on an unsealed node. It takes the Postgres pod's evidence v2 over a KMS nonce, with an X-Wing key bound in `report_data`. It answers with the volume key sealed to that key. The pod's init container (an `alpha-volume` mode that takes the key from this route instead of the runtime socket) opens LUKS2 exactly as `alpha-volume` does.
-4. **Ordering.** Unseal → db key → DB → serve. A node unsealed by custodians starts with no database. It answers only `/v1/node/*`, and audits the key release in memory until the database is reachable, then appends the rows sealed. `start_serving` would wait for the database.
-5. **Open.** A KMS node that restarts while Postgres is down has nothing to read the wrapped key from. The wrapped key must therefore also be in the custodians' share files, or in the platform-document-adjacent artifact store.
-
-Not built here: it changes the join reply and the platform document's schema, adds an unauthenticated-database startup mode, and needs the Kata Postgres pod template. Each of those wants its own review. (b) already removes the plaintext.
+Built in `docs/db-volume-key.md`: a `db-volume` intermediate under the root KEK, kept in `intermediate_keys` and, wrapped, in every share file; `POST /v1/node/db-key`, which gives it only to an attested Postgres pod whose Revision v2 the platform document lists in `db_revisions`; and the cold-start order unseal → db key → database → serve, with the node unsealed and waiting while the database is closed. The design's open point (a node restarting while Postgres is down has nothing to read the wrapped key from) is answered by the share files.
 
 ## D10 (open)
 

@@ -199,7 +199,7 @@ async fn two_current_custodians_replace_one_and_the_old_shares_open_nothing() {
     let after = wrapped(&h).await;
     assert_eq!(
         before.iter().map(|r| &r.0).collect::<Vec<_>>(),
-        ["ca", "tenant-kek-root"]
+        ["ca", "db-volume", "tenant-kek-root"]
     );
     for ((purpose, old), (_, new)) in before.iter().zip(&after) {
         assert_ne!(old, new, "{purpose} was not re-wrapped");
@@ -213,7 +213,23 @@ async fn two_current_custodians_replace_one_and_the_old_shares_open_nothing() {
     // The receipt verifies against the KMS CA and names the proposal and every share.
     let signed = custodians::verify_rotation(&rotation, &doc_for(&h)).unwrap();
     assert_eq!(signed["approved_by_shares"], json!([1, 3]));
-    assert_eq!(signed["rewrapped"], json!(["tenant-kek-root", "ca"]));
+    assert_eq!(
+        signed["rewrapped"],
+        json!(["tenant-kek-root", "ca", "db-volume"])
+    );
+    // The volume key's new wrapping goes to the new share files, and the receipt covers it.
+    let rewrapped_db = &after.iter().find(|r| r.0 == "db-volume").unwrap().1;
+    assert_eq!(
+        rotation.db_volume_wrapped.as_deref(),
+        Some(b64(rewrapped_db).as_str())
+    );
+    let mut stripped = rotation.clone();
+    stripped.db_volume_wrapped = None;
+    assert!(
+        custodians::verify_rotation(&stripped, &doc_for(&h))
+            .unwrap_err()
+            .contains("db_volume_wrapped_sha256")
+    );
     assert_eq!(
         signed["custodians_sha256"][2],
         json!(alpha_channel::sha256_label(d3.public().as_bytes()))
@@ -234,6 +250,10 @@ async fn two_current_custodians_replace_one_and_the_old_shares_open_nothing() {
     // The new custodians accept; the departed custodian's key opens none of the new shares.
     let dir = h.dir.join("rotated");
     let new_shares = accept_all(&h, &rotation, &new_keys, &dir);
+    for path in &new_shares {
+        let file = cli_node::ShareFile::read(path).unwrap();
+        assert_eq!(file.db_volume_wrapped, rotation.db_volume_wrapped);
+    }
     let e = custodians::accept(
         &rotation,
         &doc_for(&h),
@@ -615,10 +635,17 @@ async fn joined_nodes_keep_serving_and_later_joins_and_rotations_see_the_new_roo
             .unwrap()
             .is_some()
     );
+    // The join reply carries the database's volume key too (M2(a)).
+    assert!(keys.db_volume.is_some());
+    assert_eq!(
+        keys.db_volume.as_deref(),
+        h.node.intermediates().unwrap().db_volume.as_deref()
+    );
     // A join after the rotation hands out the same intermediates.
     let later = join_reply(&h).await;
     assert_eq!(later.tenant_kek_root, reply.tenant_kek_root);
     assert_eq!(later.ca_key, reply.ca_key);
+    assert_eq!(later.db_volume_key, reply.db_volume_key);
 
     // The joined node never held a root, but it reads the re-wrapped rows: the new custodians
     // rotate through it, and the shares of the first rotation open nothing after the second.
