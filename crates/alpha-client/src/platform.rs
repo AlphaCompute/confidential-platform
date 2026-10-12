@@ -7,9 +7,11 @@ use std::time::SystemTime;
 use alpha_attest::PlatformDocument;
 pub use alpha_channel::NamedSignature;
 pub use alpha_channel::platform::{SignedDocument, sign};
+use alpha_core::ComposeHash;
 use ed25519_dalek::VerifyingKey;
 
 use crate::Error;
+use crate::tls::{ListedRevisions, Pin};
 
 /// The signature and `issued_at` checks are `alpha_channel`'s; this adds the full document shape
 /// that the KMS and the CLI read.
@@ -29,14 +31,126 @@ pub async fn fetch(
     release_key: &VerifyingKey,
     now: SystemTime,
 ) -> Result<PlatformDocument, Error> {
-    let signed: SignedDocument = reqwest::get(url)
+    verify(&fetch_signed(url).await?, release_key, now)
+}
+
+/// The compiled-in release key (`services/alpha-kms/release-key.pub`).
+pub fn release_key() -> Result<VerifyingKey, Error> {
+    Ok(alpha_channel::platform::release_key()?)
+}
+
+fn unix_seconds(now: SystemTime) -> Result<u64, Error> {
+    now.duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|_| Error::Invalid("the clock is before 1970".into()))
+}
+
+async fn fetch_signed(url: &str) -> Result<SignedDocument, Error> {
+    reqwest::get(url)
         .await
         .and_then(|r| r.error_for_status())
         .map_err(|e| Error::Connect(format!("platform document fetch: {e}")))?
         .json()
         .await
-        .map_err(|e| Error::Invalid(format!("platform document body: {e}")))?;
-    verify(&signed, release_key, now)
+        .map_err(|e| Error::Invalid(format!("platform document body: {e}")))
+}
+
+/// D6's opt-in pin: the KMS by its CA plus whichever KMS Revisions the current release-signed
+/// platform document lists, so a KMS upgrade no longer changes the Revision of every App that
+/// pins it. The release key then vouches for the KMS's identity where the tenant's approval
+/// used to. The CA stays pinned by the tenant: a document naming another CA is refused.
+///
+/// A KMS build is revoked by dropping it from `kms_revisions`. Only an older document could let it
+/// back in, and none is accepted that is below `min_version` (pinned with the App's Revision),
+/// below a version this process has already accepted, or past its `expires_at` (required here,
+/// because a fresh process remembers nothing). The listed Revisions match nothing once the
+/// document they came from expires.
+pub struct PlatformPin {
+    url: String,
+    release_key: VerifyingKey,
+    min_version: u64,
+    ca_spki_sha256: [u8; 32],
+    listed: ListedRevisions,
+    accepted: parking_lot::Mutex<u64>,
+}
+
+impl PlatformPin {
+    pub fn new(
+        url: String,
+        release_key: VerifyingKey,
+        min_version: u64,
+        ca_spki_sha256: [u8; 32],
+    ) -> Self {
+        Self {
+            url,
+            release_key,
+            min_version,
+            ca_spki_sha256,
+            listed: ListedRevisions::default(),
+            accepted: parking_lot::Mutex::new(0),
+        }
+    }
+
+    /// The TLS pin, which follows every document [`PlatformPin::apply`] accepts.
+    pub fn pin(&self) -> Pin {
+        Pin::CaSpkiAndListedRevisions(self.ca_spki_sha256, self.listed.clone())
+    }
+
+    /// The Revisions a KMS leaf may name at `now`: the current document's, or none.
+    pub fn revisions(&self, now: SystemTime) -> Vec<ComposeHash> {
+        self.listed.get(unix_seconds(now).unwrap_or(u64::MAX))
+    }
+
+    /// Verifies `signed` and pins its `kms_revisions`; the version now pinned. A refused
+    /// document leaves the previous one in place until it expires.
+    pub fn apply(&self, signed: &SignedDocument, now: SystemTime) -> Result<u64, Error> {
+        let refuse = |m: String| Error::Invalid(format!("platform pin: {m}"));
+        let doc = verify(signed, &self.release_key, now)?;
+        if doc.version < self.min_version {
+            return Err(refuse(format!(
+                "document version {} is below the pinned minimum {}",
+                doc.version, self.min_version
+            )));
+        }
+        let mut accepted = self.accepted.lock();
+        if doc.version < *accepted {
+            return Err(refuse(format!(
+                "document version {} is below version {} already accepted",
+                doc.version, *accepted
+            )));
+        }
+        let expires_at = doc
+            .expires_at
+            .as_deref()
+            .ok_or_else(|| refuse("the document has no expires_at".into()))?;
+        let expires = chrono::DateTime::parse_from_rfc3339(expires_at)
+            .ok()
+            .and_then(|t| u64::try_from(t.timestamp()).ok())
+            .ok_or_else(|| refuse(format!("expires_at {expires_at:?}")))?;
+        if unix_seconds(now)? >= expires {
+            return Err(refuse(format!("the document expired at {expires_at}")));
+        }
+        let ca = crate::tls::cert_from_pem(&doc.kms_ca_pem)?;
+        if crate::tls::spki_sha256(&ca) != Some(self.ca_spki_sha256) {
+            return Err(refuse(
+                "the document's kms_ca_pem is not the pinned KMS CA".into(),
+            ));
+        }
+        if doc.kms_revisions.is_empty() {
+            return Err(refuse("the document lists no KMS Revision".into()));
+        }
+        self.listed.set(
+            doc.kms_revisions.iter().map(|r| r.compose_hash).collect(),
+            expires,
+        );
+        *accepted = doc.version;
+        Ok(doc.version)
+    }
+
+    /// Fetches the document from its URL (untrusted: the signature is what counts) and applies it.
+    pub async fn refresh(&self, now: SystemTime) -> Result<u64, Error> {
+        self.apply(&fetch_signed(&self.url).await?, now)
+    }
 }
 
 #[cfg(test)]

@@ -93,7 +93,22 @@ pub struct Service {
 pub struct Runtime {
     pub image: String,
     pub kms_ca_spki_sha256: String,
+    /// The KMS builds the App trusts; a KMS upgrade then needs a new App Revision.
+    #[serde(default)]
     pub kms_revisions: Vec<ComposeHash>,
+    /// D6's opt-in, instead of `kms_revisions`: the KMS builds the release-signed platform
+    /// document lists, so a KMS upgrade leaves the App's Revision as it is.
+    #[serde(default)]
+    pub kms_platform_pin: Option<KmsPlatformPin>,
+}
+
+/// `alpha-runtime` fetches the document from `document_url` and refuses one below
+/// `min_version` or past its `expires_at`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KmsPlatformPin {
+    pub document_url: String,
+    pub min_version: u64,
 }
 
 pub fn parse(yaml: &str) -> Result<AppSpec, String> {
@@ -110,9 +125,27 @@ fn strings(items: &[&str]) -> Yaml {
 
 fn runtime_service(runtime: &Runtime) -> Result<Mapping, String> {
     // alpha-runtime refuses these at start; a Revision that cannot boot is better refused here.
-    if runtime.kms_revisions.is_empty() {
-        return Err("runtime.kms_revisions is empty".into());
-    }
+    let kms_revisions = match &runtime.kms_platform_pin {
+        None if runtime.kms_revisions.is_empty() => {
+            return Err("runtime.kms_revisions is empty".into());
+        }
+        None => runtime
+            .kms_revisions
+            .iter()
+            .map(|r| r.to_string())
+            .collect::<Vec<_>>()
+            .join(","),
+        Some(_) if !runtime.kms_revisions.is_empty() => {
+            return Err("runtime: kms_revisions and kms_platform_pin are exclusive".into());
+        }
+        Some(pin) if !pin.document_url.starts_with("https://") || pin.min_version == 0 => {
+            return Err(
+                "runtime.kms_platform_pin needs an https:// document_url and a min_version from 1"
+                    .into(),
+            );
+        }
+        Some(pin) => format!("platform:{}", pin.min_version),
+    };
     if runtime
         .kms_ca_spki_sha256
         .strip_prefix("sha256:")
@@ -121,17 +154,18 @@ fn runtime_service(runtime: &Runtime) -> Result<Mapping, String> {
     {
         return Err("runtime.kms_ca_spki_sha256 is not sha256:<64 hex>".into());
     }
-    let revisions: Vec<String> = runtime
-        .kms_revisions
-        .iter()
-        .map(|r| r.to_string())
-        .collect();
     let mut environment = Mapping::new();
     environment.insert(
         key("ALPHACOMPUTE_KMS_CA_SPKI_SHA256"),
         key(&runtime.kms_ca_spki_sha256),
     );
-    environment.insert(key("ALPHACOMPUTE_KMS_REVISIONS"), key(&revisions.join(",")));
+    environment.insert(key("ALPHACOMPUTE_KMS_REVISIONS"), key(&kms_revisions));
+    if let Some(pin) = &runtime.kms_platform_pin {
+        environment.insert(
+            key("ALPHACOMPUTE_PLATFORM_DOCUMENT_URL"),
+            key(&pin.document_url),
+        );
+    }
     environment.insert(
         key("ALPHACOMPUTE_KMS_ENDPOINTS"),
         key("${ALPHACOMPUTE_KMS_ENDPOINTS}"),
@@ -619,6 +653,29 @@ mod tests {
         let mut spec = parse(&base).unwrap();
         spec.runtime.kms_revisions.clear();
         assert!(compose(&spec).unwrap_err().contains("kms_revisions"));
+
+        // D6: the platform pin in place of the Revision list.
+        let url = "https://release.example/platform.json";
+        spec.runtime.kms_platform_pin = Some(KmsPlatformPin {
+            document_url: url.into(),
+            min_version: 7,
+        });
+        let pinned = compose(&spec).unwrap();
+        assert!(
+            pinned.contains("ALPHACOMPUTE_KMS_REVISIONS: platform:7\\n"),
+            "{pinned}"
+        );
+        assert!(pinned.contains(&format!("ALPHACOMPUTE_PLATFORM_DOCUMENT_URL: {url}\\n")));
+        spec.runtime.kms_revisions = vec![alpha_core::compose_hash("{}")];
+        assert!(compose(&spec).unwrap_err().contains("exclusive"));
+        spec.runtime.kms_revisions.clear();
+        for (url, min_version) in [("http://release.example/p.json", 7), (url, 0)] {
+            spec.runtime.kms_platform_pin = Some(KmsPlatformPin {
+                document_url: url.into(),
+                min_version,
+            });
+            assert!(compose(&spec).unwrap_err().contains("kms_platform_pin"));
+        }
         assert!(parse(&(base + "extra: 1\n")).is_err());
     }
 }

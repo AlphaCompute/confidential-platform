@@ -485,21 +485,35 @@ fn list<'a>(value: &'a Yaml, place: &str) -> Result<&'a Vec<Yaml>, String> {
         .ok_or_else(|| format!("{place}: not a list"))
 }
 
-/// The runtime service's pins, only from a platform document verified under `release_key`.
+/// The runtime service's pins, only from a platform document verified under `release_key`: its
+/// KMS CA, and its Revision list or, with `platform_url` (D6's opt-in), the document served there
+/// from this document's version on.
 pub fn runtime(
     artifact: &SignedDocument,
     release_key: &VerifyingKey,
     now: SystemTime,
     image: &str,
+    platform_url: Option<&str>,
 ) -> Result<Runtime, String> {
     let summary = crate::sign::check(artifact, release_key, now)?;
     let kms_ca_spki_sha256 = summary.kms_ca_spki_sha256.ok_or(
         "the platform document names no KMS CA yet; wrap against a document that pins one",
     )?;
+    let (kms_revisions, kms_platform_pin) = match platform_url {
+        None => (summary.kms_revisions, None),
+        Some(url) => (
+            Vec::new(),
+            Some(crate::deploy::KmsPlatformPin {
+                document_url: url.to_owned(),
+                min_version: summary.version,
+            }),
+        ),
+    };
     Ok(Runtime {
         image: image.to_owned(),
         kms_ca_spki_sha256,
-        kms_revisions: summary.kms_revisions,
+        kms_revisions,
+        kms_platform_pin,
     })
 }
 
@@ -1332,20 +1346,29 @@ mod tests {
         let pem = ca.cert.pem();
         let artifact = crate::sign::sign(document(&pem), &key).unwrap();
 
-        let pins = runtime(&artifact, &key.verifying_key(), now, &image).unwrap();
+        let pins = runtime(&artifact, &key.verifying_key(), now, &image, None).unwrap();
         assert_eq!(
             Some(pins.kms_ca_spki_sha256.clone()),
             crate::sign::ca_spki_sha256(&pem).unwrap()
         );
         assert!(pins.kms_ca_spki_sha256.starts_with("sha256:"));
         assert_eq!(pins.kms_revisions, [revision]);
+        assert!(pins.kms_platform_pin.is_none());
         assert_eq!(pins.image, image);
 
+        // D6: the same CA, and the document's own version as the floor instead of its list.
+        let url = "https://release.example/platform.json";
+        let platform = runtime(&artifact, &key.verifying_key(), now, &image, Some(url)).unwrap();
+        assert_eq!(platform.kms_ca_spki_sha256, pins.kms_ca_spki_sha256);
+        assert!(platform.kms_revisions.is_empty());
+        let pin = platform.kms_platform_pin.unwrap();
+        assert_eq!((pin.document_url.as_str(), pin.min_version), (url, 4));
+
         let other = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
-        assert!(runtime(&artifact, &other.verifying_key(), now, &image).is_err());
+        assert!(runtime(&artifact, &other.verifying_key(), now, &image, None).is_err());
 
         let day0 = crate::sign::sign(document(""), &key).unwrap();
-        let err = runtime(&day0, &key.verifying_key(), now, &image).unwrap_err();
+        let err = runtime(&day0, &key.verifying_key(), now, &image, None).unwrap_err();
         assert!(err.contains("names no KMS CA"), "{err}");
     }
 }
