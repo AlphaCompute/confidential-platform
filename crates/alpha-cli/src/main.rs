@@ -19,8 +19,7 @@ use alpha_cli::call::Route;
 use alpha_cli::deploy::{Shroud, wrap};
 use alpha_cli::keyfile::{self, Algorithm};
 use alpha_cli::request::Call;
-use alpha_cli::{instances, node, sign};
-mod coco;
+use alpha_cli::{coco, instances, node, sign};
 use alpha_client::platform::SignedDocument;
 use alpha_client::{Client, Pin};
 use alpha_core::{AppId, KeyId, OrgId, PrincipalId};
@@ -228,14 +227,15 @@ enum CocoCommand {
     ///
     /// Workflow:
     ///   1. alpha coco render --spec pod.yaml --for-genpolicy --env cluster.env > for_genpolicy.yaml
-    ///   2. Run genpolicy 4.1.0 on for_genpolicy.yaml → policy.rego; review and tighten the policy.
+    ///   2. alpha coco genpolicy-settings --out gp; genpolicy -y for_genpolicy.yaml -p gp/rules.rego -j gp -r > policy.rego
     ///   3. alpha coco render --spec pod.yaml --policy policy.rego --env cluster.env
     Render {
         /// The YAML spec template (`${VARIABLE}` placeholders filled from --env files).
         #[arg(long)]
         spec: PathBuf,
-        /// The reviewed agent policy (genpolicy 4.1.0 output with exec and log-read rules removed).
-        /// Required unless --for-genpolicy is set.
+        /// The agent policy genpolicy 4.1.0 printed under `genpolicy-settings`; refused unless it
+        /// holds the baseline and admits exactly the spec's containers. Required unless
+        /// --for-genpolicy is set.
         #[arg(long, conflicts_with = "for_genpolicy")]
         policy: Option<PathBuf>,
         /// Render with an empty CC_INIT_DATA annotation for genpolicy input (no policy needed).
@@ -245,6 +245,34 @@ enum CocoCommand {
         /// APP_ID (lower-case UUID) and, when the spec requests GPUs, GPU_MODEL must be set.
         #[arg(long = "env", value_name = "FILE")]
         env_files: Vec<PathBuf>,
+    },
+    /// A customer's docker-compose as one Kata confidential pod of a shape. Prints
+    /// `{revision, revision_hash, initdata, pod_spec, secrets}`; runs genpolicy 4.1.0 from
+    /// /opt/kata/bin/genpolicy (pinned by digest) for the agent policy.
+    Wrap {
+        #[arg(long)]
+        app_id: AppId,
+        /// The signed platform document, as `alpha compose wrap` reads it.
+        #[arg(long)]
+        platform: PathBuf,
+        /// The `alpha-runtime` image, pinned as `<image>@sha256:<digest>`.
+        #[arg(long)]
+        runtime_image: String,
+        /// `{"runtime_class", "gpu": {"model", "count"}, "cpu", "memory_mib"}`; no `gpu` for
+        /// `kata-qemu-tdx`.
+        #[arg(long)]
+        shape: PathBuf,
+        /// Refuse every tag instead of asking its registry for the digest.
+        #[arg(long)]
+        no_resolve: bool,
+        compose: PathBuf,
+    },
+    /// Writes genpolicy-settings.json (genpolicy 4.1.0's with the agent-policy baseline applied)
+    /// and genpolicy's rules.rego into a directory, for running genpolicy by hand before
+    /// `render --policy`.
+    GenpolicySettings {
+        #[arg(long)]
+        out: PathBuf,
     },
 }
 
@@ -723,6 +751,56 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             eprintln!("revision hash {}", out.revision_hash);
             Err(Exit::Silent)
         }
+        Command::Coco {
+            command:
+                CocoCommand::Wrap {
+                    app_id,
+                    platform,
+                    runtime_image,
+                    shape,
+                    no_resolve,
+                    compose,
+                },
+        } => {
+            let bytes = fs::read(&compose)
+                .map_err(|e| Exit::Usage(format!("{}: {e}", compose.display())))?;
+            let shape =
+                fs::read(&shape).map_err(|e| Exit::Usage(format!("{}: {e}", shape.display())))?;
+            let shape = coco::wrap::Shape::parse(&shape).map_err(Exit::Usage)?;
+            let plain = wrap::parse(&bytes)?;
+            let artifact: SignedDocument = serde_json::from_value(read_json(&platform)?)
+                .map_err(|e| Exit::Refused(format!("artifact: {e}")))?;
+            let runtime =
+                wrap::runtime(&artifact, &alpha_cli::release_key()?, now, &runtime_image)?;
+            let digests = if no_resolve {
+                BTreeMap::new()
+            } else {
+                let http = wrap::registry_client_builder()
+                    .build()
+                    .map_err(|e| Exit::Refused(format!("registry client: {e}")))?;
+                wrap::resolve_all(&http, &plain).await?
+            };
+            let genpolicy = coco::policy::Genpolicy::pinned();
+            // A refusal is about the compose and exits 1; anything on our side exits 2, so the
+            // adapter shows its own message instead of ours.
+            match coco::wrap::wrap(plain, &digests, app_id, &runtime, &shape, &genpolicy).await {
+                Ok(wrapped) => Ok(json!(wrapped)),
+                Err(coco::wrap::WrapError::Refused(m)) => Err(Exit::Refused(m)),
+                Err(coco::wrap::WrapError::Failed(m)) => Err(Exit::Usage(m)),
+            }
+        }
+        Command::Coco {
+            command: CocoCommand::GenpolicySettings { out },
+        } => {
+            let write = |name: &str, text: &str| {
+                let path = out.join(name);
+                fs::write(&path, text)
+                    .map_err(|e| Exit::Refused(format!("{}: {e}", path.display())))
+            };
+            write("genpolicy-settings.json", &coco::policy::settings()?)?;
+            write("rules.rego", coco::policy::RULES)?;
+            Ok(json!({ "dir": out, "genpolicy_sha256": coco::policy::GENPOLICY_SHA256 }))
+        }
     }
 }
 
@@ -821,6 +899,29 @@ mod tests {
         assert!(!wrap(
             &[&["--app-id", "not-a-uuid"][..], &platform, &runtime].concat()
         ));
+    }
+
+    #[test]
+    fn coco_wrap_takes_the_adapters_flags() {
+        let image = format!("r@sha256:{}", "7d".repeat(32));
+        let wrap = |flags: &[&str]| {
+            let args = ["alpha", "coco", "wrap"];
+            Cli::try_parse_from(args.iter().chain(flags).chain(&["c.yaml"])).is_ok()
+        };
+        let all = [
+            "--app-id",
+            "0199a1b2-0000-7000-8000-000000000001",
+            "--platform",
+            "p.json",
+            "--runtime-image",
+            image.as_str(),
+            "--shape",
+            "s.json",
+        ];
+        assert!(wrap(&all));
+        assert!(wrap(&[&all[..], &["--no-resolve"]].concat()));
+        assert!(!wrap(&all[..6]));
+        assert!(!wrap(&all[2..]));
     }
 
     #[test]

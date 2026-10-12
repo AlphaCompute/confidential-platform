@@ -1,0 +1,27 @@
+# A customer's compose for one B300: an HTTP front with a secret and a scratch volume, and a
+# worker sharing that volume read-only.
+services:
+  web:
+    image: nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+    ports:
+      - "443:80"
+    environment:
+      MODE: production
+      WORKERS: 4
+    volumes:
+      - scratch:/var/cache/scratch
+    secrets:
+      - api_key
+  worker:
+    image: busybox@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+    command: ["sh", "-c", "while true; do ls /data; sleep 60; done"]
+    volumes:
+      - type: volume
+        source: scratch
+        target: /data
+        read_only: true
+    depends_on: [web]
+volumes:
+  scratch: {}
+secrets:
+  api_key: {}
