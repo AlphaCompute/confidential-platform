@@ -1,5 +1,7 @@
 //! `alpha coco render`: pod-spec template + agent policy + env files → rendered manifest,
-//! init-data TOML, and the Revision v2 that gets registered with the KMS.
+//! init-data TOML, and the Revision v2 that gets registered with the KMS. `alpha coco wrap`
+//! ([`wrap`]) builds the same three from a customer's compose and a shape, running genpolicy
+//! itself; both hold the agent policy to the PRD-02 baseline ([`policy`]).
 //!
 //! The pod's only Kata annotation, `io.katacontainers.config.hypervisor.cc_init_data`, holds
 //! base64(gzip(init-data)). Kata binds the digest of the raw init-data bytes into the TD's
@@ -8,7 +10,10 @@
 //!
 //! See also: `deploy/coco/render-interim.py` (the Python script this replaces).
 
-use std::collections::HashMap;
+pub mod policy;
+pub mod wrap;
+
+use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 use std::path::Path;
 
@@ -21,6 +26,7 @@ use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use flate2::Compression;
 use flate2::write::GzEncoder;
+use serde::Deserialize;
 
 /// Variables the renderer computes; env files must not set them.
 const COMPUTED: &[&str] = &["CC_INIT_DATA"];
@@ -28,6 +34,7 @@ const COMPUTED: &[&str] = &["CC_INIT_DATA"];
 /// Characters that break YAML or shell when substituted into a pod spec.
 const FORBIDDEN: &[char] = &['"', '\'', '`', '\\', '$', '\n', '\r'];
 
+#[derive(Debug)]
 pub struct RenderOutput {
     pub manifest: String,
     pub revision: CocoRevision,
@@ -186,8 +193,50 @@ fn extract_shape(rendered: &str) -> Result<(String, u32), String> {
     Ok((runtime_class, gpus))
 }
 
+/// Every container and its image in the pod templates of a rendered manifest, which may hold
+/// several YAML documents (a Deployment, its Service, ...).
+fn manifest_containers(rendered: &str) -> Result<BTreeSet<policy::PolicyContainer>, String> {
+    fn walk(value: &serde_yaml_ng::Value, out: &mut BTreeSet<policy::PolicyContainer>) {
+        let serde_yaml_ng::Value::Mapping(map) = value else {
+            if let serde_yaml_ng::Value::Sequence(items) = value {
+                items.iter().for_each(|v| walk(v, out));
+            }
+            return;
+        };
+        for (k, v) in map {
+            if matches!(k.as_str(), Some("containers" | "initContainers"))
+                && let Some(items) = v.as_sequence()
+            {
+                for c in items {
+                    if let (Some(name), Some(image)) = (
+                        c.get("name").and_then(serde_yaml_ng::Value::as_str),
+                        c.get("image").and_then(serde_yaml_ng::Value::as_str),
+                    ) {
+                        out.insert(policy::PolicyContainer {
+                            name: name.to_owned(),
+                            image: image.to_owned(),
+                        });
+                    }
+                }
+            }
+            walk(v, out);
+        }
+    }
+    let mut out = BTreeSet::new();
+    for document in serde_yaml_ng::Deserializer::from_str(rendered) {
+        let value = serde_yaml_ng::Value::deserialize(document)
+            .map_err(|e| format!("spec: not YAML: {e}"))?;
+        walk(&value, &mut out);
+    }
+    Ok(out)
+}
+
 /// Builds the `alpha.json` init-data entry in JCS (JSON Canonicalization Scheme) form.
-fn alpha_json(app_id: AppId, runtime_class: &str, gpu: Option<GpuShape>) -> Result<String, String> {
+pub(crate) fn alpha_json(
+    app_id: AppId,
+    runtime_class: &str,
+    gpu: Option<GpuShape>,
+) -> Result<String, String> {
     let entry = AlphaEntry {
         format: ALPHA_ENTRY_FORMAT.to_owned(),
         app_id,
@@ -257,6 +306,14 @@ pub fn render(
 ) -> Result<RenderOutput, String> {
     let for_shape = render_for_genpolicy(template, env)?;
     let (runtime_class, gpu_count) = extract_shape(&for_shape)?;
+    let verified = policy::verify(policy_text)?;
+    let running = manifest_containers(&for_shape)?;
+    if verified.containers != running {
+        return Err(format!(
+            "agent policy: admits {:?}, but the spec runs {:?}; run genpolicy on this spec's --for-genpolicy rendering",
+            verified.containers, running
+        ));
+    }
 
     let app_id_str = env
         .get("APP_ID")
@@ -308,18 +365,18 @@ mod tests {
         let mut m = HashMap::new();
         m.insert("APP_ID".into(), APP.into());
         m.insert("GPU_MODEL".into(), "B300".into());
-        m.insert(
-            "RUNTIME_IMAGE".into(),
-            "ghcr.io/alphacompute/alpha-runtime@sha256:aaaa".into(),
-        );
+        m.insert("RUNTIME_IMAGE".into(), RUNTIME.into());
         m
     }
+
+    const RUNTIME: &str = "ghcr.io/alphacompute/alpha-runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     const MINIMAL_SPEC: &str = "\
 spec:
   runtimeClassName: kata-qemu-nvidia-gpu-tdx
   containers:
-    - image: ${RUNTIME_IMAGE}
+    - name: app
+      image: ${RUNTIME_IMAGE}
       resources:
         limits:
           nvidia.com/pgpu: 1
@@ -328,6 +385,10 @@ spec:
 ";
 
     const MINIMAL_POLICY: &str = "package agent_policy\ndefault ExecProcessRequest := false\n";
+
+    fn baseline_policy() -> String {
+        policy::test_policy(&[("app", RUNTIME)])
+    }
 
     #[test]
     fn read_env_parses_key_value_and_rejects_duplicates() {
@@ -389,7 +450,7 @@ spec:
 
     #[test]
     fn build_initdata_produces_parseable_toml() {
-        let alpha = alpha_json(APP.parse().unwrap(), "kata-qemu-nvidia-gpu-tdx", None).unwrap();
+        let alpha = alpha_json(APP.parse().unwrap(), "kata-qemu-tdx", None).unwrap();
         let bytes = build_initdata(MINIMAL_POLICY, &alpha).unwrap();
         let parsed = alpha_core::coco::InitData::parse(&bytes).unwrap();
         let revision = parsed.revision().unwrap();
@@ -424,7 +485,7 @@ spec:
     #[test]
     fn render_produces_manifest_with_annotation_and_correct_revision() {
         let env = base_env();
-        let output = render(MINIMAL_SPEC, MINIMAL_POLICY, &env).unwrap();
+        let output = render(MINIMAL_SPEC, &baseline_policy(), &env).unwrap();
 
         assert!(!output.manifest.contains("${CC_INIT_DATA}"));
         assert!(output.manifest.contains("cc_init_data: \""));
@@ -455,8 +516,69 @@ spec:
             }),
         )
         .unwrap();
-        let initdata_bytes = build_initdata(MINIMAL_POLICY, &alpha).unwrap();
+        let initdata_bytes = build_initdata(&baseline_policy(), &alpha).unwrap();
         let parsed = alpha_core::coco::InitData::parse(&initdata_bytes).unwrap();
         assert_eq!(parsed.revision().unwrap(), output.revision);
+    }
+
+    #[test]
+    fn render_refuses_a_policy_without_the_baseline_or_for_other_containers() {
+        let env = base_env();
+        let error = render(MINIMAL_SPEC, MINIMAL_POLICY, &env).unwrap_err();
+        assert!(error.contains("rules.rego"), "{error}");
+        let other = policy::test_policy(&[("app", RUNTIME), ("debug", RUNTIME)]);
+        let error = render(MINIMAL_SPEC, &other, &env).unwrap_err();
+        assert!(error.contains("but the spec runs"), "{error}");
+        let loose = baseline_policy().replace(
+            "\"ReadStreamRequest\": false",
+            "\"ReadStreamRequest\": true",
+        );
+        let error = render(MINIMAL_SPEC, &loose, &env).unwrap_err();
+        assert!(error.contains("ReadStreamRequest"), "{error}");
+    }
+
+    fn vector(name: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/coco/render")
+            .join(name)
+    }
+
+    /// `testdata/coco/render/01-pod`: a template, its values, and the policy genpolicy 4.1.0
+    /// printed under `genpolicy-settings` for its `--for-genpolicy` rendering. Under
+    /// `WRITE_VECTORS=1` with `ALPHA_TEST_GENPOLICY` naming genpolicy 4.1.0, the policy is
+    /// generated again.
+    #[tokio::test]
+    async fn render_reproduces_the_vector() {
+        let dir = vector("01-pod");
+        let template = std::fs::read_to_string(dir.join("spec.yaml")).unwrap();
+        let env = read_env_files(&[dir.join("values.env").as_path()]).unwrap();
+        let write = std::env::var_os("WRITE_VECTORS").is_some();
+        if let (true, Some(path)) = (write, std::env::var_os("ALPHA_TEST_GENPOLICY")) {
+            let genpolicy = policy::Genpolicy {
+                path: path.into(),
+                ..policy::Genpolicy::pinned()
+            };
+            let input = render_for_genpolicy(&template, &env).unwrap();
+            let text = genpolicy.run(&input).await.unwrap();
+            std::fs::write(dir.join("policy.rego"), text).unwrap();
+        }
+        let policy_text = std::fs::read_to_string(dir.join("policy.rego")).unwrap();
+        let out = render(&template, &policy_text, &env).unwrap();
+        let expected = format!("{}\n{}\n", out.revision_canonical, out.revision_hash);
+        if write {
+            std::fs::write(dir.join("manifest.yaml"), &out.manifest).unwrap();
+            std::fs::write(dir.join("revision.txt"), &expected).unwrap();
+            return;
+        }
+        assert_eq!(
+            out.manifest,
+            std::fs::read_to_string(dir.join("manifest.yaml")).unwrap()
+        );
+        assert_eq!(
+            expected,
+            std::fs::read_to_string(dir.join("revision.txt")).unwrap()
+        );
+        assert_eq!(out.revision.runtime_class, "kata-qemu-tdx");
+        assert_eq!(out.revision.gpu, None);
     }
 }
