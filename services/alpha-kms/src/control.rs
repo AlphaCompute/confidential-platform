@@ -355,8 +355,11 @@ pub async fn put_secret(
                 ),
             ),
             (None, Some(sealed)) => {
-                let (channel, c2s) =
-                    crate::channel::open_ticket(&keys.tenant_kek_root, &sealed.ticket, node.now())?;
+                let (channel, c2s) = crate::channel::open_ticket(
+                    keys.metadata.ticket_root(),
+                    &sealed.ticket,
+                    node.now(),
+                )?;
                 let (sealed_for, value) = alpha_channel::secret::open(
                     &channel,
                     &c2s,
@@ -411,8 +414,10 @@ pub async fn put_secret(
             Some(row) => row.id,
             None => SecretId::mint().into(),
         };
-        let org_key = keys::org_key(&keys.tenant_kek_root, org_id.into(), &chain.anchor_spki)?;
-        let ciphertext = keys::aead_seal(&org_key, id.as_bytes(), &value)?;
+        let value_key = keys
+            .metadata
+            .secret_key(org_id.into(), &chain.anchor_spki)?;
+        let ciphertext = keys::aead_seal(&value_key, id.as_bytes(), &value)?;
         let record = SecretRecord {
             org_id,
             name: name.clone(),

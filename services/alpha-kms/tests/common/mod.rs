@@ -469,8 +469,9 @@ impl Harness {
     }
 
     /// The keys over the database's contents, as a test holding them reads and forges rows.
+    /// The serving node's keys over the database: epoch 0's, or the latest rotation's.
     pub fn metadata(&self) -> MetadataKeys {
-        MetadataKeys::derive(&self.node.held_intermediates().unwrap().tenant_kek_root).unwrap()
+        self.node.held_intermediates().unwrap().metadata.clone()
     }
 
     pub async fn keys(&self) -> Vec<(Uuid, KeyRecord)> {
