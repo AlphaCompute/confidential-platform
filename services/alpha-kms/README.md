@@ -8,7 +8,7 @@ The Instance API is `POST /v1/attest/nonce`, `POST /v1/attest`, and two routes t
 
 Control bodies are signed `ed25519` or `webauthn-es256`, a passkey's WebAuthn assertion over the same signing digest, accepted only on the origins and `rp_id` of the current platform document's `signer` and refused everywhere, stored signatures included, when the document has none; a passkey can be an organization's root key.
 
-**Draft (PRD-06, evidence to the customer):** `POST /v1/decisions/export`, a body signed under `alphacompute/decisions-export/v1` by any active key of an organization, answers that organization's own `attest`, `secret.get`, `key.derive` and earlier `decisions.export` audit rows after `after_seq` (at most `limit`, 1 to 500), echoing the request, with the node's receipt (route `decisions.export`) over the whole answer. Each export is itself audited. It cannot yet prove completeness or show refusals the KMS could not attribute to an organization; see `docs/customer-evidence.md`.
+**PRD-06, evidence to the customer:** `POST /v1/decisions/export`, a body signed under `alphacompute/decisions-export/v1` by any active key of an organization (a member key, or a read-only auditor key: a key registered with `"kind": "auditor"`, which signs the export and is refused as `forbidden` on every Control write), answers that organization's own `attest`, `secret.get`, `key.derive` and earlier `decisions.export` audit rows after `after_seq` (at most `limit`, 1 to 500), echoing the request, with the node's receipt (route `decisions.export`) over the whole answer. Each export is itself audited. It cannot yet prove completeness or show refusals the KMS could not attribute to an organization; see `docs/customer-evidence.md`.
 
 ## Configuration (environment only)
 

@@ -195,7 +195,7 @@ enum Command {
         #[arg(long)]
         endpoint: String,
     },
-    /// What the KMS decided about the organization's Instances (PRD-06, draft).
+    /// What the KMS decided about the organization's Instances (PRD-06).
     Evidence {
         #[command(subcommand)]
         command: EvidenceCommand,
