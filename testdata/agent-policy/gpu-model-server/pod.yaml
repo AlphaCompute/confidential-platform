@@ -1,0 +1,170 @@
+# genpolicy input for the GPU model server: deploy/coco/model-server.yaml (prd04/model-server-deploy
+# at a1fae62) rendered by its render-interim.py --for-genpolicy with fixture values (the Nemotron
+# guard model, placeholder KMS pins, alpha-runtime's image standing in for alpha-weights'), then
+# with what genpolicy 4.1.0 refuses taken out: the Service and NetworkPolicy documents, and
+# automountServiceAccountToken, enableServiceLinks and the claim's readOnly. The baseline settings
+# drop the service-account mount from every container instead.
+#
+# alpha-model-server: one OpenAI-compatible model on one whole confidential-computing GPU, in a
+# Kata TDX pod VM, in the form PRD-01 admission and the KMS accept.
+#
+# INTERIM: rendered per model by render-interim.py (cluster.env + models/<name>.env + the
+# reviewed agent policy) until `alpha coco render` (PRD-02 PR 6) emits this spec. The script puts
+# the agent policy and alpha.json into the pod's init-data, and base64(gzip(init-data)) into the
+# one Kata annotation, cc_init_data, whose digest is the TD's MRCONFIGID; the Revision v2 is a
+# function of that init-data. No other io.katacontainers.* annotation is set: admission refuses
+# them, and the pod VM's memory and vCPUs come from the containers' limits (CPU and memory stay
+# out of the Revision; RTMR0 is captured per shape in the reference values).
+#
+# Shape:
+#   alpha-runtime   native sidecar: attests through the CoCo attestation agent with the pod's
+#                   init-data, holds the leaf, terminates TLS on :8443 and proxies to vllm on
+#                   127.0.0.1:8000 (an address, not a name); writes the declared Secret file for
+#                   vllm.
+#   open-weights    init: alpha-weights opens this model's sealed weights into pod-VM memory
+#                   under the App's KMS-derived `weights` key, only if their manifest has the
+#                   digest this spec names.
+#   vllm            stock vLLM, bound to loopback only, accepting only this server's own bearer.
+#
+# Only alpha-inference reaches vLLM: the runtime admits a TLS client only with an Instance leaf of
+# the front's App (ALPHACOMPUTE_TLS_CALLER_APPS), so vLLM's routes outside /v1, which its API key
+# does not cover, are closed to everyone else too.
+#
+# Depends on PRD-02: alpha-runtime's CoCo evidence source (ALPHACOMPUTE_QUOTE_SOURCE, the
+# init-data at /run/alpha-pod/cc_init_data) and the KMS's Revision v2 appraisal.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alpha-model-server-guard
+  labels:
+    app.kubernetes.io/name: alpha-model-server
+    alphacompute.ai/model: guard
+spec:
+  replicas: 1
+  strategy:
+    # One GPU per pod and no spare GPUs assumed: replace in place.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: alpha-model-server
+      alphacompute.ai/model: guard
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: alpha-model-server
+        alphacompute.ai/model: guard
+        # GPU-hours chargeback (alpha-infra admission/chargeback-labels.yaml).
+        alphacompute.ai/tenant: alphacompute
+        alphacompute.ai/app: 6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b
+      annotations:
+        # The only Kata annotation: the init-data (agent policy + alpha.json), set by the renderer.
+        io.katacontainers.config.hypervisor.cc_init_data: ""
+    spec:
+      runtimeClassName: kata-qemu-nvidia-gpu-tdx
+      initContainers:
+        - name: alpha-runtime
+          image: ghcr.io/alphacompute/alpha-runtime@sha256:bb7dca63cfd0c44b50e87cc844a3c9eec001c8ded52f404fd476af97ec22dbe7            # ghcr.io/alphacompute/alpha-runtime@sha256:...
+          restartPolicy: Always            # native sidecar: up before open-weights, alive with vllm
+          env:
+            - name: ALPHACOMPUTE_KMS_ENDPOINTS
+              value: "https://10.20.0.11:8443,https://10.20.0.12:8443"
+            - name: ALPHACOMPUTE_KMS_CA_SPKI_SHA256
+              value: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+            - name: ALPHACOMPUTE_KMS_REVISIONS
+              value: "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+            # The TDX quote from the CoCo attestation agent in this pod VM, sent with the
+            # init-data below; not the prototype's dstack guest agent.
+            - name: ALPHACOMPUTE_QUOTE_SOURCE
+              value: "coco-aa"
+            # The loopback address itself, never a name: /etc/hosts in the pod VM is written by
+            # the host and not measured, so a name could be pointed anywhere.
+            - name: ALPHACOMPUTE_TLS_UPSTREAM
+              value: "127.0.0.1:8000"
+            # Only an Instance of alpha-inference's App, whatever its Revision (its Revision pins
+            # this server's, so this server cannot pin it back).
+            - name: ALPHACOMPUTE_TLS_CALLER_APPS
+              value: "0a1b2c3d-4e5f-4a6b-8c7d-8e9f0a1b2c3d"
+            # One bearer per server, so one server's bearer opens no other.
+            - name: ALPHACOMPUTE_SECRETS
+              value: '{"vllm":["model-server-bearer-guard"]}'
+          ports:
+            - name: https
+              containerPort: 8443
+          # The agent policy refuses exec, so no exec probe could ever pass: the runtime opens
+          # 8443 only once it has attested.
+          startupProbe:
+            tcpSocket: { port: 8443 }
+            periodSeconds: 5
+            failureThreshold: 120
+          volumeMounts:
+            - { name: runtime-socket, mountPath: /run/alpha }
+            - { name: secrets-vllm, mountPath: /run/alpha-secrets/vllm }
+            - { name: pod-initdata, mountPath: /run/alpha-pod, readOnly: true }
+        - name: open-weights
+          image: ghcr.io/alphacompute/alpha-runtime@sha256:bb7dca63cfd0c44b50e87cc844a3c9eec001c8ded52f404fd476af97ec22dbe7            # ghcr.io/alphacompute/alpha-weights@sha256:...
+          # The model and the manifest digest its seal Job printed, pinned here by the agent policy:
+          # another model's sealed volume, or an older sealing of this one, does not open.
+          args: ["open", "nvidia/llama-3.1-nemotron-safety-guard-8b-v3", "sha256:3333333333333333333333333333333333333333333333333333333333333333", "/sealed", "/weights"]
+          volumeMounts:
+            - { name: runtime-socket, mountPath: /run/alpha }
+            - { name: sealed-weights, mountPath: /sealed, readOnly: true }
+            - { name: weights, mountPath: /weights }
+      containers:
+        - name: vllm
+          image: docker.io/vllm/vllm-openai@sha256:d8d39b59e909d2378ac4feeb191f7e7b6f1342477dc66b7c47cec89e9985ad8a               # vllm/vllm-openai:<version>@sha256:... (pinned at G0)
+          command: ["/bin/sh", "-c"]
+          # Loopback only: the sole way in is the runtime's TLS on :8443. The bearer is read
+          # from the Secret file into the environment, never onto the command line, and vLLM does
+          # not start until the file holds it: without it vLLM would serve with no key at all.
+          args:
+            - >-
+              until [ -s /run/secrets/model-server-bearer-guard ]; do sleep 1; done &&
+              export VLLM_API_KEY="$(cat /run/secrets/model-server-bearer-guard)" &&
+              exec vllm serve /weights
+              --served-model-name "nvidia/llama-3.1-nemotron-safety-guard-8b-v3"
+              --host 127.0.0.1 --port 8000
+              --tensor-parallel-size 1
+              --max-model-len 16384
+              
+          env:
+            - { name: HF_HUB_OFFLINE, value: "1" }
+            - { name: VLLM_NO_USAGE_STATS, value: "1" }
+            - { name: DO_NOT_TRACK, value: "1" }
+          resources:
+            # The pod VM is sized from these limits (Kata's static sandbox sizing on TDX): the
+            # weights opened into memory, vLLM's host-side overhead and /dev/shm.
+            limits:
+              nvidia.com/pgpu: 1             # one whole GPU in CC mode, passed through to the pod VM
+              cpu: "8"
+              memory: "65536Mi"
+          readinessProbe:
+            # The kubelet probes from the node, so 127.0.0.1 would be the node's own loopback. The
+            # runtime's TLS port is the pod's only open port and answers once attested; whether
+            # vLLM serves the model is what alpha-inference checks over TLS before any use.
+            tcpSocket: { port: 8443 }
+            periodSeconds: 10
+            failureThreshold: 60
+          volumeMounts:
+            - { name: secrets-vllm, mountPath: /run/secrets, readOnly: true }
+            - { name: weights, mountPath: /weights, readOnly: true }
+            - { name: shm, mountPath: /dev/shm }
+      volumes:
+        - { name: runtime-socket, emptyDir: { medium: Memory } }
+        - { name: secrets-vllm, emptyDir: { medium: Memory, sizeLimit: 1Mi } }
+        # The pod's own init-data, which the runtime sends with its evidence. The host could put
+        # anything here; the KMS refuses any init-data that is not the digest in MRCONFIGID.
+        - name: pod-initdata
+          downwardAPI:
+            items:
+              - path: cc_init_data
+                fieldRef:
+                  fieldPath: metadata.annotations['io.katacontainers.config.hypervisor.cc_init_data']
+        # Opened weights live in pod-VM memory (TDX-encrypted), never on a host disk.
+        - name: weights
+          emptyDir: { medium: Memory, sizeLimit: "24Gi" }
+        - name: shm
+          emptyDir: { medium: Memory, sizeLimit: 16Gi }
+        # Sealed with the App's key and bound to this model: safe on host storage.
+        - name: sealed-weights
+          persistentVolumeClaim:
+            claimName: sealed-weights-guard

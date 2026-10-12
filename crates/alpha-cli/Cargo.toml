@@ -37,6 +37,10 @@ zeroize = "1"
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false }
+# The Kata agent's policy engine, as kata-containers 4.1.0's agent builds it (src/agent/policy):
+# the same regorus commit and features, and the json-patch it applies policy state with.
+json-patch = "=4.2.0"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
+regorus = { git = "https://github.com/microsoft/regorus", rev = "898643129e3652efd43e596f978d99f85e770235", default-features = false, features = ["arc", "base64", "base64url", "regex", "std"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }

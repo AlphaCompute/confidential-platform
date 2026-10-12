@@ -160,4 +160,32 @@ The GPU backend in the suite reports each GPU as its report describes it. The `n
 
 ## What the KMS cannot see
 
-Exec, log reads, file copies and container changes are refused inside the guest by the agent policy. The KMS's part is to make sure that policy is the one the tenant signed. Those cases are run against a live pod by the full malicious-host suite (deliverable 18), not by the core suite.
+Exec, log reads, file copies and container changes are refused inside the guest by the agent policy. The KMS's part is to make sure that policy is the one the tenant signed. Those cases are the full suite's, below.
+
+## Malicious-host full suite
+
+PRD-02 deliverable 18 runs what a hostile host can ask the Kata agent inside a launched pod to do, in two layers.
+
+**Policy layer, in CI** (`crates/alpha-cli/tests/agent_policy.rs`, step `malicious-host full suite (policy)` of the check job). It evaluates genpolicy 4.1.0's policy for two representative pods (`testdata/agent-policy`: a GPU model server on `kata-qemu-nvidia-gpu-tdx`, a CPU App on `kata-qemu-tdx`, both with `alpha-runtime` mounting the init-data at `/run/alpha-pod/cc_init_data`) exactly as the Kata 4.1.0 agent does: regorus at the agent's commit with the agent's engine options, the policy loaded as `set_policy` loads the init-data's, one query `data.agent_policy.<request type>` per call, each request with every field Kata's own types serialize, and the policy state carried from call to call. Every case first launches the pod with the requests a host legitimately sends (sandbox, network, file copies, each container created, started and waited on) and requires each to be allowed, so a policy that refuses too much fails the suite too; a restart, the stop and the sandbox's destruction must be allowed as well.
+
+| The host | Result |
+|---|---|
+| `kubectl exec` into any container, with or without a terminal, or the container's own command again | refused (`ExecProcessRequest`) |
+| `kubectl logs` | refused (`ReadStreamRequest`): the agent answers with the data cleared |
+| writes to or closes a container's stdin; asks for diagnostic data | refused |
+| copies a file outside its shared directory: the root filesystem a guest pull made, an in-guest volume, the sandbox storage, a `..` traversal, a relative path, a device, a symlink at the top or pointing out or absolute | refused (`CopyFileRequest`) |
+| creates a container, after launch or as a restart, with: another image digest; another image under the same image-name annotation; an extra, changed or unset environment variable (`LD_PRELOAD`, a service-link `VLLM_PORT=tcp://…`); an extra bind mount; a service-account token; an in-guest volume swapped for a host-shared directory; a mount moved or made writable; an extra storage; another command or argument; another working directory, user or terminal; privileged capabilities or `CAP_SYS_ADMIN`; `no_new_privileges` or a read-only root flipped; a host device; a hook; a sysctl; `/proc/kcore` unmasked or `/proc/sys` writable; a seccomp profile; the pod's process namespace shared; a string user; a shared mount; a hypervisor annotation; another pod's name; another container's name; an ephemeral debug container | refused (`CreateContainerRequest`) |
+| pulls the pause container from a registry instead of unpacking the guest's own | refused |
+| gives the model server a second GPU or none, or the GPU to the runtime | refused |
+| creates the CPU App in another namespace | refused |
+| sets a new policy; updates, pauses or resumes a container; remounts an in-guest volume; reads or sets iptables; lists interfaces or routes; changes `lo` or routes or neighbours through loopback addresses; creates the sandbox with a guest hook, a kernel module or a shared process namespace; adds swap; hot-plugs memory; reseeds the RNG; sets the clock; resizes a volume; reads volume stats or metrics; reconfigures the memory agent; starts tracing | refused |
+| signals any container (or an id the pod never had), waits on it, reads its stats, resizes its terminal, removes it, destroys the sandbox, rewrites a file in its shared directory (`resolv.conf`, `hosts`, the downward-API copy of the init-data), creates a container without one of the mounts its spec lists | allowed: availability and host-written files, which the host has anyway. The runtime reaches the KMS and its upstream by address, not by name, and the KMS checks the init-data it is sent against `MRCONFIGID` |
+
+**What the suite found in genpolicy 4.1.0's output, and the Alpha baseline that closes it.** With genpolicy's own rules and settings, the host can:
+
+- run another image. `rules.rego` checks neither the image a guest pull fetches (the `image_guest_pull` storage's `source`, a TODO upstream) nor the `io.kubernetes.cri.image-name` annotation, so any image whose command, environment, user and mounts match the policy runs, with no change to `MRCONFIGID`: its code would hold the pod's runtime key and get the Revision's leaf. The same gap lets the host have the pause container pulled from a registry instead of unpacked from the guest image.
+- unset any environment variable the spec sets (only that each variable set is allowed is checked);
+- add service-link-shaped variables (`<ANY>_PORT=tcp://…`, `<ANY>_SERVICE_HOST=…`) to any container, and the Azure and `TERM` variables;
+- mount a service-account token or an Azure token directory into any container.
+
+The baseline (`testdata/agent-policy/README.md`) is a settings drop-in (`genpolicy-settings.d/30-alpha-baseline.json`: exec, streams, diagnostics and ephemeral remounts denied, file copies only into the shared directory, only `HOSTNAME` and the API server's `KUBERNETES_*` variables beyond the spec's, no token mounts) and a rules patch (`alpha-rules.patch`: the pulled image and the image-name annotation must be the policy's, the pause container must be the guest's own, every variable the policy names must be set). `alpha coco render` and `alpha coco wrap` must generate with both, and give genpolicy the spec without `automountServiceAccountToken`, `enableServiceLinks` and a claim's `readOnly`, which 4.1.0 refuses. The suite also checks that genpolicy's rules alone still have the image and environment gaps, so an upstream fix shows up as a failing test.

@@ -1,0 +1,89 @@
+# genpolicy input for a CPU-only confidential App (kata-qemu-tdx), in the shape `alpha coco wrap`
+# emits for a compose (rafay-plugins rafay-integration/coco-gpu.md): alpha-runtime as a native
+# sidecar terminating TLS on 8443, the App on loopback, the pod's init-data mounted for the
+# runtime at /run/alpha-pod/cc_init_data. The App image stands in for a customer's.
+#
+# The deployed spec also sets automountServiceAccountToken: false and enableServiceLinks: false.
+# genpolicy 4.1.0 refuses both fields as unsupported, so they are left out of its input; the
+# baseline settings drop the service-account mount from every container instead.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b
+  namespace: app-6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      alphacompute.ai/app: 6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b
+  template:
+    metadata:
+      labels:
+        alphacompute.ai/app: 6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b
+        alphacompute.ai/tenant: 5e0d1c2b-3a49-4f58-9e67-d8c9b0a1f2e3
+      annotations:
+        io.katacontainers.config.hypervisor.cc_init_data: ""
+    spec:
+      runtimeClassName: kata-qemu-tdx
+      securityContext:
+        supplementalGroups: [0]
+      initContainers:
+        - name: alpha-runtime
+          image: ghcr.io/alphacompute/alpha-runtime@sha256:bb7dca63cfd0c44b50e87cc844a3c9eec001c8ded52f404fd476af97ec22dbe7
+          restartPolicy: Always
+          env:
+            - name: ALPHACOMPUTE_KMS_ENDPOINTS
+              value: "https://10.20.0.11:8443,https://10.20.0.12:8443"
+            - name: ALPHACOMPUTE_KMS_CA_SPKI_SHA256
+              value: "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+            - name: ALPHACOMPUTE_KMS_REVISIONS
+              value: "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+            - name: ALPHACOMPUTE_QUOTE_SOURCE
+              value: "coco-aa"
+            - name: ALPHACOMPUTE_TLS_UPSTREAM
+              value: "127.0.0.1:8080"
+            - name: ALPHACOMPUTE_SECRETS
+              value: '{"app":["api-key"]}'
+          ports:
+            - name: https
+              containerPort: 8443
+          startupProbe:
+            tcpSocket: { port: 8443 }
+            periodSeconds: 5
+            failureThreshold: 120
+          resources:
+            limits: { cpu: "1", memory: 1Gi }
+            requests: { cpu: "1", memory: 1Gi }
+          volumeMounts:
+            - { name: runtime-socket, mountPath: /run/alpha }
+            - { name: secrets-app, mountPath: /run/alpha-secrets/app }
+            - { name: pod-initdata, mountPath: /run/alpha-pod, readOnly: true }
+      containers:
+        - name: app
+          image: docker.io/library/busybox@sha256:66a6306db78bf2dbf3487f293aa8d6990d8e506fdffab9cc43fe422becf886e4
+          command: ["httpd", "-f", "-p", "127.0.0.1:8080", "-h", "/srv"]
+          securityContext:
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+          env:
+            - { name: APP_MODE, value: production }
+          readinessProbe:
+            tcpSocket: { port: 8443 }
+            periodSeconds: 10
+          resources:
+            limits: { cpu: "3", memory: 7Gi }
+            requests: { cpu: "3", memory: 7Gi }
+          volumeMounts:
+            - { name: secrets-app, mountPath: /run/secrets, readOnly: true }
+      volumes:
+        - { name: runtime-socket, emptyDir: { medium: Memory } }
+        - { name: secrets-app, emptyDir: { medium: Memory, sizeLimit: 1Mi } }
+        - name: pod-initdata
+          downwardAPI:
+            items:
+              - path: cc_init_data
+                fieldRef:
+                  fieldPath: metadata.annotations['io.katacontainers.config.hypervisor.cc_init_data']

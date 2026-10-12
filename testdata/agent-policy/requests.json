@@ -1,0 +1,428 @@
+{
+  "AddARPNeighborsRequest": {
+    "neighbors": {
+      "ARPNeighbors": [
+        {
+          "device": "eth0",
+          "flags": 0,
+          "lladdr": "00:00:5e:00:53:01",
+          "state": 128,
+          "toIPAddress": {
+            "address": "10.0.0.1",
+            "family": 0,
+            "mask": ""
+          }
+        }
+      ]
+    }
+  },
+  "AddSwapPathRequest": {
+    "path": ""
+  },
+  "AddSwapRequest": {
+    "PCIPath": []
+  },
+  "CloseStdinRequest": {
+    "container_id": "",
+    "exec_id": ""
+  },
+  "CopyFileRequest": {
+    "dir_mode": 0,
+    "file_mode": 0,
+    "file_size": 0,
+    "file_type": "Unknown",
+    "gid": 0,
+    "offset": 0,
+    "path": "",
+    "symlink_target": null,
+    "uid": 0
+  },
+  "CreateContainerRequest/container": {
+    "OCI": {
+      "Annotations": {},
+      "Hooks": null,
+      "Hostname": "",
+      "Linux": {
+        "CgroupsPath": "",
+        "Devices": [],
+        "GIDMappings": [],
+        "IntelRdt": null,
+        "MaskedPaths": [],
+        "MountLabel": "",
+        "Namespaces": [],
+        "ReadonlyPaths": [],
+        "Resources": {
+          "BlockIO": null,
+          "CPU": {
+            "Cpus": "",
+            "Mems": "",
+            "Period": 100000,
+            "Quota": 0,
+            "RealtimePeriod": 0,
+            "RealtimeRuntime": 0,
+            "Shares": 2
+          },
+          "Devices": [],
+          "HugepageLimits": [],
+          "Memory": {
+            "DisableOOMKiller": false,
+            "Kernel": 0,
+            "KernelTCP": 0,
+            "Limit": 0,
+            "Reservation": 0,
+            "Swap": 0,
+            "Swappiness": 0
+          },
+          "Network": null,
+          "Pids": null
+        },
+        "RootfsPropagation": "",
+        "Seccomp": null,
+        "Sysctl": {},
+        "UIDMappings": []
+      },
+      "Mounts": [],
+      "Process": {
+        "ApparmorProfile": "cri-containerd.apparmor.d",
+        "Args": [],
+        "Capabilities": {
+          "Ambient": [],
+          "Bounding": [],
+          "Effective": [],
+          "Inheritable": [],
+          "Permitted": []
+        },
+        "ConsoleSize": null,
+        "Cwd": "",
+        "Env": [],
+        "NoNewPrivileges": false,
+        "OOMScoreAdj": 994,
+        "Rlimits": [],
+        "SelinuxLabel": "",
+        "Terminal": false,
+        "User": {
+          "AdditionalGids": [],
+          "GID": 0,
+          "UID": 0,
+          "Username": ""
+        }
+      },
+      "Root": {
+        "Path": "",
+        "Readonly": false
+      },
+      "Solaris": null,
+      "Version": "",
+      "Windows": null
+    },
+    "container_id": "",
+    "devices": [],
+    "exec_id": "",
+    "sandbox_pidns": false,
+    "shared_mounts": [],
+    "stderr_port": 0,
+    "stdin_port": 0,
+    "stdout_port": 0,
+    "storages": [],
+    "string_user": null
+  },
+  "CreateContainerRequest/sandbox": {
+    "OCI": {
+      "Annotations": {},
+      "Hooks": null,
+      "Hostname": "policy-redis-deployment-6674f9448-xjrzf",
+      "Linux": {
+        "CgroupsPath": "",
+        "Devices": [],
+        "GIDMappings": [],
+        "IntelRdt": null,
+        "MaskedPaths": [],
+        "MountLabel": "",
+        "Namespaces": [],
+        "ReadonlyPaths": [],
+        "Resources": {
+          "BlockIO": null,
+          "CPU": {
+            "Cpus": "",
+            "Mems": "",
+            "Period": 0,
+            "Quota": 0,
+            "RealtimePeriod": 0,
+            "RealtimeRuntime": 0,
+            "Shares": 2
+          },
+          "Devices": [],
+          "HugepageLimits": [],
+          "Memory": null,
+          "Network": null,
+          "Pids": null
+        },
+        "RootfsPropagation": "",
+        "Seccomp": null,
+        "Sysctl": {},
+        "UIDMappings": []
+      },
+      "Mounts": [],
+      "Process": {
+        "ApparmorProfile": "",
+        "Args": [],
+        "Capabilities": {
+          "Ambient": [],
+          "Bounding": [],
+          "Effective": [],
+          "Inheritable": [],
+          "Permitted": []
+        },
+        "ConsoleSize": null,
+        "Cwd": "",
+        "Env": [],
+        "NoNewPrivileges": true,
+        "OOMScoreAdj": -998,
+        "Rlimits": [],
+        "SelinuxLabel": "",
+        "Terminal": false,
+        "User": {
+          "AdditionalGids": [],
+          "GID": 0,
+          "UID": 0,
+          "Username": ""
+        }
+      },
+      "Root": {
+        "Path": "",
+        "Readonly": false
+      },
+      "Solaris": null,
+      "Version": "",
+      "Windows": null
+    },
+    "container_id": "",
+    "devices": [],
+    "exec_id": "",
+    "sandbox_pidns": false,
+    "shared_mounts": [],
+    "stderr_port": 0,
+    "stdin_port": 0,
+    "stdout_port": 0,
+    "storages": [],
+    "string_user": null
+  },
+  "CreateSandboxRequest": {
+    "dns": [],
+    "guest_hook_path": "",
+    "hostname": "",
+    "kernel_modules": [],
+    "sandbox_id": "",
+    "sandbox_pidns": false,
+    "storages": []
+  },
+  "DestroySandboxRequest": {},
+  "ExecProcessRequest": {
+    "container_id": "",
+    "exec_id": "",
+    "process": {
+      "ApparmorProfile": "",
+      "Args": [],
+      "Capabilities": {
+        "Ambient": [],
+        "Bounding": [],
+        "Effective": [],
+        "Inheritable": [],
+        "Permitted": []
+      },
+      "ConsoleSize": null,
+      "Cwd": "",
+      "Env": [],
+      "NoNewPrivileges": false,
+      "OOMScoreAdj": 0,
+      "Rlimits": [],
+      "SelinuxLabel": "",
+      "Terminal": false,
+      "User": {
+        "AdditionalGids": [],
+        "GID": 0,
+        "UID": 0,
+        "Username": ""
+      }
+    },
+    "stderr_port": 0,
+    "stdin_port": 0,
+    "stdout_port": 0,
+    "string_user": null
+  },
+  "GetDiagnosticDataRequest": {
+    "container_id": "",
+    "log_type": ""
+  },
+  "GetIPTablesRequest": {
+    "is_ipv6": false
+  },
+  "GetMetricsRequest": {},
+  "GetOOMEventRequest": {},
+  "GuestDetailsRequest": {
+    "mem_block_size": false,
+    "mem_hotplug_probe": false
+  },
+  "ListInterfacesRequest": {},
+  "ListRoutesRequest": {},
+  "MemAgentCompactConfig": {
+    "compact_force_times": null,
+    "compact_order": null,
+    "compact_psi_percent_limit": null,
+    "compact_sec_max": null,
+    "compact_threshold": null,
+    "disabled": null,
+    "period_psi_percent_limit": null,
+    "period_secs": null
+  },
+  "MemAgentMemcgConfig": {
+    "disabled": null,
+    "eviction_psi_percent_limit": null,
+    "eviction_run_aging_count_min": null,
+    "period_psi_percent_limit": null,
+    "period_secs": null,
+    "swap": null,
+    "swappiness_max": null
+  },
+  "MemHotplugByProbeRequest": {
+    "memHotplugProbeAddr": []
+  },
+  "OnlineCPUMemRequest": {
+    "cpu_only": false,
+    "nb_cpus": 0,
+    "wait": false
+  },
+  "PauseContainerRequest": {
+    "container_id": ""
+  },
+  "ReadStreamRequest": {
+    "container_id": "",
+    "exec_id": "",
+    "len": 0
+  },
+  "RemoveContainerRequest": {
+    "container_id": "",
+    "timeout": 0
+  },
+  "RemoveStaleVirtiofsShareMountsRequest": {},
+  "ReseedRandomDevRequest": {
+    "data": []
+  },
+  "ResizeVolumeRequest": {
+    "size": 0,
+    "volume_guest_path": ""
+  },
+  "ResumeContainerRequest": {
+    "container_id": ""
+  },
+  "SetGuestDateTimeRequest": {
+    "Sec": 0,
+    "Usec": 0
+  },
+  "SetIPTablesRequest": {
+    "data": [],
+    "is_ipv6": false
+  },
+  "SetPolicyRequest": {
+    "policy": ""
+  },
+  "SignalProcessRequest": {
+    "container_id": "",
+    "exec_id": "",
+    "signal": 0
+  },
+  "StartContainerRequest": {
+    "container_id": ""
+  },
+  "StatsContainerRequest": {
+    "container_id": ""
+  },
+  "TtyWinResizeRequest": {
+    "column": 0,
+    "container_id": "",
+    "exec_id": "",
+    "row": 0
+  },
+  "UpdateContainerRequest": {
+    "container_id": "",
+    "resources": {
+      "BlockIO": null,
+      "CPU": {
+        "Cpus": "",
+        "Mems": "",
+        "Period": 0,
+        "Quota": 0,
+        "RealtimePeriod": 0,
+        "RealtimeRuntime": 0,
+        "Shares": 0
+      },
+      "Devices": [],
+      "HugepageLimits": [],
+      "Memory": {
+        "DisableOOMKiller": false,
+        "Kernel": 0,
+        "KernelTCP": 0,
+        "Limit": 0,
+        "Reservation": 0,
+        "Swap": 0,
+        "Swappiness": 0
+      },
+      "Network": null,
+      "Pids": null
+    }
+  },
+  "UpdateEphemeralMountsRequest": {
+    "storages": []
+  },
+  "UpdateInterfaceRequest": {
+    "interface": {
+      "IPAddresses": [
+        {
+          "address": "10.244.0.14",
+          "family": 0,
+          "mask": "24"
+        },
+        {
+          "address": "fe80::6474:9fff:fe6a:9601",
+          "family": 1,
+          "mask": "64"
+        }
+      ],
+      "device": "eth0",
+      "devicePath": "",
+      "hwAddr": "66:74:9f:6a:96:01",
+      "mtu": 1500,
+      "name": "eth0",
+      "raw_flags": 0,
+      "type_": ""
+    }
+  },
+  "UpdateRoutesRequest": {
+    "routes": {
+      "Routes": [
+        {
+          "dest": "",
+          "device": "eth0",
+          "family": 0,
+          "flags": 0,
+          "gateway": "10.244.0.1",
+          "mtu": 0,
+          "scope": 0,
+          "source": ""
+        }
+      ]
+    }
+  },
+  "VolumeStatsRequest": {
+    "volume_guest_path": ""
+  },
+  "WaitProcessRequest": {
+    "container_id": "",
+    "exec_id": ""
+  },
+  "WriteStreamRequest": {
+    "container_id": "",
+    "data": [],
+    "exec_id": ""
+  }
+}
