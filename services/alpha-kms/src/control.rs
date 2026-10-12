@@ -126,6 +126,22 @@ async fn denied(node: &Node, key_id: Option<KeyId>, action: &str, error: &ApiErr
         .await;
 }
 
+/// The node's receipt over `route`, `request` and `response`, under its current leaf.
+pub(crate) fn receipt(
+    node: &Node,
+    route: &str,
+    request: &Value,
+    response: Value,
+) -> Result<Value, ApiError> {
+    let leaf = certs::pem(&node.server_cert.leaf_der()?);
+    // Read after the leaf, so a renewal in between cannot put issued_at before its notBefore.
+    let issued_at = node.now();
+    let receipt =
+        alpha_channel::receipt::issue(&node.runtime_key, leaf, route, request, response, issued_at)
+            .map_err(|e| ApiError::internal(format!("receipt: {e}")))?;
+    serde_json::to_value(receipt).map_err(|e| ApiError::internal(format!("receipt: {e}")))
+}
+
 fn receipted(
     node: &Node,
     route: &str,
@@ -135,20 +151,7 @@ fn receipted(
     let Value::Object(mut fields) = response else {
         return Err(ApiError::internal("a Control response is not an object"));
     };
-    let leaf = certs::pem(&node.server_cert.leaf_der()?);
-    // Read after the leaf, so a renewal in between cannot put issued_at before its notBefore.
-    let issued_at = node.now();
-    let receipt = alpha_channel::receipt::issue(
-        &node.runtime_key,
-        leaf,
-        route,
-        request,
-        Value::Object(fields.clone()),
-        issued_at,
-    )
-    .map_err(|e| ApiError::internal(format!("receipt: {e}")))?;
-    let receipt =
-        serde_json::to_value(receipt).map_err(|e| ApiError::internal(format!("receipt: {e}")))?;
+    let receipt = receipt(node, route, request, Value::Object(fields.clone()))?;
     fields.insert("receipt".into(), receipt);
     Ok(Value::Object(fields))
 }

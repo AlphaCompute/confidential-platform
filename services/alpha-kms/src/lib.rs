@@ -1,4 +1,4 @@
-//! The key broker: six tables, fourteen routes on one TLS port, one process-wide state.
+//! The key broker: seven tables, sixteen routes on one TLS port, one process-wide state.
 
 #![cfg_attr(
     test,
@@ -16,6 +16,7 @@ pub mod body;
 pub mod certs;
 pub mod channel;
 pub mod control;
+pub mod custodians;
 pub mod error;
 pub mod instance;
 pub mod keys;
@@ -256,6 +257,8 @@ pub struct Node {
     pub server_cert: Arc<tls::ServerCert>,
     /// How far this node has verified the audit chain, or where it found it broken.
     pub audit_chain: Mutex<Result<audit::Checkpoint, String>>,
+    /// The approvals of a custodian rotation counted so far ([`custodians`]).
+    pub pending_rotation: Mutex<Option<custodians::Pending>>,
     bucket: Mutex<(f64, Instant)>,
 }
 
@@ -303,6 +306,7 @@ impl Node {
             phase: RwLock::new(Phase::Sealed { shares: Vec::new() }),
             server_cert,
             audit_chain: Mutex::new(Ok(audit::Checkpoint::default())),
+            pending_rotation: Mutex::new(None),
             bucket: Mutex::new((BUCKET_CAPACITY, Instant::now())),
         }))
     }
@@ -451,6 +455,11 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/v1/node/bootstrap", post(node::bootstrap))
         .route("/v1/node/unseal", post(node::unseal))
         .route("/v1/node/join", post(node::join))
+        .route("/v1/node/custodians/rotate", post(custodians::rotate))
+        .route(
+            "/v1/node/custodians/rotation",
+            get(custodians::last_rotation),
+        )
         .layer(middleware::from_fn_with_state(node.clone(), gate))
         .fallback(|| async { ApiError::not_found("no such route").into_response() })
         .with_state(node)
