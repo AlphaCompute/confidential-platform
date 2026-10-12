@@ -1,11 +1,22 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select app_id, org_id, compose, created_by_key, signature, created_at, revoked_at\n         from revisions where compose_hash = $1",
+  "query": "select compose_hash, app_id as \"app_id!\", org_id as \"org_id!\", compose as \"compose!\",\n                  created_by_key as \"created_by_key!\", signature as \"signature!\", created_at, revoked_at\n           from revisions where sealed is null for update",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "app_id",
+        "name": "compose_hash",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "revisions",
+            "name": "compose_hash"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "app_id!",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -15,8 +26,8 @@
         }
       },
       {
-        "ordinal": 1,
-        "name": "org_id",
+        "ordinal": 2,
+        "name": "org_id!",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -26,8 +37,8 @@
         }
       },
       {
-        "ordinal": 2,
-        "name": "compose",
+        "ordinal": 3,
+        "name": "compose!",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -37,8 +48,8 @@
         }
       },
       {
-        "ordinal": 3,
-        "name": "created_by_key",
+        "ordinal": 4,
+        "name": "created_by_key!",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -48,8 +59,8 @@
         }
       },
       {
-        "ordinal": 4,
-        "name": "signature",
+        "ordinal": 5,
+        "name": "signature!",
         "type_info": "Jsonb",
         "origin": {
           "Table": {
@@ -59,7 +70,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -70,7 +81,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "revoked_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -82,19 +93,18 @@
       }
     ],
     "parameters": {
-      "Left": [
-        "Bytea"
-      ]
+      "Left": []
     },
     "nullable": [
       false,
-      false,
-      false,
-      false,
-      false,
+      true,
+      true,
+      true,
+      true,
+      true,
       false,
       true
     ]
   },
-  "hash": "40feaf75956151be3e6ba6efc6ec7f4d1da96aa0286ec6296eb1a5fa755819e1"
+  "hash": "34acee1da489901e6d596cc896b1a4f98bfa55c7bc79d4ce56bd562d6c63e295"
 }

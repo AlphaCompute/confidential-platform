@@ -124,12 +124,12 @@ async fn a_device_passkey_claims_its_organization_and_registers_a_key() {
 
     let message = refused(h.post("/v1/keys", claim.clone()).await, "signature_invalid");
     assert!(message.contains("no signer"), "{message}");
-    let rows =
-        sqlx::query_scalar::<_, i64>("select count(*) from principal_keys where org_id = $1")
-            .bind(org)
-            .fetch_one(&h.pool)
-            .await
-            .unwrap();
+    let rows = h
+        .keys()
+        .await
+        .into_iter()
+        .filter(|(_, k)| k.org_id == org)
+        .count();
     assert_eq!(rows, 0);
     assert_eq!(denied(&h, "key.register").await, "signature_invalid");
 
@@ -163,7 +163,7 @@ async fn a_device_passkey_claims_its_organization_and_registers_a_key() {
     let doc = h.node.platform_document().unwrap();
     let chain = alpha_kms::keys::walk_chain(
         &h.pool,
-        &keys.tenant_kek_root,
+        &keys,
         second_id,
         h.node.now_utc(),
         doc.signer.as_ref(),
@@ -175,16 +175,10 @@ async fn a_device_passkey_claims_its_organization_and_registers_a_key() {
         json!(b64(&chain.key.public_key)),
         a1["payload"]["public_key"]
     );
-    let refused = alpha_kms::keys::walk_chain(
-        &h.pool,
-        &keys.tenant_kek_root,
-        second_id,
-        h.node.now_utc(),
-        None,
-    )
-    .await
-    .err()
-    .unwrap();
+    let refused = alpha_kms::keys::walk_chain(&h.pool, &keys, second_id, h.node.now_utc(), None)
+        .await
+        .err()
+        .unwrap();
     assert_eq!(refused.code, "signature_invalid");
 }
 
@@ -556,13 +550,11 @@ async fn another_organizations_passkey_or_a_grafted_link_does_not_sign() {
     refused(put(&h, "across", body).await, "signature_invalid");
 
     // Would pass if the chain walk stopped verifying each link's registration under its parent.
-    sqlx::query("update principal_keys set org_id = $1, registered_by_key = $2 where id = $3")
-        .bind(Uuid::from(y.org))
-        .bind(Uuid::from(y.root.0))
-        .bind(Uuid::from(x.admin.0))
-        .execute(&h.pool)
-        .await
-        .unwrap();
+    h.edit_key(x.admin.0, |k| {
+        k.org_id = y.org.into();
+        k.registered_by_key = Some(y.root.0.into());
+    })
+    .await;
     let message = refused(
         put(
             &h,
@@ -586,24 +578,24 @@ async fn a_stored_passkey_signature_without_its_assertion_fields_is_invalid_not_
     let Some(h) = harness().await else {
         return;
     };
-    let (PasskeyOrg { admin, .. }, app, hash) = passkey_app(&h, 85).await;
+    let (PasskeyOrg { admin, .. }, app, _) = passkey_app(&h, 85).await;
 
-    sqlx::query(
-        "update revisions set signature = signature - 'client_data_json' where compose_hash = $1",
-    )
-    .bind(hash.as_bytes().as_slice())
-    .execute(&h.pool)
-    .await
-    .unwrap();
+    h.edit_revisions(|r| {
+        r.signature
+            .as_object_mut()
+            .unwrap()
+            .remove("client_data_json");
+    })
+    .await;
     refused(h.attest(KEYED).await, "signature_invalid");
 
-    sqlx::query(
-        "update principal_keys set signature = signature - 'authenticator_data' where id = $1",
-    )
-    .bind(Uuid::from(admin.0))
-    .execute(&h.pool)
-    .await
-    .unwrap();
+    h.edit_key(admin.0, |k| {
+        k.signature
+            .as_object_mut()
+            .unwrap()
+            .remove("authenticator_data");
+    })
+    .await;
     refused(
         put(
             &h,

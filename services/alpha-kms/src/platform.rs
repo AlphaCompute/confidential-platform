@@ -76,12 +76,11 @@ pub async fn apply(node: &Node, verified: Verified) -> Result<(), ApiError> {
             drop(tx);
             let message =
                 format!("platform document version {version} is below the stored {stored}");
-            audit::node(
+            node.audit(audit::node(
                 "platform.reload",
                 "denied",
                 json!({ "version": version, "stored": stored, "message": message }),
-            )
-            .insert(&node.pool)
+            ))
             .await?;
             return Err(ApiError::internal(message));
         }
@@ -96,12 +95,13 @@ pub async fn apply(node: &Node, verified: Verified) -> Result<(), ApiError> {
             )
             .execute(&mut *tx)
             .await?;
+            let keys = node.intermediates().ok();
             audit::node(
                 "platform.reload",
                 "ok",
                 json!({ "version": version, "previous": stored }),
             )
-            .insert(&mut *tx)
+            .insert(&mut tx, keys.as_ref().map(|k| &k.metadata))
             .await?;
         }
     }
@@ -148,6 +148,7 @@ pub async fn run(node: Arc<Node>) {
             eprintln!("platform document: {}", e.message);
         }
         renew_leaf(&node);
+        node.maintain().await;
     }
 }
 

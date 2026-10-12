@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select id, org_id, public_key, document, signature, registered_by_key, anchor_check, revoked_at,\n                  revocation_reason::text as \"revocation_reason\"\n           from principal_keys where id = $1",
+  "query": "select id, org_id as \"org_id!\", principal_id as \"principal_id!\",\n                  public_key as \"public_key!\", document as \"document!\", registered_by_key,\n                  signature as \"signature!\", revoked_at, revocation_reason::text as revocation_reason\n           from principal_keys where sealed is null for update",
   "describe": {
     "columns": [
       {
@@ -16,7 +16,7 @@
       },
       {
         "ordinal": 1,
-        "name": "org_id",
+        "name": "org_id!",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -27,7 +27,18 @@
       },
       {
         "ordinal": 2,
-        "name": "public_key",
+        "name": "principal_id!",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "principal_keys",
+            "name": "principal_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "public_key!",
         "type_info": "Bytea",
         "origin": {
           "Table": {
@@ -37,24 +48,13 @@
         }
       },
       {
-        "ordinal": 3,
-        "name": "document",
+        "ordinal": 4,
+        "name": "document!",
         "type_info": "Jsonb",
         "origin": {
           "Table": {
             "table": "principal_keys",
             "name": "document"
-          }
-        }
-      },
-      {
-        "ordinal": 4,
-        "name": "signature",
-        "type_info": "Jsonb",
-        "origin": {
-          "Table": {
-            "table": "principal_keys",
-            "name": "signature"
           }
         }
       },
@@ -71,12 +71,12 @@
       },
       {
         "ordinal": 6,
-        "name": "anchor_check",
-        "type_info": "Bytea",
+        "name": "signature!",
+        "type_info": "Jsonb",
         "origin": {
           "Table": {
             "table": "principal_keys",
-            "name": "anchor_check"
+            "name": "signature"
           }
         }
       },
@@ -99,21 +99,19 @@
       }
     ],
     "parameters": {
-      "Left": [
-        "Uuid"
-      ]
+      "Left": []
     },
     "nullable": [
       false,
-      false,
-      false,
-      false,
-      false,
+      true,
+      true,
+      true,
+      true,
       true,
       true,
       true,
       null
     ]
   },
-  "hash": "f1dee8002417d0cce3f08b3bbd54ac40a2a409f1ffc531a5ab50991d813d83d4"
+  "hash": "aa0ff40eb8c4acc28cf9f946aac7bb96001b0b776c8ed892fb3bac51034ced8b"
 }

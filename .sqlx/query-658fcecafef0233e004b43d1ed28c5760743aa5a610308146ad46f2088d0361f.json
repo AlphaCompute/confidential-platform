@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "insert into principal_keys (id, org_id, principal_id, public_key, document, signature, anchor_check)\n         values ($1, $2, $3, $4, $5, $6, $7) returning created_at",
+  "query": "insert into principal_keys (id, org_index, public_key_index, anchor_check, sealed)\n         values ($1, $2, $3, $4, $5) returning created_at",
   "describe": {
     "columns": [
       {
@@ -18,11 +18,9 @@
     "parameters": {
       "Left": [
         "Uuid",
-        "Uuid",
-        "Uuid",
         "Bytea",
-        "Jsonb",
-        "Jsonb",
+        "Bytea",
+        "Bytea",
         "Bytea"
       ]
     },
@@ -30,5 +28,5 @@
       false
     ]
   },
-  "hash": "549effe26ceb12dbe633a571f33ec4435b151caccf4fad5d79a831e138b4d48d"
+  "hash": "658fcecafef0233e004b43d1ed28c5760743aa5a610308146ad46f2088d0361f"
 }

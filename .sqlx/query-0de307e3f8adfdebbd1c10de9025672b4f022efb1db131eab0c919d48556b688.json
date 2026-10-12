@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into secrets (id, name_index, ciphertext, sealed) values ($1, $2, $3, $4)\n         on conflict (name_index) do update set ciphertext = $3, sealed = $4",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bytea",
+        "Bytea",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0de307e3f8adfdebbd1c10de9025672b4f022efb1db131eab0c919d48556b688"
+}

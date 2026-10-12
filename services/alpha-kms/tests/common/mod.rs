@@ -16,7 +16,9 @@ use alpha_cli::node::{NodeIdentity, ShareFile};
 use alpha_client::{Client, Pin};
 use alpha_core::{AppId, KeyId, OrgId, PrincipalId, context};
 use alpha_crypto::{INFO_UNSEAL_SHARE, PrivateKey, PublicKey};
-use alpha_kms::{Clock, CollateralSource, Config, Node, NodeGuest, platform, rfc3339, tls};
+use alpha_kms::instance::RevisionRow;
+use alpha_kms::store::{self, Index, KeyRecord, MetadataKeys, SecretRecord, Table};
+use alpha_kms::{Clock, CollateralSource, Config, Node, NodeGuest, audit, platform, rfc3339, tls};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use ed25519_dalek::SigningKey;
@@ -430,19 +432,134 @@ impl Harness {
         signature: Value,
     ) -> alpha_core::ComposeHash {
         let hash = alpha_core::compose_hash(&compose);
-        sqlx::query!("insert into revisions (compose_hash, app_id, org_id, compose, created_by_key, signature, created_at) values ($1, $2, $3, $4, $5, $6, $7)",
-            hash.as_bytes().as_slice(), Uuid::from(app_id), Uuid::from(org), compose, Uuid::from(key), signature,
-            chrono::DateTime::<chrono::Utc>::from(self.now()))
-            .execute(&self.pool).await.unwrap();
+        let row = RevisionRow {
+            app_id: app_id.into(),
+            org_id: org.into(),
+            compose,
+            created_by_key: key.into(),
+            signature,
+            created_at: self.now().into(),
+            revoked_at: None,
+        };
+        store::insert_revision(&self.pool, &self.metadata(), hash, &row)
+            .await
+            .unwrap();
         hash
     }
 
+    /// Across every organization: the database's rows are opened, not queried by name.
     pub async fn secrets_named(&self, name: &str) -> i64 {
-        sqlx::query_scalar::<_, i64>("select count(*) from secrets where name = $1")
-            .bind(name)
-            .fetch_one(&self.pool)
+        self.secrets()
             .await
-            .unwrap()
+            .iter()
+            .filter(|(_, s)| s.name == name)
+            .count() as i64
+    }
+
+    /// The keys over the database's contents, as a test holding them reads and forges rows.
+    pub fn metadata(&self) -> MetadataKeys {
+        MetadataKeys::derive(&self.node.intermediates().unwrap().tenant_kek_root).unwrap()
+    }
+
+    pub async fn keys(&self) -> Vec<(Uuid, KeyRecord)> {
+        let rows: Vec<(Uuid, Vec<u8>)> =
+            sqlx::query_as("select id, sealed from principal_keys order by created_at")
+                .fetch_all(&self.pool)
+                .await
+                .unwrap();
+        let keys = self.metadata();
+        rows.into_iter()
+            .map(|(id, sealed)| {
+                let record = keys
+                    .open(Table::PrincipalKeys, id.as_bytes(), &sealed)
+                    .unwrap();
+                (id, record)
+            })
+            .collect()
+    }
+
+    pub async fn revisions(&self) -> Vec<(Vec<u8>, RevisionRow)> {
+        let rows: Vec<(Vec<u8>, Vec<u8>)> =
+            sqlx::query_as("select compose_hash, sealed from revisions order by created_at")
+                .fetch_all(&self.pool)
+                .await
+                .unwrap();
+        let keys = self.metadata();
+        rows.into_iter()
+            .map(|(hash, sealed)| {
+                let row = keys.open(Table::Revisions, &hash, &sealed).unwrap();
+                (hash, row)
+            })
+            .collect()
+    }
+
+    pub async fn secrets(&self) -> Vec<(Uuid, SecretRecord)> {
+        let rows: Vec<(Uuid, Vec<u8>)> = sqlx::query_as("select id, sealed from secrets")
+            .fetch_all(&self.pool)
+            .await
+            .unwrap();
+        let keys = self.metadata();
+        rows.into_iter()
+            .map(|(id, sealed)| {
+                let record = keys.open(Table::Secrets, id.as_bytes(), &sealed).unwrap();
+                (id, record)
+            })
+            .collect()
+    }
+
+    /// What someone holding the metadata key could do to a `principal_keys` row: `edit` its
+    /// sealed fields and seal it again, its blind indexes following.
+    pub async fn edit_key(&self, id: impl Into<Uuid>, edit: impl FnOnce(&mut KeyRecord)) {
+        let id = id.into();
+        let keys = self.metadata();
+        let (_, mut record) = self
+            .keys()
+            .await
+            .into_iter()
+            .find(|(k, _)| *k == id)
+            .unwrap();
+        edit(&mut record);
+        sqlx::query("update principal_keys set sealed = $2, org_index = $3, public_key_index = $4 where id = $1")
+            .bind(id)
+            .bind(keys.seal(Table::PrincipalKeys, id.as_bytes(), &record).unwrap())
+            .bind(keys.index(Index::KeyOrg, record.org_id.as_bytes()).unwrap())
+            .bind(keys.index(Index::KeyPublicKey, &record.public_key).unwrap())
+            .execute(&self.pool)
+            .await
+            .unwrap();
+    }
+
+    /// [`Harness::edit_key`] for every Revision.
+    pub async fn edit_revisions(&self, edit: impl Fn(&mut RevisionRow)) {
+        let keys = self.metadata();
+        for (hash, mut row) in self.revisions().await {
+            edit(&mut row);
+            sqlx::query("update revisions set sealed = $2, app_index = $3, org_index = $4 where compose_hash = $1")
+                .bind(&hash)
+                .bind(keys.seal(Table::Revisions, &hash, &row).unwrap())
+                .bind(keys.index(Index::RevisionApp, row.app_id.as_bytes()).unwrap())
+                .bind(keys.index(Index::RevisionOrg, row.org_id.as_bytes()).unwrap())
+                .execute(&self.pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// [`Harness::edit_key`] for the Secrets named `name`.
+    pub async fn edit_secrets(&self, name: &str, edit: impl Fn(&mut SecretRecord)) {
+        let keys = self.metadata();
+        for (id, mut record) in self.secrets().await {
+            if record.name != name {
+                continue;
+            }
+            edit(&mut record);
+            sqlx::query("update secrets set sealed = $2 where id = $1")
+                .bind(id)
+                .bind(keys.seal(Table::Secrets, id.as_bytes(), &record).unwrap())
+                .execute(&self.pool)
+                .await
+                .unwrap();
+        }
     }
 
     pub async fn put_secret(
@@ -519,17 +636,27 @@ impl Harness {
         *alpha_kms::keys::app_key(&org_key, app, purpose).unwrap()
     }
 
-    pub async fn audit(&self, action: &str) -> Vec<(i64, String, Value)> {
-        sqlx::query!(
-            "select seq, outcome, details from audit_log where action = $1 order by seq",
-            action
+    /// Every row of the audit chain, verified and opened.
+    pub async fn audit_rows(&self) -> Vec<audit::Row> {
+        let mut rows = Vec::new();
+        audit::verify(
+            &self.pool,
+            &self.metadata(),
+            audit::Checkpoint::default(),
+            |row| rows.push(row),
         )
-        .fetch_all(&self.pool)
         .await
-        .unwrap()
-        .into_iter()
-        .map(|r| (r.seq, r.outcome, r.details))
-        .collect()
+        .unwrap();
+        rows
+    }
+
+    pub async fn audit(&self, action: &str) -> Vec<(i64, String, Value)> {
+        self.audit_rows()
+            .await
+            .into_iter()
+            .filter(|r| r.entry.action == action)
+            .map(|r| (r.seq, r.entry.outcome, r.entry.details))
+            .collect()
     }
 }
 
