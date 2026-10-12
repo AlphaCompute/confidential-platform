@@ -267,8 +267,8 @@ enum CocoCommand {
         no_resolve: bool,
         compose: PathBuf,
     },
-    /// Writes genpolicy-settings.json (genpolicy 4.1.0's with the agent-policy baseline applied)
-    /// and genpolicy's rules.rego into a directory, for running genpolicy by hand before
+    /// Writes genpolicy's settings directory (genpolicy 4.1.0's defaults plus the Alpha baseline
+    /// drop-ins) and the patched rules.rego into a directory, for running genpolicy by hand before
     /// `render --policy`.
     GenpolicySettings {
         #[arg(long)]
@@ -797,7 +797,11 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 fs::write(&path, text)
                     .map_err(|e| Exit::Refused(format!("{}: {e}", path.display())))
             };
-            write("genpolicy-settings.json", &coco::policy::settings()?)?;
+            fs::create_dir_all(out.join("genpolicy-settings.d"))
+                .map_err(|e| Exit::Refused(format!("{}: {e}", out.display())))?;
+            for (path, text) in coco::policy::settings_files() {
+                write(&path, text)?;
+            }
             write("rules.rego", coco::policy::RULES)?;
             Ok(json!({ "dir": out, "genpolicy_sha256": coco::policy::GENPOLICY_SHA256 }))
         }

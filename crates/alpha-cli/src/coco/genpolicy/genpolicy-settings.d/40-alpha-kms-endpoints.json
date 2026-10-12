@@ -1,0 +1,7 @@
+[
+  {
+    "op": "add",
+    "path": "/request_defaults/CreateContainerRequest/allow_env_regex/-",
+    "value": "^ALPHACOMPUTE_KMS_ENDPOINTS=https://[a-z0-9.-]{1,253}(:[0-9]{1,5})?(,https://[a-z0-9.-]{1,253}(:[0-9]{1,5})?){0,7}$"
+  }
+]
