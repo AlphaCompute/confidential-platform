@@ -9,7 +9,7 @@ name: stand
 # platform runs beside the prototype, `owned` once the prototype is retired. Every variable a
 # watched part needs must then be set; an empty or whitespace-only one fails the run.
 #
-# prototype, until M-D, from a GitHub-hosted runner (unchanged from before PRD-01):
+# prototype, until M-D, from a GitHub-hosted runner, with the same variables as before PRD-01:
 #   STAND_SHROUD_URL              the prototype's shroud-go
 #   STAND_APPS                    the Apps whose copies must all be serving
 #   secret STAND_LIST_KEY         API key that may list the Apps' copies

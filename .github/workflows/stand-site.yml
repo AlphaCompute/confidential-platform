@@ -8,6 +8,18 @@ name: stand-site
 # one. A runner that never picks the job up raises no alarm of its own, so the infra pool's
 # monitoring must watch the runner itself.
 #
+# These setup mistakes leave the job waiting in the same way while the runner is online and idle,
+# so watching the runner does not catch them either: no run ever fails, and nothing alarms.
+#   - STAND_SITE_RUNNER is not a label the runner carries. Only an unset or empty one falls back
+#     to a hosted runner, where the check fails naming it; any other value, a misspelt one too, is
+#     taken as the label.
+#   - The runner group does not allow public repositories. An organization runner group refuses
+#     them unless "Allow public repositories" is checked, and this repository is public.
+#   - The runner group's repository access does not include this repository, or its "Selected
+#     workflows" entry is not exactly the one below.
+# Once STAND_TARGET is set, run this workflow by hand (workflow_dispatch on main) and see its job
+# start on the site runner.
+#
 # Every fifteen minutes the job asks whether the site PCCS serves the root CA CRL and fails when
 # it does not, which is what makes GitHub send a notification. The check is
 # .github/stand/check.sh site; a failing round is retried once after two minutes and only the
