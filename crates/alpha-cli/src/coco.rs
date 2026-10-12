@@ -525,7 +525,7 @@ spec:
     fn render_refuses_a_policy_without_the_baseline_or_for_other_containers() {
         let env = base_env();
         let error = render(MINIMAL_SPEC, MINIMAL_POLICY, &env).unwrap_err();
-        assert!(error.contains("rules.rego"), "{error}");
+        assert!(error.contains("Alpha rules patch"), "{error}");
         let other = policy::test_policy(&[("app", RUNTIME), ("debug", RUNTIME)]);
         let error = render(MINIMAL_SPEC, &other, &env).unwrap_err();
         assert!(error.contains("but the spec runs"), "{error}");
