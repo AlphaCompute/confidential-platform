@@ -181,6 +181,7 @@ pub async fn enter(node: &Arc<Node>, root: Zeroizing<[u8; 32]>) -> Result<Entere
         }
         _ => {
             let keys = open_database(node, &root).await?;
+            node::check_unseal_floors(node).await?;
             node.start_serving(keys).await?;
             Ok(Entered::Serving)
         }
@@ -237,7 +238,10 @@ async fn await_database(node: Arc<Node>) {
         let genesis = unsealed.genesis.lock().take();
         let result = match genesis {
             None => match open_database(&node, &unsealed.root).await {
-                Ok(keys) => node.start_serving(keys).await,
+                Ok(keys) => match node::check_unseal_floors(&node).await {
+                    Ok(()) => node.start_serving(keys).await,
+                    Err(e) => Err(e),
+                },
                 Err(e) => Err(e),
             },
             Some(genesis) => match write_genesis(&node, &genesis).await {
@@ -260,6 +264,7 @@ async fn await_database(node: Arc<Node>) {
                 eprintln!("the database does not open under this root: {}", e.message);
                 *node.phase.write() = Phase::Sealed { shares: Vec::new() };
                 *node.unseal_extras.lock() = UnsealExtras::default();
+                node.unseal_floors.lock().clear();
                 let held: Vec<Held> = std::mem::take(&mut *node.held_audit.lock());
                 for row in &held {
                     let _ = node.audit(row.audit()).await;
@@ -299,14 +304,15 @@ async fn write_genesis(node: &Node, genesis: &Genesis) -> Result<(), ApiError> {
     if inserted != genesis.rows.len() as u64 {
         return Err(ApiError::new("already_exists", "database is not empty"));
     }
-    audit::node(
+    let appended = audit::node(
         "node.bootstrap",
         "ok",
         json!({ "database": "opened after" }),
     )
-    .insert(&mut tx, Some(&genesis.keys.metadata))
+    .insert(&mut tx, &node.chain, Some(&genesis.keys.metadata))
     .await?;
     tx.commit().await?;
+    appended.committed(&node.chain);
     Ok(())
 }
 

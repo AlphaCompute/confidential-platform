@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select coalesce((select epoch from intermediate_keys where purpose = 'data-key'), 0)\n             as \"epoch!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "epoch!",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "ab9b4293fc7a2c60d9f037e5fd1d086f411fdbaeb2c3d60ad724f425ddbc8fa2"
+}

@@ -234,11 +234,23 @@ pub async fn start_node_with(
     clock: Clock,
     gpu_backends: Vec<Arc<dyn GpuVerifier>>,
 ) -> (Arc<Node>, String, tokio::sync::oneshot::Sender<()>) {
+    start_node_with_peers(pool, release_url, release_key, clock, gpu_backends, vec![]).await
+}
+
+/// [`start_node_with`] whose `kms_endpoints` are `peers`.
+pub async fn start_node_with_peers(
+    pool: PgPool,
+    release_url: &str,
+    release_key: &SigningKey,
+    clock: Clock,
+    gpu_backends: Vec<Arc<dyn GpuVerifier>>,
+    peers: Vec<String>,
+) -> (Arc<Node>, String, tokio::sync::oneshot::Sender<()>) {
     let event_log: Vec<EventLogEntry> =
         serde_json::from_slice(&read(KEYED, "event_log.json")).unwrap();
     let collateral = serde_json::from_slice(&read(KEYED, "collateral.json")).unwrap();
     let config = Config {
-        kms_endpoints: vec![],
+        kms_endpoints: peers,
         platform_document_url: release_url.to_owned(),
         gpu_backends,
         #[cfg(feature = "dev-root")]
@@ -457,8 +469,9 @@ impl Harness {
     }
 
     /// The keys over the database's contents, as a test holding them reads and forges rows.
+    /// The serving node's keys over the database: epoch 0's, or the latest rotation's.
     pub fn metadata(&self) -> MetadataKeys {
-        MetadataKeys::derive(&self.node.intermediates().unwrap().tenant_kek_root).unwrap()
+        self.node.held_intermediates().unwrap().metadata.clone()
     }
 
     pub async fn keys(&self) -> Vec<(Uuid, KeyRecord)> {
@@ -841,4 +854,62 @@ impl Ca {
         });
         url
     }
+}
+
+/// ACC-FD-103: a halted node is not ready, names only the fixed reason, releases nothing on any
+/// route and appends nothing to the chain, maintenance passes included.
+pub async fn assert_halted(h: &Harness, instance: &reqwest::Client, reason: &str) {
+    let rows = audit_count(h).await;
+    let (status, ready) = send(client().get(format!("{}/ready", h.url))).await;
+    assert_eq!(
+        (status, ready),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "sealed": false, "halted": reason })
+        )
+    );
+    let refused = |(status, reply): (StatusCode, Value)| {
+        assert_eq!(
+            (status, code(&reply)),
+            (StatusCode::SERVICE_UNAVAILABLE, "halted"),
+            "{reply}"
+        );
+    };
+    refused(send(instance.get(format!("{}/v1/secrets/chained", h.url))).await);
+    refused(
+        send(
+            instance
+                .post(format!("{}/v1/keys/derive", h.url))
+                .json(&json!({ "purpose": "disk" })),
+        )
+        .await,
+    );
+    refused(h.attest(KEYED).await);
+    refused(
+        h.put_secret("chained", &[AppId::mint()], b"w", h.now(), &h.root)
+            .await,
+    );
+    assert_eq!(h.node.intermediates().err().map(|e| e.code), Some("halted"));
+    let e = h
+        .node
+        .audit(audit::node("node.fact", "ok", json!({})))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "halted");
+    h.node.maintain().await;
+    assert_eq!(audit_count(h).await, rows, "a halted node appends nothing");
+    // Its head stays readable, for its peers.
+    let (status, reply) = send(client().get(format!("{}/v1/node/audit-head", h.url))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        reply["head"],
+        json!(h.node.chain.floor().map(|f| f.to_wire()))
+    );
+}
+
+pub async fn audit_count(h: &Harness) -> i64 {
+    sqlx::query_scalar("select count(*) from audit_log")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap()
 }

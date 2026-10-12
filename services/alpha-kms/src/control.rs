@@ -19,7 +19,7 @@ use sqlx::PgTransaction;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::audit::Audit;
+use crate::audit::{self, Audit};
 use crate::body::Body;
 use crate::error::ApiError;
 use crate::instance::RevisionRow;
@@ -87,14 +87,16 @@ async fn authorize(
     Ok(chain)
 }
 
+/// The route's audit row in its transaction; [`audit::Appended::committed`] once that commits.
 async fn audited(
     tx: &mut PgTransaction<'_>,
+    node: &Node,
     keys: &Intermediates,
     chain: &Chain,
     action: &str,
     object: String,
     details: Value,
-) -> Result<(), ApiError> {
+) -> Result<audit::Appended, ApiError> {
     Audit {
         actor_kind: "principal",
         actor: &chain.key.id.to_string(),
@@ -105,9 +107,8 @@ async fn audited(
         details,
         evidence_sha256: None,
     }
-    .insert(tx, Some(&keys.metadata))
-    .await?;
-    Ok(())
+    .insert(tx, &node.chain, Some(&keys.metadata))
+    .await
 }
 
 async fn denied(node: &Node, key_id: Option<KeyId>, action: &str, error: &ApiError) {
@@ -219,8 +220,9 @@ pub async fn register_revision(
             revoked_at: None,
         };
         store::insert_revision(&mut *tx, &keys.metadata, compose_hash, &row).await?;
-        audited(
+        let appended = audited(
             &mut tx,
+            &node,
             &keys,
             &chain,
             "revision.register",
@@ -229,6 +231,7 @@ pub async fn register_revision(
         )
         .await?;
         tx.commit().await?;
+        appended.committed(&node.chain);
         Ok(revision_json(
             compose_hash,
             p.app_id.into(),
@@ -277,13 +280,14 @@ pub async fn revoke_revision(
             .await?
             .filter(|r| r.org_id == chain.key.org_id)
             .ok_or_else(|| ApiError::not_found("no such revision"))?;
-        let revoked_at = match revision.revoked_at {
-            Some(t) => t,
+        let (revoked_at, appended) = match revision.revoked_at {
+            Some(t) => (t, None),
             None => {
                 let t = store::revoke_revision(&mut tx, &keys.metadata, p.compose_hash, &revision)
                     .await?;
-                audited(
+                let appended = audited(
                     &mut tx,
+                    &node,
                     &keys,
                     &chain,
                     "revision.revoke",
@@ -291,10 +295,13 @@ pub async fn revoke_revision(
                     json!({}),
                 )
                 .await?;
-                t
+                (t, Some(appended))
             }
         };
         tx.commit().await?;
+        if let Some(appended) = appended {
+            appended.committed(&node.chain);
+        }
         Ok(json!({ "compose_hash": p.compose_hash, "revoked_at": rfc3339(revoked_at) }))
     })
 }
@@ -348,8 +355,11 @@ pub async fn put_secret(
                 ),
             ),
             (None, Some(sealed)) => {
-                let (channel, c2s) =
-                    crate::channel::open_ticket(&keys.tenant_kek_root, &sealed.ticket, node.now())?;
+                let (channel, c2s) = crate::channel::open_ticket(
+                    keys.metadata.ticket_root(),
+                    &sealed.ticket,
+                    node.now(),
+                )?;
                 let (sealed_for, value) = alpha_channel::secret::open(
                     &channel,
                     &c2s,
@@ -404,8 +414,10 @@ pub async fn put_secret(
             Some(row) => row.id,
             None => SecretId::mint().into(),
         };
-        let org_key = keys::org_key(&keys.tenant_kek_root, org_id.into(), &chain.anchor_spki)?;
-        let ciphertext = keys::aead_seal(&org_key, id.as_bytes(), &value)?;
+        let value_key = keys
+            .metadata
+            .secret_key(org_id.into(), &chain.anchor_spki)?;
+        let ciphertext = keys::aead_seal(&value_key, id.as_bytes(), &value)?;
         let record = SecretRecord {
             org_id,
             name: name.clone(),
@@ -417,8 +429,9 @@ pub async fn put_secret(
             issued_at: at,
         };
         store::upsert_secret(&mut *tx, &keys.metadata, id, &ciphertext, &record).await?;
-        audited(
+        let appended = audited(
             &mut tx,
+            &node,
             &keys,
             &chain,
             "secret.put",
@@ -427,6 +440,7 @@ pub async fn put_secret(
         )
         .await?;
         tx.commit().await?;
+        appended.committed(&node.chain);
         Ok(json!({
             "id": id, "name": name, "org_id": org_id, "app_ids": app_ids,
             "content_sha256": p.content_sha256, "issued_at": rfc3339(at),
@@ -515,8 +529,9 @@ async fn register_endorsed_key(
     let created_at = store::insert_key(&mut tx, &keys.metadata, id, None, &record)
         .await?
         .ok_or_else(|| ApiError::new("already_exists", "public_key is already registered"))?;
-    audited(
+    let appended = audited(
         &mut tx,
+        node,
         keys,
         &chain,
         "key.register",
@@ -525,6 +540,7 @@ async fn register_endorsed_key(
     )
     .await?;
     tx.commit().await?;
+    appended.committed(&node.chain);
     Ok(json!({
         "id": id, "principal_id": p.principal_id, "org_id": chain.key.org_id,
         "created_at": rfc3339(created_at),
@@ -589,7 +605,7 @@ async fn register_root_key(
         store::insert_key(&mut tx, &keys.metadata, id, Some(check.as_slice()), &record)
             .await?
             .ok_or_else(|| ApiError::new("already_exists", "public_key is already registered"))?;
-    Audit {
+    let appended = Audit {
         actor_kind: "principal",
         actor: &id.to_string(),
         action: "key.register",
@@ -599,9 +615,10 @@ async fn register_root_key(
         details: json!({ "principal_id": p.principal_id, "root": true }),
         evidence_sha256: None,
     }
-    .insert(&mut tx, Some(&keys.metadata))
+    .insert(&mut tx, &node.chain, Some(&keys.metadata))
     .await?;
     tx.commit().await?;
+    appended.committed(&node.chain);
     Ok(root_key_json(
         id,
         Uuid::from(p.principal_id),
@@ -658,12 +675,13 @@ pub async fn revoke_key(
             .await?
             .filter(|k| k.org_id == chain.key.org_id)
             .ok_or_else(|| ApiError::not_found("no such key"))?;
-        let (revoked_at, reason) = match (target.revoked_at, &target.revocation_reason) {
-            (Some(t), Some(reason)) => (t, reason.clone()),
+        let (revoked_at, reason, appended) = match (target.revoked_at, &target.revocation_reason) {
+            (Some(t), Some(reason)) => (t, reason.clone(), None),
             _ => {
                 let t = store::revoke_key(&mut tx, &keys.metadata, &target, &p.reason).await?;
-                audited(
+                let appended = audited(
                     &mut tx,
+                    &node,
                     &keys,
                     &chain,
                     "key.revoke",
@@ -671,10 +689,13 @@ pub async fn revoke_key(
                     json!({ "reason": p.reason }),
                 )
                 .await?;
-                (t, p.reason.clone())
+                (t, p.reason.clone(), Some(appended))
             }
         };
         tx.commit().await?;
+        if let Some(appended) = appended {
+            appended.committed(&node.chain);
+        }
         Ok(json!({ "key_id": target.id, "revoked_at": rfc3339(revoked_at), "reason": reason }))
     })
 }

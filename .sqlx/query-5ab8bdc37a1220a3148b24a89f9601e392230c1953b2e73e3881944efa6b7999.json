@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select compose_hash, sealed from revisions for update",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "compose_hash",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "revisions",
+            "name": "compose_hash"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "sealed",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "revisions",
+            "name": "sealed"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "5ab8bdc37a1220a3148b24a89f9601e392230c1953b2e73e3881944efa6b7999"
+}

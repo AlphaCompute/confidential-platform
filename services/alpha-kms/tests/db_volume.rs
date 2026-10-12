@@ -306,6 +306,7 @@ async fn unseal_then_db_key_then_database_then_serve() {
             &path,
             &h.custodians[i - 1],
             version,
+            false,
         )
         .await
         .unwrap();
@@ -397,6 +398,7 @@ async fn a_node_unsealed_with_the_database_closed_and_no_volume_key_stays_sealed
         &h.dir.join("share-1.json"),
         &h.custodians[0],
         1,
+        false,
     )
     .await
     .unwrap();
@@ -406,6 +408,7 @@ async fn a_node_unsealed_with_the_database_closed_and_no_volume_key_stays_sealed
         &h.dir.join("share-2.json"),
         &h.custodians[1],
         1,
+        false,
     )
     .await
     .unwrap_err();
@@ -474,6 +477,7 @@ async fn genesis_with_the_database_closed_writes_it_once_it_opens() {
             &dir.join(format!("share-{i}.json")),
             custodian,
             1,
+            false,
         )
         .await
         .unwrap();
