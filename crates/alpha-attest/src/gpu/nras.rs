@@ -860,9 +860,11 @@ mod tests {
             )
             .is_ok()
         );
-        // CC mode off is reported, and check_gpus refuses it.
-        let out = parse(&with(CC_CLAIM, json!("OFF")), 1).unwrap();
-        assert!(!out[0].cc_mode);
+        // CC mode off, or DevTools mode, is reported as not in CC mode, and check_gpus refuses it.
+        for mode in ["OFF", "DEVTOOLS"] {
+            let out = parse(&with(CC_CLAIM, json!(mode)), 1).unwrap();
+            assert!(!out[0].cc_mode, "{mode}");
+        }
         // A policy that names no CC-mode claim refuses every GPU.
         let mut unset = policy();
         unset.nras_cc_mode = None;
