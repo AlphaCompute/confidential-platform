@@ -10,7 +10,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use alpha_attest::{EVIDENCE_FORMAT, EventLogEntry, Evidence, GpuVerifier};
+use alpha_attest::snp::kds::{KdsClient, KdsFuture};
+use alpha_attest::{AppraisalError, EVIDENCE_FORMAT, EventLogEntry, Evidence, GpuVerifier};
 use alpha_channel::receipt::{self, Expected};
 use alpha_cli::node::{NodeIdentity, ShareFile};
 use alpha_client::{Client, Pin};
@@ -239,6 +240,7 @@ pub async fn start_node_with(
         kms_endpoints: vec![],
         platform_document_url: release_url.to_owned(),
         gpu_backends,
+        snp_kds: Arc::new(TestKds),
         #[cfg(feature = "dev-root")]
         dev_root_kek: None,
     };
@@ -265,6 +267,23 @@ pub async fn start_node_with(
         .await
     });
     (node, base, tx)
+}
+
+/// The KDS that test documents' `snp_policy` names.
+pub const TEST_KDS: &str = "https://kds.example";
+
+/// AMD's KDS standing in at [`TEST_KDS`]: it serves AMD's real Milan VCEK CRL
+/// (`testdata/attest/snp-virtee-milan/crl.der`) and nothing else.
+pub struct TestKds;
+
+impl KdsClient for TestKds {
+    fn get<'a>(&'a self, url: &'a str) -> KdsFuture<'a> {
+        let body = (url == format!("{TEST_KDS}/vcek/v1/Milan/crl"))
+            .then(|| read("snp-virtee-milan", "crl.der"));
+        Box::pin(async move {
+            body.ok_or_else(|| AppraisalError::Failed(format!("kds {url}: status 404")))
+        })
+    }
 }
 
 pub fn platform_document(capture: &str) -> Value {

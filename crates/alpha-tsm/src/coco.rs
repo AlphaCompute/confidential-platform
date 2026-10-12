@@ -1,11 +1,12 @@
 //! What a Kata confidential pod reads about itself, from inside one of its containers: a TDX quote
-//! over our `report_data`, the CCEL boot events when the source returns them, the init-data the
-//! pod booted with, and one attestation report per passed-through GPU, which the CoCo attestation
-//! agent's NVIDIA attester collects.
+//! (on an SNP runtime class, an SEV-SNP attestation report and the VCEK the host attached) over our
+//! `report_data`, the CCEL boot events when the source returns them, the init-data the pod booted
+//! with, and one attestation report per passed-through GPU, which the CoCo attestation agent's
+//! NVIDIA attester collects.
 //!
-//! Nothing here is trusted by the KMS. The quote is signed by the TD; the init-data is checked
-//! against MRCONFIGID; GPU reports are verified by the GPU backend. A source that lies only makes
-//! the attestation fail.
+//! Nothing here is trusted by the KMS. The quote is signed by the TD, the report by the chip's
+//! VCEK; the init-data is checked against MRCONFIGID or HOST_DATA; GPU reports are verified by the
+//! GPU backend. A source that lies only makes the attestation fail.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -14,6 +15,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use alpha_attest::{CpuEvidence, CpuKind, EVIDENCE_FORMAT_V2, EvidenceV2, GpuEvidence};
+use alpha_core::coco::{RuntimeClass, Tee};
 use base64::Engine;
 use base64::prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
 use serde::Deserialize;
@@ -40,6 +42,35 @@ pub const NVIDIA_TEE: &str = "nvidia";
 pub const NVSWITCH_ARCH: &str = "LS10";
 
 const TIMEOUT: Duration = Duration::from_secs(30);
+
+/// configfs-tsm's `provider` for an SEV-SNP guest.
+pub const SEV_GUEST_PROVIDER: &str = "sev_guest";
+/// The SNP attestation report's length and where its `report_data` sits.
+const SNP_REPORT_LEN: usize = 0x4A0;
+const SNP_REPORT_DATA: std::ops::Range<usize> = 0x50..0x90;
+const SNP_KEY_INFO: std::ops::Range<usize> = 0x48..0x4C;
+/// The certificate table GUIDs (GHCB specification, `MSG_REPORT_REQ` extended request) of the keys
+/// that sign a report, in the byte order the host tooling (virtee's `sev` crate) writes them.
+const VCEK_GUID: [u8; 16] = guid(
+    0x63da758d,
+    0xe664,
+    0x4564,
+    [0xad, 0xc5, 0xf4, 0xb9, 0x3b, 0xe8, 0xac, 0xcd],
+);
+const VLEK_GUID: [u8; 16] = guid(
+    0xa8074bc2,
+    0xa25a,
+    0x483e,
+    [0xaa, 0xe6, 0x39, 0xc0, 0x45, 0xa0, 0xb8, 0xa1],
+);
+
+const fn guid(a: u32, b: u16, c: u16, d: [u8; 8]) -> [u8; 16] {
+    let (a, b, c) = (a.to_be_bytes(), b.to_be_bytes(), c.to_be_bytes());
+    [
+        a[0], a[1], a[2], a[3], b[0], b[1], c[0], c[1], d[0], d[1], d[2], d[3], d[4], d[5], d[6],
+        d[7],
+    ]
+}
 
 /// Where the TDX quote comes from; chosen by `ALPHACOMPUTE_QUOTE_SOURCE`, which the agent policy
 /// pins with the rest of the runtime container's environment.
@@ -166,17 +197,30 @@ fn tsm_entry_name() -> Result<String, Error> {
 /// One quote from an entry of our own, created for this report and removed after it; an entry
 /// that already exists is never reused.
 fn tsm_quote(dir: &Path, report_data: &[u8; 64]) -> Result<Vec<u8>, Error> {
+    let (quote, _) = with_tsm_entry(dir, |entry| tsm_report(entry, report_data, false))?;
+    check_report_data(&quote, report_data)?;
+    Ok(quote)
+}
+
+fn with_tsm_entry<T>(
+    dir: &Path,
+    report: impl FnOnce(&Path) -> Result<T, Error>,
+) -> Result<T, Error> {
     let entry = dir.join(tsm_entry_name()?);
     fs::create_dir(&entry).map_err(|e| Error::Io(entry.display().to_string(), e))?;
-    let result = tsm_report(&entry, report_data);
+    let result = report(&entry);
     let _ = fs::remove_dir(&entry);
     result
 }
 
-/// Writes `inblob` and reads `outblob` in an existing entry. The kernel's `generation` counts
-/// writes to the entry: if it moved between our write and our read, someone else wrote to the
-/// entry and the quote may answer their data, so it is refused.
-fn tsm_report(entry: &Path, report_data: &[u8; 64]) -> Result<Vec<u8>, Error> {
+/// Writes `inblob` and reads `outblob` (and with `aux`, `auxblob`) in an existing entry. The
+/// kernel's `generation` counts writes to the entry: if it moved between our write and our last
+/// read, someone else wrote to the entry and the report may answer their data, so it is refused.
+fn tsm_report(
+    entry: &Path,
+    report_data: &[u8; 64],
+    aux: bool,
+) -> Result<(Vec<u8>, Vec<u8>), Error> {
     let io = |what: &str| {
         let what = format!("{}/{what}", entry.display());
         move |e| Error::Io(what, e)
@@ -190,14 +234,102 @@ fn tsm_report(entry: &Path, report_data: &[u8; 64]) -> Result<Vec<u8>, Error> {
     };
     fs::write(entry.join("inblob"), report_data).map_err(io("inblob"))?;
     let written = generation()?;
-    let quote = fs::read(entry.join("outblob")).map_err(io("outblob"))?;
+    let out = fs::read(entry.join("outblob")).map_err(io("outblob"))?;
+    // The host may attach no certificates; then the KMS fetches the VCEK from KDS.
+    let auxblob = if aux {
+        match fs::read(entry.join("auxblob")) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(io("auxblob")(e)),
+        }
+    } else {
+        Vec::new()
+    };
     if generation()? != written {
         return Err(Error::Agent(
             "the configfs-tsm entry was written to while the quote was read".into(),
         ));
     }
-    check_report_data(&quote, report_data)?;
-    Ok(quote)
+    Ok((out, auxblob))
+}
+
+/// An SEV-SNP report over `report_data` from configfs-tsm, and the VCEK or VLEK the host attached
+/// to it (empty when it attached none), from an entry of our own.
+pub fn snp_report(dir: &Path, report_data: &[u8; 64]) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    with_tsm_entry(dir, |entry| snp_report_in(entry, report_data))
+}
+
+fn snp_report_in(entry: &Path, report_data: &[u8; 64]) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    let provider = fs::read_to_string(entry.join("provider"))
+        .map_err(|e| Error::Io(format!("{}/provider", entry.display()), e))?;
+    if provider.trim() != SEV_GUEST_PROVIDER {
+        return Err(Error::Agent(format!(
+            "configfs-tsm provider {:?} is not {SEV_GUEST_PROVIDER}: this is not an SEV-SNP guest",
+            provider.trim()
+        )));
+    }
+    let (report, auxblob) = tsm_report(entry, report_data, true)?;
+    if report.len() != SNP_REPORT_LEN {
+        return Err(Error::Agent(format!(
+            "the SNP report is {} bytes, not {SNP_REPORT_LEN}",
+            report.len()
+        )));
+    }
+    if report.get(SNP_REPORT_DATA) != Some(report_data.as_slice()) {
+        return Err(Error::Agent(
+            "the SNP report's report_data is not the data asked for".into(),
+        ));
+    }
+    // KEY_INFO bits 4:2 name the key that signed the report: 0 the VCEK, 1 the VLEK.
+    let key_info = report
+        .get(SNP_KEY_INFO)
+        .and_then(|b| <[u8; 4]>::try_from(b).ok())
+        .map(u32::from_le_bytes)
+        .unwrap_or_default();
+    let guid = match (key_info >> 2) & 0b111 {
+        0 => VCEK_GUID,
+        1 => VLEK_GUID,
+        other => {
+            return Err(Error::Agent(format!(
+                "the SNP report is signed by key {other}, not a VCEK or VLEK"
+            )));
+        }
+    };
+    let vek = cert_from_table(&auxblob, &guid)?;
+    Ok((report, vek))
+}
+
+/// The certificate filed under `guid` in a certificate table, empty if none is: 24-byte entries
+/// (GUID, then offset and length, little-endian and relative to the table) up to an all-zero one.
+/// Untrusted: the KMS verifies whatever is sent under its pinned chain.
+pub fn cert_from_table(table: &[u8], guid: &[u8; 16]) -> Result<Vec<u8>, Error> {
+    let bad = |m: &str| Error::Agent(format!("SNP certificate table: {m}"));
+    if table.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut found = Vec::new();
+    for entry in table.chunks(24) {
+        let entry = <&[u8; 24]>::try_from(entry).map_err(|_| bad("truncated entry"))?;
+        let (id, rest) = entry.split_at(16);
+        if id.iter().all(|b| *b == 0) {
+            return Ok(found);
+        }
+        if id != guid {
+            continue;
+        }
+        let le32 = |at: usize| -> Option<usize> {
+            rest.get(at..at.saturating_add(4))
+                .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                .map(u32::from_le_bytes)
+                .and_then(|v| usize::try_from(v).ok())
+        };
+        let (offset, length) = le32(0).zip(le32(4)).ok_or_else(|| bad("entry"))?;
+        found = table
+            .get(offset..offset.saturating_add(length))
+            .ok_or_else(|| bad("an entry points outside the table"))?
+            .to_vec();
+    }
+    Err(bad("no terminating entry"))
 }
 
 fn tcp_get(addr: &str, path: &str) -> Result<Vec<u8>, Error> {
@@ -324,7 +456,43 @@ pub struct Source {
 
 impl Source {
     pub fn evidence(&self, report_data: &[u8; 64]) -> Result<EvidenceV2, Error> {
-        let (quote, event_log) = quote(self.quote, report_data)?;
+        let tee = RuntimeClass::from_name(&self.runtime_class)
+            .map(RuntimeClass::tee)
+            .ok_or_else(|| {
+                Error::Agent(format!(
+                    "runtime class {:?} is not supported",
+                    self.runtime_class
+                ))
+            })?;
+        let cpu = match (tee, self.quote) {
+            (Tee::Tdx, source) => {
+                let (quote, event_log) = quote(source, report_data)?;
+                CpuEvidence {
+                    kind: CpuKind::Tdx,
+                    quote,
+                    event_log,
+                    vek: Vec::new(),
+                }
+            }
+            (Tee::Snp, QuoteSource::ConfigfsTsm) => {
+                let (report, vek) = snp_report(Path::new(TSM_REPORT_DIR), report_data)?;
+                CpuEvidence {
+                    kind: CpuKind::Snp,
+                    quote: report,
+                    event_log: Vec::new(),
+                    vek,
+                }
+            }
+            // ponytail: snp-capture — the attestation agent's SNP evidence (guest-components'
+            // `SnpEvidence`, a serde rendering of the report) is read once an SNP pod shows its
+            // exact shape on the pinned guest-components; until then SNP pods use configfs-tsm.
+            (Tee::Snp, QuoteSource::AttestationAgent) => {
+                return Err(Error::Agent(
+                    "on SEV-SNP the report is read from configfs-tsm: set ALPHACOMPUTE_QUOTE_SOURCE=coco-tsm"
+                        .into(),
+                ));
+            }
+        };
         let gpus = agent_gpu_evidence(
             ATTESTATION_AGENT,
             &alpha_attest::gpu::gpu_nonce(report_data),
@@ -332,11 +500,7 @@ impl Source {
         )?;
         Ok(EvidenceV2 {
             format: EVIDENCE_FORMAT_V2.into(),
-            cpu: CpuEvidence {
-                kind: CpuKind::Tdx,
-                quote,
-                event_log,
-            },
+            cpu,
             gpus,
             initdata: self.initdata.clone(),
             runtime_class: self.runtime_class.clone(),
@@ -460,13 +624,14 @@ mod tests {
         let rd = [0x22u8; 64];
         fs::write(entry.join("outblob"), quote_with(&rd)).unwrap();
         fs::write(entry.join("generation"), "7\n").unwrap();
-        let quote = tsm_report(&entry, &rd).unwrap();
+        let (quote, _) = tsm_report(&entry, &rd, false).unwrap();
         assert_eq!(fs::read(entry.join("inblob")).unwrap(), rd);
         assert_eq!(quote, quote_with(&rd));
         fs::write(entry.join("outblob"), quote_with(&[0; 64])).unwrap();
-        assert!(tsm_report(&entry, &rd).is_err());
+        let (other, _) = tsm_report(&entry, &rd, false).unwrap();
+        assert!(check_report_data(&other, &rd).is_err());
         fs::remove_file(entry.join("generation")).unwrap();
-        assert!(tsm_report(&entry, &rd).is_err());
+        assert!(tsm_report(&entry, &rd, false).is_err());
         let _ = fs::remove_dir_all(&entry);
     }
 
@@ -574,5 +739,134 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+    /// A certificate table: the entries, then the all-zero one, then the data.
+    fn cert_table(certs: &[([u8; 16], &[u8])]) -> Vec<u8> {
+        let header = 24 * (certs.len() + 1);
+        let mut table = Vec::new();
+        let mut data = Vec::new();
+        for (guid, cert) in certs {
+            table.extend_from_slice(guid);
+            table.extend_from_slice(&((header + data.len()) as u32).to_le_bytes());
+            table.extend_from_slice(&(cert.len() as u32).to_le_bytes());
+            data.extend_from_slice(cert);
+        }
+        table.extend_from_slice(&[0; 24]);
+        table.extend_from_slice(&data);
+        table
+    }
+
+    const ASK_GUID: [u8; 16] = guid(
+        0x4ab7b379,
+        0xbbac,
+        0x4fe4,
+        [0xa0, 0x2f, 0x05, 0xae, 0xf3, 0x27, 0xc7, 0x82],
+    );
+
+    /// An SNP report shell over `report_data`, signed by `key` (0 VCEK, 1 VLEK).
+    fn snp_report_with(report_data: &[u8; 64], key: u32) -> Vec<u8> {
+        let mut r = vec![0u8; SNP_REPORT_LEN];
+        r[0..4].copy_from_slice(&3u32.to_le_bytes());
+        r[0x48..0x4C].copy_from_slice(&(key << 2).to_le_bytes());
+        r[SNP_REPORT_DATA].copy_from_slice(report_data);
+        r
+    }
+
+    fn snp_entry(name: &str) -> std::path::PathBuf {
+        let entry =
+            std::env::temp_dir().join(format!("alpha-tsm-snp-{name}-{}", std::process::id()));
+        fs::create_dir_all(&entry).unwrap();
+        fs::write(entry.join("provider"), "sev_guest\n").unwrap();
+        fs::write(entry.join("generation"), "1\n").unwrap();
+        entry
+    }
+
+    #[test]
+    fn configfs_tsm_gives_the_snp_report_and_the_vek_that_signed_it() {
+        let rd = [0x5au8; 64];
+        let entry = snp_entry("vcek");
+        fs::write(entry.join("outblob"), snp_report_with(&rd, 0)).unwrap();
+        fs::write(
+            entry.join("auxblob"),
+            cert_table(&[
+                (ASK_GUID, b"ask"),
+                (VCEK_GUID, b"vcek"),
+                (VLEK_GUID, b"vlek"),
+            ]),
+        )
+        .unwrap();
+        let (report, vek) = snp_report_in(&entry, &rd).unwrap();
+        assert_eq!(report, snp_report_with(&rd, 0));
+        assert_eq!(vek, b"vcek");
+        assert_eq!(fs::read(entry.join("inblob")).unwrap(), rd);
+
+        // A VLEK-signed report takes the VLEK.
+        fs::write(entry.join("outblob"), snp_report_with(&rd, 1)).unwrap();
+        assert_eq!(snp_report_in(&entry, &rd).unwrap().1, b"vlek");
+        // No certificates from the host: the KMS fetches the VCEK.
+        fs::remove_file(entry.join("auxblob")).unwrap();
+        fs::write(entry.join("outblob"), snp_report_with(&rd, 0)).unwrap();
+        assert!(snp_report_in(&entry, &rd).unwrap().1.is_empty());
+
+        // Over other data, unsigned, the wrong length, not an SNP guest.
+        for (outblob, why) in [
+            (snp_report_with(&[0; 64], 0), "report_data"),
+            (snp_report_with(&rd, 7), "signed by key 7"),
+            (snp_report_with(&rd, 0)[..1000].to_vec(), "1000 bytes"),
+        ] {
+            fs::write(entry.join("outblob"), outblob).unwrap();
+            let error = snp_report_in(&entry, &rd).unwrap_err().to_string();
+            assert!(error.contains(why), "{why}: {error}");
+        }
+        fs::write(entry.join("provider"), "tdx_guest\n").unwrap();
+        let error = snp_report_in(&entry, &rd).unwrap_err().to_string();
+        assert!(error.contains("not an SEV-SNP guest"), "{error}");
+        let _ = fs::remove_dir_all(&entry);
+    }
+
+    #[test]
+    fn certificate_tables_are_bounded() {
+        let table = cert_table(&[(VCEK_GUID, b"vcek")]);
+        assert_eq!(cert_from_table(&table, &VCEK_GUID).unwrap(), b"vcek");
+        assert!(cert_from_table(&table, &VLEK_GUID).unwrap().is_empty());
+        assert!(cert_from_table(&[], &VCEK_GUID).unwrap().is_empty());
+        let error = cert_from_table(&table[..30], &VLEK_GUID)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("truncated"), "{error}");
+        let mut outside = table.clone();
+        outside[20..24].copy_from_slice(&1000u32.to_le_bytes());
+        let error = cert_from_table(&outside, &VCEK_GUID)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("outside the table"), "{error}");
+        let error = cert_from_table(&table[..24], &VLEK_GUID)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no terminating entry"), "{error}");
+    }
+
+    #[test]
+    fn an_snp_pod_reads_its_report_from_configfs_tsm_only() {
+        let source = |quote| Source {
+            quote,
+            initdata: Vec::new(),
+            runtime_class: alpha_core::coco::SNP_CPU_RUNTIME_CLASS.into(),
+            gpu_count: 0,
+        };
+        let error = source(QuoteSource::AttestationAgent)
+            .evidence(&[0; 64])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("ALPHACOMPUTE_QUOTE_SOURCE=coco-tsm"),
+            "{error}"
+        );
+        // No TSM tree here: configfs-tsm fails at the pod.
+        assert!(source(QuoteSource::ConfigfsTsm).evidence(&[0; 64]).is_err());
+        let mut unknown = source(QuoteSource::ConfigfsTsm);
+        unknown.runtime_class = "kata-qemu-sev".into();
+        let error = unknown.evidence(&[0; 64]).unwrap_err().to_string();
+        assert!(error.contains("not supported"), "{error}");
     }
 }

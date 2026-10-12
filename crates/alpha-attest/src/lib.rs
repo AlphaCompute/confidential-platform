@@ -1,8 +1,8 @@
-//! Verifier for the evidence an Instance sends to the KMS: DCAP through `dcap-qvl`, then the
-//! checks that are ours — `report_data` binding, RTMR replay, reference values, the measured
-//! `compose_hash`, and for a Kata pod its init-data and GPUs. Pure over its arguments except
-//! [`fetch_collateral`] and the GPU backends: [`gpu::nras`] calls NRAS over HTTPS, and
-//! [`kata::appraise_any`] calls the backends it is given.
+//! Verifier for the evidence an Instance sends to the KMS: DCAP through `dcap-qvl` (or an SEV-SNP
+//! report through [`snp`]), then the checks that are ours — `report_data` binding, RTMR replay,
+//! reference values, the measured `compose_hash`, and for a Kata pod its init-data and GPUs. Pure
+//! over its arguments except [`fetch_collateral`], [`snp::kds`] and the GPU backends:
+//! [`gpu::nras`] calls NRAS over HTTPS, and [`kata::appraise_any`] calls the backends it is given.
 
 #![cfg_attr(
     test,
@@ -18,6 +18,7 @@
 mod event_log;
 pub mod gpu;
 pub mod kata;
+pub mod snp;
 
 use std::fmt;
 use std::str::FromStr;
@@ -38,7 +39,10 @@ pub use gpu::{
     GpuAppraisal, GpuEvidence, GpuPolicy, GpuVerdict, GpuVerifier, GpuVerifierKind, GpuVouch,
     VerifiedGpu,
 };
-pub use kata::{AnyEvidence, CocoAppraised, CpuEvidence, CpuKind, EvidenceV2, appraise_any};
+pub use kata::{
+    AnyEvidence, CocoAppraised, CpuEvidence, CpuKind, EvidenceV2, VerifiedCpu, appraise_any,
+};
+pub use snp::{SnpPolicy, VerifiedReport};
 
 pub const EVIDENCE_FORMAT: &str = "alphacompute-evidence/1";
 pub const EVIDENCE_FORMAT_V2: &str = "alphacompute-evidence/2";
@@ -150,6 +154,10 @@ pub struct PlatformDocument {
     /// on the GPU runtime class can attest; pods on the CPU class never need it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_policy: Option<GpuPolicy>,
+    /// What an SEV-SNP guest must prove (`kata-snp/1`): AMD's pinned certificates, minimum TCB
+    /// and guest policy. Absent, no Revision on an SNP runtime class can attest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snp_policy: Option<SnpPolicy>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,11 +176,50 @@ pub struct ReferenceValue {
     #[serde(default, skip_serializing_if = "ReferenceKind::is_prototype")]
     pub kind: ReferenceKind,
     /// For a Kata guest: the runtime class whose guest image these are (`kata-qemu-tdx` or
-    /// `kata-qemu-nvidia-gpu-tdx`). Required for `kata-tdx`: a value without one, or naming
-    /// another class, never matches a pod, since the class decides whether GPUs are checked.
+    /// `kata-qemu-nvidia-gpu-tdx` for `kata-tdx`, `kata-qemu-snp` or `kata-qemu-nvidia-gpu-snp`
+    /// for `kata-snp`). Required for a Kata kind: a value without one, or naming another class,
+    /// never matches a pod, since the class decides whether GPUs are checked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_class: Option<String>,
-    pub values: ReferenceMeasurements,
+    pub values: ReferenceValues,
+}
+
+/// A TDX guest's registers, or an SNP guest's launch measurement. A value whose shape is not its
+/// `kind`'s never matches.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ReferenceValues {
+    Tdx(ReferenceMeasurements),
+    Snp(SnpReferenceMeasurement),
+}
+
+impl ReferenceValues {
+    pub fn tdx(&self) -> Option<&ReferenceMeasurements> {
+        match self {
+            Self::Tdx(values) => Some(values),
+            Self::Snp(_) => None,
+        }
+    }
+
+    pub fn snp(&self) -> Option<&SnpReferenceMeasurement> {
+        match self {
+            Self::Snp(values) => Some(values),
+            Self::Tdx(_) => None,
+        }
+    }
+}
+
+impl From<ReferenceMeasurements> for ReferenceValues {
+    fn from(values: ReferenceMeasurements) -> Self {
+        Self::Tdx(values)
+    }
+}
+
+/// An SNP guest's `MEASUREMENT` at launch (firmware, kernel, initrd, command line, vCPU state).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnpReferenceMeasurement {
+    pub measurement: Measurement,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,7 +230,8 @@ pub enum ReferenceKind {
     PrototypeTdx,
     /// A Kata pod VM on TDX, the CPU guest or the NVIDIA guest per `runtime_class`: `kata-tdx/1`.
     KataTdx,
-    /// A Kata pod VM on SEV-SNP (PRD-02 P2; no profile appraises it yet).
+    /// A Kata pod VM on SEV-SNP, the CPU guest or the NVIDIA guest per `runtime_class`:
+    /// `kata-snp/1`.
     KataSnp,
 }
 
@@ -203,11 +251,23 @@ pub struct ReferenceMeasurements {
     pub rtmr2: Measurement,
 }
 
+impl ReferenceMeasurements {
+    /// MRTD and RTMR0..2 are these.
+    pub fn matches(&self, measured: &Measured) -> bool {
+        self.mrtd == measured.mrtd
+            && self.rtmr0 == measured.rtmr0
+            && self.rtmr1 == measured.rtmr1
+            && self.rtmr2 == measured.rtmr2
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttestationResult {
     pub format: String,
     pub verdict: Verdict,
-    pub measured: Measured,
+    /// The TD's registers; absent for an SNP guest, whose launch measurement is in `coco.snp`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured: Option<Measured>,
     pub tcb_status: String,
     pub advisories: Vec<String>,
     pub os_image: String,
@@ -216,7 +276,8 @@ pub struct AttestationResult {
     pub evidence_sha256: String,
     pub verified_at: String,
     pub policy_version: u64,
-    /// The `kata-tdx/1` profile's findings: init-data, policy, runtime class and every GPU.
+    /// The `kata-tdx/1` or `kata-snp/1` profile's findings: init-data, policy, runtime class,
+    /// every GPU and, on SNP, the report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coco: Option<CocoAppraised>,
 }
@@ -240,7 +301,8 @@ pub struct Revision {
 /// KMS fills after looking `compose_hash` up in its Revisions.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Appraised {
-    pub measured: Measured,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measured: Option<Measured>,
     pub tcb_status: String,
     pub advisories: Vec<String>,
     pub os_image: String,
@@ -398,10 +460,7 @@ pub fn appraise(
         .iter()
         .find(|rv| {
             rv.kind == ReferenceKind::PrototypeTdx
-                && rv.values.mrtd == measured.mrtd
-                && rv.values.rtmr0 == measured.rtmr0
-                && rv.values.rtmr1 == measured.rtmr1
-                && rv.values.rtmr2 == measured.rtmr2
+                && rv.values.tdx().is_some_and(|v| v.matches(&measured))
         })
         .map(|rv| rv.name.clone())
         .ok_or_else(|| Unknown(format!("no reference value for mrtd {}", measured.mrtd)))?;
@@ -419,7 +478,7 @@ pub fn appraise(
 
     let evidence_json = serde_json::to_value(evidence).map_err(|e| Failed(e.to_string()))?;
     Ok(Appraised {
-        measured,
+        measured: Some(measured),
         tcb_status,
         advisories,
         os_image,

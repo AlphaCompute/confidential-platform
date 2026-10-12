@@ -14,11 +14,20 @@ dcap-qvl = "=0.6.3"
 hex = { version = "0.4", features = ["serde"] }
 p384 = { version = "0.13", features = ["ecdsa"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+# RSA-PSS for AMD's CRL under the pinned ARK; the version `sev` and `dcap-qvl` already use.
+rsa = "=0.9.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# SEV-SNP report parsing and the ARK/ASK/VCEK chain (virtee, as Trustee's SNP verifier); pure Rust
+# (`crypto_nossl`), no host ioctls (`sev` feature off).
+sev = { version = "=8.0.0", default-features = false, features = ["snp", "crypto_nossl"] }
 sha2 = "0.11"
+# The digest `rsa` 0.9 verifies with.
+sha2_10 = { package = "sha2", version = "0.10" }
 thiserror = "2"
 tokio = { version = "1", features = ["time"] }
+# VCEK extensions and AMD's CRL; the version `sev` parses certificates with.
+x509-cert = "=0.2.5"
 
 [dev-dependencies]
 chrono = { version = "0.4", default-features = false }

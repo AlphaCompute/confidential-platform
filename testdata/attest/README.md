@@ -1,6 +1,6 @@
 # Attestation vectors
 
-Golden inputs for `crates/alpha-attest`, read by `crates/alpha-attest/tests/vectors.rs`. Every quote here was produced by a real Phala Cloud CVM; nothing is synthesized or edited into a passing state. `now` in the tests is the capture time, so the DCAP collateral never expires.
+Golden inputs for `crates/alpha-attest`, read by `crates/alpha-attest/tests/vectors.rs`. Every quote here was produced by a real Phala Cloud CVM; nothing is synthesized or edited into a passing state. `snp-virtee-milan/` is the one SEV-SNP vector, a published third-party report with AMD's collateral (its README gives the provenance). `now` in the tests is the capture time, so the DCAP collateral never expires.
 
 ## Captures
 
