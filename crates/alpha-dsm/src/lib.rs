@@ -44,6 +44,8 @@ use rustls::{ClientConfig, RootCertStore};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+pub mod tenancy;
+
 /// A token is not reused this close to its expiry.
 const TOKEN_MARGIN: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
