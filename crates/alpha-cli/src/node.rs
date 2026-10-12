@@ -324,7 +324,9 @@ pub async fn unseal(
         .unseal(&UnsealRequest {
             share_hpke,
             db_volume_wrapped: file.db_volume_wrapped.clone(),
-            platform_document_version: Some(doc_version),
+            // Only beside the wrapped key: a share file from before M2(a) unseals an older node,
+            // which refuses fields it does not know.
+            platform_document_version: file.db_volume_wrapped.as_ref().map(|_| doc_version),
         })
         .await
         .map_err(|e| e.to_string())
