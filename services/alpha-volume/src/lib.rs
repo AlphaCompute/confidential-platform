@@ -292,9 +292,13 @@ fn check_metadata(tools: &Tools, device: &str) -> Result<(), Error> {
         )));
     };
     let field = |pointer: &str| segment.pointer(pointer).and_then(serde_json::Value::as_str);
-    if field("/encryption") != Some(CIPHER) || field("/integrity/type") != Some(INTEGRITY) {
+    let int_field = |pointer: &str| segment.pointer(pointer).and_then(serde_json::Value::as_u64);
+    if field("/encryption") != Some(CIPHER)
+        || field("/integrity/type") != Some(INTEGRITY)
+        || int_field("/key_size") != Some(512)
+    {
         return Err(Error::Refused(format!(
-            "{device}: header is not {CIPHER} with {INTEGRITY} integrity"
+            "{device}: header is not {CIPHER} with a 512-bit key and {INTEGRITY} integrity"
         )));
     }
     Ok(())
@@ -420,7 +424,7 @@ mod tests {
             }
             std::fs::write(
                 dir.join("luksdump.json"),
-                r#"{"segments":{"0":{"type":"crypt","encryption":"aes-xts-plain64","integrity":{"type":"hmac(sha256)"}}}}"#,
+                r#"{"segments":{"0":{"type":"crypt","encryption":"aes-xts-plain64","key_size":512,"integrity":{"type":"hmac(sha256)"}}}}"#,
             )
             .unwrap();
             Self { dir }
