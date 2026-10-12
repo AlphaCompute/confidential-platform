@@ -64,10 +64,10 @@ Delete it, and render with `alpha coco render`, once that exists.
 
 ## Choices worth knowing
 
-- **The namespace is an Alpha confidential one**, labelled `alphacompute.io/confidential=true`,
-  `alphacompute.io/attested=true` and `alphacompute.io/track=alpha`: PRD-01 admission then holds
+- **The namespace is an Alpha confidential one**, labelled `alphacompute.ai/confidential=true`,
+  `alphacompute.ai/attested=true` and `alphacompute.ai/track=alpha`: PRD-01 admission then holds
   every pod to the rules above, and lets it tolerate the Alpha track taint the runtime class adds.
-  The pods carry `alphacompute.io/tenant` and `alphacompute.io/app` for GPU-hours chargeback.
+  The pods carry `alphacompute.ai/tenant` and `alphacompute.ai/app` for GPU-hours chargeback.
 - **Only alpha-inference gets in.** vLLM listens on loopback only, so the pod's only way in is the
   runtime's TLS on 8443, which alpha-inference pins to the KMS CA and the Revision. In the other
   direction the runtime admits a client only with an Instance leaf of alpha-inference's App

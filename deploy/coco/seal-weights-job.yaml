@@ -13,16 +13,16 @@ metadata:
   name: seal-weights-${MODEL_NAME}
   labels:
     app.kubernetes.io/name: alpha-seal-weights
-    alphacompute.io/model: ${MODEL_NAME}
+    alphacompute.ai/model: ${MODEL_NAME}
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
         app.kubernetes.io/name: alpha-seal-weights
-        alphacompute.io/model: ${MODEL_NAME}
-        alphacompute.io/tenant: ${TENANT}
-        alphacompute.io/app: ${APP_ID}
+        alphacompute.ai/model: ${MODEL_NAME}
+        alphacompute.ai/tenant: ${TENANT}
+        alphacompute.ai/app: ${APP_ID}
       annotations:
         # The only Kata annotation: the init-data (agent policy + alpha.json), set by the renderer.
         io.katacontainers.config.hypervisor.cc_init_data: "${CC_INIT_DATA}"
