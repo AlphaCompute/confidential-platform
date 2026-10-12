@@ -670,7 +670,9 @@ function approvalApi(options = {}) {
     compose_hash: options.compose_hash || `sha256:${sha256(compose || "").toString("hex")}`,
     catalog_template_sha256: options.catalog_template_sha256 || null,
     compose: options.catalog_template_sha256 ? null : compose,
-    machine: "tdx.medium",
+    // Sent only when a test gives it, as shroud-go sends it only once it relays one.
+    initdata: options.initdata,
+    machine: options.machine || "tdx.medium",
     credentials: options.credentials || [],
     current: options.current || null,
     expires_at: options.expires_at || iso(now + 24 * 3600 * 1000),
@@ -693,6 +695,7 @@ function approvalApi(options = {}) {
     "compose_hash",
     "catalog_template_sha256",
     "compose",
+    "initdata",
     "machine",
     "credentials",
     "current",

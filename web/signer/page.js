@@ -70,8 +70,8 @@ const MESSAGES = {
     "What the service asked you to approve does not match what it would run. Nothing was signed.",
   unreadable:
     "This page cannot read what the service asked you to approve, so it cannot show it to you. Nothing was signed.",
-  not_registrable:
-    "The KMS would refuse to register what the service asked you to approve. Nothing was signed.",
+  no_initdata:
+    "The service did not send this pod's init-data, so this page cannot show its images or agent policy. Approving registers them by the digests under Technical details.",
   approved: "Approved. You can close this tab.",
   declined: "Declined. You can close this tab.",
   secret_missing: "Enter a value for every secret.",
@@ -81,6 +81,15 @@ const MESSAGES = {
   revision_revoked: "The KMS refuses this launch because it was revoked before. Nothing was approved.",
   one_key: (expiresAt) =>
     `Your organization has one passkey. If you lose it you lose the organization. Your link stays open until ${expiresAt}.`,
+};
+
+// What the pod's agent policy lets the host do with one kind of request, by its verdict from the
+// wasm; a verdict this page does not know reads as not denied.
+const VERDICTS = {
+  denied: "denied",
+  ruled: "not denied: the policy has rules that may allow it",
+  replaceable: "not denied: the policy lets the host replace the policy",
+  failures_allowed: "not denied: the policy lets refused requests through",
 };
 
 const CODES = {
@@ -759,9 +768,32 @@ function approvalRefusal(read) {
 // its compose_hash, parsed for display from those same bytes.
 function uploadedLaunch(read) {
   if (typeof read.compose !== "string") return { refusal: MESSAGES.mismatch };
-  return parsedLaunch(read, read.compose, {
+  const extra = {
     machine: `${read.machine || "not stated"} (chosen by the service, not part of what you sign)`,
-  });
+  };
+  if (wasm_bindgen.isCocoRevision(read.compose)) return revisionLaunch(read, extra);
+  return parsedLaunch(read, read.compose, extra);
+}
+
+// A Revision v2 for a Kata confidential pod, refused unless registration would accept it. It
+// holds only digests of the pod's init-data and agent policy, so their content is shown only from
+// init-data the service sends that rebuilds exactly these bytes.
+function revisionLaunch(read, extra) {
+  if (wasm_bindgen.bodySha256(utf8(read.compose)) !== read.compose_hash) {
+    return { refusal: MESSAGES.mismatch };
+  }
+  const initdata = read.initdata == null ? undefined : read.initdata;
+  if (initdata !== undefined && typeof initdata !== "string") {
+    return { refusal: MESSAGES.unreadable };
+  }
+  try {
+    const view = JSON.parse(wasm_bindgen.cocoRevision(read.compose, read.app_id, initdata));
+    const { revision, pod } = view;
+    return { compose: read.compose, services: {}, revision, pod, ...extra };
+  } catch (e) {
+    const mismatch = String(e && e.message).startsWith("compose_mismatch:");
+    return { refusal: mismatch ? MESSAGES.mismatch : MESSAGES.unreadable };
+  }
 }
 
 function parsedLaunch(read, compose, extra) {
@@ -796,8 +828,56 @@ function serviceBlock(name, service) {
   return block;
 }
 
+function verdict(name) {
+  return Object.hasOwn(VERDICTS, name) ? VERDICTS[name] : VERDICTS.ruled;
+}
+
+function describeRevision(a) {
+  const { read, launch } = a;
+  const r = launch.revision;
+  const pod = el("div", undefined, "service");
+  pod.append(
+    el("h3", "Confidential pod"),
+    fact("Runtime class", r.runtime_class),
+    fact("GPUs", r.gpu ? `${r.gpu.count} × ${r.gpu.model}, in confidential computing mode` : "none"),
+  );
+  const nodes = [el("h2", "What will run"), pod];
+  if (launch.pod) {
+    const { policy } = launch.pod;
+    const images = el("div", undefined, "service");
+    images.append(el("h3", "Images the agent policy names"));
+    if (!policy.images.length) images.append(el("p", "None that this page can read."));
+    for (const image of policy.images) images.append(...imageLines(image));
+    const host = el("div", undefined, "service");
+    host.append(
+      el("h3", "What the host may do in the pod"),
+      fact("Run commands in a container (exec)", verdict(policy.exec)),
+      fact("Read a container's output (logs)", verdict(policy.logs)),
+    );
+    nodes.push(images, host);
+  } else {
+    // ponytail: R2b. Until shroud-go relays the init-data with the request, a Revision v2 is
+    // approved from this view of its digests, which the plan accepts until its full view.
+    nodes.push(el("p", MESSAGES.no_initdata, "warning"));
+  }
+  nodes.push(fact("Machine", launch.machine));
+  const details = el("details");
+  details.append(
+    el("summary", "Technical details"),
+    fact("App", read.app_id),
+    fact("compose_hash", read.compose_hash, "digest"),
+    fact("initdata_sha256", r.initdata_sha256, "digest"),
+    fact("policy_sha256", r.policy_sha256, "digest"),
+    el("pre", launch.compose),
+  );
+  if (launch.pod) details.append(el("pre", launch.pod.policy_text));
+  nodes.push(details);
+  return nodes;
+}
+
 function describeLaunch(a) {
   const { read, launch } = a;
+  if (launch.revision) return describeRevision(a);
   const nodes = [];
   if (launch.heading) nodes.push(el("p", launch.heading));
   for (const line of launch.notes || []) nodes.push(el("p", line, "warning"));

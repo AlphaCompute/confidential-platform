@@ -11,6 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod agent_policy;
 pub mod catalog;
 pub mod coco;
 pub mod compose;

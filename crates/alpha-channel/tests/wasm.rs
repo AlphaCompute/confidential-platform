@@ -12,9 +12,9 @@ use std::collections::BTreeMap;
 use alpha_channel::handshake;
 use alpha_channel::secret::{self, Sealed};
 use alpha_channel::wasm::{
-    Initiator, KmsSecretSealer, Responder, body_sha256, canonical_json, compose_services, signable,
-    signing_digest, verify_catalog, verify_grant, verify_kms_receipt, verify_member_request,
-    verify_platform,
+    Initiator, KmsSecretSealer, Responder, body_sha256, canonical_json, coco_revision,
+    compose_services, is_coco_revision, signable, signing_digest, verify_catalog, verify_grant,
+    verify_kms_receipt, verify_member_request, verify_platform,
 };
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
@@ -34,6 +34,9 @@ const PLATFORM_DOCUMENT: &str = include_str!("../../../testdata/channel/platform
 const KMS_LEAF: &str = include_str!("../../../testdata/channel/kms-leaf.pem");
 const KMS_LEAF_KEY: &str = include_str!("../../../testdata/channel/kms-leaf-key.pem");
 const KMS_COMPOSE: &str = include_str!("../../../testdata/manifest/06-kms-node/app-compose.json");
+const COCO_INITDATA: &str = include_str!("../../../testdata/coco/b300x1/initdata.toml");
+const COCO_REVISION: &str = include_str!("../../../testdata/coco/b300x1/revision.json");
+const COCO_APP: &str = "01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b";
 
 /// 2026-06-01T00:00:00Z.
 const NOW_MS: f64 = 1_780_272_000_000.0;
@@ -370,6 +373,48 @@ fn member_documents_from_signable_verify_through_the_exports() {
             .unwrap()
             .contains("@sha256:")
     );
+}
+
+#[wasm_bindgen_test]
+fn a_revision_v2_is_shown_only_from_initdata_that_rebuilds_it() {
+    assert!(is_coco_revision(COCO_REVISION));
+    assert!(!is_coco_revision(COMPOSE));
+    let initdata = base64::prelude::BASE64_STANDARD.encode(COCO_INITDATA);
+    let shown: Value = serde_json::from_str(
+        &coco_revision(COCO_REVISION, COCO_APP, Some(initdata))
+            .map_err(message)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        shown["revision"]["gpu"],
+        json!({"count": 1, "model": "B300"})
+    );
+    assert_eq!(shown["pod"]["policy"]["exec"], "denied");
+    assert_eq!(shown["pod"]["policy"]["logs"], "denied");
+    assert_eq!(
+        shown["pod"]["policy"]["images"].as_array().unwrap().len(),
+        3
+    );
+    let bare: Value = serde_json::from_str(
+        &coco_revision(COCO_REVISION, COCO_APP, None)
+            .map_err(message)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(bare["pod"], Value::Null);
+
+    let edited = base64::prelude::BASE64_STANDARD.encode(format!("{COCO_INITDATA}\n"));
+    let m = message(coco_revision(COCO_REVISION, COCO_APP, Some(edited)).unwrap_err());
+    assert!(m.starts_with("compose_mismatch:"), "{m}");
+    for (text, app, initdata) in [
+        (COCO_REVISION, "01920000-0000-7000-8000-000000000002", None),
+        (COCO_REVISION, COCO_APP, Some("not base64!".to_owned())),
+        (COMPOSE, COCO_APP, None),
+    ] {
+        let m = message(coco_revision(text, app, initdata).unwrap_err());
+        assert!(m.starts_with("malformed:"), "{m}");
+    }
 }
 
 #[wasm_bindgen_test]

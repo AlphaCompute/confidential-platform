@@ -71,21 +71,33 @@ pub fn compose_services(compose: &str) -> Result<String, JsError> {
     to_json(&compose::services(compose).map_err(js)?)
 }
 
-/// The payload to sign under `revision` that registers `revision` for `app_id`:
-/// `{app_id, compose}` or `{app_id, init_data, digest}`, refused when the KMS would refuse it.
-/// `kata_policy_json` is the verified platform document's `kata_policy`, or `null` when it has
-/// none, which an init-data must carry.
-#[wasm_bindgen(js_name = revisionPayload)]
-pub fn revision_payload(
+/// Whether a registered document is a Revision v2 rather than a compose, by the test the KMS
+/// applies.
+#[wasm_bindgen(js_name = isCocoRevision)]
+pub fn is_coco_revision(text: &str) -> bool {
+    alpha_core::coco::is_revision_v2(text)
+}
+
+/// `{revision, pod}` of `text`, a Revision v2 that registration accepts for `app_id`. `pod` is
+/// `{policy: {exec, logs, images}, policy_text}` read from `initdata_b64` (standard base64 of the
+/// init-data bytes), which must rebuild `text` exactly (`compose_mismatch` otherwise), or null
+/// when no init-data is given.
+#[wasm_bindgen(js_name = cocoRevision)]
+pub fn coco_revision(
+    text: &str,
     app_id: &str,
-    revision: &str,
-    kata_policy_json: &str,
+    initdata_b64: Option<String>,
 ) -> Result<String, JsError> {
+    use base64::Engine;
+    use base64::prelude::BASE64_STANDARD;
     let app_id: alpha_core::AppId = app_id
         .parse()
         .map_err(|_| js(Error::Malformed(format!("app_id {app_id:?} is not a UUID"))))?;
-    let kata_policy: Option<alpha_core::KataPolicy> = parse("kata policy", kata_policy_json)?;
-    to_json(&compose::revision_payload(app_id, revision, kata_policy.as_ref()).map_err(js)?)
+    let initdata = initdata_b64
+        .map(|b64| BASE64_STANDARD.decode(b64))
+        .transpose()
+        .map_err(|_| js(Error::Malformed("initdata is not standard base64".into())))?;
+    to_json(&crate::coco::view(text, app_id, initdata.as_deref()).map_err(js)?)
 }
 
 fn canonical(value: &serde_json::Value) -> Result<String, JsError> {
