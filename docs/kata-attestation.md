@@ -158,6 +158,29 @@ If a required claim name differs on the B300, `nras::claims::REQUIRED` is the on
 
 The GPU backend in the suite reports each GPU as its report describes it. The `nras` backend reports a GPU whose CC-mode claim holds anything but the CC-on value (`OFF`, `DEVTOOLS`) as not in CC mode (`gpu::nras` tests). A nonce is stateless and valid for five minutes, so within that window one pod may attest twice with one nonce; the leaf certifies a runtime key only the pod holds, so replaying a fresh exchange gains the host nothing. The appraisal-only cases, a guest image without a reference value and a downgraded TCB among them, are `alpha_attest` tests.
 
+## A KMS node on Kata
+
+`alpha-kms` itself runs as a Kata pod on the verifier pool (PRD-05), on the CPU class `kata-qemu-tdx`. With `ALPHACOMPUTE_QUOTE_SOURCE=coco-aa` (or `coco-tsm`) it reads the init-data it booted with from `/run/alpha-pod/cc_init_data` and its Revision is the Revision v2 that init-data stands for (`alpha_kms::NodeGuest`); init-data on any other class is refused at start. It quotes through the same CoCo source as `alpha-runtime` (`alpha_tsm::coco::Source`, no GPU evidence) with `report_data` = `SHA-256(SPKI ‖ nonce) ‖ SHA-256(xwing)`, so the X-Wing key custodians seal to is bound exactly as on a prototype node. Its leaf names that Revision v2, so clients pin it in `ALPHACOMPUTE_KMS_REVISIONS` like any KMS build.
+
+A node is admitted by `alpha_attest::node`, the one appraisal both the serving node (before `join`) and a custodian's `alpha bootstrap` / `alpha unseal` run:
+
+1. Prototype evidence: `appraise` as before. Kata evidence: steps 1 to 9 above with the X-Wing key bound, so its Revision v2 hash must be in `kms_revisions`.
+2. A Kata node's init-data names `kata-qemu-tdx`; a node on the GPU class is refused (`a KMS node runs on the runtime class kata-qemu-tdx`), and no GPU backend is ever called for a node. Its GPU decision is the CPU class's: no GPU evidence.
+3. The `kms_revisions` entry with that hash is listed for the profile the node was appraised under: `"kind": "kata-tdx"` for a Kata build, absent (`prototype-tdx`) for a prototype build. So a prototype CVM whose compose were a Kata build's Revision v2 bytes, or the reverse, is not a node (`attestation_unknown`).
+
+During the migration the platform document lists both builds:
+
+```json
+"kms_revisions": [
+  {"compose_hash": "sha256:<prototype build>", "build": "kms v…", "source_url": "…"},
+  {"compose_hash": "sha256:<Revision v2 of the Kata KMS init-data>", "build": "kms v… (kata)", "source_url": "…", "kind": "kata-tdx"}
+]
+```
+
+A Kata node then joins a serving prototype node through the existing protocol (`node.join.request`, a nonce from the serving node, `POST /v1/node/join` with its evidence v2 and X-Wing key, the intermediates in the reply), so the CA and every key are kept; each join writes a `node.join` audit row naming the joining node's Revision and, for a Kata node, its `coco` findings. `alpha bootstrap` on a Kata node is production genesis. The KMS's tests run this over synthetic quotes (`services/alpha-kms/tests/kata_node.rs`, through `node::join_verified` and `alpha_cli::node::verify_kata_node`, which no route or command reaches) until B300 Kata captures exist at M1; the join route and the CLI always run DCAP first.
+
+What a custodian verifies before a share leaves their key, for a Kata node: DCAP and the TCB policy; `kata-tdx` reference values for the CPU guest; MRCONFIGID equal to the digest of the init-data the node sent; the Revision v2 rebuilt from that init-data listed as a `kata-tdx` KMS build; the X-Wing key and runtime key bound in `report_data`; the TLS key equal to the attested runtime key. What the KMS pod may run, and that nothing can exec into it or read its logs, is the agent policy inside that init-data, so it is reviewed once, when the build is listed by the release key, and not by the CLI. The CLI prints the node's `profile`, `revision`, `os_image` and `policy_sha256` for the custodian's record.
+
 ## What the KMS cannot see
 
 Exec, log reads, file copies and container changes are refused inside the guest by the agent policy. The KMS's part is to make sure that policy is the one the tenant signed. Those cases are run against a live pod by the full malicious-host suite (deliverable 18), not by the core suite.

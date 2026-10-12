@@ -3,9 +3,9 @@
 
 use std::sync::Arc;
 
-use alpha_attest::{Evidence, appraise, report_data};
+use alpha_attest::{AnyEvidence, Appraised, VerifiedQuote, kata, report_data};
 use alpha_client::tls::PeerCerts;
-use alpha_client::{Client, Identity, JoinRequest, Pin, UnsealRequest};
+use alpha_client::{Client, Identity, JoinReply, JoinRequest, NodeEvidence, Pin, UnsealRequest};
 use alpha_core::{context, signing_digest};
 use alpha_crypto::{INFO_NODE_BOOTSTRAP, INFO_UNSEAL_SHARE, Sealed};
 use axum::Json;
@@ -35,21 +35,27 @@ pub struct NonceQuery {
     pub nonce: String,
 }
 
+/// This node's evidence over the caller's nonce, its X-Wing key bound in `report_data[32..64]`: a
+/// prototype node's quote and event log, or a Kata node's evidence v2 with its init-data.
 pub async fn evidence(
     State(node): State<Arc<Node>>,
     Query(query): Query<NonceQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<NodeEvidence>, ApiError> {
     let nonce = decode32("nonce", &query.nonce)?;
     let xwing = node.xwing_key.public();
     let rd = report_data(&node.runtime_spki, &nonce, Some(xwing.as_bytes()));
-    let quote = alpha_tsm::quote(&rd).map_err(|e| ApiError::internal(format!("quote: {e}")))?;
-    Ok(Json(json!({
-        "quote": BASE64_URL_SAFE_NO_PAD.encode(quote),
-        "event_log": node.event_log,
-        "runtime_pubkey": BASE64_URL_SAFE_NO_PAD.encode(&node.runtime_spki),
-        "xwing_pubkey": xwing,
-        "compose_hash": node.compose_hash,
-    })))
+    let (quote, event_log, evidence_v2) = match node.guest.evidence(&rd)? {
+        AnyEvidence::V1(e) => (BASE64_URL_SAFE_NO_PAD.encode(e.quote), e.event_log, None),
+        AnyEvidence::V2(e) => (String::new(), Vec::new(), Some(e)),
+    };
+    Ok(Json(NodeEvidence {
+        quote,
+        event_log,
+        evidence_v2,
+        runtime_pubkey: BASE64_URL_SAFE_NO_PAD.encode(&node.runtime_spki),
+        xwing_pubkey: xwing,
+        compose_hash: node.compose_hash,
+    }))
 }
 
 pub use alpha_client::{BootstrapBody, BootstrapRequest};
@@ -229,12 +235,39 @@ pub async fn join(
         .first()
         .ok_or_else(|| ApiError::new("cert_invalid", "no client certificate"))?;
     let spki = certs::spki_of(leaf)?;
-    let actor = keys::sha256_hex(&spki);
-    let result = join_inner(&node, &spki, &request).await;
+    join_audited(&node, &spki, &request, None).await.map(Json)
+}
+
+/// [`join`] for a Kata node's `alphacompute-evidence/2` over a TDX quote the caller has verified:
+/// every step after DCAP, the audit row included, for the client certificate key `spki`. No route
+/// reaches it. The KMS's tests join Kata nodes through it over synthetic quotes, as
+/// [`crate::instance::attest_verified`] attests Kata pods, until B300 Kata captures exist (M1).
+pub async fn join_verified(
+    node: &Node,
+    spki: &[u8],
+    request: &JoinRequest,
+    verified: VerifiedQuote,
+) -> Result<Value, ApiError> {
+    join_audited(node, spki, request, Some(verified)).await
+}
+
+async fn join_audited(
+    node: &Node,
+    spki: &[u8],
+    request: &JoinRequest,
+    verified: Option<VerifiedQuote>,
+) -> Result<Value, ApiError> {
+    let actor = keys::sha256_hex(spki);
+    let result = join_inner(node, spki, request, verified).await;
     let (outcome, details) = match &result {
-        Ok(compose_hash) => (
+        Ok(appraised) => (
             "ok",
-            json!({ "runtime_pubkey_sha256": actor, "compose_hash": compose_hash }),
+            json!({
+                "runtime_pubkey_sha256": actor,
+                "compose_hash": appraised.compose_hash,
+                "os_image": appraised.os_image,
+                "coco": appraised.coco,
+            }),
         ),
         Err(e) => (e.outcome(), e.details()),
     };
@@ -243,18 +276,22 @@ pub async fn join(
         .await?;
     result?;
     let keys = node.intermediates()?;
-    Ok(Json(json!({
+    Ok(json!({
         "tenant_kek_root": BASE64_URL_SAFE_NO_PAD.encode(keys.tenant_kek_root.as_slice()),
         "ca_key": BASE64_URL_SAFE_NO_PAD.encode(keys.ca_key_der.as_slice()),
         "ca_cert": BASE64_URL_SAFE_NO_PAD.encode(&keys.ca_cert_der),
-    })))
+    }))
 }
 
+/// The joining node's appraisal is the one a custodian's CLI runs before unsealing
+/// ([`alpha_attest::node`]): prototype evidence, or `kata-tdx/1` on the CPU class, listed in
+/// `kms_revisions` for that profile.
 async fn join_inner(
     node: &Node,
     spki: &[u8],
     request: &JoinRequest,
-) -> Result<alpha_core::ComposeHash, ApiError> {
+    verified: Option<VerifiedQuote>,
+) -> Result<Appraised, ApiError> {
     node.intermediates()?;
     let now = node.now();
     let nonce = decode32("nonce", &request.nonce)?;
@@ -262,16 +299,32 @@ async fn join_inner(
     let doc = node
         .platform_document()
         .ok_or_else(|| ApiError::new("attestation_unknown", "no platform document"))?;
-    let collateral = collateral(node, &request.evidence.quote).await?;
-    let appraised = appraise(
-        &request.evidence,
-        &nonce,
-        spki,
-        Some(request.xwing_pubkey.as_bytes()),
-        &doc,
-        &collateral,
-        now,
-    )?;
+    let xwing = request.xwing_pubkey.as_bytes();
+    let appraised = match (&request.evidence, verified) {
+        (AnyEvidence::V1(_), Some(_)) => {
+            return Err(ApiError::internal(
+                "a verified quote comes with alphacompute-evidence/2 only",
+            ));
+        }
+        (AnyEvidence::V2(evidence), Some(verified)) => {
+            alpha_attest::node::appraise_kata_node(evidence, verified, &nonce, spki, xwing, &doc)?
+        }
+        (evidence, None) => {
+            if let AnyEvidence::V2(evidence) = evidence {
+                kata::check_cpu_kind(evidence)?;
+            }
+            let collateral = collateral(node, evidence.quote()).await?;
+            alpha_attest::node::appraise_node(
+                evidence,
+                &nonce,
+                spki,
+                xwing,
+                &doc,
+                &collateral,
+                now,
+            )?
+        }
+    };
     let requested = sqlx::query_scalar!(
         "select exists(select 1 from audit_log
            where action = 'node.join.request' and outcome = 'ok'
@@ -287,7 +340,7 @@ async fn join_inner(
             "no node.join.request in the last 10 minutes",
         ));
     }
-    Ok(appraised.compose_hash)
+    Ok(appraised)
 }
 
 /// The start rule: sealed → the first endpoint whose `/ready` is 200 gets a
@@ -312,8 +365,20 @@ pub async fn try_join(node: &Node) -> Result<(), ApiError> {
 
 async fn join_via(node: &Node, client: &Client, endpoint: &str) -> Result<(), ApiError> {
     let http = |e: alpha_client::Error| ApiError::internal(format!("join: {e}"));
-    let nonce_text = client.attest_nonce().await.map_err(http)?.nonce;
-    let nonce = decode32("nonce", &nonce_text)?;
+    let nonce = client.attest_nonce().await.map_err(http)?.nonce;
+    let request = join_request(node, nonce, endpoint).await?;
+    let reply = client.join(&request).await.map_err(http)?;
+    finish_join(node, &reply)
+}
+
+/// The joining side's request over the serving node's `nonce`: a `node.join.request` row, which
+/// the serving node requires, then this node's evidence with its X-Wing key bound.
+pub async fn join_request(
+    node: &Node,
+    nonce: String,
+    endpoint: &str,
+) -> Result<JoinRequest, ApiError> {
+    let raw = decode32("nonce", &nonce)?;
     audit::node(
         "node.join.request",
         "ok",
@@ -322,21 +387,16 @@ async fn join_via(node: &Node, client: &Client, endpoint: &str) -> Result<(), Ap
     .insert(&node.pool)
     .await?;
     let xwing = node.xwing_key.public();
-    let rd = report_data(&node.runtime_spki, &nonce, Some(xwing.as_bytes()));
-    let quote = alpha_tsm::quote(&rd).map_err(|e| ApiError::internal(format!("quote: {e}")))?;
-    let evidence = Evidence {
-        format: alpha_attest::EVIDENCE_FORMAT.into(),
-        quote,
-        event_log: node.event_log.clone(),
-    };
-    let reply = client
-        .join(&JoinRequest {
-            nonce: nonce_text,
-            evidence,
-            xwing_pubkey: xwing,
-        })
-        .await
-        .map_err(http)?;
+    let rd = report_data(&node.runtime_spki, &raw, Some(xwing.as_bytes()));
+    Ok(JoinRequest {
+        nonce,
+        evidence: node.guest.evidence(&rd)?,
+        xwing_pubkey: xwing,
+    })
+}
+
+/// Serves with the intermediates the other node handed over.
+pub fn finish_join(node: &Node, reply: &JoinReply) -> Result<(), ApiError> {
     let field = |name: &str, text: &str| {
         alpha_client::decode(name, text).map_err(|e| ApiError::internal(format!("join reply: {e}")))
     };
