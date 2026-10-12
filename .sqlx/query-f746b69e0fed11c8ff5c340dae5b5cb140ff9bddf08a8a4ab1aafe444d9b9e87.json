@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select distinct app_id from revisions where compose_hash = any($1)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "app_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "revisions",
+            "name": "app_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "ByteaArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f746b69e0fed11c8ff5c340dae5b5cb140ff9bddf08a8a4ab1aafe444d9b9e87"
+}

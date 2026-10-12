@@ -26,7 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use alpha_core::KmsRevision;
 use alpha_core::{AppId, ComposeHash, OrgId, hex_bytes};
-use alpha_core::{CatalogKey, Signer};
+use alpha_core::{CatalogKey, Signer, Trustee};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 pub use dcap_qvl::QuoteCollateralV3 as Collateral;
@@ -151,6 +151,9 @@ pub struct PlatformDocument {
     /// on the GPU runtime class can attest; pods on the CPU class never need it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_policy: Option<GpuPolicy>,
+    /// The Trustee pods the KMS feeds (Option B, `docs/trustee.md`). Absent, none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trustee: Option<Trustee>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

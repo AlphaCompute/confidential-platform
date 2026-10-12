@@ -733,6 +733,114 @@ pub async fn revoke_key(
     })
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrusteeGrantPayload {
+    app_id: AppId,
+    resources: Vec<alpha_trustee::GrantEntry>,
+    issued_at: DateTime<Utc>,
+}
+
+/// Option B's opt-in (`docs/trustee.md`): which of an App's resources a Trustee pod may release
+/// to the App's own attested pods, replaced whole by a later `issued_at`; an empty list opts out.
+/// The App must be the signer's organization's (it has a Revision there and none elsewhere) and
+/// never a Trustee pod's own.
+pub async fn put_trustee_grant(
+    State(node): State<Arc<Node>>,
+    Path(path_app): Path<String>,
+    Body(body, request): Body<Signed>,
+) -> Result<Json<Value>, ApiError> {
+    audited_route!(node, body, request, "trustee.grant", async {
+        let keys = node.intermediates()?;
+        let p: TrusteeGrantPayload = payload(&body.payload)?;
+        if path_app != p.app_id.to_string() {
+            return Err(ApiError::malformed("path and payload app_id differ"));
+        }
+        for entry in &p.resources {
+            entry.check().map_err(ApiError::malformed)?;
+        }
+        let distinct: std::collections::BTreeSet<_> = p.resources.iter().collect();
+        if distinct.len() != p.resources.len() {
+            return Err(ApiError::malformed("grant: an entry is listed twice"));
+        }
+        let at = within_window(p.issued_at, node.now_utc())?;
+        let chain = authorize(&node, &keys, context::TRUSTEE_GRANT, &body, at).await?;
+        let org_id = chain.key.org_id;
+        let app = Uuid::from(p.app_id);
+        let doc = node
+            .platform_document()
+            .ok_or_else(|| ApiError::internal("no platform document"))?;
+        let mut tx = node.pool.begin().await?;
+        sqlx::query!(
+            "select pg_advisory_xact_lock(hashtext($1))",
+            format!("trustee-grant/{app}")
+        )
+        .execute(&mut *tx)
+        .await?;
+        let owner = sqlx::query!(
+            "select exists(select 1 from revisions where app_id = $1 and org_id = $2) as ours,
+                    exists(select 1 from revisions where app_id = $1 and org_id <> $2) as theirs",
+            app,
+            org_id
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        if owner.ours != Some(true) || owner.theirs != Some(false) {
+            return Err(ApiError::not_found(
+                "no such app in this organization: register a Revision of it first",
+            ));
+        }
+        if crate::trustee::trustee_apps(&mut *tx, &doc)
+            .await?
+            .contains(&app)
+        {
+            return Err(ApiError::new(
+                "policy_denied",
+                "a Trustee App's resources are never released through Trustee",
+            ));
+        }
+        let existing = sqlx::query_scalar!(
+            "select issued_at from trustee_grants where app_id = $1",
+            app
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if existing.is_some_and(|issued| issued >= at) {
+            return Err(ApiError::new(
+                "already_exists",
+                "a grant with a later issued_at is stored",
+            ));
+        }
+        sqlx::query!(
+            "insert into trustee_grants (app_id, org_id, resources, document, signed_by_key, signature, issued_at)
+             values ($1, $2, $3, $4, $5, $6, $7)
+             on conflict (app_id) do update set org_id = $2, resources = $3, document = $4,
+               signed_by_key = $5, signature = $6, issued_at = $7",
+            app,
+            org_id,
+            json!(p.resources),
+            body.payload,
+            chain.key.id,
+            json!(body.signature),
+            at,
+        )
+        .execute(&mut *tx)
+        .await?;
+        audited(
+            &mut tx,
+            &chain,
+            "trustee.grant",
+            format!("app:{app}"),
+            json!({ "resources": p.resources }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(json!({
+            "app_id": app, "org_id": org_id, "resources": p.resources, "issued_at": rfc3339(at),
+        }))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

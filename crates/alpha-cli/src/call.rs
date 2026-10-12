@@ -3,7 +3,7 @@
 use std::time::SystemTime;
 
 use alpha_client::{Client, PutSecretBody, sign, sign_self};
-use alpha_core::{ComposeHash, KeyId, OrgId, PrincipalId, context};
+use alpha_core::{AppId, ComposeHash, KeyId, OrgId, PrincipalId, context};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use ed25519_dalek::SigningKey;
@@ -21,6 +21,7 @@ pub enum Route {
     PutSecret,
     RegisterKey,
     RevokeKey,
+    TrusteeGrant,
 }
 
 impl Route {
@@ -30,6 +31,7 @@ impl Route {
             Self::RevokeRevision | Self::RevokeKey => context::CONTROL,
             Self::PutSecret => context::SECRET,
             Self::RegisterKey => context::PRINCIPAL_KEY,
+            Self::TrusteeGrant => context::TRUSTEE_GRANT,
         }
     }
 }
@@ -90,6 +92,12 @@ pub async fn run(
                 .map_err(|e| format!("key_id: {e}"))?;
             json!(client.revoke_key(id, &signed).await.map_err(api)?)
         }
+        Route::TrusteeGrant => {
+            let app: AppId = field(&signed.payload, "app_id")?
+                .parse()
+                .map_err(|e| format!("app_id: {e}"))?;
+            client.put_trustee_grant(app, &signed).await.map_err(api)?
+        }
     };
     Ok(reply)
 }
@@ -131,6 +139,10 @@ mod tests {
         let parse = |s| Route::from_str(s, false);
         assert_eq!(parse("put-secret").unwrap().context(), context::SECRET);
         assert_eq!(parse("revoke-key").unwrap().context(), context::CONTROL);
+        assert_eq!(
+            parse("trustee-grant").unwrap().context(),
+            context::TRUSTEE_GRANT
+        );
         assert!(parse("secrets").is_err());
     }
 }

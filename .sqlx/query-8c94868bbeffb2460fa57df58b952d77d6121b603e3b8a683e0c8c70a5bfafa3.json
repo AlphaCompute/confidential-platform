@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select distinct r.compose_hash, a.mrconfigid from revisions r\n           join trustee_attestations a on a.revision = r.compose_hash\n           where r.revoked_at is null and r.app_id = any($1)\n           order by r.compose_hash",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "compose_hash",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "revisions",
+            "name": "compose_hash"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "mrconfigid",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "trustee_attestations",
+            "name": "mrconfigid"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "8c94868bbeffb2460fa57df58b952d77d6121b603e3b8a683e0c8c70a5bfafa3"
+}

@@ -17,6 +17,7 @@ alpha-channel = { path = "../../crates/alpha-channel" }
 alpha-client = { path = "../../crates/alpha-client" }
 alpha-core = { path = "../../crates/alpha-core" }
 alpha-crypto = { path = "../../crates/alpha-crypto" }
+alpha-trustee = { path = "../../crates/alpha-trustee" }
 alpha-tsm = { path = "../../crates/alpha-tsm" }
 axum = "0.8"
 base64 = "0.23"

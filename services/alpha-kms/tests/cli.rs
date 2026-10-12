@@ -137,7 +137,7 @@ async fn an_organization_registers_its_root_key_and_the_root_key_registers_a_sig
 }
 
 #[tokio::test]
-async fn call_signs_all_five_control_routes() {
+async fn call_signs_all_six_control_routes() {
     let Some(h) = wall_clock_harness().await else {
         return;
     };
@@ -231,6 +231,20 @@ async fn call_signs_all_five_control_routes() {
     .await
     .unwrap_err();
     assert!(err.contains("--value"), "{err}");
+    // Option B's grant: the path comes from the payload's app_id.
+    let reply = run(
+        Route::TrusteeGrant,
+        &admin,
+        json!({ "app_id": app_id, "resources": [{ "type": "secret", "tag": "api-key" }] }),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        reply["resources"],
+        json!([{ "type": "secret", "tag": "api-key" }])
+    );
+    assert_eq!(reply["receipt"]["document"]["route"], "trustee.grant");
     let err = run(Route::RegisterKey, &admin, json!({}), Some(b"x".to_vec()))
         .await
         .unwrap_err();

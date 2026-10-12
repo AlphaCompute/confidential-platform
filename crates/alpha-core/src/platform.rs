@@ -33,6 +33,83 @@ impl KmsRevisionKind {
     }
 }
 
+/// Option B (PRD-02 deliverable 26): the Trustee pods alpha-kms feeds, and what they may do.
+/// Absent, no Trustee pod gets anything from the KMS.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "TrusteeFields")]
+pub struct Trustee {
+    /// The Trustee pod builds: each the Revision v2 of a Trustee pod's init-data, which must also
+    /// be registered at the KMS like any App's.
+    pub revisions: Vec<TrusteeRevision>,
+    /// The DNS name workload pods reach Trustee's KBS under; the KBS's TLS leaf names it.
+    pub kbs_hostname: String,
+    /// How long a Trustee pod may act on the policy and reference values it last fetched from
+    /// the KMS, in seconds: at least a minute, at most an hour (the life of a leaf).
+    pub max_state_age_secs: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrusteeRevision {
+    pub compose_hash: ComposeHash,
+    pub build: String,
+    pub source_url: String,
+}
+
+/// The suffix a KBS name must end in until G0 settles which roots the guest trusts.
+pub const NON_PUBLIC_SUFFIX: &str = ".internal";
+
+/// The bounds of [`Trustee::max_state_age_secs`].
+pub const TRUSTEE_STATE_AGE_SECS: std::ops::RangeInclusive<u32> = 60..=3600;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrusteeFields {
+    revisions: Vec<TrusteeRevision>,
+    kbs_hostname: String,
+    max_state_age_secs: u32,
+}
+
+impl TryFrom<TrusteeFields> for Trustee {
+    type Error = String;
+
+    fn try_from(f: TrusteeFields) -> Result<Self, Self::Error> {
+        if !is_host(&f.kbs_hostname) {
+            return Err(format!(
+                "trustee.kbs_hostname {:?} is not a lowercase host",
+                f.kbs_hostname
+            ));
+        }
+        // ponytail: G0 — the guest's KBS client (kbs_protocol at guest-components d4dce5ce) adds
+        // the pinned certificate as a root without dropping its built-in roots, so a publicly
+        // trusted certificate for the KBS's name may pass too. Until G0 confirms the guest image's
+        // root set, the name must be one no public CA issues for.
+        if !f.kbs_hostname.ends_with(NON_PUBLIC_SUFFIX) {
+            return Err(format!(
+                "trustee.kbs_hostname {:?} is not under {NON_PUBLIC_SUFFIX} (G0: the guest's TLS roots)",
+                f.kbs_hostname
+            ));
+        }
+        if !TRUSTEE_STATE_AGE_SECS.contains(&f.max_state_age_secs) {
+            return Err(format!(
+                "trustee.max_state_age_secs {} is not between 60 and 3600",
+                f.max_state_age_secs
+            ));
+        }
+        Ok(Self {
+            revisions: f.revisions,
+            kbs_hostname: f.kbs_hostname,
+            max_state_age_secs: f.max_state_age_secs,
+        })
+    }
+}
+
+impl Trustee {
+    pub fn lists(&self, revision: ComposeHash) -> bool {
+        self.revisions.iter().any(|r| r.compose_hash == revision)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "SignerFields")]
 pub struct Signer {
@@ -226,6 +303,37 @@ mod tests {
 
     fn catalog_key(algorithm: &str, public_key: &str) -> Result<CatalogKey, serde_json::Error> {
         serde_json::from_value(json!({ "algorithm": algorithm, "public_key": public_key }))
+    }
+
+    #[test]
+    fn trustee_names_a_host_and_a_state_age_within_a_leaf() {
+        let trustee = |host: &str, age: u32| {
+            serde_json::from_value::<Trustee>(json!({
+                "revisions": [{ "compose_hash": format!("sha256:{}", "1".repeat(64)),
+                                "build": "trustee v0.21.0", "source_url": "https://example" }],
+                "kbs_hostname": host,
+                "max_state_age_secs": age,
+            }))
+        };
+        let ok = trustee("kbs.trustee.internal", 300).unwrap();
+        assert!(ok.lists(format!("sha256:{}", "1".repeat(64)).parse().unwrap()));
+        assert!(!ok.lists(format!("sha256:{}", "2".repeat(64)).parse().unwrap()));
+        assert!(trustee("kbs.trustee.internal", 60).is_ok());
+        assert!(trustee("kbs.trustee.internal", 3600).is_ok());
+        for (host, age) in [
+            ("KBS.internal", 300),
+            ("https://kbs.internal", 300),
+            ("kbs.internal:8443", 300),
+            ("kbs.example", 300),
+            ("kbs.internal.example", 300),
+            ("kbs.internal", 59),
+            ("kbs.internal", 3601),
+        ] {
+            assert!(trustee(host, age).is_err(), "{host} {age}");
+        }
+        let mut extra = serde_json::to_value(&ok).unwrap();
+        extra["policy"] = json!("allow");
+        assert!(serde_json::from_value::<Trustee>(extra).is_err());
     }
 
     #[test]

@@ -111,6 +111,39 @@ pub fn issue_leaf(
         .to_vec())
 }
 
+/// A one-hour TLS server leaf from `ca` over a foreign SPKI naming one DNS name and nothing
+/// else: server authentication only, so it is never an Instance's or a node's client identity,
+/// and no Instance leaf (URI SANs only) passes a client's check of this name.
+pub fn issue_server_leaf(
+    ca_key: &KeyPair,
+    ca_cert_der: &[u8],
+    spki_der: &[u8],
+    dns_name: &str,
+    now: SystemTime,
+) -> Result<Vec<u8>, ApiError> {
+    let spki = SubjectPublicKeyInfo::from_der(spki_der)
+        .map_err(|e| ApiError::malformed(format!("server key: {e}")))?;
+    let issuer = Issuer::from_ca_cert_der(&ca_cert_der.into(), ca_key)
+        .map_err(|e| ApiError::internal(format!("ca certificate: {e}")))?;
+    let mut params = CertificateParams::default();
+    params.distinguished_name = DistinguishedName::new();
+    params.subject_alt_names = vec![SanType::DnsName(
+        Ia5String::try_from(dns_name).map_err(|e| ApiError::internal(format!("san: {e}")))?,
+    )];
+    params.is_ca = IsCa::ExplicitNoCa;
+    params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    params.use_authority_key_identifier_extension = true;
+    params.not_before = now.into();
+    params.not_after = later(now, LEAF_TTL)?.into();
+    params.serial_number = Some(serial()?);
+    Ok(params
+        .signed_by(&spki, &issuer)
+        .map_err(|e| ApiError::internal(format!("leaf: {e}")))?
+        .der()
+        .to_vec())
+}
+
 pub fn instance_sans(
     org_id: OrgId,
     app_id: AppId,
@@ -181,6 +214,7 @@ pub fn parse_instance_sans(sans: &[String]) -> Result<InstanceIdentity, ApiError
 #[cfg(test)]
 mod tests {
     use rcgen::PublicKeyData;
+    use rustls::client::danger::ServerCertVerifier;
 
     use super::*;
 
@@ -233,6 +267,49 @@ mod tests {
             "cert_invalid"
         );
         assert!(parse_instance_sans(&node_sans(hash)).is_err());
+
+        let server = issue_server_leaf(
+            &ca_key,
+            &ca_cert,
+            &runtime.subject_public_key_info(),
+            "kbs.trustee.example",
+            now,
+        )
+        .unwrap();
+        let server_chain = vec![CertificateDer::from(server.clone())];
+        let e = verify_to_ca(verifier.as_ref(), &server_chain, now).unwrap_err();
+        assert_eq!(
+            e.code, "cert_invalid",
+            "a server leaf is no client identity"
+        );
+        assert!(uri_sans(&server).unwrap().is_empty());
+        let mut roots = RootCertStore::empty();
+        roots.add(CertificateDer::from(ca_cert.clone())).unwrap();
+        let server_verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
+            .build()
+            .unwrap();
+        let name = |n: &str| rustls::pki_types::ServerName::try_from(n.to_owned()).unwrap();
+        let at = UnixTime::since_unix_epoch(
+            (now + Duration::from_secs(60))
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap(),
+        );
+        assert!(
+            server_verifier
+                .verify_server_cert(&server_chain[0], &[], &name("kbs.trustee.example"), &[], at)
+                .is_ok()
+        );
+        assert!(
+            server_verifier
+                .verify_server_cert(&server_chain[0], &[], &name("kms.example"), &[], at)
+                .is_err()
+        );
+        // An Instance's leaf from the same CA names no host, so it never passes for the KBS.
+        assert!(
+            server_verifier
+                .verify_server_cert(&chain[0], &[], &name("kbs.trustee.example"), &[], at)
+                .is_err()
+        );
         assert!(parse_instance_sans(&[sans[0].clone()]).is_err());
     }
 }

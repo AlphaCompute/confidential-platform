@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select issued_at from trustee_grants where app_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "issued_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "trustee_grants",
+            "name": "issued_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "1eedea6f744c4801a488473785ca90b7bdd07c45527a23903033e22fee9f2ac3"
+}

@@ -1,4 +1,4 @@
-//! The key broker: six tables, fourteen routes on one TLS port, one process-wide state.
+//! The key broker: eight tables, nineteen routes on one TLS port, one process-wide state.
 
 #![cfg_attr(
     test,
@@ -22,6 +22,7 @@ pub mod keys;
 pub mod node;
 pub mod platform;
 pub mod tls;
+pub mod trustee;
 pub mod webauthn;
 
 use std::sync::Arc;
@@ -375,6 +376,17 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/v1/secrets/{name}", put(control::put_secret))
         .route("/v1/keys", post(control::register_key))
         .route("/v1/keys/{id}/revoke", post(control::revoke_key))
+        .route(
+            "/v1/trustee/grants/{app_id}",
+            put(control::put_trustee_grant),
+        )
+        .route(
+            "/v1/trustee/attestations",
+            post(trustee::register_attestation),
+        )
+        .route("/v1/trustee/releases", post(trustee::release))
+        .route("/v1/trustee/state", get(trustee::state))
+        .route("/v1/trustee/kbs-leaf", post(trustee::kbs_leaf))
         .route("/v1/node/evidence", get(node::evidence))
         .route("/v1/node/bootstrap", post(node::bootstrap))
         .route("/v1/node/unseal", post(node::unseal))

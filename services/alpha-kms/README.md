@@ -1,12 +1,14 @@
 # alpha-kms
 
-The key broker of the trust plane: six tables, fourteen `/v1` routes on one TLS port (`:8443`, TLS 1.3, `X25519MLKEM768`), plus `GET /healthz` (process only) and `GET /ready` (database checked, `{"sealed": …}`).
+The key broker of the trust plane: eight tables, nineteen `/v1` routes on one TLS port (`:8443`, TLS 1.3, `X25519MLKEM768`), plus `GET /healthz` (process only) and `GET /ready` (database checked, `{"sealed": …}`).
 
 The Instance API is `POST /v1/attest/nonce`, `POST /v1/attest`, and two routes that need the Instance's leaf as a client certificate: `GET /v1/secrets/{name}` and `POST /v1/keys/derive`. The last answers `{"key"}`, 32 bytes derived from the organization's `org_key` and the leaf's App id for the requested `purpose`, the same for every Revision of the App; it is how an App holds a key no person ever sees, and nothing but an attested Instance reaches it.
 
 `POST /v1/channel` answers an inner-channel handshake with the node's leaf and a ticket, and `PUT /v1/secrets/{name}` then takes the value either as `value` or as `sealed: {ticket, frame}`, whose plaintext begins with the signing digest of the put's payload, so a relay sees only ciphertext; any node of the deployment opens the ticket within ten minutes.
 
 Control bodies are signed `ed25519` or `webauthn-es256`, a passkey's WebAuthn assertion over the same signing digest, accepted only on the origins and `rp_id` of the current platform document's `signer` and refused everywhere, stored signatures included, when the document has none; a passkey can be an organization's root key.
+
+Five routes serve Option B's Trustee pods (`docs/trustee.md`): `PUT /v1/trustee/grants/{app_id}`, a Control mutation signed under `alphacompute/trustee-grant/v1` by which a tenant opts an App's resources in; and, over mTLS with the leaf of a Trustee pod whose Revision the platform document's `trustee.revisions` lists, `POST /v1/trustee/attestations` (a KBS attestation, admitted only if the KMS's own rules admit the pod), `POST /v1/trustee/releases` (one resource for one admitted pod, audited with its Revision), `GET /v1/trustee/state` (the KBS resource policy, the Attestation Service's policies and the RVPS reference values, generated now) and `POST /v1/trustee/kbs-leaf` (the KBS's TLS leaf for `trustee.kbs_hostname`).
 
 ## Configuration (environment only)
 
@@ -35,6 +37,8 @@ The image is `images/kms/Dockerfile` (`alpha-kms`, or `alpha-kms-dev` with `--bu
 `tests/kata.rs`, on the same database, covers Kata confidential pods (`docs/kata-attestation.md`) over synthetic quotes: Revision v2 registration, a GPU pod's and a CPU pod's leaf naming their Revision v2, evidence v2 through the route reaching DCAP, and an audit row for an unregistered or revoked Revision v2, a GPU backend the node does not run or that refuses, and a failed TD or GPU check. `tests/malicious_host.rs` is the malicious-host core suite (`docs/kata-attestation.md`): every case a hostile host can try on a Kata pod's attestation, each refused with its named reason and audit row; CI runs it as its own step.
 
 `tests/kata_node.rs`, on the same database, covers a KMS node on Kata over synthetic quotes: its identity from CPU-class init-data, its evidence v2 served by `GET /v1/node/evidence`, genesis by three custodians through `alpha-cli`'s `verify_kata_node` and `bootstrap`, a second Kata node unsealed by two of them, a Kata node joining a prototype node (and refused, with its audit row, when its build is unlisted, listed as a prototype build, its quote binds another X-Wing key or no join was requested), evidence v2 through the join route reaching DCAP, and clients pinning the CA with both builds' Revisions.
+
+`tests/trustee.rs`, on the same database, covers Option B's Trustee routes with a Trustee pod attested over a synthetic quote: a granted resource of every type released to an admitted pod and audited with its Revision, and each refusal with its audit row (an unregistered, foreign or revoked Revision, a non-affirming or expired token, an App that has not opted in, another App's resource, a Trustee App, stale state, an unlisted or delisted Trustee build, a tampered grant).
 
 `tests/cli.rs` drives `alpha-cli`'s library functions against the same in-process node (`crates/alpha-cli/README.md`).
 

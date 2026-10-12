@@ -297,6 +297,7 @@ dependencies = [
  "alpha-cpu-app",
  "alpha-crypto",
  "alpha-runtime",
+ "alpha-trustee",
  "alpha-tsm",
  "axum",
  "base64 0.23.1",
@@ -345,6 +346,48 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-rustls",
+ "zeroize",
+]
+
+[[package]]
+name = "alpha-trustee"
+version = "0.1.0"
+dependencies = [
+ "alpha-attest",
+ "alpha-core",
+ "base64 0.23.1",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+]
+
+[[package]]
+name = "alpha-trustee-feed"
+version = "0.1.0"
+dependencies = [
+ "alpha-client",
+ "alpha-core",
+ "alpha-runtime",
+ "alpha-trustee",
+ "alpha-tsm",
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "ed25519-dalek 3.0.0",
+ "getrandom 0.4.3",
+ "hex",
+ "p256 0.14.0",
+ "parking_lot",
+ "pem 3.0.6",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "tokio",
  "zeroize",
 ]
 

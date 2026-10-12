@@ -393,6 +393,7 @@ pub struct JoinReply {
     pub ca_cert: String,
 }
 
+#[derive(Clone)]
 pub struct Client {
     endpoints: Vec<String>,
     http: reqwest::Client,
@@ -482,6 +483,20 @@ impl Client {
         self.request(Method::POST, path, Some(&json!(body))).await
     }
 
+    /// A route whose bodies another crate defines (`alpha_trustee::wire`).
+    pub async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, Error> {
+        self.request(Method::GET, path, None).await
+    }
+
+    /// See [`Self::get_json`].
+    pub async fn post_json<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &impl Serialize,
+    ) -> Result<T, Error> {
+        self.post(path, body).await
+    }
+
     pub async fn ready(&self) -> Result<Ready, Error> {
         self.request(Method::GET, "/ready", None).await
     }
@@ -525,6 +540,16 @@ impl Client {
         self.request(
             Method::PUT,
             &format!("/v1/secrets/{name}"),
+            Some(&json!(body)),
+        )
+        .await
+    }
+
+    /// Option B's opt-in: the App's resources Trustee may release (`docs/trustee.md`).
+    pub async fn put_trustee_grant(&self, app_id: AppId, body: &Signed) -> Result<Value, Error> {
+        self.request(
+            Method::PUT,
+            &format!("/v1/trustee/grants/{app_id}"),
             Some(&json!(body)),
         )
         .await

@@ -433,7 +433,7 @@ pub async fn get_secret(
     result.map(Json)
 }
 
-async fn get_secret_inner(
+pub(crate) async fn get_secret_inner(
     node: &Node,
     tenant_kek_root: &[u8; 32],
     identity: &certs::InstanceIdentity,
@@ -569,7 +569,7 @@ pub async fn derive_key(
     result.map(Json)
 }
 
-async fn derive_key_inner(
+pub(crate) async fn derive_key_inner(
     node: &Node,
     tenant_kek_root: &[u8; 32],
     identity: &certs::InstanceIdentity,
