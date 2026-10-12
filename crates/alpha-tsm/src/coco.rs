@@ -200,6 +200,10 @@ fn tsm_report(entry: &Path, report_data: &[u8; 64]) -> Result<Vec<u8>, Error> {
     Ok(quote)
 }
 
+/// 4 MiB is well above any real NVIDIA quote bundle but prevents a buggy or compromised
+/// in-pod process from causing OOM via an unbounded loopback response.
+const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+
 fn tcp_get(addr: &str, path: &str) -> Result<Vec<u8>, Error> {
     let io = |what: String| move |e| Error::Io(what.clone(), e);
     let mut stream = TcpStream::connect(addr).map_err(io(format!("connect {addr}")))?;
@@ -213,6 +217,7 @@ fn tcp_get(addr: &str, path: &str) -> Result<Vec<u8>, Error> {
         .map_err(io("write to the attestation agent".into()))?;
     let mut response = Vec::new();
     stream
+        .take(MAX_RESPONSE_BYTES)
         .read_to_end(&mut response)
         .map_err(io("read from the attestation agent".into()))?;
     http_body(&response)
