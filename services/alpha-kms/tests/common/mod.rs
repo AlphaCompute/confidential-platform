@@ -219,12 +219,24 @@ pub async fn start_node(
     release_key: &SigningKey,
     clock: Clock,
 ) -> (Arc<Node>, String, tokio::sync::oneshot::Sender<()>) {
+    start_node_with_root_dsm(pool, release_url, release_key, clock, None).await
+}
+
+/// [`start_node`] whose measured configuration names our own DSM for the root co-factor.
+pub async fn start_node_with_root_dsm(
+    pool: PgPool,
+    release_url: &str,
+    release_key: &SigningKey,
+    clock: Clock,
+    root_dsm: Option<alpha_dsm::OwnDsmConfig>,
+) -> (Arc<Node>, String, tokio::sync::oneshot::Sender<()>) {
     let event_log: Vec<EventLogEntry> =
         serde_json::from_slice(&read(KEYED, "event_log.json")).unwrap();
     let collateral = serde_json::from_slice(&read(KEYED, "collateral.json")).unwrap();
     let config = Config {
         kms_endpoints: vec![],
         platform_document_url: release_url.to_owned(),
+        root_dsm,
         #[cfg(feature = "dev-root")]
         dev_root_kek: None,
     };
@@ -265,9 +277,27 @@ pub async fn harness() -> Option<Harness> {
 }
 
 pub async fn harness_with_clock(clock: Clock) -> Option<Harness> {
+    harness_inner(clock, None).await
+}
+
+/// A harness whose node holds its root's co-factor in our own DSM, bootstrapped with its API key.
+pub async fn harness_with_root_dsm(
+    root_dsm: alpha_dsm::OwnDsmConfig,
+    api_key: zeroize::Zeroizing<String>,
+) -> Option<Harness> {
+    let now = captured_at(KEYED);
+    harness_inner(Arc::new(move || now), Some((root_dsm, api_key))).await
+}
+
+async fn harness_inner(
+    clock: Clock,
+    root_dsm: Option<(alpha_dsm::OwnDsmConfig, zeroize::Zeroizing<String>)>,
+) -> Option<Harness> {
     let pool = fresh_database().await?;
     let release = ReleaseServer::start(platform_document(KEYED)).await;
-    let (node, base, shutdown) = start_node(pool.clone(), &release.url, &release.key, clock).await;
+    let (config, api_key) = root_dsm.unzip();
+    let (node, base, shutdown) =
+        start_node_with_root_dsm(pool.clone(), &release.url, &release.key, clock, config).await;
     let custodians: Vec<PrivateKey> = (0..3).map(|_| PrivateKey::generate().unwrap()).collect();
     let dir = std::env::temp_dir().join(format!("alpha-harness-{}", Uuid::now_v7()));
     fs::create_dir_all(&dir).unwrap();
@@ -276,6 +306,7 @@ pub async fn harness_with_clock(clock: Clock) -> Option<Harness> {
         &spki_client(&base, &node),
         &identity,
         custodian_pubs(&custodians),
+        api_key,
         1,
         &dir,
     )

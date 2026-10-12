@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into root_cofactor (dsm_endpoint, dsm_key, api_key_wrapped, cofactor)\n             values ($1, $2, $3, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Jsonb",
+        "Bytea",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8f2f4cac1d98aa96c5a52a0e598c1118f1e350f703d4131e390ccd9543b9514d"
+}

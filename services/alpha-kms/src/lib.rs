@@ -15,6 +15,7 @@ pub mod audit;
 pub mod body;
 pub mod certs;
 pub mod channel;
+pub mod cofactor;
 pub mod control;
 pub mod error;
 pub mod instance;
@@ -46,6 +47,8 @@ use crate::error::ApiError;
 pub struct Config {
     pub kms_endpoints: Vec<String>,
     pub platform_document_url: String,
+    /// Our own DSM holding the root KEK's co-factor (PRD-06 I3); see [`cofactor`].
+    pub root_dsm: Option<alpha_dsm::OwnDsmConfig>,
     #[cfg(feature = "dev-root")]
     pub dev_root_kek: Option<Zeroizing<[u8; 32]>>,
 }
@@ -63,6 +66,11 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .collect(),
             platform_document_url: env("ALPHACOMPUTE_PLATFORM_DOCUMENT_URL")?,
+            root_dsm: std::env::var(cofactor::ROOT_DSM_ENV)
+                .ok()
+                .map(|text| alpha_dsm::OwnDsmConfig::parse(&text, cofactor::ROOT_DSM_ENV))
+                .transpose()
+                .map_err(|e| e.to_string())?,
             #[cfg(feature = "dev-root")]
             dev_root_kek: std::env::var("ALPHACOMPUTE_KMS_DEV_ROOT_KEK")
                 .ok()

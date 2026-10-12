@@ -15,6 +15,7 @@ use alpha_crypto::{INFO_NODE_BOOTSTRAP, INFO_UNSEAL_SHARE, PublicKey, Sealed};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use alpha_channel::sha256_label;
 
@@ -151,15 +152,19 @@ pub async fn bootstrap(
     client: &Client,
     node: &NodeIdentity,
     custodians: [PublicKey; 3],
+    root_dsm_api_key: Option<Zeroizing<String>>,
     doc_version: u64,
     out_dir: &Path,
 ) -> Result<Value, String> {
-    let body = BootstrapBody { custodians };
+    let body = BootstrapBody {
+        custodians,
+        root_dsm_api_key,
+    };
     let body_hpke = alpha_crypto::seal(
         &node.xwing,
         INFO_NODE_BOOTSTRAP,
         &node.aad(),
-        &serde_json::to_vec(&body).map_err(|e| e.to_string())?,
+        &Zeroizing::new(serde_json::to_vec(&body).map_err(|e| e.to_string())?),
     )
     .map_err(|e| e.to_string())?;
     let reply = client
