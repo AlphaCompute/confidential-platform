@@ -101,7 +101,7 @@ async fn an_organization_reads_its_own_decisions_signed_by_the_kms() {
     assert!(actions.contains(&("secret.get", "ok")), "{actions:?}");
     assert!(actions.contains(&("secret.get", "denied")), "{actions:?}");
     assert!(actions.contains(&("key.derive", "ok")), "{actions:?}");
-    // Control calls are not decisions about Instances (QUESTION(PRD-06 Q1)).
+    // Control calls are not decisions about Instances (QUESTION(PRD-06 Q87)).
     assert!(!actions.iter().any(|(a, _)| a.starts_with("secret.put")));
     // The attest row carries the signed verifier claims of #90 and the evidence digest.
     let attest = decisions
