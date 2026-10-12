@@ -14,12 +14,17 @@ dcap-qvl = "=0.6.3"
 hex = { version = "0.4", features = ["serde"] }
 p384 = { version = "0.13", features = ["ecdsa"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+rustls-pki-types = { version = "1", features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
 thiserror = "2"
 tokio = { version = "1", features = ["time"] }
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["aws-lc-rs", "std"] }
+x509-parser = "0.18"
 
 [dev-dependencies]
+p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 chrono = { version = "0.4", default-features = false }
 tokio = { version = "1", features = ["macros", "rt"] }

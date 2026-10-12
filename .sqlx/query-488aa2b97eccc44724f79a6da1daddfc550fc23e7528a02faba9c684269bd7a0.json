@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update ccm_identities set revoked_at = now() where id = $1 returning revoked_at",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "revoked_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "ccm_identities",
+            "name": "revoked_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "488aa2b97eccc44724f79a6da1daddfc550fc23e7528a02faba9c684269bd7a0"
+}
