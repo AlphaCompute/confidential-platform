@@ -667,6 +667,7 @@ spec:
         if let (true, Some(path)) = (write, std::env::var_os("ALPHA_TEST_GENPOLICY")) {
             let genpolicy = policy::Genpolicy {
                 path: path.into(),
+                defaults: None,
                 ..policy::Genpolicy::pinned()
             };
             let input = render_for_genpolicy(&template, &env).unwrap();
