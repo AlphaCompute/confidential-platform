@@ -9,9 +9,9 @@
 //!  "service_principals": [{"id": "...", "name": "...", "roles": ["..."]}]}
 //! ```
 //!
-//! QUESTION(PRD-06 Q5), assumption `ccm-listing` (F3): what CCM lists and how. Once Fortanix
+//! QUESTION(PRD-06 Q81), assumption `ccm-listing` (F3): what CCM lists and how. Once Fortanix
 //! answers, this module reads CCM's own export or API, like [`super::dsm`].
-//! QUESTION(PRD-06 Q3), assumption `ccm-roles` (F3): the role names and which are policy rights.
+//! QUESTION(PRD-06 Q81), assumption `ccm-roles` (F3): the role names and which are policy rights.
 
 use serde::Deserialize;
 
@@ -100,7 +100,7 @@ pub fn parse_export(bytes: &[u8], source: String) -> Result<Listing, Error> {
 /// A live CCM read. Not implemented: it refuses, naming the question that blocks it.
 pub async fn fetch(_account: &ServiceAccount) -> Result<Vec<u8>, Error> {
     // TODO(draft): read CCM's users and API principals live once F3 names the API and a
-    // read-only role that may call it (QUESTION(PRD-06 Q5)).
+    // read-only role that may call it (QUESTION(PRD-06 Q81)).
     Err(Error::NotImplemented(
         "a live CCM read: CCM's listing API and a read-only role are Fortanix question F3; \
          use --ccm-listing with the customer's export"

@@ -54,16 +54,14 @@ pub struct Assumption {
     pub confirmed: bool,
 }
 
-// QUESTION(PRD-06 Q1): DSM role names and which of them are key-admin rights.
-// QUESTION(PRD-06 Q2): DSM App permission names and how each is classified.
-// QUESTION(PRD-06 Q3): CCM role names and which of them are policy rights.
-// QUESTION(PRD-06 Q4): DSM listing endpoints, paging, and the auditor login.
-// QUESTION(PRD-06 Q5): what CCM lists, and how.
+// QUESTION(PRD-06 Q80): DSM role and App permission names, and which are key-admin rights.
+// QUESTION(PRD-06 Q81): CCM role names, which are policy rights, and what CCM lists and how.
+// QUESTION(PRD-06 Q82): DSM listing endpoints, paging, and the auditor login.
 pub const ASSUMPTIONS: &[Assumption] = &[
     Assumption {
         id: "dsm-roles",
         question: "F3",
-        open_question: "Q1",
+        open_question: "Q80",
         text: "DSM user roles: ACCOUNTADMINISTRATOR and GROUPADMINISTRATOR administer keys; \
                ACCOUNTAUDITOR and GROUPAUDITOR only read; ACCOUNTMEMBER alone grants no key or \
                policy right. Custom roles (any other value) are unknown and count as admin.",
@@ -72,7 +70,7 @@ pub const ASSUMPTIONS: &[Assumption] = &[
     Assumption {
         id: "dsm-app-permissions",
         question: "F3",
-        open_question: "Q2",
+        open_question: "Q80",
         text: "DSM App group permissions: SIGN, VERIFY, ENCRYPT, DECRYPT, WRAPKEY, UNWRAPKEY, \
                DERIVEKEY, MACGENERATE, MACVERIFY, EXPORT, AGREEKEY, MASKDECRYPT and TRANSFORM \
                use or read keys; AUDIT only reads; MANAGE and every other value administer keys.",
@@ -81,7 +79,7 @@ pub const ASSUMPTIONS: &[Assumption] = &[
     Assumption {
         id: "dsm-listing",
         question: "F3",
-        open_question: "Q4",
+        open_question: "Q82",
         text: "GET /sys/v1/users, /sys/v1/apps and /sys/v1/groups, paged by limit and offset, \
                list every principal of the selected account with account_role and groups; an \
                ACCOUNTAUDITOR user may call them after POST /sys/v1/session/auth and \
@@ -91,7 +89,7 @@ pub const ASSUMPTIONS: &[Assumption] = &[
     Assumption {
         id: "ccm-roles",
         question: "F3",
-        open_question: "Q3",
+        open_question: "Q81",
         text: "CCM account roles: ACCOUNT_ADMINISTRATOR and ACCOUNT_MEMBER can change \
                attestation policy (approve builds, apps or nodes); READ_ONLY and \
                ACCOUNT_AUDITOR only read. Anything else is unknown and counts as admin.",
@@ -100,7 +98,7 @@ pub const ASSUMPTIONS: &[Assumption] = &[
     Assumption {
         id: "ccm-listing",
         question: "F3",
-        open_question: "Q5",
+        open_question: "Q81",
         text: "The customer can export every CCM user and API principal with its roles; this \
                draft reads that export in its own shape (alphacompute-ccm-listing/0) because \
                CCM's listing API is not known.",
@@ -257,7 +255,7 @@ pub struct Person {
 
 /// The roster `docs/separation-of-duties.md` keeps at `<roster location>`, in the shape this
 /// check reads.
-// QUESTION(PRD-06 Q9): this format is new; the roster's owner decides whether it is kept in it.
+// QUESTION(PRD-06 Q86): this format is new; the roster's owner decides whether it is kept in it.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Roster {
@@ -319,7 +317,7 @@ pub enum Purpose {
 }
 
 impl Purpose {
-    // QUESTION(PRD-06 Q8): the rights each recorded credential may hold. The node agents'
+    // QUESTION(PRD-06 Q85): the rights each recorded credential may hold. The node agents'
     // needs are F4; until it is answered they may hold nothing but read-only.
     fn allows(self, right: Right) -> bool {
         match self {

@@ -76,7 +76,7 @@ struct Export {
     groups: Vec<Group>,
 }
 
-/// QUESTION(PRD-06 Q1), assumption `dsm-roles` (F3).
+/// QUESTION(PRD-06 Q80), assumption `dsm-roles` (F3).
 fn user_right(role: &str) -> Right {
     match super::normalize(role).as_str() {
         "ACCOUNTADMINISTRATOR" | "GROUPADMINISTRATOR" => Right::Admin,
@@ -86,7 +86,7 @@ fn user_right(role: &str) -> Right {
     }
 }
 
-/// QUESTION(PRD-06 Q2), assumption `dsm-app-permissions` (F3).
+/// QUESTION(PRD-06 Q80), assumption `dsm-app-permissions` (F3).
 fn app_right(permission: &str) -> Right {
     match super::normalize(permission).as_str() {
         "SIGN" | "VERIFY" | "ENCRYPT" | "DECRYPT" | "WRAPKEY" | "UNWRAPKEY" | "DERIVEKEY"
@@ -285,9 +285,9 @@ async fn get_all(http: &reqwest::Client, url: &str, token: &str) -> Result<Vec<V
 /// Reads users, apps and groups live and returns them in the export's shape, so the same parser
 /// reads both and the bytes can be kept with the audit record.
 ///
-/// QUESTION(PRD-06 Q4), assumption `dsm-listing` (F3): the endpoints, the paging, and whether an
+/// QUESTION(PRD-06 Q82), assumption `dsm-listing` (F3): the endpoints, the paging, and whether an
 /// ACCOUNTAUDITOR login may list every principal.
-/// QUESTION(PRD-06 Q6): whether AlphaCompute should hold this login at all.
+/// QUESTION(PRD-06 Q83): whether AlphaCompute should hold this login at all.
 pub async fn fetch(
     account: &ServiceAccount,
     login: &AuditorLogin,

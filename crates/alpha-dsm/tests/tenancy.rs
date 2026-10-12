@@ -1,6 +1,6 @@
 //! The live DSM read of the tenancy check against a stand-in DSM that answers the endpoints
 //! assumed under `dsm-listing` (F3): an auditor login, account selection, paged listings, and
-//! the session ended afterwards. What a real DSM answers is PRD-06 Q4.
+//! the session ended afterwards. What a real DSM answers is PRD-06 Q82.
 
 #![allow(
     clippy::unwrap_used,
