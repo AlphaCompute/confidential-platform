@@ -1,4 +1,4 @@
-//! The key broker: six tables, fourteen routes on one TLS port, one process-wide state.
+//! The key broker: seven tables, seventeen routes on one TLS port, one process-wide state.
 
 #![cfg_attr(
     test,
@@ -13,6 +13,7 @@
 
 pub mod audit;
 pub mod body;
+pub mod ccm;
 pub mod certs;
 pub mod channel;
 pub mod control;
@@ -277,6 +278,7 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/ready", get(ready))
         .route("/v1/attest/nonce", post(instance::nonce))
         .route("/v1/attest", post(instance::attest))
+        .route("/v1/attest/ccm", post(ccm::attest_ccm))
         .route("/v1/secrets/{name}", get(instance::get_secret))
         .route("/v1/keys/derive", post(instance::derive_key))
         .route("/v1/channel", post(channel::handshake))
@@ -287,6 +289,11 @@ pub fn router(node: Arc<Node>) -> Router {
         )
         .route("/v1/secrets/{name}", put(control::put_secret))
         .route("/v1/keys", post(control::register_key))
+        .route("/v1/ccm-identities", post(control::register_ccm_identity))
+        .route(
+            "/v1/ccm-identities/{id}/revoke",
+            post(control::revoke_ccm_identity),
+        )
         .route("/v1/keys/{id}/revoke", post(control::revoke_key))
         .route("/v1/node/evidence", get(node::evidence))
         .route("/v1/node/bootstrap", post(node::bootstrap))

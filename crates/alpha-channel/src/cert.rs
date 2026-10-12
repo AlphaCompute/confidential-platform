@@ -4,7 +4,7 @@
 
 use std::time::SystemTime;
 
-use alpha_core::{AppId, ComposeHash, OrgId};
+use alpha_core::{AppId, CcmIdentityId, ComposeHash, OrgId};
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
 use p256::pkcs8::DecodePublicKey;
@@ -104,6 +104,67 @@ pub fn parse_kms_sans(sans: &[String]) -> Result<ComposeHash, Error> {
         .strip_prefix("urn:alphacompute:revision:")
         .and_then(|s| s.parse().ok())
         .ok_or_else(not_node)
+}
+
+/// The scheme of a CCM-attested identity's first URI SAN (PRD-06 I5). It is not `alphacompute://`,
+/// so [`parse_instance_sans`] refuses the leaf and nothing that expects an Alpha Revision accepts it.
+pub const CCM_SAN_SCHEME: &str = "alphacompute-ccm://";
+/// The prefix of a CCM-attested identity's second URI SAN, before the zone's `sha256:<hex>`.
+pub const CCM_ZONE_SAN_PREFIX: &str = "urn:alphacompute:ccm-zone:";
+
+/// The identity a leaf for a Fortanix CCM-attested workload carries:
+/// `alphacompute-ccm://<org>/<ccm identity id>/<key sha256>` then
+/// `urn:alphacompute:ccm-zone:sha256:<hex>`. The organization allow-listed that CCM identity
+/// (`POST /v1/ccm-identities`); no Revision is named, because the KMS appraised no evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CcmSans {
+    pub org_id: OrgId,
+    pub ccm_identity_id: CcmIdentityId,
+    pub runtime_pubkey_sha256_hex: String,
+    pub zone_ca_spki_sha256: String,
+}
+
+pub fn ccm_sans(sans: &CcmSans) -> [String; 2] {
+    [
+        format!(
+            "{CCM_SAN_SCHEME}{}/{}/{}",
+            sans.org_id, sans.ccm_identity_id, sans.runtime_pubkey_sha256_hex
+        ),
+        format!("{CCM_ZONE_SAN_PREFIX}{}", sans.zone_ca_spki_sha256),
+    ]
+}
+
+/// A CCM-attested identity's leaf, for a service that has decided to accept one. Every other
+/// leaf, an Instance's included, is foreign here, as a CCM leaf is to [`parse_instance_sans`].
+pub fn parse_ccm_sans(sans: &[String]) -> Result<CcmSans, Error> {
+    let invalid = || Error::ForeignCertificate("certificate SANs are not a CCM identity's".into());
+    let [identity, zone] = sans else {
+        return Err(invalid());
+    };
+    let parts: Vec<&str> = identity
+        .strip_prefix(CCM_SAN_SCHEME)
+        .ok_or_else(invalid)?
+        .split('/')
+        .collect();
+    let [org, id, key] = parts[..] else {
+        return Err(invalid());
+    };
+    let zone = zone
+        .strip_prefix(CCM_ZONE_SAN_PREFIX)
+        .filter(|z| {
+            z.strip_prefix("sha256:")
+                .and_then(alpha_core::hex_bytes::<32>)
+                .is_some()
+        })
+        .ok_or_else(invalid)?;
+    Ok(CcmSans {
+        org_id: org.parse().map_err(|_| invalid())?,
+        ccm_identity_id: id.parse().map_err(|_| invalid())?,
+        runtime_pubkey_sha256_hex: alpha_core::hex_bytes::<32>(key)
+            .map(|_| key.to_owned())
+            .ok_or_else(invalid)?,
+        zone_ca_spki_sha256: zone.to_owned(),
+    })
 }
 
 /// One PEM `CERTIFICATE` block and nothing else.
@@ -216,6 +277,47 @@ mod tests {
                 "{sans:?}"
             );
         }
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+    fn ccm_sans_round_trip_and_are_never_an_instances() {
+        let key = "ab".repeat(32);
+        let sans = CcmSans {
+            org_id: ORG.parse().unwrap(),
+            ccm_identity_id: APP.parse().unwrap(),
+            runtime_pubkey_sha256_hex: key.clone(),
+            zone_ca_spki_sha256: format!("sha256:{}", "cd".repeat(32)),
+        };
+        let written = ccm_sans(&sans);
+        assert_eq!(written[0], format!("alphacompute-ccm://{ORG}/{APP}/{key}"));
+        assert_eq!(parse_ccm_sans(&written).unwrap(), sans);
+        // The two kinds of leaf never stand for each other.
+        assert_eq!(
+            parse_instance_sans(&written).unwrap_err().code(),
+            "foreign_certificate"
+        );
+        let instance = [format!("alphacompute://{ORG}/{APP}/{key}"), revision()];
+        assert!(parse_ccm_sans(&instance).is_err());
+        let node = [KMS_SAN.to_owned(), revision()];
+        assert!(parse_ccm_sans(&node).is_err());
+        for bad in [
+            [
+                written[0].clone(),
+                format!("{CCM_ZONE_SAN_PREFIX}sha256:abcd"),
+            ],
+            [written[0].clone(), revision()],
+            [
+                format!("alphacompute-ccm://{ORG}/{APP}"),
+                written[1].clone(),
+            ],
+            [
+                format!("alphacompute-ccm://{ORG}/{APP}/abcd"),
+                written[1].clone(),
+            ],
+        ] {
+            assert!(parse_ccm_sans(&bad).is_err(), "{bad:?}");
+        }
+        assert!(parse_ccm_sans(&written[..1]).is_err());
     }
 
     #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]

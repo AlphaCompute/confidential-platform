@@ -23,7 +23,7 @@ pub use compose::{
     ComposeHash, ParseComposeHashError, RegistrationError, check_registration, compose_hash,
     hex_bytes,
 };
-pub use id::{AppId, KeyId, OrgId, PrincipalId, RequestId, SecretId};
+pub use id::{AppId, CcmIdentityId, KeyId, OrgId, PrincipalId, RequestId, SecretId};
 pub use platform::{CatalogKey, KmsRevision, Signer};
 pub use signing::{context, jcs, parse, signing_digest};
 

@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select revoked_at from ccm_identities where id = $1 and org_id = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "revoked_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "ccm_identities",
+            "name": "revoked_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "7b5210888424119b8eaa9fa88d0cec566563464bdc159557c6d736b587ac35f8"
+}

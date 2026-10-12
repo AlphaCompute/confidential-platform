@@ -23,6 +23,10 @@ use crate::{
 /// `attestation_receipt`, over the attest request, the attestation result and the leaf.
 pub const ATTEST_ROUTE: &str = "attest";
 
+/// The route name a KMS signs a CCM attestation under: its `POST /v1/attest/ccm` reply's
+/// `attestation_receipt`, over the CCM attest request, the CCM attestation result and the leaf.
+pub const ATTEST_CCM_ROUTE: &str = "attest.ccm";
+
 /// `{document, signature, certificate_chain}`; the chain is the node's leaf only, because every
 /// verifier pins its own KMS CA.
 #[derive(Clone, Debug, Serialize, Deserialize)]

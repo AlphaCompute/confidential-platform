@@ -64,6 +64,7 @@ id!(AppId);
 id!(KeyId);
 id!(SecretId);
 id!(RequestId);
+id!(CcmIdentityId);
 
 #[cfg(test)]
 mod tests {
