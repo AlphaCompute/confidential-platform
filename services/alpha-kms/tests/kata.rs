@@ -1,4 +1,4 @@
-//! A Kata confidential pod's attestation (`kata-tdx/1`, PRD-02) against a real Postgres
+//! A Kata confidential pod's attestation (`kata-tdx/1`, PRD-02; `kata-snp/1` is `tests/snp.rs`) against a real Postgres
 //! (`DATABASE_URL`; skipped without it): Revision v2 registration, the leaf naming it, the GPU
 //! backends, and an audit row for every refusal. Pods attest over synthetic quotes (see
 //! `common::kata`); the route's DCAP step is checked for evidence v2 with a quote that fails it.
@@ -138,6 +138,8 @@ async fn evidence_v2_through_the_route_is_dcap_verified_and_audited() {
         "{reply}"
     );
     assert!(reply["error"]["message"].as_str().unwrap().contains("dcap"));
+    // SEV-SNP evidence goes to `kata-snp/1`, which this document (no `snp_policy`) refuses before
+    // any collateral is fetched; `tests/snp.rs` runs a real report through it.
     evidence["cpu"]["kind"] = json!("snp");
     let (status, reply) = h.post("/v1/attest", body(evidence.clone())).await;
     assert_eq!(
@@ -149,7 +151,7 @@ async fn evidence_v2_through_the_route_is_dcap_verified_and_audited() {
         reply["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("no kata-snp/1 profile")
+            .contains("the platform document has no snp_policy")
     );
     let rows = h.audit("attest").await;
     assert_eq!(rows.len(), 2);

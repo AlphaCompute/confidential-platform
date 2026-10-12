@@ -325,13 +325,18 @@ async fn an_unknown_runtime_class_or_a_policy_hash_mismatch_is_refused() {
         return;
     };
     let nonce = fresh_nonce(&s.h);
-    // A class no Revision v2 may name; and the CPU class claimed by the GPU pod to skip its GPU
-    // checks, which its NVIDIA guest's registers do not match.
+    // A class no Revision v2 may name; an SEV-SNP class claimed by a TD; and the CPU class claimed
+    // by the GPU pod to skip its GPU checks, which its NVIDIA guest's registers do not match.
     for (class, code, reason) in [
+        (
+            "kata-qemu-nvidia-gpu-sev",
+            "attestation_failed",
+            "runtime class \"kata-qemu-nvidia-gpu-sev\" is not supported".to_owned(),
+        ),
         (
             "kata-qemu-nvidia-gpu-snp",
             "attestation_failed",
-            "runtime class \"kata-qemu-nvidia-gpu-snp\" is not supported".to_owned(),
+            "runtime class kata-qemu-nvidia-gpu-snp does not run on Tdx".to_owned(),
         ),
         (
             CPU_RUNTIME_CLASS,

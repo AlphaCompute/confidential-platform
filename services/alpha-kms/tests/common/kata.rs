@@ -1,20 +1,26 @@
-//! A Kata confidential pod as the KMS sees it, over synthetic verified quotes: no B300 Kata capture
-//! exists before M1, so DCAP is exercised by the route with the real Phala captures and these pods
-//! go through `instance::attest_verified`, which runs every later step and writes the audit row. A
-//! pod is its init-data and Revision v2, the quote a TD running that init-data produces, one
-//! evidence entry per GPU, and [`FakeGpu`], a backend that reports what each entry says.
+//! A Kata confidential pod as the KMS sees it, over synthetic verified quotes and SNP reports: no
+//! B300 Kata capture exists before M1 and no SNP capture of ours at all, so DCAP is exercised by the
+//! route with the real Phala captures, the SNP report checks with virtee's real Milan report, and
+//! these pods go through `instance::attest_verified`, which runs every later step and writes the
+//! audit row. A pod is its init-data and Revision v2, the quote a TD (or the report an SNP guest)
+//! running that init-data produces, one evidence entry per GPU, and [`FakeGpu`], a backend that
+//! reports what each entry says.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use alpha_attest::gpu::ccm::FortanixCcm;
 use alpha_attest::gpu::{GpuFuture, gpu_nonce};
+use alpha_attest::snp::{SnpFindings, SnpTcb, VekKind};
 use alpha_attest::{
     AppraisalError, CpuEvidence, CpuKind, EVIDENCE_FORMAT_V2, EvidenceV2, GpuEvidence, GpuPolicy,
-    GpuVerdict, GpuVerifier, GpuVerifierKind, Measured, Measurement, VerifiedGpu, VerifiedQuote,
-    report_data,
+    GpuVerdict, GpuVerifier, GpuVerifierKind, Measured, Measurement, VerifiedCpu, VerifiedGpu,
+    VerifiedQuote, VerifiedReport, report_data,
 };
-use alpha_core::coco::{CPU_RUNTIME_CLASS, CocoRevision, GPU_RUNTIME_CLASS, InitData};
+use alpha_core::coco::{
+    CPU_RUNTIME_CLASS, CocoRevision, GPU_RUNTIME_CLASS, InitData, RuntimeClass,
+    SNP_CPU_RUNTIME_CLASS, SNP_GPU_RUNTIME_CLASS, Tee,
+};
 use alpha_core::{AppId, ComposeHash, KeyId, context};
 use alpha_kms::error::ApiError;
 use alpha_kms::instance::{self, AttestRequest};
@@ -25,7 +31,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{Harness, KEYED, b64, captured_at, harness_with, platform_document};
+use super::{Harness, KEYED, TEST_KDS, b64, captured_at, harness_with, platform_document, text};
 
 /// A baseline agent policy: exec and log reads denied.
 pub const POLICY: &str = "package agent_policy\ndefault ExecProcessRequest := false\ndefault ReadStreamRequest := false\n";
@@ -60,8 +66,42 @@ pub fn reference_value(name: &str, class: &str, registers: [Measurement; 4]) -> 
             "values": { "mrtd": mrtd, "rtmr0": rtmr0, "rtmr1": rtmr1, "rtmr2": rtmr2 } })
 }
 
+/// The launch measurement of each SNP runtime class's guest image, as [`kata_document`] lists it.
+pub fn snp_measurement(class: &str) -> Measurement {
+    if class == SNP_CPU_RUNTIME_CLASS {
+        m(21)
+    } else {
+        m(22)
+    }
+}
+
+/// A `kata-snp` reference value for `class`'s guest image.
+pub fn snp_reference_value(name: &str, class: &str, measurement: Measurement) -> Value {
+    json!({ "name": name, "kind": "kata-snp", "runtime_class": class,
+            "values": { "measurement": measurement } })
+}
+
+/// An `snp_policy` pinning AMD's Milan ARK and ASK as KDS serves them
+/// (`testdata/attest/snp-virtee-milan/cert_chain.pem`, ASK first), at the TCB of virtee's report,
+/// allowing the SMT its host ran with, with [`TEST_KDS`] as the KDS.
+pub fn snp_policy() -> Value {
+    let chain = text("snp-virtee-milan", "cert_chain.pem");
+    let end = "-----END CERTIFICATE-----";
+    let at = chain.find(end).unwrap() + end.len();
+    json!({
+        "products": { "Milan": {
+            "ark_pem": format!("{}\n", chain[at..].trim()),
+            "ask_pem": format!("{}\n", chain[..at].trim()),
+            "min_tcb": { "bootloader": 3, "tee": 0, "snp": 8, "microcode": 115 },
+        }},
+        "allow_smt": true,
+        "kds_url": TEST_KDS,
+    })
+}
+
 /// The keyed capture's platform document as `version`, with a `kata-tdx` reference value for each
-/// runtime class's guest and a `gpu_policy` allowing B300s that NRAS verifies.
+/// TDX runtime class's guest, a `kata-snp` one for each SNP class's, and a `gpu_policy` allowing
+/// B300s that NRAS verifies.
 pub fn kata_document(version: u64) -> Value {
     let mut doc = platform_document(KEYED);
     doc["version"] = json!(version);
@@ -76,6 +116,12 @@ pub fn kata_document(version: u64) -> Value {
         CPU_RUNTIME_CLASS,
         registers(CPU_RUNTIME_CLASS),
     ));
+    for (name, class) in [
+        ("kata-snp/cpu-4c-8g", SNP_CPU_RUNTIME_CLASS),
+        ("nvidia-snp/b300x8", SNP_GPU_RUNTIME_CLASS),
+    ] {
+        values.push(snp_reference_value(name, class, snp_measurement(class)));
+    }
     doc["gpu_policy"] = json!({ "allowed_models": ["B300"], "verifiers": ["nras"] });
     doc
 }
@@ -154,6 +200,28 @@ impl Pod {
         }
     }
 
+    /// A CPU-only pod of `app` on SEV-SNP.
+    pub fn snp_cpu(app: AppId) -> Self {
+        Self {
+            initdata: initdata(app, SNP_CPU_RUNTIME_CLASS, None, POLICY),
+            runtime_class: SNP_CPU_RUNTIME_CLASS.into(),
+            ..Self::cpu(app)
+        }
+    }
+
+    /// A pod of `app` on SEV-SNP with `count` B300s in CC mode.
+    pub fn snp_gpu(app: AppId, count: u32) -> Self {
+        Self {
+            initdata: initdata(app, SNP_GPU_RUNTIME_CLASS, Some(count), POLICY),
+            runtime_class: SNP_GPU_RUNTIME_CLASS.into(),
+            ..Self::gpu(app, count)
+        }
+    }
+
+    pub fn is_snp(&self) -> bool {
+        RuntimeClass::from_name(&self.runtime_class).map(RuntimeClass::tee) == Some(Tee::Snp)
+    }
+
     pub fn spki(&self) -> Vec<u8> {
         self.key
             .verifying_key()
@@ -185,9 +253,14 @@ impl Pod {
         EvidenceV2 {
             format: EVIDENCE_FORMAT_V2.into(),
             cpu: CpuEvidence {
-                kind: CpuKind::Tdx,
+                kind: if self.is_snp() {
+                    CpuKind::Snp
+                } else {
+                    CpuKind::Tdx
+                },
                 quote: b"synthetic quote".to_vec(),
                 event_log: Vec::new(),
+                vek: Vec::new(),
             },
             gpus: self
                 .gpus
@@ -231,6 +304,42 @@ impl Pod {
         Self::quote_of(&self.initdata, &self.runtime_class, self.report_data(nonce))
     }
 
+    /// The report an SNP guest booted from `class`'s guest with `initdata` produces over
+    /// `report_data`, as `snp::verify_report` returns it once its chain, CRL, TCB and policy pass.
+    pub fn report_of(initdata: &str, class: &str, report_data: [u8; 64]) -> VerifiedReport {
+        let host_data = InitData::parse(initdata.as_bytes()).unwrap().hostdata();
+        let measurement = snp_measurement(class);
+        VerifiedReport {
+            report_data,
+            measurement,
+            host_data,
+            findings: SnpFindings {
+                product: "Genoa".into(),
+                signing_key: VekKind::Vcek,
+                measurement,
+                host_data,
+                reported_tcb: SnpTcb {
+                    bootloader: 9,
+                    tee: 0,
+                    snp: 23,
+                    microcode: 72,
+                    fmc: None,
+                },
+                guest_policy: "0x30000".into(),
+                vmpl: 0,
+            },
+        }
+    }
+
+    /// What this pod's guest produces for `nonce`: a TDX quote or an SNP report, by its class.
+    pub fn verified(&self, nonce: &[u8; 32]) -> VerifiedCpu {
+        if self.is_snp() {
+            Self::report_of(&self.initdata, &self.runtime_class, self.report_data(nonce)).into()
+        } else {
+            self.quote(nonce).into()
+        }
+    }
+
     /// The request as `alpha-runtime` sends it (`alpha_client::AttestRequest`), as the KMS parses it.
     pub fn request(&self, nonce: &[u8; 32], evidence: EvidenceV2) -> AttestRequest {
         let wire = alpha_client::AttestRequest {
@@ -241,13 +350,14 @@ impl Pod {
         serde_json::from_value(serde_json::to_value(&wire).unwrap()).unwrap()
     }
 
-    /// Attests with a fresh nonce, this pod's evidence and the quote its TD produces.
+    /// Attests with a fresh nonce, this pod's evidence and the quote its TD (or the report its SNP
+    /// guest) produces.
     pub async fn attest(&self, h: &Harness) -> Result<Value, ApiError> {
         let nonce = fresh_nonce(h);
         attest(
             h,
             &self.request(&nonce, self.evidence(&nonce)),
-            self.quote(&nonce),
+            self.verified(&nonce),
         )
         .await
     }
@@ -274,9 +384,9 @@ pub fn fresh_nonce(h: &Harness) -> [u8; 32] {
 pub async fn attest(
     h: &Harness,
     request: &AttestRequest,
-    quote: VerifiedQuote,
+    verified: impl Into<VerifiedCpu>,
 ) -> Result<Value, ApiError> {
-    instance::attest_verified(&h.node, request, quote).await
+    instance::attest_verified(&h.node, request, verified).await
 }
 
 /// The leaf's URI SANs.
