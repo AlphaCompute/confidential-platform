@@ -398,6 +398,27 @@ async fn runtime_attests_with_the_captures_key_and_serves_the_three_routes() {
         json!({ "attested": true, "cert_not_after": rfc3339(h.now() + certs::LEAF_TTL) })
     );
 
+    // The evidence bundle (PRD-06 clear claims) verifies against the KMS CA alone and names
+    // alpha-kms's DCAP appraisal of the prototype CVM as the only verifier.
+    let (status, bundle) = socket.get("/v1/evidence-bundle").await;
+    assert_eq!(status, 200, "{bundle}");
+    let verified = alpha_client::attestation::verify_bundle(
+        &serde_json::to_vec(&bundle).unwrap(),
+        &h.ca_pem,
+        &[h.node.compose_hash],
+    )
+    .unwrap();
+    assert_eq!(verified.result.revision.compose_hash, hash);
+    assert_eq!(json!(verified.verifiers.attested_by), json!(["alpha"]));
+    assert_eq!(
+        json!(verified.verifiers.cpu),
+        json!([{ "verifier": "alpha-kms-dcap", "profile": "alphacompute-evidence/1" }])
+    );
+    assert_eq!(
+        identity["attestation_result"]["verifiers"],
+        json!(verified.verifiers)
+    );
+
     // Secrets over mTLS with the leaf, cached with it: a later put is not seen until renewal.
     let model_key = format!("/v1/secrets/{app}.model-key");
     let (status, secret) = socket.get(&model_key).await;

@@ -241,6 +241,31 @@ impl Pod {
         serde_json::from_value(serde_json::to_value(&wire).unwrap()).unwrap()
     }
 
+    /// The request as `alpha-runtime` serializes it, which its evidence bundle carries.
+    pub fn wire(&self, nonce: &[u8; 32]) -> Value {
+        serde_json::to_value(alpha_client::AttestRequest {
+            runtime_pubkey: b64(&self.spki()),
+            nonce: b64(nonce),
+            evidence: self.evidence(nonce).into(),
+        })
+        .unwrap()
+    }
+
+    /// Attests with a fresh nonce and returns the reply as an evidence bundle, as `alpha-runtime`
+    /// serves it.
+    pub async fn bundle(&self, h: &Harness) -> Value {
+        let nonce = fresh_nonce(h);
+        let wire = self.wire(&nonce);
+        let request = serde_json::from_value(wire.clone()).unwrap();
+        let reply = attest(h, &request, self.quote(&nonce)).await.unwrap();
+        json!({
+            "format": alpha_client::attestation::BUNDLE_FORMAT,
+            "request": wire,
+            "receipt": reply["attestation_receipt"],
+            "certificate_chain": reply["certificate_chain"],
+        })
+    }
+
     /// Attests with a fresh nonce, this pod's evidence and the quote its TD produces.
     pub async fn attest(&self, h: &Harness) -> Result<Value, ApiError> {
         let nonce = fresh_nonce(h);
@@ -307,14 +332,23 @@ pub async fn refused(h: &Harness, result: Result<Value, ApiError>, code: &str, r
 /// A GPU verifier backend standing in for NRAS: it reports every GPU as its report describes it,
 /// the nonce it is over included. NRAS also refuses a report over another nonce itself; this one
 /// does not, so the KMS's own checks are what refuse it.
-#[derive(Default)]
 pub struct FakeGpu {
+    kind: GpuVerifierKind,
     calls: AtomicUsize,
 }
 
 impl FakeGpu {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        Self::of(GpuVerifierKind::Nras)
+    }
+
+    /// The same stand-in as another backend kind; its token digest is `0xab` for NRAS and `0xcc`
+    /// for any other.
+    pub fn of(kind: GpuVerifierKind) -> Arc<Self> {
+        Arc::new(Self {
+            kind,
+            calls: AtomicUsize::new(0),
+        })
     }
 
     pub fn calls(&self) -> usize {
@@ -324,7 +358,7 @@ impl FakeGpu {
 
 impl GpuVerifier for FakeGpu {
     fn kind(&self) -> GpuVerifierKind {
-        GpuVerifierKind::Nras
+        self.kind
     }
 
     fn verify<'a>(
@@ -352,9 +386,14 @@ impl GpuVerifier for FakeGpu {
                     })
                 })
                 .collect::<Result<Vec<_>, AppraisalError>>()?;
+            let token = if self.kind == GpuVerifierKind::Nras {
+                0xab
+            } else {
+                0xcc
+            };
             Ok(GpuVerdict {
                 gpus,
-                token_sha256: [0xab; 32],
+                token_sha256: [token; 32],
             })
         })
     }

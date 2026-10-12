@@ -13,13 +13,17 @@
 
 mod common;
 
+use std::sync::Arc;
+
+use alpha_attest::{GpuVerifier, GpuVerifierKind, Party};
+use alpha_client::attestation::verify_bundle;
 use alpha_core::coco::{CPU_RUNTIME_CLASS, GPU_RUNTIME_CLASS};
 use alpha_core::{AppId, context};
-use alpha_kms::rfc3339;
+use alpha_kms::{certs, rfc3339};
 use common::kata::*;
 use common::*;
 use reqwest::StatusCode;
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 #[tokio::test]
@@ -266,4 +270,90 @@ async fn a_kata_pod_whose_revision_or_gpu_backends_do_not_pass_is_refused_and_au
         "revision is revoked",
     )
     .await;
+}
+
+/// PRD-06 clear claims: every leaf comes with the KMS's signed statement of which verifiers
+/// attested the workload, derived from its own appraisal, and an evidence bundle carrying it
+/// verifies offline against the pinned KMS CA and nothing else.
+#[tokio::test]
+async fn every_leaf_comes_with_a_signed_statement_of_the_verifiers_that_attested_it() {
+    let gpu = FakeGpu::new();
+    let ccm = FakeGpu::of(GpuVerifierKind::FortanixCcm);
+    let now = captured_at(KEYED);
+    let backends: Vec<Arc<dyn GpuVerifier>> = vec![gpu.clone(), ccm.clone()];
+    let Some(h) = harness_with(Arc::new(move || now), backends).await else {
+        return;
+    };
+    publish(&h, kata_document(2)).await;
+    let admin = h.register_key(&h.root, 33).await;
+    let pod = Pod::gpu(AppId::mint(), 8);
+    pod.register(&h, &admin).await;
+    let cpu = Pod::cpu(AppId::mint());
+    cpu.register(&h, &admin).await;
+    let kms = [h.node.compose_hash];
+
+    // NRAS alone: Alpha appraised the TD, NVIDIA's service vouched for the GPUs.
+    let bundle = pod.bundle(&h).await;
+    let verified = verify_bundle(&serde_json::to_vec(&bundle).unwrap(), &h.ca_pem, &kms).unwrap();
+    assert_eq!(
+        json!(verified.verifiers),
+        json!({
+            "format": "alphacompute-verifiers/1",
+            "attested_by": ["alpha", "nvidia"],
+            "cpu": [{ "verifier": "alpha-kms-dcap", "profile": "kata-tdx/1" }],
+            "gpu": [{ "verifier": "nras", "token_sha256": format!("sha256:{}", "ab".repeat(32)) }],
+        })
+    );
+    assert!(!verified.verifiers.attested_by(Party::Fortanix));
+    assert_eq!(verified.result.revision.compose_hash, pod.hash());
+    // The audit row records the same claims as the signed result.
+    let (_, outcome, details) = h.audit("attest").await.pop().unwrap();
+    assert_eq!(outcome, "ok");
+    assert_eq!(details["verifiers"], json!(verified.verifiers));
+
+    // A gpu_policy listing both backends: Fortanix CCM is named beside NVIDIA's.
+    let mut doc = kata_document(3);
+    doc["gpu_policy"]["verifiers"] = json!(["nras", "fortanix-ccm"]);
+    publish(&h, doc).await;
+    let both = pod.bundle(&h).await;
+    let verified = verify_bundle(&serde_json::to_vec(&both).unwrap(), &h.ca_pem, &kms).unwrap();
+    assert_eq!(
+        verified.verifiers.attested_by,
+        [Party::Alpha, Party::Nvidia, Party::Fortanix]
+    );
+    assert_eq!(
+        verified.verifiers.gpu[1].token_sha256,
+        format!("sha256:{}", "cc".repeat(32))
+    );
+    assert_eq!((gpu.calls(), ccm.calls()), (2, 1));
+
+    // A CPU pod: Alpha alone, and no GPU entry.
+    let alone = cpu.bundle(&h).await;
+    let verified = verify_bundle(&serde_json::to_vec(&alone).unwrap(), &h.ca_pem, &kms).unwrap();
+    assert_eq!(json!(verified.verifiers.attested_by), json!(["alpha"]));
+    assert!(verified.verifiers.gpu.is_empty());
+
+    // Nothing in a bundle can be changed without the check failing.
+    let refused = |bundle: &Value, ca: &str, kms: &[alpha_core::ComposeHash]| {
+        verify_bundle(&serde_json::to_vec(bundle).unwrap(), ca, kms)
+            .unwrap_err()
+            .to_string()
+    };
+    let mut claimed = bundle.clone();
+    claimed["receipt"]["document"]["response"]["attestation_result"]["verifiers"]["attested_by"] =
+        json!(["alpha", "fortanix"]);
+    assert!(refused(&claimed, &h.ca_pem, &kms).contains("does not verify"));
+    let mut other_evidence = bundle.clone();
+    other_evidence["request"] = alone["request"].clone();
+    assert!(refused(&other_evidence, &h.ca_pem, &kms).contains("another request"));
+    let mut other_leaf = bundle.clone();
+    other_leaf["certificate_chain"] = both["certificate_chain"].clone();
+    assert!(refused(&other_leaf, &h.ca_pem, &kms).contains("not the one the receipt names"));
+    let other_node = alpha_core::compose_hash("another KMS revision");
+    assert!(refused(&bundle, &h.ca_pem, &[other_node]).contains("not in the allowlist"));
+    let (_, other_ca) = certs::new_ca(h.now()).unwrap();
+    assert!(!refused(&bundle, &certs::pem(&other_ca), &kms).is_empty());
+    let mut unsigned = bundle.clone();
+    unsigned["receipt"] = Value::Null;
+    assert!(!refused(&unsigned, &h.ca_pem, &kms).is_empty());
 }

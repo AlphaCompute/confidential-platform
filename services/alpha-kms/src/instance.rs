@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alpha_attest::{
     AnyEvidence, Appraised, AttestationResult, CocoAppraised, RESULT_FORMAT, Revision, Verdict,
-    VerifiedQuote, appraise, kata, verify_quote,
+    VerifiedQuote, Verifiers, appraise, kata, verify_quote,
 };
 use alpha_client::DerivedKey;
 use alpha_client::tls::PeerCerts;
@@ -211,9 +211,13 @@ async fn attest_audited(
         .map_err(|e| ApiError::malformed(format!("evidence: {e}")))?;
     let evidence_sha256 = Sha256::digest(evidence_json).to_vec();
     let now = node.now();
-    let result = attest_inner(node, &spki, request, verified, now).await;
+    let result = match attest_inner(node, &spki, request, verified, now).await {
+        Ok((leaf_der, result)) => attestation_receipt(node, request, &leaf_der, &result, now)
+            .map(|receipt| (leaf_der, result, receipt)),
+        Err(e) => Err(e),
+    };
     let (outcome, details, org_id) = match &result {
-        Ok((_, result)) => (
+        Ok((_, result, _)) => (
             "ok",
             json!(result),
             Some(Uuid::from(result.revision.org_id)),
@@ -228,19 +232,56 @@ async fn attest_audited(
         object: result
             .as_ref()
             .ok()
-            .map(|(_, result)| format!("revision:{}", result.revision.compose_hash)),
+            .map(|(_, result, _)| format!("revision:{}", result.revision.compose_hash)),
         outcome,
         details,
         evidence_sha256: Some(evidence_sha256),
     }
     .insert(&node.pool)
     .await?;
-    let (leaf_der, result) = result?;
+    let (leaf_der, result, receipt) = result?;
     Ok(json!({
         "certificate_chain": [certs::pem(&leaf_der), node.intermediates()?.ca_pem()],
         "not_after": rfc3339(crate::later(now, certs::LEAF_TTL)?),
         "attestation_result": result,
+        "attestation_receipt": receipt,
     }))
+}
+
+/// The KMS's signature over this attestation: the request as the KMS parsed it, the result (with
+/// the verifiers that attested, PRD-06 clear claims) and the leaf it issued. Unlike the reply's
+/// `attestation_result`, it can be checked by anyone pinning the KMS CA, after the leaf expires.
+fn attestation_receipt(
+    node: &Node,
+    request: &AttestRequest,
+    leaf_der: &[u8],
+    result: &AttestationResult,
+    now: SystemTime,
+) -> Result<Value, ApiError> {
+    let request = json!({
+        "runtime_pubkey": request.runtime_pubkey,
+        "nonce": request.nonce,
+        "evidence": request.evidence,
+    });
+    let response = json!({
+        "attestation_result": result,
+        "certificate_sha256": format!("sha256:{}", hex::encode(Sha256::digest(leaf_der))),
+        "not_after": rfc3339(crate::later(now, certs::LEAF_TTL)?),
+    });
+    let leaf = certs::pem(&node.server_cert.leaf_der()?);
+    // Read after the node's leaf, so a renewal in between cannot put issued_at before its
+    // notBefore.
+    let issued_at = node.now();
+    let receipt = alpha_channel::receipt::issue(
+        &node.runtime_key,
+        leaf,
+        alpha_channel::receipt::ATTEST_ROUTE,
+        &request,
+        response,
+        issued_at,
+    )
+    .map_err(|e| ApiError::internal(format!("receipt: {e}")))?;
+    serde_json::to_value(receipt).map_err(|e| ApiError::internal(format!("receipt: {e}")))
 }
 
 /// The leaf's DER and the result behind it. A Kata pod's quote is DCAP-verified here unless the
@@ -318,6 +359,7 @@ async fn attest_inner(
         ),
         now,
     )?;
+    let verifiers = Verifiers::of(&appraised);
     let result = AttestationResult {
         format: RESULT_FORMAT.into(),
         verdict: Verdict::Verified,
@@ -335,6 +377,7 @@ async fn attest_inner(
         verified_at: rfc3339(now),
         policy_version: appraised.policy_version,
         coco: appraised.coco,
+        verifiers: Some(verifiers),
     };
     Ok((leaf_der, result))
 }

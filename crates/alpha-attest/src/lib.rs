@@ -18,6 +18,7 @@
 mod event_log;
 pub mod gpu;
 pub mod kata;
+pub mod verifiers;
 
 use std::fmt;
 use std::str::FromStr;
@@ -39,6 +40,7 @@ pub use gpu::{
     VerifiedGpu,
 };
 pub use kata::{AnyEvidence, CocoAppraised, CpuEvidence, CpuKind, EvidenceV2, appraise_any};
+pub use verifiers::{CpuVerifierKind, CpuVouch, Party, Verifiers};
 
 pub const EVIDENCE_FORMAT: &str = "alphacompute-evidence/1";
 pub const EVIDENCE_FORMAT_V2: &str = "alphacompute-evidence/2";
@@ -219,6 +221,10 @@ pub struct AttestationResult {
     /// The `kata-tdx/1` profile's findings: init-data, policy, runtime class and every GPU.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coco: Option<CocoAppraised>,
+    /// Which verifiers attested the workload (PRD-06 clear claims), from the KMS's own appraisal.
+    /// Absent only in a result from a KMS that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verifiers: Option<Verifiers>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
