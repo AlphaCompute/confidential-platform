@@ -133,7 +133,10 @@ pub fn outcome(prepared: &Prepared, status: reqwest::StatusCode, body: &Value) -
 
 /// Opens or finds every request of the batch, in order, and reports each; `true` when any failed.
 pub async fn prepare_all(shroud: &Shroud, batch: &Path) -> Result<(Value, bool), String> {
-    let http = reqwest::Client::new();
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("reqwest: {e}"))?;
     let mut lines = Vec::new();
     let mut failed = false;
     for (path, entry) in read_batch(batch)? {
