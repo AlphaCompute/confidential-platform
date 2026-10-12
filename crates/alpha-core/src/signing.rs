@@ -18,6 +18,8 @@ pub mod context {
     pub const CONNECTOR_WRITE: &str = "alphacompute/connector-write/v1";
     pub const KMS_RECEIPT: &str = "alphacompute/kms-receipt/v1";
     pub const CATALOG: &str = "alphacompute/catalog/v1";
+    /// An organization asking the KMS for its own decisions (PRD-06, evidence to the customer).
+    pub const DECISIONS_EXPORT: &str = "alphacompute/decisions-export/v1";
 }
 
 pub fn jcs(document: &Value) -> serde_json::Result<Vec<u8>> {
