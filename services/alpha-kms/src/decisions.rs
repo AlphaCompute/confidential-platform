@@ -15,10 +15,10 @@
 //! What the export cannot prove yet:
 //! - TODO(draft): completeness. The receipt proves the KMS returned these rows, not that it
 //!   returned every row; that needs the hash-chained audit log (confidential-platform #95) and a
-//!   chain head in the receipt. QUESTION(PRD-06 Q3).
+//!   chain head in the receipt. QUESTION(PRD-06 Q89).
 //! - TODO(draft): refusals the KMS could not attribute. A failed attestation, or a refused
 //!   Control call, is recorded with no organization (the KMS never learned whose it was), so it is
-//!   not in any organization's export. QUESTION(PRD-06 Q4).
+//!   not in any organization's export. QUESTION(PRD-06 Q89).
 
 use std::sync::Arc;
 
@@ -72,7 +72,7 @@ async fn export_inner(node: &Node, body: &Signed, request: &Value) -> Result<Val
         return Err(ApiError::malformed(format!("limit: 1 to {MAX_ROWS}")));
     }
     let at = within_window(p.issued_at, node.now_utc())?;
-    // QUESTION(PRD-06 Q2): any active key of the organization may read its decisions. A
+    // QUESTION(PRD-06 Q88): any active key of the organization may read its decisions. A
     // read-only auditor key kind (so a customer's auditor holds no key that can register a
     // Revision or put a Secret) is not built.
     let chain = authorize(node, &keys, context::DECISIONS_EXPORT, body, at).await?;
@@ -81,7 +81,7 @@ async fn export_inner(node: &Node, body: &Signed, request: &Value) -> Result<Val
         .limit
         .checked_add(1)
         .ok_or_else(|| ApiError::malformed("limit"))?;
-    // QUESTION(PRD-06 Q1): which actions are "decisions". Today: the Instance API's three, and
+    // QUESTION(PRD-06 Q87): which actions are "decisions". Today: the Instance API's three, and
     // earlier exports. The organization's own Control calls are in the audit log too and could
     // be added.
     let rows = sqlx::query!(
