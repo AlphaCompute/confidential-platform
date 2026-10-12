@@ -912,6 +912,7 @@ mod tests {
                 .and(std::env::var_os("ALPHA_TEST_GENPOLICY"))
                 .map(|path| policy::Genpolicy {
                     path: path.into(),
+                    defaults: None,
                     ..policy::Genpolicy::pinned()
                 });
             match live {
