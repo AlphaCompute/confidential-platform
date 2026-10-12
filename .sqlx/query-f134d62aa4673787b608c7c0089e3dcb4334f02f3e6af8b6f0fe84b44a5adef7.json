@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update revisions set app_index = $2, org_index = $3, sealed = $4,\n               app_id = null, org_id = null, compose = null, created_by_key = null,\n               signature = null, revoked_at = null\n             where compose_hash = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Bytea",
+        "Bytea",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f134d62aa4673787b608c7c0089e3dcb4334f02f3e6af8b6f0fe84b44a5adef7"
+}

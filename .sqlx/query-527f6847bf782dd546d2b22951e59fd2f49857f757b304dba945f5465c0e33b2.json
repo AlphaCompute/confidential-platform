@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select id from principal_keys where registered_by_key is null",
+  "query": "select id from principal_keys where anchor_check is not null",
   "describe": {
     "columns": [
       {
@@ -22,5 +22,5 @@
       false
     ]
   },
-  "hash": "0ffaa610a40ef3f0fcd900223af518950bd01ebff3fc5b91b5df7cf06f7f9437"
+  "hash": "527f6847bf782dd546d2b22951e59fd2f49857f757b304dba945f5465c0e33b2"
 }

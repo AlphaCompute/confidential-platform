@@ -20,7 +20,7 @@ use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, KeyInit, Mac};
 use p256::pkcs8::DecodePublicKey;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -31,7 +31,7 @@ use crate::body::Body;
 use crate::control::SecretPayload;
 use crate::error::ApiError;
 use crate::keys::{self, SignatureObject};
-use crate::{CollateralSource, Node, certs, rfc3339};
+use crate::{CollateralSource, Intermediates, Node, certs, rfc3339, store};
 
 pub const NONCE_MAX_AGE: Duration = Duration::from_secs(300);
 
@@ -109,7 +109,8 @@ pub async fn collateral(node: &Node, quote: &[u8]) -> Result<alpha_attest::Colla
     })
 }
 
-/// A `revisions` row with what the checks need.
+/// A `revisions` row with what the checks need: the row's sealed fields.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RevisionRow {
     pub app_id: Uuid,
     pub org_id: Uuid,
@@ -120,25 +121,11 @@ pub struct RevisionRow {
     pub revoked_at: Option<DateTime<Utc>>,
 }
 
-pub async fn load_revision(
-    exec: impl sqlx::PgExecutor<'_>,
-    compose_hash: ComposeHash,
-) -> Result<Option<RevisionRow>, ApiError> {
-    Ok(sqlx::query_as!(
-        RevisionRow,
-        "select app_id, org_id, compose, created_by_key, signature, created_at, revoked_at
-         from revisions where compose_hash = $1",
-        compose_hash.as_bytes().as_slice()
-    )
-    .fetch_optional(exec)
-    .await?)
-}
-
 /// The last appraisal step, on every attestation and every Instance call: the Revision's signature and
 /// the signer's chain, from the row as it is now.
 pub async fn verify_revision(
     exec: impl sqlx::PgExecutor<'_> + Copy,
-    tenant_kek_root: &[u8; 32],
+    keys: &Intermediates,
     compose_hash: ComposeHash,
     revision: &RevisionRow,
     signer: Option<&Signer>,
@@ -161,7 +148,7 @@ pub async fn verify_revision(
     let document = json!({ "app_id": revision.app_id, "compose": revision.compose });
     let chain = keys::verify_signed(
         exec,
-        tenant_kek_root,
+        keys,
         &signature,
         context::REVISION,
         &document,
@@ -220,7 +207,7 @@ async fn attest_audited(
         ),
         Err(e) => (e.outcome(), e.details(), None),
     };
-    Audit {
+    node.audit(Audit {
         actor_kind: "instance",
         actor: &actor,
         action: "attest",
@@ -232,8 +219,7 @@ async fn attest_audited(
         outcome,
         details,
         evidence_sha256: Some(evidence_sha256),
-    }
-    .insert(&node.pool)
+    })
     .await?;
     let (leaf_der, result) = result?;
     Ok(json!({
@@ -290,12 +276,12 @@ async fn attest_inner(
         }
     };
     let keys = node.intermediates()?;
-    let revision = load_revision(&node.pool, appraised.compose_hash)
+    let revision = store::load_revision(&node.pool, &keys.metadata, appraised.compose_hash)
         .await?
         .ok_or_else(|| unregistered(&appraised))?;
     verify_revision(
         &node.pool,
-        &keys.tenant_kek_root,
+        &keys,
         appraised.compose_hash,
         &revision,
         doc.signer.as_ref(),
@@ -413,12 +399,12 @@ pub async fn get_secret(
     let verifier = certs::ca_verifier(&keys.ca_cert_der)?;
     let sans = certs::verify_to_ca(verifier.as_ref(), &peer.0, node.now())?;
     let identity = certs::parse_instance_sans(&sans)?;
-    let result = get_secret_inner(&node, &keys.tenant_kek_root, &identity, &name).await;
+    let result = get_secret_inner(&node, &keys, &identity, &name).await;
     let (outcome, details) = match &result {
         Ok(_) => ("ok", json!({})),
         Err(e) => (e.outcome(), e.details()),
     };
-    Audit {
+    node.audit(Audit {
         actor_kind: "instance",
         actor: &identity.runtime_pubkey_sha256_hex,
         action: "secret.get",
@@ -427,44 +413,34 @@ pub async fn get_secret(
         outcome,
         details,
         evidence_sha256: None,
-    }
-    .insert(&node.pool)
+    })
     .await?;
     result.map(Json)
 }
 
 async fn get_secret_inner(
     node: &Node,
-    tenant_kek_root: &[u8; 32],
+    keys: &Intermediates,
     identity: &certs::InstanceIdentity,
     name: &str,
 ) -> Result<Value, ApiError> {
     let doc = node.platform_document();
     let signer = doc.as_deref().and_then(|d| d.signer.as_ref());
-    let revision = load_revision(&node.pool, identity.compose_hash)
+    let revision = store::load_revision(&node.pool, &keys.metadata, identity.compose_hash)
         .await?
         .filter(|r| {
             r.org_id == Uuid::from(identity.org_id) && r.app_id == Uuid::from(identity.app_id)
         })
         .ok_or_else(|| ApiError::not_found("no such revision"))?;
-    verify_revision(
-        &node.pool,
-        tenant_kek_root,
-        identity.compose_hash,
-        &revision,
-        signer,
-    )
-    .await?;
-    let secret = sqlx::query!(
-        "select id, ciphertext, content_sha256, document, signed_by_key, signature
-         from secrets where org_id = $1 and name = $2 and $3 = any(app_ids)",
-        Uuid::from(identity.org_id),
-        name,
-        Uuid::from(identity.app_id),
-    )
-    .fetch_optional(&node.pool)
-    .await?
-    .ok_or_else(|| ApiError::not_found("no such secret for this app"))?;
+    verify_revision(&node.pool, keys, identity.compose_hash, &revision, signer).await?;
+    let store::SecretRow {
+        id,
+        ciphertext,
+        record: secret,
+    } = store::load_secret(&node.pool, &keys.metadata, identity.org_id.into(), name)
+        .await?
+        .filter(|s| s.record.app_ids.contains(&Uuid::from(identity.app_id)))
+        .ok_or_else(|| ApiError::not_found("no such secret for this app"))?;
     let signature: SignatureObject = serde_json::from_value(secret.signature)
         .map_err(|_| ApiError::signature_invalid("secret signature object"))?;
     if signature.key_id.map(Uuid::from) != Some(secret.signed_by_key) {
@@ -485,7 +461,7 @@ async fn get_secret_inner(
     }
     let chain = keys::verify_signed(
         &node.pool,
-        tenant_kek_root,
+        keys,
         &signature,
         context::SECRET,
         &secret.document,
@@ -498,8 +474,8 @@ async fn get_secret_inner(
             "secret signer is not of its organization",
         ));
     }
-    let org_key = keys::org_key(tenant_kek_root, identity.org_id, &chain.anchor_spki)?;
-    let value = keys::aead_open(&org_key, secret.id.as_bytes(), &secret.ciphertext)
+    let org_key = keys::org_key(&keys.tenant_kek_root, identity.org_id, &chain.anchor_spki)?;
+    let value = keys::aead_open(&org_key, id.as_bytes(), &ciphertext)
         .ok_or_else(|| ApiError::internal("secret does not decrypt under org_key"))?;
     Ok(json!({
         "value": BASE64_URL_SAFE_NO_PAD.encode(&*value),
@@ -536,10 +512,7 @@ pub async fn derive_key(
     let (actor, org_id, result) = match identity {
         Ok(identity) => {
             let result = match request {
-                Ok(request) => {
-                    derive_key_inner(&node, &keys.tenant_kek_root, &identity, &request.purpose)
-                        .await
-                }
+                Ok(request) => derive_key_inner(&node, &keys, &identity, &request.purpose).await,
                 Err(e) => Err(e),
             };
             (
@@ -554,7 +527,7 @@ pub async fn derive_key(
         Ok(_) => ("ok", json!({})),
         Err(e) => (e.outcome(), e.details()),
     };
-    Audit {
+    node.audit(Audit {
         actor_kind: "instance",
         actor: &actor,
         action: "key.derive",
@@ -563,15 +536,14 @@ pub async fn derive_key(
         outcome,
         details,
         evidence_sha256: None,
-    }
-    .insert(&node.pool)
+    })
     .await?;
     result.map(Json)
 }
 
 async fn derive_key_inner(
     node: &Node,
-    tenant_kek_root: &[u8; 32],
+    keys: &Intermediates,
     identity: &certs::InstanceIdentity,
     purpose: &str,
 ) -> Result<DerivedKey, ApiError> {
@@ -581,7 +553,7 @@ async fn derive_key_inner(
         ));
     }
     let doc = node.platform_document();
-    let revision = load_revision(&node.pool, identity.compose_hash)
+    let revision = store::load_revision(&node.pool, &keys.metadata, identity.compose_hash)
         .await?
         .filter(|r| {
             r.org_id == Uuid::from(identity.org_id) && r.app_id == Uuid::from(identity.app_id)
@@ -589,13 +561,13 @@ async fn derive_key_inner(
         .ok_or_else(|| ApiError::not_found("no such revision"))?;
     let chain = verify_revision(
         &node.pool,
-        tenant_kek_root,
+        keys,
         identity.compose_hash,
         &revision,
         doc.as_deref().and_then(|d| d.signer.as_ref()),
     )
     .await?;
-    let org_key = keys::org_key(tenant_kek_root, identity.org_id, &chain.anchor_spki)?;
+    let org_key = keys::org_key(&keys.tenant_kek_root, identity.org_id, &chain.anchor_spki)?;
     let key = keys::app_key(&org_key, identity.app_id, purpose)?;
     Ok(DerivedKey {
         key: Zeroizing::new(BASE64_URL_SAFE_NO_PAD.encode(key.as_slice())),

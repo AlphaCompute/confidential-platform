@@ -154,12 +154,12 @@ async fn evidence_v2_through_the_route_is_dcap_verified_and_audited() {
     let rows = h.audit("attest").await;
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|(_, outcome, _)| outcome == "denied"));
-    let with_evidence: i64 = sqlx::query_scalar(
-        "select count(*) from audit_log where action = 'attest' and evidence_sha256 is not null",
-    )
-    .fetch_one(&h.pool)
-    .await
-    .unwrap();
+    let with_evidence = h
+        .audit_rows()
+        .await
+        .into_iter()
+        .filter(|r| r.entry.action == "attest" && r.entry.evidence_sha256.is_some())
+        .count();
     assert_eq!(with_evidence, 2);
 
     evidence["format"] = json!("alphacompute-evidence/3");

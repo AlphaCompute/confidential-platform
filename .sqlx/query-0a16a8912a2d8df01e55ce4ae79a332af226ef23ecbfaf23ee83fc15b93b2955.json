@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update principal_keys set org_index = $2, public_key_index = $3, sealed = $4,\n               org_id = null, principal_id = null, public_key = null, document = null,\n               registered_by_key = null, signature = null, revoked_at = null, revocation_reason = null\n             where id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bytea",
+        "Bytea",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0a16a8912a2d8df01e55ce4ae79a332af226ef23ecbfaf23ee83fc15b93b2955"
+}

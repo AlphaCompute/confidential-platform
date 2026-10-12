@@ -195,13 +195,14 @@ async fn call_signs_all_five_control_routes() {
     .unwrap();
     assert_eq!(reply["compose_hash"], expected["compose_hash"]);
     assert_eq!(reply["receipt"]["document"]["route"], "revision.register");
-    let stored: String = sqlx::query_scalar!(
-        "select compose from revisions where app_id = $1",
-        Uuid::from(app_id)
-    )
-    .fetch_one(&h.pool)
-    .await
-    .unwrap();
+    let stored = h
+        .revisions()
+        .await
+        .into_iter()
+        .find(|(_, r)| r.app_id == Uuid::from(app_id))
+        .unwrap()
+        .1
+        .compose;
     assert_eq!(
         stored,
         fs::read_to_string(testdata().join("manifest/01-canonical/app-compose.json")).unwrap()
@@ -318,13 +319,14 @@ async fn deploy_register_only_registers_the_generated_compose() {
         reply.get("deploy").is_none(),
         "register-only stops before shroud-go"
     );
-    let stored: String = sqlx::query_scalar!(
-        "select compose from revisions where app_id = $1",
-        Uuid::from(spec.app_id)
-    )
-    .fetch_one(&h.pool)
-    .await
-    .unwrap();
+    let stored = h
+        .revisions()
+        .await
+        .into_iter()
+        .find(|(_, r)| r.app_id == Uuid::from(spec.app_id))
+        .unwrap()
+        .1
+        .compose;
     assert_eq!(
         stored,
         fs::read_to_string(vector.join("app-compose.json")).unwrap()
@@ -388,7 +390,7 @@ async fn bootstrap_once_never_again_then_unseal_the_second_node() {
         json!(sign::ca_spki_sha256(&h.ca_pem).unwrap().unwrap())
     );
     let root_id: Uuid =
-        sqlx::query_scalar!("select id from principal_keys where registered_by_key is null")
+        sqlx::query_scalar!("select id from principal_keys where anchor_check is not null")
             .fetch_one(&h.pool)
             .await
             .unwrap();
