@@ -12,6 +12,9 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 
+/// Every line `log!` wrote, from every test in this process.
+pub(crate) static LOGGED: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+
 #[derive(Clone)]
 pub(crate) struct ReportBehavior {
     pub status: StatusCode,
@@ -34,6 +37,7 @@ pub(crate) fn test_state(
 ) -> Arc<crate::AppState> {
     let upstream = crate::Upstream::new(&config).unwrap();
     Arc::new(crate::AppState {
+        metrics: crate::metrics::Metrics::new(&config),
         config,
         secrets: parking_lot::RwLock::new(crate::Secrets {
             provider_key: zeroize::Zeroizing::new(provider_key.to_string()),
@@ -69,6 +73,7 @@ pub(crate) fn test_config(upstream_url: &str, models: &[&str]) -> crate::Config 
             judge_models: vec!["guard".to_string()],
             allow: crate::guard::Allow::default(),
         },
+        metrics_port: None,
     }
 }
 

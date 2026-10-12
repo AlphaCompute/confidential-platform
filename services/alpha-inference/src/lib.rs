@@ -10,6 +10,10 @@
 //! Whatever the model, a member's whole prompt is judged by `alpha-guard` before it reaches an
 //! upstream and the completion is judged before it is released (`guard`); only the judge's own
 //! calls, under their own bearer, are exempt.
+//!
+//! Every model's check is run again in the background before it expires (`keep_warm`), and
+//! members' completions are measured per upstream without their text (`metrics`) against the
+//! SLOs of `slo`, which `bench` also measures from outside.
 
 #![cfg_attr(
     test,
@@ -22,8 +26,19 @@
     )
 )]
 
+/// Every line this service logs goes through here, so tests can read what was logged. Lines carry
+/// fixed words, codes, numbers and measured values only, never conversation text.
+macro_rules! log {
+    ($($arg:tt)*) => {
+        $crate::log_line(format!($($arg)*))
+    };
+}
+
+pub mod bench;
 pub mod guard;
+pub mod metrics;
 pub mod own;
+pub mod slo;
 pub mod upstream;
 
 #[cfg(test)]
@@ -31,7 +46,7 @@ mod test_support;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, State};
@@ -45,7 +60,19 @@ use zeroize::Zeroizing;
 
 pub use upstream::Upstream;
 
+pub(crate) fn log_line(line: String) {
+    eprintln!("alpha-inference: {line}");
+    #[cfg(test)]
+    test_support::LOGGED.lock().push(line);
+}
+
+/// The members' TLS port.
+pub const TLS_PORT: u16 = 8443;
 const COMPLETIONS_BODY_LIMIT: usize = 16 * 1024 * 1024;
+/// Every model's upstream is checked again this often in the background, well inside the
+/// 60-second trust of a check, so a member's request finds a current check (and, for our own
+/// servers, an open pinned connection) instead of waiting for one.
+pub const KEEP_WARM_INTERVAL: Duration = Duration::from_secs(30);
 /// A completion, from connecting to the last byte of its body, gets this long on either kind
 /// of upstream; a stuck upstream then answers `502 upstream` instead of holding a task forever.
 pub const COMPLETION_TIMEOUT: Duration = Duration::from_secs(600);
@@ -68,6 +95,9 @@ pub struct Config {
     pub model_servers: BTreeMap<String, own::ModelServer>,
     /// The judge every member's turn and completion goes through.
     pub guard: guard::GuardConfig,
+    /// `METRICS_PORT`: where `/metrics` is served in plain HTTP, apart from the members' TLS
+    /// port; unset, nowhere.
+    pub metrics_port: Option<u16>,
 }
 
 impl Config {
@@ -128,6 +158,20 @@ impl Config {
             },
         };
         let guard = guard::GuardConfig::build(&get, &models)?;
+        let metrics_port = match get("METRICS_PORT") {
+            None => None,
+            Some(raw) => Some(
+                raw.parse::<std::num::NonZeroU16>()
+                    .ok()
+                    .map(std::num::NonZeroU16::get)
+                    .filter(|port| *port != TLS_PORT)
+                    .ok_or_else(|| {
+                        Error::internal(format!(
+                            "METRICS_PORT must be a port from 1 to 65535 other than {TLS_PORT}"
+                        ))
+                    })?,
+            ),
+        };
         Ok(Config {
             upstream_url: upstream_url.trim_end_matches('/').to_owned(),
             models,
@@ -135,6 +179,7 @@ impl Config {
             upstream_policy,
             model_servers,
             guard,
+            metrics_port,
         })
     }
 
@@ -189,6 +234,7 @@ pub struct AppState {
     /// Our own model servers, pinned by the KMS CA and each model's Revisions.
     pub own: own::Servers,
     pub guard: guard::Guard,
+    pub metrics: metrics::Metrics,
 }
 
 /// Every error this service answers with, OpenAI-shaped on the wire. Messages never carry a
@@ -220,6 +266,12 @@ pub enum Error {
 impl Error {
     pub fn internal(message: impl Into<String>) -> Self {
         Error::Internal(message.into())
+    }
+
+    /// The status and the fixed `code` this error answers with.
+    pub fn status_and_code(&self) -> (StatusCode, &'static str) {
+        let (status, _, code) = self.parts();
+        (status, code)
     }
 
     fn parts(&self) -> (StatusCode, &'static str, &'static str) {
@@ -471,30 +523,78 @@ async fn chat_completions(
             }
             relay(send(&state, &model, body).await?)
         }
+        // The judge's own calls are not observed: they are moderation, already inside the
+        // latency of the member's request they judge.
         AuthedCaller::Member => {
-            let input = state.guard.check_input(&model, &parsed).await?;
-            let upstream_response = send(&state, &model, body).await?;
-            let (status, content_type, held) = hold(upstream_response).await?;
-            // An upstream refusal carries no completion, and its body is text nobody judged: the
-            // member gets its status with a fixed error instead.
-            if !status.is_success() {
-                return Err(Error::UpstreamRefused(status));
-            }
-            state.guard.check_output(&model, &input, &held).await?;
-            Response::builder()
-                .status(status)
-                .header(header::CONTENT_TYPE, content_type)
-                .body(axum::body::Body::from(held))
-                .map_err(|e| Error::internal(format!("response: {e}")))
+            let started = Instant::now();
+            let mut usage = metrics::Usage::default();
+            let answer = member_completion(&state, &model, &parsed, body, &mut usage).await;
+            let (status, error) = match &answer {
+                Ok(response) => (response.status(), None),
+                Err(e) => {
+                    let (status, code) = e.status_and_code();
+                    (status, Some(code))
+                }
+            };
+            state.metrics.observe(
+                &model,
+                &metrics::Observation {
+                    status,
+                    error,
+                    elapsed: started.elapsed(),
+                    usage,
+                },
+            );
+            answer
         }
     }
 }
 
+/// A member's completion: the prompt judged, the upstream's answer held and judged, then
+/// released whole. `usage` is filled in once the upstream answered 2xx, whatever the judge says.
+async fn member_completion(
+    state: &AppState,
+    model: &str,
+    parsed: &Value,
+    body: Bytes,
+    usage: &mut metrics::Usage,
+) -> Result<Response, Error> {
+    let input = state.guard.check_input(model, parsed).await?;
+    let streamed = parsed.get("stream").and_then(Value::as_bool) == Some(true);
+    let upstream_started = Instant::now();
+    let upstream_response = send(state, model, body).await?;
+    let held = hold(upstream_response, streamed).await?;
+    // An upstream refusal carries no completion, and its body is text nobody judged: the
+    // member gets its status with a fixed error instead.
+    if !held.status.is_success() {
+        return Err(Error::UpstreamRefused(held.status));
+    }
+    *usage = match &held.meter {
+        Some(meter) => metrics::Usage::streamed(upstream_started, held.done, meter),
+        None => metrics::Usage::whole(&held.body),
+    };
+    state.guard.check_output(model, &input, &held.body).await?;
+    Response::builder()
+        .status(held.status)
+        .header(header::CONTENT_TYPE, held.content_type)
+        .body(axum::body::Body::from(held.body))
+        .map_err(|e| Error::internal(format!("response: {e}")))
+}
+
+/// An upstream's whole answer.
+struct Held {
+    status: StatusCode,
+    content_type: header::HeaderValue,
+    body: Bytes,
+    /// When its last byte arrived.
+    done: Instant,
+    /// For a streamed completion: what its chunks said about timing, read as they arrived.
+    meter: Option<metrics::SseMeter>,
+}
+
 /// The upstream's whole answer, held so it can be judged before any byte is released. Streams
 /// are held too: within one completion there is no streaming under moderation.
-async fn hold(
-    upstream_response: reqwest::Response,
-) -> Result<(StatusCode, header::HeaderValue, Bytes), Error> {
+async fn hold(upstream_response: reqwest::Response, streamed: bool) -> Result<Held, Error> {
     let status = StatusCode::from_u16(upstream_response.status().as_u16())
         .unwrap_or(StatusCode::BAD_GATEWAY);
     let content_type = upstream_response
@@ -502,6 +602,7 @@ async fn hold(
         .get(header::CONTENT_TYPE)
         .cloned()
         .unwrap_or_else(|| header::HeaderValue::from_static("text/event-stream"));
+    let mut meter = streamed.then(metrics::SseMeter::default);
     let mut held: Vec<u8> = Vec::new();
     let mut upstream_response = upstream_response;
     while let Some(chunk) = upstream_response
@@ -512,9 +613,22 @@ async fn hold(
         if held.len().saturating_add(chunk.len()) > COMPLETION_HOLD_LIMIT {
             return Err(Error::ContentTooLarge);
         }
+        if let Some(meter) = &mut meter {
+            meter.feed(&chunk, Instant::now());
+        }
         held.extend_from_slice(&chunk);
     }
-    Ok((status, content_type, Bytes::from(held)))
+    let done = Instant::now();
+    if let Some(meter) = &mut meter {
+        meter.finish(done);
+    }
+    Ok(Held {
+        status,
+        content_type,
+        body: Bytes::from(held),
+        done,
+        meter,
+    })
 }
 
 /// Forwards `body` for an allowlisted `model` over its verified upstream, the upstream's own
@@ -553,8 +667,55 @@ async fn send(state: &AppState, model: &str, body: Bytes) -> Result<reqwest::Res
     }
 }
 
+/// Checks every model's upstream again now, concurrently. A request meanwhile goes on using the
+/// check this one replaces, so it never waits for it; a refusal replaces a passing check as it
+/// would inline.
+pub async fn keep_warm(state: &Arc<AppState>) {
+    let mut checks = tokio::task::JoinSet::new();
+    for model in state.config.models.clone() {
+        let state = state.clone();
+        checks.spawn(async move {
+            if state.own.serves(&model) {
+                if let Ok(bearer) = model_server_bearer(&state, &model) {
+                    let _ = state.own.refresh(&model, bearer.as_str()).await;
+                }
+            } else {
+                let _ = state.upstream.refresh(&model).await;
+            }
+        });
+    }
+    while checks.join_next().await.is_some() {}
+}
+
+/// [`keep_warm`] at once, then every [`KEEP_WARM_INTERVAL`].
+pub async fn keep_warm_forever(state: Arc<AppState>) {
+    loop {
+        keep_warm(&state).await;
+        tokio::time::sleep(KEEP_WARM_INTERVAL).await;
+    }
+}
+
 async fn healthz() -> StatusCode {
     StatusCode::OK
+}
+
+async fn metrics_text(State(state): State<Arc<AppState>>) -> Response {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        metrics::render(&state),
+    )
+        .into_response()
+}
+
+/// `/metrics` alone, for the plain-HTTP listener on `METRICS_PORT`: no route of the members'
+/// TLS port is reachable through it.
+pub fn metrics_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/metrics", get(metrics_text))
+        .with_state(state)
 }
 
 async fn ready(State(state): State<Arc<AppState>>) -> StatusCode {
@@ -654,6 +815,22 @@ mod tests {
         assert!(err.to_string().contains("UPSTREAM_POLICY"), "{err}");
     }
 
+    #[test]
+    fn metrics_port_is_optional_and_never_the_members_port() {
+        assert_eq!(Config::build(valid_env).unwrap().metrics_port, None);
+        assert_eq!(
+            Config::build(with_override("METRICS_PORT", "9464"))
+                .unwrap()
+                .metrics_port,
+            Some(9464)
+        );
+        for bad in ["8443", "0", "70000", "metrics"] {
+            let leaked: &'static str = Box::leak(bad.to_owned().into_boxed_str());
+            let err = Config::build(with_override("METRICS_PORT", leaked)).unwrap_err();
+            assert!(err.to_string().contains("METRICS_PORT"), "{bad}: {err}");
+        }
+    }
+
     fn own_servers_json(models: &[&str]) -> String {
         let entries: Vec<String> = models
             .iter()
@@ -749,6 +926,7 @@ mod tests {
             upstream: Upstream::new(&state.config).unwrap(),
             own: servers,
             guard: guard::Guard::fixed(Ok(()), Ok(())),
+            metrics: metrics::Metrics::new(&state.config),
         });
         let app = router(state);
 
@@ -776,6 +954,7 @@ mod tests {
         let config = test_config(base, &["m1", "guard"]);
         Arc::new(AppState {
             upstream: Upstream::new(&config).unwrap(),
+            metrics: metrics::Metrics::new(&config),
             config,
             secrets: parking_lot::RwLock::new(Secrets {
                 provider_key: Zeroizing::new("provider-key".into()),

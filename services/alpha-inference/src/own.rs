@@ -26,6 +26,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
+use crate::metrics::CheckStats;
 use crate::upstream::Clock;
 use crate::{COMPLETION_TIMEOUT, Error};
 
@@ -104,6 +105,9 @@ pub enum Reason {
     NotServed,
 }
 
+/// Every [`Reason::code`].
+pub const REASON_CODES: &[&str] = &["handshake", "status", "not_served"];
+
 impl Reason {
     pub fn code(self) -> &'static str {
         match self {
@@ -126,6 +130,7 @@ struct Server {
     client: parking_lot::RwLock<reqwest::Client>,
     /// The single flight for this model's check, as in `upstream`.
     slot: Mutex<Option<Checked>>,
+    stats: CheckStats,
 }
 
 /// The pinned clients for our own model servers, one per model.
@@ -222,6 +227,7 @@ impl Servers {
                         revisions: server.revisions.clone(),
                         client: parking_lot::RwLock::new(client),
                         slot: Mutex::new(None),
+                        stats: CheckStats::new(REASON_CODES),
                     },
                 ))
             })
@@ -263,17 +269,45 @@ impl Servers {
             return checked.outcome;
         }
         let outcome = Self::check(server, model, bearer).await;
-        if let Err(reason) = &outcome {
-            eprintln!(
-                "alpha-inference: model server for {model} not verified: {}",
-                reason.code()
-            );
-        }
         *guard = Some(Checked { at: now, outcome });
         outcome
     }
 
+    /// Checks `model`'s server again now without holding up requests, which go on using the
+    /// last check until this one replaces it (unless a newer one already did).
+    pub async fn refresh(&self, model: &str, bearer: &str) -> Result<(), Reason> {
+        let Some(server) = self.servers.get(model) else {
+            return Err(Reason::NotServed);
+        };
+        let now = (self.now)();
+        let outcome = Self::check(server, model, bearer).await;
+        let mut guard = server.slot.lock().await;
+        if guard.as_ref().is_none_or(|checked| checked.at <= now) {
+            *guard = Some(Checked { at: now, outcome });
+        }
+        outcome
+    }
+
+    /// Each model's attestation-check counts.
+    pub fn check_stats(&self) -> impl Iterator<Item = (&str, &CheckStats)> {
+        self.servers
+            .iter()
+            .map(|(model, server)| (model.as_str(), &server.stats))
+    }
+
     async fn check(server: &Server, model: &str, bearer: &str) -> Result<(), Reason> {
+        let started = std::time::Instant::now();
+        let outcome = Self::check_once(server, model, bearer).await;
+        server
+            .stats
+            .record(started.elapsed(), outcome.err().map(Reason::code));
+        if let Err(reason) = &outcome {
+            log!("model server for {model} not verified: {}", reason.code());
+        }
+        outcome
+    }
+
+    async fn check_once(server: &Server, model: &str, bearer: &str) -> Result<(), Reason> {
         let client = server.client.read().clone();
         let response = client
             .get(format!("{}/v1/models", server.origin))
@@ -291,8 +325,8 @@ impl Servers {
             return Err(Reason::NotServed);
         }
         // Fixed labels only: the model id and the Revision the pinned leaf carried.
-        eprintln!(
-            "alpha-inference: model {model} served by alphacompute revision {}",
+        log!(
+            "model {model} served by alphacompute revision {}",
             revision.map_or_else(|| "unknown".to_owned(), |r| r.to_string())
         );
         Ok(())
@@ -330,8 +364,8 @@ impl Servers {
             .await
             .map_err(|_| Error::Upstream)?;
         // Fixed labels only, as for the check: the model, the Revision and the status.
-        eprintln!(
-            "alpha-inference: model {model} completion served by alphacompute revision {} status={}",
+        log!(
+            "model {model} completion served by alphacompute revision {} status={}",
             served_revision(&response).map_or_else(|| "unknown".to_owned(), |r| r.to_string()),
             response.status().as_u16()
         );
@@ -659,6 +693,132 @@ mod tests {
         servers.forget("m1").await;
         servers.verified("m1", "b").await.unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    /// Keep-warm: a refresh 45 seconds into a check's minute replaces it, so a request at 90
+    /// seconds still finds a current check and runs none; every check is counted.
+    #[tokio::test]
+    async fn a_refresh_before_expiry_keeps_the_check_current_so_a_request_runs_none() {
+        let (ca_key, ca_cert) = new_ca();
+        let rev = revision('1');
+        let (url, hits) = spawn_model_server(leaf(&ca_key, &ca_cert, &rev), &["m1"]).await;
+        let start = SystemTime::now();
+        let clock = Arc::new(parking_lot::Mutex::new(start));
+        let now: Clock = {
+            let clock = clock.clone();
+            Arc::new(move || *clock.lock())
+        };
+        let map = BTreeMap::from([(
+            "m1".to_owned(),
+            ModelServer {
+                url,
+                revisions: vec![rev],
+                bearer: "model-server-bearer-m1".to_owned(),
+            },
+        )]);
+        let servers = Servers::build(
+            &map,
+            &CertificateDer::from(ca_cert.der().to_vec()),
+            None,
+            now,
+        )
+        .unwrap();
+
+        servers.verified("m1", "b").await.unwrap();
+        *clock.lock() = start + Duration::from_secs(45);
+        servers.refresh("m1", "b").await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        *clock.lock() = start + Duration::from_secs(90);
+        servers.verified("m1", "b").await.unwrap();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "the refreshed check is current"
+        );
+
+        let (model, stats) = servers.check_stats().next().unwrap();
+        assert_eq!(model, "m1");
+        assert_eq!(stats.checks(), 2);
+        assert_eq!(servers.refresh("other", "b").await, Err(Reason::NotServed));
+    }
+
+    /// A failed refresh replaces a passing check: the model is refused at once, not served on
+    /// the strength of the older check, and the refusal is counted by its reason.
+    #[tokio::test]
+    async fn a_failed_refresh_replaces_a_passing_check() {
+        let (ca_key, ca_cert) = new_ca();
+        let rev = revision('1');
+        let (url, _hits) = spawn_model_server(leaf(&ca_key, &ca_cert, &rev), &["m1"]).await;
+        let servers = servers_for(&url, &ca_cert, vec![rev]);
+        servers.verified("m1", "b").await.unwrap();
+        // The same server, now pinned to a Revision it does not carry.
+        let stale = servers_for(&url, &ca_cert, vec![revision('2')]);
+        *stale.servers["m1"].slot.lock().await = servers.servers["m1"].slot.lock().await.take();
+        assert_eq!(stale.refresh("m1", "b").await, Err(Reason::Handshake));
+        assert_eq!(stale.verified("m1", "b").await, Err(Reason::Handshake));
+        let (_, stats) = stale.check_stats().next().unwrap();
+        assert_eq!(stats.refusals("handshake"), 1);
+    }
+
+    /// Through the router: once the front has kept a model warm, a member's request reaches the
+    /// model server for the completion alone, without a check of its own first.
+    #[tokio::test]
+    async fn after_keep_warm_a_request_does_not_wait_for_a_check() {
+        let (ca_key, ca_cert) = new_ca();
+        let rev = revision('1');
+        let (url, hits) = spawn_model_server(leaf(&ca_key, &ca_cert, &rev), &["m1"]).await;
+        let mut config = crate::test_support::test_config("https://external.invalid", &["m1"]);
+        config.model_servers.insert(
+            "m1".to_owned(),
+            ModelServer {
+                url,
+                revisions: vec![rev],
+                bearer: "model-server-bearer-m1".to_owned(),
+            },
+        );
+        let state = Arc::new(crate::AppState {
+            upstream: crate::Upstream::new(&config).unwrap(),
+            own: Servers::new(
+                &config.model_servers,
+                &CertificateDer::from(ca_cert.der().to_vec()),
+                None,
+            )
+            .unwrap(),
+            metrics: crate::metrics::Metrics::new(&config),
+            config,
+            secrets: parking_lot::RwLock::new(crate::Secrets {
+                provider_key: Zeroizing::new(String::new()),
+                caller_bearer: Zeroizing::new(b"member".to_vec()),
+                model_server_bearers: BTreeMap::from([(
+                    "m1".to_owned(),
+                    Zeroizing::new("ms".to_owned()),
+                )]),
+                judge_bearer: Zeroizing::new(b"judge".to_vec()),
+            }),
+            guard: crate::guard::Guard::fixed(Ok(()), Ok(())),
+        });
+        crate::keep_warm(&state).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("authorization", "Bearer member")
+            .body(axum::body::Body::from(
+                json!({"model": "m1", "messages": [{"role": "user", "content": "q"}]}).to_string(),
+            ))
+            .unwrap();
+        let _ = tower::ServiceExt::oneshot(crate::router(state.clone()), request)
+            .await
+            .unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "the completion only");
+        let metrics = crate::metrics::render(&state);
+        assert!(
+            metrics.contains(
+                "alpha_inference_attestation_checks_total{upstream=\"own\",model=\"m1\"} 1"
+            ),
+            "{metrics}"
+        );
     }
 
     /// A model server whose runtime pins its callers to the front's App: the front's leaf gets

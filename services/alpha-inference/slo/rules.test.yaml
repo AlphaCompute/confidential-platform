@@ -1,0 +1,163 @@
+# promtool unit tests of the SLO rules rendered from slo.toml (promtool test rules rules.test.yaml).
+# The thresholds are slo.toml's placeholders; change these inputs along with them.
+rule_files:
+- rules.yaml
+evaluation_interval: 1m
+tests:
+# Own model servers slow to the first token, against a fast external provider: both TTFT alerts
+# and the comparison fire for own only; nothing else does.
+- interval: 1m
+  input_series:
+  - series: 'alpha_inference_request_duration_seconds_count{upstream="own", model="corpus", status_class="2xx"}'
+    values: '0+2x60'
+  - series: 'alpha_inference_request_duration_seconds_count{upstream="external", model="hosted", status_class="2xx"}'
+    values: '0+2x60'
+  - series: 'alpha_inference_ttft_seconds_bucket{upstream="own", model="corpus", le="0.5"}'
+    values: '0x60'
+  - series: 'alpha_inference_ttft_seconds_bucket{upstream="own", model="corpus", le="1"}'
+    values: '0x60'
+  - series: 'alpha_inference_ttft_seconds_bucket{upstream="own", model="corpus", le="2"}'
+    values: '0+2x60'
+  - series: 'alpha_inference_ttft_seconds_bucket{upstream="own", model="corpus", le="+Inf"}'
+    values: '0+2x60'
+  - series: 'alpha_inference_ttft_seconds_bucket{upstream="external", model="hosted", le="0.5"}'
+    values: '0+2x60'
+  - series: 'alpha_inference_ttft_seconds_bucket{upstream="external", model="hosted", le="1"}'
+    values: '0+2x60'
+  - series: 'alpha_inference_ttft_seconds_bucket{upstream="external", model="hosted", le="2"}'
+    values: '0+2x60'
+  - series: 'alpha_inference_ttft_seconds_bucket{upstream="external", model="hosted", le="+Inf"}'
+    values: '0+2x60'
+  - series: 'alpha_inference_errors_total{upstream="own", model="corpus", code="upstream_unverified"}'
+    values: '0x60'
+  - series: 'alpha_inference_errors_total{upstream="external", model="hosted", code="upstream_unverified"}'
+    values: '0x60'
+  - series: 'alpha_inference_attestation_checks_total{upstream="own", model="corpus"}'
+    values: '0+2x60'
+  alert_rule_test:
+  - eval_time: 40m
+    alertname: AlphaInferenceTTFTP95High
+    exp_alerts:
+    - exp_labels: {severity: warning, upstream: own}
+      exp_annotations:
+        summary: "own: p95 time to first token is above the SLO's 1.5s over 30m"
+  - eval_time: 40m
+    alertname: AlphaInferenceTTFTP50High
+    exp_alerts:
+    - exp_labels: {severity: warning, upstream: own}
+      exp_annotations:
+        summary: "own: p50 time to first token is above the SLO's 0.5s over 30m"
+  - eval_time: 40m
+    alertname: AlphaInferenceOwnTTFTBehindExternal
+    exp_alerts:
+    - exp_labels: {severity: warning}
+      exp_annotations:
+        summary: "own model servers: p95 time to first token is more than 1.25x the external provider's over 30m"
+  - eval_time: 40m
+    alertname: AlphaInferenceAttestationRefusalsHigh
+    exp_alerts: []
+  - eval_time: 40m
+    alertname: AlphaInferenceErrorRateHigh
+    exp_alerts: []
+  - eval_time: 40m
+    alertname: AlphaInferenceMetricsAbsent
+    exp_alerts: []
+  # The condition must hold for 15 minutes first.
+  - eval_time: 10m
+    alertname: AlphaInferenceTTFTP95High
+    exp_alerts: []
+# Own model servers failing attestation checks: 2 of 20 requests a minute refused
+# upstream_unverified (502), so both the error rate and the attestation refusal rate alert,
+# critical, for own only.
+- interval: 1m
+  input_series:
+  - series: 'alpha_inference_request_duration_seconds_count{upstream="own", model="corpus", status_class="2xx"}'
+    values: '0+18x60'
+  - series: 'alpha_inference_request_duration_seconds_count{upstream="own", model="corpus", status_class="5xx"}'
+    values: '0+2x60'
+  - series: 'alpha_inference_errors_total{upstream="own", model="corpus", code="upstream_unverified"}'
+    values: '0+2x60'
+  - series: 'alpha_inference_request_duration_seconds_count{upstream="external", model="hosted", status_class="2xx"}'
+    values: '0+20x60'
+  - series: 'alpha_inference_errors_total{upstream="external", model="hosted", code="upstream_unverified"}'
+    values: '0x60'
+  - series: 'alpha_inference_attestation_checks_total{upstream="own", model="corpus"}'
+    values: '0+2x60'
+  alert_rule_test:
+  - eval_time: 40m
+    alertname: AlphaInferenceAttestationRefusalsHigh
+    exp_alerts:
+    - exp_labels: {severity: critical, upstream: own}
+      exp_annotations:
+        summary: "own: requests refused for a failed attestation check are above the SLO's 0.001 over 30m"
+  - eval_time: 40m
+    alertname: AlphaInferenceErrorRateHigh
+    exp_alerts:
+    - exp_labels: {severity: critical, upstream: own}
+      exp_annotations:
+        summary: "own: server errors are above the SLO's 0.01 of requests over 30m"
+# Own decoding at about 7.5 tokens/s against about 87.5 for the external provider: below its own
+# floor and below 0.8x the external provider's.
+- interval: 1m
+  input_series:
+  - series: 'alpha_inference_request_duration_seconds_count{upstream="own", model="corpus", status_class="2xx"}'
+    values: '0+2x60'
+  - series: 'alpha_inference_request_duration_seconds_count{upstream="external", model="hosted", status_class="2xx"}'
+    values: '0+2x60'
+  - series: 'alpha_inference_output_tokens_per_second_bucket{upstream="own", model="corpus", le="5"}'
+    values: '0x60'
+  - series: 'alpha_inference_output_tokens_per_second_bucket{upstream="own", model="corpus", le="10"}'
+    values: '0+2x60'
+  - series: 'alpha_inference_output_tokens_per_second_bucket{upstream="own", model="corpus", le="+Inf"}'
+    values: '0+2x60'
+  - series: 'alpha_inference_output_tokens_per_second_bucket{upstream="external", model="hosted", le="75"}'
+    values: '0x60'
+  - series: 'alpha_inference_output_tokens_per_second_bucket{upstream="external", model="hosted", le="100"}'
+    values: '0+2x60'
+  - series: 'alpha_inference_output_tokens_per_second_bucket{upstream="external", model="hosted", le="+Inf"}'
+    values: '0+2x60'
+  - series: 'alpha_inference_attestation_checks_total{upstream="own", model="corpus"}'
+    values: '0+2x60'
+  alert_rule_test:
+  - eval_time: 40m
+    alertname: AlphaInferenceTokensPerSecondLow
+    exp_alerts:
+    - exp_labels: {severity: warning, upstream: own}
+      exp_annotations:
+        summary: "own: median output tokens/s is below the SLO's 30 over 30m"
+  - eval_time: 40m
+    alertname: AlphaInferenceOwnThroughputBehindExternal
+    exp_alerts:
+    - exp_labels: {severity: warning}
+      exp_annotations:
+        summary: "own model servers: median output tokens/s is less than 0.8x the external provider's over 30m"
+# Too few requests to judge (15 in 30 minutes, fewer than min_requests): a slow first token does
+# not alert.
+- interval: 1m
+  input_series:
+  - series: 'alpha_inference_request_duration_seconds_count{upstream="own", model="corpus", status_class="2xx"}'
+    values: '0+0.5x60'
+  - series: 'alpha_inference_ttft_seconds_bucket{upstream="own", model="corpus", le="1"}'
+    values: '0x60'
+  - series: 'alpha_inference_ttft_seconds_bucket{upstream="own", model="corpus", le="2"}'
+    values: '0+0.5x60'
+  - series: 'alpha_inference_ttft_seconds_bucket{upstream="own", model="corpus", le="+Inf"}'
+    values: '0+0.5x60'
+  - series: 'alpha_inference_attestation_checks_total{upstream="own", model="corpus"}'
+    values: '0+2x60'
+  alert_rule_test:
+  - eval_time: 40m
+    alertname: AlphaInferenceTTFTP95High
+    exp_alerts: []
+# Nothing scraped: none of the alerts above could fire, which is itself an alert.
+- interval: 1m
+  input_series:
+  - series: 'up{job="something-else"}'
+    values: '1x30'
+  alert_rule_test:
+  - eval_time: 20m
+    alertname: AlphaInferenceMetricsAbsent
+    exp_alerts:
+    - exp_labels: {severity: warning}
+      exp_annotations:
+        summary: "no alpha-inference metrics, so none of its SLO alerts can fire"

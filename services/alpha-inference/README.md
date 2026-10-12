@@ -23,6 +23,7 @@ Whatever the model, every member's turn is judged by `alpha-guard` before it rea
 | `GUARD_POLICY` | JSON `{"model": "...", "categories": ["..."]}`, 1 to 32 one-line categories without `<`: what this front refuses, judged by `model`; required, and changing it is a new Revision |
 | `JUDGE_MODELS` | comma-separated models the judge's own bearer may name, each in `MODELS`; must include `GUARD_POLICY`'s model; required |
 | `GUARD_ALLOW` | optional, comma-separated: what a member's request may carry that the judge cannot read. `assistant_prefill` admits a last message from the assistant (the model continues it); `non_text_parts` admits image, audio and other non-text parts (only their `text`, if any, is judged). Unset, both are refused |
+| `METRICS_PORT` | optional port, not 8443, for `GET /metrics` in plain HTTP on a listener of its own (see *Metrics*); unset, no metrics are served |
 
 Secrets, released only to this App's Revision, and read only when this Revision uses them: `judge-bearer` (always; the bearer `alpha-guard` presents as its own `inference-bearer`; must be set and differ from `caller-bearer`, or the front refuses to start), `caller-bearer` (always; compared by SHA-256 digest against every `/v1` request's `Authorization: Bearer` header before any upstream contact), `redpill-api-key` (when some model is RedPill's; RedPill's own key, never sent to any other App, never released to a caller) and, for each of our model servers, the Secret its `MODEL_SERVERS` entry names in `bearer` (sent only over that server's pinned connection, never to RedPill, another model server or a caller). Each model server declares the same value as its own Secret of that name, so one server's bearer opens no other.
 
@@ -50,6 +51,37 @@ The judge is dialled as any caller dials it: this Instance's leaf as the client 
 
 **What this leaves open:** the judge sees only text, so a Revision whose `GUARD_ALLOW` names `non_text_parts` serves images and audio nobody judged. The prompt is judged as the front renders it, not through the model's own chat template, and a window is judged on its own, so a request split across a window boundary is judged in two pieces.
 
+## Keeping upstreams warm
+
+Every 30 seconds, and once at start, the front runs every model's check again in the background (`keep_warm`): the gateway check for an external model, the pinned `/v1/models` read for one of ours. A request meanwhile goes on using the check being replaced, so it never waits for one, and since a check is trusted for a minute a member's request always finds a current one; for our own servers the pinned connection the check opened stays in the pool for the completion. A failed background check replaces a passing one exactly as an inline check would: the model is refused until a check passes again.
+
+## Metrics
+
+`GET /metrics` on `METRICS_PORT`, a plain-HTTP listener that serves that route alone, apart from the members' TLS port and its bearer. Plain HTTP because no scraper can verify an Instance leaf (its names are URIs, not DNS names), and because nothing in it is secret: aggregate numbers under bounded labels. Families, all labelled `upstream` (`own`, `external`) and `model` (a value of `MODELS`; nothing else is ever a label):
+
+| Family | What |
+|---|---|
+| `alpha_inference_request_duration_seconds` (histogram, + `status_class` `2xx`/`4xx`/`5xx`/`other`) | a member's completion from arrival to answer, moderation included |
+| `alpha_inference_ttft_seconds` (histogram) | streamed: from the upstream leg's start (after the prompt is judged; attestation check, connection and prefill included) to the first chunk with output. The member gets the stream only after the judge, so this is the upstream's TTFT, not the member's |
+| `alpha_inference_output_tokens_per_second` (histogram) | streamed: `(output tokens - 1) / (last byte - first output)` |
+| `alpha_inference_output_tokens_total` | `usage.completion_tokens`, or for a stream without usage its chunks with output |
+| `alpha_inference_errors_total` (+ `code`) | refusals by the fixed error code of the answer (`upstream_unverified`, `content_blocked`, ...) |
+| `alpha_inference_attestation_checks_total`, `alpha_inference_attestation_refusals_total` (+ `reason`), `alpha_inference_attestation_check_duration_seconds` | each check of an upstream, inline or keep-warm; reasons are the fixed codes of *The gateway check* and *Our own model servers* |
+
+The judge's own calls are not observed: they are moderation, already inside the latency of the member's request they judge. A request for a model outside `MODELS` is not observed at all. The completion body is read for timing and token counts only; no text, no error message and no value a caller chose is ever a label, and every log line goes through one function so the tests can check what was logged.
+
+## SLOs and the benchmark
+
+`slo/slo.toml` sets per-upstream targets (p50/p95 TTFT and latency, median tokens/s, error and attestation-refusal rates) and how close `own` must stay to `external`. All of them are placeholders until measured (`ponytail:` in the file). `slo/rules.yaml` is rendered from it (Prometheus recording rules and `Alpha…` alerts; `alpha-inference-bench rules > slo/rules.yaml`, and a test fails while the two differ) and unit-tested with promtool (`slo/rules.test.yaml`, run in CI with promtool 3.15.0). No Prometheus scrapes alpha-inference yet: alpha-infra's observability add-on scrapes only its own pods in `alpha-system`.
+
+`alpha-inference-bench run` sends the fixed prompt set (`slo/prompts.json`) as streamed completions to any OpenAI-compatible endpoint, one `--model <own|external>=<model>` per upstream, and prints TTFT, latency, tokens/s and errors per upstream, then the SLO report from the same evaluation code (exit 1 unless every objective passed; too few requests is no data, not a pass). The bearer comes from `ALPHA_BENCH_BEARER`; `--kms-ca` and `--revision` pin the TLS to an Instance of alpha-inference. It reads a response for timing and token counts and never prints or keeps its text. Through the front the stream is held until judged, so the bench's TTFT there includes moderation and the whole generation.
+
+```sh
+ALPHA_BENCH_BEARER=... cargo run -p alpha-inference --bin alpha-inference-bench -- run \
+  --endpoint https://alpha-inference:8443/v1 --kms-ca kms-ca.pem --revision sha256:... \
+  --model own=nvidia/nemotron-3.5-lightning --model external=<external model>
+```
+
 ## Our own model servers
 
 A model server's `alpha-runtime` sidecar terminates TLS with the one-hour Instance leaf the KMS issued after appraising the pod VM's evidence, and this front pins every connection to it with `Pin::CaAndInstanceRevisions`: the chain must end at this Instance's own KMS CA (the last certificate of its own chain, already checked by its runtime against the measured CA) and the leaf must carry one of the model's `revisions`, or the handshake fails before a request byte. No report is read here — the KMS's appraisal is the check, and the leaf is its readable form. This front presents its own Instance leaf as the client certificate (renewed with every refresh), and a model server's runtime admits only an Instance of this front's App (`ALPHACOMPUTE_TLS_CALLER_APPS`): nobody else reaches any of vLLM's routes, including the ones outside `/v1` that vLLM's API key does not cover. The server pins this front by App, not by Revision, because this front's Revision names the server's.
@@ -68,7 +100,7 @@ Before forwarding any request for a model, and at most once a minute per model: 
 
 ## Tests
 
-`cargo test -p alpha-inference` runs the golden and failure-mode tests: `check_report` against a real captured RedPill report (`testdata/redpill/`) and against it mutated (wrong nonce, wrong SPKI, a tampered quote byte, a policy that denies the TCB status, expired collateral); every way the report endpoint can fail (refused, non-2xx, timeout, non-JSON, a missing field); the 60-second reuse window and refetch on expiry; two concurrent checks on a cold model sharing one fetch; SPKI pinning on the forwarding connection; and the router (bearer required before any upstream contact, a model outside the allowlist refused before any upstream contact, `Config::build`'s refusals). Moderation is tested against a fixed judge that records what it is asked: the whole prompt, a fabricated history and the tool definitions reach it; a prefill, a non-text part, a request's own chat template, log probabilities and a request with no text are refused before the judge or any upstream; a completion is released only on allow, never when the body is unreadable, empty or an upstream error; and a conversation's earlier windows are judged once.
+`cargo test -p alpha-inference` runs the golden and failure-mode tests: `check_report` against a real captured RedPill report (`testdata/redpill/`) and against it mutated (wrong nonce, wrong SPKI, a tampered quote byte, a policy that denies the TCB status, expired collateral); every way the report endpoint can fail (refused, non-2xx, timeout, non-JSON, a missing field); the 60-second reuse window and refetch on expiry; two concurrent checks on a cold model sharing one fetch; SPKI pinning on the forwarding connection; and the router (bearer required before any upstream contact, a model outside the allowlist refused before any upstream contact, `Config::build`'s refusals). Moderation is tested against a fixed judge that records what it is asked: the whole prompt, a fabricated history and the tool definitions reach it; a prefill, a non-text part, a request's own chat template, log probabilities and a request with no text are refused before the judge or any upstream; a completion is released only on allow, never when the body is unreadable, empty or an upstream error; and a conversation's earlier windows are judged once. Metrics, keep-warm and SLOs: a prompt and a completion carrying a unique marker never reach the metrics or any logged line; `/metrics` serves nothing else and needs no bearer; a refresh before expiry keeps a check current and a failed one replaces it; after keep-warm a member's request reaches its model server for the completion alone; the SLO file's validation and evaluation (no data is never a pass); the checked-in rules equal the rendered ones; the bench against a local mock OpenAI-compatible server.
 
 The live test proves the whole front end to end against the real RedPill API and is `#[ignore]`d unless a key is present:
 

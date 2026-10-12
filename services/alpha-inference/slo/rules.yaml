@@ -1,0 +1,164 @@
+# Rendered from slo.toml by `alpha-inference-bench rules`; edit slo.toml and render again (a
+# test fails while the two differ). Rates and quantiles over 30m, per upstream (own, external).
+# Not loaded anywhere yet: no Prometheus scrapes alpha-inference's METRICS_PORT.
+groups:
+- name: alpha-inference-slo
+  rules:
+  - record: upstream:alpha_inference_requests:increase30m
+    expr: sum by (upstream) (increase(alpha_inference_request_duration_seconds_count[30m]))
+  - record: upstream:alpha_inference_ttft_seconds:p50
+    expr: histogram_quantile(0.5, sum by (upstream, le) (rate(alpha_inference_ttft_seconds_bucket[30m])))
+  - record: upstream:alpha_inference_request_duration_seconds:p50
+    expr: histogram_quantile(0.5, sum by (upstream, le) (rate(alpha_inference_request_duration_seconds_bucket{status_class="2xx"}[30m])))
+  - record: upstream:alpha_inference_ttft_seconds:p95
+    expr: histogram_quantile(0.95, sum by (upstream, le) (rate(alpha_inference_ttft_seconds_bucket[30m])))
+  - record: upstream:alpha_inference_request_duration_seconds:p95
+    expr: histogram_quantile(0.95, sum by (upstream, le) (rate(alpha_inference_request_duration_seconds_bucket{status_class="2xx"}[30m])))
+  - record: upstream:alpha_inference_output_tokens_per_second:p50
+    expr: histogram_quantile(0.5, sum by (upstream, le) (rate(alpha_inference_output_tokens_per_second_bucket[30m])))
+  - record: upstream:alpha_inference_error:ratio
+    expr: sum by (upstream) (rate(alpha_inference_request_duration_seconds_count{status_class="5xx"}[30m])) / sum by (upstream) (rate(alpha_inference_request_duration_seconds_count[30m]))
+  - record: upstream:alpha_inference_attestation_refusal:ratio
+    expr: sum by (upstream) (rate(alpha_inference_errors_total{code="upstream_unverified"}[30m])) / sum by (upstream) (rate(alpha_inference_request_duration_seconds_count[30m]))
+- name: alpha-inference-slo-alerts
+  rules:
+  - alert: AlphaInferenceTTFTP50High
+    expr: upstream:alpha_inference_ttft_seconds:p50{upstream="own"} > 0.5 and on (upstream) upstream:alpha_inference_requests:increase30m{upstream="own"} >= 20
+    for: 15m
+    labels:
+      severity: warning
+      upstream: own
+    annotations:
+      summary: "own: p50 time to first token is above the SLO's 0.5s over 30m"
+  - alert: AlphaInferenceTTFTP95High
+    expr: upstream:alpha_inference_ttft_seconds:p95{upstream="own"} > 1.5 and on (upstream) upstream:alpha_inference_requests:increase30m{upstream="own"} >= 20
+    for: 15m
+    labels:
+      severity: warning
+      upstream: own
+    annotations:
+      summary: "own: p95 time to first token is above the SLO's 1.5s over 30m"
+  - alert: AlphaInferenceLatencyP50High
+    expr: upstream:alpha_inference_request_duration_seconds:p50{upstream="own"} > 10 and on (upstream) upstream:alpha_inference_requests:increase30m{upstream="own"} >= 20
+    for: 15m
+    labels:
+      severity: warning
+      upstream: own
+    annotations:
+      summary: "own: p50 completion latency is above the SLO's 10s over 30m"
+  - alert: AlphaInferenceLatencyP95High
+    expr: upstream:alpha_inference_request_duration_seconds:p95{upstream="own"} > 30 and on (upstream) upstream:alpha_inference_requests:increase30m{upstream="own"} >= 20
+    for: 15m
+    labels:
+      severity: warning
+      upstream: own
+    annotations:
+      summary: "own: p95 completion latency is above the SLO's 30s over 30m"
+  - alert: AlphaInferenceTokensPerSecondLow
+    expr: upstream:alpha_inference_output_tokens_per_second:p50{upstream="own"} < 30 and on (upstream) upstream:alpha_inference_requests:increase30m{upstream="own"} >= 20
+    for: 15m
+    labels:
+      severity: warning
+      upstream: own
+    annotations:
+      summary: "own: median output tokens/s is below the SLO's 30 over 30m"
+  - alert: AlphaInferenceErrorRateHigh
+    expr: upstream:alpha_inference_error:ratio{upstream="own"} > 0.01 and on (upstream) upstream:alpha_inference_requests:increase30m{upstream="own"} >= 20
+    for: 15m
+    labels:
+      severity: critical
+      upstream: own
+    annotations:
+      summary: "own: server errors are above the SLO's 0.01 of requests over 30m"
+  - alert: AlphaInferenceAttestationRefusalsHigh
+    expr: upstream:alpha_inference_attestation_refusal:ratio{upstream="own"} > 0.001 and on (upstream) upstream:alpha_inference_requests:increase30m{upstream="own"} >= 20
+    for: 15m
+    labels:
+      severity: critical
+      upstream: own
+    annotations:
+      summary: "own: requests refused for a failed attestation check are above the SLO's 0.001 over 30m"
+  - alert: AlphaInferenceTTFTP50High
+    expr: upstream:alpha_inference_ttft_seconds:p50{upstream="external"} > 0.75 and on (upstream) upstream:alpha_inference_requests:increase30m{upstream="external"} >= 20
+    for: 15m
+    labels:
+      severity: warning
+      upstream: external
+    annotations:
+      summary: "external: p50 time to first token is above the SLO's 0.75s over 30m"
+  - alert: AlphaInferenceTTFTP95High
+    expr: upstream:alpha_inference_ttft_seconds:p95{upstream="external"} > 2 and on (upstream) upstream:alpha_inference_requests:increase30m{upstream="external"} >= 20
+    for: 15m
+    labels:
+      severity: warning
+      upstream: external
+    annotations:
+      summary: "external: p95 time to first token is above the SLO's 2s over 30m"
+  - alert: AlphaInferenceLatencyP50High
+    expr: upstream:alpha_inference_request_duration_seconds:p50{upstream="external"} > 10 and on (upstream) upstream:alpha_inference_requests:increase30m{upstream="external"} >= 20
+    for: 15m
+    labels:
+      severity: warning
+      upstream: external
+    annotations:
+      summary: "external: p50 completion latency is above the SLO's 10s over 30m"
+  - alert: AlphaInferenceLatencyP95High
+    expr: upstream:alpha_inference_request_duration_seconds:p95{upstream="external"} > 30 and on (upstream) upstream:alpha_inference_requests:increase30m{upstream="external"} >= 20
+    for: 15m
+    labels:
+      severity: warning
+      upstream: external
+    annotations:
+      summary: "external: p95 completion latency is above the SLO's 30s over 30m"
+  - alert: AlphaInferenceTokensPerSecondLow
+    expr: upstream:alpha_inference_output_tokens_per_second:p50{upstream="external"} < 30 and on (upstream) upstream:alpha_inference_requests:increase30m{upstream="external"} >= 20
+    for: 15m
+    labels:
+      severity: warning
+      upstream: external
+    annotations:
+      summary: "external: median output tokens/s is below the SLO's 30 over 30m"
+  - alert: AlphaInferenceErrorRateHigh
+    expr: upstream:alpha_inference_error:ratio{upstream="external"} > 0.01 and on (upstream) upstream:alpha_inference_requests:increase30m{upstream="external"} >= 20
+    for: 15m
+    labels:
+      severity: critical
+      upstream: external
+    annotations:
+      summary: "external: server errors are above the SLO's 0.01 of requests over 30m"
+  - alert: AlphaInferenceAttestationRefusalsHigh
+    expr: upstream:alpha_inference_attestation_refusal:ratio{upstream="external"} > 0.001 and on (upstream) upstream:alpha_inference_requests:increase30m{upstream="external"} >= 20
+    for: 15m
+    labels:
+      severity: critical
+      upstream: external
+    annotations:
+      summary: "external: requests refused for a failed attestation check are above the SLO's 0.001 over 30m"
+  - alert: AlphaInferenceOwnTTFTBehindExternal
+    expr: upstream:alpha_inference_ttft_seconds:p95{upstream="own"} > ignoring (upstream) 1.25 * upstream:alpha_inference_ttft_seconds:p95{upstream="external"} and on () upstream:alpha_inference_requests:increase30m{upstream="own"} >= 20 and on () upstream:alpha_inference_requests:increase30m{upstream="external"} >= 20
+    for: 15m
+    labels:
+      severity: warning
+    annotations:
+      summary: "own model servers: p95 time to first token is more than 1.25x the external provider's over 30m"
+  - alert: AlphaInferenceOwnLatencyBehindExternal
+    expr: upstream:alpha_inference_request_duration_seconds:p95{upstream="own"} > ignoring (upstream) 1.25 * upstream:alpha_inference_request_duration_seconds:p95{upstream="external"} and on () upstream:alpha_inference_requests:increase30m{upstream="own"} >= 20 and on () upstream:alpha_inference_requests:increase30m{upstream="external"} >= 20
+    for: 15m
+    labels:
+      severity: warning
+    annotations:
+      summary: "own model servers: p95 completion latency is more than 1.25x the external provider's over 30m"
+  - alert: AlphaInferenceOwnThroughputBehindExternal
+    expr: upstream:alpha_inference_output_tokens_per_second:p50{upstream="own"} < ignoring (upstream) 0.8 * upstream:alpha_inference_output_tokens_per_second:p50{upstream="external"} and on () upstream:alpha_inference_requests:increase30m{upstream="own"} >= 20 and on () upstream:alpha_inference_requests:increase30m{upstream="external"} >= 20
+    for: 15m
+    labels:
+      severity: warning
+    annotations:
+      summary: "own model servers: median output tokens/s is less than 0.8x the external provider's over 30m"
+  - alert: AlphaInferenceMetricsAbsent
+    expr: absent(alpha_inference_attestation_checks_total)
+    for: 15m
+    labels:
+      severity: warning
+    annotations:
+      summary: "no alpha-inference metrics, so none of its SLO alerts can fire"

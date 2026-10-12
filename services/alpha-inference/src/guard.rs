@@ -493,8 +493,8 @@ fn log(phase: &str, model: &str, outcome: Result<(), Refusal>, started: Instant)
         Err(Refusal::TooLarge) => "too_large",
         Err(Refusal::Unjudgeable) => "unjudgeable",
     };
-    eprintln!(
-        "alpha-inference: guard phase={phase} outcome={outcome} model={model} elapsed_ms={}",
+    log!(
+        "guard phase={phase} outcome={outcome} model={model} elapsed_ms={}",
         started.elapsed().as_millis()
     );
 }

@@ -5,7 +5,7 @@
 //! SPKI for 60 seconds. Every failure — network, shape, collateral, quote or policy — leaves
 //! the model unverified; nothing is ever forwarded on a failure.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -14,6 +14,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
+use crate::metrics::CheckStats;
 use crate::{Config, Error};
 
 /// A verification is trusted for one minute; older than that, the check runs again.
@@ -42,6 +43,17 @@ pub enum Reason {
     /// and this connection's SPKI.
     Binding,
 }
+
+/// Every [`Reason::code`].
+pub const REASON_CODES: &[&str] = &[
+    "fetch",
+    "status",
+    "shape",
+    "collateral",
+    "quote",
+    "policy",
+    "binding",
+];
 
 impl Reason {
     pub fn code(self) -> &'static str {
@@ -89,6 +101,8 @@ pub struct Upstream {
     pccs_url: String,
     policy: Policy,
     slots: HashMap<String, Mutex<Option<Checked>>>,
+    /// Keyed as `slots`, in order for the metrics.
+    stats: BTreeMap<String, CheckStats>,
     /// Never pinned, never given the provider key: it only reads the report that says which
     /// key to pin to next.
     report_client: reqwest::Client,
@@ -194,11 +208,17 @@ impl Upstream {
             .into_iter()
             .map(|model| (model, Mutex::new(None)))
             .collect();
+        let stats = config
+            .external_models()
+            .into_iter()
+            .map(|model| (model, CheckStats::new(REASON_CODES)))
+            .collect();
         Ok(Self {
             upstream_url: config.upstream_url.clone(),
             pccs_url: config.pccs_url.clone(),
             policy: config.upstream_policy.clone(),
             slots,
+            stats,
             report_client: unpinned_client(report_timeout)?,
             now,
         })
@@ -220,12 +240,6 @@ impl Upstream {
             return checked.outcome.clone().map_err(VerifyOutcome::Unverified);
         }
         let outcome = self.check(model, now).await;
-        if let Err(reason) = &outcome {
-            eprintln!(
-                "alpha-inference: verification failed for {model}: {}",
-                reason.code()
-            );
-        }
         // Replaces whatever was cached before, good or bad — a fresh failure past the TTL
         // must not go on serving a stale-but-formerly-good client.
         *guard = Some(Checked {
@@ -243,7 +257,44 @@ impl Upstream {
         }
     }
 
+    /// Runs the check for `model` again now without holding up requests, which go on using the
+    /// last check until this one replaces it (unless a newer one already did).
+    pub async fn refresh(&self, model: &str) -> Result<(), VerifyOutcome> {
+        let Some(slot) = self.slots.get(model) else {
+            return Err(VerifyOutcome::UnknownModel);
+        };
+        let now = (self.now)();
+        let outcome = self.check(model, now).await;
+        let mut guard = slot.lock().await;
+        if guard.as_ref().is_none_or(|checked| checked.at <= now) {
+            *guard = Some(Checked {
+                at: now,
+                outcome: outcome.clone(),
+            });
+        }
+        outcome.map(|_| ()).map_err(VerifyOutcome::Unverified)
+    }
+
+    /// Each model's attestation-check counts.
+    pub fn check_stats(&self) -> impl Iterator<Item = (&str, &CheckStats)> {
+        self.stats
+            .iter()
+            .map(|(model, stats)| (model.as_str(), stats))
+    }
+
     async fn check(&self, model: &str, now: SystemTime) -> Result<reqwest::Client, Reason> {
+        let started = std::time::Instant::now();
+        let outcome = self.check_once(model, now).await;
+        if let Some(stats) = self.stats.get(model) {
+            stats.record(started.elapsed(), outcome.as_ref().err().map(|r| r.code()));
+        }
+        if let Err(reason) = &outcome {
+            log!("verification failed for {model}: {}", reason.code());
+        }
+        outcome
+    }
+
+    async fn check_once(&self, model: &str, now: SystemTime) -> Result<reqwest::Client, Reason> {
         let mut nonce = [0u8; 32];
         getrandom::fill(&mut nonce).map_err(|_| Reason::Fetch)?;
 
@@ -555,6 +606,46 @@ mod tests {
         );
     }
 
+    /// Keep-warm on the external provider: a refresh runs the gateway check again before the
+    /// minute is up and replaces the slot, here with a refusal (fail closed), counted by reason;
+    /// a request within the refreshed minute fetches nothing.
+    #[tokio::test]
+    async fn a_refresh_replaces_the_slot_before_expiry_and_counts_its_refusal() {
+        let (base, hits, _completions) =
+            spawn_report_server(answering(StatusCode::INTERNAL_SERVER_ERROR, "")).await;
+        let start = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let clock_cell = Arc::new(parking_lot::Mutex::new(start));
+        let clock: Clock = {
+            let cell = clock_cell.clone();
+            Arc::new(move || *cell.lock())
+        };
+        let upstream =
+            Upstream::build(&test_config(&base, &["m1"]), clock, Duration::from_secs(5)).unwrap();
+        *upstream.slots.get("m1").unwrap().lock().await = Some(Checked {
+            at: start,
+            outcome: Ok(pinned_client(&[7u8; 32]).unwrap()),
+        });
+
+        *clock_cell.lock() = start + Duration::from_secs(45);
+        assert!(matches!(
+            upstream.refresh("m1").await,
+            Err(VerifyOutcome::Unverified(Reason::Status))
+        ));
+        *clock_cell.lock() = start + Duration::from_secs(90);
+        assert!(matches!(
+            upstream.verified("m1").await,
+            Err(VerifyOutcome::Unverified(Reason::Status))
+        ));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let (model, stats) = upstream.check_stats().next().unwrap();
+        assert_eq!(model, "m1");
+        assert_eq!((stats.checks(), stats.refusals("status")), (1, 1));
+        assert!(matches!(
+            upstream.refresh("other").await,
+            Err(VerifyOutcome::UnknownModel)
+        ));
+    }
+
     #[tokio::test]
     async fn two_concurrent_checks_on_a_cold_model_make_one_report_fetch_and_share_its_result() {
         let (base, hits, _completions) = spawn_report_server(ReportBehavior {
@@ -795,6 +886,7 @@ mod tests {
             let config = test_config(&base, &["m1"]);
             let state = Arc::new(crate::AppState {
                 upstream: Upstream::new(&config).unwrap(),
+                metrics: crate::metrics::Metrics::new(&config),
                 config,
                 secrets: parking_lot::RwLock::new(crate::Secrets {
                     provider_key: zeroize::Zeroizing::new("provider-key".into()),
@@ -827,6 +919,140 @@ mod tests {
                 assert!(body.contains("upstream_refused"), "{body}");
             }
             assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    /// A prompt and a completion carrying a unique marker go through the front: streamed and
+    /// released, blocked by the judge, refused by the upstream, and once with the marker as the
+    /// model's name. The metrics observed every request of an allowlisted model, and the marker
+    /// reaches neither the metrics nor any line this process logged.
+    #[tokio::test]
+    async fn no_prompt_or_completion_text_reaches_the_metrics_or_the_log() {
+        use crate::guard::Refusal::Blocked;
+        let mut nonce = [0u8; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let marker = format!("leak-marker-{}", hex::encode(nonce));
+        let stream: &'static str = Box::leak(
+            format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"role\":\"assistant\",\"content\":\"\"}}}}]}}\n\n\
+                 data: {{\"choices\":[{{\"delta\":{{\"content\":\"{marker} one\"}}}}]}}\n\n\
+                 data: {{\"choices\":[{{\"delta\":{{\"content\":\" two {marker}\"}}}}]}}\n\n\
+                 data: {{\"choices\":[],\"usage\":{{\"completion_tokens\":2}}}}\n\n\
+                 data: [DONE]\n\n"
+            )
+            .into_boxed_str(),
+        );
+        let refusal: &'static str = Box::leak(
+            format!(r#"{{"error":{{"message":"{marker}","code":"{marker}"}}}}"#).into_boxed_str(),
+        );
+        for (upstream_status, upstream_body, output, model, expected) in [
+            (200, stream, Ok(()), "m1", "status_class=\"2xx\""),
+            (
+                200,
+                stream,
+                Err(Blocked),
+                "m1",
+                "code=\"content_blocked\"} 1",
+            ),
+            (400, refusal, Ok(()), "m1", "code=\"upstream_refused\"} 1"),
+            (200, stream, Ok(()), marker.as_str(), "status_class"),
+        ] {
+            let (cert, key, spki) = self_signed_leaf();
+            let (base, _hits, _last_auth) =
+                spawn_tls_fake_answering(cert, key, upstream_status, upstream_body).await;
+            let config = test_config(&base, &["m1"]);
+            let state = Arc::new(crate::AppState {
+                upstream: Upstream::new(&config).unwrap(),
+                metrics: crate::metrics::Metrics::new(&config),
+                config,
+                secrets: parking_lot::RwLock::new(crate::Secrets {
+                    provider_key: zeroize::Zeroizing::new("provider-key".into()),
+                    caller_bearer: zeroize::Zeroizing::new(b"member".to_vec()),
+                    model_server_bearers: std::collections::BTreeMap::new(),
+                    judge_bearer: zeroize::Zeroizing::new(b"judge".to_vec()),
+                }),
+                own: crate::own::Servers::none(),
+                guard: crate::guard::Guard::fixed(Ok(()), output),
+            });
+            *state.upstream.slots.get("m1").unwrap().lock().await = Some(Checked {
+                at: SystemTime::now(),
+                outcome: Ok(pinned_client(&spki).unwrap()),
+            });
+            let front = spawn_router(crate::router(state.clone())).await;
+            reqwest::Client::new()
+                .post(format!("{front}/v1/chat/completions"))
+                .header(reqwest::header::AUTHORIZATION, "Bearer member")
+                .json(&serde_json::json!({
+                    "model": model,
+                    "stream": true,
+                    "messages": [{"role": "user", "content": format!("say {marker}")}],
+                }))
+                .send()
+                .await
+                .unwrap();
+
+            let metrics = crate::metrics::render(&state);
+            assert!(!metrics.contains(&marker), "{metrics}");
+            assert!(metrics.contains(expected) == (model == "m1"), "{metrics}");
+            if output.is_ok() && upstream_status == 200 && model == "m1" {
+                for observed in [
+                    "alpha_inference_ttft_seconds_count{upstream=\"external\",model=\"m1\"} 1",
+                    "alpha_inference_output_tokens_total{upstream=\"external\",model=\"m1\"} 2",
+                    "alpha_inference_output_tokens_per_second_count{upstream=\"external\",model=\"m1\"} 1",
+                ] {
+                    assert!(metrics.contains(observed), "{observed}\n{metrics}");
+                }
+            }
+        }
+        let logged = crate::test_support::LOGGED.lock().clone();
+        assert!(
+            logged
+                .iter()
+                .any(|line| line.contains("guard phase=output")),
+            "the log was captured"
+        );
+        assert!(
+            logged.iter().all(|line| !line.contains(&marker)),
+            "{logged:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_metrics_listener_serves_only_metrics_without_a_bearer() {
+        let state = test_state(
+            test_config("https://example.invalid", &["m1"]),
+            b"member",
+            "key",
+        );
+        let base = spawn_router(crate::metrics_router(state)).await;
+        let http = reqwest::Client::new();
+        let response = http.get(format!("{base}/metrics")).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("text/plain; version=0.0.4")
+        );
+        let text = response.text().await.unwrap();
+        for zero in [
+            "alpha_inference_errors_total{upstream=\"external\",model=\"m1\",code=\"upstream_unverified\"} 0",
+            "alpha_inference_attestation_checks_total{upstream=\"external\",model=\"m1\"} 0",
+            "alpha_inference_attestation_refusals_total{upstream=\"external\",model=\"m1\",reason=\"binding\"} 0",
+        ] {
+            assert!(text.contains(zero), "{zero}\n{text}");
+        }
+        for path in ["/v1/models", "/v1/chat/completions", "/healthz"] {
+            let response = http
+                .get(format!("{base}{path}"))
+                .header(reqwest::header::AUTHORIZATION, "Bearer member")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 404, "{path}");
         }
     }
 

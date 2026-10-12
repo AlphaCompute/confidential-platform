@@ -1,0 +1,68 @@
+{
+  "about": "The fixed prompt set of alpha-inference-bench: short to long prompts and outputs, sent in this order to every model. Changing it changes what a report measures; keep it when comparing runs.",
+  "prompts": [
+    {
+      "id": "short-fact",
+      "max_tokens": 64,
+      "messages": [
+        { "role": "user", "content": "In one sentence, what does a hash function do?" }
+      ]
+    },
+    {
+      "id": "list-steps",
+      "max_tokens": 256,
+      "messages": [
+        { "role": "system", "content": "You are a concise technical assistant." },
+        { "role": "user", "content": "List the steps to rotate a TLS certificate on a web server without downtime." }
+      ]
+    },
+    {
+      "id": "summarize-paragraph",
+      "max_tokens": 128,
+      "messages": [
+        {
+          "role": "user",
+          "content": "Summarize in two sentences: A confidential virtual machine keeps its memory encrypted with a key held by the processor, so the host operating system and the hypervisor cannot read it. Before a service inside it is given secrets, a remote party checks a signed report from the processor that names the exact software that was loaded. Only if that software is the expected build are the secrets released, and every release is recorded so that it can be audited later."
+        }
+      ]
+    },
+    {
+      "id": "code-function",
+      "max_tokens": 384,
+      "messages": [
+        { "role": "user", "content": "Write a Python function that merges two sorted lists into one sorted list in linear time, with a short docstring and two example calls." }
+      ]
+    },
+    {
+      "id": "explain-tradeoff",
+      "max_tokens": 512,
+      "messages": [
+        { "role": "user", "content": "Explain the trade-offs between batching requests and serving them one at a time in a GPU inference server, covering latency, throughput and memory." }
+      ]
+    },
+    {
+      "id": "multi-turn",
+      "max_tokens": 192,
+      "messages": [
+        { "role": "user", "content": "I am planning a three-day hiking trip in mild autumn weather." },
+        { "role": "assistant", "content": "That sounds like a good time of year for it. What would you like help with?" },
+        { "role": "user", "content": "Give me a packing list grouped into clothing, food and safety." }
+      ]
+    },
+    {
+      "id": "structured-json",
+      "max_tokens": 256,
+      "messages": [
+        { "role": "system", "content": "Answer with JSON only." },
+        { "role": "user", "content": "Describe three fictional books as a JSON array of objects with the fields title, year and a one-sentence summary." }
+      ]
+    },
+    {
+      "id": "long-answer",
+      "max_tokens": 1024,
+      "messages": [
+        { "role": "user", "content": "Write a detailed guide, with headings, to setting up monitoring for a small web service: what to measure, how to alert, and how to avoid alert fatigue." }
+      ]
+    }
+  ]
+}

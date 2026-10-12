@@ -1,0 +1,48 @@
+# SLOs of attested inference through alpha-inference, per upstream: `own` (our attested model
+# servers) and `external` (the external provider behind its attested gateway), and how close our
+# own must stay to the external one. Read by `alpha-inference-bench` for its report, and rendered
+# into rules.yaml by `alpha-inference-bench rules`; a test fails while the two differ.
+#
+# ponytail: every target below is a placeholder, not a measurement. The `own` targets wait for
+# B300/B200 model servers under load (M1); the `external` ones for the provider measured with the
+# bench through the front. Replace both with measured baselines, then render rules.yaml again.
+#
+# What each number is measured on (alpha-inference metrics, and the bench the same way):
+#   ttft     streamed completions, from the upstream leg's start (attestation check, connection
+#            and prefill included) to the first chunk with output
+#   latency  2xx completions, from arrival to answer, moderation included
+#   tokens/s streamed completions, (output tokens - 1) / (last byte - first output)
+#   error rate              server errors (5xx, or no answer) over requests
+#   attestation refusal rate  requests answered `upstream_unverified` over requests
+
+# The window rates and quantiles are taken over, and how long an alert's condition must hold.
+window_minutes = 30
+alert_for_minutes = 15
+# Fewer requests than this behind an objective, in a window or a bench run, is no data: never a pass.
+min_requests = 20
+
+[upstream.own]
+ttft_p50_seconds = 0.5
+ttft_p95_seconds = 1.5
+latency_p50_seconds = 10.0
+latency_p95_seconds = 30.0
+min_tokens_per_second_p50 = 30.0
+max_error_rate = 0.01
+max_attestation_refusal_rate = 0.001
+
+[upstream.external]
+ttft_p50_seconds = 0.75
+ttft_p95_seconds = 2.0
+latency_p50_seconds = 10.0
+latency_p95_seconds = 30.0
+min_tokens_per_second_p50 = 30.0
+max_error_rate = 0.01
+max_attestation_refusal_rate = 0.001
+
+# Our own model servers against the external provider over the same window: own p95 TTFT and
+# latency at most these multiples of the external provider's, own median tokens/s at least this
+# fraction of it.
+[comparison]
+ttft_p95_max_ratio = 1.25
+latency_p95_max_ratio = 1.25
+tokens_per_second_p50_min_ratio = 0.8

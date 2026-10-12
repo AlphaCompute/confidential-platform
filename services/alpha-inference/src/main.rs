@@ -1,9 +1,11 @@
 //! Thin entrypoint: attest, read this Instance's identity and its Secrets — the caller bearer,
 //! and the credential of each upstream kind this Revision uses — then serve the `/v1` routes
-//! over TLS on `:8443` until SIGTERM, refreshing the leaf and the Secrets every five minutes. A failed read of the Secrets is retried; a lost identity ends the process: the
-//! runtime is gone when the Revision is revoked, and the front must not go on serving with what
-//! it read before. All logic lives in `run`, which maps every error to a non-zero exit and never
-//! panics.
+//! over TLS on `:8443` until SIGTERM, refreshing the leaf and the Secrets every five minutes,
+//! keeping every model's upstream check warm and, given `METRICS_PORT`, serving `/metrics` in
+//! plain HTTP on that port alone. A failed read of the Secrets is retried; a lost identity ends
+//! the process: the runtime is gone when the Revision is revoked, and the front must not go on
+//! serving with what it read before. All logic lives in `run`, which maps every error to a
+//! non-zero exit and never panics.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -11,11 +13,12 @@ use std::sync::Arc;
 use alpha_client::runtime::RuntimeIdentity;
 use alpha_client::runtime::{RuntimeSocket, refresh_forever};
 use alpha_client::tls::{InstanceCert, serve, server_config};
-use alpha_inference::{AppState, Config, Error, Secrets, Upstream, guard, own, router};
+use alpha_inference::{
+    AppState, Config, Error, Secrets, TLS_PORT, Upstream, guard, keep_warm_forever, metrics,
+    metrics_router, own, router,
+};
 use tokio::net::TcpListener;
 use zeroize::Zeroizing;
-
-const PORT: u16 = 8443;
 
 #[tokio::main]
 async fn main() {
@@ -102,6 +105,7 @@ async fn run() -> Result<(), Error> {
     let secrets = read_secrets(&runtime, &config).await?;
     let upstream = Upstream::new(&config)?;
     let state = Arc::new(AppState {
+        metrics: metrics::Metrics::new(&config),
         config,
         secrets: parking_lot::RwLock::new(secrets),
         upstream,
@@ -110,9 +114,16 @@ async fn run() -> Result<(), Error> {
     });
     let app = router(state.clone());
 
-    let listener = TcpListener::bind(("0.0.0.0", PORT))
+    let listener = TcpListener::bind(("0.0.0.0", TLS_PORT))
         .await
-        .map_err(|e| Error::internal(format!("bind :{PORT}: {e}")))?;
+        .map_err(|e| Error::internal(format!("bind :{TLS_PORT}: {e}")))?;
+    if let Some(port) = state.config.metrics_port {
+        let metrics = TcpListener::bind(("0.0.0.0", port))
+            .await
+            .map_err(|e| Error::internal(format!("bind :{port}: {e}")))?;
+        tokio::spawn(axum::serve(metrics, metrics_router(state.clone())).into_future());
+    }
+    tokio::spawn(keep_warm_forever(state.clone()));
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| Error::internal(format!("sigterm: {e}")))?;
