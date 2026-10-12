@@ -77,6 +77,16 @@ has_headers "$port" "/sign/$wasm" 200 application/wasm
 font=$(cd "$dist" && ls public_sans-*.woff2)
 has_headers "$port" "/sign/$font" 200 font/woff2
 has_headers "$port" /sign/ 404 ""
+# The embed view (PRD-03 S5, draft): the test document lists no embed_ancestors, so no page may
+# frame it, and it may never use passkeys.
+curl -sI "http://127.0.0.1:$port/sign/embed" | tr -d '\r' > "$tmp/embed"
+head -n 1 "$tmp/embed" | grep -q " 200 " || fail "/sign/embed is not 200"
+grep -q "^Content-Security-Policy: .*frame-ancestors 'none';" "$tmp/embed" || fail "/sign/embed may be framed without embed_ancestors"
+grep -qxF "Permissions-Policy: publickey-credentials-get=(), publickey-credentials-create=()" "$tmp/embed" ||
+  fail "/sign/embed may use passkeys"
+if grep -q "@EMBED_ANCESTORS@" "$tmp/embed"; then
+  fail "/sign/embed carries the unfilled placeholder"
+fi
 has_headers "$port" /sign/nope.js 404 ""
 
 render "$port" "$tmp/good.html"
