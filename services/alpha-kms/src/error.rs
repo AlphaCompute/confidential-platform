@@ -42,7 +42,7 @@ impl ApiError {
             "revision_revoked" | "already_exists" => StatusCode::CONFLICT,
             "not_found" => StatusCode::NOT_FOUND,
             "rate_limited" => StatusCode::TOO_MANY_REQUESTS,
-            "sealed" => StatusCode::SERVICE_UNAVAILABLE,
+            "sealed" | "halted" => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

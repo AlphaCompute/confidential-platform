@@ -1,0 +1,45 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select now() as \"ts!\", h.seq as \"seq?\", h.link as \"link?\"\n           from (select 1) one\n           left join (select seq, link from audit_log where link is not null\n                      order by seq desc limit 1) h on true",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "ts!",
+        "type_info": "Timestamptz",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "seq?",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "audit_log",
+            "name": "seq"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "link?",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "audit_log",
+            "name": "link"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      true,
+      true
+    ]
+  },
+  "hash": "097832719c784f9b1e87f758a275cd65a8ddc197aee161fa24604abe5740647b"
+}

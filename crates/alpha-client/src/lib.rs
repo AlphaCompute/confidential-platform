@@ -365,16 +365,42 @@ impl BootstrapReply {
     }
 }
 
+/// A point of a KMS node's audit chain: a linked row's `seq` and its `link` (base64url of 32
+/// bytes), which commits to every row before it. A node that knows a head refuses a database that
+/// does not hold it: one restored from an older copy, or another copy altogether.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditHead {
+    pub seq: i64,
+    pub link: String,
+}
+
+/// `GET /v1/node/audit-head`: the highest head the node has seen committed, `None` before it has
+/// seen any.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditHeadReply {
+    pub head: Option<AuditHead>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UnsealRequest {
     pub share_hpke: Sealed,
+    /// The head the custodian's share file remembers from an earlier unseal: the node refuses to
+    /// serve a database that does not hold it. Sent only when present, so an earlier release's
+    /// node still takes a request without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_floor: Option<AuditHead>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UnsealReply {
     pub sealed: bool,
     pub shares: usize,
+    /// Once serving: the audit head the node serves from, for the custodian's share file.
+    #[serde(default)]
+    pub audit_head: Option<AuditHead>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -391,6 +417,9 @@ pub struct JoinReply {
     pub tenant_kek_root: String,
     pub ca_key: String,
     pub ca_cert: String,
+    /// The serving node's audit head: the joining node refuses to serve a database without it.
+    #[serde(default)]
+    pub audit_head: Option<AuditHead>,
 }
 
 pub struct Client {
@@ -550,6 +579,10 @@ impl Client {
 
     pub async fn join(&self, body: &JoinRequest) -> Result<JoinReply, Error> {
         self.post("/v1/node/join", body).await
+    }
+
+    pub async fn audit_head(&self) -> Result<AuditHeadReply, Error> {
+        self.request(Method::GET, "/v1/node/audit-head", None).await
     }
 }
 

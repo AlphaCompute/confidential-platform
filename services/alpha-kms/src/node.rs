@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use alpha_attest::{AnyEvidence, Appraised, VerifiedQuote, kata, report_data};
 use alpha_client::tls::PeerCerts;
-use alpha_client::{Client, Identity, JoinReply, JoinRequest, NodeEvidence, Pin, UnsealRequest};
+use alpha_client::{
+    AuditHeadReply, Client, Identity, JoinReply, JoinRequest, NodeEvidence, Pin, UnsealRequest,
+};
 use alpha_core::{context, signing_digest};
 use alpha_crypto::{INFO_NODE_BOOTSTRAP, INFO_UNSEAL_SHARE, Sealed};
 use axum::Json;
@@ -64,6 +66,7 @@ pub async fn bootstrap(
     State(node): State<Arc<Node>>,
     Body(request, _): Body<BootstrapRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    node.chain.refuse_if_halted()?;
     if !node.is_sealed() {
         return Err(ApiError::new("already_exists", "node is already serving"));
     }
@@ -100,10 +103,11 @@ pub async fn bootstrap(
     if inserted != 2 {
         return Err(ApiError::new("already_exists", "database is not empty"));
     }
-    audit::node("node.bootstrap", "ok", json!({}))
-        .insert(&mut tx, Some(&keys.metadata))
+    let appended = audit::node("node.bootstrap", "ok", json!({}))
+        .insert(&mut tx, &node.chain, Some(&keys.metadata))
         .await?;
     tx.commit().await?;
+    appended.committed(&node.chain);
 
     let shares = Gf256::split_bytes(
         2,
@@ -177,6 +181,7 @@ pub async fn unseal(
     State(node): State<Arc<Node>>,
     Body(request, _): Body<UnsealRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    node.chain.refuse_if_halted()?;
     let aad = runtime_spki_sha256(&node);
     let share = alpha_crypto::open(
         &node.xwing_key,
@@ -185,6 +190,11 @@ pub async fn unseal(
         &request.share_hpke,
     )
     .map_err(|e| ApiError::malformed(format!("share_hpke: {e}")))?;
+    let floor = request
+        .audit_floor
+        .as_ref()
+        .map(audit::Head::from_wire)
+        .transpose()?;
     let collected = {
         let mut phase = node.phase.write();
         let Phase::Sealed { shares } = &mut *phase else {
@@ -192,6 +202,7 @@ pub async fn unseal(
         };
         if !shares.contains(&*share) {
             shares.push(share.to_vec());
+            node.unseal_floors.lock().extend(floor);
         }
         shares.clone()
     };
@@ -205,6 +216,14 @@ pub async fn unseal(
             .map(Zeroizing::new)
             .ok_or_else(|| ApiError::malformed("shares do not combine"))?;
         let keys = unwrap_intermediates(&node, &root).await?;
+        // The shares open this database, so their custodians are genuine: the database must hold
+        // every head their share files remember from earlier unseals.
+        let floors = std::mem::take(&mut *node.unseal_floors.lock());
+        for floor in floors {
+            node.chain
+                .observe(&node.pool, floor, "a custodian's share file")
+                .await?;
+        }
         node.start_serving(keys).await
     }
     .await;
@@ -212,13 +231,53 @@ pub async fn unseal(
         if let Phase::Sealed { shares } = &mut *node.phase.write() {
             shares.clear();
         }
+        node.unseal_floors.lock().clear();
         node.audit(audit::node("node.unseal", "denied", e.details()))
             .await?;
         return Err(e);
     }
     node.audit(audit::node("node.unseal", "ok", json!({})))
         .await?;
-    Ok(Json(json!({ "sealed": false, "shares": 2 })))
+    Ok(Json(json!({
+        "sealed": false,
+        "shares": 2,
+        "audit_head": node.chain.floor().map(|h| h.to_wire()),
+    })))
+}
+
+/// The highest audit head this node has seen committed, also once it has halted: a peer that
+/// reads it refuses a database without it ([`learn_peer_heads`]).
+pub async fn audit_head(State(node): State<Arc<Node>>) -> Json<AuditHeadReply> {
+    Json(AuditHeadReply {
+        head: node.chain.floor().map(|h| h.to_wire()),
+    })
+}
+
+const PEER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Each node in `kms_endpoints` that answers over a channel pinned as a join is (the KMS CA and a
+/// listed KMS Revision) gives the highest audit head it has seen; this node's database must hold
+/// every one, or this node halts. A peer that does not answer, or is sealed, tells nothing.
+pub async fn learn_peer_heads(node: &Node) -> Result<(), ApiError> {
+    let Some(doc) = node.platform_document() else {
+        return Ok(());
+    };
+    for endpoint in &node.config.kms_endpoints {
+        let Ok(client) = join_client(node, endpoint, &doc.kms_ca_pem, &doc.kms_revisions) else {
+            continue;
+        };
+        let Ok(Ok(AuditHeadReply { head: Some(head) })) =
+            tokio::time::timeout(PEER_TIMEOUT, client.audit_head()).await
+        else {
+            continue;
+        };
+        let Ok(head) = audit::Head::from_wire(&head) else {
+            eprintln!("audit head from {endpoint}: malformed");
+            continue;
+        };
+        node.chain.observe(&node.pool, head, endpoint).await?;
+    }
+    Ok(())
 }
 
 pub async fn join(
@@ -275,6 +334,8 @@ async fn join_audited(
         "tenant_kek_root": BASE64_URL_SAFE_NO_PAD.encode(keys.tenant_kek_root.as_slice()),
         "ca_key": BASE64_URL_SAFE_NO_PAD.encode(keys.ca_key_der.as_slice()),
         "ca_cert": BASE64_URL_SAFE_NO_PAD.encode(&keys.ca_cert_der),
+        // Includes the `node.join` row above: the joining node must find it in its database.
+        "audit_head": node.chain.floor().map(|h| h.to_wire()),
     }))
 }
 
@@ -389,7 +450,8 @@ pub async fn join_request(
     })
 }
 
-/// Serves with the intermediates the other node handed over.
+/// Serves with the intermediates the other node handed over, once its database holds the audit
+/// head the serving node reported: a node pointed at another or an older copy halts instead.
 pub async fn finish_join(node: &Node, reply: &JoinReply) -> Result<(), ApiError> {
     let field = |name: &str, text: &str| {
         alpha_client::decode(name, text).map_err(|e| ApiError::internal(format!("join reply: {e}")))
@@ -403,6 +465,15 @@ pub async fn finish_join(node: &Node, reply: &JoinReply) -> Result<(), ApiError>
         Zeroizing::new(field("ca_key", &reply.ca_key)?),
         field("ca_cert", &reply.ca_cert)?,
     )?;
+    if let Some(head) = &reply.audit_head {
+        node.chain
+            .observe(
+                &node.pool,
+                audit::Head::from_wire(head)?,
+                "the node it joined",
+            )
+            .await?;
+    }
     node.start_serving(keys).await
 }
 

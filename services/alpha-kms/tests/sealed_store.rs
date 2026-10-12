@@ -305,14 +305,17 @@ async fn without_keys_a_node_writes_only_node_facts_in_the_clear() {
         details: json!({}),
         evidence_sha256: None,
     };
-    let e = tenant.insert_now(&h.pool, None).await.unwrap_err();
+    let e = tenant
+        .insert_now(&h.pool, &h.node.chain, None)
+        .await
+        .unwrap_err();
     assert_eq!(e.code, "sealed");
     let fact = audit::node(
         "node.join.request",
         "ok",
         json!({ "endpoint": "https://a" }),
     );
-    let seq = fact.insert_now(&h.pool, None).await.unwrap();
+    let seq = fact.insert_now(&h.pool, &h.node.chain, None).await.unwrap();
     let row = h
         .audit_rows()
         .await
@@ -465,16 +468,20 @@ async fn the_audit_chain_catches_a_changed_moved_inserted_or_removed_row() {
     h.node.maintain().await;
     let (_, ready) = send(client().get(format!("{}/ready", h.url))).await;
     assert_eq!(ready["audit_chain"], json!({ "verified_through": head }));
+    let instance = h.instance_client().await;
+    let secret_url = format!("{}/v1/secrets/chained", h.url);
+    assert_eq!(send(instance.get(&secret_url)).await.0, StatusCode::OK);
     exec(
         &h,
         "insert into audit_log (ts, sealed, link) select ts, sealed, link from audit_log where seq = $1",
         &[b],
     )
     .await;
+    let tampered_at = count(&h, "select max(seq) from audit_log").await;
     h.node.maintain().await;
-    let (_, ready) = send(client().get(format!("{}/ready", h.url))).await;
-    let broken = ready["audit_chain"]["broken"].as_str().unwrap();
-    assert!(broken.contains(&format!("seq {}", head + 2)), "{broken}");
+    let broken = h.node.audit_chain.lock().clone().unwrap_err();
+    assert!(broken.contains(&format!("seq {tampered_at}")), "{broken}");
+    assert_halted(&h, &instance, "audit_chain_broken").await;
 }
 
 #[tokio::test]
