@@ -22,7 +22,9 @@ purpose (`[a-z0-9][a-z0-9._-]{0,63}`); a repeated key or any other shape is refu
 `ALPHACOMPUTE_TLS_UPSTREAM`, measured too, is `<service>:<port>`, the published service of a
 wrapped compose and its plain container port; the service must be a lowercase key purpose and
 the port 1 to 65535, or the runtime exits 1 at start naming the variable. Without it the runtime
-opens no TCP port at all.
+opens no TCP port at all. `ALPHACOMPUTE_EVIDENCE_EXPORT`, measured too (on Kata, pinned by the
+agent policy), is unset or exactly `alphacompute-evidence-export/1`, which turns on
+`GET /v1/evidence`; any other value exits 1 at start.
 
 The socket is `/run/alpha/runtime.sock`, HTTP/1.1 JSON, no authentication (access is the right
 to the socket), and comes up only after the first attestation succeeded:
@@ -33,6 +35,7 @@ to the socket), and comes up only after the first attestation succeeded:
 | `GET /v1/secrets/{name}` | the KMS reply for the Secret of that KMS name (a declared Secret's is `<app_id>.<name>`), fetched over mTLS with the leaf and cached until the leaf expires; a KMS error passes through in its envelope with its status |
 | `GET /v1/keys/{purpose}` | the KMS reply to `POST /v1/keys/derive` for that purpose, `{key}`, 32 bytes base64url: the App's own key, the same for every Revision of the App; fetched and cached like a secret, up to 64 purposes per leaf, beyond which a key is derived again on every read |
 | `GET /v1/evidence-bundle` | the current leaf's evidence bundle (`alphacompute-evidence-bundle/1`): the attest request as sent, the `[leaf, KMS CA]` chain and the KMS's `attestation_receipt`, which signs the result and the verifiers that attested this workload (PRD-06 clear claims, `docs/clear-claims.md`); 404 when the KMS sent no receipt |
+| `GET /v1/evidence?nonce=<base64url 32 bytes>` | PRD-06 I2: the evidence this runtime sends the KMS, over a second verifier's nonce (`alphacompute-evidence-export/1`, `docs/evidence-export.md`); `404` unless the measured `ALPHACOMPUTE_EVIDENCE_EXPORT=alphacompute-evidence-export/1` turns it on, `&format=fortanix-ccm` answers `501` until Fortanix's F8 |
 | `GET /healthz` | `{attested, cert_not_after}` |
 
 With no valid leaf (the last renewal failed and the hour is over) every route but `/healthz` answers

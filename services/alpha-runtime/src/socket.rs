@@ -6,7 +6,7 @@ use std::sync::Arc;
 use alpha_client::DerivedKey;
 use alpha_core::RequestId;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -22,6 +22,7 @@ pub fn router(runtime: Arc<Runtime>) -> Router {
         .route("/v1/secrets/{name}", get(secret))
         .route("/v1/keys/{purpose}", get(key))
         .route("/v1/evidence-bundle", get(evidence_bundle))
+        .route("/v1/evidence", get(evidence))
         .route("/healthz", get(healthz))
         .fallback(|| async { envelope(StatusCode::NOT_FOUND, "not_found", "no such route") })
         .with_state(runtime)
@@ -112,6 +113,61 @@ async fn evidence_bundle(State(runtime): State<Arc<Runtime>>) -> Result<Response
             "the KMS sent no attestation receipt",
         ),
     })
+}
+
+/// PRD-06 I2: `GET /v1/evidence?nonce=<32 bytes base64url>[&format=alphacompute|fortanix-ccm]`.
+/// 404 unless `ALPHACOMPUTE_EVIDENCE_EXPORT` turned it on; `fortanix-ccm` answers 501 until F8.
+async fn evidence(State(runtime): State<Arc<Runtime>>, uri: Uri) -> Result<Response, Error> {
+    let mut nonce = None;
+    let mut format = "alphacompute";
+    for pair in uri.query().unwrap_or_default().split('&') {
+        match pair.split_once('=') {
+            Some(("nonce", value)) if nonce.is_none() => nonce = Some(value),
+            Some(("format", value)) => format = value,
+            _ => {
+                return Ok(envelope(
+                    StatusCode::BAD_REQUEST,
+                    "malformed",
+                    "query: nonce=<base64url>, optionally format=alphacompute|fortanix-ccm",
+                ));
+            }
+        }
+    }
+    let Some(nonce) = nonce
+        .and_then(|n| BASE64_URL_SAFE_NO_PAD.decode(n).ok())
+        .and_then(|n| <[u8; 32]>::try_from(n).ok())
+    else {
+        return Ok(envelope(
+            StatusCode::BAD_REQUEST,
+            "malformed",
+            "nonce: expected 32 bytes base64url",
+        ));
+    };
+    if !matches!(format, "alphacompute" | "fortanix-ccm") {
+        return Ok(envelope(
+            StatusCode::BAD_REQUEST,
+            "malformed",
+            "format: alphacompute or fortanix-ccm",
+        ));
+    }
+    let Some(export) = runtime.export_evidence(&nonce).await? else {
+        return Ok(envelope(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "evidence export is off: the measured configuration does not set ALPHACOMPUTE_EVIDENCE_EXPORT",
+        ));
+    };
+    if format == "fortanix-ccm" {
+        return Ok(match alpha_attest::export::ccm_input(&export) {
+            Ok(input) => Json(input).into_response(),
+            Err(e) => envelope(
+                StatusCode::NOT_IMPLEMENTED,
+                "not_implemented",
+                e.to_string(),
+            ),
+        });
+    }
+    Ok(Json(export).into_response())
 }
 
 pub fn healthz_json(runtime: &Runtime) -> Value {

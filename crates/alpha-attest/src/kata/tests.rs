@@ -901,3 +901,28 @@ async fn gpu_backends_run_only_after_every_td_check_passed() {
     );
     assert_eq!(calls(), 1);
 }
+
+/// PRD-06 I2: an exported pod's quote appraises under `kata-tdx/1` with the derived nonce, so a
+/// second verifier runs the KMS's own rules, and never with the caller's raw nonce.
+#[test]
+fn an_exported_quote_appraises_over_the_derived_nonce_only() {
+    use crate::export::{export_nonce, export_report_data};
+    let pod = Pod::cpu();
+    let caller = [0x5a; 32];
+    let quote = VerifiedQuote {
+        report_data: export_report_data(SPKI, &caller),
+        ..pod.quote()
+    };
+    let derived = export_nonce(&caller);
+    let appraised = appraise_kata_cpu(&pod.evidence(), quote.clone(), &derived, SPKI, None, &doc())
+        .unwrap()
+        .finish(None, &[])
+        .unwrap();
+    assert_eq!(appraised.compose_hash, pod.revision_hash());
+    refused(
+        appraise_kata_cpu(&pod.evidence(), quote, &caller, SPKI, None, &doc())
+            .and_then(|c| c.finish(None, &[])),
+        "attestation_failed",
+        "report_data is not bound",
+    );
+}
