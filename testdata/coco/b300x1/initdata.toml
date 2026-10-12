@@ -1,0 +1,54 @@
+algorithm = "sha384"
+version = "0.1.0"
+
+[data]
+"policy.rego" = '''
+package agent_policy
+
+import rego.v1
+
+# Requests from the host that this pod refuses whatever they carry.
+default AllowRequestsFailingPolicy := false
+default CopyFileRequest := false
+default CreateContainerRequest := false
+default ExecProcessRequest := false
+default ReadStreamRequest := false
+default SetPolicyRequest := false
+default StartContainerRequest := true
+default WaitProcessRequest := true
+
+CreateContainerRequest if {
+	some container in policy_data.containers
+	input.OCI.Annotations["io.kubernetes.cri.image-name"] == container.OCI.Annotations["io.kubernetes.cri.image-name"]
+}
+
+policy_data := {
+  "containers": [
+    {
+      "OCI": {
+        "Annotations": {
+          "io.kubernetes.cri.container-type": "sandbox",
+          "io.kubernetes.cri.image-name": "registry.k8s.io/pause@sha256:5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c"
+        }
+      }
+    },
+    {
+      "OCI": {
+        "Annotations": {
+          "io.kubernetes.cri.container-type": "container",
+          "io.kubernetes.cri.image-name": "ghcr.io/alphacompute/alpha-runtime@sha256:7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d"
+        }
+      }
+    },
+    {
+      "OCI": {
+        "Annotations": {
+          "io.kubernetes.cri.container-type": "container",
+          "io.kubernetes.cri.image-name": "docker.io/vllm/vllm-openai@sha256:e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1"
+        }
+      }
+    }
+  ]
+}
+'''
+"alpha.json" = '''{"app_id":"01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b","format":"alphacompute-initdata/1","gpu":{"count":1,"model":"B300"},"runtime_class":"kata-qemu-nvidia-gpu-tdx"}'''

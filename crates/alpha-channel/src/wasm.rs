@@ -70,6 +70,35 @@ pub fn compose_services(compose: &str) -> Result<String, JsError> {
     to_json(&compose::services(compose).map_err(js)?)
 }
 
+/// Whether a registered document is a Revision v2 rather than a compose, by the test the KMS
+/// applies.
+#[wasm_bindgen(js_name = isCocoRevision)]
+pub fn is_coco_revision(text: &str) -> bool {
+    alpha_core::coco::is_revision_v2(text)
+}
+
+/// `{revision, pod}` of `text`, a Revision v2 that registration accepts for `app_id`. `pod` is
+/// `{policy: {exec, logs, images}, policy_text}` read from `initdata_b64` (standard base64 of the
+/// init-data bytes), which must rebuild `text` exactly (`compose_mismatch` otherwise), or null
+/// when no init-data is given.
+#[wasm_bindgen(js_name = cocoRevision)]
+pub fn coco_revision(
+    text: &str,
+    app_id: &str,
+    initdata_b64: Option<String>,
+) -> Result<String, JsError> {
+    use base64::Engine;
+    use base64::prelude::BASE64_STANDARD;
+    let app_id: alpha_core::AppId = app_id
+        .parse()
+        .map_err(|_| js(Error::Malformed(format!("app_id {app_id:?} is not a UUID"))))?;
+    let initdata = initdata_b64
+        .map(|b64| BASE64_STANDARD.decode(b64))
+        .transpose()
+        .map_err(|_| js(Error::Malformed("initdata is not standard base64".into())))?;
+    to_json(&crate::coco::view(text, app_id, initdata.as_deref()).map_err(js)?)
+}
+
 fn canonical(value: &serde_json::Value) -> Result<String, JsError> {
     alpha_core::jcs(value)
         .ok()
