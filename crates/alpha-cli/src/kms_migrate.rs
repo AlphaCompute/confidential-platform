@@ -21,16 +21,24 @@
 //!   step done only once its effect is observed (the joined node serves with the baseline's
 //!   identifiers, or the stopped node no longer serves), and prints the one action that follows.
 //!   It never marks two steps at once.
+//! - `rollback`: reverses the last recorded step, as Q61 proposes. Undoing a join: the operator
+//!   stops that Kata node, and the tool checks that it no longer serves and that the quorum and
+//!   the CA and key identifiers are unchanged. Undoing a stop: the operator restarts that prototype
+//!   node, and the tool checks that it rejoined with the same identifiers. Like `step`, it marks
+//!   the rollback done only once that is observed, and refuses if any other node's identifiers
+//!   differ or the quorum would drop. Once the last prototype node has stopped, a prototype node
+//!   can only come back by joining a Kata node, so undoing that stop is refused unless the
+//!   prototype build is still listed in `kms_revisions`.
 //!
-//! Unknowns are open questions in the PR (PRD-05 draft): the prototype inventory (Q57), the
-//! key identifiers' publication (Q58), the quorum (Q59), cut-over order (Q60), rollback (Q61),
-//! and whether the tool should drive Rafay and the prototype platform itself (Q62).
+//! Open questions in the PR, numbered program-wide: the prototype inventory (Q57), the key
+//! identifiers' publication (Q58), the quorum (Q59), cut-over order (Q60), rollback (Q61, built
+//! as proposed), and whether the tool should drive Rafay and the prototype platform itself (Q62).
 
 use std::collections::BTreeSet;
 
 use alpha_attest::PlatformDocument;
 use alpha_client::{Client, NodeKeyIds, Pin};
-use alpha_core::ComposeHash;
+use alpha_core::{ComposeHash, KmsRevisionKind};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -463,6 +471,10 @@ pub async fn verify(
 pub struct State {
     pub format: String,
     pub completed: Vec<Step>,
+    /// The last completed step while `rollback` waits for its reversal to be observed. `step`
+    /// refuses until the rollback completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolling_back: Option<Step>,
 }
 
 impl State {
@@ -470,7 +482,23 @@ impl State {
         Self {
             format: STATE_FORMAT.into(),
             completed: Vec::new(),
+            rolling_back: None,
         }
+    }
+
+    /// The format, and the completed steps as the start of `plan`.
+    fn check(&self, plan: &[Step]) -> Result<(), String> {
+        if self.format != STATE_FORMAT {
+            return Err(format!("state: format {:?}", self.format));
+        }
+        if !plan.starts_with(&self.completed) {
+            return Err(
+                "state: the completed steps are not the start of this inventory's plan; \
+                 the inventory changed mid-migration"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -515,16 +543,13 @@ pub async fn step(
     state: &mut State,
     doc: &PlatformDocument,
 ) -> Result<StepOutcome, String> {
-    if state.format != STATE_FORMAT {
-        return Err(format!("state: format {:?}", state.format));
-    }
     let plan = plan(inventory)?;
-    if !plan.starts_with(&state.completed) {
-        return Err(
-            "state: the completed steps are not the start of this inventory's plan; \
-                    the inventory changed mid-migration"
-                .into(),
-        );
+    state.check(&plan)?;
+    if let Some(undoing) = &state.rolling_back {
+        return Err(format!(
+            "a rollback of {undoing:?} is in progress; run `alpha kms migrate rollback` until it \
+             completes"
+        ));
     }
     let report = verify(inventory, baseline, doc).await?;
     if !report.ok {
@@ -535,11 +560,17 @@ pub async fn step(
     }
     let done = state.completed.len();
     let (must_serve, must_not) = expected(inventory, &plan, done);
-    for name in &must_serve {
+    // The prototype node a pending stop names may already be stopped: that is the effect `step`
+    // is waiting to observe.
+    let stopping = match plan.get(done) {
+        Some(Step::Stop(n)) => Some(n.as_str()),
+        _ => None,
+    };
+    for name in must_serve.iter().filter(|n| Some(n.as_str()) != stopping) {
         if !report.serving(name) {
             return Err(format!(
-                "{name} must serve after {done} steps but does not; nothing marked \
-                 (TODO(draft): rollback, QUESTION(PRD-05 Q61))"
+                "{name} must serve after {done} steps but does not; nothing marked (`alpha kms \
+                 migrate rollback` reverses the last step)"
             ));
         }
     }
@@ -587,6 +618,249 @@ pub async fn step(
         Ok(StepOutcome {
             completed: None,
             next: next_of(done),
+            report,
+        })
+    }
+}
+
+/// What `rollback` decided.
+#[derive(Clone, Debug, Serialize)]
+pub struct RollbackOutcome {
+    /// The step being reversed: the last one recorded.
+    pub undoing: Step,
+    /// True once the reversal was observed and the step removed from the state.
+    pub rolled_back: bool,
+    /// What the operator does now: the reversal, or, once it is done, the step that is pending
+    /// again.
+    pub next: Value,
+    pub report: Report,
+}
+
+impl Step {
+    /// What the operator does to reverse this step.
+    pub fn undo_action(&self, inventory: &Inventory) -> String {
+        let endpoint = inventory
+            .nodes
+            .iter()
+            .find(|n| n.name == self.node())
+            .map_or("", |n| n.endpoint.as_str());
+        match self {
+            Self::Join(n) => format!(
+                "stop the Kata KMS node {n} ({endpoint}) through Rafay, and only that one; the CA \
+                 and keys stay as they are, since they never left the database. Then run `alpha \
+                 kms migrate rollback` again."
+            ),
+            Self::Stop(n) => format!(
+                "restart the prototype KMS node {n} ({endpoint}); it rejoins a serving node on \
+                 start. Then run `alpha kms migrate rollback` again."
+            ),
+        }
+    }
+}
+
+/// The build a restarted prototype node `name` attests as: its Revision in the baseline, or, if
+/// it was not serving when the baseline was taken, every prototype Revision the baseline records.
+fn prototype_builds(baseline: &Baseline, name: &str) -> Vec<ComposeHash> {
+    let revision = |v: &Value| serde_json::from_value::<ComposeHash>(v["revision"].clone()).ok();
+    let own: Vec<ComposeHash> = baseline
+        .taken_from
+        .iter()
+        .filter(|v| v["node"].as_str() == Some(name))
+        .filter_map(revision)
+        .collect();
+    if own.is_empty() {
+        baseline.taken_from.iter().filter_map(revision).collect()
+    } else {
+        own
+    }
+}
+
+/// Q61: a restarted prototype node serves again only by joining a serving node, which admits it
+/// only if its build is listed as `prototype-tdx` in `kms_revisions`. Once the last prototype node
+/// has stopped, the node it joins is a Kata node, so the prototype build must stay listed (until
+/// M-G) for a stop to be reversible at all.
+fn check_prototype_listed(
+    baseline: &Baseline,
+    doc: &PlatformDocument,
+    name: &str,
+    last_prototype: bool,
+) -> Result<(), String> {
+    let builds = prototype_builds(baseline, name);
+    let listed = builds.iter().any(|b| {
+        doc.kms_revisions
+            .iter()
+            .any(|r| r.compose_hash == *b && r.kind == KmsRevisionKind::PrototypeTdx)
+    });
+    if listed {
+        return Ok(());
+    }
+    let builds = builds
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let why = if last_prototype {
+        format!(
+            "{name} was the last prototype node to stop, so restarting it means a prototype node \
+             joining a Kata node"
+        )
+    } else {
+        format!("restarting {name} means it joins a serving node again")
+    };
+    Err(format!(
+        "rollback refused, nothing marked: {why}, and a serving node admits it only while its \
+         build ({builds}) is listed as prototype-tdx in the platform document's kms_revisions \
+         (version {}), which it is not. Keep the prototype build listed until M-G (Q61), or go \
+         forward instead.",
+        doc.version
+    ))
+}
+
+/// Reverses the last recorded step: names what the operator does, and removes the step from
+/// `state` once its reversal is observed. Refuses when any node other than the one being rolled
+/// back reports other identifiers, the document names another CA, stopping a Kata node would
+/// leave fewer than `quorum` serving, or another node is out of place.
+pub async fn rollback(
+    inventory: &Inventory,
+    baseline: &Baseline,
+    state: &mut State,
+    doc: &PlatformDocument,
+) -> Result<RollbackOutcome, String> {
+    let plan = plan(inventory)?;
+    state.check(&plan)?;
+    let last = state
+        .completed
+        .last()
+        .cloned()
+        .ok_or("state: no step is recorded, so there is nothing to roll back")?;
+    if let Step::Stop(name) = &last {
+        let (serving_after, _) = expected(inventory, &plan, state.completed.len());
+        let last_prototype = !inventory
+            .of(NodeKind::Prototype)
+            .iter()
+            .any(|p| serving_after.contains(&p.name));
+        check_prototype_listed(baseline, doc, name, last_prototype)?;
+    }
+    let report = verify(inventory, baseline, doc).await?;
+    let document = match document_ca_spki(doc) {
+        Ok(ca) if ca == baseline.ca_spki_sha256 => None,
+        Ok(ca) => Some(format!(
+            "the platform document (version {}) names the CA key {ca}, not the baseline's",
+            doc.version
+        )),
+        Err(e) => Some(e),
+    };
+    rollback_observed(inventory, &plan, state, report, document)
+}
+
+/// [`rollback`] once every node was observed through the baseline's pin; `document` is what is
+/// wrong with the platform document's CA, if anything.
+pub fn rollback_observed(
+    inventory: &Inventory,
+    plan: &[Step],
+    state: &mut State,
+    report: Report,
+    document: Option<String>,
+) -> Result<RollbackOutcome, String> {
+    state.check(plan)?;
+    let done = state.completed.len();
+    let last = state
+        .completed
+        .last()
+        .cloned()
+        .ok_or("state: no step is recorded, so there is nothing to roll back")?;
+    if let Some(undoing) = &state.rolling_back
+        && *undoing != last
+    {
+        return Err(format!(
+            "state: rolling back {undoing:?}, but the last recorded step is {last:?}"
+        ));
+    }
+    let target = last.node();
+    let refused = |why: String| {
+        Err(format!(
+            "rollback of {last:?} refused, nothing marked: {why}"
+        ))
+    };
+
+    // What a rollback does not undo stops it: another CA in the document, or any node but the
+    // Kata node being stopped reporting other identifiers (a restarted prototype node included).
+    let mut problems: Vec<String> = document.into_iter().collect();
+    for node in &report.nodes {
+        let undone_join = node.node == target && matches!(last, Step::Join(_));
+        if !node.differences.is_empty() && !undone_join {
+            problems.push(format!("{}: {}", node.node, node.differences.join("; ")));
+        }
+    }
+    if !problems.is_empty() {
+        return refused(problems.join("; "));
+    }
+
+    // The quorum, counting only nodes with the baseline's identifiers.
+    let others = report
+        .nodes
+        .iter()
+        .filter(|n| n.serving && n.differences.is_empty() && n.node != target)
+        .count();
+    let target_serving = report.serving(target);
+    let (observed, serving_after) = match &last {
+        Step::Join(_) => (!target_serving, others),
+        Step::Stop(_) => (
+            target_serving,
+            others.saturating_add(usize::from(target_serving)),
+        ),
+    };
+    if let Step::Join(n) = &last
+        && others < inventory.quorum
+    {
+        return refused(format!(
+            "without {n}, {others} nodes serve under the baseline's identifiers, below the \
+             quorum {}",
+            inventory.quorum
+        ));
+    }
+    // Every other node where the plan has it one step back.
+    let (must_serve, must_not) = expected(inventory, plan, done.saturating_sub(1));
+    for name in must_serve.iter().filter(|n| *n != target) {
+        if !report.serving(name) {
+            return refused(format!("{name} must serve but does not"));
+        }
+    }
+    for name in must_not.iter().filter(|n| *n != target) {
+        if report.serving(name) {
+            return refused(format!(
+                "{name} was stopped by an earlier step but serves again"
+            ));
+        }
+    }
+    for later in plan.iter().skip(done) {
+        if let Step::Join(n) = later
+            && report.serving(n)
+        {
+            return refused(format!("{n} serves before its turn"));
+        }
+    }
+    if observed && serving_after < inventory.quorum {
+        return refused(format!(
+            "{serving_after} nodes serve, below the quorum {}",
+            inventory.quorum
+        ));
+    }
+    if observed {
+        state.completed.pop();
+        state.rolling_back = None;
+        Ok(RollbackOutcome {
+            next: json!({ "step": last, "action": last.action(inventory) }),
+            undoing: last,
+            rolled_back: true,
+            report,
+        })
+    } else {
+        state.rolling_back = Some(last.clone());
+        Ok(RollbackOutcome {
+            next: json!({ "rollback": last, "action": last.undo_action(inventory) }),
+            undoing: last,
+            rolled_back: false,
             report,
         })
     }
@@ -740,5 +1014,138 @@ mod tests {
         let mut cert = ids(&baseline.ca_spki_sha256, "hmac-sha256:t");
         cert.ca_cert_sha256 = "sha256:reissued".into();
         assert!(baseline.differences(&cert)[0].starts_with("CA certificate"));
+    }
+
+    /// A report in which `serving` serve, `differing` among them with another tenant key.
+    fn report_of(inv: &Inventory, serving: &[&str], differing: &[&str]) -> Report {
+        let nodes: Vec<NodeReport> = inv
+            .nodes
+            .iter()
+            .map(|n| {
+                let up = serving.contains(&n.name.as_str());
+                NodeReport {
+                    node: n.name.clone(),
+                    kind: n.kind,
+                    serving: up,
+                    revision: up.then(|| ComposeHash::from([1; 32])),
+                    not_serving: (!up).then(|| "connection refused".into()),
+                    differences: if differing.contains(&n.name.as_str()) {
+                        vec!["tenant-kek-root: hmac-sha256:other where the baseline has t".into()]
+                    } else {
+                        Vec::new()
+                    },
+                }
+            })
+            .collect();
+        Report {
+            ok: true,
+            serving: serving.len(),
+            quorum: inv.quorum,
+            problems: Vec::new(),
+            nodes,
+        }
+    }
+
+    fn state_of(steps: &[Step]) -> State {
+        State {
+            completed: steps.to_vec(),
+            ..State::new()
+        }
+    }
+
+    #[test]
+    fn rolling_back_a_join_waits_for_that_kata_node_to_stop() {
+        let inv = inventory(2, 2, 2);
+        let plan = plan(&inv).unwrap();
+        let mut state = state_of(&plan[..1]);
+        // Still serving: the operator is told to stop it, and the rollback is recorded as pending.
+        let report = report_of(&inv, &["proto-0", "proto-1", "kata-0"], &[]);
+        let out = rollback_observed(&inv, &plan, &mut state, report, None).unwrap();
+        assert!(!out.rolled_back);
+        assert_eq!(out.undoing, Step::Join("kata-0".into()));
+        let action = out.next["action"].as_str().unwrap();
+        assert!(
+            action.starts_with("stop the Kata KMS node kata-0"),
+            "{action}"
+        );
+        assert_eq!(state.rolling_back, Some(Step::Join("kata-0".into())));
+        assert_eq!(state.completed.len(), 1);
+        // A Kata node that joined with other identifiers can still be rolled back.
+        let report = report_of(&inv, &["proto-0", "proto-1", "kata-0"], &["kata-0"]);
+        assert!(rollback_observed(&inv, &plan, &mut state, report, None).is_ok());
+        // Stopped, the others unchanged: rolled back, and the join is pending again.
+        let report = report_of(&inv, &["proto-0", "proto-1"], &[]);
+        let out = rollback_observed(&inv, &plan, &mut state, report, None).unwrap();
+        assert!(out.rolled_back);
+        assert_eq!(
+            out.next["step"],
+            json!({ "action": "join", "node": "kata-0" })
+        );
+        assert_eq!(state, State::new());
+    }
+
+    #[test]
+    fn rolling_back_a_stop_waits_for_that_prototype_node_to_rejoin_unchanged() {
+        let inv = inventory(2, 2, 2);
+        let plan = plan(&inv).unwrap();
+        let mut state = state_of(&plan[..2]);
+        let report = report_of(&inv, &["proto-1", "kata-0"], &[]);
+        let out = rollback_observed(&inv, &plan, &mut state, report, None).unwrap();
+        assert!(!out.rolled_back);
+        let action = out.next["action"].as_str().unwrap();
+        assert!(
+            action.starts_with("restart the prototype KMS node proto-0"),
+            "{action}"
+        );
+        // Back, but with other identifiers: refused, and nothing marked.
+        let report = report_of(&inv, &["proto-0", "proto-1", "kata-0"], &["proto-0"]);
+        let refused = rollback_observed(&inv, &plan, &mut state, report, None).unwrap_err();
+        assert!(refused.contains("proto-0: tenant-kek-root"), "{refused}");
+        assert_eq!(state.completed.len(), 2);
+        let report = report_of(&inv, &["proto-0", "proto-1", "kata-0"], &[]);
+        let out = rollback_observed(&inv, &plan, &mut state, report, None).unwrap();
+        assert!(out.rolled_back);
+        assert_eq!(state, state_of(&plan[..1]));
+    }
+
+    #[test]
+    fn a_rollback_refuses_moved_identifiers_a_broken_quorum_and_nodes_out_of_place() {
+        let inv = inventory(2, 2, 2);
+        let plan = plan(&inv).unwrap();
+        let refused = |state: &mut State, serving: &[&str], differing: &[&str]| {
+            let report = report_of(&inv, serving, differing);
+            rollback_observed(&inv, &plan, state, report, None).unwrap_err()
+        };
+        let mut state = state_of(&plan[..1]);
+        // Another node's identifiers moved: not what this rollback undoes.
+        let err = refused(&mut state, &["proto-0", "proto-1", "kata-0"], &["proto-1"]);
+        assert!(err.contains("proto-1: tenant-kek-root"), "{err}");
+        // proto-1 is down: stopping kata-0 would leave one node, below the quorum of two.
+        let err = refused(&mut state, &["proto-0", "kata-0"], &[]);
+        assert!(err.contains("below the quorum 2"), "{err}");
+        // A later Kata node joined ahead of the plan.
+        let err = refused(&mut state, &["proto-0", "proto-1", "kata-0", "kata-1"], &[]);
+        assert!(err.contains("kata-1 serves before its turn"), "{err}");
+        assert_eq!(state, state_of(&plan[..1]));
+        // Undoing a stop while another stopped prototype serves again.
+        let mut state = state_of(&plan[..4]);
+        let err = refused(&mut state, &["kata-0", "kata-1", "proto-0"], &[]);
+        assert!(
+            err.contains("proto-0 was stopped by an earlier step"),
+            "{err}"
+        );
+        // The document names another CA.
+        let report = report_of(&inv, &["kata-0", "kata-1"], &[]);
+        let err = rollback_observed(&inv, &plan, &mut state, report, Some("other CA".into()))
+            .unwrap_err();
+        assert!(err.contains("other CA"), "{err}");
+        // Nothing recorded, nothing to roll back; a pending rollback of another step.
+        let report = report_of(&inv, &["proto-0", "proto-1"], &[]);
+        let err = rollback_observed(&inv, &plan, &mut State::new(), report, None).unwrap_err();
+        assert!(err.contains("nothing to roll back"), "{err}");
+        let mut state = state_of(&plan[..2]);
+        state.rolling_back = Some(plan[0].clone());
+        let report = report_of(&inv, &["proto-1", "kata-0"], &[]);
+        assert!(rollback_observed(&inv, &plan, &mut state, report, None).is_err());
     }
 }

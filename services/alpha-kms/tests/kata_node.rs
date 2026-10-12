@@ -522,3 +522,171 @@ async fn kms_migrate_marks_a_join_that_kept_the_ca_and_keys_and_nothing_else() {
     assert!(refused.contains("verify failed"), "{refused}");
     assert_eq!(state.completed.len(), 1);
 }
+
+/// Waits until `verify` sees `name` serving (or not) through the baseline's pin.
+async fn await_serving(
+    inventory: &alpha_cli::kms_migrate::Inventory,
+    baseline: &alpha_cli::kms_migrate::Baseline,
+    doc: &alpha_attest::PlatformDocument,
+    name: &str,
+    serving: bool,
+) {
+    for _ in 0..100 {
+        let report = alpha_cli::kms_migrate::verify(inventory, baseline, doc)
+            .await
+            .unwrap();
+        if report.serving(name) == serving {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    panic!("{name} never became serving={serving}");
+}
+
+/// Serves `node` on `url`'s address again: the prototype node, restarted where it was.
+async fn restart(node: &Arc<Node>, url: &str) -> tokio::sync::oneshot::Sender<()> {
+    let addr: std::net::SocketAddr = url.trim_start_matches("https://").parse().unwrap();
+    let mut listener = None;
+    // The stopped listener lets go of the port once its connections drained.
+    for _ in 0..100 {
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(l) => {
+                listener = Some(l);
+                break;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
+        }
+    }
+    let listener = listener.unwrap();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let app = alpha_kms::router(node.clone());
+    let config = tls::server_config(node.server_cert.clone()).unwrap();
+    tokio::spawn(async move {
+        alpha_client::tls::serve(listener, config, app, async {
+            let _ = rx.await;
+        })
+        .await
+    });
+    tx
+}
+
+/// `alpha kms migrate rollback` (Q61) over the same join: the stop of the last prototype node is
+/// reversible only while the prototype build is listed, and is rolled back once that node serves
+/// again with the same identifiers; the join is rolled back once the Kata node no longer serves,
+/// the prototype node still serving with the baseline's identifiers. Nothing is started or
+/// stopped by the tool: the test plays the operator.
+#[tokio::test]
+async fn kms_migrate_rolls_back_the_last_stop_and_then_the_join() {
+    use alpha_cli::kms_migrate as m;
+    let Some(mut h) = harness_with_clock(Arc::new(SystemTime::now)).await else {
+        return;
+    };
+    let initdata = kms_initdata();
+    let revision = kms_revision(&initdata);
+    let listed = listing(kata_document(2), revision, "kata-tdx");
+    publish(&h, listed.clone()).await;
+    let mut doc = listed;
+    doc["kms_ca_pem"] = json!(h.ca_pem);
+    // The same document without the prototype build: what M-G would publish.
+    let mut kata_only = doc.clone();
+    kata_only["kms_revisions"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|r| r["kind"] == "kata-tdx");
+    let doc: alpha_attest::PlatformDocument = serde_json::from_value(doc).unwrap();
+    let kata_only: alpha_attest::PlatformDocument = serde_json::from_value(kata_only).unwrap();
+    let (joiner, joiner_url, joiner_listener) =
+        start_kata_node(h.pool.clone(), &h.release, &initdata).await;
+    let inventory: m::Inventory = serde_json::from_value(json!({
+        "format": m::INVENTORY_FORMAT,
+        "quorum": 1,
+        "nodes": [
+            { "name": "proto-a", "endpoint": h.url, "kind": "prototype" },
+            { "name": "kata-a", "endpoint": joiner_url, "kind": "kata" }
+        ]
+    }))
+    .unwrap();
+    let baseline = m::take_baseline(&inventory, &doc).await.unwrap();
+    let mut state = m::State::new();
+    let err = m::rollback(&inventory, &baseline, &mut state, &doc)
+        .await
+        .unwrap_err();
+    assert!(err.contains("nothing to roll back"), "{err}");
+
+    // Forward: kata-a joins, then proto-a, the last prototype node, stops.
+    let reply = join(&h, &joiner, &initdata, None).await.unwrap();
+    node::finish_join(&joiner, &serde_json::from_value(reply).unwrap()).unwrap();
+    let out = m::step(&inventory, &baseline, &mut state, &doc)
+        .await
+        .unwrap();
+    assert_eq!(out.completed, Some(m::Step::Join("kata-a".into())));
+    h._shutdown = tokio::sync::oneshot::channel().0;
+    await_serving(&inventory, &baseline, &doc, "proto-a", false).await;
+    let out = m::step(&inventory, &baseline, &mut state, &doc)
+        .await
+        .unwrap();
+    assert_eq!(out.completed, Some(m::Step::Stop("proto-a".into())));
+    assert!(out.next.is_none());
+
+    // With the prototype build delisted, proto-a could only come back by joining a Kata node
+    // that would refuse it: refused, and the state is left alone.
+    let before = state.clone();
+    let err = m::rollback(&inventory, &baseline, &mut state, &kata_only)
+        .await
+        .unwrap_err();
+    assert!(err.contains("last prototype node"), "{err}");
+    assert!(err.contains("kms_revisions"), "{err}");
+    assert_eq!(state, before);
+
+    // Listed: the operator is told to restart proto-a; `step` waits for the rollback.
+    let out = m::rollback(&inventory, &baseline, &mut state, &doc)
+        .await
+        .unwrap();
+    assert!(!out.rolled_back);
+    let action = out.next["action"].as_str().unwrap();
+    assert!(
+        action.starts_with("restart the prototype KMS node proto-a"),
+        "{action}"
+    );
+    assert_eq!(state.rolling_back, Some(m::Step::Stop("proto-a".into())));
+    let err = m::step(&inventory, &baseline, &mut state, &doc)
+        .await
+        .unwrap_err();
+    assert!(err.contains("rollback"), "{err}");
+
+    // proto-a serves again with the baseline's identifiers: the stop is rolled back.
+    h._shutdown = restart(&h.node, &h.url).await;
+    await_serving(&inventory, &baseline, &doc, "proto-a", true).await;
+    let out = m::rollback(&inventory, &baseline, &mut state, &doc)
+        .await
+        .unwrap();
+    assert!(out.rolled_back, "{:?}", out.report);
+    assert_eq!(state.completed, [m::Step::Join("kata-a".into())]);
+    assert_eq!(state.rolling_back, None);
+
+    // Then the join: the operator stops kata-a; proto-a alone keeps the quorum of one.
+    let out = m::rollback(&inventory, &baseline, &mut state, &doc)
+        .await
+        .unwrap();
+    assert!(!out.rolled_back);
+    let action = out.next["action"].as_str().unwrap();
+    assert!(
+        action.starts_with("stop the Kata KMS node kata-a"),
+        "{action}"
+    );
+    drop(joiner_listener);
+    await_serving(&inventory, &baseline, &doc, "kata-a", false).await;
+    let out = m::rollback(&inventory, &baseline, &mut state, &doc)
+        .await
+        .unwrap();
+    assert!(out.rolled_back);
+    assert_eq!(state, m::State::new());
+    let out = m::step(&inventory, &baseline, &mut state, &doc)
+        .await
+        .unwrap();
+    assert!(out.completed.is_none());
+    assert_eq!(
+        out.next.unwrap()["step"],
+        json!({ "action": "join", "node": "kata-a" })
+    );
+}

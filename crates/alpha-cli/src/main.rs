@@ -253,6 +253,17 @@ enum MigrateCommand {
         #[arg(long, default_value = "kms-migration-state.json")]
         state: PathBuf,
     },
+    /// Reverses the last recorded step: names what the operator stops or restarts, and removes
+    /// the step from the state once that is observed with the baseline's CA and keys and the
+    /// quorum kept. Never starts or stops anything itself.
+    Rollback {
+        #[arg(long)]
+        inventory: PathBuf,
+        #[arg(long)]
+        baseline: PathBuf,
+        #[arg(long, default_value = "kms-migration-state.json")]
+        state: PathBuf,
+    },
 }
 
 fn read_typed<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Exit> {
@@ -329,6 +340,22 @@ async fn kms_migrate(
             let doc = platform_document(config, now).await?;
             let outcome = m::step(&inventory, &baseline, &mut current, &doc).await?;
             if outcome.completed.is_some() {
+                write_json(&state, &current, false)?;
+            }
+            Ok(json!(outcome))
+        }
+        MigrateCommand::Rollback {
+            inventory,
+            baseline,
+            state,
+        } => {
+            let inventory: m::Inventory = read_typed(&inventory)?;
+            let baseline: m::Baseline = read_typed(&baseline)?;
+            let mut current: m::State = read_typed(&state)?;
+            let before = current.clone();
+            let doc = platform_document(config, now).await?;
+            let outcome = m::rollback(&inventory, &baseline, &mut current, &doc).await?;
+            if current != before {
                 write_json(&state, &current, false)?;
             }
             Ok(json!(outcome))
