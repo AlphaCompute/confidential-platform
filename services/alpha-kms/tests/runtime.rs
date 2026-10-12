@@ -25,7 +25,7 @@ use alpha_client::tls::{self, Pin};
 use alpha_client::{Client, Error as ClientError};
 use alpha_core::{AppId, ComposeHash, KeyId, context};
 use alpha_kms::{certs, rfc3339};
-use alpha_runtime::{Config, Delivery, Error, EvidenceSource, Exit, Runtime, Secrets, proxy};
+use alpha_runtime::{Config, Delivery, Error, EvidenceSource, Exit, Runtime, Secrets, Tls, proxy};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use common::*;
@@ -161,7 +161,7 @@ struct Socket {
 
 impl Socket {
     fn start(runtime: Arc<Runtime>) -> Self {
-        Self::serve(runtime, None)
+        Self::serve(runtime, Tls::Off)
     }
 
     /// As [`Socket::start`], with the Endpoint listening on a free local port.
@@ -171,10 +171,10 @@ impl Socket {
             .unwrap()
             .expect("the config names an upstream");
         let addr = endpoint.local_addr().unwrap();
-        (Self::serve(runtime, Some(endpoint)), addr)
+        (Self::serve(runtime, Tls::Bound(endpoint)), addr)
     }
 
-    fn serve(runtime: Arc<Runtime>, tls: Option<proxy::Endpoint>) -> Self {
+    fn serve(runtime: Arc<Runtime>, tls: Tls) -> Self {
         // Short: a unix socket path is capped at 104 bytes on macOS; the random tail of the
         // UUID, not the timestamp head, keeps parallel tests apart.
         let path = std::env::temp_dir().join(format!(
@@ -1468,6 +1468,48 @@ async fn secret_files_are_written_by_the_running_runtime() {
     let (status, secret) = socket.get(&format!("/v1/secrets/{app}.later")).await;
     assert_eq!(status, 200, "{secret}");
     assert_eq!(secret["value"], json!(b64(b"l1")));
+    assert_eq!(socket.stop().await, Exit::Drained);
+}
+
+#[tokio::test]
+async fn in_a_pod_the_endpoint_opens_once_every_declared_secret_is_written() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    let (app, _, admin) = app_with_secret(&h, b"v1").await;
+    let (port, _) = start_plain_service().await;
+    let config = Config {
+        secrets: alpha_runtime::parse_secrets(Some(r#"{"web":["model-key","later"]}"#)).unwrap(),
+        ..config_with_upstream(&h, port)
+    };
+    let (runtime, _) = start_runtime(&h, config);
+    runtime.attest().await.unwrap();
+    let addr = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let socket = Socket::serve(runtime, Tls::AfterSecrets(addr));
+    wait_for_file(&socket.secrets.join("web/model-key"), b"v1").await;
+    // `later` is declared but not stored yet: the sidecar's startup probe still fails.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(TcpStream::connect(addr).await.is_err());
+
+    let (status, reply) = h
+        .put_secret(&format!("{app}.later"), &[app], b"l1", h.now(), &admin)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    wait_for_file(&socket.secrets.join("web/later"), b"l1").await;
+    let config = Arc::new(hybrid_client(&h));
+    let mut opened = None;
+    for _ in 0..50 {
+        if let Ok(tls) = connect(addr, &config).await {
+            opened = Some(tls);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let reply = get_body(opened.expect("the endpoint opened")).await;
+    assert!(reply.ends_with(BODY), "{reply}");
     assert_eq!(socket.stop().await, Exit::Drained);
 }
 
