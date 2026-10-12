@@ -68,6 +68,7 @@ fn join_reply(serving: &Node) -> JoinReply {
         tenant_kek_root: b64(keys.tenant_kek_root.as_slice()),
         ca_key: b64(&keys.ca_key_der),
         ca_cert: b64(&keys.ca_cert_der),
+        data_key: keys.data.as_ref().map(|d| b64(&d.encode())),
         audit_head: serving.chain.floor().map(|f| f.to_wire()),
     }
 }

@@ -21,7 +21,12 @@ use crate::{Intermediates, store, webauthn};
 
 pub type Key32 = Zeroizing<[u8; 32]>;
 
-fn derive(ikm: &[u8; 32], salt: &[u8], org: OrgId, anchor_spki: &[u8]) -> Result<Key32, ApiError> {
+pub(crate) fn derive(
+    ikm: &[u8; 32],
+    salt: &[u8],
+    org: OrgId,
+    anchor_spki: &[u8],
+) -> Result<Key32, ApiError> {
     let info = [org.as_bytes().as_slice(), &Sha256::digest(anchor_spki)].concat();
     let mut out = Zeroizing::new([0u8; 32]);
     Hkdf::<Sha256>::new(Some(salt), ikm)

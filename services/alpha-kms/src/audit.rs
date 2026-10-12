@@ -331,6 +331,9 @@ async fn append(
         .execute(&mut **tx)
         .await?;
     watch.check(&mut **tx).await?;
+    if let Some(keys) = keys {
+        check_epoch(tx, watch, keys).await?;
+    }
     let head = sqlx::query!(
         r#"select now() as "ts!", h.seq as "seq?", h.link as "link?"
            from (select 1) one
@@ -349,7 +352,7 @@ async fn append(
         Some(keys) => {
             let content =
                 serde_json::to_vec(entry).map_err(|e| ApiError::internal(format!("audit: {e}")))?;
-            let sealed = aead_seal(keys.audit_key(), &sealed_aad(&prev, ts), &content)?;
+            let sealed = aead_seal(keys.audit_key()?, &sealed_aad(&prev, ts), &content)?;
             let link = link(&prev, ts, Form::Sealed, &sealed);
             let seq = sqlx::query_scalar!(
                 "insert into audit_log (ts, details, sealed, link) values ($1, null, $2, $3)
@@ -389,6 +392,48 @@ async fn append(
     Ok(Appended { seq, link })
 }
 
+/// Takes the chain lock in `tx` without appending: a custodian rotation holds it from its first
+/// statement, so no node appends, and so commits a route's rows, under keys the rotation replaces.
+pub async fn lock_chain(tx: &mut PgTransaction<'_>) -> Result<(), ApiError> {
+    sqlx::query!("select pg_advisory_xact_lock($1)", CHAIN_LOCK)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Under the chain lock: the database's data key must be the one `keys` come from. Every route
+/// that writes a sealed row appends its audit row in the same transaction, so a node whose keys a
+/// rotation has replaced writes nothing under them (`sealed`, and it joins again on its next
+/// maintenance pass). A database whose data key is older than the node's was restored: it halts.
+async fn check_epoch(
+    tx: &mut PgTransaction<'_>,
+    watch: &Watch,
+    keys: &MetadataKeys,
+) -> Result<(), ApiError> {
+    let epoch = crate::store::data_epoch(&mut **tx).await?;
+    match epoch.cmp(&keys.epoch()) {
+        std::cmp::Ordering::Equal => Ok(()),
+        std::cmp::Ordering::Greater => Err(stale_keys()),
+        std::cmp::Ordering::Less => {
+            watch.halt(
+                Halt::RolledBack,
+                &format!(
+                    "the database's data key is from epoch {epoch}, before this node's {}",
+                    keys.epoch()
+                ),
+            );
+            Err(Halt::RolledBack.error())
+        }
+    }
+}
+
+pub fn stale_keys() -> ApiError {
+    ApiError::new(
+        "sealed",
+        "a custodian rotation has re-keyed the database since this node took its keys; it joins again",
+    )
+}
+
 pub fn node<'a>(action: &'a str, outcome: &'a str, details: Value) -> Audit<'a> {
     Audit {
         actor_kind: "node",
@@ -421,6 +466,10 @@ pub struct Checkpoint {
     pub link: Vec<u8>,
     #[serde(skip)]
     pub link_seq: i64,
+    /// The epoch of the audit key that opened the last sealed row: rows seal under one epoch's key
+    /// after another, never back.
+    #[serde(skip)]
+    pub audit_epoch: usize,
     pub linked: u64,
     pub sealed: u64,
     /// Rows without a link (written by an earlier release) not yet moved into the chain.
@@ -498,10 +547,17 @@ pub async fn verify(
             let is_sealed = r.sealed.is_some();
             let (entry, expected) = match r.sealed {
                 Some(sealed) => {
-                    let content = aead_open(keys.audit_key(), &sealed_aad(&at.link, r.ts), &sealed)
+                    let aad = sealed_aad(&at.link, r.ts);
+                    let (epoch, content) = keys
+                        .audit_keys()
+                        .iter()
+                        .enumerate()
+                        .skip(at.audit_epoch)
+                        .find_map(|(epoch, key)| aead_open(key, &aad, &sealed).map(|c| (epoch, c)))
                         .ok_or_else(|| {
                             broken("a sealed row does not open after its predecessor")
                         })?;
+                    at.audit_epoch = epoch;
                     let entry: Entry = serde_json::from_slice(&content)
                         .map_err(|_| broken("a sealed row is not an audit entry"))?;
                     at.sealed = at.sealed.saturating_add(1);
