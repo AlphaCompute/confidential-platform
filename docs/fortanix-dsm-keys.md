@@ -117,8 +117,11 @@ release, so it is not supported, not even for a pilot.
 
 The DSM App is a trusted-CA App with both:
 
-- the KMS CA as its trusted CA. It comes from the release-signed platform document, and
-  `alpha sign --check` prints it;
+- the KMS CA as its trusted CA: `kms_ca_pem` in the release-signed platform document.
+  `alpha sign --check` verifies that artifact under the compiled-in release key but does not
+  print the CA. It prints the document's `version`, `kms_ca_spki_sha256` (the SHA-256 of the
+  CA's SubjectPublicKeyInfo, as `sha256:<hex>`) and `kms_revisions`. Copy `kms_ca_pem` from the
+  `document` of the artifact it checked;
 - one DNS name of the leaf as the subject alternative name it requires:
 
 | `binding` | DNS name the DSM App matches | Who gets the keys |

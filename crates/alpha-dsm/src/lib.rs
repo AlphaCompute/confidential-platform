@@ -88,8 +88,9 @@ pub enum Binding {
     /// `<app id>.<org id>.app.alphacompute.invalid`: every Revision of this App the tenant
     /// signed gets the keys.
     App,
-    /// `<compose hash>.<app id>.<org id>.revision.alphacompute.invalid`: this Revision only; the
-    /// customer adds the next Revision's name to the DSM App before rolling it out.
+    /// `<hash hex 1-32>.<hash hex 33-64>.<app id>.<org id>.revision.alphacompute.invalid`, the
+    /// compose hash split into two 32-hex labels ([`tls::revision_dns_name`]): this Revision
+    /// only; the customer adds the next Revision's name to the DSM App before rolling it out.
     Revision,
 }
 
