@@ -309,6 +309,18 @@ pub fn tsm_evidence() -> EvidenceSource {
 /// for a Kata confidential pod. The agent policy pins it with the rest of the container's env.
 pub const QUOTE_SOURCE_ENV: &str = "ALPHACOMPUTE_QUOTE_SOURCE";
 
+/// When the Endpoint's TLS listener opens.
+pub enum Tls {
+    /// No upstream: no listener.
+    Off,
+    /// Already bound (the prototype CVM, where compose's health check orders the services).
+    Bound(proxy::Endpoint),
+    /// Bound on this address once every declared Secret is written: in a Kata pod the port
+    /// opening is what the sidecar's startup probe waits for before the services start, so a
+    /// service never starts without its Secret files.
+    AfterSecrets(std::net::SocketAddr),
+}
+
 /// Which guest this runtime is in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Guest {
@@ -408,6 +420,8 @@ pub struct Runtime {
     kms: Client,
     attested: RwLock<Option<Arc<Attested>>>,
     revoked: watch::Sender<bool>,
+    /// Set once every declared Secret has been written (at once when none is declared).
+    delivered: watch::Sender<bool>,
 }
 
 impl Runtime {
@@ -444,6 +458,7 @@ impl Runtime {
             kms,
             attested: RwLock::new(None),
             revoked: watch::Sender::new(false),
+            delivered: watch::Sender::new(false),
         }))
     }
 
@@ -672,6 +687,7 @@ impl Runtime {
 
     async fn deliver_forever(&self, root: PathBuf) {
         if self.config.secrets.is_empty() {
+            self.delivered.send_replace(true);
             return;
         }
         let mut retry = SECRETS_FIRST_RETRY;
@@ -680,6 +696,7 @@ impl Runtime {
             match self.deliver(&root).await {
                 Delivery::Revoked => return,
                 Delivery::Complete => {
+                    self.delivered.send_replace(true);
                     retry = SECRETS_FIRST_RETRY;
                     waiting.clear();
                     tokio::time::sleep(SECRETS_POLL).await;
@@ -717,6 +734,11 @@ impl Runtime {
         }
     }
 
+    /// Resolves once every declared Secret file has been written.
+    pub async fn secrets_delivered(&self) {
+        let _ = self.delivered.subscribe().wait_for(|d| *d).await;
+    }
+
     /// Serves the socket, renews the leaf, keeps the declared Secret files under
     /// `secrets_root` current and, given `tls` and an upstream, proxies the Endpoint until
     /// `shutdown` resolves or the Revision is revoked. Socket connections drain either way;
@@ -725,7 +747,7 @@ impl Runtime {
         self: Arc<Self>,
         listener: UnixListener,
         secrets_root: PathBuf,
-        tls: Option<proxy::Endpoint>,
+        tls: Tls,
         shutdown: impl Future<Output = ()>,
     ) -> Exit {
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -741,11 +763,26 @@ impl Runtime {
             async move { runtime.deliver_forever(secrets_root).await }
         });
         let (stop_proxy, proxy_stopped) = tokio::sync::oneshot::channel::<Exit>();
-        let proxy = tls.map(|endpoint| {
-            tokio::spawn(
-                endpoint.serve(async move { proxy_stopped.await.unwrap_or(Exit::Revoked) }),
-            )
-        });
+        let stopping = async move { proxy_stopped.await.unwrap_or(Exit::Revoked) };
+        let proxy = match tls {
+            Tls::Off => None,
+            Tls::Bound(endpoint) => Some(tokio::spawn(endpoint.serve(stopping))),
+            Tls::AfterSecrets(addr) => {
+                let runtime = self.clone();
+                Some(tokio::spawn(async move {
+                    let mut stopping = std::pin::pin!(stopping);
+                    tokio::select! {
+                        () = runtime.secrets_delivered() => {}
+                        _ = &mut stopping => return,
+                    }
+                    match proxy::Endpoint::bind(runtime, addr).await {
+                        Ok(Some(endpoint)) => endpoint.serve(stopping).await,
+                        Ok(None) => {}
+                        Err(e) => eprintln!("alpha-runtime: {e}"),
+                    }
+                }))
+            }
+        };
         let mut revoked = self.revoked.subscribe();
         let exit = tokio::select! {
             () = shutdown => Exit::Drained,
