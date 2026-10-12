@@ -1205,13 +1205,13 @@ function imageChanges(before, services) {
 // own click, so a framing page cannot change what is approved or trick a click into a signature.
 // It cannot decline either: a decline is a state change and stays on the approval page.
 //
-// QUESTION(PRD-03 Q14): the Rafay portal origins, and whether Rafay can frame a third-party page
-// at all. QUESTION(PRD-03 Q15): Ryan Tharp's sign-off on framing an approval view.
-// QUESTION(PRD-03 Q16): whether a window of our own meets "tenants never leave their portal".
+// QUESTION(PRD-03 Q75): the Rafay portal origins, and whether Rafay can frame a third-party page
+// at all. QUESTION(PRD-03 Q76): Ryan Tharp's sign-off on framing an approval view.
+// QUESTION(PRD-03 Q77): whether a window of our own meets "tenants never leave their portal".
 
 // Whether every page around this frame is an allowed portal. location.ancestorOrigins lists them
 // in Chromium and Safari; Firefox lacks it, and there frame-ancestors from the host is the only
-// check (QUESTION(PRD-03 Q17)).
+// check (QUESTION(PRD-03 Q78)).
 function framedByAllowed(allowed) {
   if (window.top === window.self) return false;
   const chain = location.ancestorOrigins;
@@ -1249,7 +1249,7 @@ async function startEmbed(view, ticket) {
     // page's Cross-Origin-Opener-Policy severs it again.
     // With noopener a browser returns null whether or not the window opened, so a blocked
     // pop-up looks like an opened one and the note covers both.
-    // TODO(draft): QUESTION(PRD-03 Q16) — telling them apart, or showing "Approved" here without
+    // TODO(draft): QUESTION(PRD-03 Q77) — telling them apart, or showing "Approved" here without
     // "Check again", needs a channel back from the new window, which noopener rules out.
     window.open(`${location.origin}/sign/approve#${ticket}`, "_blank", "noopener");
     offer(ui, MESSAGES.embed_opened, check);

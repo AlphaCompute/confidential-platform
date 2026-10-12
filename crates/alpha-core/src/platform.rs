@@ -32,7 +32,7 @@ pub struct Signer {
     /// only a release-signed document can let a portal frame it. The view never signs: approving
     /// still opens `/sign/approve` in a window of its own.
     ///
-    /// QUESTION(PRD-03 Q14): which Rafay portal origins go here. QUESTION(PRD-03 Q15): Ryan
+    /// QUESTION(PRD-03 Q75): which Rafay portal origins go here. QUESTION(PRD-03 Q76): Ryan
     /// Tharp's sign-off on framing an approval view at all.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub embed_ancestors: Vec<String>,
