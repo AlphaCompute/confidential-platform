@@ -17,12 +17,15 @@ pub fn sign(document: Value, key: &SigningKey) -> Result<SignedDocument, String>
     platform::sign(document, key).map_err(|e| e.to_string())
 }
 
-/// `ALPHACOMPUTE_KMS_CA_SPKI_SHA256` and `ALPHACOMPUTE_KMS_REVISIONS`, from a verified artifact.
+/// `ALPHACOMPUTE_KMS_CA_SPKI_SHA256` and `ALPHACOMPUTE_KMS_REVISIONS`, from a verified artifact,
+/// and the PCCS it names.
 #[derive(Debug, PartialEq, Eq, Serialize)]
 pub struct Summary {
     pub version: u64,
     pub kms_ca_spki_sha256: Option<String>,
     pub kms_revisions: Vec<ComposeHash>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pccs_url: Option<String>,
 }
 
 pub fn check(
@@ -39,6 +42,7 @@ pub fn check(
             .iter()
             .map(|r| r.compose_hash)
             .collect(),
+        pccs_url: document.pccs_url,
     })
 }
 
@@ -76,7 +80,8 @@ mod tests {
             Summary {
                 version: 4,
                 kms_ca_spki_sha256: None,
-                kms_revisions: vec![hash]
+                kms_revisions: vec![hash],
+                pccs_url: None,
             }
         );
         let other = SigningKey::from_bytes(&[9u8; 32]);
@@ -104,5 +109,26 @@ mod tests {
         assert!(sign(document.clone(), &key).is_ok());
         document["signer"]["origins"][0] = json!("https://sign.example/path");
         assert!(sign(document, &key).is_err());
+    }
+
+    /// alpha-infra's draft generator writes `pccs_url`; it used to be refused as an unknown field.
+    #[test]
+    fn a_document_names_its_pccs_and_check_prints_it() {
+        let key = SigningKey::from_bytes(&[8u8; 32]);
+        let site = "https://pccs.site1.alphacompute.internal:8081/sgx/certification/v4/";
+        let mut document = json!({
+            "version": 5, "issued_at": "2026-10-12T00:00:00Z",
+            "policy": { "tcb_statuses": ["UpToDate"], "tolerated_advisories": [] },
+            "reference_values": [], "kms_ca_pem": "", "kms_revisions": [],
+            "pccs_url": site
+        });
+        let artifact = sign(document.clone(), &key).unwrap();
+        let summary = check(&artifact, &key.verifying_key(), SystemTime::now()).unwrap();
+        assert_eq!(summary.pccs_url.as_deref(), Some(site));
+        for bad in ["http://pccs.example/", "https://pccs.example/?a", ""] {
+            document["pccs_url"] = json!(bad);
+            let e = sign(document.clone(), &key).unwrap_err();
+            assert!(e.contains("pccs_url"), "{bad}: {e}");
+        }
     }
 }

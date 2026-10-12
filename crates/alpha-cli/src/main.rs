@@ -30,11 +30,19 @@ struct Cli {
     command: Command,
 }
 
-/// The site PCCS, as alpha-infra's blueprints name it (`blueprints/alpha-coco-*/pins.json`). It
-/// answers only inside the site, under a certificate from the site CA.
+/// The site PCCS, as alpha-infra's blueprints name it (`blueprints/alpha-coco-*/pins.json`), for
+/// a platform document that names none. It answers only inside the site, under a certificate
+/// from the site CA.
 // ponytail: Q2 — the site domain is undecided; `alphacompute.internal` stands in for it, as in
-// alpha-infra. `--pccs-url` / `ALPHACOMPUTE_PCCS_URL` override it.
+// alpha-infra.
 const PCCS_URL: &str = "https://pccs.site1.alphacompute.internal:8081/sgx/certification/v4/";
+
+/// The PCCS `unseal` and `bootstrap` fetch collateral from: `--pccs-url` when given (development,
+/// or a custodian outside the site), else the one the verified platform document names, else
+/// the site PCCS. Collateral is Intel-signed whoever serves it.
+fn pccs_url<'a>(flag: Option<&'a str>, doc: &'a PlatformDocument) -> &'a str {
+    flag.or(doc.pccs_url.as_deref()).unwrap_or(PCCS_URL)
+}
 
 /// Everything from flags or `ALPHACOMPUTE_*`; each command asks for what it needs.
 #[derive(Args)]
@@ -50,14 +58,10 @@ struct Config {
     /// The release-signed platform document.
     #[arg(long, global = true, env = "ALPHACOMPUTE_PLATFORM_DOCUMENT_URL")]
     platform_document_url: Option<String>,
-    /// PCCS for DCAP collateral: our own, the site PCCS the hosts' QCNL and the KMS use.
-    #[arg(
-        long,
-        global = true,
-        env = "ALPHACOMPUTE_PCCS_URL",
-        default_value = PCCS_URL
-    )]
-    pccs_url: String,
+    /// PCCS for DCAP collateral, over the one the platform document names (development, or a
+    /// custodian outside the site). Unset: the document's, else our site PCCS.
+    #[arg(long, global = true, env = "ALPHACOMPUTE_PCCS_URL")]
+    pccs_url: Option<String>,
     #[arg(long, global = true, env = "ALPHACOMPUTE_SHROUD_URL")]
     shroud_url: Option<String>,
     #[arg(
@@ -644,9 +648,14 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let remembered = node::ShareFile::read(&share)?.platform_document_version;
             let doc = platform_document(config, now).await?;
             let custodian = keyfile::read(&key, &passphrase("passphrase: ")?)?.xwing()?;
-            let (attested, client) =
-                node::attested_node(&endpoint, &config.pccs_url, &doc, Some(remembered), now)
-                    .await?;
+            let (attested, client) = node::attested_node(
+                &endpoint,
+                pccs_url(config.pccs_url.as_deref(), &doc),
+                &doc,
+                Some(remembered),
+                now,
+            )
+            .await?;
             let reply =
                 node::unseal(&client, &attested.identity, &share, &custodian, doc.version).await?;
             Ok(
@@ -673,8 +682,14 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 .try_into()
                 .map_err(|_| Exit::Usage("--custodians takes exactly three files".into()))?;
             let doc = platform_document(config, now).await?;
-            let (attested, client) =
-                node::attested_node(&endpoint, &config.pccs_url, &doc, None, now).await?;
+            let (attested, client) = node::attested_node(
+                &endpoint,
+                pccs_url(config.pccs_url.as_deref(), &doc),
+                &doc,
+                None,
+                now,
+            )
+            .await?;
             let mut out = node::bootstrap(
                 &client,
                 &attested.identity,
@@ -712,10 +727,13 @@ async fn main() {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
+    use alpha_attest::PlatformDocument;
     use clap::Parser;
+    use serde_json::json;
 
-    use super::Cli;
+    use super::{Cli, pccs_url};
 
     #[test]
     fn stop_takes_force_or_a_drain_not_both() {
@@ -740,21 +758,38 @@ mod tests {
     }
 
     #[test]
-    fn pccs_defaults_to_the_site_pccs_and_approvals_prepare_takes_a_batch() {
-        let pccs = |args: &[&str]| {
+    fn the_platform_documents_pccs_is_used_over_the_site_default_and_the_flag_over_both() {
+        let flag = |args: &[&str]| {
             Cli::try_parse_from(args)
                 .ok()
                 .map(|cli| cli.config.pccs_url)
         };
         let prepare = ["alpha", "approvals", "prepare", "batch.json"];
-        assert_eq!(pccs(&prepare).as_deref(), Some(super::PCCS_URL));
-        assert!(!super::PCCS_URL.contains("phala"));
-        let flag = ["alpha", "--pccs-url", "https://pccs.example"];
+        assert_eq!(flag(&prepare), Some(None));
+        let given = ["alpha", "--pccs-url", "https://pccs.example"];
         assert_eq!(
-            pccs(&[&flag[..], &prepare[1..]].concat()).as_deref(),
-            Some("https://pccs.example")
+            flag(&[&given[..], &prepare[1..]].concat()),
+            Some(Some("https://pccs.example".into()))
         );
-        assert_eq!(pccs(&prepare[..3]), None);
+        assert_eq!(flag(&prepare[..3]), None);
+
+        let mut doc: PlatformDocument = serde_json::from_value(json!({
+            "version": 1, "issued_at": "2026-10-12T00:00:00Z",
+            "policy": { "tcb_statuses": ["UpToDate"], "tolerated_advisories": [] },
+            "reference_values": [], "kms_ca_pem": "", "kms_revisions": []
+        }))
+        .unwrap();
+        assert_eq!(pccs_url(None, &doc), super::PCCS_URL);
+        assert!(!super::PCCS_URL.contains("phala"));
+        doc.pccs_url = Some("https://pccs.site2.example/sgx/certification/v4/".into());
+        assert_eq!(
+            pccs_url(None, &doc),
+            "https://pccs.site2.example/sgx/certification/v4/"
+        );
+        assert_eq!(
+            pccs_url(Some("https://pccs.example"), &doc),
+            "https://pccs.example"
+        );
     }
 
     #[test]

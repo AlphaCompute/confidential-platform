@@ -188,10 +188,24 @@ pub fn quote_source(var: Option<&str>) -> Result<Option<alpha_tsm::coco::QuoteSo
     }
 }
 
-/// Where DCAP collateral comes from: the PCCS in production, a fixed capture in tests.
+/// Where DCAP collateral comes from: a PCCS in production, a fixed capture in tests.
 pub enum CollateralSource {
-    Pccs(String),
+    /// The PCCS the platform document names. `ALPHACOMPUTE_PCCS_URL` (`env`) is read only when
+    /// the document names none, as one signed before `pccs_url` existed, except in a `dev-root`
+    /// build, where it overrides the document so a development node can use a test PCCS.
+    Pccs {
+        env: Option<String>,
+    },
     Fixed(Box<Collateral>),
+}
+
+/// The PCCS to fetch from, by the rule on [`CollateralSource::Pccs`].
+pub fn pccs_url<'a>(document: Option<&'a str>, env: Option<&'a str>, dev: bool) -> Option<&'a str> {
+    match (document, env) {
+        (Some(_), Some(env)) if dev => Some(env),
+        (Some(document), _) => Some(document),
+        (None, env) => env,
+    }
 }
 
 /// The two intermediates in memory after unseal, join or bootstrap.
@@ -421,6 +435,17 @@ mod tests {
     use alpha_attest::GpuVerifierKind;
 
     use super::*;
+
+    #[test]
+    fn the_document_names_the_pccs_and_the_environment_overrides_it_only_in_development() {
+        let (doc, env) = (Some("https://pccs.site"), Some("https://pccs.test"));
+        assert_eq!(pccs_url(doc, env, false), doc);
+        assert_eq!(pccs_url(doc, None, false), doc);
+        assert_eq!(pccs_url(None, env, false), env);
+        assert_eq!(pccs_url(None, None, false), None);
+        assert_eq!(pccs_url(doc, env, true), env);
+        assert_eq!(pccs_url(doc, None, true), doc);
+    }
 
     #[test]
     fn quote_source_is_read_as_alpha_runtime_reads_it() {
