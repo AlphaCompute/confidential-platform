@@ -30,6 +30,12 @@ struct Cli {
     command: Command,
 }
 
+/// The site PCCS, as alpha-infra's blueprints name it (`blueprints/alpha-coco-*/pins.json`). It
+/// answers only inside the site, under a certificate from the site CA.
+// ponytail: Q2 — the site domain is undecided; `alphacompute.internal` stands in for it, as in
+// alpha-infra. `--pccs-url` / `ALPHACOMPUTE_PCCS_URL` override it.
+const PCCS_URL: &str = "https://pccs.site1.alphacompute.internal:8081/sgx/certification/v4/";
+
 /// Everything from flags or `ALPHACOMPUTE_*`; each command asks for what it needs.
 #[derive(Args)]
 struct Config {
@@ -44,12 +50,12 @@ struct Config {
     /// The release-signed platform document.
     #[arg(long, global = true, env = "ALPHACOMPUTE_PLATFORM_DOCUMENT_URL")]
     platform_document_url: Option<String>,
-    /// PCCS for DCAP collateral.
+    /// PCCS for DCAP collateral: our own, the site PCCS the hosts' QCNL and the KMS use.
     #[arg(
         long,
         global = true,
         env = "ALPHACOMPUTE_PCCS_URL",
-        default_value = "https://pccs.phala.network"
+        default_value = PCCS_URL
     )]
     pccs_url: String,
     #[arg(long, global = true, env = "ALPHACOMPUTE_SHROUD_URL")]
@@ -195,6 +201,11 @@ enum Command {
         #[arg(long)]
         endpoint: String,
     },
+    /// Approval requests for the re-approval campaign (PRD-05 M3).
+    Approvals {
+        #[command(subcommand)]
+        command: ApprovalsCommand,
+    },
     /// Genesis on an empty database: three custodian public keys.
     Bootstrap {
         /// Three files, each holding a custodian's public key as `keygen --custodian` printed it.
@@ -223,6 +234,17 @@ enum ComposeCommand {
         #[arg(long)]
         no_resolve: bool,
         compose: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApprovalsCommand {
+    /// Opens, or finds, one approval request per App in the batch through shroud-go, under the
+    /// organization's API key, and prints each signer link; rerun to refresh expired links.
+    Prepare {
+        /// `{"requests": [{"wrapped", "title", "machine"}, ...]}`: each App's `alpha coco wrap`
+        /// output (relative to this file), its Rafay environment name and its machine shape.
+        batch: PathBuf,
     },
 }
 
@@ -601,6 +623,19 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             }
             Ok(out)
         }
+        Command::Approvals {
+            command: ApprovalsCommand::Prepare { batch },
+        } => {
+            let shroud = Shroud {
+                url: need(config.shroud_url.clone(), "shroud-url")?,
+                api_key: need(config.shroud_api_key.clone(), "shroud-api-key")?,
+            };
+            let (out, failed) = alpha_cli::approvals::prepare_all(&shroud, &batch).await?;
+            if failed {
+                return Err(Exit::Partial(out));
+            }
+            Ok(out)
+        }
         Command::Unseal {
             share,
             key,
@@ -702,6 +737,24 @@ mod tests {
         assert!(stop(&["--force"]));
         assert!(stop(&["--drain-seconds", "60"]));
         assert!(!stop(&["--force", "--drain-seconds", "60"]));
+    }
+
+    #[test]
+    fn pccs_defaults_to_the_site_pccs_and_approvals_prepare_takes_a_batch() {
+        let pccs = |args: &[&str]| {
+            Cli::try_parse_from(args)
+                .ok()
+                .map(|cli| cli.config.pccs_url)
+        };
+        let prepare = ["alpha", "approvals", "prepare", "batch.json"];
+        assert_eq!(pccs(&prepare).as_deref(), Some(super::PCCS_URL));
+        assert!(!super::PCCS_URL.contains("phala"));
+        let flag = ["alpha", "--pccs-url", "https://pccs.example"];
+        assert_eq!(
+            pccs(&[&flag[..], &prepare[1..]].concat()).as_deref(),
+            Some("https://pccs.example")
+        );
+        assert_eq!(pccs(&prepare[..3]), None);
     }
 
     #[test]
