@@ -609,11 +609,14 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let remembered = node::ShareFile::read(&share)?.platform_document_version;
             let doc = platform_document(config, now).await?;
             let custodian = keyfile::read(&key, &passphrase("passphrase: ")?)?.xwing()?;
-            let (identity, client) =
+            let (attested, client) =
                 node::attested_node(&endpoint, &config.pccs_url, &doc, Some(remembered), now)
                     .await?;
-            let reply = node::unseal(&client, &identity, &share, &custodian, doc.version).await?;
-            Ok(json!(reply))
+            let reply =
+                node::unseal(&client, &attested.identity, &share, &custodian, doc.version).await?;
+            Ok(
+                json!({ "sealed": reply.sealed, "shares": reply.shares, "node": attested.summary() }),
+            )
         }
         Command::Bootstrap {
             custodians,
@@ -635,12 +638,20 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 .try_into()
                 .map_err(|_| Exit::Usage("--custodians takes exactly three files".into()))?;
             let doc = platform_document(config, now).await?;
-            let (identity, client) =
+            let (attested, client) =
                 node::attested_node(&endpoint, &config.pccs_url, &doc, None, now).await?;
-            Ok(
-                node::bootstrap(&client, &identity, custodians, doc.version, Path::new("."))
-                    .await?,
+            let mut out = node::bootstrap(
+                &client,
+                &attested.identity,
+                custodians,
+                doc.version,
+                Path::new("."),
             )
+            .await?;
+            if let Some(fields) = out.as_object_mut() {
+                fields.insert("node".into(), attested.summary());
+            }
+            Ok(out)
         }
     }
 }

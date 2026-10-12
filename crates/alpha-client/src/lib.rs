@@ -16,7 +16,9 @@ pub mod platform;
 pub mod runtime;
 pub mod tls;
 
-use alpha_attest::{AnyEvidence, AttestationResult, EVIDENCE_FORMAT, EventLogEntry, Evidence};
+use alpha_attest::{
+    AnyEvidence, AttestationResult, EVIDENCE_FORMAT, EventLogEntry, Evidence, EvidenceV2,
+};
 use alpha_core::{
     AppId, ComposeHash, KeyId, OrgId, PrincipalId, SecretId, context, signing_digest,
 };
@@ -249,23 +251,40 @@ pub struct KeyRevoked {
     pub receipt: Option<Value>,
 }
 
-/// `GET /v1/node/evidence`: the quote is base64url, `runtime_pubkey` the P-256 SPKI DER.
+/// `GET /v1/node/evidence`. A prototype node sends `quote` (base64url) and `event_log`, as it
+/// always has; a Kata node sends its `alphacompute-evidence/2` as `evidence` instead, the init-data
+/// it booted with included. `runtime_pubkey` is the P-256 SPKI DER in base64url.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeEvidence {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub quote: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub event_log: Vec<EventLogEntry>,
+    #[serde(default, rename = "evidence", skip_serializing_if = "Option::is_none")]
+    pub evidence_v2: Option<EvidenceV2>,
     pub runtime_pubkey: String,
     pub xwing_pubkey: PublicKey,
+    /// What the node says it is; never trusted, the appraisal rebuilds it from the evidence.
     pub compose_hash: ComposeHash,
 }
 
 impl NodeEvidence {
-    pub fn evidence(&self) -> Result<Evidence, Error> {
-        Ok(Evidence {
-            format: EVIDENCE_FORMAT.into(),
-            quote: decode("quote", &self.quote)?,
-            event_log: self.event_log.clone(),
-        })
+    /// The evidence to appraise: exactly one of the two forms, never both or neither.
+    pub fn evidence(&self) -> Result<AnyEvidence, Error> {
+        match (
+            &self.evidence_v2,
+            self.quote.is_empty() && self.event_log.is_empty(),
+        ) {
+            (Some(v2), true) => Ok(AnyEvidence::V2(v2.clone())),
+            (None, false) => Ok(AnyEvidence::V1(Evidence {
+                format: EVIDENCE_FORMAT.into(),
+                quote: decode("quote", &self.quote)?,
+                event_log: self.event_log.clone(),
+            })),
+            _ => Err(Error::Invalid(
+                "node evidence: expected either quote and event_log or evidence".into(),
+            )),
+        }
     }
 
     pub fn runtime_spki(&self) -> Result<Vec<u8>, Error> {
@@ -362,7 +381,8 @@ pub struct UnsealReply {
 #[serde(deny_unknown_fields)]
 pub struct JoinRequest {
     pub nonce: String,
-    pub evidence: Evidence,
+    /// `alphacompute-evidence/1` from a prototype node, `/2` from a Kata node.
+    pub evidence: AnyEvidence,
     pub xwing_pubkey: PublicKey,
 }
 

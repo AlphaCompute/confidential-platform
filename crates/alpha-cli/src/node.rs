@@ -1,12 +1,14 @@
 //! `alpha bootstrap` and `alpha unseal`: nothing is sealed to a node the CLI has not verified.
 //! [`verify_node`] is the whole decision, pure over its arguments; the two commands only
-//! move bytes once it has said yes.
+//! move bytes once it has said yes. A prototype node and a Kata node (`kata-tdx/1`, its identity
+//! the Revision v2 of its init-data) are appraised by `alpha_attest::node`, the same function the
+//! serving node runs before a `join`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use alpha_attest::{Collateral, PlatformDocument, appraise};
+use alpha_attest::{AnyEvidence, Appraised, Collateral, PlatformDocument, VerifiedQuote, kata};
 use alpha_client::{
     BootstrapBody, BootstrapRequest, Client, NodeEvidence, Pin, UnsealReply, UnsealRequest,
     fetch_node_evidence,
@@ -33,10 +35,32 @@ impl NodeIdentity {
     }
 }
 
+/// A node that passed [`verify_node`]: what the CLI seals to, and what it found.
+#[derive(Clone, Debug)]
+pub struct AttestedNode {
+    pub identity: NodeIdentity,
+    pub appraised: Appraised,
+}
+
+impl AttestedNode {
+    /// What the custodian is told about the node a share or the bootstrap body went to.
+    pub fn summary(&self) -> Value {
+        let a = &self.appraised;
+        json!({
+            "profile": a.coco.as_ref().map_or("prototype-tdx", |c| c.profile.as_str()),
+            "revision": a.compose_hash,
+            "os_image": a.os_image,
+            "tcb_status": a.tcb_status,
+            "policy_sha256": a.coco.as_ref().map(|c| c.policy_sha256),
+            "runtime_pubkey_sha256": a.runtime_pubkey_sha256,
+        })
+    }
+}
+
 /// The custodian-side checks, in order: the document is not older than the one
-/// remembered, the evidence appraises with the X-Wing key bound in `report_data`, the node's
-/// Revision is in `kms_revisions`, and the TLS server the evidence came from holds the attested
-/// runtime key.
+/// remembered, the evidence appraises with the X-Wing key bound in `report_data` (a Kata node's
+/// on the CPU runtime class), the node's Revision is in `kms_revisions` for the profile it was
+/// appraised under, and the TLS server the evidence came from holds the attested runtime key.
 pub fn verify_node(
     evidence: &NodeEvidence,
     nonce: &[u8; 32],
@@ -45,7 +69,51 @@ pub fn verify_node(
     remembered_version: Option<u64>,
     collateral: &Collateral,
     now: SystemTime,
-) -> Result<NodeIdentity, String> {
+) -> Result<AttestedNode, String> {
+    check_version(doc, remembered_version)?;
+    let runtime_spki = evidence.runtime_spki().map_err(|e| e.to_string())?;
+    let appraised = alpha_attest::node::appraise_node(
+        &evidence.evidence().map_err(|e| e.to_string())?,
+        nonce,
+        &runtime_spki,
+        evidence.xwing_pubkey.as_bytes(),
+        doc,
+        collateral,
+        now,
+    )
+    .map_err(|e| format!("{}: {e}", e.code()))?;
+    attested(evidence, runtime_spki, server_spki, appraised)
+}
+
+/// [`verify_node`] for a Kata node's evidence over a quote `alpha_attest::verify_quote` has
+/// verified: every check after DCAP. The KMS's tests run the CLI's half of a Kata genesis through
+/// it over synthetic quotes until B300 Kata captures exist (M1); the commands never call it.
+pub fn verify_kata_node(
+    evidence: &NodeEvidence,
+    verified: VerifiedQuote,
+    nonce: &[u8; 32],
+    server_spki: &[u8],
+    doc: &PlatformDocument,
+    remembered_version: Option<u64>,
+) -> Result<AttestedNode, String> {
+    check_version(doc, remembered_version)?;
+    let runtime_spki = evidence.runtime_spki().map_err(|e| e.to_string())?;
+    let AnyEvidence::V2(v2) = evidence.evidence().map_err(|e| e.to_string())? else {
+        return Err("a verified quote comes with alphacompute-evidence/2 only".into());
+    };
+    let appraised = alpha_attest::node::appraise_kata_node(
+        &v2,
+        verified,
+        nonce,
+        &runtime_spki,
+        evidence.xwing_pubkey.as_bytes(),
+        doc,
+    )
+    .map_err(|e| format!("{}: {e}", e.code()))?;
+    attested(evidence, runtime_spki, server_spki, appraised)
+}
+
+fn check_version(doc: &PlatformDocument, remembered_version: Option<u64>) -> Result<(), String> {
     if let Some(remembered) = remembered_version
         && doc.version < remembered
     {
@@ -54,23 +122,24 @@ pub fn verify_node(
             doc.version
         ));
     }
-    let runtime_spki = evidence.runtime_spki().map_err(|e| e.to_string())?;
-    appraise(
-        &evidence.evidence().map_err(|e| e.to_string())?,
-        nonce,
-        &runtime_spki,
-        Some(evidence.xwing_pubkey.as_bytes()),
-        doc,
-        collateral,
-        now,
-    )
-    .map_err(|e| format!("{}: {e}", e.code()))?;
+    Ok(())
+}
+
+fn attested(
+    evidence: &NodeEvidence,
+    runtime_spki: Vec<u8>,
+    server_spki: &[u8],
+    appraised: Appraised,
+) -> Result<AttestedNode, String> {
     if server_spki != runtime_spki {
         return Err("server TLS key is not the attested runtime_pubkey".into());
     }
-    Ok(NodeIdentity {
-        runtime_spki,
-        xwing: evidence.xwing_pubkey.clone(),
+    Ok(AttestedNode {
+        identity: NodeIdentity {
+            runtime_spki,
+            xwing: evidence.xwing_pubkey.clone(),
+        },
+        appraised,
     })
 }
 
@@ -81,16 +150,20 @@ pub async fn attested_node(
     doc: &PlatformDocument,
     remembered_version: Option<u64>,
     now: SystemTime,
-) -> Result<(NodeIdentity, Client), String> {
+) -> Result<(AttestedNode, Client), String> {
     let nonce = random::<32>()?;
     let (evidence, server_spki) = fetch_node_evidence(endpoint, &nonce)
         .await
         .map_err(|e| e.to_string())?;
-    let quote = evidence.evidence().map_err(|e| e.to_string())?.quote;
-    let collateral = alpha_attest::fetch_collateral(pccs_url, &quote)
+    let any = evidence.evidence().map_err(|e| e.to_string())?;
+    // SEV-SNP evidence is named for what it is, before any collateral is fetched.
+    if let AnyEvidence::V2(v2) = &any {
+        kata::check_cpu_kind(v2).map_err(|e| format!("{}: {e}", e.code()))?;
+    }
+    let collateral = alpha_attest::fetch_collateral(pccs_url, any.quote())
         .await
         .map_err(|e| e.to_string())?;
-    let identity = verify_node(
+    let node = verify_node(
         &evidence,
         &nonce,
         &server_spki,
@@ -101,10 +174,10 @@ pub async fn attested_node(
     )?;
     let client = Client::new(
         vec![endpoint.to_owned()],
-        Pin::Spki(identity.runtime_spki.clone()),
+        Pin::Spki(node.identity.runtime_spki.clone()),
     )
     .map_err(|e| e.to_string())?;
-    Ok((identity, client))
+    Ok((node, client))
 }
 
 pub const SHARE_FORMAT: &str = "alphacompute-share/1";
@@ -251,6 +324,7 @@ mod tests {
         let evidence = NodeEvidence {
             quote: BASE64_URL_SAFE_NO_PAD.encode(quote),
             event_log: serde_json::from_slice(&read("event_log.json")).unwrap(),
+            evidence_v2: None,
             runtime_pubkey: BASE64_URL_SAFE_NO_PAD.encode(read("runtime_spki.der")),
             xwing_pubkey: PublicKey::try_from(read("node_xwing_pubkey.bin").as_slice()).unwrap(),
             compose_hash: alpha_core::compose_hash("ignored: the measured one is used"),
@@ -281,6 +355,7 @@ mod tests {
             &c.collateral,
             c.now,
         )
+        .map(|node| node.identity)
     }
 
     #[test]
@@ -308,6 +383,25 @@ mod tests {
         c.doc.kms_revisions.clear();
         let err = verify(&c, &c.evidence, &spki, None).unwrap_err();
         assert!(err.starts_with("attestation_unknown"), "{err}");
+    }
+
+    #[test]
+    fn node_evidence_in_both_forms_or_neither_or_under_a_kata_build_is_refused() {
+        let mut c = capture();
+        let spki = read("runtime_spki.der");
+        let mut neither = c.evidence.clone();
+        neither.quote.clear();
+        neither.event_log.clear();
+        let err = verify(&c, &neither, &spki, None).unwrap_err();
+        assert!(
+            err.contains("either quote and event_log or evidence"),
+            "{err}"
+        );
+        // A prototype node's quote is never read as a Kata node's, nor a listed prototype build
+        // as a Kata one.
+        c.doc.kms_revisions[0].kind = alpha_core::KmsRevisionKind::KataTdx;
+        let err = verify(&c, &c.evidence, &spki, None).unwrap_err();
+        assert!(err.contains("not listed as a prototype-tdx build"), "{err}");
     }
 
     #[test]
