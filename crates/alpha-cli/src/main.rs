@@ -689,23 +689,22 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let template = fs::read_to_string(&spec)
                 .map_err(|e| Exit::Usage(format!("{}: {e}", spec.display())))?;
             let paths: Vec<&Path> = env_files.iter().map(PathBuf::as_path).collect();
-            let env =
-                coco::read_env_files(&paths).map_err(|e| Exit::Refused(e))?;
+            let env = coco::read_env_files(&paths).map_err(|e| Exit::Refused(e))?;
 
             if for_genpolicy {
-                let out = coco::render_for_genpolicy(&template, &env)
-                    .map_err(|e| Exit::Refused(e))?;
+                let out =
+                    coco::render_for_genpolicy(&template, &env).map_err(|e| Exit::Refused(e))?;
                 print!("{out}");
                 return Err(Exit::Silent);
             }
 
-            let policy_path =
-                policy.ok_or_else(|| Exit::Usage("--policy is required unless --for-genpolicy is set".into()))?;
+            let policy_path = policy.ok_or_else(|| {
+                Exit::Usage("--policy is required unless --for-genpolicy is set".into())
+            })?;
             let policy_text = fs::read_to_string(&policy_path)
                 .map_err(|e| Exit::Usage(format!("{}: {e}", policy_path.display())))?;
 
-            let out = coco::render(&template, &policy_text, &env)
-                .map_err(|e| Exit::Refused(e))?;
+            let out = coco::render(&template, &policy_text, &env).map_err(|e| Exit::Refused(e))?;
             print!("{}", out.manifest);
             eprintln!(
                 "init-data {}, policy {}",
