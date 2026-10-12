@@ -5,13 +5,13 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alpha_attest::{
-    AnyEvidence, Appraised, AttestationResult, CocoAppraised, RESULT_FORMAT, Revision, Verdict,
-    VerifiedQuote, appraise, kata, verify_quote,
+    AnyEvidence, Appraised, AttestationResult, CocoAppraised, EvidenceV2, PlatformDocument,
+    RESULT_FORMAT, Revision, Verdict, VerifiedQuote, appraise, kata, verify_quote,
 };
 use alpha_client::DerivedKey;
 use alpha_client::tls::PeerCerts;
 use alpha_core::coco::{self, CocoRevision};
-use alpha_core::{ComposeHash, Signer, context};
+use alpha_core::{AppId, ComposeHash, OrgId, Signer, context};
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Extension, Path, State};
@@ -268,40 +268,12 @@ async fn attest_inner(
             ));
         }
         (AnyEvidence::V2(evidence), verified) => {
-            let verified = match verified {
-                Some(verified) => verified,
-                None => {
-                    kata::check_cpu_kind(evidence)?;
-                    let collateral = collateral(node, &evidence.cpu.quote).await?;
-                    verify_quote(&evidence.cpu.quote, &collateral, &doc.policy, now)?
-                }
-            };
-            // The TD checks, then (GPU class only) every backend the `gpu_policy` lists.
-            kata::appraise_kata_tdx(
-                evidence,
-                verified,
-                &nonce,
-                spki,
-                None,
-                &doc,
-                &node.config.gpu_backends,
-            )
-            .await?
+            let binding = kata::Binding::runtime(spki, &nonce, None);
+            appraise_kata(node, evidence, verified, &binding, &doc, now).await?
         }
     };
+    let revision = admit(node, &doc, &appraised).await?;
     let keys = node.intermediates()?;
-    let revision = load_revision(&node.pool, appraised.compose_hash)
-        .await?
-        .ok_or_else(|| unregistered(&appraised))?;
-    verify_revision(
-        &node.pool,
-        &keys.tenant_kek_root,
-        appraised.compose_hash,
-        &revision,
-        doc.signer.as_ref(),
-    )
-    .await?;
-    check_platform(&revision, appraised.coco.as_ref())?;
     let runtime_sha_hex = appraised
         .runtime_pubkey_sha256
         .trim_start_matches("sha256:")
@@ -318,7 +290,65 @@ async fn attest_inner(
         ),
         now,
     )?;
-    let result = AttestationResult {
+    Ok((leaf_der, attestation_result(appraised, &revision, now)))
+}
+
+/// `kata-tdx/1` over `alphacompute-evidence/2` under `binding`: DCAP and the TCB policy unless the
+/// caller of a test seam has verified the quote, the TD checks, then (GPU class only) every
+/// backend the `gpu_policy` lists. `POST /v1/attest` and the KBS facade both appraise through
+/// here and differ only in `binding`.
+pub(crate) async fn appraise_kata(
+    node: &Node,
+    evidence: &EvidenceV2,
+    verified: Option<VerifiedQuote>,
+    binding: &kata::Binding,
+    doc: &PlatformDocument,
+    now: SystemTime,
+) -> Result<Appraised, ApiError> {
+    let verified = match verified {
+        Some(verified) => verified,
+        None => {
+            kata::check_cpu_kind(evidence)?;
+            let collateral = collateral(node, &evidence.cpu.quote).await?;
+            verify_quote(&evidence.cpu.quote, &collateral, &doc.policy, now)?
+        }
+    };
+    Ok(
+        kata::appraise_kata_tdx_bound(evidence, verified, binding, doc, &node.config.gpu_backends)
+            .await?,
+    )
+}
+
+/// What the KMS requires of an appraisal before anything is released on it, whichever protocol
+/// carried the evidence: its Revision is registered, unrevoked, validly signed by its
+/// organization, and of the platform that was appraised ([`check_platform`]).
+pub(crate) async fn admit(
+    node: &Node,
+    doc: &PlatformDocument,
+    appraised: &Appraised,
+) -> Result<RevisionRow, ApiError> {
+    let keys = node.intermediates()?;
+    let revision = load_revision(&node.pool, appraised.compose_hash)
+        .await?
+        .ok_or_else(|| unregistered(appraised))?;
+    verify_revision(
+        &node.pool,
+        &keys.tenant_kek_root,
+        appraised.compose_hash,
+        &revision,
+        doc.signer.as_ref(),
+    )
+    .await?;
+    check_platform(&revision, appraised.coco.as_ref())?;
+    Ok(revision)
+}
+
+pub(crate) fn attestation_result(
+    appraised: Appraised,
+    revision: &RevisionRow,
+    now: SystemTime,
+) -> AttestationResult {
+    AttestationResult {
         format: RESULT_FORMAT.into(),
         verdict: Verdict::Verified,
         measured: appraised.measured,
@@ -335,8 +365,7 @@ async fn attest_inner(
         verified_at: rfc3339(now),
         policy_version: appraised.policy_version,
         coco: appraised.coco,
-    };
-    Ok((leaf_der, result))
+    }
 }
 
 fn unregistered(appraised: &Appraised) -> ApiError {
@@ -439,28 +468,76 @@ async fn get_secret_inner(
     identity: &certs::InstanceIdentity,
     name: &str,
 ) -> Result<Value, ApiError> {
+    current_revision(
+        node,
+        tenant_kek_root,
+        identity.org_id,
+        identity.app_id,
+        identity.compose_hash,
+    )
+    .await?;
+    let secret = open_secret(
+        node,
+        tenant_kek_root,
+        identity.org_id,
+        identity.app_id,
+        name,
+    )
+    .await?;
+    Ok(json!({
+        "value": BASE64_URL_SAFE_NO_PAD.encode(&*secret.value),
+        "content_sha256": secret.content_sha256,
+        "issued_at": rfc3339(secret.issued_at),
+    }))
+}
+
+/// The Revision an Instance was certified for, as its row is now: of this App and organization,
+/// unrevoked and validly signed. Every release checks it again, so revoking a Revision stops it.
+pub(crate) async fn current_revision(
+    node: &Node,
+    tenant_kek_root: &[u8; 32],
+    org_id: OrgId,
+    app_id: AppId,
+    compose_hash: ComposeHash,
+) -> Result<keys::Chain, ApiError> {
     let doc = node.platform_document();
-    let signer = doc.as_deref().and_then(|d| d.signer.as_ref());
-    let revision = load_revision(&node.pool, identity.compose_hash)
+    let revision = load_revision(&node.pool, compose_hash)
         .await?
-        .filter(|r| {
-            r.org_id == Uuid::from(identity.org_id) && r.app_id == Uuid::from(identity.app_id)
-        })
+        .filter(|r| r.org_id == Uuid::from(org_id) && r.app_id == Uuid::from(app_id))
         .ok_or_else(|| ApiError::not_found("no such revision"))?;
     verify_revision(
         &node.pool,
         tenant_kek_root,
-        identity.compose_hash,
+        compose_hash,
         &revision,
-        signer,
+        doc.as_deref().and_then(|d| d.signer.as_ref()),
     )
-    .await?;
+    .await
+}
+
+/// A Secret's value as its organization signed it.
+pub(crate) struct OpenedSecret {
+    pub value: Zeroizing<Vec<u8>>,
+    pub content_sha256: String,
+    pub issued_at: DateTime<Utc>,
+}
+
+/// The Secret `name` of `org_id`, opened only if its signed document lists `app_id`.
+pub(crate) async fn open_secret(
+    node: &Node,
+    tenant_kek_root: &[u8; 32],
+    org_id: OrgId,
+    app_id: AppId,
+    name: &str,
+) -> Result<OpenedSecret, ApiError> {
+    let doc = node.platform_document();
+    let signer = doc.as_deref().and_then(|d| d.signer.as_ref());
     let secret = sqlx::query!(
         "select id, ciphertext, content_sha256, document, signed_by_key, signature
          from secrets where org_id = $1 and name = $2 and $3 = any(app_ids)",
-        Uuid::from(identity.org_id),
+        Uuid::from(org_id),
         name,
-        Uuid::from(identity.app_id),
+        Uuid::from(app_id),
     )
     .fetch_optional(&node.pool)
     .await?
@@ -480,7 +557,7 @@ async fn get_secret_inner(
             "secret row differs from its signed document",
         ));
     }
-    if !document.app_ids.contains(&identity.app_id) {
+    if !document.app_ids.contains(&app_id) {
         return Err(ApiError::not_found("no such secret for this app"));
     }
     let chain = keys::verify_signed(
@@ -493,19 +570,19 @@ async fn get_secret_inner(
         signer,
     )
     .await?;
-    if chain.key.org_id != Uuid::from(identity.org_id) {
+    if chain.key.org_id != Uuid::from(org_id) {
         return Err(ApiError::signature_invalid(
             "secret signer is not of its organization",
         ));
     }
-    let org_key = keys::org_key(tenant_kek_root, identity.org_id, &chain.anchor_spki)?;
+    let org_key = keys::org_key(tenant_kek_root, org_id, &chain.anchor_spki)?;
     let value = keys::aead_open(&org_key, secret.id.as_bytes(), &secret.ciphertext)
         .ok_or_else(|| ApiError::internal("secret does not decrypt under org_key"))?;
-    Ok(json!({
-        "value": BASE64_URL_SAFE_NO_PAD.encode(&*value),
-        "content_sha256": content_sha256,
-        "issued_at": rfc3339(document.issued_at),
-    }))
+    Ok(OpenedSecret {
+        value,
+        content_sha256,
+        issued_at: document.issued_at,
+    })
 }
 
 #[derive(Deserialize)]
@@ -575,31 +652,37 @@ async fn derive_key_inner(
     identity: &certs::InstanceIdentity,
     purpose: &str,
 ) -> Result<DerivedKey, ApiError> {
+    let key = derive_app_key(
+        node,
+        tenant_kek_root,
+        identity.org_id,
+        identity.app_id,
+        identity.compose_hash,
+        purpose,
+    )
+    .await?;
+    Ok(DerivedKey {
+        key: Zeroizing::new(BASE64_URL_SAFE_NO_PAD.encode(key.as_slice())),
+    })
+}
+
+/// The App's key for `purpose`, after [`current_revision`].
+pub(crate) async fn derive_app_key(
+    node: &Node,
+    tenant_kek_root: &[u8; 32],
+    org_id: OrgId,
+    app_id: AppId,
+    compose_hash: ComposeHash,
+    purpose: &str,
+) -> Result<keys::Key32, ApiError> {
     if !alpha_core::is_key_purpose(purpose) {
         return Err(ApiError::malformed(
             "purpose: 1 to 64 of a-z, 0-9, '.', '_', '-', starting with a letter or digit",
         ));
     }
-    let doc = node.platform_document();
-    let revision = load_revision(&node.pool, identity.compose_hash)
-        .await?
-        .filter(|r| {
-            r.org_id == Uuid::from(identity.org_id) && r.app_id == Uuid::from(identity.app_id)
-        })
-        .ok_or_else(|| ApiError::not_found("no such revision"))?;
-    let chain = verify_revision(
-        &node.pool,
-        tenant_kek_root,
-        identity.compose_hash,
-        &revision,
-        doc.as_deref().and_then(|d| d.signer.as_ref()),
-    )
-    .await?;
-    let org_key = keys::org_key(tenant_kek_root, identity.org_id, &chain.anchor_spki)?;
-    let key = keys::app_key(&org_key, identity.app_id, purpose)?;
-    Ok(DerivedKey {
-        key: Zeroizing::new(BASE64_URL_SAFE_NO_PAD.encode(key.as_slice())),
-    })
+    let chain = current_revision(node, tenant_kek_root, org_id, app_id, compose_hash).await?;
+    let org_key = keys::org_key(tenant_kek_root, org_id, &chain.anchor_spki)?;
+    keys::app_key(&org_key, app_id, purpose)
 }
 
 #[cfg(test)]

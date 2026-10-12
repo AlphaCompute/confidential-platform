@@ -776,6 +776,43 @@ fn report_data_forms() {
     assert!(!report_data_binds(&[0x5b; 64], &expected));
 }
 
+/// The KBS protocol's binding: the quote holds the digest the attestation agent wrote, byte for
+/// byte; the agent's hex form of it binds nothing; GPU reports are over the binding's own nonce;
+/// the result names the key it was given. Every other step is the runtime binding's.
+#[test]
+fn an_exact_binding_takes_report_data_byte_for_byte_and_its_own_gpu_nonce() {
+    let pod = Pod::gpu(8);
+    let exact = pod.expected_report_data();
+    let own_gpu_nonce = gpu_nonce(&exact);
+    let binding = Binding::exact(exact, own_gpu_nonce, [0x77; 32]);
+    let appraised = appraise_kata_cpu_bound(&pod.evidence(), pod.quote(), &binding, &doc())
+        .and_then(|cpu| cpu.finish(doc().gpu_policy.as_ref(), &pod.gpu_results()))
+        .unwrap();
+    assert_eq!(
+        appraised.runtime_pubkey_sha256,
+        format!("sha256:{}", "77".repeat(32))
+    );
+
+    let hex_form = Pod {
+        aa_report_data: true,
+        ..Pod::gpu(8)
+    };
+    refused(
+        appraise_kata_cpu_bound(&hex_form.evidence(), hex_form.quote(), &binding, &doc())
+            .and_then(|cpu| cpu.finish(doc().gpu_policy.as_ref(), &pod.gpu_results())),
+        "attestation_failed",
+        "report_data",
+    );
+
+    let other_gpu_nonce = Binding::exact(exact, [9; 32], [0x77; 32]);
+    refused(
+        appraise_kata_cpu_bound(&pod.evidence(), pod.quote(), &other_gpu_nonce, &doc())
+            .and_then(|cpu| cpu.finish(doc().gpu_policy.as_ref(), &pod.gpu_results())),
+        "attestation_failed",
+        "report is not over this nonce",
+    );
+}
+
 /// A GPU backend that counts its calls and vouches for every GPU it is given.
 struct Counting {
     calls: std::sync::atomic::AtomicUsize,

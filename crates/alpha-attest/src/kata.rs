@@ -211,6 +211,59 @@ pub fn report_data_binds(quoted: &[u8; 64], expected: &[u8; 64]) -> bool {
     quoted.as_slice() == digest.as_bytes()
 }
 
+/// What the quote's `report_data` must bind and what every GPU report must be over: the one
+/// input on which the two protocols a pod attests through differ. Every other `kata-tdx/1` step
+/// is the same for both.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Binding {
+    report_data: [u8; 64],
+    agent_hex: bool,
+    gpu_nonce: [u8; 32],
+    key_sha256: [u8; 32],
+    kms_node: bool,
+}
+
+impl Binding {
+    /// `POST /v1/attest`'s: [`report_data`] of the runtime key, the KMS nonce and, for a KMS node,
+    /// its X-Wing key, in either form [`report_data_binds`] accepts; GPU reports over
+    /// [`gpu::gpu_nonce`] of it. A KMS node's Revision must also be in `kms_revisions`.
+    pub fn runtime(
+        runtime_pubkey_spki: &[u8],
+        nonce: &[u8; 32],
+        node_xwing_spki: Option<&[u8]>,
+    ) -> Self {
+        let report_data = report_data(runtime_pubkey_spki, nonce, node_xwing_spki);
+        Self {
+            report_data,
+            agent_hex: true,
+            gpu_nonce: gpu::gpu_nonce(&report_data),
+            key_sha256: Sha256::digest(runtime_pubkey_spki).into(),
+            kms_node: node_xwing_spki.is_some(),
+        }
+    }
+
+    /// The KBS protocol's: `report_data` byte for byte only (the attestation agent's TDX attester
+    /// writes the runtime-data digest there itself), GPU reports over `gpu_nonce`, certifying the
+    /// key whose SHA-256 is `key_sha256`. Never a KMS node.
+    pub fn exact(report_data: [u8; 64], gpu_nonce: [u8; 32], key_sha256: [u8; 32]) -> Self {
+        Self {
+            report_data,
+            agent_hex: false,
+            gpu_nonce,
+            key_sha256,
+            kms_node: false,
+        }
+    }
+
+    fn binds(&self, quoted: &[u8; 64]) -> bool {
+        if self.agent_hex {
+            report_data_binds(quoted, &self.report_data)
+        } else {
+            *quoted == self.report_data
+        }
+    }
+}
+
 /// `kata-tdx/1` over a quote [`crate::verify_quote`] has already verified: [`appraise_kata_cpu`],
 /// then, only if it passed and the pod is on the GPU runtime class, every backend the
 /// `gpu_policy` lists, then [`CpuAppraised::finish`].
@@ -223,14 +276,19 @@ pub async fn appraise_kata_tdx(
     doc: &PlatformDocument,
     gpu_backends: &[Arc<dyn GpuVerifier>],
 ) -> Result<Appraised, AppraisalError> {
-    let cpu = appraise_kata_cpu(
-        evidence,
-        verified,
-        nonce,
-        runtime_pubkey_spki,
-        node_xwing_spki,
-        doc,
-    )?;
+    let binding = Binding::runtime(runtime_pubkey_spki, nonce, node_xwing_spki);
+    appraise_kata_tdx_bound(evidence, verified, &binding, doc, gpu_backends).await
+}
+
+/// [`appraise_kata_tdx`] under any [`Binding`].
+pub async fn appraise_kata_tdx_bound(
+    evidence: &EvidenceV2,
+    verified: VerifiedQuote,
+    binding: &Binding,
+    doc: &PlatformDocument,
+    gpu_backends: &[Arc<dyn GpuVerifier>],
+) -> Result<Appraised, AppraisalError> {
+    let cpu = appraise_kata_cpu_bound(evidence, verified, binding, doc)?;
     let gpus = match cpu.gpu_shape() {
         None => Vec::new(),
         Some(shape) => {
@@ -317,6 +375,17 @@ pub fn appraise_kata_cpu(
     nonce: &[u8; 32],
     runtime_pubkey_spki: &[u8],
     node_xwing_spki: Option<&[u8]>,
+    doc: &PlatformDocument,
+) -> Result<CpuAppraised, AppraisalError> {
+    let binding = Binding::runtime(runtime_pubkey_spki, nonce, node_xwing_spki);
+    appraise_kata_cpu_bound(evidence, verified, &binding, doc)
+}
+
+/// [`appraise_kata_cpu`] under any [`Binding`].
+pub fn appraise_kata_cpu_bound(
+    evidence: &EvidenceV2,
+    verified: VerifiedQuote,
+    binding: &Binding,
     doc: &PlatformDocument,
 ) -> Result<CpuAppraised, AppraisalError> {
     use AppraisalError::*;
@@ -407,8 +476,7 @@ pub fn appraise_kata_cpu(
     };
 
     // Last of the TD checks, as the plan orders them (PRD-02 R5e).
-    let expected = report_data(runtime_pubkey_spki, nonce, node_xwing_spki);
-    if !report_data_binds(&quoted, &expected) {
+    if !binding.binds(&quoted) {
         return Err(Failed(
             "report_data is not bound to this key and nonce".into(),
         ));
@@ -417,7 +485,7 @@ pub fn appraise_kata_cpu(
     let compose_hash = revision
         .hash()
         .map_err(|e| Failed(format!("revision: {e}")))?;
-    if node_xwing_spki.is_some()
+    if binding.kms_node
         && !doc
             .kms_revisions
             .iter()
@@ -434,10 +502,7 @@ pub fn appraise_kata_cpu(
         advisories,
         os_image: reference.name.clone(),
         compose_hash,
-        runtime_pubkey_sha256: format!(
-            "sha256:{}",
-            hex::encode(Sha256::digest(runtime_pubkey_spki))
-        ),
+        runtime_pubkey_sha256: format!("sha256:{}", hex::encode(binding.key_sha256)),
         evidence_sha256: format!(
             "sha256:{}",
             hex::encode(Sha256::digest(
@@ -458,7 +523,7 @@ pub fn appraise_kata_cpu(
         appraised,
         gpus,
         gpu_evidence: evidence.gpus.len(),
-        gpu_nonce: gpu::gpu_nonce(&expected),
+        gpu_nonce: binding.gpu_nonce,
     })
 }
 

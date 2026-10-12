@@ -254,6 +254,31 @@ struct NvidiaDevice {
     certificate: String,
 }
 
+/// The GPUs in the attestation agent's NVIDIA device evidence (its additional evidence under
+/// [`NVIDIA_TEE`]), NVSwitches left out, in the agent's order. The KMS reads the same value from
+/// a KBS attestation.
+pub fn nvidia_gpus(nvidia: Value) -> Result<Vec<GpuEvidence>, Error> {
+    let nvidia: NvidiaEvidence = serde_json::from_value(nvidia)
+        .map_err(|e| Error::Agent(format!("NVIDIA device evidence: {e}")))?;
+    let decode = |what: &str, text: &str| {
+        BASE64_STANDARD
+            .decode(text.trim())
+            .map_err(|_| Error::Agent(format!("NVIDIA device {what} is not base64")))
+    };
+    nvidia
+        .device_evidence_list
+        .into_iter()
+        .filter(|d| !d.arch.eq_ignore_ascii_case(NVSWITCH_ARCH))
+        .map(|d| {
+            Ok(GpuEvidence {
+                evidence: decode("evidence", &d.evidence)?,
+                certificate: decode("certificate", &d.certificate)?,
+                arch: d.arch,
+            })
+        })
+        .collect()
+}
+
 /// One report per GPU over `nonce`, from the attestation agent's device evidence
 /// (`GET /aa/additional-evidence`): the agent's NVIDIA attester asks every confidential GPU for a
 /// report over the first 32 bytes of the runtime data, so the nonce is sent as the runtime data,
@@ -280,30 +305,10 @@ pub fn agent_gpu_evidence(
     }
     let mut devices: serde_json::Map<String, Value> = serde_json::from_slice(&body)
         .map_err(|e| Error::Agent(format!("attestation agent device evidence: {e}")))?;
-    let nvidia: NvidiaEvidence = devices
+    let nvidia = devices
         .remove(NVIDIA_TEE)
-        .ok_or_else(|| Error::Agent("the attestation agent reports no NVIDIA device".into()))
-        .and_then(|v| {
-            serde_json::from_value(v)
-                .map_err(|e| Error::Agent(format!("NVIDIA device evidence: {e}")))
-        })?;
-    let decode = |what: &str, text: &str| {
-        BASE64_STANDARD
-            .decode(text.trim())
-            .map_err(|_| Error::Agent(format!("NVIDIA device {what} is not base64")))
-    };
-    let gpus = nvidia
-        .device_evidence_list
-        .into_iter()
-        .filter(|d| !d.arch.eq_ignore_ascii_case(NVSWITCH_ARCH))
-        .map(|d| {
-            Ok(GpuEvidence {
-                evidence: decode("evidence", &d.evidence)?,
-                certificate: decode("certificate", &d.certificate)?,
-                arch: d.arch,
-            })
-        })
-        .collect::<Result<Vec<_>, Error>>()?;
+        .ok_or_else(|| Error::Agent("the attestation agent reports no NVIDIA device".into()))?;
+    let gpus = nvidia_gpus(nvidia)?;
     if gpus.len() != count {
         return Err(Error::Agent(format!(
             "{} GPUs reported, the init-data expects {count}",
