@@ -150,6 +150,12 @@ pub struct PlatformDocument {
     /// on the GPU runtime class can attest; pods on the CPU class never need it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_policy: Option<GpuPolicy>,
+    /// The `alpha-volume` images, each `<image>@sha256:<digest>`, that may open an encrypted
+    /// persistent volume (PRD-02 deliverable 25): the only images an agent policy may run
+    /// privileged in the TD. `alpha coco render` and `wrap` refuse any other; absent, no pod gets
+    /// a persistent volume.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alpha_volume_images: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

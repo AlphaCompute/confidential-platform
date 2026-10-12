@@ -8,7 +8,7 @@
         clippy::arithmetic_side_effects
     )
 )]
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -249,8 +249,9 @@ enum CocoCommand {
         /// block-mode claim, the alpha-volume init container and the container's mount.
         #[arg(long = "volume", value_name = "VOLUME")]
         volumes: Vec<String>,
-        /// The alpha-volume image, pinned by digest; required with --volume.
-        #[arg(long)]
+        /// The alpha-volume image, pinned by digest; required with --volume, and one the
+        /// platform document lists in `alpha_volume_images`.
+        #[arg(long, requires = "platform")]
         volume_image: Option<String>,
         /// Option B: Trustee's KBS, `https://<host>[:<port>]`, which the init-data's aa.toml and
         /// cdh.toml point the guest components at. Requires --kbs-cert.
@@ -260,6 +261,10 @@ enum CocoCommand {
         /// init-data). Requires --kbs-url.
         #[arg(long)]
         kbs_cert: Option<PathBuf>,
+        /// The signed platform document, as `alpha sign --check` reads it; required with
+        /// --volume, whose image it must list.
+        #[arg(long)]
+        platform: Option<PathBuf>,
     },
     /// A customer's docker-compose as one Kata confidential pod of a shape. Prints
     /// `{revision, revision_hash, initdata, pod_spec, secrets}`; runs genpolicy 4.1.0 from
@@ -281,7 +286,8 @@ enum CocoCommand {
         #[arg(long)]
         no_resolve: bool,
         /// The `alpha-volume` image, pinned by digest, for a compose that declares persistent
-        /// volumes (`x-alphacompute-volumes`); without it such a compose is refused.
+        /// volumes (`x-alphacompute-volumes`); without it such a compose is refused. It must be
+        /// one the platform document lists in `alpha_volume_images`.
         #[arg(long)]
         volume_image: Option<String>,
         /// Option B: Trustee's KBS, `https://<host>[:<port>]`, for a compose that opts in with
@@ -752,10 +758,20 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                     volume_image,
                     kbs_url,
                     kbs_cert,
+                    platform,
                 },
         } => {
             let kbs = coco::cdh::kbs_from_flags(kbs_url.as_deref(), kbs_cert.as_deref())
                 .map_err(Exit::Usage)?;
+            let listed = match platform {
+                Some(platform) => {
+                    let artifact: SignedDocument = serde_json::from_value(read_json(&platform)?)
+                        .map_err(|e| Exit::Refused(format!("artifact: {e}")))?;
+                    coco::volume::listed_images(&artifact, &alpha_cli::release_key()?, now)
+                        .map_err(Exit::Refused)?
+                }
+                None => BTreeSet::new(),
+            };
             let volumes = coco::Volumes {
                 image: volume_image,
                 volumes: volumes
@@ -763,6 +779,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                     .map(|v| coco::RenderVolume::parse(v))
                     .collect::<Result<_, _>>()
                     .map_err(Exit::Usage)?,
+                listed,
             };
             let template = fs::read_to_string(&spec)
                 .map_err(|e| Exit::Usage(format!("{}: {e}", spec.display())))?;
@@ -815,9 +832,13 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 fs::read(&shape).map_err(|e| Exit::Usage(format!("{}: {e}", shape.display())))?;
             let shape = coco::wrap::Shape::parse(&shape).map_err(Exit::Usage)?;
             let plain = wrap::parse(&bytes)?;
+            let artifact: SignedDocument = serde_json::from_value(read_json(&platform)?)
+                .map_err(|e| Exit::Refused(format!("artifact: {e}")))?;
             let persistent = coco::wrap::Persistent {
                 volumes: coco::wrap::persistent_volumes(&bytes)?,
                 image: volume_image,
+                listed: coco::volume::listed_images(&artifact, &alpha_cli::release_key()?, now)
+                    .map_err(Exit::Refused)?,
             };
             let ext = coco::wrap::Extensions {
                 persistent,
@@ -825,8 +846,6 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 kbs,
                 scratch: coco::cdh::scratch_volumes(&bytes)?,
             };
-            let artifact: SignedDocument = serde_json::from_value(read_json(&platform)?)
-                .map_err(|e| Exit::Refused(format!("artifact: {e}")))?;
             let runtime =
                 wrap::runtime(&artifact, &alpha_cli::release_key()?, now, &runtime_image)?;
             let digests = if no_resolve {

@@ -16,7 +16,7 @@ use std::time::Duration;
 
 pub use alpha_core::coco::policy::{
     ALLOWED_ENV_REGEX, COPY_FILE_PATHS, DSM_ENV, KMS_ENDPOINTS_ENV_REGEX, PolicyContainer,
-    REFUSED_REQUESTS, RULES, Verified, dsm_pinned, verify,
+    REFUSED_REQUESTS, RULES, Verified, dsm_pinned, verify, verify_with_volumes,
 };
 #[cfg(test)]
 use alpha_core::coco::policy::{

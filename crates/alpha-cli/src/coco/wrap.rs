@@ -44,7 +44,7 @@ pub const MAX_SECRETS: usize = 16;
 /// as `alpha compose wrap`'s health check does with its 24-hour start period.
 const STARTUP_PROBE_PERIOD: u32 = 5;
 const STARTUP_PROBE_FAILURES: u32 = 17_280;
-pub(crate) const SOCKET_VOLUME: &str = "alpha-run";
+pub(crate) const SOCKET_VOLUME: &str = alpha_core::coco::policy::VOLUME_SOCKET_VOLUME;
 const POD_VOLUME: &str = "alpha-pod";
 const SECRETS_VOLUME_PREFIX: &str = "alpha-secrets-";
 /// alpha-runtime's `SECRETS_DIR`: it writes each declaring service's files under
@@ -123,7 +123,11 @@ pub struct Wrapped {
 #[derive(Clone, Debug, Default)]
 pub struct Persistent {
     pub volumes: BTreeMap<String, String>,
+    /// `--volume-image`: one of `listed`.
     pub image: Option<String>,
+    /// The `alpha-volume` images the release-signed platform document lists
+    /// (`super::volume::listed_images`), the only ones a volume init container may run.
+    pub listed: BTreeSet<String>,
 }
 
 /// The compose's `x-alphacompute-*` extensions, with what the adapter gives for them: persistent
@@ -280,7 +284,7 @@ pub async fn wrap(
     let names: BTreeSet<String> = persistent.volumes.keys().cloned().collect();
     let policy = policy::pin_hostname(&policy);
     let policy = super::volume::propagate(&policy, &names).map_err(failed)?;
-    let verified = policy::verify(&policy).map_err(failed)?;
+    let verified = policy::verify_with_volumes(&policy, &persistent.listed).map_err(failed)?;
     if verified.containers != expected {
         return Err(failed(format!(
             "agent policy: admits {:?}, not the pod's containers {:?}",
@@ -291,14 +295,8 @@ pub async fn wrap(
     super::cdh::check_pinned(&sealed, &verified).map_err(failed)?;
     // wrap has no DSM input: a compose cannot declare one (PRD-06 I1), so the policy pins none.
     super::check_dsm(&containers, &verified).map_err(failed)?;
-    let volume_containers = expected
-        .iter()
-        .filter(|c| {
-            c.name
-                .starts_with(alpha_core::coco::policy::VOLUME_CONTAINER_PREFIX)
-        })
-        .cloned()
-        .collect();
+    let volume_containers =
+        super::volume::containers(persistent.volumes.keys(), persistent.image.as_deref());
     super::volume::check_elevated(&verified, &volume_containers).map_err(failed)?;
 
     let gpu = shape.gpu.clone();
@@ -397,6 +395,7 @@ fn pod_spec(
                     "volume image {image:?}: not one pinned image reference; give it as <image>@sha256:<digest>"
                 ));
             }
+            super::volume::check_image(image, &persistent.listed)?;
             volumes.extend(super::volume::pod_volumes(name));
             volume_inits.push(super::volume::init_container(name, image, SOCKET_VOLUME));
         } else {
@@ -940,6 +939,11 @@ mod tests {
     const VOLUME_IMAGE: &str =
         "busybox@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e";
 
+    /// The platform document's `alpha_volume_images`, listing the stand-in.
+    fn listed() -> BTreeSet<String> {
+        BTreeSet::from([VOLUME_IMAGE.to_owned()])
+    }
+
     fn app_id() -> AppId {
         "01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b".parse().unwrap()
     }
@@ -1065,6 +1069,7 @@ mod tests {
         let persistent = Persistent {
             volumes: persistent_volumes(&compose).unwrap(),
             image: Some(VOLUME_IMAGE.into()),
+            listed: listed(),
         };
         let ext = Extensions {
             persistent,
@@ -1329,6 +1334,7 @@ mod tests {
                     persistent: Persistent {
                         volumes: persistent_volumes(compose).unwrap_or_default(),
                         image: None,
+                        listed: BTreeSet::new(),
                     },
                     kbs_requested: super::super::cdh::kbs_requested(compose).unwrap_or(false),
                     kbs: None,
@@ -1575,7 +1581,8 @@ mod tests {
         // back to the guest, the App's slaved to it, and nothing else elevated.
         let initdata = BASE64_STANDARD.decode(&w.initdata).unwrap();
         let text = InitData::parse(&initdata).unwrap().data["policy.rego"].clone();
-        let verified = policy::verify(&text).unwrap();
+        let verified = policy::verify_with_volumes(&text, &listed()).unwrap();
+        assert!(policy::verify(&text).is_err());
         assert_eq!(
             verified.elevated,
             BTreeSet::from(["alpha-volume-pgdata".to_owned()])
@@ -1638,6 +1645,7 @@ mod tests {
         let no_image = Persistent {
             volumes: volumes.clone(),
             image: None,
+            listed: listed(),
         };
         assert!(
             refuse(no_image, compose.clone())
@@ -1650,6 +1658,7 @@ mod tests {
         let persistent = Persistent {
             volumes,
             image: Some(VOLUME_IMAGE.into()),
+            listed: listed(),
         };
         assert!(
             refuse(persistent, unmounted.into_bytes())
@@ -1673,6 +1682,109 @@ mod tests {
             let error = persistent_volumes(bad.as_bytes()).unwrap_err();
             assert!(error.contains(why), "{why}: {error}");
         }
+    }
+
+    /// ACC-FD-100: `--volume-image` is not trusted for itself. An image the platform document
+    /// does not list is refused before genpolicy runs; and a policy whose `alpha-volume-*`
+    /// container runs another image, other args or more mounts than the opener's is refused
+    /// after it, though the name is right.
+    #[tokio::test]
+    async fn wrap_runs_only_a_listed_volume_image_as_the_opener() {
+        let out = dir("coco/wrap/03-volume");
+        let shape = Shape::parse(&fs::read(out.join("shape.json")).unwrap()).unwrap();
+        let compose = fs::read(out.join("compose.yaml")).unwrap();
+        let recorded = fs::read_to_string(out.join("policy.rego")).unwrap();
+        let attacker = format!(
+            "registry.example/attacker/volume@sha256:{}",
+            "ab".repeat(32)
+        );
+        let run = |image: &str, listed: BTreeSet<String>, policy: String| {
+            let persistent = Persistent {
+                volumes: persistent_volumes(&compose).unwrap(),
+                image: Some(image.to_owned()),
+                listed,
+            };
+            let (compose, shape) = (compose.clone(), shape.clone());
+            async move {
+                wrap(
+                    parse(&compose).unwrap(),
+                    &BTreeMap::new(),
+                    app_id(),
+                    &runtime(),
+                    &shape,
+                    &Extensions {
+                        persistent,
+                        ..Extensions::default()
+                    },
+                    &Fixed(policy),
+                )
+                .await
+            }
+        };
+        let refused = |r: Result<Wrapped, WrapError>, why: &str| {
+            let error = r.err().unwrap_or_else(|| panic!("wrapped; expected {why}"));
+            assert!(error.to_string().contains(why), "{why}: {error}");
+            error
+        };
+        let e = refused(
+            run(&attacker, listed(), String::new()).await,
+            "not an alpha-volume image",
+        );
+        assert!(matches!(e, WrapError::Refused(_)));
+        refused(
+            run(VOLUME_IMAGE, BTreeSet::new(), String::new()).await,
+            "lists no alpha-volume image",
+        );
+        // The recorded policy with its volume container edited.
+        let edited = |edit: &dyn Fn(&mut Value)| {
+            use alpha_core::coco::policy::DATA_PREFIX;
+            let data = recorded
+                .strip_prefix(policy::RULES)
+                .and_then(|d| d.strip_prefix(DATA_PREFIX))
+                .unwrap();
+            let mut data: Value = serde_json::from_str(data).unwrap();
+            let container = data["containers"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|c| {
+                    c["OCI"]["Annotations"]["io.kubernetes.cri.container-name"]
+                        == json!("alpha-volume-pgdata")
+                })
+                .unwrap();
+            edit(container);
+            let data = serde_json::to_string_pretty(&data).unwrap();
+            format!("{}{DATA_PREFIX}{data}\n", policy::RULES)
+        };
+        run(VOLUME_IMAGE, listed(), edited(&|_| {})).await.unwrap();
+        let swapped = edited(&|c| {
+            c["OCI"]["Annotations"]["io.kubernetes.cri.image-name"] = json!(attacker);
+        });
+        refused(
+            run(VOLUME_IMAGE, listed(), swapped).await,
+            "not an alpha-volume image",
+        );
+        let shell = edited(&|c| {
+            c["OCI"]["Process"]["Args"] = json!(["sh", "-c", "id", "open", "pgdata"]);
+        });
+        refused(run(VOLUME_IMAGE, listed(), shell).await, "runs");
+        let extra_arg = edited(&|c| {
+            c["OCI"]["Process"]["Args"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!("--debug"));
+        });
+        refused(run(VOLUME_IMAGE, listed(), extra_arg).await, "runs");
+        let extra_mount = edited(&|c| {
+            c["OCI"]["Mounts"].as_array_mut().unwrap().push(json!({
+                "destination": "/host", "source": "/", "type_": "bind",
+                "options": ["rbind", "rprivate", "rw"],
+            }));
+        });
+        refused(
+            run(VOLUME_IMAGE, listed(), extra_mount).await,
+            "mounts / at /host",
+        );
     }
 
     #[test]
