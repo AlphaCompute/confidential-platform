@@ -172,7 +172,7 @@ fn extract_shape(rendered: &str) -> Result<(String, u32), String> {
         if trimmed.is_empty() {
             continue;
         }
-        let indent = line.len() - trimmed.len();
+        let indent = line.len().saturating_sub(trimmed.len());
         // Leave the limits context when we return to the same or a shallower indentation level.
         if in_limits && indent <= limits_indent {
             in_limits = false;
@@ -180,12 +180,13 @@ fn extract_shape(rendered: &str) -> Result<(String, u32), String> {
         if trimmed.starts_with("limits:") {
             in_limits = true;
             limits_indent = indent;
-        } else if in_limits {
-            if let Some(v) = trimmed.strip_prefix("nvidia.com/pgpu:") {
-                if let Some(n) = v.split_whitespace().next().and_then(|n| n.parse::<u32>().ok()) {
-                    gpus = gpus.saturating_add(n);
-                }
-            }
+        } else if in_limits
+            && let Some(n) = trimmed
+                .strip_prefix("nvidia.com/pgpu:")
+                .and_then(|v| v.split_whitespace().next())
+                .and_then(|n| n.parse::<u32>().ok())
+        {
+            gpus = gpus.saturating_add(n);
         }
     }
 
