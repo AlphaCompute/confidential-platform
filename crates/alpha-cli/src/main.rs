@@ -195,6 +195,11 @@ enum Command {
         #[arg(long)]
         endpoint: String,
     },
+    /// Fortanix checks (PRD-06). Read-only.
+    Fortanix {
+        #[command(subcommand)]
+        command: FortanixCommand,
+    },
     /// Genesis on an empty database: three custodian public keys.
     Bootstrap {
         /// Three files, each holding a custodian's public key as `keygen --custodian` printed it.
@@ -203,6 +208,49 @@ enum Command {
         #[arg(long)]
         endpoint: String,
     },
+}
+
+#[derive(Subcommand)]
+enum FortanixCommand {
+    /// Who holds what in one Fortanix account: fails if an AlphaCompute identity holds a CCM
+    /// policy or DSM key-admin right in a customer's account, or if a Fortanix admin of an
+    /// account we administer holds another separation-of-duties role. Exit 0 pass, 1 fail,
+    /// 3 unconfirmed (no violation found, but under Fortanix assumptions not yet confirmed).
+    TenancyCheck {
+        /// The account's onboarding record (`alphacompute-fortanix-account/1`).
+        #[arg(long)]
+        account: PathBuf,
+        /// The separation-of-duties roster (`alphacompute-sod-roster/1`).
+        #[arg(long)]
+        roster: PathBuf,
+        /// The customer's DSM export: `{"users", "apps", "groups"}` as DSM's API returns them.
+        #[arg(long, conflicts_with = "dsm_login_file")]
+        dsm_listing: Option<PathBuf>,
+        /// Read the DSM live with this read-only login file (`{"email", "password"}`).
+        #[arg(long)]
+        dsm_login_file: Option<PathBuf>,
+        /// Allow classical TLS key exchange to the DSM (F6).
+        #[arg(long, requires = "dsm_login_file")]
+        classical_allowed: bool,
+        /// Keep the listing a live read fetched in this directory, named by its sha256.
+        #[arg(long, requires = "dsm_login_file")]
+        save_listing_dir: Option<PathBuf>,
+        /// The customer's CCM export (`alphacompute-ccm-listing/0`).
+        #[arg(long)]
+        ccm_listing: Option<PathBuf>,
+        /// `json` (the record) or `markdown` (for the quarterly audit file).
+        #[arg(long, default_value = "json")]
+        format: ReportFormat,
+        /// Also write the JSON record here.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ReportFormat {
+    Json,
+    Markdown,
 }
 
 #[derive(Subcommand)]
@@ -281,6 +329,8 @@ enum Exit {
     Usage(String),
     /// Printed like a success, but some part of it failed.
     Partial(Value),
+    /// Printed as is, then exit with this status (0 included).
+    Printed(String, i32),
 }
 
 impl From<String> for Exit {
@@ -615,6 +665,44 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let reply = node::unseal(&client, &identity, &share, &custodian, doc.version).await?;
             Ok(json!(reply))
         }
+        Command::Fortanix {
+            command:
+                FortanixCommand::TenancyCheck {
+                    account,
+                    roster,
+                    dsm_listing,
+                    dsm_login_file,
+                    classical_allowed,
+                    save_listing_dir,
+                    ccm_listing,
+                    format,
+                    out,
+                },
+        } => {
+            let account = alpha_cli::fortanix::load_account(&account).map_err(Exit::Usage)?;
+            let roster = alpha_cli::fortanix::load_roster(&roster).map_err(Exit::Usage)?;
+            let sources = alpha_cli::fortanix::Sources {
+                dsm_listing,
+                ccm_listing,
+                dsm_login: dsm_login_file,
+                classical_allowed,
+                save_listing_dir,
+            };
+            let listings = alpha_cli::fortanix::listings(&account, &sources).await?;
+            let report =
+                alpha_cli::fortanix::run(&account, &roster, &listings, alpha_cli::rfc3339(now));
+            let json = serde_json::to_string_pretty(&report)
+                .map_err(|e| Exit::Refused(format!("report: {e}")))?;
+            if let Some(path) = out {
+                fs::write(&path, &json)
+                    .map_err(|e| Exit::Refused(format!("{}: {e}", path.display())))?;
+            }
+            let text = match format {
+                ReportFormat::Json => json,
+                ReportFormat::Markdown => report.markdown(),
+            };
+            Err(Exit::Printed(text, report.verdict.exit_code()))
+        }
         Command::Bootstrap {
             custodians,
             endpoint,
@@ -661,6 +749,10 @@ async fn main() {
         Err(Exit::Partial(value)) => {
             println!("{value:#}");
             std::process::exit(1);
+        }
+        Err(Exit::Printed(text, code)) => {
+            println!("{text}");
+            std::process::exit(code);
         }
     }
 }
@@ -718,6 +810,39 @@ mod tests {
                 .map(|e| e.kind()),
             Some(clap::error::ErrorKind::DisplayVersion)
         );
+    }
+
+    #[test]
+    fn tenancy_check_takes_one_dsm_source() {
+        let check = |flags: &[&str]| {
+            let args = [
+                "alpha",
+                "fortanix",
+                "tenancy-check",
+                "--account",
+                "a.json",
+                "--roster",
+                "r.json",
+            ];
+            Cli::try_parse_from(args.iter().chain(flags)).is_ok()
+        };
+        assert!(check(&["--dsm-listing", "d.json"]));
+        assert!(check(&[
+            "--dsm-login-file",
+            "l.json",
+            "--format",
+            "markdown"
+        ]));
+        assert!(check(&["--ccm-listing", "c.json", "--out", "o.json"]));
+        assert!(!check(&[
+            "--dsm-listing",
+            "d.json",
+            "--dsm-login-file",
+            "l.json"
+        ]));
+        assert!(!check(&["--classical-allowed"]));
+        assert!(!check(&["--save-listing-dir", "x"]));
+        assert!(!check(&["--format", "yaml"]));
     }
 
     #[test]
