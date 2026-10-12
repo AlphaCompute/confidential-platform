@@ -41,7 +41,7 @@ web/signer/build.sh web/signer/dist
 
 It needs the toolchain in `rust-toolchain.toml`, `openssl`, and the `wasm-bindgen` CLI at the
 version `crates/alpha-channel` pins (`cargo install wasm-bindgen-cli --version 0.2.128 --locked`).
-The output directory must be empty or absent, and receives eight files:
+The output directory must be empty or absent, and receives nine files:
 
 - `index.html`, which loads the stylesheet and both scripts with `integrity="sha256-…"`;
 - `alpha_channel-<hex>.js`, the wasm-bindgen glue built for `--target no-modules`;
@@ -50,6 +50,8 @@ The output directory must be empty or absent, and receives eight files:
 - `public_sans-<hex>.woff2`, which the page script fetches with its integrity and adds as a
   `FontFace`, because an `@font-face` source cannot carry one;
 - `headers`, the response headers the host must send;
+- `headers-embed`, the response headers of `/sign/embed` (below), with `@EMBED_ANCESTORS@` for
+  the host to fill;
 - `OFL.txt`, the license of the font, which the host need not serve.
 
 The font is Public Sans Regular (from `fonts/`), under the SIL Open Font License 1.1 in
@@ -77,12 +79,54 @@ the fragment, so it never reaches a server. The assets are served next to it und
 the types `text/javascript`, `application/wasm`, `text/css` and `font/woff2`, and may be cached forever because
 their names change with their content. `/sign/platform.json` is the release-signed platform
 document, and `/sign/catalog/<64 hex>.json` serves each catalog entry under the SHA-256 of its
-bytes. Every response under `/sign/` carries each line of `headers` verbatim; the policy there
+bytes. Every response under `/sign/` but `/sign/embed` (below) carries each line of `headers` verbatim; the policy there
 forbids framing, inline code, string evaluation and any other origin. `connect-src 'self'` holds
 only while the document's `api_origin` is the page's own origin; a host whose API lives on another
 origin adds it to `connect-src`, or every call fails as unavailable.
 
 On dev, shroud-go serves the page and embeds a copy of this build.
+
+## The embed view (PRD-03 S5, draft)
+
+Tenants approve without leaving their Rafay portal, while the approval stays on our origin, where
+Rafay, which is not trusted, cannot change what is approved. `<origin>/sign/embed#<ticket>` is the
+one view of this page another origin may frame:
+
+- **Only the portals the platform document names.** `signer.embed_ancestors` in the
+  release-signed document lists at most eight exact https origins (no wildcard, path or scheme
+  source; never a signer origin). Empty, the default, means no page may frame the view. The host
+  serves `/sign/embed` with `headers-embed`, replacing `@EMBED_ANCESTORS@` with that list,
+  space-separated, or with `'none'` when it is empty. In Chromium and Safari the page also checks
+  `location.ancestorOrigins` against the list and refuses if any page around it is not listed;
+  Firefox has no such list, so there the host's `frame-ancestors` is the only check.
+- **It never signs.** It shows which launch waits (organization, title, App, compose_hash, when
+  the link closes) and one button, "Review and approve", which opens `/sign/approve#<ticket>` in
+  a new top-level window with `noopener`. The passkey prompt, the full launch view and every
+  signature stay on the approval page, under `frame-ancestors 'none'` and its own
+  Cross-Origin-Opener-Policy. `headers-embed` denies the frame passkeys altogether
+  (`Permissions-Policy: publickey-credentials-get=(), publickey-credentials-create=()`). A framing
+  page can at most trick a click into opening that window, where the user still reads the launch
+  and confirms with a passkey. The view cannot decline either; a decline is a state change.
+- **It only reads.** After approving in the other window, "Check again" shows the request
+  decided.
+
+Still open (draft):
+
+- QUESTION(PRD-03 Q14), Rafay: the portal origins, and whether the portal can frame a page of
+  another origin at all (an iframe extension point, its `sandbox` flags: the view needs
+  `allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox`).
+- QUESTION(PRD-03 Q15), Ryan Tharp: security sign-off on framing an approval view.
+- QUESTION(PRD-03 Q16), Christopher Freytes and the exec sponsor: whether a window of our own
+  meets "tenants never leave their portal", or the passkey prompt must run in the frame
+  (`publickey-credentials-get` delegated to the portal; proposed: no).
+- QUESTION(PRD-03 Q17), Ryan Tharp: whether Firefox, without `ancestorOrigins`, may rely on
+  `frame-ancestors` alone (proposed: yes; it is the browser's own enforcement).
+- TODO(draft): shroud-go serves `/sign/embed` with `headers-embed` filled from the document it
+  serves; until it does, the path is not served and nothing can frame the view.
+- TODO(draft): the rafay-plugins adapter shows only `approval_url`; how the portal learns the
+  embed URL (the same ticket under `/sign/embed`) waits on Q14.
+- TODO(draft): if the portal sends `Cross-Origin-Embedder-Policy: require-corp`, the view needs
+  `Cross-Origin-Resource-Policy: cross-origin` on `/sign/embed` only.
 
 ## Tests
 

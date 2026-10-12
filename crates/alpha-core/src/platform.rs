@@ -18,7 +18,20 @@ pub struct Signer {
     pub rp_id: String,
     pub bundle_sha256: String,
     pub api_origin: String,
+    /// The portal origins that may frame the read-only approval view `/sign/embed` (PRD-03 S5,
+    /// draft). Empty means no page may frame it, which is the default. The host builds the
+    /// view's `frame-ancestors` from this list, and the page checks its ancestors against it, so
+    /// only a release-signed document can let a portal frame it. The view never signs: approving
+    /// still opens `/sign/approve` in a window of its own.
+    ///
+    /// QUESTION(PRD-03 Q14): which Rafay portal origins go here. QUESTION(PRD-03 Q15): Ryan
+    /// Tharp's sign-off on framing an approval view at all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub embed_ancestors: Vec<String>,
 }
+
+/// At most this many portal origins may frame the approval view.
+pub const MAX_EMBED_ANCESTORS: usize = 8;
 
 #[derive(Deserialize)]
 struct SignerFields {
@@ -26,6 +39,8 @@ struct SignerFields {
     rp_id: String,
     bundle_sha256: String,
     api_origin: String,
+    #[serde(default)]
+    embed_ancestors: Vec<String>,
 }
 
 impl TryFrom<SignerFields> for Signer {
@@ -68,11 +83,34 @@ impl TryFrom<SignerFields> for Signer {
                 f.bundle_sha256
             ));
         }
+        if f.embed_ancestors.len() > MAX_EMBED_ANCESTORS {
+            return Err(format!(
+                "signer.embed_ancestors lists more than {MAX_EMBED_ANCESTORS} origins"
+            ));
+        }
+        for (i, ancestor) in f.embed_ancestors.iter().enumerate() {
+            // An exact https origin each: no wildcard, path or scheme-only source can be written
+            // as one, so the frame-ancestors the host derives cannot widen beyond this list.
+            if origin_host(ancestor).is_none() {
+                return Err(format!(
+                    "signer.embed_ancestors {ancestor:?} is not an https origin"
+                ));
+            }
+            if f.embed_ancestors.iter().take(i).any(|a| a == ancestor) {
+                return Err(format!("signer.embed_ancestors lists {ancestor:?} twice"));
+            }
+            if f.origins.contains(ancestor) {
+                return Err(format!(
+                    "signer.embed_ancestors {ancestor:?} is a signer origin: the approval view is framed by a portal, never by the signer"
+                ));
+            }
+        }
         Ok(Self {
             origins: f.origins,
             rp_id: f.rp_id,
             bundle_sha256: f.bundle_sha256,
             api_origin: f.api_origin,
+            embed_ancestors: f.embed_ancestors,
         })
     }
 }
@@ -311,6 +349,37 @@ mod tests {
             "later": 1
         });
         assert!(serde_json::from_value::<CatalogKey>(key).is_ok());
+    }
+
+    #[test]
+    fn embed_ancestors_are_distinct_https_origins_and_default_to_none() {
+        let none = signer("later", json!(1)).unwrap();
+        assert!(none.embed_ancestors.is_empty());
+        let view = serde_json::to_value(&none).unwrap();
+        assert!(view.get("embed_ancestors").is_none(), "{view}");
+        let portal = "https://console.rafay.example";
+        let one = signer("embed_ancestors", json!([portal])).unwrap();
+        assert_eq!(one.embed_ancestors, [portal]);
+        for bad in [
+            json!(["*"]),
+            json!(["https://*.rafay.example"]),
+            json!(["https:"]),
+            json!(["http://console.rafay.example"]),
+            json!(["https://console.rafay.example/"]),
+            json!(["https://console.rafay.example/portal"]),
+            json!(["'self'"]),
+            json!(["https://console.rafay.example https://evil.example"]),
+            json!([portal, portal]),
+            json!(["https://sign.example"]),
+            json!(
+                (0..=MAX_EMBED_ANCESTORS)
+                    .map(|i| format!("https://p{i}.rafay.example"))
+                    .collect::<Vec<_>>()
+            ),
+            json!("https://console.rafay.example"),
+        ] {
+            assert!(signer("embed_ancestors", bad.clone()).is_err(), "{bad}");
+        }
     }
 
     #[test]
