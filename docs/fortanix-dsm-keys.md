@@ -25,7 +25,9 @@ environment, so there the value is measured only when the init-data's agent poli
 runtime container's `ALPHACOMPUTE_DSM` to exactly what the tenant signed, as PRD-02 does for
 `ALPHACOMPUTE_QUOTE_SOURCE`. Without that pin, a host could point the Instance at a DSM and a CA
 of its choosing and hand the App keys the host knows. `alpha coco render` will write that policy.
-Until it does, a Kata Instance does not declare a DSM.
+Until it does, a Kata Instance must not declare a DSM, and nothing enforces that yet:
+`alpha-runtime` reads `ALPHACOMPUTE_DSM` from whatever environment it is given, on Kata as on the
+compose path.
 
 ```json
 {
