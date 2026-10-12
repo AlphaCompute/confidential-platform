@@ -386,6 +386,70 @@ pub struct JoinRequest {
     pub xwing_pubkey: PublicKey,
 }
 
+pub const ROTATION_FORMAT: &str = "alphacompute-custodian-rotation/1";
+
+/// What two current custodians approve: a new root KEK split to exactly these three X-Wing keys,
+/// on the node whose runtime key `kms_node_spki_sha256` names, over a nonce that node minted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RotationProposal {
+    pub format: String,
+    pub nonce: String,
+    pub kms_node_spki_sha256: String,
+    pub custodians: [PublicKey; 3],
+}
+
+impl RotationProposal {
+    /// `signing_digest(CUSTODIAN_ROTATION, proposal)`: what each approval is bound to.
+    pub fn digest(&self) -> Result<[u8; 32], Error> {
+        let value = serde_json::to_value(self)
+            .map_err(|e| Error::Invalid(format!("rotation proposal: {e}")))?;
+        signing_digest(context::CUSTODIAN_ROTATION, &value)
+            .map_err(|e| Error::Invalid(format!("rotation proposal: {e}")))
+    }
+}
+
+/// One current custodian's approval: `approval_hpke` seals `digest(proposal) ‖ share` to the
+/// node's X-Wing key under `INFO_CUSTODIAN_APPROVAL`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RotateRequest {
+    pub proposal: RotationProposal,
+    pub approval_hpke: Sealed,
+}
+
+/// A committed rotation as the node stores and serves it: the proposal, the new root's three
+/// shares sealed to the new custodians in the proposal's order, and the node's receipt, whose
+/// signed response carries the digests of everything beside it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rotation {
+    pub id: String,
+    pub proposal: RotationProposal,
+    pub shares_hpke: Vec<Sealed>,
+    pub receipt: Value,
+}
+
+/// What a rotation's receipt names a sealed share by: SHA-256 of its canonical JSON.
+pub fn sealed_sha256(sealed: &Sealed) -> Result<String, Error> {
+    let value = serde_json::to_value(sealed).map_err(|e| Error::Invalid(e.to_string()))?;
+    let bytes = alpha_core::jcs(&value).map_err(|e| Error::Invalid(e.to_string()))?;
+    Ok(alpha_channel::sha256_label(&bytes))
+}
+
+/// The route name a rotation's receipt carries.
+pub const ROTATION_ROUTE: &str = "custodians.rotate";
+
+/// `rotation` is present once the second approval has rotated the root.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RotateReply {
+    pub rotated: bool,
+    pub approvals: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<Rotation>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct JoinReply {
     pub tenant_kek_root: String,
@@ -550,6 +614,16 @@ impl Client {
 
     pub async fn join(&self, body: &JoinRequest) -> Result<JoinReply, Error> {
         self.post("/v1/node/join", body).await
+    }
+
+    pub async fn rotate_custodians(&self, body: &RotateRequest) -> Result<RotateReply, Error> {
+        self.post("/v1/node/custodians/rotate", body).await
+    }
+
+    /// The last committed rotation, which the node keeps for a reply that never arrived.
+    pub async fn last_rotation(&self) -> Result<Rotation, Error> {
+        self.request(Method::GET, "/v1/node/custodians/rotation", None)
+            .await
     }
 }
 

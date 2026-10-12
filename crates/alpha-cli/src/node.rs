@@ -17,6 +17,7 @@ use alpha_crypto::{INFO_NODE_BOOTSTRAP, INFO_UNSEAL_SHARE, PublicKey, Sealed};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use alpha_channel::sha256_label;
 
@@ -40,6 +41,8 @@ impl NodeIdentity {
 pub struct AttestedNode {
     pub identity: NodeIdentity,
     pub appraised: Appraised,
+    /// A Kata node's agent policy, from the init-data its quote binds; none for a prototype node.
+    pub policy: Option<String>,
 }
 
 impl AttestedNode {
@@ -134,12 +137,22 @@ fn attested(
     if server_spki != runtime_spki {
         return Err("server TLS key is not the attested runtime_pubkey".into());
     }
+    // The appraisal bound this init-data to the quote; its policy is what the node runs under.
+    let policy = match evidence.evidence().map_err(|e| e.to_string())? {
+        AnyEvidence::V1(_) => None,
+        AnyEvidence::V2(v2) => Some(
+            alpha_core::coco::InitData::parse(&v2.initdata)
+                .and_then(|d| d.policy().map(str::to_owned))
+                .map_err(|e| format!("init-data: {e}"))?,
+        ),
+    };
     Ok(AttestedNode {
         identity: NodeIdentity {
             runtime_spki,
             xwing: evidence.xwing_pubkey.clone(),
         },
         appraised,
+        policy,
     })
 }
 
@@ -207,6 +220,24 @@ impl ShareFile {
     pub fn write(&self, path: &Path) -> Result<(), String> {
         let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())? + "\n";
         fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// [`ShareFile::write`] to a path that must not exist yet, readable by its owner only.
+    pub fn create(&self, path: &Path) -> Result<(), String> {
+        let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())? + "\n";
+        let mut out = fs::OpenOptions::new();
+        out.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut out, 0o600);
+        out.open(path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()))
+            .map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// Opens the share under the custodian's key.
+    pub fn open(&self, custodian: &alpha_crypto::PrivateKey) -> Result<Zeroizing<Vec<u8>>, String> {
+        alpha_crypto::open(custodian, INFO_UNSEAL_SHARE, &self.aad()?, &self.share_hpke)
+            .map_err(|e| format!("share file: {e}"))
     }
 
     fn aad(&self) -> Result<[u8; 32], String> {
@@ -277,8 +308,7 @@ pub async fn unseal(
     doc_version: u64,
 ) -> Result<UnsealReply, String> {
     let mut file = ShareFile::read(share_path)?;
-    let share = alpha_crypto::open(custodian, INFO_UNSEAL_SHARE, &file.aad()?, &file.share_hpke)
-        .map_err(|e| format!("share file: {e}"))?;
+    let share = file.open(custodian)?;
     let share_hpke = alpha_crypto::seal(&node.xwing, INFO_UNSEAL_SHARE, &node.aad(), &share)
         .map_err(|e| e.to_string())?;
     if doc_version > file.platform_document_version {

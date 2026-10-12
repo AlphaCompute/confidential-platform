@@ -12,6 +12,7 @@ pub mod context {
     pub const CONTROL: &str = "alphacompute/control/v1";
     pub const PLATFORM: &str = "alphacompute/platform/v1";
     pub const NODE_BOOTSTRAP: &str = "alphacompute/node-bootstrap/v1";
+    pub const CUSTODIAN_ROTATION: &str = "alphacompute/custodian-rotation/v1";
     pub const INNER_CHANNEL: &str = "alphacompute/inner-channel/v1";
     pub const CONNECTOR_REQUEST: &str = "alphacompute/connector-request/v1";
     pub const CONNECTOR_GRANT: &str = "alphacompute/connector-grant/v1";

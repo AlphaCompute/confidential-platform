@@ -74,13 +74,14 @@ The Instance read no longer filters on `app_ids` in SQL. It opens the row and re
 | `actor_kind`, `actor`, `action`, `outcome`, `details` | clear, node facts only | Written only by a node that holds no key yet: `node.join.request`, a refused `node.unseal`, `platform.reload` at start, `node.join` on a sealed node. They name no organization, object or evidence (enforced on write and on verify). An older release's serving node still queries `node.join.request` here. |
 | `org_id`, `object`, `evidence_sha256` | must be encrypted: null for every row this release writes | A row of an earlier release is moved into the chain and scrubbed (below). |
 
-### `platform_document`, `intermediate_keys`
+### `platform_document`, `intermediate_keys`, `custodian_rotations`
 
 | Column | Class | Why |
 |---|---|---|
 | `platform_document.*` | clear | The release-signed document is public: it is served at an unauthenticated URL, and every stored copy is re-verified against the release key. |
-| `intermediate_keys.wrapped` | already ciphertext | Under the root KEK. |
+| `intermediate_keys.wrapped` | already ciphertext | Under the root KEK. A custodian rotation re-wraps it under a new root (`docs/custodian-rotation.md`); what it wraps, and so every key derived here, is unchanged. |
 | `intermediate_keys.public_part` | clear | The CA certificate, pinned in the platform document. |
+| `custodian_rotations.rotation` | clear, its shares already ciphertext | The proposal (the custodians' X-Wing public keys, a spent nonce, the node's key hash), the new shares HPKE-sealed to the custodians, and the node's receipt. No tenant appears in it, and the custodians verify the receipt rather than trust the row. |
 
 ### What the host still learns
 

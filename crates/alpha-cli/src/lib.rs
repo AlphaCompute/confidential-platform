@@ -14,6 +14,7 @@
 )]
 pub mod call;
 pub mod catalog;
+pub mod custodians;
 pub mod deploy;
 pub mod instances;
 pub mod keyfile;
