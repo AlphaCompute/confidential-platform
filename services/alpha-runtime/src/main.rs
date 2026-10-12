@@ -99,7 +99,17 @@ async fn run() -> Result<Exit, Error> {
         std::os::unix::fs::PermissionsExt::from_mode(0o666),
     )
     .map_err(socket)?;
-    let tls = proxy::Endpoint::bind(runtime.clone(), ([0, 0, 0, 0], TLS_PORT).into()).await?;
+    let addr = ([0, 0, 0, 0], TLS_PORT).into();
+    let tls = match (guest, &runtime.config().tls_upstream) {
+        (_, None) => alpha_runtime::Tls::Off,
+        (alpha_runtime::Guest::Coco(_), Some(_)) => alpha_runtime::Tls::AfterSecrets(addr),
+        (alpha_runtime::Guest::Prototype, Some(_)) => {
+            match proxy::Endpoint::bind(runtime.clone(), addr).await? {
+                Some(endpoint) => alpha_runtime::Tls::Bound(endpoint),
+                None => alpha_runtime::Tls::Off,
+            }
+        }
+    };
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| Error::Socket(format!("SIGTERM handler: {e}")))?;
     let shutdown = async move {
