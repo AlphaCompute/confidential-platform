@@ -76,7 +76,7 @@ pub async fn attest_ccm(
 /// `appraise_ccm`, the platform document's zone pin and the audit row included. No route reaches
 /// it. Until Fortanix names the identity fields (F5, F8) `appraise_ccm` refuses every
 /// certificate, so the KMS's tests run the rest of I5 through this.
-pub(crate) async fn attest_ccm_verified(
+pub async fn attest_ccm_verified(
     node: &Node,
     request: &AttestCcmRequest,
     appraised: CcmAppraised,
