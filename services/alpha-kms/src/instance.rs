@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alpha_attest::{
-    AnyEvidence, Appraised, AttestationResult, CocoAppraised, RESULT_FORMAT, Revision, Verdict,
-    VerifiedQuote, appraise, kata, verify_quote,
+    AnyEvidence, Appraised, AttestationResult, CocoAppraised, CpuKind, RESULT_FORMAT, Revision,
+    Verdict, VerifiedCpu, appraise, kata, verify_quote,
 };
 use alpha_client::DerivedKey;
 use alpha_client::tls::PeerCerts;
@@ -184,22 +184,23 @@ pub async fn attest(
     attest_audited(&node, &request, None).await.map(Json)
 }
 
-/// [`attest`] for `alphacompute-evidence/2` over a TDX quote the caller has verified: every step
-/// after DCAP, the audit row included. No route reaches it. The KMS's tests run the Kata pod's
-/// cases through it over synthetic quotes, as `alpha_attest::kata` tests its profile, until B300
-/// Kata captures exist (M1).
+/// [`attest`] for `alphacompute-evidence/2` over CPU evidence the caller has verified (a TDX quote
+/// or an SEV-SNP report): every step after DCAP or the SNP report checks, the audit row included.
+/// No route reaches it. The KMS's tests run the Kata pod's cases through it over synthetic quotes
+/// and reports, as `alpha_attest::kata` tests its profiles, until B300 Kata captures exist (M1)
+/// and an SNP capture from our own pod (`ponytail: snp-capture`).
 pub async fn attest_verified(
     node: &Node,
     request: &AttestRequest,
-    verified: VerifiedQuote,
+    verified: impl Into<VerifiedCpu>,
 ) -> Result<Value, ApiError> {
-    attest_audited(node, request, Some(verified)).await
+    attest_audited(node, request, Some(verified.into())).await
 }
 
 async fn attest_audited(
     node: &Node,
     request: &AttestRequest,
-    verified: Option<VerifiedQuote>,
+    verified: Option<VerifiedCpu>,
 ) -> Result<Value, ApiError> {
     let spki = BASE64_URL_SAFE_NO_PAD
         .decode(&request.runtime_pubkey)
@@ -243,13 +244,13 @@ async fn attest_audited(
     }))
 }
 
-/// The leaf's DER and the result behind it. A Kata pod's quote is DCAP-verified here unless the
-/// caller of [`attest_verified`] has done so.
+/// The leaf's DER and the result behind it. A Kata pod's quote is DCAP-verified, or its SNP report
+/// verified to the pinned AMD chain, here unless the caller of [`attest_verified`] has done so.
 async fn attest_inner(
     node: &Node,
     spki: &[u8],
     request: &AttestRequest,
-    verified: Option<VerifiedQuote>,
+    verified: Option<VerifiedCpu>,
     now: SystemTime,
 ) -> Result<(Vec<u8>, AttestationResult), ApiError> {
     let nonce = decode32("nonce", &request.nonce)?;
@@ -268,16 +269,21 @@ async fn attest_inner(
             ));
         }
         (AnyEvidence::V2(evidence), verified) => {
+            // The profile by CPU kind: `kata-tdx/1` or `kata-snp/1`.
             let verified = match verified {
                 Some(verified) => verified,
-                None => {
-                    kata::check_cpu_kind(evidence)?;
-                    let collateral = collateral(node, &evidence.cpu.quote).await?;
-                    verify_quote(&evidence.cpu.quote, &collateral, &doc.policy, now)?
-                }
+                None => match kata::cpu_kind(evidence)? {
+                    CpuKind::Tdx => {
+                        let collateral = collateral(node, &evidence.cpu.quote).await?;
+                        verify_quote(&evidence.cpu.quote, &collateral, &doc.policy, now)?.into()
+                    }
+                    CpuKind::Snp => kata::verify_snp(evidence, &doc, &node.snp_kds, now)
+                        .await?
+                        .into(),
+                },
             };
-            // The TD checks, then (GPU class only) every backend the `gpu_policy` lists.
-            kata::appraise_kata_tdx(
+            // The CPU checks, then (GPU classes only) every backend the `gpu_policy` lists.
+            kata::appraise_kata(
                 evidence,
                 verified,
                 &nonce,
@@ -351,7 +357,7 @@ fn unregistered(appraised: &Appraised) -> ApiError {
 }
 
 /// A registered compose is attested only by a prototype CVM (`alphacompute-evidence/1`) and a
-/// registered Revision v2 only by a Kata pod (`kata-tdx/1`), whose findings must then be that
+/// registered Revision v2 only by a Kata pod (`kata-tdx/1` or `kata-snp/1`), whose findings must then be that
 /// Revision's: its runtime class, init-data and policy digests, and exactly its GPUs, of its model.
 /// The Revision hash already binds the init-data; held again here against the registered row, so
 /// no leaf names a Revision whose GPUs were not the ones verified.
@@ -675,6 +681,7 @@ mod tests {
             runtime_class: revision.runtime_class.clone(),
             gpus: (0..8).map(|i| gpu(i, "B300")).collect(),
             gpu_verifiers: Vec::new(),
+            snp: None,
         };
         (row(revision.canonical().unwrap(), app), found)
     }

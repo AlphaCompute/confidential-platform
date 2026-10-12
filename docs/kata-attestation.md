@@ -1,12 +1,12 @@
-# Attesting a Kata confidential pod (`kata-tdx/1`)
+# Attesting a Kata confidential pod (`kata-tdx/1`, `kata-snp/1`)
 
-How `alpha-kms` decides to issue a Revision leaf to a Kata confidential pod on TDX, CPU-only or with NVIDIA confidential GPUs (PRD-02). Clients see no change: the leaf, its one-hour lifetime and its SANs (`urn:alphacompute:revision:sha256:<hash>`) are what they were. The prototype profile (`alphacompute-evidence/1`) is unchanged and both coexist.
+How `alpha-kms` decides to issue a Revision leaf to a Kata confidential pod on TDX or AMD SEV-SNP, CPU-only or with NVIDIA confidential GPUs (PRD-02). SEV-SNP (`kata-snp/1`, PRD-02 P2) has [its own section](#sev-snp-kata-snp1); everything else applies to both. Clients see no change: the leaf, its one-hour lifetime and its SANs (`urn:alphacompute:revision:sha256:<hash>`) are what they were. The prototype profile (`alphacompute-evidence/1`) is unchanged and both coexist.
 
-`POST /v1/attest` takes either evidence format (`services/alpha-kms/src/instance.rs`): `alphacompute-evidence/1` goes to the prototype `appraise`, `alphacompute-evidence/2` to `kata-tdx/1` in `alpha_attest` (`kata`, `gpu`) and then to the KMS's own checks below. Any other format is `malformed`.
+`POST /v1/attest` takes either evidence format (`services/alpha-kms/src/instance.rs`): `alphacompute-evidence/1` goes to the prototype `appraise`, `alphacompute-evidence/2` to `kata-tdx/1` or `kata-snp/1` in `alpha_attest` (`kata`, `snp`, `gpu`) by `cpu.kind`, and then to the KMS's own checks below. Any other format is `malformed`.
 
 ## Identity: init-data and the Revision v2
 
-Kata binds the digest of the pod's init-data into the TD's `MRCONFIGID` when it launches the VM, and the Kata agent policy the pod runs under is the init-data's `policy.rego` entry. The policy pins images by digest and fixes each container's command, environment and mounts, and denies exec and log reads. So the init-data, not the pod spec the host holds, says what may run.
+Kata binds the digest of the pod's init-data into the TD's `MRCONFIGID` (an SNP guest's `HOST_DATA`) when it launches the VM, and the Kata agent policy the pod runs under is the init-data's `policy.rego` entry. The policy pins images by digest and fixes each container's command, environment and mounts, and denies exec and log reads. So the init-data, not the pod spec the host holds, says what may run.
 
 `alpha coco render` adds one entry of ours, `alpha.json`:
 
@@ -25,14 +25,16 @@ It is registered in its JCS form, signed by the org key or a passkey exactly lik
 
 ### Runtime classes
 
-A Revision v2 names one of two runtime classes, both Kata on TDX. The class decides the `gpu` section, in `alpha.json` and in the Revision alike:
+A Revision v2 names one of four runtime classes, Kata on TDX or on SEV-SNP. The class decides the TEE (and so the profile) and the `gpu` section, in `alpha.json` and in the Revision alike:
 
-| `runtime_class` | Pods | `gpu` |
-|---|---|---|
-| `kata-qemu-tdx` | CPU-only confidential pods: the KMS, broker, signer, guard, inference front and Corpus supervisor | Absent. Any `gpu` section is refused, even one with `count: 0`, so one pod has exactly one Revision. |
-| `kata-qemu-nvidia-gpu-tdx` | Pods with whole B300 GPUs in CC mode (`nvidia.com/pgpu`) | Required: `count` 1 or 8 and an upper-case `model`. A GPU-class Revision without GPUs is refused. |
+| `runtime_class` | TEE | Pods | `gpu` |
+|---|---|---|---|
+| `kata-qemu-tdx` | TDX | CPU-only confidential pods: the KMS, broker, signer, guard, inference front and Corpus supervisor | Absent. Any `gpu` section is refused, even one with `count: 0`, so one pod has exactly one Revision. |
+| `kata-qemu-nvidia-gpu-tdx` | TDX | Pods with whole B300 GPUs in CC mode (`nvidia.com/pgpu`) | Required: `count` 1 or 8 and an upper-case `model`. A GPU-class Revision without GPUs is refused. |
+| `kata-qemu-snp` | SEV-SNP | CPU-only pods on an SNP host (alpha-infra #10's `alpha-coco-cpu-snp` blueprint) | As `kata-qemu-tdx`. |
+| `kata-qemu-nvidia-gpu-snp` | SEV-SNP | Pods with confidential GPUs on an SNP host | As `kata-qemu-nvidia-gpu-tdx`. |
 
-Any other class is refused at registration and at appraisal (`kata-qemu-nvidia-gpu-snp` waits for the `kata-snp/1` profile). A CPU-only pod's entries:
+Any other class is refused at registration and at appraisal. The same App on TDX and on SNP is two Revisions (the runtime class is in the Revision), each registered and signed on its own. A CPU-only pod's entries:
 
 ```json
 {"app_id":"<uuid>","format":"alphacompute-initdata/1","runtime_class":"kata-qemu-tdx"}
@@ -53,7 +55,7 @@ Any other class is refused at registration and at appraisal (`kata-qemu-nvidia-g
 }
 ```
 
-`event_log` (the CCEL boot events) is optional; when sent, RTMR0..2 must replay from it. `runtime_class` is the pod's own claim: a class no Revision v2 may name is refused, and any other claim is refused unless it equals the measured init-data's. `kind: "snp"` is refused until the `kata-snp/1` profile exists.
+`event_log` (the CCEL boot events) is optional; when sent, RTMR0..2 must replay from it. `runtime_class` is the pod's own claim: a class no Revision v2 may name, or a class of the other TEE than `cpu.kind`, is refused, and any other claim is refused unless it equals the measured init-data's. `kind: "snp"` evidence (an SNP report in `quote`, optionally its VCEK in `vek`) goes to `kata-snp/1`; a TDX quote with a `vek`, or an SNP report with an `event_log`, is refused.
 
 A pod on `kata-qemu-tdx` sends no GPU evidence (`gpus` empty or absent). If it sends any, the appraisal refuses it once the TD checks have passed, without calling a GPU backend, and it refuses a GPU that a backend verified for such a pod the same way: GPU evidence from a CPU pod is refused, never ignored. The KMS refuses it the same way.
 
@@ -138,6 +140,67 @@ At G0, on the first B300 in CC mode:
 
 If a required claim name differs on the B300, `nras::claims::REQUIRED` is the one place to change.
 
+## SEV-SNP (`kata-snp/1`)
+
+The same pods on AMD SEV-SNP (EPYC Milan, Genoa, Turin), on the runtime classes `kata-qemu-snp` and `kata-qemu-nvidia-gpu-snp`. Everything after the CPU evidence is shared with `kata-tdx/1` (`alpha_attest::kata::appraise_kata`): runtime class, reference value, init-data, Revision v2, `report_data`, GPUs, and in the KMS registration, signature and the registered Revision's GPUs. What differs is the CPU evidence and how the init-data is bound.
+
+### Evidence
+
+```json
+"cpu": {"kind": "snp", "quote": "<base64url of the 1184-byte attestation report>", "vek": "<base64url DER VCEK or VLEK, optional>"}
+```
+
+In the pod, `alpha_tsm::coco` reads the report from configfs-tsm (`ALPHACOMPUTE_QUOTE_SOURCE=coco-tsm`): a fresh entry of its own, `provider` must be `sev_guest`, `inblob` our 64-byte `report_data`, `outblob` the report, `auxblob` the host's certificate table (GHCB extended guest request), from which the VCEK (or the VLEK, as the report's `KEY_INFO` says) is taken; the entry's `generation` must not move. The pod checks the length and its `report_data` before sending. `coco-aa` is refused on SNP classes for now: the attestation agent's SNP evidence is a serde rendering of the report whose exact shape on the pinned guest-components is to be read from our first SNP pod (`ponytail: snp-capture`). Nothing the pod sends is trusted.
+
+### Appraisal (`alpha_attest::snp`, `kata::verify_snp`)
+
+1. The platform document has an `snp_policy` (else `attestation_unknown`).
+2. Collateral (`snp::kds`): the VEK from the evidence, or the VCEK from KDS at `snp_policy.kds_url` (`/vcek/v1/{product}/{hwid}?blSPL…`; a version 2 report names no product, so it must carry its VCEK); AMD's CRL always from KDS (`/{vcek|vlek}/v1/{product}/crl`). VCEKs are cached for good, CRLs for an hour and kept while KDS does not answer. No `kds_url`, no CRL: refused. The ARK, ASK and ASVK are **never** taken from the evidence or KDS.
+3. The report is exactly 1184 bytes and parses (the `sev` crate), and re-encodes to the same bytes, so no field is read from bytes the signature does not cover and nonzero reserved bytes are refused. `SIGNATURE_ALGO` is ECDSA P-384, the report is signed (not `MASK_CHIP_KEY`) by a VCEK or VLEK.
+4. The product comes from the VEK's `productName` and, from report version 3, the report's CPUID; they must agree, and `snp_policy.products` must pin it (else `attestation_unknown`).
+5. Chain: the pinned ARK is self-signed and signs the pinned ASK (VLEK: the pinned ASVK, else `policy_denied`), which signs the VEK (RSA-PSS SHA-384), with matching issuer names; ARK, intermediate and VEK are valid now.
+6. CRL: AMD's, signed by the pinned ARK (RSA-PSS SHA-384, salt 48), issued by it, `thisUpdate ≤ now < nextUpdate`, and not listing the intermediate.
+7. The report's signature verifies under the VEK's P-384 key over bytes `0x000–0x29F`.
+8. The VEK certifies the report: its TCB extensions (`blSPL`, `teeSPL`, `snpSPL`, `ucodeSPL`, `fmcSPL`) equal `REPORTED_TCB`, and a VCEK's `hwID` is the report's `CHIP_ID` (Turin on: its first 8 bytes).
+9. Policy (`policy_denied`): the guest policy does not allow debugging; it allows a migration agent only if `allow_migration_agent`; the platform runs SMT only if `allow_smt`; the report is from `snp_policy.vmpl` (0 for Kata without an SVSM); `REPORTED_TCB` is at or above the product's `min_tcb`, component by component.
+
+Then the shared steps, as for TDX: the runtime class is supported and an SNP class; `MEASUREMENT` matches a reference value of kind `kata-snp` for that class; `HOST_DATA` is the init-data's digest (`attestation_failed`: HOST_DATA is not the digest of the init-data sent); the init-data, its class, `report_data` (raw or as the agent's hex), the Revision v2, then GPUs by class, then the KMS's steps 11 to 13.
+
+`HOST_DATA` is 32 bytes: the pinned Kata writes the init-data digest under the declared algorithm, cut to 32 bytes (`alpha_core::coco::InitData::hostdata`; a `sha256` init-data fills it exactly, `sha384` is truncated). Read from Kata's source, not yet from a report of ours: `ponytail: snp-capture`, as Q10 is for MRCONFIGID.
+
+### Platform document
+
+```json
+"reference_values": [
+  {"name": "kata-snp/cpu-4c-8g", "kind": "kata-snp", "runtime_class": "kata-qemu-snp",
+   "values": {"measurement": "sha384:…"}}
+],
+"snp_policy": {
+  "products": {"Genoa": {"ark_pem": "-----BEGIN CERTIFICATE-----…", "ask_pem": "…", "asvk_pem": "… (optional)",
+                         "min_tcb": {"bootloader": 0, "tee": 0, "snp": 0, "microcode": 0}}},
+  "allow_smt": false,
+  "allow_migration_agent": false,
+  "vmpl": 0,
+  "kds_url": "<AMD's KDS, https://>"
+}
+```
+
+The ARK, ASK and ASVK are copied from AMD's KDS (`/vcek/v1/{product}/cert_chain`, `/vlek/v1/{product}/cert_chain`) when the document is prepared and checked by whoever signs it; the release signature, not TLS, is what makes them trusted. `min_tcb` is per product because SVNs are not comparable across generations (Turin adds `fmc`). Every field refuses unknown keys. A `kata-snp` value has `values.measurement` only; a value whose shape is not its kind's never matches.
+
+### What the result records
+
+`measured` (TDX registers) is absent; `tcb_status` is `AtOrAboveMinimum`; `coco.profile` is `kata-snp/1` and `coco.snp` holds the product, `signing_key` (`vcek`/`vlek`), `measurement`, `host_data`, `reported_tcb`, `guest_policy` and `vmpl`.
+
+### Tests and what needs hardware
+
+We have no SNP hardware. `testdata/attest/snp-virtee-milan` is virtee/sev's published Milan report and VCEK (Apache-2.0) with AMD's Milan chain and CRL fetched from KDS on 2026-10-12 (provenance in its README). Over it, `alpha_attest::snp` tests the whole report path for real: the chain to the pinned ARK, the CRL, the signature, TCB and SMT policy, and refusals for a changed byte, a foreign root or intermediate, an unpinned product, a tampered or expired CRL, an expired VCEK, a higher minimum TCB and another VMPL. `services/alpha-kms/tests/snp.rs` posts it through `/v1/attest`, where it verifies and is then refused by our own checks (no reference value; listed, HOST_DATA), and audited. Our SNP pods' cases (leaf, GPUs, swapped init-data, TDX/SNP confusion, DevTools GPU) run over synthetic verified reports through `instance::attest_verified`, as TDX's do before M1. Debug and migration-agent policy are unit tests over parsed synthetic reports, since a real report cannot be edited.
+
+`ponytail: snp-capture`, on our first SNP host (alpha-infra #10's `alpha-coco-cpu-snp` blueprint states SNP capture and appraisal are not built; this adds the appraisal, not the capture):
+- a golden report from a `kata-qemu-snp` pod, proving `HOST_DATA` = the init-data digest as above and the configfs-tsm path (`provider`, `auxblob` table layout and GUID byte order);
+- the `kata-snp` reference values captured per guest image and VM size (`refvals add` speaks TDX only today), and the `snp_policy` `min_tcb` chosen from AMD's current TCB guidance;
+- the attestation agent's SNP evidence shape, before `coco-aa` is allowed on SNP;
+- `kata-qemu-nvidia-gpu-snp` with a GPU passed through on an SNP host.
+
 ## Malicious-host core suite
 
 `services/alpha-kms/tests/malicious_host.rs` (PRD-02 deliverable 7) runs what a hostile host can do to a Kata pod's attestation through the KMS, on Postgres 18 in CI's db-tests job (step `malicious-host core suite`). Each case attests over the quote a TD launched as the case describes would produce. Every case is refused with its reason, an `attest` audit row records exactly that refusal, no leaf is issued, and where the TD side fails no GPU backend is called.
@@ -153,7 +216,7 @@ If a required claim name differs on the B300, `nras::claims::REQUIRED` is the on
 | passes a GPU in DevTools mode or with CC off | `policy_denied`: gpu `<i>`: not in CC mode |
 | uses a revoked Revision | `revision_revoked` |
 | serves an older, still release-signed platform document | the reload is refused with a denied `platform.reload` audit row and the newer document stays in force, so a guest image it withdrew stays refused |
-| claims a runtime class no Revision v2 may name, or the CPU class for a GPU pod | `attestation_failed`: runtime class … is not supported; `attestation_unknown`: no kata-tdx reference value … and runtime class kata-qemu-tdx |
+| claims a runtime class no Revision v2 may name, an SEV-SNP class for a TD, or the CPU class for a GPU pod | `attestation_failed`: runtime class … is not supported, or … does not run on Tdx; `attestation_unknown`: no kata-tdx reference value … and runtime class kata-qemu-tdx |
 | launches the pod with a policy of its own (MRCONFIGID consistent) | `attestation_unknown`: the Revision v2 of this init-data (policy …) is not registered |
 
 The GPU backend in the suite reports each GPU as its report describes it. The `nras` backend reports a GPU whose CC-mode claim holds anything but the CC-on value (`OFF`, `DEVTOOLS`) as not in CC mode (`gpu::nras` tests). A nonce is stateless and valid for five minutes, so within that window one pod may attest twice with one nonce; the leaf certifies a runtime key only the pod holds, so replaying a fresh exchange gains the host nothing. The appraisal-only cases, a guest image without a reference value and a downgraded TCB among them, are `alpha_attest` tests.

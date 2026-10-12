@@ -416,14 +416,14 @@ mod tests {
         AttestationResult {
             format: "test".into(),
             verdict: Verdict::Verified,
-            measured: Measured {
+            measured: Some(Measured {
                 mrtd: m,
                 rtmr0: m,
                 rtmr1: m,
                 rtmr2: m,
                 rtmr3: m,
                 mrconfigid: None,
-            },
+            }),
             tcb_status: "UpToDate".into(),
             advisories: Vec::new(),
             os_image: "test".into(),

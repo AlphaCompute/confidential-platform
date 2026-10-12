@@ -29,6 +29,7 @@ use std::time::{Instant, SystemTime};
 
 use alpha_attest::gpu::ccm::FortanixCcm;
 use alpha_attest::gpu::nras::Nras;
+use alpha_attest::snp::kds::{HttpKds, Kds, KdsClient};
 use alpha_attest::{Collateral, EventLogEntry, GpuVerifier, PlatformDocument};
 use alpha_core::ComposeHash;
 use axum::Router;
@@ -51,6 +52,9 @@ pub struct Config {
     /// The GPU verifier backends a Kata pod's GPUs may be verified by; the platform document's
     /// `gpu_policy` decides which of them must all pass. See [`gpu_backends`].
     pub gpu_backends: Vec<Arc<dyn GpuVerifier>>,
+    /// AMD's KDS, for the VCEKs and CRLs of SEV-SNP pods, at the URL the platform document's
+    /// `snp_policy` pins; the node caches what it fetches (`Node::snp_kds`).
+    pub snp_kds: Arc<dyn KdsClient>,
     #[cfg(feature = "dev-root")]
     pub dev_root_kek: Option<Zeroizing<[u8; 32]>>,
 }
@@ -69,6 +73,7 @@ impl Config {
                 .collect(),
             platform_document_url: env("ALPHACOMPUTE_PLATFORM_DOCUMENT_URL")?,
             gpu_backends: gpu_backends(std::env::var("ALPHACOMPUTE_FORTANIX_CCM_URL").ok())?,
+            snp_kds: Arc::new(HttpKds::new().map_err(|e| e.to_string())?),
             #[cfg(feature = "dev-root")]
             dev_root_kek: std::env::var("ALPHACOMPUTE_KMS_DEV_ROOT_KEK")
                 .ok()
@@ -139,6 +144,8 @@ pub struct Node {
     pub config: Config,
     pub clock: Clock,
     pub collateral: CollateralSource,
+    /// SEV-SNP collateral from [`Config::snp_kds`], cached across attestations.
+    pub snp_kds: Kds,
     pub nonce_key: [u8; 32],
     pub runtime_key: SigningKey,
     pub runtime_pkcs8: Zeroizing<Vec<u8>>,
@@ -183,6 +190,7 @@ impl Node {
             Arc::new(tls::ServerCert::sealed(&runtime_pkcs8, (clock)()).map_err(|e| e.message)?);
         Ok(Arc::new(Self {
             pool,
+            snp_kds: Kds::new(config.snp_kds.clone()),
             config,
             clock,
             collateral,

@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::gpu::{GpuPolicy, GpuVerifier, GpuVerifierKind, gpu_nonce};
-use crate::{Measured, Policy, ReferenceMeasurements, ReferenceValue};
+use crate::{Measured, Policy, ReferenceMeasurements, ReferenceValue, ReferenceValues};
 
 const SPKI: &[u8] = b"runtime spki";
 const NONCE: [u8; 32] = [3; 32];
@@ -91,6 +91,7 @@ impl Pod {
                 kind: CpuKind::Tdx,
                 quote: vec![0; 4],
                 event_log: Vec::new(),
+                vek: Vec::new(),
             },
             gpus: (0..self.gpus)
                 .map(|_| GpuEvidence {
@@ -197,7 +198,8 @@ fn doc() -> PlatformDocument {
                     rtmr0: m(2),
                     rtmr1: m(3),
                     rtmr2: m(4),
-                },
+                }
+                .into(),
             },
             ReferenceValue {
                 name: "kata-tdx/cpu".into(),
@@ -208,7 +210,8 @@ fn doc() -> PlatformDocument {
                     rtmr0: m(2),
                     rtmr1: m(13),
                     rtmr2: m(14),
-                },
+                }
+                .into(),
             },
         ],
         kms_ca_pem: String::new(),
@@ -225,6 +228,7 @@ fn doc() -> PlatformDocument {
             nras_keys: Default::default(),
             nras_cc_mode: None,
         }),
+        snp_policy: None,
     }
 }
 
@@ -255,7 +259,10 @@ fn eight_gpu_pod_is_appraised_to_its_revision_v2() {
     let appraised = pod.appraise(&doc()).unwrap();
     assert_eq!(appraised.compose_hash, pod.revision_hash());
     assert_eq!(appraised.os_image, "nvidia-uvm-tdx/b300x8");
-    assert_eq!(appraised.measured.mrconfigid, Some(pod.quote().mrconfigid));
+    assert_eq!(
+        appraised.measured.unwrap().mrconfigid,
+        Some(pod.quote().mrconfigid)
+    );
     let coco = appraised.coco.unwrap();
     assert_eq!(coco.profile, "kata-tdx/1");
     assert_eq!(coco.runtime_class, CLASS);
@@ -427,17 +434,28 @@ fn wrong_gpu_count_and_gpu_not_in_cc_mode_are_refused() {
 fn runtime_class_must_be_supported_the_init_datas_and_the_reference_values() {
     let pod = Pod::gpu(1);
     // A class no Revision v2 may name is refused before any reference value is looked up, even
-    // one listed for that class.
-    let mut evidence = pod.evidence();
-    evidence.runtime_class = "kata-qemu-nvidia-gpu-snp".into();
-    let mut listed = doc();
-    listed.reference_values[0].runtime_class = Some("kata-qemu-nvidia-gpu-snp".into());
-    for doc in [doc(), listed] {
-        refused(
-            pod.appraise_with(&evidence, pod.quote(), &doc, &pod.gpu_results()),
-            "attestation_failed",
-            "runtime class \"kata-qemu-nvidia-gpu-snp\" is not supported",
-        );
+    // one listed for that class; so is an SNP class in a TD.
+    for (class, reason) in [
+        (
+            "kata-qemu-nvidia-gpu-sev",
+            "runtime class \"kata-qemu-nvidia-gpu-sev\" is not supported",
+        ),
+        (
+            "kata-qemu-nvidia-gpu-snp",
+            "runtime class kata-qemu-nvidia-gpu-snp does not run on Tdx",
+        ),
+    ] {
+        let mut evidence = pod.evidence();
+        evidence.runtime_class = class.into();
+        let mut listed = doc();
+        listed.reference_values[0].runtime_class = Some(class.into());
+        for doc in [doc(), listed] {
+            refused(
+                pod.appraise_with(&evidence, pod.quote(), &doc, &pod.gpu_results()),
+                "attestation_failed",
+                reason,
+            );
+        }
     }
     // A supported claim is held to the measured init-data's class: a GPU pod claims the CPU class
     // in a TD whose registers are the CPU guest's, so a CPU-class value matches first.
@@ -663,7 +681,9 @@ fn tampered_event_log_is_refused_and_a_matching_one_passes() {
         quote.measured.rtmr2,
     ) = (r0, r1, r2);
     let mut doc = doc();
-    let values = &mut doc.reference_values[0].values;
+    let ReferenceValues::Tdx(values) = &mut doc.reference_values[0].values else {
+        panic!("a kata-tdx value");
+    };
     (values.rtmr0, values.rtmr1, values.rtmr2) = (r0, r1, r2);
 
     let mut evidence = pod.evidence();
@@ -681,14 +701,20 @@ fn tampered_event_log_is_refused_and_a_matching_one_passes() {
 }
 
 #[test]
-fn snp_and_unknown_formats_are_unknown() {
+fn snp_evidence_over_a_tdx_quote_and_unknown_formats_are_refused() {
     let pod = Pod::gpu(1);
     let mut evidence = pod.evidence();
     evidence.cpu.kind = CpuKind::Snp;
     refused(
         pod.appraise_with(&evidence, pod.quote(), &doc(), &pod.gpu_results()),
-        "attestation_unknown",
-        "kata-snp",
+        "attestation_failed",
+        "the evidence is Snp, the verified CPU evidence is not",
+    );
+    let error = check_cpu_kind(&evidence).unwrap_err();
+    assert_eq!(error.code(), "attestation_unknown");
+    assert!(
+        error.to_string().contains("appraised by kata-snp/1"),
+        "{error}"
     );
     let mut evidence = pod.evidence();
     evidence.format = "alphacompute-evidence/3".into();
@@ -900,4 +926,340 @@ async fn gpu_backends_run_only_after_every_td_check_passed() {
         "is not the init-data's",
     );
     assert_eq!(calls(), 1);
+}
+
+/// `kata-snp/1`: the same pods on SEV-SNP, over synthetic verified reports. The report's own
+/// verification (chain, CRL, TCB, guest policy) is `snp::tests` over a real Milan report; that
+/// report is also run through the whole profile below, where it stops at the checks that are ours.
+mod snp_pods {
+    use alpha_core::coco::{SNP_CPU_RUNTIME_CLASS, SNP_GPU_RUNTIME_CLASS};
+
+    use super::*;
+    use crate::SnpReferenceMeasurement;
+    use crate::snp::kds::{Kds, crl_url};
+    use crate::snp::{SnpFindings, SnpTcb, VekKind, VerifiedReport};
+
+    const TCB: SnpTcb = SnpTcb {
+        bootloader: 3,
+        tee: 0,
+        snp: 8,
+        microcode: 115,
+        fmc: None,
+    };
+
+    fn snp(pod: Pod) -> Pod {
+        let class = if pod.class == CPU_CLASS {
+            SNP_CPU_RUNTIME_CLASS
+        } else {
+            SNP_GPU_RUNTIME_CLASS
+        };
+        let gpu = (pod.class == CLASS).then_some(pod.gpus);
+        Pod {
+            initdata: initdata_text(class, POLICY, gpu),
+            class,
+            ..pod
+        }
+    }
+
+    /// The launch measurement of each SNP class's guest image, as [`doc`] lists it.
+    fn measurement(class: &str) -> Measurement {
+        if class == SNP_CPU_RUNTIME_CLASS {
+            m(21)
+        } else {
+            m(22)
+        }
+    }
+
+    fn evidence(pod: &Pod) -> EvidenceV2 {
+        let mut evidence = pod.evidence();
+        evidence.cpu.kind = CpuKind::Snp;
+        evidence
+    }
+
+    /// The report an SNP guest running this pod's init-data produces.
+    fn report(pod: &Pod) -> VerifiedReport {
+        let expected = pod.expected_report_data();
+        let report_data = if pod.aa_report_data {
+            let hex = hex::encode(Sha256::digest(expected));
+            <[u8; 64]>::try_from(hex.as_bytes()).unwrap()
+        } else {
+            expected
+        };
+        let host_data = InitData::parse(pod.initdata.as_bytes()).unwrap().hostdata();
+        let measurement = measurement(pod.class);
+        VerifiedReport {
+            report_data,
+            measurement,
+            host_data,
+            findings: SnpFindings {
+                product: "Genoa".into(),
+                signing_key: VekKind::Vcek,
+                measurement,
+                host_data,
+                reported_tcb: TCB,
+                guest_policy: "0x30000".into(),
+                vmpl: 0,
+            },
+        }
+    }
+
+    fn snp_doc() -> PlatformDocument {
+        let mut doc = doc();
+        for (name, class) in [
+            ("kata-snp/cpu", SNP_CPU_RUNTIME_CLASS),
+            ("nvidia-snp/b300x8", SNP_GPU_RUNTIME_CLASS),
+        ] {
+            doc.reference_values.push(ReferenceValue {
+                name: name.into(),
+                kind: ReferenceKind::KataSnp,
+                runtime_class: Some(class.into()),
+                values: ReferenceValues::Snp(SnpReferenceMeasurement {
+                    measurement: measurement(class),
+                }),
+            });
+        }
+        doc
+    }
+
+    fn appraise(
+        pod: &Pod,
+        evidence: &EvidenceV2,
+        report: VerifiedReport,
+        doc: &PlatformDocument,
+    ) -> Result<Appraised, AppraisalError> {
+        appraise_kata_cpu(evidence, report, &NONCE, SPKI, pod.xwing(), doc)?
+            .finish(doc.gpu_policy.as_ref(), &pod.gpu_results())
+    }
+
+    fn ok(pod: &Pod) -> Result<Appraised, AppraisalError> {
+        appraise(pod, &evidence(pod), report(pod), &snp_doc())
+    }
+
+    #[test]
+    fn snp_pods_are_appraised_to_their_revision_v2() {
+        let cpu = snp(Pod::cpu());
+        let appraised = ok(&cpu).unwrap();
+        assert_eq!(appraised.compose_hash, cpu.revision_hash());
+        assert_eq!(appraised.os_image, "kata-snp/cpu");
+        assert_eq!(appraised.measured, None);
+        assert_eq!(appraised.tcb_status, SNP_TCB_STATUS);
+        let coco = appraised.coco.unwrap();
+        assert_eq!(coco.profile, "kata-snp/1");
+        assert_eq!(coco.runtime_class, SNP_CPU_RUNTIME_CLASS);
+        assert!(coco.gpus.is_empty());
+        assert_eq!(coco.snp, Some(report(&cpu).findings));
+        // The result serializes without TDX registers and with the report's findings.
+        let json = serde_json::to_value(&coco).unwrap();
+        assert_eq!(json["snp"]["signing_key"], "vcek");
+        assert_eq!(json["snp"]["measurement"], serde_json::json!(m(21)));
+
+        let gpu = snp(Pod::gpu(8));
+        let appraised = ok(&gpu).unwrap();
+        assert_eq!(appraised.os_image, "nvidia-snp/b300x8");
+        assert_eq!(appraised.coco.unwrap().gpus.len(), 8);
+
+        // Runtime data through the attestation agent, and a KMS node in kms_revisions.
+        let aa = Pod {
+            aa_report_data: true,
+            ..snp(Pod::cpu())
+        };
+        ok(&aa).unwrap();
+        let node = Pod {
+            node: true,
+            ..snp(Pod::cpu())
+        };
+        refused(ok(&node), "attestation_unknown", "kms revision");
+        let mut doc = snp_doc();
+        doc.kms_revisions.push(KmsRevision {
+            compose_hash: node.revision_hash(),
+            build: "kms".into(),
+            source_url: "https://example.invalid/kms".into(),
+        });
+        appraise(&node, &evidence(&node), report(&node), &doc).unwrap();
+    }
+
+    #[test]
+    fn malicious_host_snp_cases_are_refused() {
+        let pod = snp(Pod::gpu(8));
+
+        // Init-data swapped after launch: HOST_DATA holds the launched one's digest.
+        let mut swapped = evidence(&pod);
+        swapped.initdata =
+            initdata_text(SNP_GPU_RUNTIME_CLASS, "package other\n", Some(8)).into_bytes();
+        refused(
+            appraise(&pod, &swapped, report(&pod), &snp_doc()),
+            "attestation_failed",
+            "HOST_DATA is not the digest of the init-data sent",
+        );
+        // A guest image not in the reference values, or listed for the other SNP class, or as a
+        // TDX value.
+        let mut unlisted = report(&pod);
+        unlisted.measurement = m(99);
+        refused(
+            appraise(&pod, &evidence(&pod), unlisted, &snp_doc()),
+            "attestation_unknown",
+            "no kata-snp reference value for measurement",
+        );
+        let mut cpu_guest = report(&pod);
+        cpu_guest.measurement = measurement(SNP_CPU_RUNTIME_CLASS);
+        refused(
+            appraise(&pod, &evidence(&pod), cpu_guest, &snp_doc()),
+            "attestation_unknown",
+            "runtime class kata-qemu-nvidia-gpu-snp",
+        );
+        let mut tdx_kind = snp_doc();
+        for rv in &mut tdx_kind.reference_values {
+            if rv.values.snp().is_some() {
+                rv.kind = ReferenceKind::KataTdx;
+            }
+        }
+        refused(
+            appraise(&pod, &evidence(&pod), report(&pod), &tdx_kind),
+            "attestation_unknown",
+            "kata-snp reference value",
+        );
+        // Stale nonce, or a report over the host's own key.
+        let mut stale = report(&pod);
+        stale.report_data = report_data(SPKI, &[4; 32], None);
+        refused(
+            appraise(&pod, &evidence(&pod), stale, &snp_doc()),
+            "attestation_failed",
+            "report_data is not bound",
+        );
+        // A TDX class claimed on an SNP report, and an SNP class in a TD.
+        let mut tdx_class = evidence(&pod);
+        tdx_class.runtime_class = CLASS.into();
+        refused(
+            appraise(&pod, &tdx_class, report(&pod), &snp_doc()),
+            "attestation_failed",
+            "runtime class kata-qemu-nvidia-gpu-tdx does not run on Snp",
+        );
+        let tdx = Pod::gpu(8);
+        let mut in_a_td = tdx.evidence();
+        in_a_td.runtime_class = SNP_GPU_RUNTIME_CLASS.into();
+        refused(
+            tdx.appraise_with(&in_a_td, tdx.quote(), &snp_doc(), &tdx.gpu_results()),
+            "attestation_failed",
+            "does not run on Tdx",
+        );
+        // Evidence that says TDX over a verified SNP report, an SNP pod with a TDX event log, a
+        // TDX quote with an AMD VEK.
+        refused(
+            appraise(&pod, &pod.evidence(), report(&pod), &snp_doc()),
+            "attestation_failed",
+            "the evidence is Tdx",
+        );
+        let mut with_log = evidence(&pod);
+        with_log.cpu.event_log = vec![EventLogEntry {
+            imr: 0,
+            event_type: 0,
+            digest: vec![0; 48],
+            event: String::new(),
+            event_payload: Vec::new(),
+        }];
+        refused(
+            appraise(&pod, &with_log, report(&pod), &snp_doc()),
+            "attestation_failed",
+            "no TDX event log",
+        );
+        let mut with_vek = tdx.evidence();
+        with_vek.cpu.vek = vec![1];
+        refused(
+            tdx.appraise_with(&with_vek, tdx.quote(), &doc(), &tdx.gpu_results()),
+            "attestation_failed",
+            "not signed by an AMD VEK",
+        );
+        // A CPU-class SNP pod presenting GPUs, and too few GPUs on the GPU class.
+        let liar = Pod {
+            gpus: 1,
+            ..snp(Pod::cpu())
+        };
+        refused(
+            appraise(&liar, &evidence(&liar), report(&liar), &snp_doc()),
+            "attestation_failed",
+            "kata-qemu-snp, which runs no GPU",
+        );
+        let mut short = evidence(&pod);
+        short.gpus.truncate(7);
+        refused(
+            appraise(&pod, &short, report(&pod), &snp_doc()),
+            "attestation_failed",
+            "Revision expects 8",
+        );
+    }
+
+    #[tokio::test]
+    async fn without_snp_policy_snp_evidence_is_unknown() {
+        let pod = snp(Pod::cpu());
+        let kds = Kds::new(Arc::new(crate::snp::tests::FakeKds::default()));
+        let error = verify_snp(&evidence(&pod), &snp_doc(), &kds, crate::snp::tests::now())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), "attestation_unknown");
+        assert!(error.to_string().contains("no snp_policy"), "{error}");
+        let error = verify_snp(&pod.evidence(), &snp_doc(), &kds, crate::snp::tests::now())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("SEV-SNP evidence only"),
+            "{error}"
+        );
+    }
+
+    /// virtee's real Milan report through the whole profile: the report verifies under AMD's
+    /// pinned chain and CRL, then the checks that are ours refuse it, since it is not a guest of
+    /// ours: its measurement is no reference value, and once it is listed, its HOST_DATA (zero)
+    /// binds no init-data.
+    #[tokio::test]
+    async fn a_real_snp_report_reaches_the_profiles_own_checks() {
+        use crate::snp::tests as real;
+
+        let fake = Arc::new(real::FakeKds::default());
+        fake.bodies.lock().unwrap().insert(
+            crl_url("https://kds.example", "Milan", VekKind::Vcek),
+            real::crl(),
+        );
+        let kds = Kds::new(fake);
+        let pod = snp(Pod::cpu());
+        let mut evidence = evidence(&pod);
+        evidence.cpu.quote = real::report();
+        evidence.cpu.vek = real::vcek();
+        let mut doc = snp_doc();
+        doc.snp_policy = Some(real::policy());
+
+        let run = |doc: PlatformDocument, evidence: EvidenceV2| {
+            let kds = &kds;
+            async move {
+                appraise_kata_snp(&evidence, &NONCE, SPKI, None, &doc, kds, &[], real::now()).await
+            }
+        };
+        refused(
+            run(doc.clone(), evidence.clone()).await,
+            "attestation_unknown",
+            "no kata-snp reference value for measurement sha384:7a1e5c26",
+        );
+        let verified = verify_snp(&evidence, &doc, &kds, real::now())
+            .await
+            .unwrap();
+        doc.reference_values.push(ReferenceValue {
+            name: "virtee-test-guest".into(),
+            kind: ReferenceKind::KataSnp,
+            runtime_class: Some(SNP_CPU_RUNTIME_CLASS.into()),
+            values: ReferenceValues::Snp(SnpReferenceMeasurement {
+                measurement: verified.measurement,
+            }),
+        });
+        refused(
+            run(doc.clone(), evidence.clone()).await,
+            "attestation_failed",
+            "HOST_DATA is not the digest of the init-data sent",
+        );
+        // The same report with its VCEK left out: a version 2 report cannot name its KDS product.
+        evidence.cpu.vek.clear();
+        refused(
+            run(doc, evidence).await,
+            "attestation_failed",
+            "must carry its VCEK",
+        );
+    }
 }

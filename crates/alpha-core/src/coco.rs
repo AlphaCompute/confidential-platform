@@ -33,21 +33,42 @@ pub const GPU_RUNTIME_CLASS: &str = "kata-qemu-nvidia-gpu-tdx";
 /// The confidential runtime class for CPU-only pods: a Kata TD on TDX with no device passed
 /// through (the KMS, broker, signer, guard, inference front and Corpus supervisor).
 pub const CPU_RUNTIME_CLASS: &str = "kata-qemu-tdx";
-/// The runtime classes a Revision v2 may name; `kata-qemu-nvidia-gpu-snp` waits for the
-/// `kata-snp/1` profile (PRD-02, P2).
-pub const RUNTIME_CLASSES: [&str; 2] = [GPU_RUNTIME_CLASS, CPU_RUNTIME_CLASS];
+/// [`GPU_RUNTIME_CLASS`] on AMD SEV-SNP: the NVIDIA guest image in an SNP guest (`kata-snp/1`).
+pub const SNP_GPU_RUNTIME_CLASS: &str = "kata-qemu-nvidia-gpu-snp";
+/// [`CPU_RUNTIME_CLASS`] on AMD SEV-SNP (`kata-snp/1`).
+pub const SNP_CPU_RUNTIME_CLASS: &str = "kata-qemu-snp";
+/// The runtime classes a Revision v2 may name.
+pub const RUNTIME_CLASSES: [&str; 4] = [
+    GPU_RUNTIME_CLASS,
+    CPU_RUNTIME_CLASS,
+    SNP_GPU_RUNTIME_CLASS,
+    SNP_CPU_RUNTIME_CLASS,
+];
 /// Whole GPUs only (no MIG in CC mode), one or a full eight-GPU node.
 pub const GPU_COUNTS: [u32; 2] = [1, 8];
 /// Init-data larger than this is refused before it is parsed.
 pub const MAX_INITDATA_BYTES: usize = 512 * 1024;
 
-/// A runtime class a Revision v2 may name, and what it says about GPUs.
+/// The CPU TEE a runtime class runs its pod VM in, which decides the evidence profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tee {
+    /// Intel TDX: `kata-tdx/1`, init-data bound in MRCONFIGID.
+    Tdx,
+    /// AMD SEV-SNP: `kata-snp/1`, init-data bound in HOST_DATA.
+    Snp,
+}
+
+/// A runtime class a Revision v2 may name, and what it says about the TEE and GPUs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeClass {
     /// [`CPU_RUNTIME_CLASS`]: no GPU, so a Revision on it has no `gpu` section.
     Cpu,
     /// [`GPU_RUNTIME_CLASS`]: a `gpu` section with [`GPU_COUNTS`] whole GPUs of one model.
     Gpu,
+    /// [`SNP_CPU_RUNTIME_CLASS`]: as [`Self::Cpu`], on SEV-SNP.
+    SnpCpu,
+    /// [`SNP_GPU_RUNTIME_CLASS`]: as [`Self::Gpu`], on SEV-SNP.
+    SnpGpu,
 }
 
 impl RuntimeClass {
@@ -55,6 +76,8 @@ impl RuntimeClass {
         match name {
             CPU_RUNTIME_CLASS => Some(Self::Cpu),
             GPU_RUNTIME_CLASS => Some(Self::Gpu),
+            SNP_CPU_RUNTIME_CLASS => Some(Self::SnpCpu),
+            SNP_GPU_RUNTIME_CLASS => Some(Self::SnpGpu),
             _ => None,
         }
     }
@@ -63,12 +86,21 @@ impl RuntimeClass {
         match self {
             Self::Cpu => CPU_RUNTIME_CLASS,
             Self::Gpu => GPU_RUNTIME_CLASS,
+            Self::SnpCpu => SNP_CPU_RUNTIME_CLASS,
+            Self::SnpGpu => SNP_GPU_RUNTIME_CLASS,
         }
     }
 
     /// Whether a pod of this class runs with GPUs passed through, and so must prove them.
     pub fn has_gpus(self) -> bool {
-        self == Self::Gpu
+        matches!(self, Self::Gpu | Self::SnpGpu)
+    }
+
+    pub fn tee(self) -> Tee {
+        match self {
+            Self::Cpu | Self::Gpu => Tee::Tdx,
+            Self::SnpCpu | Self::SnpGpu => Tee::Snp,
+        }
     }
 }
 
@@ -160,6 +192,22 @@ impl InitData {
         out
     }
 
+    /// What an SEV-SNP guest's 32-byte HOST_DATA holds for this init-data on the pinned Kata: the
+    /// digest under the declared algorithm, cut to 32 bytes (a SHA-256 digest fills it exactly).
+    // ponytail: snp-capture — Kata's SNP binding read from its source, not yet from a pod's report;
+    // proven with a golden vector from our first SNP pod, as Q10 is for MRCONFIGID.
+    pub fn hostdata(&self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let digest = match self.algorithm {
+            InitDataAlgorithm::Sha256 => Sha256::digest(&self.bytes).to_vec(),
+            InitDataAlgorithm::Sha384 => Sha384::digest(&self.bytes).to_vec(),
+        };
+        for (dst, src) in out.iter_mut().zip(digest) {
+            *dst = src;
+        }
+        out
+    }
+
     /// SHA-256 of the exact init-data bytes, whatever algorithm the document declares: the
     /// Revision v2's `initdata_sha256`.
     pub fn sha256(&self) -> ComposeHash {
@@ -234,25 +282,26 @@ pub struct GpuShape {
     pub model: String,
 }
 
-/// The runtime class decides the GPU section: none on the CPU class (not even a zero count, so one
-/// pod has one Revision), and one or eight GPUs of one model on the GPU class.
+/// The runtime class decides the GPU section: none on a CPU class (not even a zero count, so one
+/// pod has one Revision), and one or eight GPUs of one model on a GPU class.
 fn check_shape(runtime_class: &str, gpu: Option<&GpuShape>) -> Result<(), String> {
     let class = RuntimeClass::from_name(runtime_class)
         .ok_or_else(|| format!("runtime_class {runtime_class:?} is not supported"))?;
-    let gpu = match (class, gpu) {
-        (RuntimeClass::Cpu, None) => return Ok(()),
-        (RuntimeClass::Cpu, Some(gpu)) => {
+    let name = class.name();
+    let gpu = match (class.has_gpus(), gpu) {
+        (false, None) => return Ok(()),
+        (false, Some(gpu)) => {
             return Err(format!(
-                "runtime_class {CPU_RUNTIME_CLASS} runs no GPU, so a gpu section (count {}) is not allowed",
+                "runtime_class {name} runs no GPU, so a gpu section (count {}) is not allowed",
                 gpu.count
             ));
         }
-        (RuntimeClass::Gpu, None) => {
+        (true, None) => {
             return Err(format!(
-                "runtime_class {GPU_RUNTIME_CLASS} needs a gpu section with count 1 or 8"
+                "runtime_class {name} needs a gpu section with count 1 or 8"
             ));
         }
-        (RuntimeClass::Gpu, Some(gpu)) => gpu,
+        (true, Some(gpu)) => gpu,
     };
     if !GPU_COUNTS.contains(&gpu.count) {
         return Err(format!("gpu.count {} is not 1 or 8", gpu.count));
@@ -420,6 +469,17 @@ mod tests {
     }
 
     #[test]
+    fn hostdata_is_the_digest_cut_to_32_bytes() {
+        let a = cpu_alpha();
+        let t256 = initdata("sha256", &a);
+        let h = InitData::parse(t256.as_bytes()).unwrap().hostdata();
+        assert_eq!(h.as_slice(), Sha256::digest(t256.as_bytes()).as_slice());
+        let t384 = initdata("sha384", &a);
+        let h = InitData::parse(t384.as_bytes()).unwrap().hostdata();
+        assert_eq!(h.as_slice(), &Sha384::digest(t384.as_bytes())[..32]);
+    }
+
+    #[test]
     fn refuses_malformed_initdata_and_entries() {
         let a = cpu_alpha();
         assert!(matches!(
@@ -456,7 +516,9 @@ mod tests {
                 "runtime_class",
             ),
             (alpha_on("kata-qemu-tdx-2", ""), "runtime_class"),
-            (alpha_on("kata-qemu-snp", ""), "runtime_class"),
+            (alpha_on("kata-qemu-sev", ""), "runtime_class"),
+            (alpha_on(SNP_CPU_RUNTIME_CLASS, GPU1), "runs no GPU"),
+            (alpha_on(SNP_GPU_RUNTIME_CLASS, ""), "needs a gpu section"),
             // The GPU class with no GPU, and the CPU class with any gpu section at all.
             (alpha(""), "needs a gpu section"),
             (alpha(GPU0), "gpu.count 0"),
@@ -593,7 +655,11 @@ mod tests {
         assert!(registered(revision(CPU_RUNTIME_CLASS, None)).is_ok());
         assert!(registered(revision(GPU_RUNTIME_CLASS, Some(1))).is_ok());
         assert!(registered(revision(GPU_RUNTIME_CLASS, Some(8))).is_ok());
+        assert!(registered(revision(SNP_CPU_RUNTIME_CLASS, None)).is_ok());
+        assert!(registered(revision(SNP_GPU_RUNTIME_CLASS, Some(8))).is_ok());
         for (class, gpu, why) in [
+            (SNP_CPU_RUNTIME_CLASS, Some(1), "runs no GPU"),
+            (SNP_GPU_RUNTIME_CLASS, None, "needs a gpu section"),
             (CPU_RUNTIME_CLASS, Some(1), "runs no GPU"),
             (CPU_RUNTIME_CLASS, Some(8), "runs no GPU"),
             (CPU_RUNTIME_CLASS, Some(0), "runs no GPU"),
@@ -608,13 +674,21 @@ mod tests {
 
     #[test]
     fn runtime_class_names_round_trip() {
-        for class in [RuntimeClass::Cpu, RuntimeClass::Gpu] {
+        for (class, tee, gpus) in [
+            (RuntimeClass::Cpu, Tee::Tdx, false),
+            (RuntimeClass::Gpu, Tee::Tdx, true),
+            (RuntimeClass::SnpCpu, Tee::Snp, false),
+            (RuntimeClass::SnpGpu, Tee::Snp, true),
+        ] {
             assert_eq!(RuntimeClass::from_name(class.name()), Some(class));
             assert!(RUNTIME_CLASSES.contains(&class.name()));
+            assert_eq!((class.tee(), class.has_gpus()), (tee, gpus), "{class:?}");
         }
-        assert!(RuntimeClass::Gpu.has_gpus());
-        assert!(!RuntimeClass::Cpu.has_gpus());
-        assert_eq!(RuntimeClass::from_name("kata-qemu-nvidia-gpu-snp"), None);
+        assert_eq!(
+            RuntimeClass::from_name("kata-qemu-nvidia-gpu-snp"),
+            Some(RuntimeClass::SnpGpu)
+        );
+        assert_eq!(RuntimeClass::from_name("kata-qemu-sev"), None);
         assert_eq!(RuntimeClass::from_name("KATA-QEMU-TDX"), None);
     }
 }
