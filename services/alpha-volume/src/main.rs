@@ -4,9 +4,12 @@
 //! then open the LUKS2 volume on the claim's block device, or format a device that carries no
 //! LUKS header at all, and mount it where the App's container finds it. Every failure is a
 //! non-zero exit naming the step, and nothing is ever formatted over an existing header.
+//!
+//! `alpha-volume open-db <name> <device> <mount dir>` is the same for the trust-zone Postgres pod,
+//! with the key from an unsealed KMS node instead of `alpha-runtime` ([`alpha_volume::db`]).
 
 use alpha_client::runtime::RuntimeSocket;
-use alpha_volume::{Error, Request, Tools, key_purpose, open_or_format};
+use alpha_volume::{Error, Request, Tools, db, key_purpose, open_or_format};
 
 #[tokio::main]
 async fn main() {
@@ -28,16 +31,26 @@ async fn run() -> Result<String, Error> {
     let [mode, name, device, mount_dir] = args.as_slice() else {
         return Err(Error::Usage);
     };
-    if mode != "open" {
-        return Err(Error::Usage);
-    }
     let request = Request::new(name, device, mount_dir)?;
-    let runtime = RuntimeSocket::default();
-    runtime.wait_attested().await;
-    let key = runtime
-        .key(&key_purpose(&request.name))
-        .await
-        .map_err(|e| Error::Key(e.to_string()))?;
+    let key = match mode.as_str() {
+        "open" => {
+            let runtime = RuntimeSocket::default();
+            runtime.wait_attested().await;
+            runtime
+                .key(&key_purpose(&request.name))
+                .await
+                .map_err(|e| Error::Key(e.to_string()))?
+        }
+        // The trust-zone Postgres pod (PRD-05 M2(a)): the db-volume key from an unsealed KMS node.
+        "open-db" => {
+            let config = db::Config::from_env(|name| std::env::var(name).ok())?;
+            db::fetch_key(&config).await?
+        }
+        _ => return Err(Error::Usage),
+    };
+    // TODO(draft): with D10's client-certificate answer (PRD-05 draft PR #105), open-db also
+    // writes Postgres's root.crt, server.crt and server.key from the same key next to the data
+    // directory. That code is on #105's branch, not this stack.
     tokio::task::spawn_blocking(move || open_or_format(&Tools::pinned(), &request, &key))
         .await
         .map_err(|e| Error::Io(format!("worker: {e}")))?

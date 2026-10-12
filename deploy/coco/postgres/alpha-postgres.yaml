@@ -1,0 +1,117 @@
+# alpha-postgres: the trust-zone Postgres on the verifier pool, in a Kata TDX pod VM, its data
+# directory on a LUKS2 volume under the KMS's db-volume key (PRD-05 M2(a), docs/db-volume-key.md).
+#
+# PRD-05 DRAFT. Rendered by `alpha coco render` with env/alpha-postgres.env; the Revision v2 it
+# prints goes into the platform document's db_revisions with "kind": "kata-tdx" (NOT
+# kms_revisions). Nothing secret is in this spec: the init-data is public, like the KMS's.
+#
+# Start order (cold start, or the M-C move): the pod is scheduled; the init container
+# `alpha-volume open-db` attests a KMS node from ALPHACOMPUTE_KMS_ENDPOINTS and waits until one is
+# unsealed by custodians (a sealed node answers `sealed`); it receives the volume key, formats the
+# claim on first use or opens it, and mounts it on /run/pgdata; then postgres starts on it and the
+# waiting KMS node serves. unseal → db key → database → serve.
+apiVersion: v1
+kind: Service
+metadata:
+  name: alpha-postgres
+  labels:
+    app.kubernetes.io/name: alpha-postgres
+spec:
+  # Headless: the KMS reaches the one pod by its stable name. QUESTION(PRD-05 Q4): the host
+  # resolves this name; with D10's verify-full against the derived CA (#105) a wrong answer
+  # fails the handshake, without it the KMS's rows are still sealed (#95).
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: alpha-postgres
+  ports:
+    - name: postgres
+      port: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: alpha-postgres
+  labels:
+    app.kubernetes.io/name: alpha-postgres
+spec:
+  serviceName: alpha-postgres
+  # One primary. QUESTION(PRD-05 Q3): a standby would need its own volume key release and
+  # streaming replication over TLS between two attested pods; not drafted.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: alpha-postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: alpha-postgres
+        alphacompute.ai/tenant: platform
+        alphacompute.ai/app: ${APP_ID}
+      annotations:
+        io.katacontainers.config.hypervisor.cc_init_data: "${CC_INIT_DATA}"
+    spec:
+      runtimeClassName: kata-qemu-tdx
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        alphacompute.ai/role: verifier
+      initContainers:
+        - name: alpha-volume-pgdata
+          image: ${VOLUME_IMAGE}                 # alpha-volume, pinned by digest
+          args: ["open-db", "pgdata", "/dev/pgdata", "/run/pgdata"]
+          env:
+            - { name: ALPHACOMPUTE_QUOTE_SOURCE, value: "coco-aa" }
+            # During the M-C move these are the prototype KMS nodes (this release), which attest
+            # as prototype builds listed in kms_revisions; afterwards the Kata nodes.
+            - { name: ALPHACOMPUTE_KMS_ENDPOINTS, value: "${KMS_NODE_ENDPOINTS}" }
+            - { name: ALPHACOMPUTE_PLATFORM_DOCUMENT_URL, value: "${PLATFORM_DOCUMENT_URL}" }
+            - { name: ALPHACOMPUTE_PLATFORM_DOCUMENT_MIN_VERSION, value: "${PLATFORM_DOCUMENT_MIN_VERSION}" }
+            - { name: ALPHACOMPUTE_PCCS_URL, value: "${PCCS_URL}" }
+            - { name: ALPHACOMPUTE_DB_KEY_WAIT_SECONDS, value: "1800" }
+          resources:
+            requests: { cpu: "500m", memory: 256Mi }
+            limits: { cpu: "500m", memory: 256Mi }
+          # device-mapper and mount inside the TD; the agent policy admits privileged for
+          # alpha-volume-* only, pinned by image digest and arguments (#86's baseline).
+          securityContext: { privileged: true }
+          volumeDevices:
+            - { name: pgdata, devicePath: /dev/pgdata }
+          volumeMounts:
+            - { name: opened, mountPath: /run/pgdata, mountPropagation: Bidirectional }
+      containers:
+        - name: postgres
+          image: ${POSTGRES_IMAGE}               # postgres:18, pinned by digest
+          # TODO(draft): authentication is D10. With #105's answer this becomes
+          #   -c ssl=on -c ssl_ca_file=/run/pgdata/tls/root.crt -c ssl_cert_file=/run/pgdata/tls/server.crt
+          #   -c ssl_key_file=/run/pgdata/tls/server.key -c hba_file=/etc/alpha/pg_hba.conf
+          #   -c ident_file=/etc/alpha/pg_ident.conf -c ssl_min_protocol_version=TLSv1.3
+          # with the hba/ident files baked into a pinned image (a ConfigMap is the host's). Until
+          # then this fails closed: no hba_file is named and POSTGRES_PASSWORD is unset, so the
+          # stock entrypoint refuses to initialise a database (QUESTION(PRD-05 Q5)).
+          args: ["postgres", "-c", "listen_addresses=*", "-c", "log_connections=authentication"]
+          env:
+            - { name: PGDATA, value: /run/pgdata/data }
+          ports:
+            - { name: postgres, containerPort: 5432 }
+          # TCP only, no exec (the agent policy refuses exec).
+          readinessProbe:
+            tcpSocket: { port: 5432 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "${POSTGRES_VCPUS}", memory: "${POSTGRES_MEMORY_MIB}Mi" }
+            limits: { cpu: "${POSTGRES_VCPUS}", memory: "${POSTGRES_MEMORY_MIB}Mi" }
+          volumeMounts:
+            - { name: opened, mountPath: /run/pgdata, mountPropagation: HostToContainer }
+      volumes:
+        - name: opened
+          emptyDir: { medium: Memory }
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: [ReadWriteOnce]
+        volumeMode: Block
+        # ponytail: the cluster default storage class until PRD-01 names the verifier pool's.
+        resources:
+          requests:
+            storage: ${POSTGRES_STORAGE}

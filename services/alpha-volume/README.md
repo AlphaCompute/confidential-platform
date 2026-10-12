@@ -9,6 +9,14 @@ deliverable 25, Option A). `alpha coco render --volume` and `alpha coco wrap` (a
 alpha-volume open <name> <device> <mount dir>
 ```
 
+`alpha-volume open-db <name> <device> <mount dir>` (PRD-05 draft) is the same for the trust-zone
+Postgres pod, with the key from an unsealed KMS node instead of `alpha-runtime`: it attests a node
+from `ALPHACOMPUTE_KMS_ENDPOINTS` as a custodian's CLI does, quotes over its own X-Wing key and the
+node's nonce, and receives the `db-volume` key over `POST /v1/node/db-key`. It rounds over the
+endpoints every five seconds until one answers or `ALPHACOMPUTE_DB_KEY_WAIT_SECONDS` (default 1800)
+runs out, so it waits for the custodians' unseal. `docs/db-volume-key.md`,
+`deploy/coco/postgres/`.
+
 1. Waits for `alpha-runtime` (the pod's sidecar) to attest, then reads the App's key for purpose
    `volume.<name>` from `/run/alpha/runtime.sock` (`keys/derive` at the KMS; the KMS's purpose
    alphabet has no `:`, so PRD-02's `volume:<name>` is `volume.<name>`). The key is the App's, so

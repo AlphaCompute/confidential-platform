@@ -42,6 +42,8 @@ use std::process::{Command, Stdio};
 
 use zeroize::Zeroizing;
 
+pub mod db;
+
 /// The App-key purpose of a volume: the KMS's purpose alphabet has no `:`, so PRD-02's
 /// `volume:<name>` is spelled `volume.<name>`.
 pub const KEY_PURPOSE_PREFIX: &str = "volume.";
@@ -62,7 +64,7 @@ const LABEL_LEN: usize = 48;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("usage: alpha-volume open <name> <device> <mount dir>")]
+    #[error("usage: alpha-volume open|open-db <name> <device> <mount dir>")]
     Usage,
     #[error("{0}")]
     Invalid(String),

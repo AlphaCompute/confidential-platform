@@ -131,7 +131,7 @@ spec:
 2. It quotes over `report_data(xwing, nonce, None)` through the CoCo source.
 3. It opens the reply.
 
-It then formats or opens LUKS2 exactly as `open` does: the header rules, the `av:<name>` label, the cipher and integrity, and never formatting over a header. The mode is one match arm in `services/alpha-volume/src/main.rs` and lands with #86, which this stack does not include. Until then this section is the template, and `db_key::fetch` is its tested client. The agent policy must pin the init container's image, arguments and environment as it does for `alpha-volume-*` (#79's baseline).
+It then formats or opens LUKS2 exactly as `open` does: the header rules, the `av:<name>` label, the cipher and integrity, and never formatting over a header. The mode is `services/alpha-volume/src/db.rs` (the PRD-05 draft that merges #86 into this stack); the deployable template is `deploy/coco/postgres/alpha-postgres.yaml`. The agent policy must pin the init container's image, arguments and environment as it does for `alpha-volume-*` (#79's baseline).
 
 ## Not decided here
 
