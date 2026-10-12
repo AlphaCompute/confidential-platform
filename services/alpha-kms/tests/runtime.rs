@@ -25,7 +25,9 @@ use alpha_client::tls::{self, Pin};
 use alpha_client::{Client, Error as ClientError};
 use alpha_core::{AppId, ComposeHash, KeyId, context};
 use alpha_kms::{certs, rfc3339};
-use alpha_runtime::{Config, Delivery, Error, EvidenceSource, Exit, Runtime, Secrets, proxy};
+use alpha_runtime::{
+    Config, Delivery, Error, EvidenceSource, Exit, PlatformPinConfig, Runtime, Secrets, proxy,
+};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use common::*;
@@ -85,6 +87,7 @@ fn config(h: &Harness, endpoints: Vec<String>) -> Config {
     Config {
         kms_ca_spki_sha256: ca_spki_sha256(&h.ca_pem),
         kms_revisions: vec![h.node.compose_hash],
+        platform: None,
         kms_endpoints: endpoints,
         secrets: Secrets::new(),
         tls_upstream: None,
@@ -1517,4 +1520,133 @@ async fn a_revoked_revision_gets_no_new_secret_files() {
     assert_eq!(std::fs::read_dir(fresh.join("web")).unwrap().count(), 0);
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&fresh);
+}
+
+fn attested_or_refused(result: Result<Arc<alpha_runtime::Attested>, Error>, needle: &str) {
+    let Err(err) = result else {
+        panic!("the runtime attested; expected {needle}");
+    };
+    let message = err.to_string();
+    let matched = match &err {
+        Error::Kms(ClientError::Connect(_)) => needle == "connect",
+        Error::Kms(ClientError::Invalid(m)) => m.contains(needle),
+        _ => false,
+    };
+    assert!(matched, "{needle}: {message}");
+}
+
+/// D6's opt-in pin: the KMS by its CA plus the Revisions the current release-signed platform
+/// document lists. A KMS upgrade is a new document, not a new App Revision; an older document
+/// never brings a dropped build back.
+#[tokio::test]
+async fn the_platform_pin_follows_the_release_signed_document_and_never_goes_back() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    let (_, hash, _) = app_with_secret(&h, b"v1").await;
+    let node = h.node.compose_hash;
+    let upgraded = alpha_core::compose_hash("the next KMS build");
+    let later = h.now() + Duration::from_secs(86_400);
+    let listing = |version: u64, revisions: &[ComposeHash], expires_at: Option<SystemTime>| {
+        let mut d = platform_document(KEYED);
+        d["version"] = json!(version);
+        d["kms_ca_pem"] = json!(h.ca_pem);
+        d["kms_revisions"] = json!(
+            revisions
+                .iter()
+                .map(|r| json!({ "compose_hash": r, "build": "b", "source_url": "u" }))
+                .collect::<Vec<_>>()
+        );
+        if let Some(t) = expires_at {
+            d["expires_at"] = json!(rfc3339(t));
+        }
+        d
+    };
+    let release = ReleaseServer::start(listing(10, &[node], Some(later))).await;
+    let pinned = |min_version: u64| Config {
+        kms_revisions: Vec::new(),
+        platform: Some(PlatformPinConfig {
+            document_url: release.url.clone(),
+            min_version,
+            release_key: release.key.verifying_key(),
+        }),
+        ..config(&h, vec![h.url.clone()])
+    };
+
+    let (runtime, _) = start_runtime(&h, pinned(10));
+    assert_eq!(runtime.attest().await.unwrap().identity.compose_hash, hash);
+
+    // The KMS moves to another build: the next document lists only that one, and this node's
+    // build is refused at the handshake, with the runtime's configuration unchanged.
+    release.set(listing(11, &[upgraded], Some(later)));
+    attested_or_refused(runtime.attest().await, "connect");
+    // Served version 10 again, which still lists the node: below what this process accepted,
+    // so version 11's list stays.
+    release.set(listing(10, &[node], Some(later)));
+    attested_or_refused(runtime.attest().await, "connect");
+    release.set(listing(12, &[node, upgraded], Some(later)));
+    runtime.attest().await.unwrap();
+
+    // A fresh process remembers nothing: the measured minimum and the expiry bound how old a
+    // document it takes.
+    release.set(listing(10, &[node], Some(later)));
+    let (fresh, _) = start_runtime(&h, pinned(11));
+    attested_or_refused(fresh.attest().await, "below the pinned minimum 11");
+    let (fresh, _) = start_runtime(&h, pinned(10));
+    fresh.attest().await.unwrap();
+    for (document, refusal) in [
+        (
+            listing(13, &[node], Some(h.now() - Duration::from_secs(1))),
+            "expired",
+        ),
+        (listing(13, &[node], None), "no expires_at"),
+        (listing(13, &[], Some(later)), "lists no KMS Revision"),
+        (
+            {
+                let mut d = listing(13, &[node], Some(later));
+                d["kms_ca_pem"] = json!(Ca::new().pem());
+                d
+            },
+            "not the pinned KMS CA",
+        ),
+    ] {
+        release.set(document);
+        let (fresh, _) = start_runtime(&h, pinned(10));
+        attested_or_refused(fresh.attest().await, refusal);
+    }
+    release.set(listing(13, &[node], Some(later)));
+    let mut other_key = pinned(10);
+    if let Some(p) = other_key.platform.as_mut() {
+        p.release_key = ed25519_dalek::SigningKey::from_bytes(&[43u8; 32]).verifying_key();
+    }
+    let (fresh, _) = start_runtime(&h, other_key);
+    attested_or_refused(fresh.attest().await, "release signature does not verify");
+
+    // The listed Revisions lapse with their document, for every handshake after it.
+    let pin = alpha_client::platform::PlatformPin::new(
+        release.url.clone(),
+        release.key.verifying_key(),
+        1,
+        ca_spki_sha256(&h.ca_pem),
+    );
+    let lapse = h.now() + Duration::from_secs(1800);
+    let signed =
+        alpha_client::platform::sign(listing(14, &[node], Some(lapse)), &release.key).unwrap();
+    assert_eq!(pin.apply(&signed, h.now()).unwrap(), 14);
+    assert_eq!(pin.revisions(h.now()), [node]);
+    assert!(pin.revisions(lapse).is_empty());
+    // Both inside the node's one-hour leaf, so only the listing's expiry differs.
+    let at =
+        |t: SystemTime| Client::configured(vec![h.url.clone()], pin.pin(), None, pinned_time(t));
+    assert!(
+        at(lapse - Duration::from_secs(1))
+            .unwrap()
+            .ready()
+            .await
+            .is_ok()
+    );
+    assert!(matches!(
+        at(lapse).unwrap().ready().await.unwrap_err(),
+        ClientError::Connect(_)
+    ));
 }

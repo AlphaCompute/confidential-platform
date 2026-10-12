@@ -226,6 +226,7 @@ fn doc() -> PlatformDocument {
             nras_cc_mode: None,
         }),
         pccs_url: None,
+        expires_at: None,
     }
 }
 

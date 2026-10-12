@@ -52,6 +52,28 @@ pub enum Pin {
     CaSpkiAndRevisions([u8; 32], Vec<ComposeHash>),
     /// The leaf's SubjectPublicKeyInfo is exactly these bytes.
     Spki(Vec<u8>),
+    /// [`Pin::CaSpkiAndRevisions`] with the KMS Revisions a release-signed platform document
+    /// currently lists (D6, [`crate::platform::PlatformPin`]), read on every handshake.
+    CaSpkiAndListedRevisions([u8; 32], ListedRevisions),
+}
+
+/// A Revision list one party refreshes and every handshake of a pinned client reads, empty (so
+/// matching nothing) from the Unix second it expires.
+#[derive(Clone, Debug, Default)]
+pub struct ListedRevisions(Arc<parking_lot::RwLock<(Vec<ComposeHash>, u64)>>);
+
+impl ListedRevisions {
+    pub fn get(&self, now_unix: u64) -> Vec<ComposeHash> {
+        let listed = self.0.read();
+        if now_unix >= listed.1 {
+            return Vec::new();
+        }
+        listed.0.clone()
+    }
+
+    pub fn set(&self, revisions: Vec<ComposeHash>, expires_unix: u64) {
+        *self.0.write() = (revisions, expires_unix);
+    }
 }
 
 pub fn cert_from_pem(pem: &str) -> Result<CertificateDer<'static>, Error> {
@@ -84,7 +106,10 @@ impl PinnedServer {
                         .to_owned(),
                 )
             }
-            Some(Pin::CaSpkiAndRevisions(..) | Pin::Spki(_)) | None => None,
+            Some(
+                Pin::CaSpkiAndRevisions(..) | Pin::CaSpkiAndListedRevisions(..) | Pin::Spki(_),
+            )
+            | None => None,
         };
         Ok(Self {
             pin,
@@ -114,7 +139,7 @@ impl ServerCertVerifier for PinnedServer {
                     .as_ref()
                     .ok_or_else(|| refuse("pinned ca is not an anchor".into()))?,
             ),
-            Pin::CaSpkiAndRevisions(sha256, _) => {
+            Pin::CaSpkiAndRevisions(sha256, _) | Pin::CaSpkiAndListedRevisions(sha256, _) => {
                 let ca = intermediates
                     .iter()
                     .find(|c| spki_sha256(c).as_ref() == Some(sha256))
@@ -143,25 +168,30 @@ impl ServerCertVerifier for PinnedServer {
                 )
                 .map_err(|e| refuse(format!("server chain does not end at the pinned ca: {e}")))?;
         }
+        let kms_revision = |revisions: &[ComposeHash]| {
+            let sans = uri_sans(end_entity).map_err(|e| refuse(e.to_string()))?;
+            // An Instance leaf from the same CA also carries a Revision SAN and the
+            // server-auth EKU; only a node's leaf carries the KMS identity.
+            if !sans.iter().any(|s| s == KMS_SAN) {
+                return Err(refuse("server certificate is not a KMS node's".into()));
+            }
+            let allowed = revisions
+                .iter()
+                .map(|r| format!("urn:alphacompute:revision:{r}"))
+                .any(|urn| sans.contains(&urn));
+            if !allowed {
+                return Err(refuse(
+                    "server certificate carries no allowed KMS revision".into(),
+                ));
+            }
+            Ok(())
+        };
         match pin {
             Pin::Ca(_) => {}
             Pin::CaAndRevisions(_, revisions) | Pin::CaSpkiAndRevisions(_, revisions) => {
-                let sans = uri_sans(end_entity).map_err(|e| refuse(e.to_string()))?;
-                // An Instance leaf from the same CA also carries a Revision SAN and the
-                // server-auth EKU; only a node's leaf carries the KMS identity.
-                if !sans.iter().any(|s| s == KMS_SAN) {
-                    return Err(refuse("server certificate is not a KMS node's".into()));
-                }
-                let allowed = revisions
-                    .iter()
-                    .map(|r| format!("urn:alphacompute:revision:{r}"))
-                    .any(|urn| sans.contains(&urn));
-                if !allowed {
-                    return Err(refuse(
-                        "server certificate carries no allowed KMS revision".into(),
-                    ));
-                }
+                kms_revision(revisions)?;
             }
+            Pin::CaSpkiAndListedRevisions(_, listed) => kms_revision(&listed.get(now.as_secs()))?,
             Pin::CaAndInstanceRevisions(_, revisions) => {
                 let sans = uri_sans(end_entity).map_err(|e| refuse(e.to_string()))?;
                 let instance = parse_instance_sans(&sans).map_err(|e| refuse(e.to_string()))?;

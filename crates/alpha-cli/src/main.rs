@@ -237,6 +237,11 @@ enum ComposeCommand {
         /// Refuse every tag instead of asking its registry for the digest.
         #[arg(long)]
         no_resolve: bool,
+        /// D6's opt-in: pin the KMS by its CA and whatever the platform document served at this
+        /// https:// URL lists, from `--platform`'s version on, instead of `--platform`'s Revision
+        /// list. KMS upgrades then leave the App's Revision as it is.
+        #[arg(long)]
+        kms_platform_pin: Option<String>,
         compose: PathBuf,
     },
 }
@@ -512,6 +517,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                     platform,
                     runtime_image,
                     no_resolve,
+                    kms_platform_pin,
                     compose,
                 },
         } => {
@@ -520,8 +526,13 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let plain = wrap::parse(&bytes)?;
             let artifact: SignedDocument = serde_json::from_value(read_json(&platform)?)
                 .map_err(|e| Exit::Refused(format!("artifact: {e}")))?;
-            let runtime =
-                wrap::runtime(&artifact, &alpha_cli::release_key()?, now, &runtime_image)?;
+            let runtime = wrap::runtime(
+                &artifact,
+                &alpha_cli::release_key()?,
+                now,
+                &runtime_image,
+                kms_platform_pin.as_deref(),
+            )?;
             let digests = if no_resolve {
                 BTreeMap::new()
             } else {

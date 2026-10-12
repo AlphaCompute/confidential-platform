@@ -161,6 +161,24 @@ pub struct PlatformDocument {
         deserialize_with = "alpha_core::platform::deserialize_pccs_url"
     )]
     pub pccs_url: Option<String>,
+    /// When this document stops vouching for `kms_revisions` to a client that pins the KMS by the
+    /// platform document (D6), which remembers no version across restarts: RFC 3339. A runtime
+    /// in that mode refuses a document without it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_rfc3339"
+    )]
+    pub expires_at: Option<String>,
+}
+
+fn deserialize_rfc3339<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let text = Option::<String>::deserialize(d)?;
+    if let Some(text) = &text {
+        chrono::DateTime::parse_from_rfc3339(text)
+            .map_err(|e| serde::de::Error::custom(format!("expires_at {text:?}: {e}")))?;
+    }
+    Ok(text)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-pub use tls::{Identity, Pin};
+pub use tls::{Identity, ListedRevisions, Pin};
 
 pub type TimeProvider = Arc<dyn rustls::time_provider::TimeProvider>;
 

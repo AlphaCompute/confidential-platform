@@ -10,6 +10,7 @@ workspace = true
 [dependencies]
 alpha-core = { path = "../alpha-core" }
 base64 = "0.23"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 dcap-qvl = "=0.6.3"
 hex = { version = "0.4", features = ["serde"] }
 p384 = { version = "0.13", features = ["ecdsa"] }
@@ -21,5 +22,4 @@ thiserror = "2"
 tokio = { version = "1", features = ["time"] }
 
 [dev-dependencies]
-chrono = { version = "0.4", default-features = false }
 tokio = { version = "1", features = ["macros", "rt"] }
