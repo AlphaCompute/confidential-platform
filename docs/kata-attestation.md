@@ -6,9 +6,9 @@ How `alpha-kms` decides to issue a Revision leaf to a Kata confidential pod on T
 
 ## Identity: init-data and the Revision v2
 
-Kata binds the digest of the pod's init-data into the TD's `MRCONFIGID` when it launches the VM, and the Kata agent policy the pod runs under is the init-data's `policy.rego` entry. The policy pins images by digest and fixes each container's command, environment and mounts, and denies exec and log reads. So the init-data, not the pod spec the host holds, says what may run.
+Kata binds the digest of the pod's init-data into the TD's `MRCONFIGID` when it launches the VM, and the Kata agent policy the pod runs under is the init-data's `policy.rego` entry. The policy pins images by digest and fixes each container's command, environment and mounts, and denies exec and log reads. So the init-data, not the pod spec the host holds, says what may run. The policy is genpolicy 4.1.0's for the pod spec, held to the PRD-02 baseline by `alpha coco render` and `alpha coco wrap` ([coco-generator.md](coco-generator.md)).
 
-`alpha coco render` adds one entry of ours, `alpha.json`:
+`alpha coco render` and `alpha coco wrap` add one entry of ours, `alpha.json`:
 
 ```json
 {"app_id":"<uuid>","format":"alphacompute-initdata/1","gpu":{"count":8,"model":"B300"},"runtime_class":"kata-qemu-nvidia-gpu-tdx"}
@@ -39,7 +39,7 @@ Any other class is refused at registration and at appraisal (`kata-qemu-nvidia-g
 {"app_id":"<uuid>","format":"alphacompute-coco-revision/1","initdata_sha256":"sha256:<hex>","policy_sha256":"sha256:<hex>","runtime_class":"kata-qemu-tdx"}
 ```
 
-`MRCONFIGID` holds the init-data digest under the algorithm the document declares, zero-padded to 48 bytes; `alpha coco render` declares `sha384`, which fills it. This is open question Q10 until a golden vector from a B300 pod proves it at M1; `alpha_core::coco::InitData::mrconfigid` is the one place to change if Kata binds it differently.
+`MRCONFIGID` holds the init-data digest under the algorithm the document declares, zero-padded to 48 bytes; `alpha coco render` and `alpha coco wrap` declare `sha384`, which fills it. This is open question Q10 until a golden vector from a B300 pod proves it at M1; `alpha_core::coco::InitData::mrconfigid` is the one place to change if Kata binds it differently.
 
 ## Evidence (`alphacompute-evidence/2`)
 
@@ -132,4 +132,4 @@ If a required claim name differs on the B300, `nras::claims::REQUIRED` is the on
 
 ## What the KMS cannot see
 
-Exec, log reads, file copies and container changes are refused inside the guest by the agent policy. The KMS's part is to make sure that policy is the one the tenant signed. Those cases are run against a live pod by the malicious-host suite, not here.
+Exec, log reads, file copies and container changes are refused inside the guest by the agent policy (its baseline is in [coco-generator.md](coco-generator.md)). `alpha-runtime` runs in the pod as a native sidecar, reading the init-data from `/run/alpha-pod/cc_init_data` through a downward-API volume. The KMS's part is to make sure that policy is the one the tenant signed. Those cases are run against a live pod by the malicious-host suite, not here.
