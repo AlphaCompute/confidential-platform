@@ -35,6 +35,11 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 uuid = "1"
 zeroize = "1"
 
+[features]
+# Expose verify_kata_node as `pub` for cross-crate integration tests.
+# Never enable in production. Enabled transitively by alpha-kms's test-seams feature.
+test-seams = []
+
 [dev-dependencies]
 axum = { version = "0.8", default-features = false }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }

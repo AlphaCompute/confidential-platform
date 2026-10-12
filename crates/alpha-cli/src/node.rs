@@ -88,7 +88,34 @@ pub fn verify_node(
 /// [`verify_node`] for a Kata node's evidence over a quote `alpha_attest::verify_quote` has
 /// verified: every check after DCAP. The KMS's tests run the CLI's half of a Kata genesis through
 /// it over synthetic quotes until B300 Kata captures exist (M1); the commands never call it.
+///
+/// `pub(crate)` in production builds; `pub` with the `test-seams` feature so that `alpha-kms`'s
+/// integration tests can drive custodian-side verification with synthetic quotes (until M1).
+#[cfg(not(feature = "test-seams"))]
+pub(crate) fn verify_kata_node(
+    evidence: &NodeEvidence,
+    verified: VerifiedQuote,
+    nonce: &[u8; 32],
+    server_spki: &[u8],
+    doc: &PlatformDocument,
+    remembered_version: Option<u64>,
+) -> Result<AttestedNode, String> {
+    verify_kata_node_inner(evidence, verified, nonce, server_spki, doc, remembered_version)
+}
+
+#[cfg(feature = "test-seams")]
 pub fn verify_kata_node(
+    evidence: &NodeEvidence,
+    verified: VerifiedQuote,
+    nonce: &[u8; 32],
+    server_spki: &[u8],
+    doc: &PlatformDocument,
+    remembered_version: Option<u64>,
+) -> Result<AttestedNode, String> {
+    verify_kata_node_inner(evidence, verified, nonce, server_spki, doc, remembered_version)
+}
+
+fn verify_kata_node_inner(
     evidence: &NodeEvidence,
     verified: VerifiedQuote,
     nonce: &[u8; 32],
