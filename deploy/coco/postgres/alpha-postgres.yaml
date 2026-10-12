@@ -17,7 +17,7 @@ metadata:
   labels:
     app.kubernetes.io/name: alpha-postgres
 spec:
-  # Headless: the KMS reaches the one pod by its stable name. QUESTION(PRD-05 Q4): the host
+  # Headless: the KMS reaches the one pod by its stable name. QUESTION(PRD-05 Q54): the host
   # resolves this name; with D10's verify-full against the derived CA (#105) a wrong answer
   # fails the handshake, without it the KMS's rows are still sealed (#95).
   clusterIP: None
@@ -35,7 +35,7 @@ metadata:
     app.kubernetes.io/name: alpha-postgres
 spec:
   serviceName: alpha-postgres
-  # One primary. QUESTION(PRD-05 Q3): a standby would need its own volume key release and
+  # One primary. QUESTION(PRD-05 Q53): a standby would need its own volume key release and
   # streaming replication over TLS between two attested pods; not drafted.
   replicas: 1
   selector:
@@ -87,7 +87,7 @@ spec:
           #   -c ident_file=/etc/alpha/pg_ident.conf -c ssl_min_protocol_version=TLSv1.3
           # with the hba/ident files baked into a pinned image (a ConfigMap is the host's). Until
           # then this fails closed: no hba_file is named and POSTGRES_PASSWORD is unset, so the
-          # stock entrypoint refuses to initialise a database (QUESTION(PRD-05 Q5)).
+          # stock entrypoint refuses to initialise a database (QUESTION(PRD-05 Q55)).
           args: ["postgres", "-c", "listen_addresses=*", "-c", "log_connections=authentication"]
           env:
             - { name: PGDATA, value: /run/pgdata/data }

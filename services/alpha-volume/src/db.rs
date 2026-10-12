@@ -51,7 +51,7 @@ pub struct Config {
     pub platform_document_url: String,
     pub pccs_url: String,
     pub quote: QuoteSource,
-    /// QUESTION(PRD-05 Q2): the pod keeps no state, so without a measured floor the host could
+    /// QUESTION(PRD-05 Q52): the pod keeps no state, so without a measured floor the host could
     /// serve it an older, still-signed platform document listing a KMS build since dropped.
     /// Proposed: the renderer measures the version current at render time; a KMS build is
     /// revoked by a document above it, and the pod is re-rendered (a new Revision) when the
