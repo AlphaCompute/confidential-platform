@@ -13,7 +13,7 @@ use std::io::Write;
 use std::path::Path;
 
 use alpha_core::coco::{
-    ALPHA_ENTRY_FORMAT, GPU_COUNTS, INITDATA_VERSION, AlphaEntry, CocoRevision, GpuShape,
+    ALPHA_ENTRY_FORMAT, AlphaEntry, CocoRevision, GPU_COUNTS, GpuShape, INITDATA_VERSION,
     RUNTIME_CLASSES,
 };
 use alpha_core::{AppId, ComposeHash, jcs};
@@ -30,7 +30,6 @@ const FORBIDDEN: &[char] = &['"', '\'', '`', '\\', '$', '\n', '\r'];
 
 pub struct RenderOutput {
     pub manifest: String,
-    pub initdata_bytes: Vec<u8>,
     pub revision: CocoRevision,
     pub revision_canonical: String,
     pub revision_hash: ComposeHash,
@@ -40,8 +39,7 @@ pub struct RenderOutput {
 pub fn read_env_files(paths: &[&Path]) -> Result<HashMap<String, String>, String> {
     let mut out: HashMap<String, String> = HashMap::new();
     for path in paths {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         for (idx, raw) in text.lines().enumerate() {
             let line = raw.trim_end_matches('\n');
             if line.trim().is_empty() || line.trim_start().starts_with('#') {
@@ -172,7 +170,9 @@ fn extract_shape(rendered: &str) -> Result<(String, u32), String> {
         .fold(0u32, |a, n| a.saturating_add(n));
 
     if gpus > 0 && !GPU_COUNTS.contains(&gpus) {
-        return Err(format!("{gpus} total nvidia.com/pgpu: a pod must request 1 or 8"));
+        return Err(format!(
+            "{gpus} total nvidia.com/pgpu: a pod must request 1 or 8"
+        ));
     }
 
     let runtime_class = classes[0].to_owned();
@@ -257,7 +257,9 @@ pub fn render(
     let for_shape = render_for_genpolicy(template, env)?;
     let (runtime_class, gpu_count) = extract_shape(&for_shape)?;
 
-    let app_id_str = env.get("APP_ID").ok_or("APP_ID must be set in an env file")?;
+    let app_id_str = env
+        .get("APP_ID")
+        .ok_or("APP_ID must be set in an env file")?;
     let app_id: AppId = app_id_str
         .parse()
         .map_err(|_| format!("APP_ID {app_id_str:?} is not a valid App id"))?;
@@ -282,15 +284,13 @@ pub fn render(
     values.insert("CC_INIT_DATA".to_owned(), annotation);
     let manifest = substitute(template, &values)?;
 
-    let initdata =
-        alpha_core::coco::InitData::parse(&initdata_bytes).map_err(|e| e.to_string())?;
+    let initdata = alpha_core::coco::InitData::parse(&initdata_bytes).map_err(|e| e.to_string())?;
     let revision = initdata.revision().map_err(|e| e.to_string())?;
     let revision_canonical = revision.canonical().map_err(|e| e.to_string())?;
     let revision_hash = revision.hash().map_err(|e| e.to_string())?;
 
     Ok(RenderOutput {
         manifest,
-        initdata_bytes,
         revision,
         revision_canonical,
         revision_hash,
@@ -307,7 +307,10 @@ mod tests {
         let mut m = HashMap::new();
         m.insert("APP_ID".into(), APP.into());
         m.insert("GPU_MODEL".into(), "B300".into());
-        m.insert("RUNTIME_IMAGE".into(), "ghcr.io/alphacompute/alpha-runtime@sha256:aaaa".into());
+        m.insert(
+            "RUNTIME_IMAGE".into(),
+            "ghcr.io/alphacompute/alpha-runtime@sha256:aaaa".into(),
+        );
         m
     }
 
@@ -428,7 +431,10 @@ spec:
         assert_eq!(output.revision.app_id.to_string(), APP);
         assert_eq!(
             output.revision.gpu,
-            Some(GpuShape { count: 1, model: "B300".into() })
+            Some(GpuShape {
+                count: 1,
+                model: "B300".into()
+            })
         );
         assert_eq!(output.revision.runtime_class, "kata-qemu-nvidia-gpu-tdx");
 
@@ -438,8 +444,18 @@ spec:
         let canonical = output.revision.canonical().unwrap();
         assert_eq!(canonical, output.revision_canonical);
 
-        // init-data bytes are parseable and produce the same revision.
-        let parsed = alpha_core::coco::InitData::parse(&output.initdata_bytes).unwrap();
+        // Rebuild the init-data from the same inputs and verify the revision round-trips.
+        let alpha = alpha_json(
+            APP.parse().unwrap(),
+            "kata-qemu-nvidia-gpu-tdx",
+            Some(GpuShape {
+                count: 1,
+                model: "B300".into(),
+            }),
+        )
+        .unwrap();
+        let initdata_bytes = build_initdata(MINIMAL_POLICY, &alpha).unwrap();
+        let parsed = alpha_core::coco::InitData::parse(&initdata_bytes).unwrap();
         assert_eq!(parsed.revision().unwrap(), output.revision);
     }
 }
