@@ -45,14 +45,14 @@ pub fn read_env_files(paths: &[&Path]) -> Result<HashMap<String, String>, String
             if line.trim().is_empty() || line.trim_start().starts_with('#') {
                 continue;
             }
+            let line_no = idx.saturating_add(1);
             let (name, value) = line
                 .split_once('=')
-                .ok_or_else(|| format!("{}:{}: not NAME=value", path.display(), idx + 1))?;
+                .ok_or_else(|| format!("{}:{line_no}: not NAME=value", path.display()))?;
             if !is_var_name(name) {
                 return Err(format!(
-                    "{}:{}: {name:?} is not a valid NAME ([A-Z][A-Z0-9_]*)",
+                    "{}:{line_no}: {name:?} is not a valid NAME ([A-Z][A-Z0-9_]*)",
                     path.display(),
-                    idx + 1
                 ));
             }
             if COMPUTED.contains(&name) {
@@ -63,9 +63,8 @@ pub fn read_env_files(paths: &[&Path]) -> Result<HashMap<String, String>, String
             }
             if out.contains_key(name) {
                 return Err(format!(
-                    "{}:{}: {name} is already set (from an earlier file)",
+                    "{}:{line_no}: {name} is already set (from an earlier file)",
                     path.display(),
-                    idx + 1
                 ));
             }
             out.insert(name.to_owned(), value.to_owned());
@@ -94,10 +93,11 @@ pub fn substitute(template: &str, env: &HashMap<String, String>) -> Result<Strin
             break;
         };
         out.push_str(&rest[..dollar]);
-        let after = &rest[dollar + 2..];
+        // rest[dollar..] starts with "${"; advance past those two bytes.
+        let after = rest.get(dollar.saturating_add(2)..).unwrap_or_default();
         let close = after
             .find('}')
-            .ok_or_else(|| "unclosed '${{' in template".to_owned())?;
+            .ok_or_else(|| "unclosed '${' in template".to_owned())?;
         let name = &after[..close];
         if !is_var_name(name) {
             return Err(format!("template: invalid variable reference ${{{name}}}"));
@@ -121,7 +121,7 @@ pub fn substitute(template: &str, env: &HashMap<String, String>) -> Result<Strin
                 }
             }
         }
-        rest = &after[close + 1..];
+        rest = after.get(close.saturating_add(1)..).unwrap_or_default();
     }
     if !missing.is_empty() {
         missing.sort();
@@ -144,13 +144,16 @@ fn extract_shape(rendered: &str) -> Result<(String, u32), String> {
         .filter(|v| !v.is_empty())
         .collect();
 
-    if classes.len() != 1 {
-        return Err(format!(
-            "spec must name exactly one runtimeClassName; found {}: {:?}",
-            classes.len(),
-            classes,
-        ));
-    }
+    let runtime_class = match classes.as_slice() {
+        [only] => only.to_string(),
+        _ => {
+            return Err(format!(
+                "spec must name exactly one runtimeClassName; found {}: {:?}",
+                classes.len(),
+                classes,
+            ));
+        }
+    };
 
     if rendered
         .lines()
@@ -174,8 +177,6 @@ fn extract_shape(rendered: &str) -> Result<(String, u32), String> {
             "{gpus} total nvidia.com/pgpu: a pod must request 1 or 8"
         ));
     }
-
-    let runtime_class = classes[0].to_owned();
     if !RUNTIME_CLASSES.contains(&runtime_class.as_str()) {
         return Err(format!(
             "runtimeClassName {runtime_class:?} is not a supported CoCo runtime class"
