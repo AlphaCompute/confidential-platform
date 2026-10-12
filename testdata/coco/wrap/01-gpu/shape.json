@@ -1,0 +1,1 @@
+{"runtime_class":"kata-qemu-nvidia-gpu-tdx","gpu":{"model":"B300","count":1},"cpu":16,"memory_mib":196608}
