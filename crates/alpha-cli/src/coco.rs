@@ -375,6 +375,7 @@ pub fn render(
 ) -> Result<RenderOutput, String> {
     let for_shape = render_for_genpolicy(template, env)?;
     let (runtime_class, gpu_count) = extract_shape(&for_shape)?;
+    let policy_text = &policy::pin_hostname(policy_text);
     let verified = policy::verify(policy_text)?;
     let containers = manifest_containers(&for_shape)?;
     let running = admitted(&containers);

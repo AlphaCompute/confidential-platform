@@ -1,0 +1,12 @@
+[
+  {
+    "op": "test",
+    "path": "/request_defaults/CreateContainerRequest/allow_env_regex/0",
+    "value": "^HOSTNAME=$(dns_label)$"
+  },
+  {
+    "op": "replace",
+    "path": "/request_defaults/CreateContainerRequest/allow_env_regex/0",
+    "value": "^HOSTNAME=[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$"
+  }
+]
