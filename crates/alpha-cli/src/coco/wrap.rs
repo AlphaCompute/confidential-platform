@@ -686,15 +686,28 @@ fn set_identity(
 }
 
 /// The one resource genpolicy reads: a Deployment named as the adapter names it, whose pod is
-/// `spec` without the two fields genpolicy 4.1.0 does not take (`automountServiceAccountToken`
-/// and `enableServiceLinks`; both only take things away, and the settings admit neither a token
-/// mount nor service-link variables) and without the KMS endpoints variable, which the policy
+/// `spec` without the fields genpolicy 4.1.0 does not take (`automountServiceAccountToken`,
+/// `enableServiceLinks` and a claim's `readOnly`; the settings admit neither a token mount nor
+/// service-link variables, and the pod spec itself still mounts no token) and without the KMS endpoints variable, which the policy
 /// admits by pattern instead.
 pub fn genpolicy_input(app_id: AppId, spec: &Value) -> Result<String, String> {
     let mut pod = spec.clone();
     let fields = pod.as_object_mut().ok_or("pod spec is not an object")?;
     fields.remove("automountServiceAccountToken");
     fields.remove("enableServiceLinks");
+    for volume in fields
+        .get_mut("volumes")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        if let Some(claim) = volume
+            .get_mut("persistentVolumeClaim")
+            .and_then(Value::as_object_mut)
+        {
+            claim.remove("readOnly");
+        }
+    }
     for container in containers_mut(fields) {
         if let Some(env) = container.get_mut("env").and_then(Value::as_array_mut) {
             env.retain(|e| e.get("name").and_then(Value::as_str) != Some(KMS_ENDPOINTS_ENV));
