@@ -47,23 +47,23 @@ alpha-kms  /^kms-node-[0-9a-f]{16}$     alpha_kms_node
 
 ## What is not done
 
-- **Join.** A joining node writes `node.join.request` before the join reply gives it the volume key, so in client-cert mode it has no credential to write it with. `join_request` refuses with an explicit error (open question 3). Custodian unseal and genesis work.
-- **Migrations.** `alpha-kms migrate` needs a connection before any node holds the volume key; in client-cert mode it refuses (open question 6).
+- **Join.** A joining node writes `node.join.request` before the join reply gives it the volume key, so in client-cert mode it has no credential to write it with. `join_request` refuses with an explicit error (open question Q46). Custodian unseal and genesis work.
+- **Migrations.** `alpha-kms migrate` needs a connection before any node holds the volume key; in client-cert mode it refuses (open question Q49).
 - **The Postgres pod side.** `alpha-volume open-db` (the init container, separate PRD-05 draft PR) opens the volume; it should also write `root.crt`, `server.crt` and `server.key` with `issue_server`, and `postgresql.conf` should name them. Not wired.
 - **Databases from before M2(a)** have no volume key, so client-cert mode cannot reach them; the share files must carry `db_volume_wrapped` (`enter` refuses otherwise).
 - **No in-process node test** of client-cert mode: the shared CI Postgres uses passwords, so only the certificate path is tested against a real server, locally.
 
 ## Open questions
 
-The numbers match `QUESTION(PRD-05 Qn)` in the code and the PR.
+Numbered program-wide (Q44–Q50); the numbers match `QUESTION(PRD-05 Qn)` in the code and the PR.
 
-1. Which CA issues the client certificate? Proposed: the CA derived from the volume key, not the KMS CA, whose key lives in the database it would unlock (M4) and which also signs every tenant leaf.
-2. Rotation? Proposed: node leaves one hour, renewed on the tick; the server certificate bounded at 30 days, renewed on pod restart; the CA never rotates.
-3. What replaces `node.join.request` for a client-cert joiner? Proposed: the serving node writes it when it appraises the joiner.
-4. Does Postgres verify the KMS's attestation or trust the CA? Proposed: trust the CA (possession of it is the attestation proxy).
-5. Should a Kata node refuse `url` mode outright once D10 is decided? Proposed: yes.
-6. Who runs migrations against the client-cert Postgres? Proposed: a serving node, at `start_serving`, under an advisory lock.
-7. Restrict `pg_hba.conf` to the verifier pool's CIDR? Proposed: yes once PRD-01 names it.
+- **Q44.** Which CA issues the client certificate? Proposed: the CA derived from the volume key, not the KMS CA, whose key lives in the database it would unlock (M4) and which also signs every tenant leaf.
+- **Q45.** Rotation? Proposed: node leaves one hour, renewed on the tick; the server certificate bounded at 30 days, renewed on pod restart; the CA never rotates.
+- **Q46.** What replaces `node.join.request` for a client-cert joiner? Proposed: the serving node writes it when it appraises the joiner.
+- **Q47.** Does Postgres verify the KMS's attestation or trust the CA? Proposed: trust the CA (possession of it is the attestation proxy).
+- **Q48.** Should a Kata node refuse `url` mode outright once D10 is decided? Proposed: yes.
+- **Q49.** Who runs migrations against the client-cert Postgres? Proposed: a serving node, at `start_serving`, under an advisory lock.
+- **Q50.** Restrict `pg_hba.conf` to the verifier pool's CIDR? Proposed: yes once PRD-01 names it.
 
 ## Trying it
 

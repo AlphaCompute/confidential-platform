@@ -39,7 +39,7 @@ async fn run() -> Result<(), String> {
     if std::env::args().nth(1).as_deref() == Some("migrate") {
         if auth == db_auth::Mode::ClientCert {
             // TODO(draft): a migration needs a connection before any node holds the volume key.
-            // QUESTION(PRD-05 Q6): who runs migrations against the client-cert Postgres? Proposed:
+            // QUESTION(PRD-05 Q49): who runs migrations against the client-cert Postgres? Proposed:
             // a serving node, at start_serving, under an advisory lock, so no separate credential
             // exists; until then this refuses.
             return Err(

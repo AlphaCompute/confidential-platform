@@ -22,13 +22,13 @@
 //! Nothing here touches what a node may read: the rows are sealed under the KMS intermediates
 //! either way (#95). This decides who may connect.
 //!
-//! QUESTION(PRD-05 Q1): which CA issues the Postgres client certificate. Proposed: this derived
+//! QUESTION(PRD-05 Q44): which CA issues the Postgres client certificate. Proposed: this derived
 //! CA, not the KMS CA. The KMS CA's key is in `intermediate_keys`, inside the very database it
 //! would let the node into, so a cold-starting node cannot use it (M4 keeps it there); it would
 //! also make every KMS-CA leaf (tenant Instances included) a candidate client, filtered only by
 //! the CN map. The derived CA exists before the database does and only TEEs hold it.
 //!
-//! QUESTION(PRD-05 Q4): does Postgres verify the KMS's attestation or trust the CA? Proposed:
+//! QUESTION(PRD-05 Q47): does Postgres verify the KMS's attestation or trust the CA? Proposed:
 //! trust the CA. Stock Postgres cannot appraise TDX evidence; possession of the CA key is
 //! the attestation proxy (see above). A custom auth hook or an attesting proxy in the Postgres
 //! pod is possible later.
@@ -72,7 +72,7 @@ pub const CLIENT_SAN_PREFIX: &str = "alphacompute://kms-db-client/";
 /// certificate from the derived CA mapped through [`PG_IDENT`]. The `local` line is the pod's
 /// own socket (initdb and the entrypoint), which the TD's agent policy keeps exec-free.
 ///
-/// QUESTION(PRD-05 Q7): restrict the address to the verifier pool's pod CIDR? Proposed: yes once
+/// QUESTION(PRD-05 Q50): restrict the address to the verifier pool's pod CIDR? Proposed: yes once
 /// PRD-01 names it; the certificate is the control, the CIDR only narrows noise.
 pub const PG_HBA: &str = "\
 # D10 (draft): alpha-kms nodes by client certificate only (docs/db-client-auth.md).
@@ -114,7 +114,7 @@ pub fn mode(value: Option<&str>) -> Result<Mode, String> {
 /// - `client-cert`: no password at all, and no `sslmode` other than `verify-full`: the mode
 ///   sets TLS itself and a URL must not weaken it. The user, if named, must be [`ROLE`].
 ///
-/// QUESTION(PRD-05 Q5): should a Kata node refuse `url` mode outright? Proposed: not yet. During
+/// QUESTION(PRD-05 Q48): should a Kata node refuse `url` mode outright? Proposed: not yet. During
 /// the migration a Kata node may need to connect before D10 lands (network-granted `trust` on a
 /// Postgres only the verifier pool reaches, accepted as a gap since the rows are sealed). Once
 /// D10 is decided, `url` mode on a Kata node should be refused.
@@ -331,7 +331,7 @@ pub fn issue_server(
         .map_err(|e| ApiError::internal(format!("db server key: {e}")))?;
     let issuer = Issuer::from_ca_cert_der(&ca.cert_der.as_slice().into(), &ca.key)
         .map_err(|e| ApiError::internal(format!("db client CA certificate: {e}")))?;
-    // QUESTION(PRD-05 Q2): rotation. Proposed: the pod's certificate lives as long as the pod
+    // QUESTION(PRD-05 Q45): rotation. Proposed: the pod's certificate lives as long as the pod
     // (Postgres re-reads it only on reload), bounded at 30 days; the CA itself never rotates
     // because the volume key never does.
     let not_after = later(now, Duration::from_secs(30 * 86400))?;
@@ -475,7 +475,7 @@ pub fn renew_if_due(node: &Node) {
 /// key, and the serving node refuses a join without that row. In client-cert mode the joining node
 /// has no database credential until the reply, so the row cannot be written.
 ///
-/// QUESTION(PRD-05 Q3): what replaces the row for a client-cert joiner? Proposed: the serving node
+/// QUESTION(PRD-05 Q46): what replaces the row for a client-cert joiner? Proposed: the serving node
 /// writes `node.join.request` itself when it mints the join nonce for an attested, listed Kata
 /// node, because the row's job (proof that the joiner holds the database credential) is exactly
 /// what D10 (a) moves into attestation. Until that is decided this refuses, so a client-cert node
@@ -489,7 +489,7 @@ pub fn check_can_join(node: &Node) -> Result<(), ApiError> {
     }
     Err(ApiError::internal(
         "client-cert mode: a joining node has no database credential before the join reply, so \
-         it cannot write node.join.request (TODO(draft), QUESTION(PRD-05 Q3)); unseal this node \
+         it cannot write node.join.request (TODO(draft), QUESTION(PRD-05 Q46)); unseal this node \
          with custodians instead",
     ))
 }
