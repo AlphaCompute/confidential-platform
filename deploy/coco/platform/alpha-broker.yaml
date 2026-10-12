@@ -1,0 +1,107 @@
+# alpha-broker: the connector broker, in a Kata TDX pod VM on the CPU-CC cluster's attested
+# namespace. Rendered by `alpha coco render` with env/cluster.env and env/alpha-broker.env; its
+# configuration is the environment below, measured into the agent policy (services/alpha-broker).
+# Its Secrets (the providers' client secrets, connect-bearer and database-url) are released by
+# the KMS to this App's Revision only and read over the runtime socket, never from Kubernetes.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alpha-broker
+  labels:
+    app.kubernetes.io/name: alpha-broker
+spec:
+  replicas: ${REPLICAS}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: alpha-broker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: alpha-broker
+        alphacompute.ai/tenant: platform
+        alphacompute.ai/app: ${APP_ID}
+      annotations:
+        # The only Kata annotation: the init-data (agent policy + alpha.json), set by the renderer.
+        io.katacontainers.config.hypervisor.cc_init_data: "${CC_INIT_DATA}"
+    spec:
+      runtimeClassName: kata-qemu-tdx
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      initContainers:
+        # Native sidecar: attests with the pod's init-data, holds the leaf and serves it, the
+        # Secrets and derived keys to alpha-broker on /run/alpha. It opens no port of its own.
+        - name: alpha-runtime
+          image: ${RUNTIME_IMAGE}            # ghcr.io/alphacompute/alpha-runtime@sha256:...
+          restartPolicy: Always
+          env:
+            - name: ALPHACOMPUTE_KMS_ENDPOINTS
+              value: "${KMS_ENDPOINTS}"
+            - name: ALPHACOMPUTE_KMS_CA_SPKI_SHA256
+              value: "${KMS_CA_SPKI_SHA256}"
+            - name: ALPHACOMPUTE_KMS_REVISIONS
+              value: "${KMS_REVISIONS}"
+            - name: ALPHACOMPUTE_QUOTE_SOURCE
+              value: "coco-aa"
+          resources:
+            requests: { cpu: "${RUNTIME_VCPUS}", memory: "${RUNTIME_MEMORY_MIB}Mi" }
+            limits: { cpu: "${RUNTIME_VCPUS}", memory: "${RUNTIME_MEMORY_MIB}Mi" }
+          volumeMounts:
+            - { name: runtime-socket, mountPath: /run/alpha }
+            - { name: pod-initdata, mountPath: /run/alpha-pod, readOnly: true }
+      containers:
+        - name: alpha-broker
+          image: ${BROKER_IMAGE}               # ghcr.io/alphacompute/alpha-broker@sha256:...
+          env:
+            - name: GOOGLE_CLIENT_ID
+              value: "${GOOGLE_CLIENT_ID}"
+            - name: DROPBOX_CLIENT_ID
+              value: "${DROPBOX_CLIENT_ID}"
+            - name: SLACK_CLIENT_ID
+              value: "${SLACK_CLIENT_ID}"
+            - name: FIGMA_CLIENT_ID
+              value: "${FIGMA_CLIENT_ID}"
+            - name: HUBSPOT_CLIENT_ID
+              value: "${HUBSPOT_CLIENT_ID}"
+            - name: NOTION_CLIENT_ID
+              value: "${NOTION_CLIENT_ID}"
+            - name: OAUTH_REDIRECT_BASE
+              value: "${OAUTH_REDIRECT_BASE}"
+          ports:
+            - name: https
+              containerPort: 8443
+          # HTTPS from the kubelet (it does not check the leaf), no exec: the agent policy refuses
+          # exec. 8443 serves only once the runtime has attested and handed over the leaf.
+          readinessProbe:
+            httpGet: { path: /ready, port: 8443, scheme: HTTPS }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8443, scheme: HTTPS }
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            # The pod VM is sized from the containers' limits (Kata's static sandbox sizing on TDX).
+            requests: { cpu: "${VCPUS}", memory: "${MEMORY_MIB}Mi" }
+            limits: { cpu: "${VCPUS}", memory: "${MEMORY_MIB}Mi" }
+          volumeMounts:
+            - { name: runtime-socket, mountPath: /run/alpha }
+      volumes:
+        - { name: runtime-socket, emptyDir: { medium: Memory, sizeLimit: 1Mi } }
+        # The pod's own init-data, which the runtime sends with its evidence. The host could put
+        # anything here; the KMS refuses any init-data that is not the digest in MRCONFIGID.
+        - name: pod-initdata
+          downwardAPI:
+            items:
+              - path: cc_init_data
+                fieldRef:
+                  fieldPath: metadata.annotations['io.katacontainers.config.hypervisor.cc_init_data']
+---
+# Its callers pin the KMS CA and this service's Revision (or App), never this name.
+apiVersion: v1
+kind: Service
+metadata:
+  name: alpha-broker
+spec:
+  selector:
+    app.kubernetes.io/name: alpha-broker
+  ports:
+    - { name: https, port: 8443, targetPort: https }

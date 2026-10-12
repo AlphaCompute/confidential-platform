@@ -1,0 +1,139 @@
+# alpha-kms: the key authority, two nodes in a Kata TDX pod VM each, on the verifier pool
+# (alpha-infra docs/verifier-pool.md), in the namespace alpha-kms (verifier-namespaces.example.yaml).
+#
+# Rendered by `alpha coco render` with env/alpha-kms.env; the Revision v2 it prints is this build's
+# entry in the platform document's kms_revisions, with "kind": "kata-tdx". Unlike every other pod,
+# the KMS has no alpha-runtime: it is the party that appraises, so it quotes itself through the
+# CoCo attestation agent (ALPHACOMPUTE_QUOTE_SOURCE) and reads its own init-data, from which its
+# identity (its Revision v2) comes. It comes up sealed: the first node is bootstrapped by the
+# custodians, every later node joins a serving one (docs/kata-attestation.md, "A KMS node on Kata").
+#
+# Everything the node is told is in the measured environment below, so in the agent policy inside
+# the init-data. That init-data is public: GET /v1/node/evidence serves it to anyone who asks, so
+# nothing secret may be in this environment (README.md, "The database credential").
+#
+# Two nodes, one per failure domain. The StatefulSet replaces one pod at a time and waits for it to
+# be Ready, which /ready answers only once the node has joined the other and serves: never both
+# nodes at once.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: alpha-kms
+  labels:
+    app.kubernetes.io/name: alpha-kms
+spec:
+  serviceName: alpha-kms-nodes
+  replicas: 2
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: alpha-kms
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: alpha-kms
+        alphacompute.ai/tenant: platform
+        alphacompute.ai/app: ${APP_ID}
+      annotations:
+        # The only Kata annotation: the init-data (agent policy + alpha.json), set by the renderer.
+        io.katacontainers.config.hypervisor.cc_init_data: "${CC_INIT_DATA}"
+    spec:
+      runtimeClassName: kata-qemu-tdx
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        alphacompute.ai/role: verifier
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: alpha-kms
+      containers:
+        - name: alpha-kms
+          image: ${KMS_IMAGE}                # ghcr.io/alphacompute/alpha-kms@sha256:...
+          env:
+            # The quote from the CoCo attestation agent in this pod VM; the init-data below.
+            - name: ALPHACOMPUTE_QUOTE_SOURCE
+              value: "coco-aa"
+            # The nodes a sealed node walks to join: these two by their stable names and, during
+            # the migration, the prototype nodes. A name is resolved by the host's DNS, which is
+            # harmless: the join pins the KMS CA and kms_revisions.
+            - name: ALPHACOMPUTE_KMS_ENDPOINTS
+              value: "${KMS_NODE_ENDPOINTS}"
+            - name: ALPHACOMPUTE_DATABASE_URL
+              value: "${DATABASE_URL}"
+            - name: ALPHACOMPUTE_PCCS_URL
+              value: "${PCCS_URL}"
+            - name: ALPHACOMPUTE_PLATFORM_DOCUMENT_URL
+              value: "${PLATFORM_DOCUMENT_URL}"
+          ports:
+            - name: https
+              containerPort: 8443
+          # HTTPS from the kubelet, no exec (the agent policy refuses exec). /ready is 503 while
+          # sealed, so a sealed node gets no traffic through the alpha-kms Service.
+          readinessProbe:
+            httpGet: { path: /ready, port: 8443, scheme: HTTPS }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8443, scheme: HTTPS }
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            # The pod VM is sized from these (Kata's static sandbox sizing on TDX).
+            requests:
+              cpu: "${KMS_VCPUS}"
+              memory: "${KMS_MEMORY_MIB}Mi"
+            limits:
+              cpu: "${KMS_VCPUS}"
+              memory: "${KMS_MEMORY_MIB}Mi"
+          volumeMounts:
+            - { name: pod-initdata, mountPath: /run/alpha-pod, readOnly: true }
+      volumes:
+        # The pod's own init-data, which the node sends with its evidence. The host could put
+        # anything here; whoever appraises the node refuses any init-data that is not the digest
+        # in MRCONFIGID.
+        - name: pod-initdata
+          downwardAPI:
+            items:
+              - path: cc_init_data
+                fieldRef:
+                  fieldPath: metadata.annotations['io.katacontainers.config.hypervisor.cc_init_data']
+---
+# Every node by name, sealed ones included, so a custodian can reach the node it bootstraps or
+# unseals and a starting node can find the serving one.
+apiVersion: v1
+kind: Service
+metadata:
+  name: alpha-kms-nodes
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: alpha-kms
+  ports:
+    - { name: https, port: 8443, targetPort: https }
+---
+# The serving nodes only. Clients pin the KMS CA and the listed Revisions, never this name.
+apiVersion: v1
+kind: Service
+metadata:
+  name: alpha-kms
+spec:
+  selector:
+    app.kubernetes.io/name: alpha-kms
+  ports:
+    - { name: https, port: 8443, targetPort: https }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: alpha-kms
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: alpha-kms
