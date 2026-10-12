@@ -9,10 +9,10 @@ use alpha_cli::call::Route;
 use alpha_cli::deploy::{Shroud, wrap};
 use alpha_cli::keyfile::{self, Algorithm};
 use alpha_cli::request::Call;
-use alpha_cli::{coco, instances, node, sign};
+use alpha_cli::{instances, node, sign};
 use alpha_client::platform::SignedDocument;
 use alpha_client::{Client, Pin};
-use alpha_core::{AppId, InitData, KeyId, OrgId, PrincipalId};
+use alpha_core::{AppId, KeyId, OrgId, PrincipalId};
 use alpha_crypto::PublicKey;
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
@@ -49,7 +49,7 @@ struct Config {
         long,
         global = true,
         env = "ALPHACOMPUTE_PCCS_URL",
-        default_value = "https://api.trustedservices.intel.com"
+        default_value = "https://pccs.phala.network"
     )]
     pccs_url: String,
     #[arg(long, global = true, env = "ALPHACOMPUTE_SHROUD_URL")]
@@ -114,23 +114,13 @@ enum Command {
         #[arg(long, default_value = "root key")]
         label: String,
     },
-    /// Add one release signature to a platform document or its artifact, or check an artifact.
+    /// Sign a platform document with the release key, or check a signed artifact.
     Sign {
         #[arg(long, conflicts_with = "check", required_unless_present = "check")]
         release_key: Option<PathBuf>,
-        /// Verify with the compiled-in key set and print version, CA SPKI hash and Revisions.
+        /// Verify with the compiled-in key and print version, CA SPKI hash and Revisions.
         #[arg(long)]
         check: bool,
-        /// The published artifact this version replaces; the changes against it are shown on
-        /// stderr before the passphrase is asked.
-        #[arg(long, conflicts_with = "check")]
-        previous: Option<PathBuf>,
-        /// A dstack node's `app-compose.json`; one per such `kms_revisions` entry.
-        #[arg(long, conflicts_with = "check")]
-        compose: Vec<PathBuf>,
-        /// A Kata node's init-data TOML; one per such `kms_revisions` entry.
-        #[arg(long, conflicts_with = "check")]
-        init_data: Vec<PathBuf>,
         document: PathBuf,
     },
     /// Tenant YAML, or the output of `alpha compose wrap` → Revision → shroud-go deploy.
@@ -164,11 +154,6 @@ enum Command {
         #[command(subcommand)]
         command: ComposeCommand,
     },
-    /// A tenant's Kata pod spec as a Revision.
-    Coco {
-        #[command(subcommand)]
-        command: CocoCommand,
-    },
     /// Catalog entries signed with the catalog key.
     Catalog {
         #[command(subcommand)]
@@ -200,23 +185,6 @@ enum Command {
         method: reqwest::Method,
         path: String,
     },
-    /// Check an Endpoint against the platform document: an App's Instance by its leaf from the
-    /// KMS CA, or a KMS node by fresh evidence. Exits non-zero on any failed check.
-    Verify {
-        #[arg(
-            long,
-            conflicts_with = "kms_node",
-            required_unless_present = "kms_node"
-        )]
-        app: Option<AppId>,
-        /// The Revision v2 the tenant signed: it must be the leaf's Revision and pass the
-        /// document's `kata_policy`.
-        #[arg(long, requires = "app")]
-        init_data: Option<PathBuf>,
-        #[arg(long)]
-        kms_node: bool,
-        url: String,
-    },
     /// Hand one custodian's share to an attested sealed node.
     Unseal {
         #[arg(long)]
@@ -227,17 +195,43 @@ enum Command {
         #[arg(long)]
         endpoint: String,
     },
+    /// What the KMS decided about the organization's Instances (PRD-06).
+    Evidence {
+        #[command(subcommand)]
+        command: EvidenceCommand,
+    },
     /// Genesis on an empty database: three custodian public keys.
     Bootstrap {
         /// Three files, each holding a custodian's public key as `keygen --custodian` printed it.
         #[arg(long, value_delimiter = ',', num_args = 3)]
         custodians: Vec<PathBuf>,
-        /// A file holding the node login role's one-time genesis password. A Kata node needs it
-        /// (sealed to the node like the rest of the body) and replaces it with one only nodes know.
-        #[arg(long)]
-        database_password_file: Option<PathBuf>,
         #[arg(long)]
         endpoint: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum EvidenceCommand {
+    /// Export the organization's attest, secret.get and key.derive audit rows, signed by the
+    /// KMS node; prints the answer once its receipt verifies against the platform document.
+    Decisions {
+        /// Any active key of the organization.
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        key_id: KeyId,
+        /// Rows after this audit sequence number; the answer's `next_after_seq` continues.
+        #[arg(long, default_value_t = 0)]
+        after_seq: i64,
+        #[arg(long, default_value_t = 500)]
+        limit: i64,
+    },
+    /// Check an exported answer offline, as an auditor would: prints what the KMS signed.
+    VerifyDecisions {
+        /// The signed platform document, as `alpha sign --check` reads it.
+        #[arg(long)]
+        platform: PathBuf,
+        reply: PathBuf,
     },
 }
 
@@ -249,7 +243,7 @@ enum ComposeCommand {
         #[arg(long)]
         app_id: AppId,
         /// The signed platform document, as `alpha sign --check` reads it; the KMS pins come from
-        /// it once it verifies under the compiled-in release key set.
+        /// it once it verifies under the compiled-in release key.
         #[arg(long)]
         platform: PathBuf,
         /// The `alpha-runtime` image, pinned as `<image>@sha256:<digest>`.
@@ -259,55 +253,6 @@ enum ComposeCommand {
         #[arg(long)]
         no_resolve: bool,
         compose: PathBuf,
-    },
-}
-
-#[derive(Subcommand)]
-enum CocoCommand {
-    /// Writes the spec with its pod's init-data annotation to `--out` and prints
-    /// `{revision, init_data, annotation, rules_sha256, policy_data_sha256}`.
-    Render {
-        #[arg(long)]
-        app_id: AppId,
-        /// `opt/kata` of the extracted kata-tools-static-4.0.0-amd64.tar.zst: genpolicy, its
-        /// rules and settings, each checked against its release digest.
-        #[arg(long)]
-        kata: PathBuf,
-        #[arg(long)]
-        out: PathBuf,
-        /// A Pod, or a StatefulSet or Deployment rendered for its pod template, whose images are all pinned
-        /// `@sha256:` and whose supplementalGroups are explicit.
-        pod: PathBuf,
-    },
-    /// Prints `{mrtd, rtmr1, rtmr2}` of a Kata TD booting these artifacts, for the platform
-    /// document's Kata reference values. RTMR0 depends on the VM shape and is captured instead.
-    Measure {
-        /// The TDVF image, `share/ovmf/OVMF.inteltdx.fd` of the kata-static tarball.
-        #[arg(long)]
-        firmware: PathBuf,
-        /// The runtime class's `kernel`, e.g. `share/kata-containers/vmlinuz-6.18.35-200`.
-        #[arg(long)]
-        kernel: PathBuf,
-        /// The guest command line exactly as Kata passes it to QEMU's `-append`.
-        #[arg(long)]
-        cmdline: String,
-    },
-    /// Prints the platform document's `GpuReference` for the GPU that signed this evidence: its
-    /// identity and FWID as it reports them, each measurement block as NVIDIA's signed RIMs list
-    /// it. Refuses unless both RIMs verify to NVIDIA's RIM root and list every block it reports.
-    GpuReference {
-        /// The SPDM GET_MEASUREMENTS request and signed response, as NVML returns them.
-        #[arg(long)]
-        evidence: PathBuf,
-        /// The device certificate chain in PEM, leaf first, as NVML returns it.
-        #[arg(long)]
-        certificate_chain: PathBuf,
-        /// The XML of `NV_GPU_CC_DRIVER_<chip>_<driver version>` from NVIDIA's RIM service.
-        #[arg(long)]
-        driver_rim: PathBuf,
-        /// The XML of `NV_GPU_VBIOS_<project>_<project SKU>_<chip SKU>_<VBIOS version>`.
-        #[arg(long)]
-        vbios_rim: PathBuf,
     },
 }
 
@@ -398,12 +343,8 @@ fn passphrase(prompt: &str) -> Result<Vec<u8>, Exit> {
         .map_err(|e| Exit::Refused(format!("passphrase: {e}")))
 }
 
-fn read_file(path: &Path) -> Result<Vec<u8>, Exit> {
-    fs::read(path).map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))
-}
-
 fn read_json(path: &Path) -> Result<Value, Exit> {
-    let text = read_file(path)?;
+    let text = fs::read(path).map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))?;
     serde_json::from_slice(&text).map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))
 }
 
@@ -422,11 +363,7 @@ async fn platform_document(config: &Config, now: SystemTime) -> Result<PlatformD
         config.platform_document_url.as_deref(),
         "platform-document-url",
     )?;
-    let signed = alpha_client::platform::fetch_signed(url).await?;
-    let doc = alpha_client::platform::verify(&signed, &alpha_cli::release_keys()?, now)?;
-    let state = alpha_cli::platform::state_file()?;
-    alpha_cli::platform::remember(&state, url, &signed.document, doc.version)?;
-    Ok(doc)
+    Ok(alpha_client::platform::fetch(url, &alpha_cli::release_key()?, now).await?)
 }
 
 /// The admin's pin: `kms_ca_pem` of the platform document fetched and verified now.
@@ -511,40 +448,17 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
         Command::Sign {
             release_key,
             check,
-            previous,
-            compose,
-            init_data,
             document,
         } => {
             let document = read_json(&document)?;
             if check {
                 let artifact: SignedDocument = serde_json::from_value(document)
                     .map_err(|e| Exit::Refused(format!("artifact: {e}")))?;
-                let summary = sign::check(&artifact, &alpha_cli::release_keys()?, now)?;
+                let summary = sign::check(&artifact, &alpha_cli::release_key()?, now)?;
                 return Ok(json!(summary));
             }
-            let read = |paths: Vec<PathBuf>| {
-                paths
-                    .iter()
-                    .map(|p| {
-                        fs::read_to_string(p)
-                            .map_err(|e| Exit::Usage(format!("{}: {e}", p.display())))
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            };
-            let (compose, init_data) = (read(compose)?, read(init_data)?);
-            let previous = match previous {
-                Some(path) => Some(sign::artifact(read_json(&path)?)?),
-                None => None,
-            };
-            let keys = alpha_cli::release_keys()?;
-            let artifact = sign::artifact(document)?;
-            let changes = sign::diff(previous.as_ref(), &artifact.document, &keys, now)?;
-            eprintln!("changes against the previous version:\n{changes}");
             let key = read_ed25519(&need(release_key, "release-key")?)?;
-            Ok(json!(sign::sign(
-                artifact, &key, &keys, &compose, &init_data
-            )?))
+            Ok(json!(sign::sign(document, &key)?))
         }
         Command::Deploy {
             register_only,
@@ -611,7 +525,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let artifact: SignedDocument = serde_json::from_value(read_json(&platform)?)
                 .map_err(|e| Exit::Refused(format!("artifact: {e}")))?;
             let runtime =
-                wrap::runtime(&artifact, &alpha_cli::release_keys()?, now, &runtime_image)?;
+                wrap::runtime(&artifact, &alpha_cli::release_key()?, now, &runtime_image)?;
             let digests = if no_resolve {
                 BTreeMap::new()
             } else {
@@ -621,58 +535,6 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 wrap::resolve_all(&http, &plain).await?
             };
             Ok(json!(wrap::wrap(plain, &digests, app_id, &runtime)?))
-        }
-        Command::Coco {
-            command:
-                CocoCommand::Render {
-                    app_id,
-                    kata,
-                    out,
-                    pod,
-                },
-        } => {
-            let bytes =
-                fs::read(&pod).map_err(|e| Exit::Usage(format!("{}: {e}", pod.display())))?;
-            let pod = coco::parse(&bytes)?;
-            let policy = coco::Kata::read(&kata)?.genpolicy(&pod)?;
-            let rendered = coco::render(pod, app_id, &policy)?;
-            fs::write(&out, &rendered.pod)
-                .map_err(|e| Exit::Refused(format!("{}: {e}", out.display())))?;
-            Ok(json!(rendered))
-        }
-        Command::Coco {
-            command:
-                CocoCommand::Measure {
-                    firmware,
-                    kernel,
-                    cmdline,
-                },
-        } => Ok(json!({
-            "mrtd": coco::measure::mrtd(&read_file(&firmware)?)?,
-            "rtmr1": coco::measure::rtmr1(&read_file(&kernel)?)?,
-            "rtmr2": coco::measure::rtmr2(&cmdline),
-        })),
-        Command::Coco {
-            command:
-                CocoCommand::GpuReference {
-                    evidence,
-                    certificate_chain,
-                    driver_rim,
-                    vbios_rim,
-                },
-        } => {
-            let evidence = alpha_attest::GpuEvidence {
-                evidence: read_file(&evidence)?,
-                certificate_chain: read_file(&certificate_chain)?,
-            };
-            let reference = alpha_attest::gpu_reference(
-                &evidence,
-                &read_file(&driver_rim)?,
-                &read_file(&vbios_rim)?,
-                SystemTime::now(),
-            )
-            .map_err(|e| e.to_string())?;
-            Ok(json!(reference))
         }
         Command::Catalog {
             command:
@@ -769,28 +631,6 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             }
             Ok(out)
         }
-        Command::Verify {
-            app,
-            init_data,
-            kms_node: _,
-            url,
-        } => {
-            let init_data = init_data
-                .map(|path| {
-                    fs::read_to_string(&path)
-                        .map_err(|e| e.to_string())
-                        .and_then(|text| InitData::parse(text).map_err(|e| e.to_string()))
-                        .map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))
-                })
-                .transpose()?;
-            let doc = platform_document(config, now).await?;
-            Ok(match app {
-                Some(app) => {
-                    alpha_cli::verify::instance(&url, app, init_data.as_ref(), &doc).await?
-                }
-                None => alpha_cli::verify::kms_node(&url, &config.pccs_url, &doc, now).await?,
-            })
-        }
         Command::Unseal {
             share,
             key,
@@ -805,21 +645,47 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let reply = node::unseal(&client, &identity, &share, &custodian, doc.version).await?;
             Ok(json!(reply))
         }
+        Command::Evidence {
+            command:
+                EvidenceCommand::Decisions {
+                    key,
+                    key_id,
+                    after_seq,
+                    limit,
+                },
+        } => {
+            let key = read_ed25519(&key)?;
+            let (client, doc) = admin_client_and_document(config, now).await?;
+            let payload = json!({
+                "after_seq": after_seq,
+                "limit": limit,
+                "issued_at": alpha_cli::rfc3339(now),
+            });
+            let signed =
+                alpha_client::sign(alpha_core::context::DECISIONS_EXPORT, payload, key_id, &key)?;
+            let reply = client.export_decisions(&signed).await?;
+            let bytes =
+                serde_json::to_vec(&reply).map_err(|e| Exit::Refused(format!("decisions: {e}")))?;
+            let revisions: Vec<_> = doc.kms_revisions.iter().map(|r| r.compose_hash).collect();
+            alpha_client::decisions::verify(&bytes, &doc.kms_ca_pem, &revisions)?;
+            Ok(reply)
+        }
+        Command::Evidence {
+            command: EvidenceCommand::VerifyDecisions { platform, reply },
+        } => {
+            let artifact: SignedDocument = serde_json::from_value(read_json(&platform)?)
+                .map_err(|e| Exit::Refused(format!("artifact: {e}")))?;
+            let doc = alpha_client::platform::verify(&artifact, &alpha_cli::release_key()?, now)?;
+            let bytes =
+                fs::read(&reply).map_err(|e| Exit::Usage(format!("{}: {e}", reply.display())))?;
+            let revisions: Vec<_> = doc.kms_revisions.iter().map(|r| r.compose_hash).collect();
+            let signed = alpha_client::decisions::verify(&bytes, &doc.kms_ca_pem, &revisions)?;
+            Ok(json!(signed))
+        }
         Command::Bootstrap {
             custodians,
-            database_password_file,
             endpoint,
         } => {
-            let database_password = database_password_file
-                .map(|path| {
-                    let text = fs::read_to_string(&path)
-                        .map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))?;
-                    match text.trim() {
-                        "" => Err(Exit::Usage(format!("{}: empty", path.display()))),
-                        password => Ok(password.to_owned()),
-                    }
-                })
-                .transpose()?;
             let mut keys = Vec::new();
             for path in &custodians {
                 let text = fs::read_to_string(path)
@@ -838,15 +704,10 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let doc = platform_document(config, now).await?;
             let (identity, client) =
                 node::attested_node(&endpoint, &config.pccs_url, &doc, None, now).await?;
-            Ok(node::bootstrap(
-                &client,
-                &identity,
-                custodians,
-                database_password,
-                doc.version,
-                Path::new("."),
+            Ok(
+                node::bootstrap(&client, &identity, custodians, doc.version, Path::new("."))
+                    .await?,
             )
-            .await?)
         }
     }
 }

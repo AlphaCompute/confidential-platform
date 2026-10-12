@@ -12,20 +12,21 @@
 use serde::{Deserialize, Serialize};
 
 pub mod catalog;
+pub mod coco;
 pub mod compose;
 pub mod id;
-pub mod initdata;
 pub mod phala;
 pub mod platform;
+pub mod principal;
 pub mod signing;
 
 pub use compose::{
     ComposeHash, ParseComposeHashError, RegistrationError, check_registration, compose_hash,
-    has_sha256_digest, hex_bytes,
+    hex_bytes,
 };
 pub use id::{AppId, KeyId, OrgId, PrincipalId, RequestId, SecretId};
-pub use initdata::{InitData, InitDataError, MAX_INIT_DATA};
-pub use platform::{CatalogKey, KataPolicy, KmsRevision, Signer};
+pub use platform::{CatalogKey, KmsRevision, Signer};
+pub use principal::KeyKind;
 pub use signing::{context, jcs, parse, signing_digest};
 
 /// `{algorithm, signature}`, the signature in base64url.
@@ -47,11 +48,6 @@ pub fn is_key_purpose(purpose: &str) -> bool {
 pub fn is_secret_name(name: &str) -> bool {
     is_segment(name, 101)
 }
-
-/// A put carries a Secret's value after this many random bytes and commits to both in
-/// `content_sha256`, so the signed document stored beside the ciphertext does not let a reader
-/// of the database test guesses of a weak value against it.
-pub const SECRET_SALT_LEN: usize = 32;
 
 fn is_segment(name: &str, max: usize) -> bool {
     let bytes = name.as_bytes();

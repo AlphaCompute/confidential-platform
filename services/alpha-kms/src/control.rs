@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use alpha_core::{AppId, ComposeHash, KataPolicy, KeyId, OrgId, PrincipalId, SecretId, context};
+use alpha_core::{AppId, ComposeHash, KeyId, KeyKind, OrgId, PrincipalId, SecretId, context};
 use axum::Json;
 use axum::extract::{Path, State};
 use base64::Engine;
@@ -48,19 +48,22 @@ pub struct PutBody {
 
 const ISSUED_AT_WINDOW: Duration = Duration::minutes(5);
 
-fn within_window(at: DateTime<Utc>, now: DateTime<Utc>) -> Result<DateTime<Utc>, ApiError> {
+pub(crate) fn within_window(
+    at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>, ApiError> {
     if at.signed_duration_since(now).abs() > ISSUED_AT_WINDOW {
         return Err(ApiError::malformed("issued_at is outside ±5 minutes"));
     }
     Ok(at)
 }
 
-fn payload<T: serde::de::DeserializeOwned>(value: &Value) -> Result<T, ApiError> {
+pub(crate) fn payload<T: serde::de::DeserializeOwned>(value: &Value) -> Result<T, ApiError> {
     serde_json::from_value(value.clone()).map_err(|e| ApiError::malformed(format!("payload: {e}")))
 }
 
 /// The signer must be active with a chain to the anchor; the signature covers `payload`.
-async fn authorize(
+pub(crate) async fn authorize(
     node: &Node,
     keys: &Intermediates,
     ctx: &str,
@@ -108,7 +111,7 @@ async fn audited(
     Ok(())
 }
 
-async fn denied(node: &Node, key_id: Option<KeyId>, action: &str, error: &ApiError) {
+pub(crate) async fn denied(node: &Node, key_id: Option<KeyId>, action: &str, error: &ApiError) {
     let actor = key_id.map_or_else(|| "unregistered".to_owned(), |k| k.to_string());
     let _ = Audit {
         actor_kind: "principal",
@@ -124,7 +127,7 @@ async fn denied(node: &Node, key_id: Option<KeyId>, action: &str, error: &ApiErr
     .await;
 }
 
-fn receipted(
+pub(crate) fn receipted(
     node: &Node,
     route: &str,
     request: &Value,
@@ -171,74 +174,14 @@ struct RevisionPayload {
     compose: String,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InitDataRevisionPayload {
-    app_id: AppId,
-    init_data: String,
-    digest: ComposeHash,
-}
-
-/// A compose Revision or a Kata init-data Revision, as the `revisions` row holds it: digest, App,
-/// compose, init-data.
-fn revision_payload(
-    value: &Value,
-    kata_policy: Option<&KataPolicy>,
-) -> Result<(ComposeHash, AppId, Option<String>, Option<String>), ApiError> {
-    if value.get("init_data").is_none() {
-        let p: RevisionPayload = payload(value)?;
-        let hash = alpha_core::check_registration(&p.compose, p.app_id)?;
-        return Ok((hash, p.app_id, Some(p.compose), None));
-    }
-    let p: InitDataRevisionPayload = payload(value)?;
-    let init_data = alpha_core::InitData::parse(p.init_data.clone())
-        .map_err(|e| ApiError::malformed(e.to_string()))?;
-    if init_data.app_id() != Some(p.app_id) {
-        return Err(ApiError::malformed(format!(
-            "init-data [data] app_id is not the app_id {}",
-            p.app_id
-        )));
-    }
-    let digest = init_data.digest();
-    if digest != p.digest {
-        return Err(ApiError::malformed(format!(
-            "digest is not the init-data's {digest}"
-        )));
-    }
-    check_kata_policy(&init_data, kata_policy, "malformed")?;
-    Ok((digest, p.app_id, None, Some(p.init_data)))
-}
-
-/// An init-data passes only under the agent policy the current platform document pins, at
-/// registration and again on every attestation, so a Revision stored under an earlier pin, or
-/// before any, gets no leaf once the pin moves. `miss` is the code for a policy off the pin; no
-/// pin at all is always `policy_denied`.
-pub(crate) fn check_kata_policy(
-    init_data: &alpha_core::InitData,
-    kata_policy: Option<&KataPolicy>,
-    miss: &'static str,
-) -> Result<(), ApiError> {
-    let pinned = kata_policy.ok_or_else(|| {
-        ApiError::new(
-            "policy_denied",
-            "the platform document pins no Kata agent policy",
-        )
-    })?;
-    init_data
-        .check_policy(pinned)
-        .map_err(|e| ApiError::new(miss, e.to_string()))
-}
-
 pub async fn register_revision(
     State(node): State<Arc<Node>>,
     Body(body, request): Body<Signed>,
 ) -> Result<Json<Value>, ApiError> {
     audited_route!(node, body, request, "revision.register", async {
         let keys = node.intermediates()?;
-        let doc = node.platform_document();
-        let kata_policy = doc.as_deref().and_then(|d| d.kata_policy.as_ref());
-        let (compose_hash, app_id, compose, init_data) =
-            revision_payload(&body.payload, kata_policy)?;
+        let p: RevisionPayload = payload(&body.payload)?;
+        let compose_hash = alpha_core::check_registration(&p.compose, p.app_id)?;
         let chain = authorize(&node, &keys, context::REVISION, &body, node.now_utc()).await?;
         let org_id = chain.key.org_id;
         let mut tx = node.pool.begin().await?;
@@ -255,13 +198,13 @@ pub async fn register_revision(
         }
         sqlx::query!(
             "select pg_advisory_xact_lock(hashtext($1))",
-            app_id.to_string()
+            p.app_id.to_string()
         )
         .execute(&mut *tx)
         .await?;
         let other_org = sqlx::query_scalar!(
             "select exists(select 1 from revisions where app_id = $1 and org_id <> $2)",
-            Uuid::from(app_id),
+            Uuid::from(p.app_id),
             org_id
         )
         .fetch_one(&mut *tx)
@@ -270,13 +213,12 @@ pub async fn register_revision(
             return Err(ApiError::not_found("app belongs to another organization"));
         }
         let created_at = sqlx::query_scalar!(
-            "insert into revisions (compose_hash, app_id, org_id, compose, init_data, created_by_key, signature)
-             values ($1, $2, $3, $4, $5, $6, $7) returning created_at",
+            "insert into revisions (compose_hash, app_id, org_id, compose, created_by_key, signature)
+             values ($1, $2, $3, $4, $5, $6) returning created_at",
             compose_hash.as_bytes().as_slice(),
-            Uuid::from(app_id),
+            Uuid::from(p.app_id),
             org_id,
-            compose,
-            init_data,
+            p.compose,
             chain.key.id,
             json!(body.signature),
         )
@@ -287,13 +229,13 @@ pub async fn register_revision(
             &chain,
             "revision.register",
             format!("revision:{compose_hash}"),
-            json!({ "app_id": app_id }),
+            json!({ "app_id": p.app_id }),
         )
         .await?;
         tx.commit().await?;
         Ok(revision_json(
             compose_hash,
-            app_id.into(),
+            p.app_id.into(),
             org_id,
             created_at,
         ))
@@ -433,11 +375,6 @@ pub async fn put_secret(
             .strip_prefix("sha256:")
             .and_then(alpha_core::hex_bytes)
             .ok_or_else(|| ApiError::malformed("content_sha256: expected sha256:<hex>"))?;
-        if value.len() < alpha_core::SECRET_SALT_LEN {
-            return Err(ApiError::malformed(
-                "value: expected the salt before the value",
-            ));
-        }
         if Sha256::digest(&value).as_slice() != content_sha256 {
             return Err(ApiError::malformed("content_sha256 does not match value"));
         }
@@ -489,7 +426,7 @@ pub async fn put_secret(
             None => SecretId::mint().into(),
         };
         let org_key = keys::org_key(&keys.tenant_kek_root, org_id.into(), &chain.anchor_spki)?;
-        let ciphertext = keys::aead_seal(&org_key, &keys::secret_aad(id, &body.payload)?, &value)?;
+        let ciphertext = keys::aead_seal(&org_key, id.as_bytes(), &value)?;
         sqlx::query!(
             "insert into secrets (id, org_id, name, app_ids, ciphertext, content_sha256, document, signed_by_key, signature, issued_at)
              values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
@@ -532,6 +469,9 @@ struct KeyPayload {
     #[allow(dead_code)]
     label: String,
     issued_at: DateTime<Utc>,
+    /// PRD-06 Q88: `auditor` registers a read-only key; absent, a member key.
+    #[serde(default)]
+    kind: KeyKind,
 }
 
 /// The degenerate registration: the organization's own identifier, because the signer is not in
@@ -620,13 +560,13 @@ async fn register_endorsed_key(
         &chain,
         "key.register",
         format!("key:{id}"),
-        json!({ "principal_id": p.principal_id }),
+        json!({ "principal_id": p.principal_id, "kind": p.kind }),
     )
     .await?;
     tx.commit().await?;
     Ok(json!({
         "id": id, "principal_id": p.principal_id, "org_id": chain.key.org_id,
-        "created_at": rfc3339(created_at),
+        "kind": p.kind, "created_at": rfc3339(created_at),
     }))
 }
 

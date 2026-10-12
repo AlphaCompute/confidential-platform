@@ -235,6 +235,10 @@ pub struct KeyRegistered {
     /// learns whose root key holds its identifier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
+    /// A delegated key's kind (PRD-06 Q88): `member`, or `auditor` for a read-only key. A root
+    /// key registration does not name one; a root key is a member key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<alpha_core::KeyKind>,
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipt: Option<Value>,
