@@ -112,19 +112,19 @@ one view of this page another origin may frame:
 
 Still open (draft):
 
-- QUESTION(PRD-03 Q14), Rafay: the portal origins, and whether the portal can frame a page of
+- QUESTION(PRD-03 Q75), Rafay: the portal origins, and whether the portal can frame a page of
   another origin at all (an iframe extension point, its `sandbox` flags: the view needs
   `allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox`).
-- QUESTION(PRD-03 Q15), Ryan Tharp: security sign-off on framing an approval view.
-- QUESTION(PRD-03 Q16), Christopher Freytes and the exec sponsor: whether a window of our own
+- QUESTION(PRD-03 Q76), Ryan Tharp: security sign-off on framing an approval view.
+- QUESTION(PRD-03 Q77), Christopher Freytes and the exec sponsor: whether a window of our own
   meets "tenants never leave their portal", or the passkey prompt must run in the frame
   (`publickey-credentials-get` delegated to the portal; proposed: no).
-- QUESTION(PRD-03 Q17), Ryan Tharp: whether Firefox, without `ancestorOrigins`, may rely on
+- QUESTION(PRD-03 Q78), Ryan Tharp: whether Firefox, without `ancestorOrigins`, may rely on
   `frame-ancestors` alone (proposed: yes; it is the browser's own enforcement).
 - TODO(draft): shroud-go serves `/sign/embed` with `headers-embed` filled from the document it
   serves; until it does, the path is not served and nothing can frame the view.
 - TODO(draft): the rafay-plugins adapter shows only `approval_url`; how the portal learns the
-  embed URL (the same ticket under `/sign/embed`) waits on Q14.
+  embed URL (the same ticket under `/sign/embed`) waits on Q75.
 - TODO(draft): if the portal sends `Cross-Origin-Embedder-Policy: require-corp`, the view needs
   `Cross-Origin-Resource-Policy: cross-origin` on `/sign/embed` only.
 
