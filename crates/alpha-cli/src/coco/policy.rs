@@ -54,7 +54,7 @@ const DATA_PREFIX: &str = "\npolicy_data := ";
 /// `ALPHACOMPUTE_KMS_ENDPOINTS` comes from the namespace's `alpha-kms` ConfigMap, not the policy:
 /// the endpoints are only where to connect, since the runtime pins the KMS CA and Revisions. The
 /// policy admits the variable only as a list of `https://host[:port]` (the `40-` drop-in).
-pub const KMS_ENDPOINTS_ENV_REGEX: &str = "^ALPHACOMPUTE_KMS_ENDPOINTS=https://[a-z0-9.-]{1,253}(:[0-9]{1,5})?(,https://[a-z0-9.-]{1,253}(:[0-9]{1,5})?){0,7}$";
+pub const KMS_ENDPOINTS_ENV_REGEX: &str = "^ALPHACOMPUTE_KMS_ENDPOINTS=https://[a-z0-9.-]{1,253}(:[1-9][0-9]{0,3}|:[1-5][0-9]{4}|:6[0-4][0-9]{3}|:65[0-4][0-9]{2}|:655[0-2][0-9]|:6553[0-5])?(,https://[a-z0-9.-]{1,253}(:[1-9][0-9]{0,3}|:[1-5][0-9]{4}|:6[0-4][0-9]{3}|:65[0-4][0-9]{2}|:655[0-2][0-9]|:6553[0-5])?){0,7}$";
 /// The only environment variables the host may add to a container beyond those the policy
 /// lists: the pod's hostname, the API server's `KUBERNETES_*` (the baseline drop-in), and the KMS
 /// endpoints. Service links and the cloud identity variables genpolicy admits by default are not
