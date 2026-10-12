@@ -100,6 +100,7 @@ impl Pod {
                     certificate: vec![2],
                 })
                 .collect(),
+            nic: Vec::new(),
             initdata: self.initdata.clone().into_bytes(),
             runtime_class: self.class.into(),
         }
@@ -229,6 +230,7 @@ fn doc() -> PlatformDocument {
             nras_cc_mode: None,
         }),
         snp_policy: None,
+        dpu_policy: None,
     }
 }
 
@@ -1230,7 +1232,18 @@ mod snp_pods {
         let run = |doc: PlatformDocument, evidence: EvidenceV2| {
             let kds = &kds;
             async move {
-                appraise_kata_snp(&evidence, &NONCE, SPKI, None, &doc, kds, &[], real::now()).await
+                appraise_kata_snp(
+                    &evidence,
+                    &NONCE,
+                    SPKI,
+                    None,
+                    &doc,
+                    kds,
+                    &[],
+                    &[],
+                    real::now(),
+                )
+                .await
             }
         };
         refused(
@@ -1262,4 +1275,24 @@ mod snp_pods {
             "must carry its VCEK",
         );
     }
+}
+
+#[test]
+fn a_revision_that_expects_a_dpu_is_refused_without_one() {
+    let pod = Pod {
+        initdata: initdata_text(CPU_CLASS, POLICY, None).replacen(
+            &format!("\"app_id\":\"{APP}\","),
+            &format!("\"app_id\":\"{APP}\",\"dpu\":{{\"count\":1,\"model\":\"BLUEFIELD-3\"}},"),
+            1,
+        ),
+        ..Pod::cpu()
+    };
+    let cpu = appraise_kata_cpu(&pod.evidence(), pod.quote(), &NONCE, SPKI, None, &doc()).unwrap();
+    assert_eq!(cpu.dpu_shape().map(|d| d.count), Some(1));
+    // `finish` runs no DPU decision of its own, so it refuses rather than skip one.
+    refused(
+        cpu.finish(None, &pod.gpu_results()),
+        "attestation_unknown",
+        "no dpu_policy",
+    );
 }

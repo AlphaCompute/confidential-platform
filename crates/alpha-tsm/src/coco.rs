@@ -452,10 +452,21 @@ pub struct Source {
     pub initdata: Vec<u8>,
     pub runtime_class: String,
     pub gpu_count: usize,
+    /// NICs/DPUs the Revision expects attested.
+    pub dpu_count: usize,
 }
 
 impl Source {
     pub fn evidence(&self, report_data: &[u8; 64]) -> Result<EvidenceV2, Error> {
+        // ponytail: dpu-collect — a BlueField's signed measurements come from its BMC's Redfish
+        // (`ComponentIntegrity.SPDMGetSignedMeasurements` over `dpu_nonce`), which a pod cannot
+        // reach today; the collector and its path are designed in docs/dpu-attestation.md.
+        if self.dpu_count != 0 {
+            return Err(Error::Agent(format!(
+                "the Revision expects {} NIC/DPU attestations, and DPU evidence collection is not built",
+                self.dpu_count
+            )));
+        }
         let tee = RuntimeClass::from_name(&self.runtime_class)
             .map(RuntimeClass::tee)
             .ok_or_else(|| {
@@ -502,6 +513,7 @@ impl Source {
             format: EVIDENCE_FORMAT_V2.into(),
             cpu,
             gpus,
+            nic: Vec::new(),
             initdata: self.initdata.clone(),
             runtime_class: self.runtime_class.clone(),
         })
@@ -853,6 +865,7 @@ mod tests {
             initdata: Vec::new(),
             runtime_class: alpha_core::coco::SNP_CPU_RUNTIME_CLASS.into(),
             gpu_count: 0,
+            dpu_count: 0,
         };
         let error = source(QuoteSource::AttestationAgent)
             .evidence(&[0; 64])
@@ -868,5 +881,14 @@ mod tests {
         unknown.runtime_class = "kata-qemu-sev".into();
         let error = unknown.evidence(&[0; 64]).unwrap_err().to_string();
         assert!(error.contains("not supported"), "{error}");
+        // A Revision that expects a DPU: no collector yet, so the pod fails before asking.
+        let mut dpu = source(QuoteSource::ConfigfsTsm);
+        dpu.runtime_class = alpha_core::coco::CPU_RUNTIME_CLASS.into();
+        dpu.dpu_count = 1;
+        let error = dpu.evidence(&[0; 64]).unwrap_err().to_string();
+        assert!(
+            error.contains("DPU evidence collection is not built"),
+            "{error}"
+        );
     }
 }

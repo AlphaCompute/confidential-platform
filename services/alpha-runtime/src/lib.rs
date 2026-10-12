@@ -354,11 +354,17 @@ pub fn coco_identity(
         .as_ref()
         .map_or(Ok(0), |g| usize::try_from(g.count))
         .map_err(|_| Error::Evidence("gpu count".into()))?;
+    let dpu_count = revision
+        .dpu
+        .as_ref()
+        .map_or(Ok(0), |d| usize::try_from(d.count))
+        .map_err(|_| Error::Evidence("dpu count".into()))?;
     let source = alpha_tsm::coco::Source {
         quote,
         initdata: initdata.clone(),
         runtime_class: revision.runtime_class,
         gpu_count,
+        dpu_count,
     };
     Ok(CocoIdentity {
         initdata,

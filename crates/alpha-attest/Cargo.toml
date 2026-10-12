@@ -31,4 +31,6 @@ x509-cert = "=0.2.5"
 
 [dev-dependencies]
 chrono = { version = "0.4", default-features = false }
+p384 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 tokio = { version = "1", features = ["macros", "rt"] }
