@@ -177,4 +177,4 @@ Built in `docs/db-volume-key.md`: a `db-volume` intermediate under the root KEK,
 
 ## D10 (open)
 
-How the Kata KMS node authenticates to Postgres (a KMS-CA client certificate, or a password released after unseal) is Ryan Tharp's open decision. The node still connects with `ALPHACOMPUTE_DATABASE_URL`. `main.rs` marks the seam `ponytail: D10`. Either answer decides who may connect, not who may read: the rows are sealed either way.
+How the Kata KMS node authenticates to Postgres is Ryan Tharp's open decision D10; `docs/db-client-auth.md` drafts the proposed answer (a client certificate from a CA derived from the db-volume key, opt-in through `ALPHACOMPUTE_DATABASE_AUTH=client-cert`). By default the node still connects with `ALPHACOMPUTE_DATABASE_URL`. Either answer decides who may connect, not who may read: the rows are sealed either way.

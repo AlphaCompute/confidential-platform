@@ -1,8 +1,9 @@
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use alpha_kms::{CollateralSource, Config, Node, NodeGuest, node, platform, tls};
-use sqlx::postgres::PgPoolOptions;
+use alpha_kms::{CollateralSource, Config, Node, NodeGuest, db_auth, node, platform, tls};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tokio::net::TcpListener;
 
 /// The release key's public half; the private half is held by a person, never by CI.
@@ -21,17 +22,33 @@ async fn main() {
 }
 
 async fn run() -> Result<(), String> {
-    // ponytail: D10 — how a Kata KMS node authenticates to Postgres (a client certificate from the
-    // KMS CA, or a password released after unseal) is Ryan Tharp's open decision; until then the
-    // node connects with ALPHACOMPUTE_DATABASE_URL as before. The rows are sealed either way
-    // (`store`), so this decides who may connect, not who may read.
+    // D10 (draft, `alpha_kms::db_auth`): `ALPHACOMPUTE_DATABASE_AUTH=client-cert` connects with a
+    // client certificate from a CA derived from the db-volume key, so no password exists; `url`
+    // (the default) connects with ALPHACOMPUTE_DATABASE_URL as given, as the prototype nodes do.
+    // A Kata node refuses a URL with a password either way: its measured env is public (#87).
+    // The rows are sealed either way (`store`), so this decides who may connect, not who may read.
     let url = alpha_kms::env("ALPHACOMPUTE_DATABASE_URL")?;
+    let auth = db_auth::mode(std::env::var(db_auth::MODE_ENV).ok().as_deref())?;
+    let quote_source =
+        alpha_kms::quote_source(std::env::var("ALPHACOMPUTE_QUOTE_SOURCE").ok().as_deref())?;
+    db_auth::check_url(&url, auth, quote_source.is_some())?;
+    let connect = PgConnectOptions::from_str(&url).map_err(|e| format!("database: {e}"))?;
     let options = PgPoolOptions::new()
         .max_connections(8)
         .acquire_timeout(std::time::Duration::from_secs(10));
     if std::env::args().nth(1).as_deref() == Some("migrate") {
+        if auth == db_auth::Mode::ClientCert {
+            // TODO(draft): a migration needs a connection before any node holds the volume key.
+            // QUESTION(PRD-05 Q6): who runs migrations against the client-cert Postgres? Proposed:
+            // a serving node, at start_serving, under an advisory lock, so no separate credential
+            // exists; until then this refuses.
+            return Err(
+                "migrate: client-cert mode has no database credential before unseal (D10 draft)"
+                    .into(),
+            );
+        }
         let pool = options
-            .connect(&url)
+            .connect_with(connect)
             .await
             .map_err(|e| format!("database: {e}"))?;
         alpha_kms::migrate(&pool)
@@ -41,15 +58,11 @@ async fn run() -> Result<(), String> {
     }
     // Lazy: with M2(a) the database's volume opens only after custodians unseal this node and it
     // hands the Postgres pod its key, so the node starts, and answers the Node API, without it.
-    let pool = options
-        .connect_lazy(&url)
-        .map_err(|e| format!("database: {e}"))?;
+    let pool = options.connect_lazy_with(connect.clone());
     let release_key = alpha_core::hex_bytes::<32>(RELEASE_KEY_HEX.trim())
         .and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok())
         .ok_or("release-key.pub is not an Ed25519 public key")?;
-    let guest = match alpha_kms::quote_source(
-        std::env::var("ALPHACOMPUTE_QUOTE_SOURCE").ok().as_deref(),
-    )? {
+    let guest = match quote_source {
         None => {
             NodeGuest::prototype(alpha_tsm::event_log().map_err(|e| format!("event log: {e}"))?)?
         }
@@ -69,6 +82,9 @@ async fn run() -> Result<(), String> {
         guest,
         release_key,
     )?;
+    if auth == db_auth::Mode::ClientCert {
+        db_auth::enable(&node, connect);
+    }
     platform::start(&node).await;
     tokio::spawn(platform::run(node.clone()));
     start_phase(&node).await;

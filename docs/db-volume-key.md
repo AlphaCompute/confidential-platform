@@ -135,5 +135,5 @@ It then formats or opens LUKS2 exactly as `open` does: the header rules, the `av
 
 ## Not decided here
 
-- **D10.** How the KMS authenticates to Postgres is unchanged: the node connects with `ALPHACOMPUTE_DATABASE_URL`, at the `ponytail: D10` seam in `main.rs`. The volume key decides who can read the disk, not who can connect.
+- **D10.** The draft answer (`docs/db-client-auth.md`, `ALPHACOMPUTE_DATABASE_AUTH=client-cert`) derives a database client CA from this key, so a node can connect only once it holds it. The default is unchanged: the node connects with `ALPHACOMPUTE_DATABASE_URL`. The volume key decides who can read the disk; the derived CA, who can connect.
 - **Migration of an existing database** onto an encrypted volume is a dump and restore into a fresh pod: an operations step, not code.

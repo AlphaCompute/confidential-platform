@@ -13,6 +13,7 @@ Control bodies are signed `ed25519` or `webauthn-es256`, a passkey's WebAuthn as
 | Variable | Meaning |
 |---|---|
 | `ALPHACOMPUTE_DATABASE_URL` | Postgres 18; the service user is a member of the `alpha_kms` role the migration creates |
+| `ALPHACOMPUTE_DATABASE_AUTH` | D10 draft: unset or `url` connects with the URL as given (a Kata node refuses a URL with a password); `client-cert` connects as `alpha_kms_node` with a one-hour leaf from a CA derived from the db-volume key, server pinned to the same CA (`docs/db-client-auth.md`) |
 | `ALPHACOMPUTE_KMS_ENDPOINTS` | comma-separated `https://…` of the KMS nodes; walked on a sealed start to `join` |
 | `ALPHACOMPUTE_PCCS_URL` | PCCS for DCAP collateral, fetched per attestation |
 | `ALPHACOMPUTE_PLATFORM_DOCUMENT_URL` | the release-signed platform document, fetched on start and every five minutes |

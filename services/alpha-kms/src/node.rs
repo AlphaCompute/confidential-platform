@@ -94,6 +94,8 @@ pub async fn bootstrap(
     let wrapped_db = aead_seal(&root, DB_VOLUME.as_bytes(), db_volume.as_slice())?;
     let keys = Intermediates::new(tenant_kek_root, ca_key_der, ca_cert_der)?
         .with_db_volume(Some(db_volume.clone()));
+    // D10 (draft): in client-cert mode the node's database certificate comes from this new key.
+    crate::db_auth::install(&node, &db_volume)?;
     // With the database closed (M2(a) genesis: its volume key is made here), the rows wait in
     // memory until it opens; otherwise they are written before the shares leave.
     let kms_ca_pem = keys.ca_pem();
@@ -528,6 +530,7 @@ pub async fn join_request(
     nonce: String,
     endpoint: &str,
 ) -> Result<JoinRequest, ApiError> {
+    crate::db_auth::check_can_join(node)?;
     let raw = decode32("nonce", &nonce)?;
     node.audit(audit::node(
         "node.join.request",
@@ -568,6 +571,15 @@ pub async fn finish_join(node: &Node, reply: &JoinReply) -> Result<(), ApiError>
         .as_deref()
         .map(|text| DataKey::decode(&Zeroizing::new(field("data_key", text)?)))
         .transpose()?;
+    match &db_volume {
+        Some(key) => crate::db_auth::install(node, key)?,
+        None if crate::db_auth::client_cert_mode(node) => {
+            return Err(ApiError::internal(
+                "join reply: no db_volume_key, from which client-cert mode's certificate comes",
+            ));
+        }
+        None => {}
+    }
     let keys = Intermediates::new(
         tenant_kek_root,
         Zeroizing::new(field("ca_key", &reply.ca_key)?),

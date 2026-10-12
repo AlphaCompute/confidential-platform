@@ -18,6 +18,7 @@ pub mod channel;
 pub mod control;
 pub mod custodians;
 pub mod data_key;
+pub mod db_auth;
 pub mod db_volume;
 pub mod error;
 pub mod instance;
@@ -305,6 +306,8 @@ pub struct Node {
     /// The audit heads custodians' share files remembered, beside the shares collected so far;
     /// checked once the shares open the database, dropped with them otherwise.
     pub unseal_floors: Mutex<Vec<audit::Head>>,
+    /// D10 (draft): set in client-cert mode ([`db_auth`]); `None` connects with the URL as given.
+    pub db_auth: Mutex<Option<Arc<db_auth::ClientCert>>>,
     bucket: Mutex<(f64, Instant)>,
 }
 
@@ -358,6 +361,7 @@ impl Node {
             held_dropped: std::sync::atomic::AtomicU64::new(0),
             chain: audit::Watch::default(),
             unseal_floors: Mutex::new(Vec::new()),
+            db_auth: Mutex::new(None),
             bucket: Mutex::new((BUCKET_CAPACITY, Instant::now())),
         }))
     }

@@ -20,7 +20,8 @@
 //! intermediates. A joining node receives it in the join reply. Genesis with the database closed
 //! keeps the new intermediates in memory and writes them once the database answers.
 //!
-//! How the KMS authenticates to Postgres is not decided here (D10, `ponytail: D10` in `main.rs`).
+//! How the KMS authenticates to Postgres is D10; the draft answer, a client certificate from a CA
+//! derived from this key, is [`crate::db_auth`].
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -155,6 +156,24 @@ pub enum Entered {
 /// After custodians combined `root`: serve if the database answers; if it does not, and a share
 /// file carried the volume key, wait for it unsealed.
 pub async fn enter(node: &Arc<Node>, root: Zeroizing<[u8; 32]>) -> Result<Entered, ApiError> {
+    // D10 (draft): in client-cert mode the database's client certificate comes from the volume
+    // key, so the node must open it from a share file before it can even try the database.
+    if crate::db_auth::client_cert_mode(node) {
+        let wrapped = node
+            .unseal_extras
+            .lock()
+            .db_volume_wrapped
+            .clone()
+            .ok_or_else(|| {
+                ApiError::internal(
+                    "client-cert mode: no share file carried the db-volume key, from which the \
+                     database client certificate comes (D10)",
+                )
+            })?;
+        let key = open_key(&root, &wrapped)
+            .ok_or_else(|| ApiError::malformed("the shares do not open the db-volume key"))?;
+        crate::db_auth::install(node, &key)?;
+    }
     match reachable(node).await {
         Err(e) if unreachable(&e) => {
             let (wrapped, document_version) = {
@@ -232,6 +251,7 @@ async fn await_database(node: Arc<Node>) {
             Phase::Unsealed(unsealed) => unsealed.clone(),
             _ => return,
         };
+        crate::db_auth::renew_if_due(&node);
         if reachable(&node).await.is_err() {
             continue;
         }

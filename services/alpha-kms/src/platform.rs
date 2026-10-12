@@ -72,7 +72,10 @@ pub async fn apply(node: &Node, verified: Verified) -> Result<(), ApiError> {
         // A node waiting for its database (M2(a)) still needs the document to appraise the
         // Postgres pod: kept in memory only, never below the custodians' version
         // (`db_volume::Unsealed::min_document_version`), and stored at the first tick it opens.
-        Err(e) if crate::db_volume::unreachable(&e) => {
+        Err(e)
+            if crate::db_volume::unreachable(&e)
+                || crate::db_auth::refused_without_leaf(node, &e) =>
+        {
             remember(node, verified.document);
             return Err(ApiError::internal(format!(
                 "platform document version {version} in memory only: database: {e}"
@@ -171,6 +174,7 @@ pub async fn run(node: Arc<Node>) {
             eprintln!("platform document: {}", e.message);
         }
         renew_leaf(&node);
+        crate::db_auth::renew_if_due(&node);
         node.maintain().await;
     }
 }
