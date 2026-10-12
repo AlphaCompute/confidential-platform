@@ -138,6 +138,26 @@ At G0, on the first B300 in CC mode:
 
 If a required claim name differs on the B300, `nras::claims::REQUIRED` is the one place to change.
 
+## Malicious-host core suite
+
+`services/alpha-kms/tests/malicious_host.rs` (PRD-02 deliverable 7) runs what a hostile host can do to a Kata pod's attestation through the KMS, on Postgres 18 in CI's db-tests job (step `malicious-host core suite`). Each case attests over the quote a TD launched as the case describes would produce. Every case is refused with its reason, an `attest` audit row records exactly that refusal, no leaf is issued, and where the TD side fails no GPU backend is called.
+
+| The host | Refused with |
+|---|---|
+| swaps or edits the init-data after launch | `attestation_failed`: MRCONFIGID is not the digest of the init-data sent |
+| replays an exchange after its nonce expired, or uses a nonce another KMS minted | `nonce_invalid`: nonce is too old, or does not verify |
+| presents a quote over other `report_data`: an earlier nonce, or its own runtime key | `attestation_failed`: report_data is not bound to this key and nonce |
+| drops or adds a GPU | `attestation_failed`: `<n>` GPUs attested, the Revision expects 8 (before any backend call) |
+| presents one GPU's report twice, or a GPU of another model | `attestation_failed`: device … is reported for another GPU of this pod too; model … is not the Revision's |
+| presents GPU evidence bound to another nonce | `attestation_failed`: gpu `<i>`: report is not over this nonce |
+| passes a GPU in DevTools mode or with CC off | `policy_denied`: gpu `<i>`: not in CC mode |
+| uses a revoked Revision | `revision_revoked` |
+| serves an older, still release-signed platform document | the reload is refused with a denied `platform.reload` audit row and the newer document stays in force, so a guest image it withdrew stays refused |
+| claims a runtime class no Revision v2 may name, or the CPU class for a GPU pod | `attestation_failed`: runtime class … is not supported; `attestation_unknown`: no kata-tdx reference value … and runtime class kata-qemu-tdx |
+| launches the pod with a policy of its own (MRCONFIGID consistent) | `attestation_unknown`: the Revision v2 of this init-data (policy …) is not registered |
+
+The GPU backend in the suite reports each GPU as its report describes it. The `nras` backend reports a GPU whose CC-mode claim holds anything but the CC-on value (`OFF`, `DEVTOOLS`) as not in CC mode (`gpu::nras` tests). A nonce is stateless and valid for five minutes, so within that window one pod may attest twice with one nonce; the leaf certifies a runtime key only the pod holds, so replaying a fresh exchange gains the host nothing. The appraisal-only cases, a guest image without a reference value and a downgraded TCB among them, are `alpha_attest` tests.
+
 ## What the KMS cannot see
 
-Exec, log reads, file copies and container changes are refused inside the guest by the agent policy. The KMS's part is to make sure that policy is the one the tenant signed. Those cases are run against a live pod by the malicious-host suite, not here.
+Exec, log reads, file copies and container changes are refused inside the guest by the agent policy. The KMS's part is to make sure that policy is the one the tenant signed. Those cases are run against a live pod by the full malicious-host suite (deliverable 18), not by the core suite.
