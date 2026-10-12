@@ -1,3 +1,13 @@
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects
+    )
+)]
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::IsTerminal;
@@ -689,11 +699,10 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let template = fs::read_to_string(&spec)
                 .map_err(|e| Exit::Usage(format!("{}: {e}", spec.display())))?;
             let paths: Vec<&Path> = env_files.iter().map(PathBuf::as_path).collect();
-            let env = coco::read_env_files(&paths).map_err(|e| Exit::Refused(e))?;
+            let env = coco::read_env_files(&paths).map_err(Exit::Refused)?;
 
             if for_genpolicy {
-                let out =
-                    coco::render_for_genpolicy(&template, &env).map_err(|e| Exit::Refused(e))?;
+                let out = coco::render_for_genpolicy(&template, &env).map_err(Exit::Refused)?;
                 print!("{out}");
                 return Err(Exit::Silent);
             }
@@ -704,7 +713,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let policy_text = fs::read_to_string(&policy_path)
                 .map_err(|e| Exit::Usage(format!("{}: {e}", policy_path.display())))?;
 
-            let out = coco::render(&template, &policy_text, &env).map_err(|e| Exit::Refused(e))?;
+            let out = coco::render(&template, &policy_text, &env).map_err(Exit::Refused)?;
             print!("{}", out.manifest);
             eprintln!(
                 "init-data {}, policy {}",
