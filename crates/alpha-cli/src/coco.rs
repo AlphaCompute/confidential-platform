@@ -547,7 +547,7 @@ pub fn render_volumes(
 ) -> Result<RenderOutput, String> {
     let for_shape = render_volumes_for_genpolicy(template, env, volumes)?;
     let (runtime_class, gpu_count) = extract_shape(&for_shape)?;
-    let policy_text = &volume::propagate(policy_text, &volumes.names())?;
+    let policy_text = &volume::propagate(&policy::pin_hostname(policy_text), &volumes.names())?;
     let verified = policy::verify(policy_text)?;
     let containers = manifest_containers(&for_shape)?;
     let running = admitted(&containers);

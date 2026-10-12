@@ -250,6 +250,7 @@ pub async fn wrap(
     };
     let failed = |m: String| WrapError::Failed(m);
     let names: BTreeSet<String> = persistent.volumes.keys().cloned().collect();
+    let policy = policy::pin_hostname(&policy);
     let policy = super::volume::propagate(&policy, &names).map_err(failed)?;
     let verified = policy::verify(&policy).map_err(failed)?;
     if verified.containers != expected {
