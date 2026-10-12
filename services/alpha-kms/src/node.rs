@@ -12,6 +12,7 @@ use axum::Json;
 use axum::extract::{Extension, Query, State};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
+use hmac::{Hmac, KeyInit, Mac};
 use p256::ecdsa::signature::Signer;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -428,4 +429,32 @@ fn join_client(
         pkcs8: node.runtime_pkcs8.to_vec(),
     };
     Client::with_identity(vec![endpoint.to_owned()], pin, Some(identity)).map_err(internal)
+}
+
+/// `GET /v1/node/key-ids` (PRD-05 draft): a serving node's CA and tenant-kek-root identifiers, so
+/// `alpha kms migrate verify` can show that a join kept them (M4: never re-bootstrap). Served over
+/// the node's KMS-CA leaf, which the caller pins.
+///
+/// QUESTION(PRD-05 Q58): the tenant-kek-root identifier is a keyed check value (HMAC-SHA256 of a
+/// fixed label under the 256-bit key), served unauthenticated. It reveals nothing about the key
+/// beyond equality, but it is new public output derived from the root of every tenant key.
+/// Proposed: accept; the alternative is a Control-API route only the platform org may call.
+pub async fn key_ids(
+    State(node): State<Arc<Node>>,
+) -> Result<Json<alpha_client::NodeKeyIds>, ApiError> {
+    let keys = node.intermediates()?;
+    let ca_spki = alpha_client::tls::spki_of(&keys.ca_cert_der)
+        .map_err(|e| ApiError::internal(format!("ca certificate: {e}")))?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(keys.tenant_kek_root.as_slice())
+        .map_err(|e| ApiError::internal(format!("hmac: {e}")))?;
+    mac.update(alpha_client::KEY_ID_LABEL);
+    let tenant_id = mac.finalize().into_bytes();
+    Ok(Json(alpha_client::NodeKeyIds {
+        format: alpha_client::KEY_IDS_FORMAT.into(),
+        revision: node.compose_hash,
+        runtime_pubkey_sha256: keys::sha256_hex(&node.runtime_spki),
+        ca_spki_sha256: alpha_channel::sha256_label(&ca_spki),
+        ca_cert_sha256: alpha_channel::sha256_label(&keys.ca_cert_der),
+        tenant_kek_root_id: format!("hmac-sha256:{}", hex::encode(tenant_id)),
+    }))
 }

@@ -379,6 +379,7 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/v1/node/bootstrap", post(node::bootstrap))
         .route("/v1/node/unseal", post(node::unseal))
         .route("/v1/node/join", post(node::join))
+        .route("/v1/node/key-ids", get(node::key_ids))
         .layer(middleware::from_fn_with_state(node.clone(), gate))
         .fallback(|| async { ApiError::not_found("no such route").into_response() })
         .with_state(node)

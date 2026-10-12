@@ -203,6 +203,137 @@ enum Command {
         #[arg(long)]
         endpoint: String,
     },
+    /// KMS operations (PRD-05 draft).
+    Kms {
+        #[command(subcommand)]
+        command: KmsCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum KmsCommand {
+    /// Production KMS by join, never re-bootstrap (PRD-05 deliverable 11, M4): prototype nodes
+    /// replaced by Kata nodes one at a time, the CA and keys checked unchanged after each step.
+    Migrate {
+        #[command(subcommand)]
+        command: MigrateCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum MigrateCommand {
+    /// Prints the order: joins and stops alternating, the quorum kept throughout.
+    Plan {
+        #[arg(long)]
+        inventory: PathBuf,
+    },
+    /// Before the first step: the serving prototype nodes' CA and key identifiers, which every
+    /// later step must keep. Writes a new file only.
+    Baseline {
+        #[arg(long)]
+        inventory: PathBuf,
+        #[arg(long, default_value = "kms-baseline.json")]
+        out: PathBuf,
+    },
+    /// Every listed node against the baseline; exits 1 on any difference or a broken quorum.
+    Verify {
+        #[arg(long)]
+        inventory: PathBuf,
+        #[arg(long)]
+        baseline: PathBuf,
+    },
+    /// Verifies, marks the pending step done once its effect is observed, and prints the next
+    /// action. Never marks two steps at once.
+    Step {
+        #[arg(long)]
+        inventory: PathBuf,
+        #[arg(long)]
+        baseline: PathBuf,
+        /// Created on the first run.
+        #[arg(long, default_value = "kms-migration-state.json")]
+        state: PathBuf,
+    },
+}
+
+fn read_typed<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Exit> {
+    serde_json::from_value(read_json(path)?)
+        .map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))
+}
+
+fn write_json(path: &Path, value: &impl serde::Serialize, create_new: bool) -> Result<(), Exit> {
+    let text =
+        serde_json::to_string_pretty(value).map_err(|e| Exit::Refused(e.to_string()))? + "\n";
+    let mut options = fs::OpenOptions::new();
+    options.write(true);
+    if create_new {
+        options.create_new(true);
+    } else {
+        options.create(true).truncate(true);
+    }
+    options
+        .open(path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()))
+        .map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))
+}
+
+async fn kms_migrate(
+    config: &Config,
+    command: MigrateCommand,
+    now: SystemTime,
+) -> Result<Value, Exit> {
+    use alpha_cli::kms_migrate as m;
+    match command {
+        MigrateCommand::Plan { inventory } => {
+            let inventory: m::Inventory = read_typed(&inventory)?;
+            let steps = m::plan(&inventory)?;
+            let actions: Vec<Value> = steps
+                .iter()
+                .map(|s| json!({ "step": s, "action": s.action(&inventory) }))
+                .collect();
+            Ok(json!({ "quorum": inventory.quorum, "steps": actions }))
+        }
+        MigrateCommand::Baseline { inventory, out } => {
+            let inventory: m::Inventory = read_typed(&inventory)?;
+            let doc = platform_document(config, now).await?;
+            let baseline = m::take_baseline(&inventory, &doc).await?;
+            write_json(&out, &baseline, true)?;
+            Ok(json!({ "baseline": baseline, "out": out }))
+        }
+        MigrateCommand::Verify {
+            inventory,
+            baseline,
+        } => {
+            let inventory: m::Inventory = read_typed(&inventory)?;
+            let baseline: m::Baseline = read_typed(&baseline)?;
+            let doc = platform_document(config, now).await?;
+            let report = m::verify(&inventory, &baseline, &doc).await?;
+            let value = json!(report);
+            if report.ok {
+                Ok(value)
+            } else {
+                Err(Exit::Partial(value))
+            }
+        }
+        MigrateCommand::Step {
+            inventory,
+            baseline,
+            state,
+        } => {
+            let inventory: m::Inventory = read_typed(&inventory)?;
+            let baseline: m::Baseline = read_typed(&baseline)?;
+            let mut current = if state.exists() {
+                read_typed(&state)?
+            } else {
+                m::State::new()
+            };
+            let doc = platform_document(config, now).await?;
+            let outcome = m::step(&inventory, &baseline, &mut current, &doc).await?;
+            if outcome.completed.is_some() {
+                write_json(&state, &current, false)?;
+            }
+            Ok(json!(outcome))
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -653,6 +784,9 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             }
             Ok(out)
         }
+        Command::Kms {
+            command: KmsCommand::Migrate { command },
+        } => kms_migrate(config, command, now).await,
     }
 }
 

@@ -17,6 +17,7 @@ pub mod catalog;
 pub mod deploy;
 pub mod instances;
 pub mod keyfile;
+pub mod kms_migrate;
 pub mod node;
 pub mod request;
 pub mod sign;

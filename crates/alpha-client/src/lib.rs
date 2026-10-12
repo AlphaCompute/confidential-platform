@@ -156,6 +156,28 @@ pub struct Ready {
     pub sealed: bool,
 }
 
+/// `GET /v1/node/key-ids` (PRD-05 draft, migration by join): what identifies a serving node's
+/// keys without revealing them, for `alpha kms migrate` to compare across nodes and across each
+/// join. The CA by its public key and certificate; tenant-kek-root by a keyed check value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeKeyIds {
+    pub format: String,
+    /// The node's own Revision (its leaf's), and its runtime key: who answered.
+    pub revision: alpha_core::ComposeHash,
+    pub runtime_pubkey_sha256: String,
+    /// `sha256:<hex>` of the CA certificate's SubjectPublicKeyInfo, as `alpha sign --check` prints.
+    pub ca_spki_sha256: String,
+    /// `sha256:<hex>` of the CA certificate's DER.
+    pub ca_cert_sha256: String,
+    /// `hmac-sha256:<hex>` of [`KEY_ID_LABEL`] under tenant-kek-root.
+    pub tenant_kek_root_id: String,
+}
+
+pub const KEY_IDS_FORMAT: &str = "alphacompute-kms-key-ids/1";
+/// The message a node MACs under tenant-kek-root for its key identifier.
+pub const KEY_ID_LABEL: &[u8] = b"alphacompute-kms/key-id/v1/tenant-kek-root";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Nonce {
     pub nonce: String,
@@ -550,6 +572,11 @@ impl Client {
 
     pub async fn join(&self, body: &JoinRequest) -> Result<JoinReply, Error> {
         self.post("/v1/node/join", body).await
+    }
+
+    /// A serving node's key identifiers; a sealed node answers `sealed`.
+    pub async fn node_key_ids(&self) -> Result<NodeKeyIds, Error> {
+        self.request(Method::GET, "/v1/node/key-ids", None).await
     }
 }
 

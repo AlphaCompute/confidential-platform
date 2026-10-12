@@ -425,3 +425,100 @@ fn a_kms_node_identity_is_the_revision_v2_of_cpu_class_init_data_only() {
     assert!(err.contains("a KMS node runs on kata-qemu-tdx"), "{err}");
     assert!(NodeGuest::coco_with(b"not toml", synthetic_source(String::new())).is_err());
 }
+
+/// `alpha kms migrate` (PRD-05 draft) over the join above: the baseline is the prototype node's
+/// CA and tenant-kek-root identifiers, the join is marked done only once the Kata node serves
+/// with the same ones, a node from another genesis never counts as serving, and a baseline that
+/// differs stops every step.
+#[tokio::test]
+async fn kms_migrate_marks_a_join_that_kept_the_ca_and_keys_and_nothing_else() {
+    use alpha_cli::kms_migrate as m;
+    let Some(h) = harness_with_clock(Arc::new(SystemTime::now)).await else {
+        return;
+    };
+    let initdata = kms_initdata();
+    let revision = kms_revision(&initdata);
+    let listed = listing(kata_document(2), revision, "kata-tdx");
+    publish(&h, listed.clone()).await;
+    // What the operator's CLI verifies: the document naming the CA genesis made.
+    let mut doc = listed;
+    doc["kms_ca_pem"] = json!(h.ca_pem);
+    let doc: alpha_attest::PlatformDocument = serde_json::from_value(doc).unwrap();
+    let (joiner, joiner_url, _joiner) =
+        start_kata_node(h.pool.clone(), &h.release, &initdata).await;
+    let inventory: m::Inventory = serde_json::from_value(json!({
+        "format": m::INVENTORY_FORMAT,
+        "quorum": 1,
+        "nodes": [
+            { "name": "proto-a", "endpoint": h.url, "kind": "prototype" },
+            { "name": "kata-a", "endpoint": joiner_url, "kind": "kata" }
+        ]
+    }))
+    .unwrap();
+
+    let baseline = m::take_baseline(&inventory, &doc).await.unwrap();
+    assert_eq!(
+        Some(baseline.ca_spki_sha256.clone()),
+        alpha_cli::sign::ca_spki_sha256(&h.ca_pem).unwrap()
+    );
+    assert!(baseline.tenant_kek_root_id.starts_with("hmac-sha256:"));
+
+    // Nothing has joined: the join is pending and nothing is marked.
+    let mut state = m::State::new();
+    let out = m::step(&inventory, &baseline, &mut state, &doc)
+        .await
+        .unwrap();
+    assert!(out.completed.is_none());
+    assert_eq!(
+        out.next.unwrap()["step"],
+        json!({ "action": "join", "node": "kata-a" })
+    );
+    assert!(state.completed.is_empty());
+
+    // The Kata node joins the prototype node: same CA, same keys, two serving.
+    let reply = join(&h, &joiner, &initdata, None).await.unwrap();
+    node::finish_join(&joiner, &serde_json::from_value(reply).unwrap()).unwrap();
+    let report = m::verify(&inventory, &baseline, &doc).await.unwrap();
+    assert!(report.ok, "{:?}", report.problems);
+    assert_eq!(report.serving, 2);
+    let out = m::step(&inventory, &baseline, &mut state, &doc)
+        .await
+        .unwrap();
+    assert_eq!(out.completed, Some(m::Step::Join("kata-a".into())));
+    assert_eq!(
+        out.next.unwrap()["step"],
+        json!({ "action": "stop", "node": "proto-a" })
+    );
+    // proto-a still serves, so the stop stays pending.
+    let out = m::step(&inventory, &baseline, &mut state, &doc)
+        .await
+        .unwrap();
+    assert!(out.completed.is_none());
+    assert_eq!(state.completed.len(), 1);
+
+    // A node from another genesis (another CA) fails the pinned handshake: never serving.
+    let Some(other) = harness_with_clock(Arc::new(SystemTime::now)).await else {
+        return;
+    };
+    let mut wider = inventory.clone();
+    wider.nodes.push(m::InventoryNode {
+        name: "kata-b".into(),
+        endpoint: other.url.clone(),
+        kind: m::NodeKind::Kata,
+    });
+    let report = m::verify(&wider, &baseline, &doc).await.unwrap();
+    assert!(!report.serving("kata-b"));
+    assert_eq!(report.serving, 2);
+
+    // A baseline the nodes do not match: every serving node differs, and no step is marked.
+    let mut moved = baseline.clone();
+    moved.tenant_kek_root_id = "hmac-sha256:00".into();
+    let report = m::verify(&inventory, &moved, &doc).await.unwrap();
+    assert!(!report.ok);
+    assert_eq!(report.problems.len(), 2, "{:?}", report.problems);
+    let refused = m::step(&inventory, &moved, &mut state, &doc)
+        .await
+        .unwrap_err();
+    assert!(refused.contains("verify failed"), "{refused}");
+    assert_eq!(state.completed.len(), 1);
+}
