@@ -871,14 +871,16 @@ pub async fn register_ccm_identity(
         .fetch_optional(&mut *tx)
         .await?
         {
-            let stored = CcmIdentityPayload {
-                name: existing.name,
-                ..p
-            };
+            if existing.name != p.name {
+                return Err(ApiError::new(
+                    "already_exists",
+                    "identity already registered with a different name",
+                ));
+            }
             return Ok(ccm_identity_json(
                 existing.id,
                 org_id,
-                &stored,
+                &p,
                 existing.created_at,
                 existing.revoked_at,
             ));
