@@ -14,7 +14,7 @@ Control bodies are signed `ed25519` or `webauthn-es256`, a passkey's WebAuthn as
 |---|---|
 | `ALPHACOMPUTE_DATABASE_URL` | Postgres 18; the service user is a member of the `alpha_kms` role the migration creates |
 | `ALPHACOMPUTE_KMS_ENDPOINTS` | comma-separated `https://…` of the KMS nodes; walked on a sealed start to `join` |
-| `ALPHACOMPUTE_PCCS_URL` | PCCS for DCAP collateral, fetched per attestation |
+| `ALPHACOMPUTE_PCCS_URL` | PCCS for DCAP collateral, fetched per attestation and join, **only when the platform document names none** (`pccs_url`, PRD-05: the document names our PCCS). In a `dev-root` build it overrides the document, so a development node can use a test PCCS; a production node never lets its environment outrank the signed document |
 | `ALPHACOMPUTE_PLATFORM_DOCUMENT_URL` | the release-signed platform document, fetched on start and every five minutes |
 | `ALPHACOMPUTE_FORTANIX_CCM_URL` | optional `https://` endpoint of the Fortanix CCM GPU backend, which refuses every GPU until F8; unset, a `gpu_policy` listing `fortanix-ccm` refuses every GPU pod |
 | `ALPHACOMPUTE_QUOTE_SOURCE` | unset or `dstack` on a prototype CVM; `coco-aa` (the CoCo attestation agent) or `coco-tsm` (configfs-tsm) on a Kata pod, as for `alpha-runtime` |

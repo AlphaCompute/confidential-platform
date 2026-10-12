@@ -151,6 +151,16 @@ pub struct PlatformDocument {
     /// on the GPU runtime class can attest; pods on the CPU class never need it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_policy: Option<GpuPolicy>,
+    /// The PCCS DCAP collateral comes from: our own (PRD-05). The KMS and the custodian CLI use
+    /// it over their defaults. Collateral is Intel-signed whoever serves it, so this decides
+    /// where freshness and availability come from, not what is trusted. Absent in documents
+    /// signed before it existed.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "alpha_core::platform::deserialize_pccs_url"
+    )]
+    pub pccs_url: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

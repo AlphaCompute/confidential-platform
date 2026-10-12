@@ -52,7 +52,9 @@ async fn run() -> Result<(), String> {
         pool,
         Config::from_env()?,
         Arc::new(SystemTime::now),
-        CollateralSource::Pccs(alpha_kms::env("ALPHACOMPUTE_PCCS_URL")?),
+        CollateralSource::Pccs {
+            env: std::env::var("ALPHACOMPUTE_PCCS_URL").ok(),
+        },
         alpha_kms::random().map_err(|e| e.message)?,
         guest,
         release_key,

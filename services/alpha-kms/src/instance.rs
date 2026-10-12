@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alpha_attest::{
-    AnyEvidence, Appraised, AttestationResult, CocoAppraised, RESULT_FORMAT, Revision, Verdict,
-    VerifiedQuote, appraise, kata, verify_quote,
+    AnyEvidence, Appraised, AttestationResult, CocoAppraised, PlatformDocument, RESULT_FORMAT,
+    Revision, Verdict, VerifiedQuote, appraise, kata, verify_quote,
 };
 use alpha_client::DerivedKey;
 use alpha_client::tls::PeerCerts;
@@ -102,9 +102,25 @@ pub fn decode32(field: &str, text: &str) -> Result<[u8; 32], ApiError> {
         .ok_or_else(|| ApiError::malformed(format!("{field}: expected 32 bytes base64url")))
 }
 
-pub async fn collateral(node: &Node, quote: &[u8]) -> Result<alpha_attest::Collateral, ApiError> {
+pub async fn collateral(
+    node: &Node,
+    doc: &PlatformDocument,
+    quote: &[u8],
+) -> Result<alpha_attest::Collateral, ApiError> {
     Ok(match &node.collateral {
-        CollateralSource::Pccs(url) => alpha_attest::fetch_collateral(url, quote).await?,
+        CollateralSource::Pccs { env } => {
+            let url = crate::pccs_url(
+                doc.pccs_url.as_deref(),
+                env.as_deref(),
+                cfg!(feature = "dev-root"),
+            )
+            .ok_or_else(|| {
+                ApiError::internal(
+                    "no PCCS: the platform document names none and ALPHACOMPUTE_PCCS_URL is unset",
+                )
+            })?;
+            alpha_attest::fetch_collateral(url, quote).await?
+        }
         CollateralSource::Fixed(c) => (**c).clone(),
     })
 }
@@ -259,7 +275,7 @@ async fn attest_inner(
         .ok_or_else(|| ApiError::new("attestation_unknown", "no platform document"))?;
     let appraised = match (&request.evidence, verified) {
         (AnyEvidence::V1(evidence), None) => {
-            let collateral = collateral(node, &evidence.quote).await?;
+            let collateral = collateral(node, &doc, &evidence.quote).await?;
             appraise(evidence, &nonce, spki, None, &doc, &collateral, now)?
         }
         (AnyEvidence::V1(_), Some(_)) => {
@@ -272,7 +288,7 @@ async fn attest_inner(
                 Some(verified) => verified,
                 None => {
                     kata::check_cpu_kind(evidence)?;
-                    let collateral = collateral(node, &evidence.cpu.quote).await?;
+                    let collateral = collateral(node, &doc, &evidence.cpu.quote).await?;
                     verify_quote(&evidence.cpu.quote, &collateral, &doc.policy, now)?
                 }
             };
