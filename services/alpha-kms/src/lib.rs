@@ -262,6 +262,11 @@ pub enum Phase {
     Serving(Arc<Intermediates>),
 }
 
+/// How many audit rows a node waiting for its database holds at most, and how many of those may be
+/// refusals (ACC-FD-107). A release is one per Postgres pod start, so the difference is ample.
+pub const HELD_MAX: usize = 1024;
+pub const HELD_REFUSALS: usize = 1000;
+
 // ponytail: chosen without load data; set from the renewal rate once two nodes run on Phala.
 const BUCKET_CAPACITY: f64 = 200.0;
 const BUCKET_REFILL_PER_SEC: f64 = 100.0;
@@ -290,8 +295,11 @@ pub struct Node {
     pub pending_rotation: Mutex<Option<custodians::Pending>>,
     /// What custodians' unseal requests carried beside their shares (M2(a)).
     pub unseal_extras: Mutex<db_volume::UnsealExtras>,
-    /// Audit rows of a node waiting for its database, appended once it serves.
+    /// Audit rows of a node waiting for its database, appended once it serves; bounded
+    /// ([`HELD_REFUSALS`], [`HELD_MAX`]).
     pub held_audit: Mutex<Vec<db_volume::Held>>,
+    /// Refusals not held because the queue was full, counted into one row once the node serves.
+    pub held_dropped: std::sync::atomic::AtomicU64,
     /// The highest audit head this node has seen committed, and whether it has halted.
     pub chain: audit::Watch,
     /// The audit heads custodians' share files remembered, beside the shares collected so far;
@@ -347,6 +355,7 @@ impl Node {
             pending_rotation: Mutex::new(None),
             unseal_extras: Mutex::new(db_volume::UnsealExtras::default()),
             held_audit: Mutex::new(Vec::new()),
+            held_dropped: std::sync::atomic::AtomicU64::new(0),
             chain: audit::Watch::default(),
             unseal_floors: Mutex::new(Vec::new()),
             bucket: Mutex::new((BUCKET_CAPACITY, Instant::now())),
@@ -419,7 +428,10 @@ impl Node {
     }
 
     /// A node fact through [`Node::audit`], or, while the node waits for its database, held in
-    /// memory and appended once it serves.
+    /// memory and appended once it serves. The queue is bounded (ACC-FD-107): refusals fill it up
+    /// to [`HELD_REFUSALS`] and are then only counted; the rest, up to [`HELD_MAX`], is kept for
+    /// what succeeded, so a flood of refused `db-key` calls cannot crowd out a release's row. With
+    /// the queue full, a success is refused (`rate_limited`): nothing is released unrecorded.
     pub async fn audit_or_hold(
         &self,
         action: &str,
@@ -427,8 +439,29 @@ impl Node {
         details: serde_json::Value,
     ) -> Result<(), ApiError> {
         if matches!(&*self.phase.read(), Phase::Unsealed(_)) {
-            let held = db_volume::Held::new(action, outcome, details, self.now_utc());
-            self.held_audit.lock().push(held);
+            let mut queue = self.held_audit.lock();
+            let limit = if outcome == "ok" {
+                HELD_MAX
+            } else {
+                HELD_REFUSALS
+            };
+            if queue.len() >= limit {
+                if outcome == "ok" {
+                    return Err(ApiError::new(
+                        "rate_limited",
+                        "too many audit rows are held while the database is closed",
+                    ));
+                }
+                self.held_dropped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(());
+            }
+            queue.push(db_volume::Held::new(
+                action,
+                outcome,
+                details,
+                self.now_utc(),
+            ));
             return Ok(());
         }
         self.audit(audit::node(action, outcome, details))
@@ -436,9 +469,6 @@ impl Node {
             .map(|_| ())
     }
 
-    /// Enters the serving phase: unseal → the database's keys → every plaintext row sealed → serve,
-    /// with intermediates in memory and a leaf from `ca` on the listener. A database that cannot be
-    /// sealed keeps the node sealed.
     /// Enters the serving phase: unseal → the database's keys → the database holds every audit
     /// head this node knows (its own, the joined node's, the custodians', its reachable peers') →
     /// every plaintext row sealed → serve, with intermediates in memory and a leaf from `ca` on the
@@ -467,6 +497,22 @@ impl Node {
                 .await
             {
                 eprintln!("held audit row {}: {}", row.action, e.message);
+            }
+        }
+        let dropped = self
+            .held_dropped
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        if dropped > 0 {
+            let row = audit::node(
+                "audit.held_dropped",
+                "error",
+                serde_json::json!({ "refusals": dropped }),
+            );
+            if let Err(e) = row
+                .insert_now(&self.pool, &self.chain, Some(&keys.metadata))
+                .await
+            {
+                eprintln!("audit.held_dropped: {}", e.message);
             }
         }
         *self.phase.write() = Phase::Serving(Arc::new(keys));
