@@ -27,6 +27,8 @@ pub mod webauthn;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
+use alpha_attest::dpu::DpuVerifier;
+use alpha_attest::dpu::spdm::LocalDpu;
 use alpha_attest::gpu::ccm::FortanixCcm;
 use alpha_attest::gpu::nras::Nras;
 use alpha_attest::snp::kds::{HttpKds, Kds, KdsClient};
@@ -55,6 +57,9 @@ pub struct Config {
     /// AMD's KDS, for the VCEKs and CRLs of SEV-SNP pods, at the URL the platform document's
     /// `snp_policy` pins; the node caches what it fetches (`Node::snp_kds`).
     pub snp_kds: Arc<dyn KdsClient>,
+    /// The NIC/DPU verifier backends; the platform document's `dpu_policy` decides which must all
+    /// pass. Today the local SPDM verifier only (`alpha_attest::dpu::spdm`).
+    pub dpu_backends: Vec<Arc<dyn DpuVerifier>>,
     #[cfg(feature = "dev-root")]
     pub dev_root_kek: Option<Zeroizing<[u8; 32]>>,
 }
@@ -74,6 +79,7 @@ impl Config {
             platform_document_url: env("ALPHACOMPUTE_PLATFORM_DOCUMENT_URL")?,
             gpu_backends: gpu_backends(std::env::var("ALPHACOMPUTE_FORTANIX_CCM_URL").ok())?,
             snp_kds: Arc::new(HttpKds::new().map_err(|e| e.to_string())?),
+            dpu_backends: vec![Arc::new(LocalDpu::new())],
             #[cfg(feature = "dev-root")]
             dev_root_kek: std::env::var("ALPHACOMPUTE_KMS_DEV_ROOT_KEK")
                 .ok()

@@ -15,6 +15,7 @@
     )
 )]
 
+pub mod dpu;
 mod event_log;
 pub mod gpu;
 pub mod kata;
@@ -158,6 +159,10 @@ pub struct PlatformDocument {
     /// and guest policy. Absent, no Revision on an SNP runtime class can attest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snp_policy: Option<SnpPolicy>,
+    /// What a NIC/DPU must prove (`nvidia-dpu/1`) for a Revision that expects one. Absent, no such
+    /// Revision can attest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dpu_policy: Option<dpu::DpuPolicy>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

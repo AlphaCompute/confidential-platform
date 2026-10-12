@@ -9,6 +9,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use alpha_attest::dpu::{
+    DpuEvidence, DpuFuture, DpuModel, DpuVerifier, DpuVerifierKind, VerifiedDpu, dpu_nonce,
+};
 use alpha_attest::gpu::ccm::FortanixCcm;
 use alpha_attest::gpu::{GpuFuture, gpu_nonce};
 use alpha_attest::snp::{SnpFindings, SnpTcb, VekKind};
@@ -123,8 +126,15 @@ pub fn kata_document(version: u64) -> Value {
         values.push(snp_reference_value(name, class, snp_measurement(class)));
     }
     doc["gpu_policy"] = json!({ "allowed_models": ["B300"], "verifiers": ["nras"] });
+    doc["dpu_policy"] = json!({
+        "models": { DPU_MODEL: { "roots_pem": [], "measurements": {} } },
+        "verifiers": ["local"],
+    });
     doc
 }
+
+/// The NIC/DPU model test Revisions expect.
+pub const DPU_MODEL: &str = "BLUEFIELD-3";
 
 /// Signs and publishes `doc`, and has the node load it.
 pub async fn publish(h: &Harness, doc: Value) {
@@ -169,12 +179,23 @@ impl Gpu {
     }
 }
 
+/// What a synthetic DPU transcript says about itself; a real one is an SPDM transcript the local
+/// backend checks (`alpha_attest::dpu::spdm`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Dpu {
+    pub device: String,
+    pub model: String,
+    /// The nonce the transcript is over; `None` for the attestation's own DPU nonce.
+    pub nonce: Option<[u8; 32]>,
+}
+
 #[derive(Clone)]
 pub struct Pod {
     pub app: AppId,
     pub initdata: String,
     pub runtime_class: String,
     pub gpus: Vec<Gpu>,
+    pub dpus: Vec<Dpu>,
     pub key: p256::ecdsa::SigningKey,
 }
 
@@ -186,8 +207,28 @@ impl Pod {
             initdata: initdata(app, GPU_RUNTIME_CLASS, Some(count), POLICY),
             runtime_class: GPU_RUNTIME_CLASS.into(),
             gpus: (0..count).map(Gpu::b300).collect(),
+            dpus: Vec::new(),
             key: p256::ecdsa::SigningKey::from_bytes((&[9u8; 32]).into()).unwrap(),
         }
+    }
+
+    /// This pod with a Revision that also expects `count` BlueField-3 DPUs attested, and their
+    /// evidence.
+    pub fn with_dpus(mut self, count: u32) -> Self {
+        let app = format!("\"app_id\":\"{}\",", self.app);
+        self.initdata = self.initdata.replacen(
+            &app,
+            &format!("{app}\"dpu\":{{\"count\":{count},\"model\":\"{DPU_MODEL}\"}},"),
+            1,
+        );
+        self.dpus = (0..count)
+            .map(|i| Dpu {
+                device: format!("sha256:dpu-{i}"),
+                model: DPU_MODEL.into(),
+                nonce: None,
+            })
+            .collect();
+        self
     }
 
     /// A CPU-only pod of `app` (KMS, broker, signer, guard, front, supervisor).
@@ -250,6 +291,7 @@ impl Pod {
     /// The evidence this pod sends for `nonce`: its init-data, its claimed class, one entry per GPU.
     pub fn evidence(&self, nonce: &[u8; 32]) -> EvidenceV2 {
         let own = gpu_nonce(&self.report_data(nonce));
+        let own_dpu = dpu_nonce(&self.report_data(nonce));
         EvidenceV2 {
             format: EVIDENCE_FORMAT_V2.into(),
             cpu: CpuEvidence {
@@ -273,6 +315,21 @@ impl Pod {
                     })
                     .unwrap(),
                     certificate: b"certificate".to_vec(),
+                })
+                .collect(),
+            nic: self
+                .dpus
+                .iter()
+                .map(|dpu| DpuEvidence {
+                    spdm_version: "1.1.0".into(),
+                    hashing_algorithm: "TPM_ALG_SHA_512".into(),
+                    signing_algorithm: "TPM_ALG_ECDSA_ECC_NIST_P384".into(),
+                    signed_measurements: serde_json::to_vec(&Dpu {
+                        nonce: Some(dpu.nonce.unwrap_or(own_dpu)),
+                        ..dpu.clone()
+                    })
+                    .unwrap(),
+                    certificate_chain: String::new(),
                 })
                 .collect(),
             initdata: self.initdata.clone().into_bytes(),
@@ -466,6 +523,42 @@ impl GpuVerifier for FakeGpu {
                 gpus,
                 token_sha256: [0xab; 32],
             })
+        })
+    }
+}
+
+/// A DPU verifier backend standing in for the local SPDM verifier: it reports every DPU as its
+/// transcript describes it, the nonce included, so the KMS's own checks are what refuse.
+pub struct FakeDpu;
+
+impl DpuVerifier for FakeDpu {
+    fn kind(&self) -> DpuVerifierKind {
+        DpuVerifierKind::Local
+    }
+
+    fn verify<'a>(
+        &'a self,
+        dpus: &'a [DpuEvidence],
+        _nonce: &'a [u8; 32],
+        _model: &'a str,
+        _policy: &'a DpuModel,
+    ) -> DpuFuture<'a> {
+        Box::pin(async move {
+            dpus.iter()
+                .zip(0u32..)
+                .map(|(entry, index)| {
+                    let dpu: Dpu = serde_json::from_slice(&entry.signed_measurements)
+                        .map_err(|e| AppraisalError::Failed(format!("dpu transcript: {e}")))?;
+                    Ok(VerifiedDpu {
+                        index,
+                        device_id: dpu.device,
+                        model: dpu.model,
+                        measurements: Default::default(),
+                        nonce: dpu.nonce.unwrap_or_default(),
+                        revocation_checked: false,
+                    })
+                })
+                .collect()
         })
     }
 }

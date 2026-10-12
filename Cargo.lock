@@ -59,6 +59,7 @@ dependencies = [
  "dcap-qvl",
  "hex",
  "p384",
+ "rcgen",
  "reqwest",
  "rsa",
  "serde",

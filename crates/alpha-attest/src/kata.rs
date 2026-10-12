@@ -20,11 +20,12 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use alpha_core::ComposeHash;
-use alpha_core::coco::{GpuShape, InitData, RuntimeClass, Tee};
+use alpha_core::coco::{DpuShape, GpuShape, InitData, RuntimeClass, Tee};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::dpu::{self, DpuAppraisal, DpuEvidence, DpuPolicy, DpuVerifier, VerifiedDpu};
 use crate::gpu::{
     self, CheckedGpus, GpuAppraisal, GpuEvidence, GpuPolicy, GpuVerifier, GpuVouch, VerifiedGpu,
 };
@@ -73,6 +74,9 @@ pub struct EvidenceV2 {
     pub cpu: CpuEvidence,
     #[serde(default)]
     pub gpus: Vec<GpuEvidence>,
+    /// One entry per NIC/DPU the Revision expects (`nvidia-dpu/1`); absent when it expects none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nic: Vec<DpuEvidence>,
     /// The exact init-data document the pod booted with.
     #[serde(with = "base64url")]
     pub initdata: Vec<u8>,
@@ -153,6 +157,9 @@ pub struct CocoAppraised {
     /// the signed result it verified (e.g. NRAS's overall EAT). Empty for a CPU-only pod.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gpu_verifiers: Vec<GpuVouch>,
+    /// `nvidia-dpu/1`: every NIC/DPU the Revision expects, as the first listed backend verified it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dpus: Vec<VerifiedDpu>,
     /// `kata-snp/1`: what the verified SNP report says (product, signing key, launch measurement,
     /// HOST_DATA, reported TCB, guest policy, VMPL).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -278,6 +285,7 @@ pub async fn appraise_kata_snp(
     doc: &PlatformDocument,
     kds: &Kds,
     gpu_backends: &[Arc<dyn GpuVerifier>],
+    dpu_backends: &[Arc<dyn DpuVerifier>],
     now: SystemTime,
 ) -> Result<Appraised, AppraisalError> {
     let verified = verify_snp(evidence, doc, kds, now).await?;
@@ -289,6 +297,7 @@ pub async fn appraise_kata_snp(
         node_xwing_spki,
         doc,
         gpu_backends,
+        dpu_backends,
     )
     .await
 }
@@ -305,8 +314,10 @@ pub fn report_data_binds(quoted: &[u8; 64], expected: &[u8; 64]) -> bool {
 }
 
 /// `kata-tdx/1` or `kata-snp/1` over CPU evidence already verified ([`crate::verify_quote`],
-/// [`verify_snp`]): [`appraise_kata_cpu`], then, only if it passed and the pod is on a GPU runtime
-/// class, every backend the `gpu_policy` lists, then [`CpuAppraised::finish`].
+/// [`verify_snp`]): [`appraise_kata_cpu`], then, only if it passed, the checks that need no
+/// backend for the GPUs (GPU runtime classes) and DPUs (a Revision that expects them), then every
+/// backend the `gpu_policy` and `dpu_policy` list, then [`CpuAppraised::finish_with_dpus`].
+#[allow(clippy::too_many_arguments)]
 pub async fn appraise_kata(
     evidence: &EvidenceV2,
     verified: impl Into<VerifiedCpu>,
@@ -315,6 +326,7 @@ pub async fn appraise_kata(
     node_xwing_spki: Option<&[u8]>,
     doc: &PlatformDocument,
     gpu_backends: &[Arc<dyn GpuVerifier>],
+    dpu_backends: &[Arc<dyn DpuVerifier>],
 ) -> Result<Appraised, AppraisalError> {
     let cpu = appraise_kata_cpu(
         evidence,
@@ -324,14 +336,40 @@ pub async fn appraise_kata(
         node_xwing_spki,
         doc,
     )?;
-    let gpus = match cpu.gpu_shape() {
+    let gpu_policy = cpu
+        .gpu_shape()
+        .map(|shape| gpu::precheck(doc.gpu_policy.as_ref(), shape, evidence.gpus.len()))
+        .transpose()?;
+    let dpu_policy = cpu
+        .dpu_shape()
+        .map(|shape| dpu::precheck(doc.dpu_policy.as_ref(), shape, evidence.nic.len()))
+        .transpose()?;
+    let gpus = match gpu_policy {
         None => Vec::new(),
-        Some(shape) => {
-            let policy = gpu::precheck(doc.gpu_policy.as_ref(), shape, evidence.gpus.len())?;
+        Some(policy) => {
             gpu::verify_gpus(gpu_backends, &evidence.gpus, cpu.gpu_nonce(), policy).await?
         }
     };
-    cpu.finish(doc.gpu_policy.as_ref(), &gpus)
+    let dpus = match (cpu.dpu_shape(), dpu_policy) {
+        (Some(shape), Some((policy, model))) => {
+            dpu::verify_dpus(
+                dpu_backends,
+                &evidence.nic,
+                cpu.dpu_nonce(),
+                shape,
+                policy,
+                model,
+            )
+            .await?
+        }
+        _ => Vec::new(),
+    };
+    cpu.finish_with_dpus(
+        doc.gpu_policy.as_ref(),
+        &gpus,
+        doc.dpu_policy.as_ref(),
+        &dpus,
+    )
 }
 
 /// [`appraise_kata`] over a DCAP-verified TDX quote.
@@ -352,6 +390,7 @@ pub async fn appraise_kata_tdx(
         node_xwing_spki,
         doc,
         gpu_backends,
+        &[],
     )
     .await
 }
@@ -365,6 +404,9 @@ pub struct CpuAppraised {
     gpus: ClassGpus,
     gpu_evidence: usize,
     gpu_nonce: [u8; 32],
+    dpu: Option<DpuShape>,
+    dpu_evidence: usize,
+    dpu_nonce: [u8; 32],
 }
 
 /// The GPUs the pod's runtime class (from the measured init-data) allows: none on a CPU class,
@@ -395,14 +437,38 @@ impl CpuAppraised {
         &self.gpu_nonce
     }
 
-    /// The GPU decision over the backends' results, completing the appraisal. On a GPU class it
-    /// is [`gpu::check_gpus`] (pure) over the Revision's shape. The CPU classes are the only ones
-    /// whose GPU checks are skipped: there is no GPU to check, and GPU evidence from the pod, or
-    /// a GPU a backend verified for it, is refused, never ignored.
+    /// The NICs/DPUs the Revision expects, on any class; `None` and no DPU backend is to run.
+    pub fn dpu_shape(&self) -> Option<&DpuShape> {
+        self.dpu.as_ref()
+    }
+
+    /// What every DPU transcript must be over: [`dpu::dpu_nonce`] of the verified `report_data`.
+    pub fn dpu_nonce(&self) -> &[u8; 32] {
+        &self.dpu_nonce
+    }
+
+    /// [`Self::finish_with_dpus`] for a pod whose Revision expects no NIC/DPU: one that does is
+    /// refused here, since no DPU backend ran.
     pub fn finish(
         self,
         policy: Option<&GpuPolicy>,
         gpus: &[GpuAppraisal],
+    ) -> Result<Appraised, AppraisalError> {
+        self.finish_with_dpus(policy, gpus, None, &[])
+    }
+
+    /// The GPU decision over the backends' results, completing the appraisal. On a GPU class it
+    /// is [`gpu::check_gpus`] (pure) over the Revision's shape. The CPU classes are the only ones
+    /// whose GPU checks are skipped: there is no GPU to check, and GPU evidence from the pod, or
+    /// a GPU a backend verified for it, is refused, never ignored.
+    /// The NIC/DPU decision follows: [`dpu::check_dpus`] when the Revision expects DPUs, and
+    /// otherwise no DPU evidence and no DPU verified, so DPU evidence is never ignored either.
+    pub fn finish_with_dpus(
+        self,
+        policy: Option<&GpuPolicy>,
+        gpus: &[GpuAppraisal],
+        dpu_policy: Option<&DpuPolicy>,
+        dpus: &[DpuAppraisal],
     ) -> Result<Appraised, AppraisalError> {
         let checked = match &self.gpus {
             ClassGpus::Cpu => {
@@ -413,10 +479,24 @@ impl CpuAppraised {
                 gpu::check_gpus(policy, shape, self.gpu_evidence, gpus, &self.gpu_nonce)?
             }
         };
+        let verified_dpus = match &self.dpu {
+            Some(shape) => {
+                dpu::check_dpus(dpu_policy, shape, self.dpu_evidence, dpus, &self.dpu_nonce)?
+            }
+            None => {
+                if self.dpu_evidence != 0 || dpus.iter().any(|a| !a.dpus.is_empty()) {
+                    return Err(AppraisalError::Failed(
+                        "NIC/DPU evidence from a pod whose Revision expects no DPU".into(),
+                    ));
+                }
+                Vec::new()
+            }
+        };
         let mut appraised = self.appraised;
         if let Some(coco) = appraised.coco.as_mut() {
             coco.gpus = checked.gpus;
             coco.gpu_verifiers = checked.vouched;
+            coco.dpus = verified_dpus;
         }
         Ok(appraised)
     }
@@ -628,6 +708,7 @@ pub fn appraise_kata_cpu(
             runtime_class: revision.runtime_class,
             gpus: Vec::new(),
             gpu_verifiers: Vec::new(),
+            dpus: Vec::new(),
             snp: snp_findings,
         }),
     };
@@ -637,6 +718,9 @@ pub fn appraise_kata_cpu(
         gpus,
         gpu_evidence: evidence.gpus.len(),
         gpu_nonce: gpu::gpu_nonce(&expected),
+        dpu: revision.dpu.clone(),
+        dpu_evidence: evidence.nic.len(),
+        dpu_nonce: dpu::dpu_nonce(&expected),
     })
 }
 
