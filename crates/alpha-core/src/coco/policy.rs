@@ -39,8 +39,8 @@ pub const HOSTNAME_ENV_REGEX: &str = "^HOSTNAME=[a-z0-9]([-a-z0-9]{0,61}[a-z0-9]
 /// Placeholders genpolicy's rules (`allow_var`, "always_allowed") let the host fill with any
 /// value at all. genpolicy writes `HOSTNAME=$(host-name)` into every container; a host could
 /// then set `HOSTNAME=sealed.<JWS>` copied from the policy and have the agent unseal one of the
-/// App's Secrets into a container never given it. The generators pin `HOSTNAME` to the sandbox's
-/// name instead (`$(sandbox-name)`, alpha-cli's `coco::policy::pin_hostname`).
+/// App's Secrets into a container never given it. The generators take that entry out instead
+/// (alpha-cli's `coco::policy::pin_hostname`).
 pub const ANY_VALUE_PLACEHOLDERS: [&str; 3] = ["$(host-name)", "$(node-name)", "$(pod-uid)"];
 /// genpolicy 4.1.0's own `HOSTNAME` pattern, which the `50-` drop-in replaces.
 const GENPOLICY_HOSTNAME_ENV_REGEX: &str = "^HOSTNAME=$(dns_label)$";
@@ -195,16 +195,23 @@ pub fn verify(policy: &str) -> Result<Verified, String> {
                 .pointer(&format!("/OCI/Annotations/{}", key.replace('/', "~1")))
                 .and_then(Value::as_str)
         };
-        let any_value = container
-            .pointer("/OCI/Process/Env")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .find(|e| ANY_VALUE_PLACEHOLDERS.iter().any(|p| e.contains(p)));
-        if let Some(var) = any_value {
+        let listed = || {
+            container
+                .pointer("/OCI/Process/Env")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+        };
+        if let Some(var) = listed().find(|e| ANY_VALUE_PLACEHOLDERS.iter().any(|p| e.contains(p))) {
             return Err(bad(&format!(
                 "{var} lets the host set any value; regenerate it with alpha coco render or wrap"
+            )));
+        }
+        // `$(sandbox-name)` and the like: the rules match the value as an unanchored pattern.
+        if let Some(var) = listed().find(|e| e.starts_with("HOSTNAME=") && e.contains("$(")) {
+            return Err(bad(&format!(
+                "{var} lets the host set HOSTNAME to more than one DNS label; regenerate it with alpha coco render or wrap"
             )));
         }
         if annotation(TYPE_ANNOTATION) == Some("sandbox") {
@@ -379,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn hostname_is_held_to_the_sandbox_name_or_one_dns_label() {
+    fn hostname_is_held_to_one_dns_label() {
         // genpolicy's HOSTNAME, which the rules let the host fill with anything.
         let any = policy(&["PATH=/bin", "HOSTNAME=$(host-name)"]);
         assert!(
@@ -391,7 +398,14 @@ mod tests {
             let any = policy(&["PATH=/bin", &format!("X={placeholder}")]);
             assert!(verify(&any).is_err(), "{placeholder}");
         }
-        verify(&policy(&["PATH=/bin", "HOSTNAME=$(sandbox-name)"])).unwrap();
+        // $(sandbox-name), which the rules match as an unanchored pattern.
+        let sandbox = policy(&["PATH=/bin", "HOSTNAME=$(sandbox-name)"]);
+        assert!(
+            verify(&sandbox)
+                .unwrap_err()
+                .contains("more than one DNS label")
+        );
+        verify(&policy(&["PATH=/bin", "HOSTNAME=pinned"])).unwrap();
         // genpolicy's own HOSTNAME pattern, which admits a sealed secret's dots and underscores.
         let base = policy(&["PATH=/bin"]);
         let loose = base.replace(
