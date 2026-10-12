@@ -320,6 +320,47 @@ pub async fn unseal(
     Ok(reply)
 }
 
+/// What `alpha witness` found: the head the share file now remembers, and the attested node's.
+#[derive(Debug, Serialize)]
+pub struct Witnessed {
+    pub audit_head: Option<AuditHead>,
+    pub node_audit_head: Option<AuditHead>,
+}
+
+/// Records in the share file the audit head an attested, serving node has seen committed, when it
+/// is later than the one the file remembers. Run between cold starts, it keeps the floor the
+/// custodian's next unseal sends close to the live head, so a restore to anything older halts the
+/// node instead of serving. Nothing is sent to the node. A node that reports another link at the
+/// same row, or a head behind the file's, is refused: it serves another or an older database.
+pub async fn witness(client: &Client, share_path: &Path) -> Result<Witnessed, String> {
+    let mut file = ShareFile::read(share_path)?;
+    let node_audit_head = client.audit_head().await.map_err(|e| e.to_string())?.head;
+    if let (Some(node), Some(known)) = (&node_audit_head, &file.audit_head) {
+        if node.seq == known.seq && node.link != known.link {
+            return Err(format!(
+                "the node's audit row {} differs from the one this share file remembers: it serves another database",
+                node.seq
+            ));
+        }
+        if node.seq < known.seq {
+            return Err(format!(
+                "the node has seen audit rows up to {} only, and this share file remembers {}: it may serve an older database",
+                node.seq, known.seq
+            ));
+        }
+    }
+    if let Some(head) = &node_audit_head
+        && file.audit_head.as_ref().is_none_or(|h| h.seq < head.seq)
+    {
+        file.audit_head = Some(head.clone());
+        file.write(share_path)?;
+    }
+    Ok(Witnessed {
+        audit_head: file.audit_head,
+        node_audit_head,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
