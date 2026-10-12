@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update intermediate_keys set wrapped = $2\n              where purpose = $1::text::intermediate_purpose",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d42dbb63a8be230336e4096662fdd3a440740764cc384b51f62eba181e5e8d8b"
+}

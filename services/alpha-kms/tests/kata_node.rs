@@ -24,6 +24,7 @@ use std::time::SystemTime;
 use alpha_attest::{
     CpuEvidence, CpuKind, EVIDENCE_FORMAT_V2, EvidenceV2, VerifiedQuote, report_data,
 };
+use alpha_cli::custodians::{self, Baseline};
 use alpha_cli::node::{self as cli_node, AttestedNode};
 use alpha_client::{JoinReply, NodeEvidence, Pin, tls as client_tls};
 use alpha_core::coco::{CPU_RUNTIME_CLASS, GPU_RUNTIME_CLASS};
@@ -243,6 +244,77 @@ async fn a_kata_node_is_bootstrapped_by_three_custodians_and_a_second_one_unseal
         assert_eq!(reply.sealed, i == 1);
     }
     assert_eq!(second.intermediates().unwrap().ca_pem(), ca_pem);
+
+    // Custodians 2 and 3 replace custodian 1 on the second node. Each checks the node's agent
+    // policy against the baseline first (D9): this build's checker refuses until #79/#83's is
+    // wired, so the ceremony runs either with that checker or with the check skipped on record.
+    assert_eq!(attested.policy.as_deref(), Some(POLICY));
+    let refused = custodians::check_baseline(
+        attested.policy.as_deref(),
+        Baseline::Check(custodians::alpha_baseline),
+    )
+    .unwrap_err();
+    assert!(refused.starts_with("policy_denied"), "{refused}");
+    fn exec_and_logs_denied(policy: &str) -> Result<(), String> {
+        let denied = |request: &str| policy.contains(&format!("default {request} := false"));
+        (denied("ExecProcessRequest") && denied("ReadStreamRequest"))
+            .then_some(())
+            .ok_or_else(|| "exec or log reads allowed".into())
+    }
+    assert_eq!(
+        custodians::check_baseline(
+            attested.policy.as_deref(),
+            Baseline::Check(exec_and_logs_denied)
+        ),
+        Ok("held")
+    );
+    let mut pinned = doc.clone();
+    pinned["kms_ca_pem"] = json!(ca_pem);
+    let pinned = doc_of(&pinned);
+    let new: Vec<PrivateKey> = (0..3).map(|_| PrivateKey::generate().unwrap()).collect();
+    let proposal = custodians::propose(&client, &attested.identity, custodian_pubs(&new))
+        .await
+        .unwrap();
+    let mut rotation = None;
+    for i in [2usize, 3] {
+        let reply = custodians::approve(
+            &client,
+            &attested.identity,
+            &proposal,
+            &dir.join(format!("share-{i}.json")),
+            &custodians[i - 1],
+            &pinned,
+        )
+        .await
+        .unwrap();
+        rotation = reply.rotation;
+    }
+    let rotation = rotation.unwrap();
+    // Each new custodian attests the node afresh, finds it is the one that rotated, and keeps
+    // their share; two of those shares unseal a third Kata node.
+    for (i, key) in new.iter().enumerate() {
+        let live = verify(&fetch(&second_url, &initdata).await, &doc).unwrap();
+        assert!(custodians::is_rotating_node(&rotation, &live.identity));
+        let out = dir.join(format!("new-share-{}.json", i + 1));
+        custodians::accept(&rotation, &pinned, key, &out).unwrap();
+    }
+    let (third, third_url, _third) = start_kata_node(pool.clone(), &release, &initdata).await;
+    let attested = verify(&fetch(&third_url, &initdata).await, &doc).unwrap();
+    assert!(!custodians::is_rotating_node(&rotation, &attested.identity));
+    let client = spki_client(&third_url, &third);
+    for (i, key) in [(1usize, &new[0]), (2, &new[1])] {
+        cli_node::unseal(
+            &client,
+            &attested.identity,
+            &dir.join(format!("new-share-{i}.json")),
+            key,
+            1,
+        )
+        .await
+        .unwrap();
+    }
+    assert!(!third.is_sealed());
+    assert_eq!(third.intermediates().unwrap().ca_pem(), ca_pem);
 
     // A client pins the CA and the listed Revisions; the Kata node's leaf names its Revision v2.
     let ca = client_tls::cert_from_pem(&ca_pem).unwrap();

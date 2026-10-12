@@ -133,6 +133,40 @@ the platform-document URL are served; the signed document lists the Revision.
 Both nodes now serve; a restart of either is a `join` from the other; losing both means
 `alpha unseal` with two of the three shares.
 
+## Replacing a custodian
+
+When a custodian leaves, or a share or custodian key may be exposed, replace the custodian set
+the day it happens (`docs/custodian-rotation.md`). The node makes a new root KEK, and the old
+shares open nothing in the database from the commit on. Two current custodians and every new
+custodian take part; the platform document and every tenant are untouched.
+
+1. Each new custodian runs `alpha keygen --custodian --out new.key` and hands over the public
+   key it prints. A custodian who stays may keep their key and is listed again.
+2. Anyone runs `alpha custodians propose --custodians n1.pub,n2.pub,n3.pub --endpoint
+   https://<node>` against one serving node. It writes `proposal.json`, which is not secret, and
+   prints `check`: the proposal's digest and each new key's SHA-256. Its nonce lasts five
+   minutes, so the two approvers are ready before it runs.
+3. Two current custodians each run `alpha custodians rotate --proposal proposal.json --share
+   share-N.json --key custodian.key --endpoint https://<node>`, after comparing `check` with
+   the new custodians' keys out of band. Each attests the node first. The first approval prints
+   `{"rotated": false, "approvals": 1}`; the second rotates and writes `rotation.json` (the new
+   shares, sealed to the new keys, and the node's receipt). The departing custodian may be one
+   of the two.
+4. Each new custodian runs `alpha custodians accept --rotation rotation.json --key new.key --out
+   share.json --endpoint https://<node>`; without `--rotation` it fetches the node's last
+   rotation, so a lost reply costs nothing. It verifies the node and the receipt, and writes
+   the share file.
+5. Every custodian who held an old share deletes it now. Two new custodians unseal a node,
+   started for the purpose, as the ceremony's check that the new shares work. The operator runs
+   `VACUUM intermediate_keys` as the schema owner.
+
+The commands check a Kata node's agent policy against the Alpha baseline by default. Until that
+checker is in the build they refuse a Kata node and name `--no-policy-baseline`. Passing it is
+recorded in each command's output and goes in the ceremony record. Joined nodes keep serving
+throughout. A copy of the database from before the rotation plus two old shares still opens it,
+so pre-rotation backups of `intermediate_keys` are destroyed or kept like shares. The dev App
+refuses to rotate: its root comes from the environment.
+
 ## The broker's database
 
 `alpha-broker` keeps its connections in its own database on the same trust-zone Postgres, and no

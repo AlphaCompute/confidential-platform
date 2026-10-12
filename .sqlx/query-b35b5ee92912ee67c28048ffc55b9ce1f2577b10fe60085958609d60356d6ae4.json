@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select rotation from custodian_rotations order by created_at desc, id desc limit 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "rotation",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "custodian_rotations",
+            "name": "rotation"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b35b5ee92912ee67c28048ffc55b9ce1f2577b10fe60085958609d60356d6ae4"
+}
