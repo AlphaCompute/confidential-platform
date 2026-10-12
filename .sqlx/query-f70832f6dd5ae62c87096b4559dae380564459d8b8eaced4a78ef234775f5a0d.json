@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select link from audit_log where seq = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "link",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "audit_log",
+            "name": "link"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "f70832f6dd5ae62c87096b4559dae380564459d8b8eaced4a78ef234775f5a0d"
+}
