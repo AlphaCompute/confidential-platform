@@ -1,8 +1,9 @@
 //! Custodian re-share with root rotation, against an in-process node on `DATABASE_URL` (skipped
 //! without it): two current custodians rotate through `alpha-cli`'s library, one cannot, a wrong
 //! or replayed nonce cannot, a rotation that fails before its commit changes nothing, the old shares
-//! open nothing afterwards, joined nodes keep serving and later joins get the same keys, and every
-//! sealed row stays readable.
+//! open nothing afterwards, every row is re-encrypted under a new data key so an old backup with
+//! old shares opens nothing written after the rotation, derived keys do not change, and a joined
+//! node drops the replaced keys and joins again.
 
 #![allow(
     clippy::unwrap_used,
@@ -26,8 +27,11 @@ use alpha_cli::node::{self as cli_node, NodeIdentity};
 use alpha_client::{Client, RotateRequest, Rotation, RotationProposal};
 use alpha_core::AppId;
 use alpha_crypto::{INFO_CUSTODIAN_APPROVAL, PrivateKey, PublicKey};
+use alpha_kms::data_key::DataKey;
+use alpha_kms::store::MetadataKeys;
 use alpha_kms::{Clock, Node, audit, certs, instance, node, store};
 use common::*;
+use ed25519_dalek::pkcs8::EncodePublicKey;
 use reqwest::StatusCode;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -169,11 +173,11 @@ async fn unseal_with(
     let client = spki_client(&url, &node);
     let identity = node_identity(&node);
     let [(a, ka), (b, kb)] = shares;
-    let first = cli_node::unseal(&client, &identity, a, ka, 1)
+    let first = cli_node::unseal(&client, &identity, a, ka, 1, false)
         .await
         .unwrap();
     assert!(first.sealed);
-    let second = cli_node::unseal(&client, &identity, b, kb, 1).await;
+    let second = cli_node::unseal(&client, &identity, b, kb, 1, false).await;
     (node, second)
 }
 
@@ -195,19 +199,28 @@ async fn two_current_custodians_replace_one_and_the_old_shares_open_nothing() {
     let new_keys = [&h.custodians[0], &h.custodians[1], &d3];
     let rotation = rotate(&h, pubs(&new_keys), [1, 3]).await;
 
-    // Every wrapped row changed; what they wrap did not, and the node never stopped serving.
+    // Every wrapped row changed, and a data key joined them; tenant-kek-root and the CA key kept
+    // their values, and the node never stopped serving, now under the new data key.
     let after = wrapped(&h).await;
     assert_eq!(
         before.iter().map(|r| &r.0).collect::<Vec<_>>(),
         ["ca", "db-volume", "tenant-kek-root"]
     );
-    for ((purpose, old), (_, new)) in before.iter().zip(&after) {
+    assert_eq!(
+        after.iter().map(|r| &r.0).collect::<Vec<_>>(),
+        ["ca", "data-key", "db-volume", "tenant-kek-root"]
+    );
+    for (purpose, old) in &before {
+        let new = &after.iter().find(|r| &r.0 == purpose).unwrap().1;
         assert_ne!(old, new, "{purpose} was not re-wrapped");
     }
     assert!(!h.node.is_sealed());
+    let now_serving = h.node.intermediates().unwrap();
+    assert_eq!(*now_serving.tenant_kek_root, *serving.tenant_kek_root);
+    assert_eq!(now_serving.ca_key_der, serving.ca_key_der);
     assert_eq!(
-        *h.node.intermediates().unwrap().tenant_kek_root,
-        *serving.tenant_kek_root
+        (serving.metadata.epoch(), now_serving.metadata.epoch()),
+        (0, 1)
     );
 
     // The receipt verifies against the KMS CA and names the proposal and every share.
@@ -229,6 +242,11 @@ async fn two_current_custodians_replace_one_and_the_old_shares_open_nothing() {
         custodians::verify_rotation(&stripped, &doc_for(&h))
             .unwrap_err()
             .contains("db_volume_wrapped_sha256")
+    );
+    assert_eq!(signed["data_key_epoch"], json!(1));
+    assert_eq!(
+        signed["rekeyed"],
+        json!({ "principal_keys": 1, "revisions": 0, "secrets": 1 })
     );
     assert_eq!(
         signed["custodians_sha256"][2],
@@ -291,8 +309,10 @@ async fn two_current_custodians_replace_one_and_the_old_shares_open_nothing() {
     let keys = fresh.intermediates().unwrap();
     assert_eq!(*keys.tenant_kek_root, *serving.tenant_kek_root);
     assert_eq!(keys.ca_cert_der, serving.ca_cert_der);
+    assert_eq!(keys.metadata.epoch(), 1);
 
-    // The metadata sealed before the rotation, and the audit chain across it, still open.
+    // The metadata sealed before the rotation, re-encrypted with it, and the audit chain across
+    // it, still open.
     let secret = store::load_secret(&h.pool, &keys.metadata, h.org.into(), "db-password")
         .await
         .unwrap()
@@ -604,12 +624,13 @@ async fn a_rotation_that_fails_before_its_commit_leaves_the_old_root_whole() {
 }
 
 #[tokio::test]
-async fn joined_nodes_keep_serving_and_later_joins_and_rotations_see_the_new_root() {
+async fn a_joined_node_drops_the_replaced_keys_and_joins_again() {
     let Some(h) = harness().await else {
         return;
     };
     // A second node joins before the rotation, as `try_join` would.
     let reply = join_reply(&h).await;
+    assert_eq!(reply.data_key, None);
     let (joined, joined_url, _joined) = sealed_node(&h).await;
     node::finish_join(&joined, &reply).await.unwrap();
     assert!(!joined.is_sealed());
@@ -618,16 +639,42 @@ async fn joined_nodes_keep_serving_and_later_joins_and_rotations_see_the_new_roo
     let new_refs: Vec<&PrivateKey> = new.iter().collect();
     let rotation = rotate(&h, pubs(&new_refs), [1, 2]).await;
 
-    // The joined node holds the same intermediates, so it keeps serving and reads every row.
-    let keys = joined.intermediates().unwrap();
-    assert_eq!(
-        *keys.tenant_kek_root,
-        *h.node.intermediates().unwrap().tenant_kek_root
+    // The joined node still holds the replaced data key: it reads nothing re-encrypted, and the
+    // chain lock refuses it any write (and so any row sealed under that key).
+    let stale = joined.intermediates().unwrap();
+    assert_eq!(stale.metadata.epoch(), 0);
+    assert!(
+        store::load_key(&h.pool, &stale.metadata, h.root.0.into())
+            .await
+            .is_err()
     );
+    let e = joined
+        .audit(audit::node("node.fact", "ok", json!({})))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "sealed", "{}", e.message);
+    // Its next maintenance pass drops the keys and joins again; no endpoint answers here, so it
+    // waits sealed.
+    joined.maintain().await;
+    assert!(joined.is_sealed());
+    assert_eq!(joined.chain.halted(), None);
+
+    // A join after the rotation hands out the same tenant-kek-root and CA, and the new data key.
+    let later = join_reply(&h).await;
+    assert_eq!(later.tenant_kek_root, reply.tenant_kek_root);
+    assert_eq!(later.ca_key, reply.ca_key);
+    assert!(later.data_key.is_some());
+    // The stale reply no longer starts a node: its keys are not the database's.
+    let (other, _, _other) = sealed_node(&h).await;
+    let e = node::finish_join(&other, &reply).await.unwrap_err();
+    assert_eq!(e.code, "sealed", "{}", e.message);
+    node::finish_join(&joined, &later).await.unwrap();
+    let keys = joined.intermediates().unwrap();
+    assert_eq!(keys.metadata.epoch(), 1);
     joined.maintain().await;
     assert!(
         joined.audit_chain.lock().is_ok(),
-        "the chain verifies across the rotation"
+        "the chain verifies across the rotation, each row under its epoch's key"
     );
     assert!(
         store::load_key(&h.pool, &keys.metadata, h.root.0.into())
@@ -635,16 +682,12 @@ async fn joined_nodes_keep_serving_and_later_joins_and_rotations_see_the_new_roo
             .unwrap()
             .is_some()
     );
-    // The join reply carries the database's volume key too (M2(a)).
+    // The join reply carries the database's volume key too (M2(a)), unchanged by the rotation.
     assert!(keys.db_volume.is_some());
     assert_eq!(
         keys.db_volume.as_deref(),
         h.node.intermediates().unwrap().db_volume.as_deref()
     );
-    // A join after the rotation hands out the same intermediates.
-    let later = join_reply(&h).await;
-    assert_eq!(later.tenant_kek_root, reply.tenant_kek_root);
-    assert_eq!(later.ca_key, reply.ca_key);
     assert_eq!(later.db_volume_key, reply.db_volume_key);
 
     // The joined node never held a root, but it reads the re-wrapped rows: the new custodians
@@ -663,9 +706,249 @@ async fn joined_nodes_keep_serving_and_later_joins_and_rotations_see_the_new_roo
             .unwrap();
         assert_eq!(reply.rotated, rotated);
     }
+    assert_eq!(joined.intermediates().unwrap().metadata.epoch(), 2);
     let (stale, refused) = unseal_with(&h, [(&shares[0], &new[0]), (&shares[1], &new[1])]).await;
     assert!(refused.is_err());
     assert!(stale.is_sealed());
+}
+
+/// The key an Instance of the capture's App derives for `purpose`, through the route.
+async fn derived(h: &Harness, instance: &reqwest::Client) -> String {
+    let (status, reply) = send(
+        instance
+            .post(format!("{}/v1/keys/derive", h.url))
+            .json(&json!({ "purpose": "disk" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    reply["key"].as_str().unwrap().to_owned()
+}
+
+fn combine(shares: &[Vec<u8>]) -> [u8; 32] {
+    <[u8; 32]>::try_from(vsss_rs::Gf256::combine_bytes(shares).unwrap().as_slice()).unwrap()
+}
+
+async fn wrapped_row(pool: &sqlx::PgPool, table: &str, purpose: &str) -> Option<Vec<u8>> {
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "select wrapped from {table} where purpose::text = $1"
+    )))
+    .bind(purpose)
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+}
+
+/// Andrei Pfau's review (D12 item 2): two old shares and a backup taken before the rotation.
+#[tokio::test]
+async fn an_old_backup_and_old_shares_open_nothing_written_after_the_rotation() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let admin = h.register_key(&h.root, 91).await;
+    let app = AppId::mint();
+    h.insert_capture_revision(app, &admin).await;
+    let (status, reply) = h
+        .put_secret("before", &[app], b"written-before", h.now(), &admin)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let instance = h.instance_client().await;
+    let derived_before = derived(&h, &instance).await;
+
+    // The operator's backup, taken before the rotation.
+    for table in [
+        "intermediate_keys",
+        "principal_keys",
+        "revisions",
+        "secrets",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "create table backup_{table} as select * from {table}"
+        )))
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    }
+
+    // Custodians 1 and 2 hand over to three new custodians.
+    let new: Vec<PrivateKey> = (0..3).map(|_| PrivateKey::generate().unwrap()).collect();
+    let new_refs: Vec<&PrivateKey> = new.iter().collect();
+    let rotation = rotate(&h, pubs(&new_refs), [1, 2]).await;
+    let new_files = accept_all(&h, &rotation, &new_refs, &h.dir.join("backup"));
+
+    // After the rotation: a new Secret, and the old one replaced. Instances read them, and the
+    // App's derived key is what it was.
+    let later = |s: u64| h.now() + Duration::from_secs(s);
+    for (name, value, at) in [
+        ("after", &b"written-after"[..], later(1)),
+        ("before", b"replaced-after", later(2)),
+    ] {
+        let (status, reply) = h.put_secret(name, &[app], value, at, &admin).await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+    }
+    let (status, reply) = send(instance.get(format!("{}/v1/secrets/after", h.url))).await;
+    assert_eq!(
+        (status, reply["value"].clone()),
+        (StatusCode::OK, json!(b64(b"written-after")))
+    );
+    assert_eq!(derived(&h, &instance).await, derived_before);
+
+    // The attacker holds two old shares and the backup.
+    let old_root = combine(&h.shares[..2]);
+    let backup_tkr: [u8; 32] = alpha_kms::keys::aead_open(
+        &old_root,
+        b"tenant-kek-root",
+        &wrapped_row(&h.pool, "backup_intermediate_keys", "tenant-kek-root")
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+    .as_slice()
+    .try_into()
+    .unwrap();
+    assert!(
+        wrapped_row(&h.pool, "backup_intermediate_keys", "data-key")
+            .await
+            .is_none()
+    );
+    let old = MetadataKeys::derive(&backup_tkr).unwrap();
+    let anchor = h.root.1.verifying_key().to_public_key_der().unwrap();
+    let anchor = anchor.as_bytes();
+
+    // They open the backup, as of the backup: the value written before.
+    let (id, ciphertext, sealed): (Uuid, Vec<u8>, Vec<u8>) =
+        sqlx::query_as("select id, ciphertext, sealed from backup_secrets")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    let record: store::SecretRecord = old
+        .open(store::Table::Secrets, id.as_bytes(), &sealed)
+        .unwrap();
+    assert_eq!(record.name, "before");
+    let value = alpha_kms::keys::aead_open(
+        &old.secret_key(h.org, anchor).unwrap(),
+        id.as_bytes(),
+        &ciphertext,
+    )
+    .unwrap();
+    assert_eq!(value.as_slice(), b"written-before");
+
+    // They open nothing the database holds now: no Secret's record or value, written after the
+    // rotation or re-encrypted by it, no key or Revision row, no audit row after the rotation, and
+    // no intermediate.
+    let rows: Vec<(Uuid, Vec<u8>, Vec<u8>)> =
+        sqlx::query_as("select id, ciphertext, sealed from secrets")
+            .fetch_all(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 2);
+    for (id, ciphertext, sealed) in &rows {
+        assert!(
+            old.open::<store::SecretRecord>(store::Table::Secrets, id.as_bytes(), sealed)
+                .is_err()
+        );
+        assert!(
+            alpha_kms::keys::aead_open(
+                &old.secret_key(h.org, anchor).unwrap(),
+                id.as_bytes(),
+                ciphertext
+            )
+            .is_none()
+        );
+    }
+    let keys: Vec<(Uuid, Vec<u8>)> = sqlx::query_as("select id, sealed from principal_keys")
+        .fetch_all(&h.pool)
+        .await
+        .unwrap();
+    for (id, sealed) in &keys {
+        assert!(
+            old.open::<store::KeyRecord>(store::Table::PrincipalKeys, id.as_bytes(), sealed)
+                .is_err()
+        );
+    }
+    let revisions: Vec<(Vec<u8>, Vec<u8>)> =
+        sqlx::query_as("select compose_hash, sealed from revisions")
+            .fetch_all(&h.pool)
+            .await
+            .unwrap();
+    assert!(!revisions.is_empty());
+    for (hash, sealed) in &revisions {
+        assert!(
+            old.open::<instance::RevisionRow>(store::Table::Revisions, hash, sealed)
+                .is_err()
+        );
+    }
+    let rotated_at = h.audit("custodians.rotate").await[0].0;
+    match audit::verify(&h.pool, &old, audit::Checkpoint::default(), |_| {}).await {
+        Err(audit::ChainError::Broken { seq, .. }) => assert_eq!(seq, rotated_at),
+        other => panic!("the old keys read the audit log past the rotation: {other:?}"),
+    }
+    for purpose in ["tenant-kek-root", "ca", "data-key"] {
+        let current = wrapped_row(&h.pool, "intermediate_keys", purpose)
+            .await
+            .unwrap();
+        assert!(alpha_kms::keys::aead_open(&old_root, purpose.as_bytes(), &current).is_none());
+    }
+
+    // Two current shares open all of it.
+    let new_shares: Vec<Vec<u8>> = new_files[..2]
+        .iter()
+        .zip(&new)
+        .map(|(file, key)| {
+            cli_node::ShareFile::read(file)
+                .unwrap()
+                .open(key)
+                .unwrap()
+                .to_vec()
+        })
+        .collect();
+    let new_root = combine(&new_shares);
+    let tkr: [u8; 32] = alpha_kms::keys::aead_open(
+        &new_root,
+        b"tenant-kek-root",
+        &wrapped_row(&h.pool, "intermediate_keys", "tenant-kek-root")
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+    .as_slice()
+    .try_into()
+    .unwrap();
+    let data = DataKey::unwrap(
+        &new_root,
+        &wrapped_row(&h.pool, "intermediate_keys", "data-key")
+            .await
+            .unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(data.epoch, 1);
+    let current = MetadataKeys::with_data(&tkr, &data).unwrap();
+    for (name, value) in [
+        ("after", &b"written-after"[..]),
+        ("before", b"replaced-after"),
+    ] {
+        let row = store::load_secret(&h.pool, &current, h.org.into(), name)
+            .await
+            .unwrap()
+            .unwrap();
+        let opened = alpha_kms::keys::aead_open(
+            &current.secret_key(h.org, anchor).unwrap(),
+            row.id.as_bytes(),
+            &row.ciphertext,
+        )
+        .unwrap();
+        assert_eq!(opened.as_slice(), value);
+    }
+    audit::verify(&h.pool, &current, audit::Checkpoint::default(), |_| {})
+        .await
+        .unwrap();
+
+    // The residual: tenant-kek-root does not rotate, so the backup and the old shares still give
+    // every App's derived keys, which stay what customers' volumes are encrypted under.
+    assert_eq!(tkr, backup_tkr);
+    let org_key = alpha_kms::keys::org_key(&backup_tkr, h.org, anchor).unwrap();
+    let app_key = alpha_kms::keys::app_key(&org_key, app, "disk").unwrap();
+    assert_eq!(b64(app_key.as_slice()), derived_before);
 }
 
 /// The serving node's join reply to the keyed capture's node, as `db.rs` joins it.

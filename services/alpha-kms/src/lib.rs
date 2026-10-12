@@ -1,4 +1,4 @@
-//! The key broker: seven tables, eighteen routes on one TLS port, one process-wide state.
+//! The key broker: seven tables, nineteen routes on one TLS port, one process-wide state.
 
 #![cfg_attr(
     test,
@@ -17,6 +17,7 @@ pub mod certs;
 pub mod channel;
 pub mod control;
 pub mod custodians;
+pub mod data_key;
 pub mod db_volume;
 pub mod error;
 pub mod instance;
@@ -197,12 +198,15 @@ pub enum CollateralSource {
     Fixed(Box<Collateral>),
 }
 
-/// The two intermediates in memory after unseal, join or bootstrap, and the database's keys
-/// derived from the first; the database's volume key (M2(a)) when the database has one.
+/// The intermediates in memory after unseal, join or bootstrap, and the database's keys: derived
+/// from tenant-kek-root until the first custodian rotation, from the latest rotation's data key
+/// afterwards; the database's volume key (M2(a)) when the database has one.
 pub struct Intermediates {
     pub tenant_kek_root: Zeroizing<[u8; 32]>,
     pub ca_key_der: Zeroizing<Vec<u8>>,
     pub ca_cert_der: Vec<u8>,
+    /// The latest custodian rotation's data key; none before the first.
+    pub data: Option<data_key::DataKey>,
     pub metadata: store::MetadataKeys,
     pub db_volume: Option<Zeroizing<[u8; 32]>>,
 }
@@ -219,12 +223,23 @@ impl Intermediates {
             ca_key_der,
             ca_cert_der,
             db_volume: None,
+            data: None,
         })
     }
 
     pub fn with_db_volume(mut self, key: Option<Zeroizing<[u8; 32]>>) -> Self {
         self.db_volume = key;
         self
+    }
+
+    /// The database's keys from `data` (epoch 0's from tenant-kek-root when `None`).
+    pub fn with_data(mut self, data: Option<data_key::DataKey>) -> Result<Self, ApiError> {
+        self.metadata = match &data {
+            Some(data) => store::MetadataKeys::with_data(&self.tenant_kek_root, data)?,
+            None => store::MetadataKeys::derive(&self.tenant_kek_root)?,
+        };
+        self.data = data;
+        Ok(self)
     }
 
     pub fn ca_key(&self) -> Result<rcgen::KeyPair, ApiError> {
@@ -277,6 +292,11 @@ pub struct Node {
     pub unseal_extras: Mutex<db_volume::UnsealExtras>,
     /// Audit rows of a node waiting for its database, appended once it serves.
     pub held_audit: Mutex<Vec<db_volume::Held>>,
+    /// The highest audit head this node has seen committed, and whether it has halted.
+    pub chain: audit::Watch,
+    /// The audit heads custodians' share files remembered, beside the shares collected so far;
+    /// checked once the shares open the database, dropped with them otherwise.
+    pub unseal_floors: Mutex<Vec<audit::Head>>,
     bucket: Mutex<(f64, Instant)>,
 }
 
@@ -327,6 +347,8 @@ impl Node {
             pending_rotation: Mutex::new(None),
             unseal_extras: Mutex::new(db_volume::UnsealExtras::default()),
             held_audit: Mutex::new(Vec::new()),
+            chain: audit::Watch::default(),
+            unseal_floors: Mutex::new(Vec::new()),
             bucket: Mutex::new((BUCKET_CAPACITY, Instant::now())),
         }))
     }
@@ -343,7 +365,10 @@ impl Node {
         self.platform.read().clone()
     }
 
+    /// The intermediates of a serving node that has not halted: every route that releases a key
+    /// or reads a tenant row starts here.
     pub fn intermediates(&self) -> Result<Arc<Intermediates>, ApiError> {
+        self.chain.refuse_if_halted()?;
         match &*self.phase.read() {
             Phase::Serving(keys) => Ok(keys.clone()),
             Phase::Sealed { .. } => Err(ApiError::new("sealed", "node is sealed")),
@@ -351,6 +376,15 @@ impl Node {
                 "sealed",
                 "node is unsealed but waits for its database",
             )),
+        }
+    }
+
+    /// The intermediates a serving node holds, halted or not: to renew its own leaf, never for a
+    /// route ([`Node::intermediates`] is the routes' way in).
+    pub fn held_intermediates(&self) -> Option<Arc<Intermediates>> {
+        match &*self.phase.read() {
+            Phase::Serving(keys) => Some(keys.clone()),
+            Phase::Sealed { .. } | Phase::Unsealed(_) => None,
         }
     }
 
@@ -363,8 +397,9 @@ impl Node {
         matches!(&*self.phase.read(), Phase::Serving(_))
     }
 
-    /// The database's volume key, while unsealed or serving.
+    /// The database's volume key, while unsealed or serving, and not halted.
     pub fn db_volume_key(&self) -> Result<Zeroizing<[u8; 32]>, ApiError> {
+        self.chain.refuse_if_halted()?;
         match &*self.phase.read() {
             Phase::Serving(keys) => keys
                 .db_volume
@@ -376,9 +411,10 @@ impl Node {
     }
 
     /// An audit row in a transaction of its own: sealed while serving, a node fact otherwise.
+    /// Refused (`halted`) once the node has halted.
     pub async fn audit(&self, row: audit::Audit<'_>) -> Result<i64, ApiError> {
         let keys = self.intermediates().ok();
-        row.insert_now(&self.pool, keys.as_ref().map(|k| &k.metadata))
+        row.insert_now(&self.pool, &self.chain, keys.as_ref().map(|k| &k.metadata))
             .await
     }
 
@@ -403,8 +439,20 @@ impl Node {
     /// Enters the serving phase: unseal → the database's keys → every plaintext row sealed → serve,
     /// with intermediates in memory and a leaf from `ca` on the listener. A database that cannot be
     /// sealed keeps the node sealed.
+    /// Enters the serving phase: unseal → the database's keys → the database holds every audit
+    /// head this node knows (its own, the joined node's, the custodians', its reachable peers') →
+    /// every plaintext row sealed → serve, with intermediates in memory and a leaf from `ca` on the
+    /// listener. A database that cannot be sealed keeps the node sealed; one without a known head
+    /// halts it.
     pub async fn start_serving(&self, keys: Intermediates) -> Result<(), ApiError> {
-        let sealed = store::seal_plaintext(&self.pool, &keys.metadata).await?;
+        self.chain.refuse_if_halted()?;
+        node::learn_peer_heads(self).await?;
+        self.chain.check(&self.pool).await?;
+        // Keys from a node that has not yet joined again after a rotation open nothing here.
+        if store::data_epoch(&self.pool).await? != keys.metadata.epoch() {
+            return Err(audit::stale_keys());
+        }
+        let sealed = store::seal_plaintext(&self.pool, &self.chain, &keys.metadata).await?;
         if !sealed.is_empty() {
             eprintln!("sealed plaintext rows: {sealed:?}");
         }
@@ -415,7 +463,7 @@ impl Node {
         for row in &held {
             if let Err(e) = row
                 .audit()
-                .insert_now(&self.pool, Some(&keys.metadata))
+                .insert_now(&self.pool, &self.chain, Some(&keys.metadata))
                 .await
             {
                 eprintln!("held audit row {}: {}", row.action, e.message);
@@ -425,13 +473,53 @@ impl Node {
         Ok(())
     }
 
-    /// One maintenance pass while serving: rows an older node wrote in the clear are sealed, and
-    /// the audit chain is verified from where the last pass stopped.
+    /// One maintenance pass while serving: the database must still hold every head this node and
+    /// its peers have seen, rows an older node wrote in the clear are sealed, and the audit chain is
+    /// verified from where the last pass stopped. A rollback or a break halts the node; a halted
+    /// node does nothing here, and writes nothing.
     pub async fn maintain(&self) {
         let Ok(keys) = self.intermediates() else {
             return;
         };
-        match store::seal_plaintext(&self.pool, &keys.metadata).await {
+        if let Err(e) = node::learn_peer_heads(self).await {
+            eprintln!("audit head: {}", e.message);
+            return;
+        }
+        if let Err(e) = self.chain.check(&self.pool).await {
+            eprintln!("audit head: {}", e.message);
+            return;
+        }
+        // A rotation on another node replaced the data key: this node's keys open nothing the
+        // database holds now, so it drops them and joins again.
+        match store::data_epoch(&self.pool).await {
+            Ok(epoch) if epoch > keys.metadata.epoch() => {
+                eprintln!(
+                    "data key epoch {epoch} after this node's {}: joining again",
+                    keys.metadata.epoch()
+                );
+                *self.phase.write() = Phase::Sealed { shares: Vec::new() };
+                if let Err(e) = node::try_join(self).await {
+                    eprintln!("sealed: {}; waiting for unseal", e.message);
+                }
+                return;
+            }
+            Ok(epoch) if epoch < keys.metadata.epoch() => {
+                self.chain.halt(
+                    audit::Halt::RolledBack,
+                    &format!(
+                        "the database's data key is from epoch {epoch}, before this node's {}",
+                        keys.metadata.epoch()
+                    ),
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("data key epoch: {}", e.message);
+                return;
+            }
+        }
+        match store::seal_plaintext(&self.pool, &self.chain, &keys.metadata).await {
             Ok(sealed) if !sealed.is_empty() => eprintln!("sealed plaintext rows: {sealed:?}"),
             Ok(_) => {}
             Err(e) => eprintln!("sealing plaintext rows: {}", e.message),
@@ -444,6 +532,17 @@ impl Node {
         let walked = audit::verify(&self.pool, &keys.metadata, from, |_| {}).await;
         let broken = match walked {
             Ok(at) => {
+                // Walked, so committed: the floor rises to the last linked row, and the database
+                // must still hold it on the next pass.
+                if let Some(head) = at.head()
+                    && let Err(e) = self
+                        .chain
+                        .observe(&self.pool, head, "this node's walk")
+                        .await
+                {
+                    eprintln!("audit head: {}", e.message);
+                    return;
+                }
                 *self.audit_chain.lock() = Ok(at);
                 return;
             }
@@ -453,16 +552,10 @@ impl Node {
             }
             Err(e) => e.to_string(),
         };
-        eprintln!("{broken}");
-        *self.audit_chain.lock() = Err(broken.clone());
-        let row = audit::node(
-            "audit.verify",
-            "error",
-            serde_json::json!({ "message": broken }),
-        );
-        if let Err(e) = self.audit(row).await {
-            eprintln!("audit.verify: {}", e.message);
-        }
+        // ACC-FD-103: a broken chain stops the node. It writes no `audit.verify` row: nothing more
+        // goes into a chain it can no longer vouch for.
+        self.chain.halt(audit::Halt::Broken, &broken);
+        *self.audit_chain.lock() = Err(broken);
     }
 
     /// The listener's leaf from `ca`: `alphacompute://kms` and this node's Revision.
@@ -496,6 +589,9 @@ async fn gate(State(node): State<Arc<Node>>, request: Request, next: Next) -> Re
     }
     let path = request.uri().path();
     let exempt = path.starts_with("/v1/node/") || path == "/healthz" || path == "/ready";
+    if !exempt && let Some(halt) = node.chain.halted() {
+        return halt.error().into_response();
+    }
     if !exempt && !node.is_serving() {
         return ApiError::new("sealed", "node is sealed").into_response();
     }
@@ -533,12 +629,19 @@ pub fn router(node: Arc<Node>) -> Router {
         )
         .route("/v1/node/nonce", post(instance::nonce))
         .route("/v1/node/db-key", post(db_volume::db_key))
+        .route("/v1/node/audit-head", get(node::audit_head))
         .layer(middleware::from_fn_with_state(node.clone(), gate))
         .fallback(|| async { ApiError::not_found("no such route").into_response() })
         .with_state(node)
 }
 
 async fn ready(State(node): State<Arc<Node>>) -> Response {
+    // Not ready, with the fixed reason only: peers do not join it, and balancers send it nothing.
+    if let Some(halt) = node.chain.halted() {
+        let body =
+            axum::Json(serde_json::json!({ "sealed": node.is_sealed(), "halted": halt.reason() }));
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response();
+    }
     if !node.is_sealed() && !node.is_serving() {
         let body = axum::Json(serde_json::json!({ "sealed": false, "database": "waiting" }));
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response();

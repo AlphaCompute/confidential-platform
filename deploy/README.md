@@ -133,6 +133,17 @@ the platform-document URL are served; the signed document lists the Revision.
 Both nodes now serve; a restart of either is a `join` from the other; losing both means
 `alpha unseal` with two of the three shares.
 
+**A halted node.** `GET /ready` answering 503 `{"halted": "audit_chain_broken"}` or
+`{"halted": "audit_chain_rolled_back"}` means the node found the audit chain tampered with, or
+its database without an audit head it, a peer or a custodian saw committed (a restore from an
+older copy, or another copy). It releases nothing and writes nothing; it does not recover on its
+own. Find out what changed the database before anything else. A restart clears its memory and it
+then joins a serving node or waits for custodians, both of which check the heads again. To accept
+a database deliberately restored from a backup, stop every KMS node (their memory holds the head),
+then the custodians whose share files remember a later head unseal with
+`alpha unseal --accept-audit-rollback`, which goes in the ceremony record
+(`docs/metadata-encryption.md`, "Rollback of the whole database").
+
 ## Replacing a custodian
 
 When a custodian leaves, or a share or custodian key may be exposed, replace the custodian set
@@ -158,14 +169,17 @@ custodian take part; the platform document and every tenant are untouched.
    the share file.
 5. Every custodian who held an old share deletes it now. Two new custodians unseal a node,
    started for the purpose, as the ceremony's check that the new shares work. The operator runs
-   `VACUUM intermediate_keys` as the schema owner.
+   `VACUUM FULL intermediate_keys, principal_keys, revisions, secrets` as the schema owner.
 
 The commands check a Kata node's agent policy against the Alpha baseline by default. Until that
 checker is in the build they refuse a Kata node and name `--no-policy-baseline`. Passing it is
-recorded in each command's output and goes in the ceremony record. Joined nodes keep serving
-throughout. A copy of the database from before the rotation plus two old shares still opens it,
-so pre-rotation backups of `intermediate_keys` are destroyed or kept like shares. The dev App
-refuses to rotate: its root comes from the environment.
+recorded in each command's output and goes in the ceremony record. The rotation also replaces the
+data key and re-encrypts every row under it: the other node refuses writes until its next
+five-minute pass, when it joins again, so clients fail over to the rotating node meanwhile. A copy
+of the database from before the rotation plus two old shares still opens that copy as it was,
+every App's derived keys and the CA key (`docs/custodian-rotation.md`), so pre-rotation backups and
+WAL archives are destroyed or kept like shares. The dev App refuses to rotate: its root comes from
+the environment.
 
 ## The database's volume key (Kata, M2(a))
 

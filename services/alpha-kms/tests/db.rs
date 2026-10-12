@@ -118,13 +118,16 @@ async fn bootstrap_once_unseal_with_two_shares_and_sealed_gate() {
         (StatusCode::BAD_REQUEST, "malformed")
     );
     let (status, reply) = post(unseal(&h.shares[0])).await;
+    // The head the node serves from, for the custodian's share file: its own `node.unseal` row.
+    let head = node2.chain.floor().unwrap();
     assert_eq!(
         (status, reply),
         (
             StatusCode::OK,
-            json!({ "sealed": false, "shares": 2, "database": "open" })
+            json!({ "sealed": false, "shares": 2, "database": "open", "audit_head": head.to_wire() })
         )
     );
+    assert_eq!(h.audit_rows().await.last().unwrap().seq, head.seq);
     assert!(!node2.is_sealed());
     assert_eq!(
         send(client().get(format!("{url2}/ready"))).await.0,

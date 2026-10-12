@@ -209,6 +209,7 @@ pub fn accept(
         kms_node_spki_sha256: rotation.proposal.kms_node_spki_sha256.clone(),
         platform_document_version: doc.version,
         db_volume_wrapped: rotation.db_volume_wrapped.clone(),
+        audit_head: None,
     };
     // Opens, so the custodian learns now, not at the next unseal, that the share is theirs.
     file.open(custodian)?;

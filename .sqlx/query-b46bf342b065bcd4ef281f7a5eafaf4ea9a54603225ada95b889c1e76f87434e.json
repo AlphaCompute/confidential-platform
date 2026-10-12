@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select wrapped, epoch from intermediate_keys where purpose = 'data-key'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "wrapped",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "intermediate_keys",
+            "name": "wrapped"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "epoch",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "intermediate_keys",
+            "name": "epoch"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "b46bf342b065bcd4ef281f7a5eafaf4ea9a54603225ada95b889c1e76f87434e"
+}
