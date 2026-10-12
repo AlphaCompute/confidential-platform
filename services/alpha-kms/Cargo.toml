@@ -9,6 +9,9 @@ workspace = true
 
 [features]
 dev-root = []
+# Expose DCAP-bypass test seams (join_verified, verify_kata_node) as `pub` for integration
+# tests. Never enable in production. Run tests with: cargo test --features test-seams
+test-seams = ["alpha-cli/test-seams"]
 
 [dependencies]
 aes-gcm = "0.11"
