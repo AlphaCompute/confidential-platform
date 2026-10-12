@@ -30,6 +30,13 @@ const FLAG_BS = 0x10;
 
 const MESSAGES = {
   framed: "This page cannot run inside another page. Open the link in its own tab.",
+  embed_disabled: "This approval cannot be shown inside another page. Open the approval link in its own tab.",
+  embed_not_framed: "This view is shown inside your portal. Open the approval link instead.",
+  embed_ancestor: "This page is not allowed to show this approval. Open the approval link in its own tab.",
+  embed_note:
+    "Approving opens a window of AlphaCompute's own, where you see everything this launch runs and confirm with your passkey.",
+  embed_opened:
+    "Finish in the window that opened, then check here. If none opened, allow pop-ups for this page or open the approval link in its own tab.",
   no_passkeys: "This browser cannot use passkeys. Open this link in Safari, Chrome, Edge or Firefox.",
   bad_link: "This link is not valid.",
   platform: "The platform document did not verify. Do not continue; contact AlphaCompute.",
@@ -1187,6 +1194,69 @@ function imageChanges(before, services) {
     );
 }
 
+// --- S5 (PRD-03, draft): the approval view a portal may frame --------------------------------
+//
+// `/sign/embed#<ticket>` is the one view a page of another origin may frame, and only a portal
+// origin the release-signed platform document lists under `signer.embed_ancestors`; the host
+// sends the same list as the view's `frame-ancestors`. It never signs and never asks for a
+// passkey: it shows which launch waits for approval and offers one button, which opens
+// `/sign/approve#<ticket>` in a new top-level window on this origin. Everything the approval
+// page checks, shows and signs happens there, under `frame-ancestors 'none'`, after the user's
+// own click, so a framing page cannot change what is approved or trick a click into a signature.
+// It cannot decline either: a decline is a state change and stays on the approval page.
+//
+// QUESTION(PRD-03 Q14): the Rafay portal origins, and whether Rafay can frame a third-party page
+// at all. QUESTION(PRD-03 Q15): Ryan Tharp's sign-off on framing an approval view.
+// QUESTION(PRD-03 Q16): whether a window of our own meets "tenants never leave their portal".
+
+// Whether every page around this frame is an allowed portal. location.ancestorOrigins lists them
+// in Chromium and Safari; Firefox lacks it, and there frame-ancestors from the host is the only
+// check (QUESTION(PRD-03 Q17)).
+function framedByAllowed(allowed) {
+  if (window.top === window.self) return false;
+  const chain = location.ancestorOrigins;
+  if (!chain) return true;
+  const origins = Array.from(chain);
+  return origins.length > 0 && origins.every((o) => allowed.includes(o));
+}
+
+async function startEmbed(view, ticket) {
+  const allowed = (view.signer && view.signer.embed_ancestors) || [];
+  if (!allowed.length) return stop(MESSAGES.embed_disabled);
+  if (window.top === window.self) return stop(MESSAGES.embed_not_framed);
+  if (!framedByAllowed(allowed)) return stop(MESSAGES.embed_ancestor);
+  const reply = await api(view, "GET", `/v1/approval-requests/${ticket}`);
+  if (reply.status !== 200) return stop(failure(reply));
+  const read = reply.body;
+  const refusal = approvalRefusal(read);
+  if (refusal) return stop(refusal);
+  const ui = screen(
+    el(
+      "p",
+      `Launch approval for ${typeof read.org_name === "string" ? read.org_name : read.org_id}`,
+      "eyebrow",
+    ),
+    el("h1", read.title),
+  );
+  ui.facts.replaceChildren(
+    fact("App", read.app_id),
+    fact("compose_hash", read.compose_hash, "digest"),
+    fact("Link open until", read.expires_at),
+  );
+  const check = button("Check again", () => startEmbed(view, ticket), "secondary");
+  const open = button("Review and approve", async () => {
+    // noopener: the new window gets no handle back to this frame or the portal, and the approval
+    // page's Cross-Origin-Opener-Policy severs it again.
+    // With noopener a browser returns null whether or not the window opened, so a blocked
+    // pop-up looks like an opened one and the note covers both.
+    // TODO(draft): QUESTION(PRD-03 Q16) — telling them apart, or showing "Approved" here without
+    // "Check again", needs a channel back from the new window, which noopener rules out.
+    window.open(`${location.origin}/sign/approve#${ticket}`, "_blank", "noopener");
+    offer(ui, MESSAGES.embed_opened, check);
+  });
+  return offer(ui, MESSAGES.embed_note, open);
+}
+
 function servedBySigner(view) {
   return Boolean(view.signer?.origins.includes(location.origin));
 }
@@ -1212,14 +1282,17 @@ async function loadFont() {
 }
 
 async function boot() {
-  if (window.top !== window.self) return stop(MESSAGES.framed);
-  if (!window.PublicKeyCredential) return stop(MESSAGES.no_passkeys);
+  const mode = location.pathname.split("/").pop();
+  // Only the embed view may run framed, and it never asks for a passkey.
+  if (mode !== "embed") {
+    if (window.top !== window.self) return stop(MESSAGES.framed);
+    if (!window.PublicKeyCredential) return stop(MESSAGES.no_passkeys);
+  }
 
   await wasm_bindgen({ module_or_path: fetch(WASM_URL, { integrity: WASM_SRI }) });
 
-  const mode = location.pathname.split("/").pop();
   const ticket = location.hash.slice(1);
-  if ((mode !== "claim" && mode !== "approve") || !TICKET.test(ticket)) return stop(MESSAGES.bad_link);
+  if (!["claim", "approve", "embed"].includes(mode) || !TICKET.test(ticket)) return stop(MESSAGES.bad_link);
 
   const platform = await verifiedPlatform();
   if (!platform) return stop(MESSAGES.platform);
@@ -1231,6 +1304,7 @@ async function boot() {
   if (!servedBySigner(view)) return stop(MESSAGES.not_signer);
 
   if (mode === "claim") return startClaim(view, ticket);
+  if (mode === "embed") return startEmbed(view, ticket);
   return startApproval(view, viewText, ticket);
 }
 
