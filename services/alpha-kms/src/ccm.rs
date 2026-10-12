@@ -36,7 +36,7 @@ use crate::keys::{self, SignatureObject};
 use crate::{Node, certs, rfc3339};
 
 pub const CCM_RESULT_FORMAT: &str = "alphacompute-ccm-attestation-result/1";
-pub const ATTEST_CCM_ROUTE: &str = "attest.ccm";
+pub use alpha_channel::receipt::ATTEST_CCM_ROUTE;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
