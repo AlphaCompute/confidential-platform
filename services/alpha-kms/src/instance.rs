@@ -188,7 +188,7 @@ pub async fn attest(
 /// after DCAP, the audit row included. No route reaches it. The KMS's tests run the Kata pod's
 /// cases through it over synthetic quotes, as `alpha_attest::kata` tests its profile, until B300
 /// Kata captures exist (M1).
-pub async fn attest_verified(
+pub(crate) async fn attest_verified(
     node: &Node,
     request: &AttestRequest,
     verified: VerifiedQuote,
@@ -268,10 +268,10 @@ async fn attest_inner(
             ));
         }
         (AnyEvidence::V2(evidence), verified) => {
+            kata::check_cpu_kind(evidence)?;
             let verified = match verified {
                 Some(verified) => verified,
                 None => {
-                    kata::check_cpu_kind(evidence)?;
                     let collateral = collateral(node, &evidence.cpu.quote).await?;
                     verify_quote(&evidence.cpu.quote, &collateral, &doc.policy, now)?
                 }
@@ -355,7 +355,7 @@ fn unregistered(appraised: &Appraised) -> ApiError {
 /// Revision's: its runtime class, init-data and policy digests, and exactly its GPUs, of its model.
 /// The Revision hash already binds the init-data; held again here against the registered row, so
 /// no leaf names a Revision whose GPUs were not the ones verified.
-pub fn check_platform(
+pub(crate) fn check_platform(
     revision: &RevisionRow,
     coco: Option<&CocoAppraised>,
 ) -> Result<(), ApiError> {
