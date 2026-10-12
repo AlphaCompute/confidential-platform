@@ -144,6 +144,12 @@ then the custodians whose share files remember a later head unseal with
 `alpha unseal --accept-audit-rollback`, which goes in the ceremony record
 (`docs/metadata-encryption.md`, "Rollback of the whole database").
 
+**Custodians witness the audit head.** At least two custodians run `alpha witness --share
+share-N.json --endpoint https://<node>` daily and after any revocation or Secret change that
+matters. It records the head a serving node has seen in their share file, and their next unseal
+refuses a database restored from before it. A full cold restart onto a copy newer than every
+witnessed head is not caught.
+
 ## Replacing a custodian
 
 When a custodian leaves, or a share or custodian key may be exposed, replace the custodian set
@@ -168,8 +174,10 @@ custodian take part; the platform document and every tenant are untouched.
    rotation, so a lost reply costs nothing. It verifies the node and the receipt, and writes
    the share file.
 5. Every custodian who held an old share deletes it now. Two new custodians unseal a node,
-   started for the purpose, as the ceremony's check that the new shares work. The operator runs
-   `VACUUM FULL intermediate_keys, principal_keys, revisions, secrets` as the schema owner.
+   started for the purpose, as the ceremony's check that the new shares work, and each new
+   custodian runs `alpha witness` against a serving node, since a new share file remembers no
+   audit head. The operator runs `VACUUM FULL intermediate_keys, principal_keys, revisions,
+   secrets` as the schema owner.
 
 The commands check a Kata node's agent policy against the Alpha baseline by default. Until that
 checker is in the build they refuse a Kata node and name `--no-policy-baseline`. Passing it is

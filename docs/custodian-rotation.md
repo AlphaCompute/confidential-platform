@@ -47,7 +47,7 @@ Code: `services/alpha-kms/src/custodians.rs` (routes), `src/data_key.rs` and `st
    - finds the custodian's key among the three and opens their share;
    - writes `share.json`, refusing to overwrite an existing file.
 
-   The output says whether the attested node is the one that rotated (`rotating_node_attested`).
+   The output says whether the attested node is the one that rotated (`rotating_node_attested`). A new share file remembers no KMS audit head, so the new custodian then runs `alpha witness` against a serving node, which records one (`docs/metadata-encryption.md`, "Rollback of the whole database").
 
 The receipt's signed response is `{rotation_id, proposal_sha256, kms_node_spki_sha256, custodians_sha256[3], shares_hpke_sha256[3], approved_by_shares, rewrapped, data_key_epoch, rekeyed}`. `rekeyed` counts the rows re-encrypted per table. `approved_by_shares` holds the Shamir x-coordinates (1–3) of the two shares that approved. The node never learns which person holds which share.
 
