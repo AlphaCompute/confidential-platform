@@ -46,6 +46,8 @@ pub const RUNTIME_CLASSES: [&str; 4] = [
 ];
 /// Whole GPUs only (no MIG in CC mode), one or a full eight-GPU node.
 pub const GPU_COUNTS: [u32; 2] = [1, 8];
+/// The most NICs/DPUs a Revision may expect attested.
+pub const MAX_DPUS: u32 = 8;
 /// Init-data larger than this is refused before it is parsed.
 pub const MAX_INITDATA_BYTES: usize = 512 * 1024;
 
@@ -248,6 +250,7 @@ impl InitData {
             policy_sha256: self.policy_sha256()?,
             runtime_class: alpha.runtime_class,
             gpu: alpha.gpu,
+            dpu: alpha.dpu,
         })
     }
 }
@@ -262,6 +265,9 @@ pub struct AlphaEntry {
     /// Required on [`GPU_RUNTIME_CLASS`], refused on [`CPU_RUNTIME_CLASS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu: Option<GpuShape>,
+    /// The NICs/DPUs the pod's host must prove (`nvidia-dpu/1`), on any runtime class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dpu: Option<DpuShape>,
 }
 
 impl AlphaEntry {
@@ -269,8 +275,43 @@ impl AlphaEntry {
         if self.format != ALPHA_ENTRY_FORMAT {
             return Err(format!("format {:?}", self.format));
         }
-        check_shape(&self.runtime_class, self.gpu.as_ref())
+        check_shape(&self.runtime_class, self.gpu.as_ref())?;
+        check_dpu(self.dpu.as_ref())
     }
+}
+
+/// The NICs/DPUs a pod expects attested with it (composite attestation), every one the same model.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DpuShape {
+    /// 1 to [`MAX_DPUS`].
+    pub count: u32,
+    /// As the platform document's `dpu_policy` names it, e.g. `BLUEFIELD-3`.
+    pub model: String,
+}
+
+fn check_dpu(dpu: Option<&DpuShape>) -> Result<(), String> {
+    let Some(dpu) = dpu else {
+        return Ok(());
+    };
+    if !(1..=MAX_DPUS).contains(&dpu.count) {
+        return Err(format!("dpu.count {} is not 1 to {MAX_DPUS}", dpu.count));
+    }
+    if !is_model_name(&dpu.model) {
+        return Err(format!(
+            "dpu.model {:?} is not an upper-case model name",
+            dpu.model
+        ));
+    }
+    Ok(())
+}
+
+fn is_model_name(model: &str) -> bool {
+    !model.is_empty()
+        && model.len() <= 32
+        && model
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// The GPUs a pod expects, every one of them the same model.
@@ -306,13 +347,7 @@ fn check_shape(runtime_class: &str, gpu: Option<&GpuShape>) -> Result<(), String
     if !GPU_COUNTS.contains(&gpu.count) {
         return Err(format!("gpu.count {} is not 1 or 8", gpu.count));
     }
-    let model_ok = !gpu.model.is_empty()
-        && gpu.model.len() <= 32
-        && gpu
-            .model
-            .bytes()
-            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-');
-    if !model_ok {
+    if !is_model_name(&gpu.model) {
         return Err(format!(
             "gpu.model {:?} is not an upper-case model name",
             gpu.model
@@ -333,6 +368,9 @@ pub struct CocoRevision {
     pub runtime_class: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu: Option<GpuShape>,
+    /// Absent unless the init-data expects NICs/DPUs, so a Revision without one hashes as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dpu: Option<DpuShape>,
 }
 
 impl CocoRevision {
@@ -369,6 +407,7 @@ impl CocoRevision {
             )));
         }
         check_shape(&revision.runtime_class, revision.gpu.as_ref()).map_err(bad)?;
+        check_dpu(revision.dpu.as_ref()).map_err(bad)?;
         if revision.canonical()? != text {
             return Err(bad("not in canonical (JCS) form".into()));
         }
@@ -466,6 +505,52 @@ mod tests {
         let t384 = initdata("sha384", &a);
         let m = InitData::parse(t384.as_bytes()).unwrap().mrconfigid();
         assert_eq!(m.as_slice(), Sha384::digest(t384.as_bytes()).as_slice());
+    }
+
+    #[test]
+    fn a_revision_may_expect_dpus_on_any_class() {
+        const DPU: &str = "\"dpu\":{\"count\":1,\"model\":\"BLUEFIELD-3\"},";
+        for (class, gpu) in [(CPU_RUNTIME_CLASS, ""), (GPU_RUNTIME_CLASS, GPU1)] {
+            let alpha = alpha_on(class, &format!("{DPU}{gpu}"));
+            let revision = InitData::parse(initdata("sha384", &alpha).as_bytes())
+                .unwrap()
+                .revision()
+                .unwrap();
+            assert_eq!(
+                revision.dpu,
+                Some(DpuShape {
+                    count: 1,
+                    model: "BLUEFIELD-3".into()
+                })
+            );
+            let canonical = revision.canonical().unwrap();
+            let app: AppId = APP.parse().unwrap();
+            assert_eq!(
+                CocoRevision::check_registered(&canonical, app).unwrap(),
+                revision
+            );
+        }
+        for (dpu, why) in [
+            (
+                "\"dpu\":{\"count\":0,\"model\":\"BLUEFIELD-3\"},",
+                "dpu.count 0",
+            ),
+            (
+                "\"dpu\":{\"count\":9,\"model\":\"BLUEFIELD-3\"},",
+                "dpu.count 9",
+            ),
+            ("\"dpu\":{\"count\":1,\"model\":\"bf3\"},", "dpu.model"),
+            (
+                "\"dpu\":{\"count\":1,\"model\":\"BF3\",\"x\":1},",
+                "unknown field",
+            ),
+        ] {
+            let init =
+                InitData::parse(initdata("sha384", &alpha_on(CPU_RUNTIME_CLASS, dpu)).as_bytes())
+                    .unwrap();
+            let error = init.revision().unwrap_err().to_string();
+            assert!(error.contains(why), "{why}: {error}");
+        }
     }
 
     #[test]
@@ -647,6 +732,7 @@ mod tests {
                 count,
                 model: "B300".into(),
             }),
+            dpu: None,
         };
         let registered = |r: CocoRevision| {
             let text = r.canonical().unwrap();
