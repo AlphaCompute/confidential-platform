@@ -12,6 +12,7 @@
         clippy::arithmetic_side_effects
     )
 )]
+pub mod attestation;
 pub mod platform;
 pub mod runtime;
 pub mod tls;
@@ -174,6 +175,10 @@ pub struct AttestReply {
     pub certificate_chain: Vec<String>,
     pub not_after: String,
     pub attestation_result: AttestationResult,
+    /// The KMS node's receipt over the request, the result and the leaf; see [`attestation`].
+    /// Absent from a KMS that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_receipt: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

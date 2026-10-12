@@ -1,4 +1,4 @@
-//! The four routes on the unix socket: HTTP/1.1, JSON, no authentication — access is the
+//! The routes on the unix socket: HTTP/1.1, JSON, no authentication — access is the
 //! right to the socket. KMS errors pass through in their own envelope with their status.
 
 use std::sync::Arc;
@@ -21,6 +21,7 @@ pub fn router(runtime: Arc<Runtime>) -> Router {
         .route("/v1/identity", get(identity))
         .route("/v1/secrets/{name}", get(secret))
         .route("/v1/keys/{purpose}", get(key))
+        .route("/v1/evidence-bundle", get(evidence_bundle))
         .route("/healthz", get(healthz))
         .fallback(|| async { envelope(StatusCode::NOT_FOUND, "not_found", "no such route") })
         .with_state(runtime)
@@ -97,6 +98,20 @@ async fn key(
     Path(purpose): Path<String>,
 ) -> Result<Json<DerivedKey>, Error> {
     runtime.key(&purpose).await.map(Json)
+}
+
+/// The current leaf's evidence bundle (PRD-06 clear claims): the request, the leaf and the KMS's
+/// receipt naming the verifiers that attested this workload. 404 from a KMS that sends no receipt.
+async fn evidence_bundle(State(runtime): State<Arc<Runtime>>) -> Result<Response, Error> {
+    let attested = runtime.attested().ok_or(Error::NotAttested)?;
+    Ok(match &attested.bundle {
+        Some(bundle) => Json(bundle).into_response(),
+        None => envelope(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "the KMS sent no attestation receipt",
+        ),
+    })
 }
 
 pub fn healthz_json(runtime: &Runtime) -> Value {
