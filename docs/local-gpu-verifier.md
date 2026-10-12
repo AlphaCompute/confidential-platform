@@ -131,7 +131,7 @@ Release-signed in the platform document, refusing unknown fields like the rest o
 - `rims`: every RIM the verifier may use, by the SHA-384 its signature covers; the value is the RIM's ID, for people. A RIM in the cache but not here is ignored.
 - `fwids`: the certified FMC firmware IDs the release accepts, captured at G0 from a GPU whose measurements matched NVIDIA's RIMs, and added for each firmware update the release accepts.
 - `cc_mode`: `source` is `measurement` (an SPDM block index) or `opaque` (an opaque field type); `values` the signed values that mean production CC mode.
-- `ocsp_max_age_secs`: required, at most 7 days. NVIDIA's responders answer with a one-day `nextUpdate`; NVIDIA's terms (L1) ask for attestation results refreshed at least every 24 hours, which hourly leaves satisfy.
+- `ocsp_max_age_secs`: required, at most 7 days. NVIDIA's responders answer with a one-day `nextUpdate`. NVIDIA's terms (L1; Product-Specific Terms for NVIDIA Confidential Computing, v. July 9, 2026, §1.7) set no refresh interval: a customer that caches their output must publish how often it does, and that NVIDIA may update it more often.
 - `ocsp_url`: optional. When set, the KMS may query exactly this endpoint at appraisal time for a status the cache lacks; when absent, the verifier uses cached responses only and makes no network call.
 - `accept_certificate_hold`: default `false`. NVIDIA's RIM service serves RIMs whose `RIM L4 Signer` is on `certificateHold` (the GB100 VBIOS RIM above, on hold since 2025-06-26, observed 2026-10-12); a release that must accept such RIMs says so here, per document.
 
