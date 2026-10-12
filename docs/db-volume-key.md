@@ -64,7 +64,7 @@ The KMS's pool connects lazily (`main.rs`), so a node starts and answers the Nod
    - `/ready` answers 503 `{"sealed": false, "database": "waiting"}`;
    - every route outside `/v1/node/*` is `sealed`.
 2. The Postgres pod's init container attests the node and receives the key (below). It opens the volume and Postgres starts.
-3. The node tries the database every second. Once it answers, the node unwraps every intermediate under the root it held, writes the held audit rows and serves, and the root is dropped. If the rows do not open under that root, the node returns to sealed and writes a denied `node.unseal` row.
+3. The node tries the database every second. Once it answers, the node unwraps every intermediate under the root it held, checks that the database holds every audit head the custodians' share files remembered (`docs/metadata-encryption.md`, "Rollback of the whole database"), writes the held audit rows and serves, and the root is dropped. If the rows do not open under that root, the node returns to sealed and writes a denied `node.unseal` row. If the database lacks a custodian's head, it was restored from an older copy: the node halts, releases the volume key no more, and writes nothing.
 
 **Genesis** works the same way: the volume key has to exist before the volume it opens. `alpha bootstrap` on a node whose database does not answer:
 - makes the root, both intermediates and the volume key;

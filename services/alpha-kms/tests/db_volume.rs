@@ -25,7 +25,7 @@ use alpha_core::AppId;
 use alpha_core::coco::CPU_RUNTIME_CLASS;
 use alpha_crypto::PrivateKey;
 use alpha_kms::error::ApiError;
-use alpha_kms::{Node, db_volume, platform};
+use alpha_kms::{Node, audit, db_volume, platform};
 use common::kata::{Pod, kata_document, publish};
 use common::*;
 use reqwest::StatusCode;
@@ -414,6 +414,60 @@ async fn a_node_unsealed_with_the_database_closed_and_no_volume_key_stays_sealed
     .unwrap_err();
     assert!(e.contains("no share file carried the db-volume key"), "{e}");
     assert!(cold.is_sealed());
+}
+
+/// #95's rollback check holds on the cold-start path too: the custodians' audit heads are checked
+/// when the database opens, not at the unseal, which comes before it.
+#[tokio::test]
+async fn a_node_that_waited_for_its_database_halts_if_it_lacks_a_custodians_audit_head() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    // Custodian 1's share file remembers a head this database does not hold, as it would after
+    // the database was restored from a copy older than that custodian's last unseal.
+    let path = h.dir.join("share-1.json");
+    let mut file = cli_node::ShareFile::read(&path).unwrap();
+    file.audit_head = Some(
+        audit::Head {
+            seq: 1_000_000,
+            link: vec![7; 32],
+        }
+        .to_wire(),
+    );
+    file.write(&path).unwrap();
+    let port = closed_port().await;
+    let pool = pool_via(&h.pool, port).await;
+    let (cold, cold_url, _cold) =
+        start_node(pool, &h.release.url, &h.release.key, h.node.clock.clone()).await;
+    let client = spki_client(&cold_url, &cold);
+    let identity = node_identity(&cold);
+    for i in [1usize, 2] {
+        let path = h.dir.join(format!("share-{i}.json"));
+        cli_node::unseal(&client, &identity, &path, &h.custodians[i - 1], 1, false)
+            .await
+            .unwrap();
+    }
+    assert!(!cold.is_sealed() && !cold.is_serving(), "waiting");
+    let rows = audit_count(&h).await;
+
+    proxy(port).await;
+    for _ in 0..150 {
+        if cold.chain.halted().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(cold.chain.halted(), Some(audit::Halt::RolledBack));
+    assert!(!cold.is_serving());
+    assert_eq!(
+        send(client_get(&cold_url, "/ready")).await,
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "sealed": true, "halted": "audit_chain_rolled_back" })
+        )
+    );
+    assert_eq!(cold.db_volume_key().err().map(|e| e.code), Some("halted"));
+    assert_eq!(audit_count(&h).await, rows, "the halted node wrote nothing");
 }
 
 #[tokio::test]
