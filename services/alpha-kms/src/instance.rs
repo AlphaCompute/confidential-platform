@@ -263,10 +263,12 @@ fn attestation_receipt(
         "nonce": request.nonce,
         "evidence": request.evidence,
     });
+    let not_after = alpha_channel::cert::not_after_from_der(leaf_der)
+        .map_err(|e| ApiError::internal(format!("leaf not_after: {e}")))?;
     let response = json!({
         "attestation_result": result,
         "certificate_sha256": format!("sha256:{}", hex::encode(Sha256::digest(leaf_der))),
-        "not_after": rfc3339(crate::later(now, certs::LEAF_TTL)?),
+        "not_after": rfc3339(not_after),
     });
     let leaf = certs::pem(&node.server_cert.leaf_der()?);
     // Read after the node's leaf, so a renewal in between cannot put issued_at before its
