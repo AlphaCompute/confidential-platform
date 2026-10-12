@@ -251,8 +251,13 @@ fn appraise_gpu(
     let blocks: BTreeMap<u32, &[u8]> = report
         .blocks
         .iter()
-        .map(|(i, b)| (u32::from(*i).saturating_sub(1), b.value.as_slice()))
-        .collect();
+        .map(|(i, b)| {
+            let idx = u32::from(*i).checked_sub(1).ok_or_else(|| {
+                Refused("block index 0 is not a valid SPDM measurement index".into())
+            })?;
+            Ok((idx, b.value.as_slice()))
+        })
+        .collect::<Result<_, Refused>>()?;
     let candidates: Vec<&Rim> = rims.iter().filter(|r| r.platform_model == chip).collect();
     let pick = |kind: RimKind| -> super::Result<&Rim> {
         let matched: Vec<&Rim> = candidates
