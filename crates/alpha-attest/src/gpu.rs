@@ -16,7 +16,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use alpha_core::coco::GpuShape;
+use alpha_core::coco::{GPU_COUNTS, GpuShape};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -181,9 +181,10 @@ pub async fn verify_gpus(
     Ok(out)
 }
 
-/// The checks that need no backend result: the policy exists, lists a verifier and allows the
-/// Revision's model, and the pod sent one evidence entry per expected GPU. Run before any backend
-/// is called, so a pod that cannot pass costs no verifier call, and again by [`check_gpus`].
+/// The checks that need no backend result, for a pod on the GPU runtime class: the Revision
+/// expects 1 or 8 GPUs, the policy exists, lists a verifier and allows the Revision's model, and
+/// the pod sent one evidence entry per expected GPU. Run before any backend is called, so a pod
+/// that cannot pass costs no verifier call, and again by [`check_gpus`].
 pub fn precheck<'a>(
     policy: Option<&'a GpuPolicy>,
     shape: &GpuShape,
@@ -191,6 +192,14 @@ pub fn precheck<'a>(
 ) -> Result<&'a GpuPolicy, AppraisalError> {
     use AppraisalError::*;
 
+    // A checked Revision never expects another count; refused here too, so no caller can turn
+    // the GPU checks into a pass by expecting no GPU.
+    if !GPU_COUNTS.contains(&shape.count) {
+        return Err(Failed(format!(
+            "the Revision expects {} GPUs, not 1 or 8",
+            shape.count
+        )));
+    }
     let policy = policy.ok_or_else(|| Unknown("the platform document has no gpu_policy".into()))?;
     if policy.verifiers.is_empty() {
         return Err(PolicyDenied("gpu_policy lists no verifier".into()));
@@ -210,25 +219,19 @@ pub fn precheck<'a>(
     Ok(policy)
 }
 
-/// The decision over the backends' results: the Revision's GPU shape, the policy, and the nonce.
-/// `expected` is the Revision's `gpu`; `evidence_count` is how many GPUs the pod sent evidence for.
+/// The decision over the backends' results for a pod on the GPU runtime class: the Revision's GPU
+/// shape, the policy, and the nonce. `shape` is the Revision's `gpu`, which that class always
+/// has; `evidence_count` is how many GPUs the pod sent evidence for. A pod on the CPU class never
+/// gets here: `kata-tdx/1` refuses any GPU for it instead.
 pub fn check_gpus(
     policy: Option<&GpuPolicy>,
-    expected: Option<&GpuShape>,
+    shape: &GpuShape,
     evidence_count: usize,
     appraisals: &[GpuAppraisal],
     nonce: &[u8; 32],
 ) -> Result<CheckedGpus, AppraisalError> {
     use AppraisalError::*;
 
-    let Some(shape) = expected else {
-        if evidence_count != 0 {
-            return Err(Failed(format!(
-                "{evidence_count} GPU evidence entries for a Revision that expects no GPU"
-            )));
-        }
-        return Ok(CheckedGpus::default());
-    };
     let policy = precheck(policy, shape, evidence_count)?;
     let count = usize::try_from(shape.count).map_err(|_| Failed("gpu count".into()))?;
     let mut vouched = Vec::with_capacity(policy.verifiers.len());
@@ -396,19 +399,8 @@ mod tests {
         }]
     }
 
-    fn denied(
-        expected: Option<GpuShape>,
-        evidence: usize,
-        appraisals: Vec<GpuAppraisal>,
-    ) -> (String, String) {
-        let e = check_gpus(
-            Some(&policy()),
-            expected.as_ref(),
-            evidence,
-            &appraisals,
-            &NONCE,
-        )
-        .unwrap_err();
+    fn denied(shape: GpuShape, evidence: usize, appraisals: Vec<GpuAppraisal>) -> (String, String) {
+        let e = check_gpus(Some(&policy()), &shape, evidence, &appraisals, &NONCE).unwrap_err();
         (e.code().to_owned(), e.to_string())
     }
 
@@ -416,7 +408,7 @@ mod tests {
     fn eight_verified_gpus_pass_in_index_order() {
         let mut gpus: Vec<_> = (0..8).map(gpu).collect();
         gpus.reverse();
-        let out = check_gpus(Some(&policy()), Some(&shape(8)), 8, &nras(gpus), &NONCE).unwrap();
+        let out = check_gpus(Some(&policy()), &shape(8), 8, &nras(gpus), &NONCE).unwrap();
         assert_eq!(
             out.gpus.iter().map(|g| g.index).collect::<Vec<_>>(),
             (0..8).collect::<Vec<_>>()
@@ -429,10 +421,21 @@ mod tests {
                 token_sha256: format!("sha256:{}", "aa".repeat(32)),
             }]
         );
-        assert_eq!(
-            check_gpus(None, None, 0, &[], &NONCE).unwrap(),
-            CheckedGpus::default()
-        );
+    }
+
+    #[test]
+    fn a_shape_other_than_one_or_eight_gpus_is_refused_before_any_backend() {
+        // Unreachable through a checked Revision; refused here too, so expecting zero GPUs (or
+        // any other count) never turns the GPU class's checks into a pass.
+        for count in [0, 2, 16] {
+            let evidence = usize::try_from(count).unwrap();
+            let error = precheck(Some(&policy()), &shape(count), evidence).unwrap_err();
+            assert_eq!(error.code(), "attestation_failed", "{error}");
+            assert!(error.to_string().contains("not 1 or 8"), "{error}");
+            let (code, reason) = denied(shape(count), evidence, nras(Vec::new()));
+            assert_eq!(code, "attestation_failed", "{reason}");
+            assert!(reason.contains("not 1 or 8"), "{reason}");
+        }
     }
 
     #[test]
@@ -458,41 +461,31 @@ mod tests {
             ..gpu(0)
         };
         for (case, (code, reason)) in [
-            (
-                "not in CC mode",
-                denied(Some(shape(1)), 1, nras(vec![cc_off])),
-            ),
-            ("stale nonce", denied(Some(shape(1)), 1, nras(vec![stale]))),
-            ("wrong model", denied(Some(shape(1)), 1, nras(vec![h100]))),
-            (
-                "old driver",
-                denied(Some(shape(1)), 1, nras(vec![old_driver])),
-            ),
-            (
-                "old vbios",
-                denied(Some(shape(1)), 1, nras(vec![old_vbios])),
-            ),
+            ("not in CC mode", denied(shape(1), 1, nras(vec![cc_off]))),
+            ("stale nonce", denied(shape(1), 1, nras(vec![stale]))),
+            ("wrong model", denied(shape(1), 1, nras(vec![h100]))),
+            ("old driver", denied(shape(1), 1, nras(vec![old_driver]))),
+            ("old vbios", denied(shape(1), 1, nras(vec![old_vbios]))),
             (
                 "fewer GPUs than the Revision",
-                denied(Some(shape(8)), 1, nras(vec![gpu(0)])),
+                denied(shape(8), 1, nras(vec![gpu(0)])),
             ),
             (
                 "more GPUs than verified",
-                denied(Some(shape(8)), 8, nras(vec![gpu(0)])),
+                denied(shape(8), 8, nras(vec![gpu(0)])),
             ),
             (
                 "same GPU twice",
-                denied(Some(shape(1)), 1, nras(vec![gpu(0), gpu(0)])),
+                denied(shape(1), 1, nras(vec![gpu(0), gpu(0)])),
             ),
             (
                 "index out of range",
-                denied(Some(shape(1)), 1, nras(vec![gpu(3)])),
+                denied(shape(1), 1, nras(vec![gpu(3)])),
             ),
-            ("GPU on a CPU Revision", denied(None, 1, vec![])),
             (
                 "no device identity",
                 denied(
-                    Some(shape(1)),
+                    shape(1),
                     1,
                     nras(vec![VerifiedGpu {
                         device_id: String::new(),
@@ -500,14 +493,14 @@ mod tests {
                     }]),
                 ),
             ),
-            ("verifier did not run", denied(Some(shape(1)), 1, vec![])),
+            ("verifier did not run", denied(shape(1), 1, vec![])),
         ] {
             assert!(
                 matches!(code.as_str(), "attestation_failed" | "policy_denied"),
                 "{case}: {code} {reason}"
             );
         }
-        let (code, reason) = denied(Some(shape(1)), 1, nras(vec![cc_off_gpu()]));
+        let (code, reason) = denied(shape(1), 1, nras(vec![cc_off_gpu()]));
         assert_eq!(
             (code.as_str(), reason.contains("CC mode")),
             ("policy_denied", true)
@@ -525,8 +518,7 @@ mod tests {
     fn policy_gates_models_and_requires_every_listed_verifier() {
         let mut both = policy();
         both.verifiers.push(GpuVerifierKind::FortanixCcm);
-        let error =
-            check_gpus(Some(&both), Some(&shape(1)), 1, &nras(vec![gpu(0)]), &NONCE).unwrap_err();
+        let error = check_gpus(Some(&both), &shape(1), 1, &nras(vec![gpu(0)]), &NONCE).unwrap_err();
         assert!(error.to_string().contains("FortanixCcm"), "{error}");
 
         let mut appraisals = nras(vec![gpu(0)]);
@@ -535,7 +527,7 @@ mod tests {
             gpus: vec![gpu(0)],
             token_sha256: [0xcc; 32],
         });
-        let out = check_gpus(Some(&both), Some(&shape(1)), 1, &appraisals, &NONCE).unwrap();
+        let out = check_gpus(Some(&both), &shape(1), 1, &appraisals, &NONCE).unwrap();
         let named: Vec<_> = out
             .vouched
             .iter()
@@ -556,9 +548,9 @@ mod tests {
             count: 1,
             model: "H100".into(),
         };
-        let error = check_gpus(Some(&policy()), Some(&h100), 1, &[], &NONCE).unwrap_err();
+        let error = check_gpus(Some(&policy()), &h100, 1, &[], &NONCE).unwrap_err();
         assert_eq!(error.code(), "policy_denied");
-        let error = check_gpus(None, Some(&shape(1)), 1, &[], &NONCE).unwrap_err();
+        let error = check_gpus(None, &shape(1), 1, &[], &NONCE).unwrap_err();
         assert_eq!(error.code(), "attestation_unknown");
     }
 
@@ -568,7 +560,7 @@ mod tests {
         let copies: Vec<_> = (0..8)
             .map(|index| VerifiedGpu { index, ..gpu(0) })
             .collect();
-        let (code, reason) = denied(Some(shape(8)), 8, nras(copies));
+        let (code, reason) = denied(shape(8), 8, nras(copies));
         assert_eq!(code, "attestation_failed");
         assert!(reason.contains("device ueid-0"), "{reason}");
     }
