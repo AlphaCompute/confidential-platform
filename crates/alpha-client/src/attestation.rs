@@ -9,7 +9,9 @@ use std::time::SystemTime;
 
 use alpha_attest::ccm::CcmAppraised;
 use alpha_attest::{AttestationResult, Verdict, Verifiers};
-use alpha_channel::cert::{parse_ccm_sans, parse_instance_sans, pem_to_der, spki_of, uri_sans, verify_leaf};
+use alpha_channel::cert::{
+    parse_ccm_sans, parse_instance_sans, pem_to_der, spki_of, uri_sans, verify_leaf,
+};
 use alpha_channel::receipt::{self, ATTEST_CCM_ROUTE, ATTEST_ROUTE, Expected};
 use alpha_channel::sha256_label;
 use alpha_core::{CcmIdentityId, ComposeHash, OrgId};
@@ -238,7 +240,9 @@ pub fn verify_ccm_bundle(
         ));
     }
     if (sans.org_id, sans.ccm_identity_id) != (result.org_id, result.ccm_identity_id) {
-        return Err(invalid("the leaf names another CCM identity than the result"));
+        return Err(invalid(
+            "the leaf names another CCM identity than the result",
+        ));
     }
     let evidence = bundle
         .request
