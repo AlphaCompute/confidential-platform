@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use alpha_attest::{AnyEvidence, Appraised, VerifiedQuote, kata, report_data};
+use alpha_attest::{AnyEvidence, Appraised, VerifiedQuote, report_data};
 use alpha_client::tls::PeerCerts;
 use alpha_client::{Client, Identity, JoinReply, JoinRequest, NodeEvidence, Pin, UnsealRequest};
 use alpha_core::{context, signing_digest};
@@ -242,6 +242,9 @@ pub async fn join(
 /// every step after DCAP, the audit row included, for the client certificate key `spki`. No route
 /// reaches it. The KMS's tests join Kata nodes through it over synthetic quotes, as
 /// [`crate::instance::attest_verified`] attests Kata pods, until B300 Kata captures exist (M1).
+/// It exists only with the `test-seams` feature, which the crate's own tests turn on; a
+/// production build has no way to skip DCAP.
+#[cfg(feature = "test-seams")]
 pub async fn join_verified(
     node: &Node,
     spki: &[u8],
@@ -310,9 +313,6 @@ async fn join_inner(
             alpha_attest::node::appraise_kata_node(evidence, verified, &nonce, spki, xwing, &doc)?
         }
         (evidence, None) => {
-            if let AnyEvidence::V2(evidence) = evidence {
-                kata::check_cpu_kind(evidence)?;
-            }
             let collateral = collateral(node, evidence.quote()).await?;
             alpha_attest::node::appraise_node(
                 evidence,
