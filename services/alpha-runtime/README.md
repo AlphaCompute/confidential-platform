@@ -90,6 +90,13 @@ new handshakes only; a connection already open keeps going, since nothing after 
 depends on the certificate. With no valid leaf (renewal failed past the hour) a handshake fails
 instead of serving an expired certificate.
 
+With `ALPHACOMPUTE_TLS_UPSTREAM_READY` set (measured, an HTTP path such as vLLM's `/health`, only
+with an upstream), the runtime also listens on 8444 in plain HTTP, once attested, for a probe
+from outside a pod VM, where the kubelet runs probes from the node and the agent policy refuses
+exec: `GET /ready` answers 200 only while the runtime holds an unexpired leaf and `GET <path>` on
+the upstream answers 2xx within 2 s, else 503, with an empty body. That port serves nothing else
+and relays nothing of the upstream's answer.
+
 The handshake and the upstream connect are bounded at 10 s each; an upstream that does not
 answer closes the client's connection after the handshake and logs one line naming it. There
 is no idle timeout, so WebSockets and long polls stay open. No client address is forwarded (no

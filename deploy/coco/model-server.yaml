@@ -23,6 +23,13 @@
 # the front's App (ALPHACOMPUTE_TLS_CALLER_APPS), so vLLM's routes outside /v1, which its API key
 # does not cover, are closed to everyone else too.
 #
+# Warm: REPLICAS is at least 2 (render-interim.py refuses fewer), every replica the same pod
+# template, so the same init-data and the same Revision hash alpha-inference pins. Each replica
+# attests and renews its own leaf, and a pod is Ready only while its runtime holds an unexpired
+# leaf and vLLM answers /health (weights loaded): the Service sends traffic only to such a pod, so
+# losing one, a drain or a rollout never leaves the model cold. The front keeps its check of the
+# model warm on its side (alpha-inference keep_warm).
+#
 # Depends on PRD-02: alpha-runtime's CoCo evidence source (ALPHACOMPUTE_QUOTE_SOURCE, the
 # init-data at /run/alpha-pod/cc_init_data) and the KMS's Revision v2 appraisal.
 apiVersion: apps/v1
@@ -35,8 +42,11 @@ metadata:
 spec:
   replicas: ${REPLICAS}
   strategy:
-    # One GPU per pod and no spare GPUs assumed: replace in place.
-    type: Recreate
+    # One GPU per pod and no spare GPUs assumed: replace in place, one pod at a time, so the other
+    # replicas keep serving while the new one boots, attests and loads its weights. Moving to a new
+    # Revision, alpha-inference's MODEL_SERVERS lists both until the rollout is done.
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 0, maxUnavailable: 1 }
   selector:
     matchLabels:
       app.kubernetes.io/name: alpha-model-server
@@ -82,9 +92,16 @@ spec:
             # One bearer per server, so one server's bearer opens no other.
             - name: ALPHACOMPUTE_SECRETS
               value: '{"vllm":["model-server-bearer-${MODEL_NAME}"]}'
+            # Readiness on :8444 (plain HTTP, GET /ready, empty body): 200 only while the runtime
+            # holds an unexpired leaf and vLLM's /health, which needs no key and answers 200 only
+            # once the model is loaded, answers 2xx.
+            - name: ALPHACOMPUTE_TLS_UPSTREAM_READY
+              value: "/health"
           ports:
             - name: https
               containerPort: 8443
+            - name: ready
+              containerPort: 8444
           # The agent policy refuses exec, so no exec probe could ever pass: the runtime opens
           # 8443 only once it has attested.
           startupProbe:
@@ -133,12 +150,15 @@ spec:
               cpu: "${POD_VM_VCPUS}"
               memory: "${POD_VM_MEMORY_MIB}Mi"
           readinessProbe:
-            # The kubelet probes from the node, so 127.0.0.1 would be the node's own loopback. The
-            # runtime's TLS port is the pod's only open port and answers once attested; whether
-            # vLLM serves the model is what alpha-inference checks over TLS before any use.
-            tcpSocket: { port: 8443 }
+            # The kubelet probes from the node, so 127.0.0.1 would be the node's own loopback, and
+            # the agent policy refuses exec: the runtime answers for vLLM on :8444 instead. Not
+            # Ready while booting, attesting, opening weights or loading the model, nor once the
+            # leaf has expired; three misses take the pod out of the Service. alpha-inference still
+            # checks /v1/models over the pinned TLS before any use.
+            httpGet: { path: /ready, port: 8444 }
             periodSeconds: 10
-            failureThreshold: 60
+            timeoutSeconds: 3
+            failureThreshold: 3
           volumeMounts:
             - { name: secrets-vllm, mountPath: /run/secrets, readOnly: true }
             - { name: weights, mountPath: /weights, readOnly: true }
@@ -177,6 +197,18 @@ spec:
   ports:
     - { name: https, port: 8443, targetPort: https }
 ---
+# A voluntary disruption (a drain) takes at most one replica at a time.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: alpha-model-server-${MODEL_NAME}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: alpha-model-server
+      alphacompute.ai/model: ${MODEL_NAME}
+---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -189,7 +221,7 @@ spec:
   policyTypes: [Ingress, Egress]
   ingress:
     # Defence in depth only (the host enforces it); the runtime's caller pin and the bearer are
-    # the control.
+    # the control. The readiness port is for the kubelet's probe from the node alone.
     - from:
         - podSelector: { matchLabels: { app.kubernetes.io/name: alpha-inference } }
       ports: [{ port: 8443 }]

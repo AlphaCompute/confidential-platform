@@ -75,15 +75,26 @@ Delete it, and render with `alpha coco render`, once that exists.
   cover, are closed to everyone else. Each server's own bearer is the second lock.
 - **The runtime reaches vLLM at `127.0.0.1:8000`**, an address: `/etc/hosts` in a pod VM is written
   by the host and not measured.
-- **Probes are TCP on 8443.** The kubelet runs them from the node, and the agent policy refuses
-  exec, so an HTTP probe of the pod VM's loopback or an exec probe could never pass. 8443 opens
-  once the runtime has attested; whether vLLM serves the model is alpha-inference's own check.
+- **Probes go to the runtime.** The kubelet runs them from the node, and the agent policy refuses
+  exec, so an HTTP probe of the pod VM's loopback or an exec probe could never pass. The runtime's
+  startup probe is TCP on 8443, which opens once it has attested. vLLM's readiness is
+  `GET /ready` on the runtime's plain-HTTP 8444 (`ALPHACOMPUTE_TLS_UPSTREAM_READY=/health`): 200
+  only while the runtime holds an unexpired leaf and vLLM's `/health` answers, so only after the
+  weights are loaded and the server answers. alpha-inference still checks `/v1/models` over the
+  pinned TLS before any use.
+- **Kept warm.** `REPLICAS` is at least 2 (the renderer refuses fewer; `ponytail:` 2 until G0 sets
+  the GPU budget). The replicas share one pod template, so one init-data and one Revision hash,
+  which is what alpha-inference pins; each attests and renews its own leaf, and the Service sends
+  traffic only to a Ready one. Rollouts replace one pod at a time (`maxSurge: 0`, no spare GPU)
+  and a PodDisruptionBudget lets a drain take one at a time, so the model never goes cold. On its
+  side alpha-inference re-runs its check of each model every 30 seconds, inside the check's
+  one-minute trust, so a request never waits for one.
 - **Weights are opened into pod-VM memory** (`emptyDir: {medium: Memory}`), and the pod VM is
   sized from the containers' limits (`POD_VM_MEMORY_MIB`, `POD_VM_VCPUS`), not from Kata
   annotations, which admission refuses. Size them for the weights, vLLM's host-side overhead and
   `/dev/shm`. Memory and vCPUs are not in the Revision; the reference values carry RTMR0 per
   shape.
-- **One GPU per pod**, `Recreate` rollouts: no spare GPU is assumed.
+- **One GPU per pod**, no spare GPU assumed: rollouts replace pods in place, one at a time.
 
 ## Requires PRD-02
 

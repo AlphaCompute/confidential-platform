@@ -8,7 +8,8 @@
 The values files are KEY=VALUE lines (# comments); a name may be set in one file only, every
 ${NAME} in the spec must be set, and no value may still hold a <placeholder> or a character that
 would break the YAML or the shell (" ' ` \\ $ or a newline). APP_ID and INFERENCE_APP_ID are
-lower-case hyphenated UUIDs, as alpha_core::AppId prints them, and GPU_MODEL an upper-case model.
+lower-case hyphenated UUIDs, as alpha_core::AppId prints them, GPU_MODEL an upper-case model,
+and REPLICAS, in a spec that has it, at least 2.
 
 It builds the pod's init-data, a CoCo init-data document (version 0.1.0, algorithm sha384) with two
 entries, exactly as PRD-02's alpha_core::coco reads it:
@@ -37,6 +38,9 @@ INITDATA_VERSION = "0.1.0"
 ALPHA_ENTRY_FORMAT = "alphacompute-initdata/1"
 REVISION_FORMAT = "alphacompute-coco-revision/1"
 GPU_COUNTS = (1, 8)
+# A spec with replicas keeps one warm: alone, every restart, drain or rollout is a cold start of
+# minutes (pod VM boot, attestation, weights, model load).
+MIN_REPLICAS = 2
 FORBIDDEN = set("\"'`\\$\n\r")
 CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 # How alpha_core::AppId prints, so the Revision printed here is the one the KMS rebuilds.
@@ -131,6 +135,11 @@ def main(argv):
     values = read_values(env_paths)
     if "CC_INIT_DATA" in values:
         fail("CC_INIT_DATA is computed, not set")
+    if "${REPLICAS}" in template and not (
+        re.fullmatch(r"[1-9][0-9]{0,2}", values.get("REPLICAS", ""))
+        and int(values["REPLICAS"]) >= MIN_REPLICAS
+    ):
+        fail(f"REPLICAS must be a whole number of at least {MIN_REPLICAS}, so one replica is warm")
 
     if policy_path == "--for-genpolicy":
         sys.stdout.write(substitute(template, {**values, "CC_INIT_DATA": ""}))

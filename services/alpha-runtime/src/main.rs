@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use alpha_runtime::{
-    Config, EXIT_REFUSED, Error, Exit, Runtime, SECRETS_DIR, SOCKET_PATH, TLS_PORT, proxy,
+    Config, EXIT_REFUSED, Error, Exit, Runtime, SECRETS_DIR, SOCKET_PATH, TLS_PORT, proxy, ready,
 };
 use p256::ecdsa::SigningKey;
 use tokio::net::UnixListener;
@@ -45,6 +45,10 @@ fn healthcheck() -> i32 {
 
 async fn run() -> Result<Exit, Error> {
     let config = Config::from_env()?;
+    let ready_path = ready::parse_ready(
+        std::env::var(ready::READY_ENV).ok().as_deref(),
+        config.tls_upstream.as_deref(),
+    )?;
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).map_err(|e| Error::Key(format!("rng: {e}")))?;
     let key = SigningKey::from_bytes(&seed.into()).map_err(|e| Error::Key(e.to_string()))?;
@@ -100,6 +104,20 @@ async fn run() -> Result<Exit, Error> {
     )
     .map_err(socket)?;
     let tls = proxy::Endpoint::bind(runtime.clone(), ([0, 0, 0, 0], TLS_PORT).into()).await?;
+    if let (Some(upstream), Some(path)) = (runtime.config().tls_upstream.clone(), ready_path) {
+        let addr = std::net::SocketAddr::from(([0, 0, 0, 0], ready::READY_PORT));
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .map_err(|e| Error::Socket(format!("{addr}: {e}")))?;
+        let current = runtime.clone();
+        let router = ready::router(
+            Arc::new(move || current.attested().is_some()),
+            &upstream,
+            &path,
+            ready::CHECK_TIMEOUT,
+        );
+        tokio::spawn(axum::serve(listener, router).into_future());
+    }
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| Error::Socket(format!("SIGTERM handler: {e}")))?;
     let shutdown = async move {

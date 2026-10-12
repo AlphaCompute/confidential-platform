@@ -15,6 +15,7 @@
 )]
 
 pub mod proxy;
+pub mod ready;
 pub mod socket;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
