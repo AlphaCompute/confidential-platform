@@ -42,6 +42,11 @@ async fn run() -> Result<(), String> {
             NodeGuest::prototype(alpha_tsm::event_log().map_err(|e| format!("event log: {e}"))?)?
         }
         Some(source) => {
+            // Before the node listens: its evidence endpoint would publish a password (#87).
+            alpha_kms::measured_env::check_database_url(
+                &alpha_kms::env(alpha_kms::measured_env::DATABASE_URL_ENV)?,
+                true,
+            )?;
             let path = std::path::Path::new(alpha_tsm::coco::INITDATA_PATH);
             let initdata =
                 alpha_tsm::coco::initdata(path).map_err(|e| format!("init-data: {e}"))?;

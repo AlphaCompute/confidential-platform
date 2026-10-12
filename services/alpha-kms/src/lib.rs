@@ -19,6 +19,7 @@ pub mod control;
 pub mod error;
 pub mod instance;
 pub mod keys;
+pub mod measured_env;
 pub mod node;
 pub mod platform;
 pub mod tls;
