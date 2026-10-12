@@ -1,7 +1,8 @@
-//! `GET /v1/revisions/{compose_hash}?app_id=` (PRD-05 draft, M3 status tracking) against a real
+//! `GET /v1/revisions/{compose_hash}?app_id=` (PRD-05 M3 status tracking) against a real
 //! Postgres (`DATABASE_URL`; skipped without it), through `alpha_client` pinned as an admin call:
 //! a registered Revision is `registered` for its own App only, an unknown one is not, and a
-//! revoked one says so.
+//! revoked one says so; and, once an Instance of a Revision v2 attests, when its leaf expires
+//! (PRD-05 Q66, "running on CoCo").
 
 #![allow(
     clippy::unwrap_used,
@@ -18,8 +19,10 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use alpha_client::{Client, Pin, tls as client_tls};
+use alpha_core::coco::CPU_RUNTIME_CLASS;
 use alpha_core::{AppId, ComposeHash, context};
 use alpha_kms::rfc3339;
+use common::kata::*;
 use common::*;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -83,4 +86,76 @@ async fn the_kms_says_whether_it_holds_an_apps_revision() {
     let (status, _) =
         send(client().get(format!("{}/v1/revisions/not-a-hash?app_id={app}", h.url))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// The KMS's answer about a Revision through the unpinned test client: the Kata harness's node
+/// runs on the capture's clock, which a pinned client would judge its leaf by.
+async fn status(h: &Harness, hash: ComposeHash, app: AppId) -> alpha_client::RevisionStatus {
+    let (status, reply) =
+        send(client().get(format!("{}/v1/revisions/{hash}?app_id={app}", h.url))).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    serde_json::from_value(reply).unwrap()
+}
+
+#[tokio::test]
+async fn the_kms_says_when_the_latest_leaf_naming_a_revision_v2_expires() {
+    let gpu = FakeGpu::new();
+    let Some(h) = kata_harness(&gpu).await else {
+        return;
+    };
+    let admin = h.register_key(&h.root, 12).await;
+    let pod = Pod::cpu(AppId::mint());
+    let hash = pod.register(&h, &admin).await;
+
+    // Re-approved, and nothing running yet.
+    let approved = status(&h, hash, pod.app).await;
+    assert_eq!((approved.registered, approved.revoked), (true, false));
+    assert_eq!(approved.leaf_not_after, None);
+
+    // A refused attestation of the same App issues no leaf.
+    let other_pod = Pod {
+        initdata: initdata(
+            pod.app,
+            CPU_RUNTIME_CLASS,
+            None,
+            "package agent_policy\n# other\n",
+        ),
+        ..pod.clone()
+    };
+    assert!(other_pod.attest(&h).await.is_err());
+    assert_eq!(status(&h, hash, pod.app).await.leaf_not_after, None);
+
+    // The Instance attests: the KMS answers when its leaf expires, an hour after the audit row.
+    let before = chrono::Utc::now();
+    pod.attest(&h).await.unwrap();
+    let after = chrono::Utc::now();
+    let running = status(&h, hash, pod.app).await;
+    let not_after =
+        chrono::DateTime::parse_from_rfc3339(running.leaf_not_after.as_deref().unwrap())
+            .unwrap()
+            .to_utc();
+    let hour = chrono::Duration::hours(1);
+    let second = chrono::Duration::seconds(1);
+    assert!(
+        not_after >= before + hour - second && not_after <= after + hour + second,
+        "{not_after} not an hour after {before}..{after}"
+    );
+
+    // Asked for another App, neither the Revision nor its leaf is that App's.
+    let foreign = status(&h, hash, AppId::mint()).await;
+    assert!(!foreign.registered);
+    assert_eq!(foreign.leaf_not_after, None);
+
+    // An unregistered Revision of the same App has no leaf either.
+    let unregistered = Pod {
+        initdata: initdata(
+            pod.app,
+            CPU_RUNTIME_CLASS,
+            None,
+            "package agent_policy\n# v3\n",
+        ),
+        ..pod.clone()
+    };
+    let none = status(&h, unregistered.hash(), pod.app).await;
+    assert_eq!((none.registered, none.leaf_not_after), (false, None));
 }

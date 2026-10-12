@@ -156,10 +156,10 @@ pub struct Ready {
     pub sealed: bool,
 }
 
-/// `GET /v1/revisions/{compose_hash}?app_id=` (PRD-05 draft, M3 status tracking): whether the
+/// `GET /v1/revisions/{compose_hash}?app_id=` (PRD-05 M3 status tracking): whether the
 /// KMS holds this Revision for this App, which is what an organization's approval on the signer
-/// page ends in. `registered` is false for a Revision of another App, so the reply names no App
-/// the caller did not.
+/// page ends in, and whether an Instance of it holds a live leaf (PRD-05 Q66). `registered` is
+/// false for a Revision of another App, so the reply names no App the caller did not.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RevisionStatus {
@@ -167,6 +167,10 @@ pub struct RevisionStatus {
     pub app_id: AppId,
     pub registered: bool,
     pub revoked: bool,
+    /// RFC 3339; when the latest Instance leaf the KMS issued naming this Revision of this App
+    /// expires, `None` if it never issued one (or the pair is not registered). A running Instance
+    /// renews its leaf before it expires, so a time still ahead means the Revision is running.
+    pub leaf_not_after: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -565,7 +569,7 @@ impl Client {
         self.post("/v1/node/join", body).await
     }
 
-    /// Whether the KMS holds `compose_hash` as a Revision of `app_id` (PRD-05 draft).
+    /// Whether the KMS holds `compose_hash` as a Revision of `app_id`, and when its latest Instance leaf expires (PRD-05).
     pub async fn revision_status(
         &self,
         compose_hash: ComposeHash,

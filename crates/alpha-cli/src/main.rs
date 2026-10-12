@@ -246,15 +246,21 @@ enum ApprovalsCommand {
         /// output (relative to this file), its Rafay environment name and its machine shape.
         batch: PathBuf,
     },
-    /// M3 status (PRD-05 draft): for each App in the batch, whether the KMS holds its Revision v2
-    /// (re-approved), or it is pending, due soon or past the deadline. Exits 1 if any App is
-    /// overdue or revoked, or any entry failed.
+    /// M3 status (PRD-05): for each App in the batch, whether the KMS holds its Revision v2
+    /// (re-approved) and an Instance of it holds a live leaf (running on CoCo), or it is pending,
+    /// due soon or past a deadline. Exits 1 if any App is overdue (not re-approved by
+    /// `--deadline`, or re-approved but not running by `--running-deadline`) or revoked, or any
+    /// entry failed.
     Status {
         batch: PathBuf,
         /// RFC 3339; the date before the prototype shutdown by which every App must be
         /// re-approved (proposed: 2026-11-20T00:00:00Z, open question Q64).
         #[arg(long)]
         deadline: String,
+        /// RFC 3339; by when every re-approved App must be running on CoCo (proposed: M-G,
+        /// 2026-11-25T00:00:00Z, Q64). Defaults to `--deadline`.
+        #[arg(long)]
+        running_deadline: Option<String>,
         /// A pending App this many days or fewer before the deadline is `due-soon`.
         #[arg(long, default_value_t = alpha_cli::approvals::DEFAULT_DUE_WITHIN_DAYS)]
         due_within_days: u32,
@@ -654,18 +660,31 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 ApprovalsCommand::Status {
                     batch,
                     deadline,
+                    running_deadline,
                     due_within_days,
                 },
         } => {
-            let deadline = chrono::DateTime::parse_from_rfc3339(&deadline)
-                .map_err(|e| Exit::Usage(format!("--deadline: {e}")))?
-                .with_timezone(&chrono::Utc);
-            let client = admin_client(config, now).await?;
+            let parse = |flag: &str, value: &str| {
+                chrono::DateTime::parse_from_rfc3339(value)
+                    .map(|t| t.with_timezone(&chrono::Utc))
+                    .map_err(|e| Exit::Usage(format!("--{flag}: {e}")))
+            };
+            let deadline = parse("deadline", &deadline)?;
+            let running_deadline = running_deadline
+                .map(|t| parse("running-deadline", &t))
+                .transpose()?
+                .unwrap_or(deadline);
+            let campaign = alpha_cli::approvals::Campaign {
+                now: now.into(),
+                deadline,
+                running_deadline,
+                due_within: chrono::Duration::days(i64::from(due_within_days)),
+            };
+            let (client, doc) = admin_client_and_document(config, now).await?;
+            let kms_ca_pem = doc.kms_ca_pem.as_str();
             let (out, failed) = alpha_cli::approvals::status_all(
                 &batch,
-                now.into(),
-                deadline,
-                chrono::Duration::days(i64::from(due_within_days)),
+                &campaign,
                 |hash, app| {
                     let client = &client;
                     async move {
@@ -674,6 +693,9 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                             .await
                             .map_err(|e| e.to_string())
                     }
+                },
+                |url, hash, app| async move {
+                    alpha_cli::approvals::probe_endpoint(&url, kms_ca_pem, hash, app).await
                 },
             )
             .await?;

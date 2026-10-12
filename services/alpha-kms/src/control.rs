@@ -786,15 +786,26 @@ pub struct RevisionStatusQuery {
     pub app_id: AppId,
 }
 
-/// `GET /v1/revisions/{compose_hash}?app_id=` (PRD-05 draft): the M3 campaign's status source.
-/// An organization's approval on the signer page ends in `POST /v1/revisions`, so "the KMS holds
-/// the App's Revision v2" is "the App is re-approved". Unauthenticated, like attestation: the
-/// caller names the hash and the App, and learns only whether the KMS holds that pair.
+/// `GET /v1/revisions/{compose_hash}?app_id=` (PRD-05 M3): the re-approval campaign's status
+/// source. An organization's approval on the signer page ends in `POST /v1/revisions`, so "the KMS
+/// holds the App's Revision v2" is "the App is re-approved". Unauthenticated, like attestation: the
+/// caller names the hash and the App, and learns only whether the KMS holds that pair and, for a
+/// pair it holds, when the latest Instance leaf it issued naming that Revision expires.
+///
+/// PRD-05 Q66: M-F's finish line is re-approved *and running on CoCo*. A Revision v2 attests only
+/// from a Kata pod booted with its init-data, and a running Instance renews its one-hour leaf ten
+/// minutes before it expires, so a `leaf_not_after` still in the future means an Instance of the
+/// Revision v2 attested within the hour: it is running on CoCo. The time comes from the `attest`
+/// audit row (`ts` + [`certs::LEAF_TTL`]), so it is the leaf's own `notAfter` to within the second
+/// the row was written.
 ///
 /// QUESTION(PRD-05 Q63): unauthenticated, or a signed Control read? Proposed: unauthenticated. A
 /// Revision's hash and App are already public in its Instances' leaves, and any attestation
-/// attempt shows whether the KMS accepts a Revision. With #95 (sealed metadata) the lookup
-/// compares the sealed `app_id`; this draft reads the plaintext row as #87's schema has it.
+/// attempt shows whether the KMS accepts a Revision. `leaf_not_after` adds nothing either: it is
+/// the `notAfter` of the leaf the App's Endpoint presents to anyone who connects, and it is
+/// answered only for the App the caller names. With #95 (sealed metadata) the lookup compares the
+/// sealed `app_id` and reads the chained audit log; this reads the plaintext row as #87's schema
+/// has it.
 pub async fn revision_status(
     State(node): State<Arc<Node>>,
     Path(path_hash): Path<String>,
@@ -804,15 +815,44 @@ pub async fn revision_status(
     let compose_hash: ComposeHash = path_hash
         .parse()
         .map_err(|_| ApiError::malformed("compose_hash"))?;
-    let row = load_revision(&node.pool, compose_hash).await?;
-    let (registered, revoked) = match row {
-        Some(row) if row.app_id == Uuid::from(query.app_id) => (true, row.revoked_at.is_some()),
-        _ => (false, false),
+    let row = load_revision(&node.pool, compose_hash)
+        .await?
+        .filter(|row| row.app_id == Uuid::from(query.app_id));
+    let Some(row) = row else {
+        return Ok(Json(alpha_client::RevisionStatus {
+            compose_hash,
+            app_id: query.app_id,
+            registered: false,
+            revoked: false,
+            leaf_not_after: None,
+        }));
     };
+    let latest = latest_leaf(&node.pool, row.org_id, compose_hash).await?;
+    let leaf_not_after = latest
+        .map(|issued| crate::later(issued.into(), certs::LEAF_TTL).map(rfc3339))
+        .transpose()?;
     Ok(Json(alpha_client::RevisionStatus {
         compose_hash,
         app_id: query.app_id,
-        registered,
-        revoked,
+        registered: true,
+        revoked: row.revoked_at.is_some(),
+        leaf_not_after,
     }))
+}
+
+/// When the KMS last issued an Instance leaf naming `compose_hash`: its latest granted `attest`
+/// row, which names the Revision as its object and its organization as `org_id`.
+async fn latest_leaf(
+    exec: impl sqlx::PgExecutor<'_>,
+    org_id: Uuid,
+    compose_hash: ComposeHash,
+) -> Result<Option<DateTime<Utc>>, ApiError> {
+    Ok(sqlx::query_scalar!(
+        "select max(ts) from audit_log
+         where org_id = $1 and action = 'attest' and outcome = 'ok' and object = $2",
+        org_id,
+        format!("revision:{compose_hash}")
+    )
+    .fetch_one(exec)
+    .await?)
 }

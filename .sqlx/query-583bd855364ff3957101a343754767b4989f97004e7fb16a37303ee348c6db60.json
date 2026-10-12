@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select max(ts) from audit_log\n         where org_id = $1 and action = 'attest' and outcome = 'ok' and object = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "max",
+        "type_info": "Timestamptz",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "583bd855364ff3957101a343754767b4989f97004e7fb16a37303ee348c6db60"
+}
