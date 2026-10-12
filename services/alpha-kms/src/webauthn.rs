@@ -109,6 +109,7 @@ pub(crate) mod tests {
             rp_id: v["rp_id"].as_str().unwrap().to_owned(),
             bundle_sha256: format!("sha256:{}", "0".repeat(64)),
             api_origin: origin,
+            embed_ancestors: Vec::new(),
         }
     }
 
