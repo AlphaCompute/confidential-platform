@@ -531,7 +531,11 @@ impl Sealed {
 /// Seals every row an earlier release (or an older node still running one) wrote in the clear,
 /// clearing its plaintext columns, and moves its plaintext audit rows into the chain. A serving
 /// node runs it before it serves and on every platform tick; reads refuse a row not yet sealed.
-pub async fn seal_plaintext(pool: &PgPool, keys: &MetadataKeys) -> Result<Sealed, ApiError> {
+pub async fn seal_plaintext(
+    pool: &PgPool,
+    watch: &crate::audit::Watch,
+    keys: &MetadataKeys,
+) -> Result<Sealed, ApiError> {
     let mut tx = pool.begin().await?;
     sqlx::query!("select pg_advisory_xact_lock($1)", SEAL_LOCK)
         .execute(&mut *tx)
@@ -638,7 +642,7 @@ pub async fn seal_plaintext(pool: &PgPool, keys: &MetadataKeys) -> Result<Sealed
     }
     tx.commit().await?;
 
-    sealed.audit_rows = crate::audit::import_unlinked(pool, keys).await?;
+    sealed.audit_rows = crate::audit::import_unlinked(pool, watch, keys).await?;
     Ok(sealed)
 }
 

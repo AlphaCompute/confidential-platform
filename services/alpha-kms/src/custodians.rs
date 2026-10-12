@@ -299,10 +299,11 @@ pub async fn rotate_root(
             "the proposal's nonce has already rotated the root",
         ));
     }
-    audit::node("custodians.rotate", "ok", response)
-        .insert(&mut tx, Some(&keys.metadata))
+    let appended = audit::node("custodians.rotate", "ok", response)
+        .insert(&mut tx, &node.chain, Some(&keys.metadata))
         .await?;
     tx.commit().await?;
+    appended.committed(&node.chain);
     drop(new_root);
     Ok(rotation)
 }

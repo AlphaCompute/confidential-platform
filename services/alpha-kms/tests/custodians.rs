@@ -169,11 +169,11 @@ async fn unseal_with(
     let client = spki_client(&url, &node);
     let identity = node_identity(&node);
     let [(a, ka), (b, kb)] = shares;
-    let first = cli_node::unseal(&client, &identity, a, ka, 1)
+    let first = cli_node::unseal(&client, &identity, a, ka, 1, false)
         .await
         .unwrap();
     assert!(first.sealed);
-    let second = cli_node::unseal(&client, &identity, b, kb, 1).await;
+    let second = cli_node::unseal(&client, &identity, b, kb, 1, false).await;
     (node, second)
 }
 

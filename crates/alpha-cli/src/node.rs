@@ -10,8 +10,8 @@ use std::time::SystemTime;
 
 use alpha_attest::{AnyEvidence, Appraised, Collateral, PlatformDocument, VerifiedQuote, kata};
 use alpha_client::{
-    BootstrapBody, BootstrapRequest, Client, NodeEvidence, Pin, UnsealReply, UnsealRequest,
-    fetch_node_evidence,
+    AuditHead, BootstrapBody, BootstrapRequest, Client, NodeEvidence, Pin, UnsealReply,
+    UnsealRequest, fetch_node_evidence,
 };
 use alpha_crypto::{INFO_NODE_BOOTSTRAP, INFO_UNSEAL_SHARE, PublicKey, Sealed};
 use serde::{Deserialize, Serialize};
@@ -196,7 +196,8 @@ pub async fn attested_node(
 pub const SHARE_FORMAT: &str = "alphacompute-share/1";
 
 /// What a custodian keeps: their share sealed to their X-Wing key, the SPKI hash of the node
-/// that sealed it (the HPKE aad), and the highest platform-document version they have verified.
+/// that sealed it (the HPKE aad), the highest platform-document version they have verified, and
+/// the latest KMS audit head a node they unsealed served from.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShareFile {
@@ -204,6 +205,9 @@ pub struct ShareFile {
     pub share_hpke: Sealed,
     pub kms_node_spki_sha256: String,
     pub platform_document_version: u64,
+    /// Sent with the next unseal: the node refuses a database restored from before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_head: Option<AuditHead>,
 }
 
 impl ShareFile {
@@ -287,6 +291,7 @@ pub async fn bootstrap(
             share_hpke,
             kms_node_spki_sha256: sha256_label(&node.runtime_spki),
             platform_document_version: doc_version,
+            audit_head: None,
         }
         .write(&path)?;
         paths.push(path);
@@ -298,14 +303,18 @@ pub async fn bootstrap(
     }))
 }
 
-/// Opens the custodian's share under their key, seals it to the verified node and posts it;
-/// the share file then remembers the document version the node was verified against.
+/// Opens the custodian's share under their key, seals it to the verified node and posts it with
+/// the audit head the share file remembers; the share file then remembers the document version the
+/// node was verified against and the head the node serves from. `accept_rollback` sends no head and
+/// lets the file remember an earlier one: the custodian's explicit acceptance of a database
+/// restored from an older copy.
 pub async fn unseal(
     client: &Client,
     node: &NodeIdentity,
     share_path: &Path,
     custodian: &alpha_crypto::PrivateKey,
     doc_version: u64,
+    accept_rollback: bool,
 ) -> Result<UnsealReply, String> {
     let mut file = ShareFile::read(share_path)?;
     let share = file.open(custodian)?;
@@ -315,10 +324,30 @@ pub async fn unseal(
         file.platform_document_version = doc_version;
         file.write(share_path)?;
     }
-    client
-        .unseal(&UnsealRequest { share_hpke })
+    let audit_floor = if accept_rollback {
+        None
+    } else {
+        file.audit_head.clone()
+    };
+    let reply = client
+        .unseal(&UnsealRequest {
+            share_hpke,
+            audit_floor,
+        })
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    let remember = match (&reply.audit_head, &file.audit_head) {
+        // Accepted: the file forgets the later head, and keeps the restored one if this reply has it.
+        _ if accept_rollback => true,
+        (Some(head), Some(known)) => known.seq < head.seq,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    if remember {
+        file.audit_head = reply.audit_head.clone();
+        file.write(share_path)?;
+    }
+    Ok(reply)
 }
 
 #[cfg(test)]
@@ -448,10 +477,23 @@ mod tests {
             },
             kms_node_spki_sha256: sha256_label(b"node"),
             platform_document_version: 3,
+            audit_head: None,
         };
         file.write(&path).unwrap();
         let back = ShareFile::read(&path).unwrap();
         assert_eq!(back.platform_document_version, 3);
+        assert!(!fs::read_to_string(&path).unwrap().contains("audit_head"));
+        let head = AuditHead {
+            seq: 7,
+            link: "AAAA".into(),
+        };
+        ShareFile {
+            audit_head: Some(head.clone()),
+            ..file.clone()
+        }
+        .write(&path)
+        .unwrap();
+        assert_eq!(ShareFile::read(&path).unwrap().audit_head, Some(head));
         assert_eq!(
             back.aad().unwrap(),
             <[u8; 32]>::from(Sha256::digest(b"node"))
