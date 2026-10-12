@@ -17,6 +17,22 @@ of one organization that declare the same name keep separate values. Every put c
 Revision's registration, because shroud-go refuses puts once a request is approved, and the page
 says "Approved" only after the receipt of every put and of the registration verified.
 
+## Revision v2
+
+A launch whose `compose` is a Revision v2 (`format: alphacompute-coco-revision/1`, a Kata
+confidential pod) is refused unless `check_registration` would accept it for the request's App, and
+is registered like a compose: the passkey signs `{app_id, compose}` with the Revision's exact bytes
+as `compose`. The page shows its runtime class and GPUs from the Revision itself. The Revision
+holds only digests of the pod's init-data and agent policy, so images and the policy are shown only
+when the request also carries `initdata` (standard base64 of the init-data bytes, as `alpha coco
+wrap` prints it) and the wasm rebuilds exactly the requested Revision from those bytes; init-data
+that does not is refused as a mismatch. The policy summary is read from the Rego
+(`alpha_core::agent_policy`): exec or log reads read "denied" only when their rule is
+`default … := false` or absent, and the policy can be neither replaced (`SetPolicyRequest`) nor
+bypassed (`AllowRequestsFailingPolicy`). The images are those genpolicy's `policy_data` names.
+Without `initdata` the page says it cannot show them and offers the approval from the digests.
+Secrets are not put from this page for a Revision v2.
+
 ## Building
 
 ```
