@@ -183,6 +183,19 @@ impl Config {
         let var = |name: &str| {
             std::env::var(name).map_err(|_| Error::Config(format!("{name} is not set")))
         };
+        let quote_source = std::env::var("ALPHACOMPUTE_QUOTE_SOURCE").ok();
+        let dsm_raw = std::env::var("ALPHACOMPUTE_DSM").ok();
+        // On the Kata path the host writes environment variables, so ALPHACOMPUTE_DSM is not
+        // measured unless alpha-coco-render pins it in the agent policy. Refuse it now so a
+        // Kata operator cannot redirect the Instance to an attacker-controlled DSM.
+        if quote_source.as_deref() == Some("coco-aa") && dsm_raw.is_some() {
+            return Err(Error::Config(
+                "ALPHACOMPUTE_DSM is not supported on the Kata (coco-aa) quote source: \
+                 the host controls environment variables; pin the DSM config in the agent \
+                 policy with `alpha coco render` instead"
+                    .into(),
+            ));
+        }
         Ok(Self::parse(
             &var("ALPHACOMPUTE_KMS_CA_SPKI_SHA256")?,
             &var("ALPHACOMPUTE_KMS_REVISIONS")?,
@@ -190,9 +203,7 @@ impl Config {
             std::env::var("ALPHACOMPUTE_SECRETS").ok().as_deref(),
             std::env::var("ALPHACOMPUTE_TLS_UPSTREAM").ok().as_deref(),
         )?
-        .with_dsm(alpha_dsm::DsmConfig::parse(
-            std::env::var("ALPHACOMPUTE_DSM").ok().as_deref(),
-        )?))
+        .with_dsm(alpha_dsm::DsmConfig::parse(dsm_raw.as_deref())?))
     }
 
     pub fn with_dsm(mut self, dsm: Option<alpha_dsm::DsmConfig>) -> Self {
