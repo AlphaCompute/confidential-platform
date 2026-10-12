@@ -300,6 +300,10 @@ pub struct BootstrapRequest {
 #[serde(deny_unknown_fields)]
 pub struct BootstrapBody {
     pub custodians: [PublicKey; 3],
+    /// The API key of our own DSM's App holding the root KEK's co-factor (PRD-06 I3), when the
+    /// node's measured configuration names that DSM; it reaches only the attested node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_dsm_api_key: Option<zeroize::Zeroizing<String>>,
 }
 
 /// The reply as received; `payload` is typed only after its signature has been checked.

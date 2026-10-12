@@ -1,0 +1,62 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select dsm_endpoint, dsm_key, api_key_wrapped, cofactor from root_cofactor where one = 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "dsm_endpoint",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "root_cofactor",
+            "name": "dsm_endpoint"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "dsm_key",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "root_cofactor",
+            "name": "dsm_key"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "api_key_wrapped",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "root_cofactor",
+            "name": "api_key_wrapped"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "cofactor",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "root_cofactor",
+            "name": "cofactor"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "6612c252c8099637e576f9a316c387da2ac648c7296b80c8c9bf4b1c4bf0c61c"
+}

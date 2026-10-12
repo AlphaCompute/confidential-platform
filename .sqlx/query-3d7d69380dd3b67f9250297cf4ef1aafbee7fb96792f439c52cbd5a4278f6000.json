@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select details from audit_log where action = 'node.bootstrap'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "details",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "audit_log",
+            "name": "details"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "3d7d69380dd3b67f9250297cf4ef1aafbee7fb96792f439c52cbd5a4278f6000"
+}

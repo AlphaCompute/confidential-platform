@@ -18,6 +18,7 @@ use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
+use zeroize::Zeroizing;
 
 /// The alphacompute CLI: keys, Control calls, the platform document, deploys, and the
 /// custodians' bootstrap and unseal.
@@ -116,8 +117,19 @@ enum Command {
     },
     /// Sign a platform document with the release key, or check a signed artifact.
     Sign {
-        #[arg(long, conflicts_with = "check", required_unless_present = "check")]
+        #[arg(
+            long,
+            conflicts_with_all = ["check", "release_key_dsm"],
+            required_unless_present_any = ["check", "release_key_dsm"]
+        )]
         release_key: Option<PathBuf>,
+        /// The release key held in our on-prem Fortanix DSM instead of a key file (PRD-06 I3):
+        /// a JSON file `{dsm: {endpoint, ca_pem, key}, public_key}`.
+        #[arg(long, conflicts_with = "check", requires = "dsm_api_key_file")]
+        release_key_dsm: Option<PathBuf>,
+        /// The DSM App's API key, as DSM's console shows it, alone in a file.
+        #[arg(long, requires = "release_key_dsm")]
+        dsm_api_key_file: Option<PathBuf>,
         /// Verify with the compiled-in key and print version, CA SPKI hash and Revisions.
         #[arg(long)]
         check: bool,
@@ -202,6 +214,10 @@ enum Command {
         custodians: Vec<PathBuf>,
         #[arg(long)]
         endpoint: String,
+        /// For a node whose measured `ALPHACOMPUTE_KMS_ROOT_DSM` names our own DSM (PRD-06 I3):
+        /// the DSM App's API key, alone in a file. It is sealed to the attested node only.
+        #[arg(long)]
+        root_dsm_api_key_file: Option<PathBuf>,
     },
 }
 
@@ -417,6 +433,8 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
         }
         Command::Sign {
             release_key,
+            release_key_dsm,
+            dsm_api_key_file,
             check,
             document,
         } => {
@@ -426,6 +444,17 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                     .map_err(|e| Exit::Refused(format!("artifact: {e}")))?;
                 let summary = sign::check(&artifact, &alpha_cli::release_key()?, now)?;
                 return Ok(json!(summary));
+            }
+            if let Some(path) = release_key_dsm {
+                let read = |p: &Path| {
+                    fs::read_to_string(p).map_err(|e| Exit::Usage(format!("{}: {e}", p.display())))
+                };
+                let release = sign::ReleaseDsm::parse(&read(&path)?).map_err(Exit::Usage)?;
+                let api_key = Zeroizing::new(read(&need(dsm_api_key_file, "dsm-api-key-file")?)?);
+                let dsm = alpha_dsm::OwnDsm::new(&release.dsm, api_key)
+                    .map_err(|e| Exit::Usage(e.to_string()))?;
+                let key = release.verifying_key().map_err(Exit::Usage)?;
+                return Ok(json!(sign::sign_with_dsm(document, &dsm, &key, now).await?));
             }
             let key = read_ed25519(&need(release_key, "release-key")?)?;
             Ok(json!(sign::sign(document, &key)?))
@@ -618,6 +647,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
         Command::Bootstrap {
             custodians,
             endpoint,
+            root_dsm_api_key_file,
         } => {
             let mut keys = Vec::new();
             for path in &custodians {
@@ -634,13 +664,25 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let custodians: [PublicKey; 3] = keys
                 .try_into()
                 .map_err(|_| Exit::Usage("--custodians takes exactly three files".into()))?;
+            let root_dsm_api_key = root_dsm_api_key_file
+                .map(|path| {
+                    fs::read_to_string(&path)
+                        .map(|key| Zeroizing::new(key.trim().to_owned()))
+                        .map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))
+                })
+                .transpose()?;
             let doc = platform_document(config, now).await?;
             let (identity, client) =
                 node::attested_node(&endpoint, &config.pccs_url, &doc, None, now).await?;
-            Ok(
-                node::bootstrap(&client, &identity, custodians, doc.version, Path::new("."))
-                    .await?,
+            Ok(node::bootstrap(
+                &client,
+                &identity,
+                custodians,
+                root_dsm_api_key,
+                doc.version,
+                Path::new("."),
             )
+            .await?)
         }
     }
 }
@@ -691,6 +733,23 @@ mod tests {
         assert!(stop(&["--force"]));
         assert!(stop(&["--drain-seconds", "60"]));
         assert!(!stop(&["--force", "--drain-seconds", "60"]));
+    }
+
+    #[test]
+    fn sign_takes_one_release_key_a_file_or_dsm() {
+        let sign = |flags: &[&str]| {
+            let args = ["alpha", "sign"];
+            Cli::try_parse_from(args.iter().chain(flags).chain(&["doc.json"])).is_ok()
+        };
+        let dsm = ["--release-key-dsm", "d.json", "--dsm-api-key-file", "k"];
+        assert!(sign(&["--release-key", "r"]));
+        assert!(sign(&dsm));
+        assert!(sign(&["--check"]));
+        assert!(!sign(&[]));
+        assert!(!sign(&dsm[..2]));
+        assert!(!sign(&dsm[2..]));
+        assert!(!sign(&[&dsm[..], &["--release-key", "r"]].concat()));
+        assert!(!sign(&[&dsm[..], &["--check"]].concat()));
     }
 
     #[test]

@@ -128,6 +128,7 @@ dependencies = [
  "alpha-client",
  "alpha-core",
  "alpha-crypto",
+ "alpha-dsm",
  "axum",
  "base64 0.23.1",
  "chrono",
@@ -230,10 +231,13 @@ dependencies = [
 name = "alpha-dsm"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "alpha-client",
  "alpha-core",
+ "alpha-dsm",
  "axum",
  "base64 0.23.1",
+ "ed25519-dalek 3.0.0",
  "parking_lot",
  "rcgen",
  "reqwest",

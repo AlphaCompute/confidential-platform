@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select wrapped from intermediate_keys where purpose = 'ca'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "wrapped",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "intermediate_keys",
+            "name": "wrapped"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "de14069b9fcf8627098dc066849174ca986200928fc0116a929eea48a29552b3"
+}
