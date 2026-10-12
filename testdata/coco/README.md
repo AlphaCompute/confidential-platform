@@ -15,7 +15,8 @@ The KMS pins are those of `testdata/manifest/05-deploy`.
   the first asked for the runtime image's groups, which the second input pins.
 - `wrap/02-cpu` — one service on a `kata-qemu-tdx` shape: no GPU in the pod or the Revision.
 - `wrap-refusals/cases.yaml` — one compose per refusal `coco wrap` adds to `compose wrap`'s
-  (`testdata/manifest/09-wrap-refusals`), with a substring of the line the customer sees.
+  (`testdata/manifest/09-wrap-refusals`), with a substring of the line the customer sees,
+  among them a compose that tries to declare a customer DSM.
 - `render/01-pod` — `spec.yaml` and `values.env` for `alpha coco render`; `policy.rego` is
   genpolicy's output for the `--for-genpolicy` rendering, `manifest.yaml` the rendered spec and
   `revision.txt` the Revision v2 and its hash.
