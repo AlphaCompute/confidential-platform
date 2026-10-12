@@ -246,6 +246,19 @@ enum ApprovalsCommand {
         /// output (relative to this file), its Rafay environment name and its machine shape.
         batch: PathBuf,
     },
+    /// M3 status (PRD-05 draft): for each App in the batch, whether the KMS holds its Revision v2
+    /// (re-approved), or it is pending, due soon or past the deadline. Exits 1 if any App is
+    /// overdue or revoked, or any entry failed.
+    Status {
+        batch: PathBuf,
+        /// RFC 3339; the date before the prototype shutdown by which every App must be
+        /// re-approved (proposed: 2026-11-20T00:00:00Z, open question Q64).
+        #[arg(long)]
+        deadline: String,
+        /// A pending App this many days or fewer before the deadline is `due-soon`.
+        #[arg(long, default_value_t = alpha_cli::approvals::DEFAULT_DUE_WITHIN_DAYS)]
+        due_within_days: u32,
+    },
 }
 
 #[derive(Subcommand)]
@@ -631,6 +644,39 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 api_key: need(config.shroud_api_key.clone(), "shroud-api-key")?,
             };
             let (out, failed) = alpha_cli::approvals::prepare_all(&shroud, &batch).await?;
+            if failed {
+                return Err(Exit::Partial(out));
+            }
+            Ok(out)
+        }
+        Command::Approvals {
+            command:
+                ApprovalsCommand::Status {
+                    batch,
+                    deadline,
+                    due_within_days,
+                },
+        } => {
+            let deadline = chrono::DateTime::parse_from_rfc3339(&deadline)
+                .map_err(|e| Exit::Usage(format!("--deadline: {e}")))?
+                .with_timezone(&chrono::Utc);
+            let client = admin_client(config, now).await?;
+            let (out, failed) = alpha_cli::approvals::status_all(
+                &batch,
+                now.into(),
+                deadline,
+                chrono::Duration::days(i64::from(due_within_days)),
+                |hash, app| {
+                    let client = &client;
+                    async move {
+                        client
+                            .revision_status(hash, app)
+                            .await
+                            .map_err(|e| e.to_string())
+                    }
+                },
+            )
+            .await?;
             if failed {
                 return Err(Exit::Partial(out));
             }

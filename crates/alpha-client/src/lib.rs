@@ -156,6 +156,19 @@ pub struct Ready {
     pub sealed: bool,
 }
 
+/// `GET /v1/revisions/{compose_hash}?app_id=` (PRD-05 draft, M3 status tracking): whether the
+/// KMS holds this Revision for this App, which is what an organization's approval on the signer
+/// page ends in. `registered` is false for a Revision of another App, so the reply names no App
+/// the caller did not.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevisionStatus {
+    pub compose_hash: ComposeHash,
+    pub app_id: AppId,
+    pub registered: bool,
+    pub revoked: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Nonce {
     pub nonce: String,
@@ -550,6 +563,20 @@ impl Client {
 
     pub async fn join(&self, body: &JoinRequest) -> Result<JoinReply, Error> {
         self.post("/v1/node/join", body).await
+    }
+
+    /// Whether the KMS holds `compose_hash` as a Revision of `app_id` (PRD-05 draft).
+    pub async fn revision_status(
+        &self,
+        compose_hash: ComposeHash,
+        app_id: AppId,
+    ) -> Result<RevisionStatus, Error> {
+        self.request(
+            Method::GET,
+            &format!("/v1/revisions/{compose_hash}?app_id={app_id}"),
+            None,
+        )
+        .await
     }
 }
 

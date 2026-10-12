@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use alpha_core::{AppId, ComposeHash, KeyId, OrgId, PrincipalId, SecretId, context};
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use chrono::{DateTime, Duration, Utc};
@@ -779,4 +779,40 @@ mod tests {
         let e = registered_spki(&b64(&[0x5a; 91])).unwrap_err();
         assert_eq!(e.code, "malformed");
     }
+}
+
+#[derive(Deserialize)]
+pub struct RevisionStatusQuery {
+    pub app_id: AppId,
+}
+
+/// `GET /v1/revisions/{compose_hash}?app_id=` (PRD-05 draft): the M3 campaign's status source.
+/// An organization's approval on the signer page ends in `POST /v1/revisions`, so "the KMS holds
+/// the App's Revision v2" is "the App is re-approved". Unauthenticated, like attestation: the
+/// caller names the hash and the App, and learns only whether the KMS holds that pair.
+///
+/// QUESTION(PRD-05 Q63): unauthenticated, or a signed Control read? Proposed: unauthenticated. A
+/// Revision's hash and App are already public in its Instances' leaves, and any attestation
+/// attempt shows whether the KMS accepts a Revision. With #95 (sealed metadata) the lookup
+/// compares the sealed `app_id`; this draft reads the plaintext row as #87's schema has it.
+pub async fn revision_status(
+    State(node): State<Arc<Node>>,
+    Path(path_hash): Path<String>,
+    Query(query): Query<RevisionStatusQuery>,
+) -> Result<Json<alpha_client::RevisionStatus>, ApiError> {
+    node.intermediates()?;
+    let compose_hash: ComposeHash = path_hash
+        .parse()
+        .map_err(|_| ApiError::malformed("compose_hash"))?;
+    let row = load_revision(&node.pool, compose_hash).await?;
+    let (registered, revoked) = match row {
+        Some(row) if row.app_id == Uuid::from(query.app_id) => (true, row.revoked_at.is_some()),
+        _ => (false, false),
+    };
+    Ok(Json(alpha_client::RevisionStatus {
+        compose_hash,
+        app_id: query.app_id,
+        registered,
+        revoked,
+    }))
 }

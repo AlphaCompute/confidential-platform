@@ -369,6 +369,10 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/v1/channel", post(channel::handshake))
         .route("/v1/revisions", post(control::register_revision))
         .route(
+            "/v1/revisions/{compose_hash}",
+            get(control::revision_status),
+        )
+        .route(
             "/v1/revisions/{compose_hash}/revoke",
             post(control::revoke_revision),
         )

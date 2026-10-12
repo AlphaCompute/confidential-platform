@@ -131,6 +131,18 @@ pub fn outcome(prepared: &Prepared, status: reqwest::StatusCode, body: &Value) -
     line
 }
 
+/// One batch entry's wrap output, read and checked as [`prepare`] checks it.
+fn load(path: &Path, entry: &Entry) -> Result<Prepared, String> {
+    std::fs::read(path)
+        .map_err(|e| format!("{}: {e}", path.display()))
+        .and_then(|text| {
+            serde_json::from_slice::<Wrapped>(&text).map_err(|e| format!("{}: {e}", path.display()))
+        })
+        .and_then(|wrapped| {
+            prepare(entry, &wrapped).map_err(|e| format!("{}: {e}", path.display()))
+        })
+}
+
 /// Opens or finds every request of the batch, in order, and reports each; `true` when any failed.
 pub async fn prepare_all(shroud: &Shroud, batch: &Path) -> Result<(Value, bool), String> {
     let http = reqwest::Client::builder()
@@ -140,16 +152,7 @@ pub async fn prepare_all(shroud: &Shroud, batch: &Path) -> Result<(Value, bool),
     let mut lines = Vec::new();
     let mut failed = false;
     for (path, entry) in read_batch(batch)? {
-        let prepared = std::fs::read(&path)
-            .map_err(|e| format!("{}: {e}", path.display()))
-            .and_then(|text| {
-                serde_json::from_slice::<Wrapped>(&text)
-                    .map_err(|e| format!("{}: {e}", path.display()))
-            })
-            .and_then(|wrapped| {
-                prepare(&entry, &wrapped).map_err(|e| format!("{}: {e}", path.display()))
-            });
-        let prepared = match prepared {
+        let prepared = match load(&path, &entry) {
             Ok(prepared) => prepared,
             Err(e) => {
                 failed = true;
@@ -185,6 +188,162 @@ pub async fn prepare_all(shroud: &Shroud, batch: &Path) -> Result<(Value, bool),
         lines.push(line);
     }
     Ok((json!({ "requests": lines }), failed))
+}
+
+// M3 status tracking (PRD-05 draft): `alpha approvals status`.
+//
+// An organization's approval on the signer page ends in the Revision v2 being registered at the
+// KMS, so the KMS is the source of truth for "re-approved" (`GET /v1/revisions/{hash}?app_id=`),
+// not shroud-go's request list: a request can be approved in shroud-go and the registration still
+// fail, and only a registered Revision ever attests.
+//
+// QUESTION(PRD-05 Q66): is "the KMS holds the Revision v2" the campaign's finish line? M-F asks for
+// every tenant App re-approved *and running on CoCo*. Proposed: track both; this draft tracks the
+// first, and the second is an `alpha instances --wait`-style probe for a leaf naming the Revision
+// v2 (TODO(draft)).
+//
+// QUESTION(PRD-05 Q68): where does the campaign-wide list of tenant Apps come from? `prepare`
+// takes one organization's batch (its shroud-go key); status needs no key, so one batch can list
+// every App. Proposed: generate it from shroud-go's App registry and the Rafay offers at M-F.
+
+/// QUESTION(PRD-05 Q64): the campaign deadline. Proposed: 2026-11-20 (M-D), which leaves the
+/// re-approved Apps five days to redeploy on CoCo before M-G (Nov 25) and the prototype shutdown
+/// (Dec 1). Not a default: `--deadline` is required, so nobody tracks against a guessed date.
+pub const PROPOSED_DEADLINE: &str = "2026-11-20T00:00:00Z";
+/// An App still pending this close to the deadline is `due-soon`.
+pub const DEFAULT_DUE_WITHIN_DAYS: u32 = 7;
+
+/// Where an App stands in the campaign.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Standing {
+    /// The KMS holds the App's Revision v2.
+    Approved,
+    /// Not yet, and the deadline is more than `due_within` away.
+    Pending,
+    /// Not yet, and the deadline is within `due_within`.
+    DueSoon,
+    /// Not yet, and the deadline has passed.
+    Overdue,
+    /// Registered, then revoked by its organization: it will not attest.
+    Revoked,
+}
+
+pub fn standing(
+    status: &alpha_client::RevisionStatus,
+    now: chrono::DateTime<chrono::Utc>,
+    deadline: chrono::DateTime<chrono::Utc>,
+    due_within: chrono::Duration,
+) -> Standing {
+    match (status.registered, status.revoked) {
+        (true, false) => Standing::Approved,
+        (true, true) => Standing::Revoked,
+        (false, _) if now >= deadline => Standing::Overdue,
+        (false, _) if deadline.signed_duration_since(now) <= due_within => Standing::DueSoon,
+        (false, _) => Standing::Pending,
+    }
+}
+
+fn bump(counts: &mut std::collections::BTreeMap<&'static str, u64>, key: &'static str) {
+    let n = counts.entry(key).or_default();
+    *n = n.saturating_add(1);
+}
+
+/// The report for every entry of `batch`, each looked up through `lookup` (the KMS's revision
+/// status, pinned like an admin call); `true` when any App is overdue or revoked, or any entry
+/// failed.
+///
+/// TODO(draft): QUESTION(PRD-05 Q65): nothing is sent to anyone. The report lists, per
+/// organization-facing App, what to do next (`action`); which channel carries it (shroud-go email,
+/// the Rafay portal, the account manager) is open.
+pub async fn status_all<F, Fut>(
+    batch: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+    deadline: chrono::DateTime<chrono::Utc>,
+    due_within: chrono::Duration,
+    mut lookup: F,
+) -> Result<(Value, bool), String>
+where
+    F: FnMut(ComposeHash, AppId) -> Fut,
+    Fut: std::future::Future<Output = Result<alpha_client::RevisionStatus, String>>,
+{
+    let mut lines = Vec::new();
+    let mut counts = std::collections::BTreeMap::<&'static str, u64>::new();
+    let mut failed = false;
+    for (path, entry) in read_batch(batch)? {
+        let line = match load(&path, &entry) {
+            Err(e) => {
+                failed = true;
+                bump(&mut counts, "error");
+                json!({ "wrapped": path, "title": entry.title, "error": e })
+            }
+            Ok(prepared) => match lookup(prepared.compose_hash, prepared.app_id).await {
+                Err(e) => {
+                    failed = true;
+                    bump(&mut counts, "error");
+                    json!({ "app_id": prepared.app_id, "title": prepared.title,
+                            "compose_hash": prepared.compose_hash, "error": e })
+                }
+                Ok(status)
+                    if status.compose_hash != prepared.compose_hash
+                        || status.app_id != prepared.app_id =>
+                {
+                    failed = true;
+                    bump(&mut counts, "error");
+                    json!({ "app_id": prepared.app_id, "title": prepared.title,
+                            "compose_hash": prepared.compose_hash,
+                            "error": "the KMS answered about another Revision or App" })
+                }
+                Ok(status) => {
+                    let standing = standing(&status, now, deadline, due_within);
+                    let (key, action) = match standing {
+                        Standing::Approved => ("approved", None),
+                        Standing::Pending => (
+                            "pending",
+                            Some(
+                                "rerun `alpha approvals prepare` for a fresh link and send it to the organization",
+                            ),
+                        ),
+                        Standing::DueSoon => (
+                            "due-soon",
+                            Some("send a fresh link now; the deadline is close"),
+                        ),
+                        Standing::Overdue => (
+                            "overdue",
+                            Some("past the deadline: escalate (QUESTION(PRD-05 Q67))"),
+                        ),
+                        Standing::Revoked => (
+                            "revoked",
+                            Some(
+                                "the organization revoked this Revision: ask why before the prototype shutdown",
+                            ),
+                        ),
+                    };
+                    failed |= matches!(standing, Standing::Overdue | Standing::Revoked);
+                    bump(&mut counts, key);
+                    let mut line = json!({ "app_id": prepared.app_id, "title": prepared.title,
+                                           "compose_hash": prepared.compose_hash, "state": standing });
+                    if let (Some(action), Some(fields)) = (action, line.as_object_mut()) {
+                        fields.insert("action".into(), json!(action));
+                    }
+                    line
+                }
+            },
+        };
+        lines.push(line);
+    }
+    let days_left = deadline.signed_duration_since(now).num_days();
+    Ok((
+        json!({
+            "now": now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "deadline": deadline.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "days_left": days_left,
+            "counts": counts,
+            "total": lines.len(),
+            "apps": lines,
+        }),
+        failed,
+    ))
 }
 
 #[cfg(test)]
@@ -376,6 +535,141 @@ mod tests {
         assert_eq!(
             report["requests"][0]["approval_url"],
             "https://sign.example/sign/approve#t"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn status(registered: bool, revoked: bool) -> alpha_client::RevisionStatus {
+        let w = wrapped("package agent_policy\n");
+        alpha_client::RevisionStatus {
+            compose_hash: w.revision_hash,
+            app_id: APP.parse().unwrap(),
+            registered,
+            revoked,
+        }
+    }
+
+    #[test]
+    fn standing_is_the_kms_registration_then_the_calendar() {
+        let at = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().to_utc();
+        let deadline = at(PROPOSED_DEADLINE);
+        let week = chrono::Duration::days(7);
+        let early = at("2026-11-01T00:00:00Z");
+        let close = at("2026-11-15T00:00:00Z");
+        let late = at("2026-11-20T00:00:00Z");
+        assert_eq!(
+            standing(&status(true, false), late, deadline, week),
+            Standing::Approved
+        );
+        assert_eq!(
+            standing(&status(true, true), early, deadline, week),
+            Standing::Revoked
+        );
+        assert_eq!(
+            standing(&status(false, false), early, deadline, week),
+            Standing::Pending
+        );
+        assert_eq!(
+            standing(&status(false, false), close, deadline, week),
+            Standing::DueSoon
+        );
+        assert_eq!(
+            standing(&status(false, false), late, deadline, week),
+            Standing::Overdue
+        );
+    }
+
+    #[tokio::test]
+    async fn the_status_report_counts_each_app_and_fails_on_overdue_or_errors() {
+        let dir =
+            std::env::temp_dir().join(format!("alpha-approvals-status-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let w = wrapped("package agent_policy\n");
+        let other = wrapped("package agent_policy\n# v2\n");
+        let file = |w: &Wrapped| {
+            json!({ "revision": w.revision, "revision_hash": w.revision_hash,
+                    "initdata": w.initdata, "secrets": w.secrets, "pod_spec": {} })
+        };
+        std::fs::write(dir.join("a.json"), file(&w).to_string()).unwrap();
+        std::fs::write(dir.join("b.json"), file(&other).to_string()).unwrap();
+        let batch = dir.join("batch.json");
+        std::fs::write(
+            &batch,
+            json!({ "requests": [
+                { "wrapped": "a.json", "title": "approved-app", "machine": "m" },
+                { "wrapped": "b.json", "title": "pending-app", "machine": "m" },
+                { "wrapped": "missing.json", "title": "missing", "machine": "m" }
+            ] })
+            .to_string(),
+        )
+        .unwrap();
+        let registered = w.revision_hash;
+        let lookup = |hash: ComposeHash, app: AppId| async move {
+            Ok(alpha_client::RevisionStatus {
+                compose_hash: hash,
+                app_id: app,
+                registered: hash == registered,
+                revoked: false,
+            })
+        };
+        let at = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().to_utc();
+        let deadline = at(PROPOSED_DEADLINE);
+        let week = chrono::Duration::days(7);
+
+        let (report, failed) =
+            status_all(&batch, at("2026-11-01T00:00:00Z"), deadline, week, lookup)
+                .await
+                .unwrap();
+        assert!(failed, "the missing file is an error");
+        assert_eq!(report["apps"][0]["state"], "approved");
+        assert!(report["apps"][0].get("action").is_none());
+        assert_eq!(report["apps"][1]["state"], "pending");
+        assert!(
+            report["apps"][1]["action"]
+                .as_str()
+                .unwrap()
+                .contains("prepare")
+        );
+        assert!(
+            report["apps"][2]["error"]
+                .as_str()
+                .unwrap()
+                .contains("missing.json")
+        );
+        assert_eq!(
+            report["counts"],
+            json!({ "approved": 1, "pending": 1, "error": 1 })
+        );
+        assert_eq!(report["days_left"], 19);
+
+        let (report, _) = status_all(&batch, at("2026-11-21T00:00:00Z"), deadline, week, lookup)
+            .await
+            .unwrap();
+        assert_eq!(report["apps"][1]["state"], "overdue");
+
+        // A KMS answer about another Revision is an error, never a standing.
+        let (report, failed) = status_all(
+            &batch,
+            at("2026-11-01T00:00:00Z"),
+            deadline,
+            week,
+            |_, app| async move {
+                Ok(alpha_client::RevisionStatus {
+                    compose_hash: alpha_core::compose_hash("x"),
+                    app_id: app,
+                    registered: true,
+                    revoked: false,
+                })
+            },
+        )
+        .await
+        .unwrap();
+        assert!(failed);
+        assert!(
+            report["apps"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("another Revision")
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
