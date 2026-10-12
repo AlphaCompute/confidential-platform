@@ -38,8 +38,8 @@ pub struct Claims {
 
 pub fn token_key(tenant_kek_root: &[u8; 32]) -> Result<Key32, ApiError> {
     let mut out = Zeroizing::new([0u8; 32]);
-    Hkdf::<Sha256>::new(Some(b"alphacompute-kms/kbs-token/v1"), tenant_kek_root)
-        .expand(&[], out.as_mut())
+    Hkdf::<Sha256>::new(None, tenant_kek_root)
+        .expand(b"alphacompute-kms/kbs-token/v1", out.as_mut())
         .map_err(|e| ApiError::internal(format!("hkdf: {e}")))?;
     Ok(out)
 }

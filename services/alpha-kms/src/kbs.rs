@@ -240,16 +240,16 @@ fn auth_inner(node: &Node, body: &[u8]) -> Result<Value, ApiError> {
             format!("tee {:?}: only tdx is appraised (kata-tdx/1)", request.tee),
         ));
     }
-    if let Some(supported) = request
-        .extra_params
-        .get("supported-hash-algorithms")
-        .and_then(Value::as_array)
-        && !supported.iter().any(|a| a.as_str() == Some(HASH_ALGORITHM))
-    {
-        return Err(ApiError::new(
-            "policy_denied",
-            format!("the client does not support {HASH_ALGORITHM}"),
-        ));
+    if let Some(param) = request.extra_params.get("supported-hash-algorithms") {
+        let supported = param.as_array().ok_or_else(|| {
+            ApiError::new("policy_denied", "supported-hash-algorithms must be an array")
+        })?;
+        if !supported.iter().any(|a| a.as_str() == Some(HASH_ALGORITHM)) {
+            return Err(ApiError::new(
+                "policy_denied",
+                format!("the client does not support {HASH_ALGORITHM}"),
+            ));
+        }
     }
     let nonce = instance::mint_nonce(&node.nonce_key, node.now())?;
     Ok(json!({
@@ -267,7 +267,7 @@ pub async fn attest(State(node): State<Arc<Node>>, body: Bytes) -> Response {
 
 fn token_reply(token: String) -> Response {
     let cookie = format!(
-        "{SESSION_COOKIE}={token}; Path=/kbs/v0; Max-Age={}; Secure; HttpOnly",
+        "{SESSION_COOKIE}={token}; Path=/kbs/v0; Max-Age={}; Secure; HttpOnly; SameSite=Strict",
         certs::LEAF_TTL.as_secs()
     );
     let mut response = Json(json!({ "token": token })).into_response();
