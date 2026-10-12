@@ -17,6 +17,7 @@ pub mod compose;
 pub mod id;
 pub mod phala;
 pub mod platform;
+pub mod principal;
 pub mod signing;
 
 pub use compose::{
@@ -25,6 +26,7 @@ pub use compose::{
 };
 pub use id::{AppId, KeyId, OrgId, PrincipalId, RequestId, SecretId};
 pub use platform::{CatalogKey, KmsRevision, Signer};
+pub use principal::KeyKind;
 pub use signing::{context, jcs, parse, signing_digest};
 
 /// `{algorithm, signature}`, the signature in base64url.

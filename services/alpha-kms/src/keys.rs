@@ -3,7 +3,7 @@
 
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
-use alpha_core::{AppId, OrgId, Signer, signing_digest};
+use alpha_core::{AppId, KeyKind, OrgId, Signer, signing_digest};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
@@ -138,6 +138,20 @@ pub struct KeyRow {
     pub revocation_reason: Option<String>,
 }
 
+impl KeyRow {
+    /// The kind its registration document names (PRD-06 Q88); none is a member key. Read from
+    /// the document the chain walk verifies, never from a column of its own.
+    pub fn kind(&self) -> Result<KeyKind, ApiError> {
+        self.document
+            .get("kind")
+            .map_or(Ok(KeyKind::Member), |kind| {
+                serde_json::from_value(kind.clone()).map_err(|_| {
+                    ApiError::signature_invalid("a key in the chain has an unknown kind")
+                })
+            })
+    }
+}
+
 pub async fn load_key(exec: impl PgExecutor<'_>, id: Uuid) -> Result<Option<KeyRow>, ApiError> {
     Ok(sqlx::query_as!(
         KeyRow,
@@ -181,6 +195,13 @@ pub async fn walk_chain(
             return Err(invalid("the chain crosses organizations"));
         }
         if let Some(child) = &child {
+            // Only a member key registers keys; the route refuses an auditor's registration, and
+            // this refuses a row that claims one anyway.
+            if link.kind()? != KeyKind::Member {
+                return Err(invalid(
+                    "a key in the chain was registered by an auditor key",
+                ));
+            }
             verify_registration(child, &link, signer)?;
         }
         if let Some(revoked_at) = link.revoked_at {
@@ -336,6 +357,16 @@ pub async fn verify_signed(
     let digest = signing_digest(context, document)
         .map_err(|e| ApiError::malformed(format!("payload: {e}")))?;
     verify_signature(&chain.key.public_key, &digest, signature, signer)?;
+    // PRD-06 Q88: an auditor key signs reads only. Checked here, beside the signature, so every
+    // Control write refuses it and so does the Instance-side re-check of a stored Revision or
+    // Secret, whatever route or row the document came from.
+    let kind = chain.key.kind()?;
+    if !kind.may_sign(context) {
+        return Err(ApiError::new(
+            "forbidden",
+            format!("an {kind} key signs reads only, not {context}"),
+        ));
+    }
     Ok(chain)
 }
 
@@ -346,6 +377,35 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_keys_kind_is_its_registration_documents_and_none_is_a_member() {
+        let row = |document: Value| KeyRow {
+            id: Uuid::now_v7(),
+            org_id: Uuid::now_v7(),
+            public_key: Vec::new(),
+            document,
+            signature: Value::Null,
+            registered_by_key: None,
+            anchor_check: None,
+            revoked_at: None,
+            revocation_reason: None,
+        };
+        let kind = |document| row(document).kind().map_err(|e| e.code);
+        assert_eq!(kind(serde_json::json!({})), Ok(KeyKind::Member));
+        assert_eq!(
+            kind(serde_json::json!({ "kind": "member" })),
+            Ok(KeyKind::Member)
+        );
+        assert_eq!(
+            kind(serde_json::json!({ "kind": "auditor" })),
+            Ok(KeyKind::Auditor)
+        );
+        assert_eq!(
+            kind(serde_json::json!({ "kind": "root" })),
+            Err("signature_invalid")
+        );
+    }
 
     #[test]
     fn check_shape_admits_exactly_the_fields_of_its_algorithm() {

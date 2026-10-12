@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use alpha_core::{AppId, ComposeHash, KeyId, OrgId, PrincipalId, SecretId, context};
+use alpha_core::{AppId, ComposeHash, KeyId, KeyKind, OrgId, PrincipalId, SecretId, context};
 use axum::Json;
 use axum::extract::{Path, State};
 use base64::Engine;
@@ -469,6 +469,9 @@ struct KeyPayload {
     #[allow(dead_code)]
     label: String,
     issued_at: DateTime<Utc>,
+    /// PRD-06 Q88: `auditor` registers a read-only key; absent, a member key.
+    #[serde(default)]
+    kind: KeyKind,
 }
 
 /// The degenerate registration: the organization's own identifier, because the signer is not in
@@ -557,13 +560,13 @@ async fn register_endorsed_key(
         &chain,
         "key.register",
         format!("key:{id}"),
-        json!({ "principal_id": p.principal_id }),
+        json!({ "principal_id": p.principal_id, "kind": p.kind }),
     )
     .await?;
     tx.commit().await?;
     Ok(json!({
         "id": id, "principal_id": p.principal_id, "org_id": chain.key.org_id,
-        "created_at": rfc3339(created_at),
+        "kind": p.kind, "created_at": rfc3339(created_at),
     }))
 }
 
