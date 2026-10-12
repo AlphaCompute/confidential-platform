@@ -209,7 +209,6 @@ async fn an_allow_listed_ccm_identity_gets_a_leaf_of_its_own_kind_and_nothing_el
         json!({
             "format": "alphacompute-verifiers/1",
             "attested_by": ["fortanix"],
-            "cpu": [],
             "composite": [{
                 "verifier": "fortanix-ccm",
                 "zone_ca_spki_sha256": zone.spki_sha256(),
