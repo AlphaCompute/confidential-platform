@@ -143,16 +143,38 @@ pub fn pinned(policy: Option<&LocalPolicy>) -> Result<Pinned, AppraisalError> {
     if rule.values.is_empty() {
         return Err(missing("cc_mode.values"));
     }
-    if rule.source == CcSource::Measurement && !(1..=254).contains(&rule.index) {
-        return Err(malformed(
-            "cc_mode.index",
-            "is not a measurement block (1 to 254)",
-        ));
+    match rule.source {
+        CcSource::Measurement if !(1..=254).contains(&rule.index) => {
+            return Err(malformed(
+                "cc_mode.index",
+                "is not a measurement block (1 to 254)",
+            ));
+        }
+        CcSource::Opaque if rule.index == 0 => {
+            return Err(malformed(
+                "cc_mode.index",
+                "opaque field type 0 is not a known NVIDIA type",
+            ));
+        }
+        _ => {}
     }
-    let cc_values = rule
+    let cc_values: Vec<Vec<u8>> = rule
         .values
         .iter()
-        .map(|v| hex::decode(v).map_err(|_| malformed("cc_mode.values", "not hex")))
+        .map(|v| {
+            let decoded =
+                hex::decode(v).map_err(|_| malformed("cc_mode.values", "not hex"))?;
+            if rule.source == CcSource::Measurement && decoded.len() != 48 {
+                return Err(malformed(
+                    "cc_mode.values",
+                    &format!(
+                        "measurement value must be 48 bytes, got {}",
+                        decoded.len()
+                    ),
+                ));
+            }
+            Ok(decoded)
+        })
         .collect::<Result<_, _>>()?;
     let max_age = p
         .ocsp_max_age_secs
@@ -162,9 +184,9 @@ pub fn pinned(policy: Option<&LocalPolicy>) -> Result<Pinned, AppraisalError> {
         return Err(malformed("ocsp_max_age_secs", "is not 1 s to 7 days"));
     }
     if let Some(url) = &p.ocsp_url
-        && !(url.starts_with("https://") || url.starts_with("http://"))
+        && !url.starts_with("https://")
     {
-        return Err(malformed("ocsp_url", "is not an http(s) URL"));
+        return Err(malformed("ocsp_url", "is not an https:// URL"));
     }
     Ok(Pinned {
         device_roots,

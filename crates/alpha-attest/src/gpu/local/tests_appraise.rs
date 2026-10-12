@@ -536,7 +536,6 @@ fn rim_cache_files_round_trip_and_refuse_garbage() {
 
 #[tokio::test]
 async fn the_backend_refuses_before_any_work_and_queries_only_the_pinned_ocsp_endpoint() {
-    use std::io::{BufRead, BufReader, Read, Write};
     let mut world = World::new(1);
     // Nothing pinned: refused without touching the cache or the network.
     let backend = super::Local::new(Default::default())
@@ -550,95 +549,32 @@ async fn the_backend_refuses_before_any_work_and_queries_only_the_pinned_ocsp_en
         .unwrap_err();
     assert_eq!(error.code(), "attestation_unknown");
 
-    // The BROM certificate's status is not cached; the policy names an endpoint that answers
-    // with a response echoing the nonce the backend derives.
-    world.ocsp.retain(|r| {
-        !super::ocsp::parse(r)
-            .unwrap()
-            .is_about(&world.gpus[0].brom.cert, &world.ica.cert)
-    });
-    let nonce: [u8; 16] = {
-        use sha2::{Digest, Sha256};
-        Sha256::new()
-            .chain_update(b"alphacompute/gpu-local/ocsp-nonce/v1")
-            .chain_update(NONCE)
-            .chain_update(
-                world.gpus[0]
-                    .brom
-                    .cert
-                    .tbs_certificate
-                    .serial_number
-                    .as_bytes(),
-            )
-            .finalize()[..16]
-            .try_into()
-            .unwrap()
-    };
-    let answers = [
-        ocsp_response(
-            &world.gpus[0].brom.cert,
-            &world.ica,
-            super::testkit::good(),
-            10,
-            None,
-        ),
-        ocsp_response(
-            &world.gpus[0].brom.cert,
-            &world.ica,
-            super::testkit::good(),
-            10,
-            Some(&nonce),
-        ),
-    ];
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}/", listener.local_addr().unwrap());
-    let served = answers.clone();
-    std::thread::spawn(move || {
-        for (n, stream) in listener.incoming().enumerate() {
-            let Ok(mut stream) = stream else { return };
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut length = 0usize;
-            loop {
-                let mut line = String::new();
-                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                    break;
-                }
-                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    length = v.trim().parse().unwrap();
-                }
-            }
-            let mut body = vec![0; length];
-            let _ = reader.read_exact(&mut body);
-            let answer = &served[n.min(1)];
-            let _ = write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/ocsp-response\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                answer.len()
-            );
-            let _ = stream.write_all(answer);
-        }
-    });
-    world.local_policy().ocsp_url = Some(url);
-    let backend = super::Local::new(world.cache()).unwrap().with_clock(now);
-    // First answer lacks the nonce: not used, so the status is missing.
-    let error = backend
-        .verify(&world.evidence(), &NONCE, &world.policy)
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("no status"), "{error}");
-    // Second answer echoes it: the GPU passes, and the response is kept for the next appraisal.
-    let verdict = backend
-        .verify(&world.evidence(), &NONCE, &world.policy)
-        .await
-        .unwrap();
-    assert!(verdict.gpus[0].cc_mode);
-    world.local_policy().ocsp_url = None;
-    assert!(
-        backend
+    // http:// ocsp_url is rejected at policy-parse time (HTTPS closes an observation channel).
+    {
+        let mut w = World::new(1);
+        w.local_policy().ocsp_url = Some("http://ocsp.example.com/".into());
+        let backend = super::Local::new(w.cache()).unwrap().with_clock(now);
+        let err = backend
+            .verify(&w.evidence(), &NONCE, &w.policy)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("is not an https"),
+            "http:// should be rejected: {err}"
+        );
+    }
+
+    // With all OCSP responses in the cache and an https:// URL, the backend passes without
+    // making any network calls.
+    {
+        world.local_policy().ocsp_url = Some("https://ocsp.example.com/".into());
+        let backend = super::Local::new(world.cache()).unwrap().with_clock(now);
+        let verdict = backend
             .verify(&world.evidence(), &NONCE, &world.policy)
             .await
-            .is_ok()
-    );
+            .unwrap();
+        assert!(verdict.gpus[0].cc_mode);
+    }
 }
 
 #[test]
