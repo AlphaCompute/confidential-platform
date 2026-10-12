@@ -83,13 +83,16 @@ pub async fn bootstrap(
     let tenant_kek_root = Zeroizing::new(random()?);
     let (ca_key_der, ca_cert_der) = certs::new_ca(now)?;
     let ca_key_der = Zeroizing::new(ca_key_der);
+    let wrapped_tenant = aead_seal(&root, b"tenant-kek-root", tenant_kek_root.as_slice())?;
+    let wrapped_ca = aead_seal(&root, b"ca", &ca_key_der)?;
+    let keys = Intermediates::new(tenant_kek_root, ca_key_der, ca_cert_der)?;
     let mut tx = node.pool.begin().await?;
     let inserted = sqlx::query!(
         "insert into intermediate_keys (purpose, wrapped, public_part) values
            ('tenant-kek-root', $1, null), ('ca', $2, $3) on conflict (purpose) do nothing",
-        aead_seal(&root, b"tenant-kek-root", tenant_kek_root.as_slice())?,
-        aead_seal(&root, b"ca", &ca_key_der)?,
-        ca_cert_der,
+        wrapped_tenant,
+        wrapped_ca,
+        keys.ca_cert_der,
     )
     .execute(&mut *tx)
     .await?
@@ -98,7 +101,7 @@ pub async fn bootstrap(
         return Err(ApiError::new("already_exists", "database is not empty"));
     }
     audit::node("node.bootstrap", "ok", json!({}))
-        .insert(&mut *tx)
+        .insert(&mut tx, Some(&keys.metadata))
         .await?;
     tx.commit().await?;
 
@@ -116,18 +119,13 @@ pub async fn bootstrap(
         .collect::<Result<_, _>>()
         .map_err(|e| ApiError::internal(format!("seal share: {e}")))?;
     drop(root);
-    let keys = Intermediates {
-        tenant_kek_root,
-        ca_key_der,
-        ca_cert_der,
-    };
     let payload = json!({
         "shares_hpke": shares_hpke,
         "kms_ca_pem": keys.ca_pem(),
     });
     let digest = signing_digest(context::NODE_BOOTSTRAP, &payload)
         .map_err(|e| ApiError::internal(format!("payload: {e}")))?;
-    node.start_serving(keys)?;
+    node.start_serving(keys).await?;
     let signature: p256::ecdsa::Signature = node.runtime_key.sign(&digest);
     Ok(Json(json!({
         "payload": payload,
@@ -168,11 +166,11 @@ pub async fn unwrap_intermediates(node: &Node, root: &[u8; 32]) -> Result<Interm
         .map(Zeroizing::new)
         .map_err(|_| ApiError::internal("tenant-kek-root is not 32 bytes"))?;
     let ca_key_der = unwrap("ca", ca.as_ref().map(|r| r.wrapped.clone()))?;
-    Ok(Intermediates {
+    Intermediates::new(
         tenant_kek_root,
         ca_key_der,
-        ca_cert_der: ca.and_then(|r| r.public_part).unwrap_or_default(),
-    })
+        ca.and_then(|r| r.public_part).unwrap_or_default(),
+    )
 }
 
 pub async fn unseal(
@@ -207,20 +205,18 @@ pub async fn unseal(
             .map(Zeroizing::new)
             .ok_or_else(|| ApiError::malformed("shares do not combine"))?;
         let keys = unwrap_intermediates(&node, &root).await?;
-        node.start_serving(keys)
+        node.start_serving(keys).await
     }
     .await;
     if let Err(e) = outcome {
         if let Phase::Sealed { shares } = &mut *node.phase.write() {
             shares.clear();
         }
-        audit::node("node.unseal", "denied", e.details())
-            .insert(&node.pool)
+        node.audit(audit::node("node.unseal", "denied", e.details()))
             .await?;
         return Err(e);
     }
-    audit::node("node.unseal", "ok", json!({}))
-        .insert(&node.pool)
+    node.audit(audit::node("node.unseal", "ok", json!({})))
         .await?;
     Ok(Json(json!({ "sealed": false, "shares": 2 })))
 }
@@ -271,8 +267,7 @@ async fn join_audited(
         ),
         Err(e) => (e.outcome(), e.details()),
     };
-    audit::node("node.join", outcome, details)
-        .insert(&node.pool)
+    node.audit(audit::node("node.join", outcome, details))
         .await?;
     result?;
     let keys = node.intermediates()?;
@@ -368,7 +363,7 @@ async fn join_via(node: &Node, client: &Client, endpoint: &str) -> Result<(), Ap
     let nonce = client.attest_nonce().await.map_err(http)?.nonce;
     let request = join_request(node, nonce, endpoint).await?;
     let reply = client.join(&request).await.map_err(http)?;
-    finish_join(node, &reply)
+    finish_join(node, &reply).await
 }
 
 /// The joining side's request over the serving node's `nonce`: a `node.join.request` row, which
@@ -379,12 +374,11 @@ pub async fn join_request(
     endpoint: &str,
 ) -> Result<JoinRequest, ApiError> {
     let raw = decode32("nonce", &nonce)?;
-    audit::node(
+    node.audit(audit::node(
         "node.join.request",
         "ok",
         json!({ "runtime_pubkey_sha256": keys::sha256_hex(&node.runtime_spki), "endpoint": endpoint }),
-    )
-    .insert(&node.pool)
+    ))
     .await?;
     let xwing = node.xwing_key.public();
     let rd = report_data(&node.runtime_spki, &raw, Some(xwing.as_bytes()));
@@ -396,7 +390,7 @@ pub async fn join_request(
 }
 
 /// Serves with the intermediates the other node handed over.
-pub fn finish_join(node: &Node, reply: &JoinReply) -> Result<(), ApiError> {
+pub async fn finish_join(node: &Node, reply: &JoinReply) -> Result<(), ApiError> {
     let field = |name: &str, text: &str| {
         alpha_client::decode(name, text).map_err(|e| ApiError::internal(format!("join reply: {e}")))
     };
@@ -404,11 +398,12 @@ pub fn finish_join(node: &Node, reply: &JoinReply) -> Result<(), ApiError> {
         <[u8; 32]>::try_from(field("tenant_kek_root", &reply.tenant_kek_root)?.as_slice())
             .map_err(|_| ApiError::internal("join reply: tenant_kek_root"))?,
     );
-    node.start_serving(Intermediates {
+    let keys = Intermediates::new(
         tenant_kek_root,
-        ca_key_der: Zeroizing::new(field("ca_key", &reply.ca_key)?),
-        ca_cert_der: field("ca_cert", &reply.ca_cert)?,
-    })
+        Zeroizing::new(field("ca_key", &reply.ca_key)?),
+        field("ca_cert", &reply.ca_cert)?,
+    )?;
+    node.start_serving(keys).await
 }
 
 /// An HTTPS client for the other node: our self-signed runtime certificate as identity, the

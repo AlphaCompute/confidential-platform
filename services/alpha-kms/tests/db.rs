@@ -35,7 +35,13 @@ async fn bootstrap_once_unseal_with_two_shares_and_sealed_gate() {
     assert!(h.ca_pem.starts_with("-----BEGIN CERTIFICATE-----"));
     assert_eq!(h.shares.len(), 3);
     let ready = send(client().get(format!("{}/ready", h.url))).await;
-    assert_eq!(ready, (StatusCode::OK, json!({ "sealed": false })));
+    assert_eq!(
+        ready,
+        (
+            StatusCode::OK,
+            json!({ "sealed": false, "audit_chain": { "verified_through": 0 } })
+        )
+    );
 
     let aad: [u8; 32] = Sha256::digest(&h.node.runtime_spki).into();
     let again =
@@ -222,13 +228,10 @@ async fn two_organizations_live_side_by_side() {
 
     // Each organization's secrets are sealed under its own root key.
     let intermediates = h.node.intermediates().unwrap();
-    let stored = sqlx::query!(
-        "select id, ciphertext from secrets where org_id = $1 and name = 'a-secret'",
-        Uuid::from(h.org)
-    )
-    .fetch_one(&h.pool)
-    .await
-    .unwrap();
+    let stored = alpha_kms::store::load_secret(&h.pool, &h.metadata(), h.org.into(), "a-secret")
+        .await
+        .unwrap()
+        .unwrap();
     let org_key = |org, key: &SigningKey| {
         alpha_kms::keys::org_key(
             &intermediates.tenant_kek_root,
@@ -351,15 +354,11 @@ async fn a_root_key_claims_its_organization_once() {
 
     // Grafted onto the pilot organization's root by a superuser, the same row signs nothing:
     // its registration signature no longer verifies under its new parent.
-    sqlx::query!(
-        "update principal_keys set org_id = $1, registered_by_key = $2 where id = $3",
-        Uuid::from(h.org),
-        Uuid::from(h.root.0),
-        Uuid::from(admin.0)
-    )
-    .execute(&h.pool)
-    .await
-    .unwrap();
+    h.edit_key(admin.0, |k| {
+        k.org_id = h.org.into();
+        k.registered_by_key = Some(h.root.0.into());
+    })
+    .await;
     let payload = json!({ "key_id": admin.0, "reason": "retired", "issued_at": rfc3339(h.now()) });
     let (status, reply) = h
         .post(
@@ -528,9 +527,28 @@ async fn control_routes_register_revoke_and_put() {
     let other_key = SigningKey::from_bytes(&[12u8; 32]);
     let other_id = Uuid::now_v7();
     let other_spki = other_key.verifying_key().to_public_key_der().unwrap();
-    sqlx::query!("insert into principal_keys (id, org_id, principal_id, public_key, document, signature, anchor_check) values ($1, $2, $3, $4, '{}', '{}', $5)",
-        other_id, Uuid::from(other_org), Uuid::now_v7(), other_spki.as_bytes(), &[0u8; 32][..])
-        .execute(&h.pool).await.unwrap();
+    let forged = alpha_kms::store::KeyRecord {
+        org_id: other_org.into(),
+        principal_id: Uuid::now_v7(),
+        public_key: other_spki.as_bytes().to_vec(),
+        document: json!({}),
+        registered_by_key: None,
+        signature: json!({}),
+        revoked_at: None,
+        revocation_reason: None,
+    };
+    let mut conn = h.pool.acquire().await.unwrap();
+    alpha_kms::store::insert_key(
+        &mut conn,
+        &h.metadata(),
+        other_id,
+        Some(&[0u8; 32]),
+        &forged,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(conn);
     let other = (KeyId::from(other_id), other_key);
     let (status, reply) = h
         .post(
@@ -562,8 +580,14 @@ async fn control_routes_register_revoke_and_put() {
         (StatusCode::CONFLICT, "already_exists")
     );
     let foreign_app = AppId::mint();
-    sqlx::query!("insert into revisions (compose_hash, app_id, org_id, compose, created_by_key, signature) values ($1, $2, $3, '{}', $4, '{}')",
-        &[1u8; 32][..], Uuid::from(foreign_app), Uuid::from(other_org), other_id).execute(&h.pool).await.unwrap();
+    h.insert_signed_revision(
+        other_org,
+        foreign_app,
+        "{}".into(),
+        other_id.into(),
+        json!({}),
+    )
+    .await;
     let (status, reply) = h
         .put_secret(
             "api-key",
@@ -973,14 +997,13 @@ async fn attest_release_revoke_and_tamper() {
         ]
     );
     let attest_rows = h.audit("attest").await;
-    let with_evidence: i64 = sqlx::query_scalar!(
-        "select count(*) from audit_log where action = 'attest' and evidence_sha256 is not null"
-    )
-    .fetch_one(&h.pool)
-    .await
-    .unwrap()
-    .unwrap();
-    assert_eq!(with_evidence as usize, attest_rows.len());
+    let with_evidence = h
+        .audit_rows()
+        .await
+        .into_iter()
+        .filter(|r| r.entry.action == "attest" && r.entry.evidence_sha256.is_some())
+        .count();
+    assert_eq!(with_evidence, attest_rows.len());
     assert!(
         attest_rows
             .iter()
@@ -1038,16 +1061,11 @@ async fn attest_release_revoke_and_tamper() {
         (status, code(&reply)),
         (StatusCode::CONFLICT, "revision_revoked")
     );
-    sqlx::query!("update revisions set revoked_at = null")
-        .execute(&h.pool)
-        .await
-        .unwrap();
+    h.edit_revisions(|r| r.revoked_at = None).await;
 
     // The row is re-verified on every call.
-    sqlx::query!("update revisions set app_id = $1", Uuid::now_v7())
-        .execute(&h.pool)
-        .await
-        .unwrap();
+    let elsewhere = Uuid::now_v7();
+    h.edit_revisions(|r| r.app_id = elsewhere).await;
     let (status, reply) = h.attest(KEYED).await;
     assert_eq!(
         (status, code(&reply)),
@@ -1058,23 +1076,17 @@ async fn attest_release_revoke_and_tamper() {
         StatusCode::NOT_FOUND,
         "the certificate's app no longer matches the row"
     );
-    sqlx::query!("update revisions set app_id = $1", Uuid::from(app))
-        .execute(&h.pool)
-        .await
-        .unwrap();
-    sqlx::query!("update revisions set compose = compose || ' '")
-        .execute(&h.pool)
-        .await
-        .unwrap();
+    h.edit_revisions(|r| r.app_id = app.into()).await;
+    h.edit_revisions(|r| r.compose.push(' ')).await;
     let (status, reply) = send(instance.get(&secret_url)).await;
     assert_eq!(
         (status, code(&reply)),
         (StatusCode::BAD_REQUEST, "signature_invalid")
     );
-    sqlx::query!("update revisions set compose = left(compose, length(compose) - 1)")
-        .execute(&h.pool)
-        .await
-        .unwrap();
+    h.edit_revisions(|r| {
+        r.compose.pop();
+    })
+    .await;
     assert_eq!(send(instance.get(&secret_url)).await.0, StatusCode::OK);
 
     // A retired registering key keeps old objects valid; compromised fails them closed.
@@ -1091,13 +1103,10 @@ async fn attest_release_revoke_and_tamper() {
         StatusCode::OK,
         "retired: objects signed before revoked_at stay valid"
     );
-    sqlx::query!(
-        "update principal_keys set revocation_reason = 'compromised' where id = $1",
-        Uuid::from(admin.0)
-    )
-    .execute(&h.pool)
-    .await
-    .unwrap();
+    h.edit_key(admin.0, |k| {
+        k.revocation_reason = Some("compromised".into())
+    })
+    .await;
     let (status, reply) = send(instance.get(&secret_url)).await;
     assert_eq!(
         (status, code(&reply)),
@@ -1111,23 +1120,15 @@ async fn attest_release_revoke_and_tamper() {
 
     // A delegated key's row must match its signed registration document: with the SPKI
     // swapped, the holder of the replacement key signs nothing.
-    sqlx::query!(
-        "update principal_keys set revoked_at = null, revocation_reason = null where id = $1",
-        Uuid::from(admin.0)
-    )
-    .execute(&h.pool)
-    .await
-    .unwrap();
+    h.edit_key(admin.0, |k| {
+        k.revoked_at = None;
+        k.revocation_reason = None;
+    })
+    .await;
     let impostor = (admin.0, SigningKey::from_bytes(&[22u8; 32]));
     let other = impostor.1.verifying_key().to_public_key_der().unwrap();
-    sqlx::query!(
-        "update principal_keys set public_key = $1 where id = $2",
-        other.as_bytes(),
-        Uuid::from(admin.0)
-    )
-    .execute(&h.pool)
-    .await
-    .unwrap();
+    h.edit_key(admin.0, |k| k.public_key = other.as_bytes().to_vec())
+        .await;
     let payload = json!({ "key_id": admin.0, "reason": "retired", "issued_at": rfc3339(h.now()) });
     let (status, reply) = h
         .post(
@@ -1141,14 +1142,8 @@ async fn attest_release_revoke_and_tamper() {
         "{reply}"
     );
     let genuine = admin.1.verifying_key().to_public_key_der().unwrap();
-    sqlx::query!(
-        "update principal_keys set public_key = $1 where id = $2",
-        genuine.as_bytes(),
-        Uuid::from(admin.0)
-    )
-    .execute(&h.pool)
-    .await
-    .unwrap();
+    h.edit_key(admin.0, |k| k.public_key = genuine.as_bytes().to_vec())
+        .await;
     assert_eq!(send(instance.get(&secret_url)).await.0, StatusCode::OK);
 
     // Release follows the signed document, not the app_ids column.
@@ -1162,25 +1157,14 @@ async fn attest_release_revoke_and_tamper() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
-    let added = [Uuid::from(app)];
-    sqlx::query!(
-        "update secrets set app_ids = app_ids || $1 where name = 'foreign'",
-        &added[..]
-    )
-    .execute(&h.pool)
-    .await
-    .unwrap();
+    h.edit_secrets("foreign", |s| s.app_ids.push(app.into()))
+        .await;
     let (status, reply) = send(instance.get(format!("{}/v1/secrets/foreign", h.url))).await;
     assert_eq!((status, code(&reply)), (StatusCode::NOT_FOUND, "not_found"));
 
     // A swapped anchor SPKI leaves the organization's secrets undecryptable.
-    sqlx::query!(
-        "update principal_keys set public_key = $1 where registered_by_key is null",
-        other.as_bytes()
-    )
-    .execute(&h.pool)
-    .await
-    .unwrap();
+    h.edit_key(h.root.0, |k| k.public_key = other.as_bytes().to_vec())
+        .await;
     let (status, reply) = send(instance.get(&secret_url)).await;
     assert_eq!(
         (status, code(&reply)),
@@ -1320,20 +1304,17 @@ async fn derive_refuses_and_audits_without_ever_recording_the_key() {
     let unregistered = leaf_client(&h, app, alpha_core::compose_hash("unregistered"));
     let (status, reply) = derive(&h, &unregistered, body.clone()).await;
     refused(status, (StatusCode::NOT_FOUND, "not_found"), &reply);
-    sqlx::query!("update revisions set compose = compose || ' '")
-        .execute(&h.pool)
-        .await
-        .unwrap();
+    h.edit_revisions(|r| r.compose.push(' ')).await;
     let (status, reply) = derive(&h, &instance, body.clone()).await;
     refused(
         status,
         (StatusCode::BAD_REQUEST, "signature_invalid"),
         &reply,
     );
-    sqlx::query!("update revisions set compose = left(compose, length(compose) - 1)")
-        .execute(&h.pool)
-        .await
-        .unwrap();
+    h.edit_revisions(|r| {
+        r.compose.pop();
+    })
+    .await;
     let payload = json!({ "compose_hash": hash, "issued_at": rfc3339(h.now()) });
     let (status, reply) = h
         .post(
@@ -1781,11 +1762,7 @@ async fn a_sealed_value_cannot_be_moved_into_another_organization() {
         .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
     assert_eq!(h.secrets_named("moved").await, 1);
-    let owner = sqlx::query_scalar::<_, Uuid>("select org_id from secrets where name = $1")
-        .bind("moved")
-        .fetch_one(&h.pool)
-        .await
-        .unwrap();
+    let owner = owner_of(&h, "moved").await;
     assert_eq!(owner, Uuid::from(h.org));
 }
 
@@ -1813,11 +1790,7 @@ async fn a_sealed_value_for_an_app_without_a_revision_stays_with_its_organizatio
         .call(reqwest::Method::PUT, "/v1/secrets/early", body)
         .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
-    let owner = sqlx::query_scalar::<_, Uuid>("select org_id from secrets where name = $1")
-        .bind("early")
-        .fetch_one(&h.pool)
-        .await
-        .unwrap();
+    let owner = owner_of(&h, "early").await;
     assert_eq!(owner, Uuid::from(h.org));
 }
 
@@ -1847,4 +1820,12 @@ async fn a_put_carries_exactly_one_of_value_and_sealed() {
         let message = refused_put(&h, "shape", variant, StatusCode::BAD_REQUEST, "malformed").await;
         assert_eq!(message, "exactly one of value and sealed");
     }
+}
+
+async fn owner_of(h: &Harness, name: &str) -> Uuid {
+    let secrets = h.secrets().await;
+    let mut owners = secrets.iter().filter(|(_, s)| s.name == name);
+    let owner = owners.next().unwrap().1.org_id;
+    assert!(owners.next().is_none());
+    owner
 }

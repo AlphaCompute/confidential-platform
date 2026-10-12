@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select id, principal_id, public_key, created_at from principal_keys\n         where org_id = $1 and registered_by_key is null",
+  "query": "select id, sealed, created_at from principal_keys\n         where org_index = $1 and anchor_check is not null",
   "describe": {
     "columns": [
       {
@@ -16,28 +16,17 @@
       },
       {
         "ordinal": 1,
-        "name": "principal_id",
-        "type_info": "Uuid",
+        "name": "sealed",
+        "type_info": "Bytea",
         "origin": {
           "Table": {
             "table": "principal_keys",
-            "name": "principal_id"
+            "name": "sealed"
           }
         }
       },
       {
         "ordinal": 2,
-        "name": "public_key",
-        "type_info": "Bytea",
-        "origin": {
-          "Table": {
-            "table": "principal_keys",
-            "name": "public_key"
-          }
-        }
-      },
-      {
-        "ordinal": 3,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -50,15 +39,14 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Bytea"
       ]
     },
     "nullable": [
       false,
-      false,
-      false,
+      true,
       false
     ]
   },
-  "hash": "f17ec997a0368adc2e84d26eb1c87ac3ab6e40f25b1eaae4882f3107f4ef28db"
+  "hash": "85ca19ba989c4092aaeb1e525aa2a2d40cc294ef6002d2d0f46b2fd716b847bc"
 }

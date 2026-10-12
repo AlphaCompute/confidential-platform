@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select exists(select 1 from revisions where app_id = $1 and org_id <> $2)",
+  "query": "select exists(select 1 from revisions where app_index = any($1) and org_index <> $2)",
   "describe": {
     "columns": [
       {
@@ -12,13 +12,13 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Uuid"
+        "ByteaArray",
+        "Bytea"
       ]
     },
     "nullable": [
       null
     ]
   },
-  "hash": "f7ac0a5d1f273509bc587f3fe1cf730aaf617c853b5de18258a81118a48106e6"
+  "hash": "545c328dc55a30e5fa4fc8df11874388d6f4d5588e12d22f5b5e7e011a8f2344"
 }

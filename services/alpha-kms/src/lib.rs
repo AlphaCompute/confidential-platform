@@ -21,6 +21,7 @@ pub mod instance;
 pub mod keys;
 pub mod node;
 pub mod platform;
+pub mod store;
 pub mod tls;
 pub mod webauthn;
 
@@ -194,14 +195,29 @@ pub enum CollateralSource {
     Fixed(Box<Collateral>),
 }
 
-/// The two intermediates in memory after unseal, join or bootstrap.
+/// The two intermediates in memory after unseal, join or bootstrap, and the database's keys
+/// derived from the first.
 pub struct Intermediates {
     pub tenant_kek_root: Zeroizing<[u8; 32]>,
     pub ca_key_der: Zeroizing<Vec<u8>>,
     pub ca_cert_der: Vec<u8>,
+    pub metadata: store::MetadataKeys,
 }
 
 impl Intermediates {
+    pub fn new(
+        tenant_kek_root: Zeroizing<[u8; 32]>,
+        ca_key_der: Zeroizing<Vec<u8>>,
+        ca_cert_der: Vec<u8>,
+    ) -> Result<Self, ApiError> {
+        Ok(Self {
+            metadata: store::MetadataKeys::derive(&tenant_kek_root)?,
+            tenant_kek_root,
+            ca_key_der,
+            ca_cert_der,
+        })
+    }
+
     pub fn ca_key(&self) -> Result<rcgen::KeyPair, ApiError> {
         certs::key_pair(&self.ca_key_der)
     }
@@ -238,6 +254,8 @@ pub struct Node {
     pub platform: RwLock<Option<Arc<PlatformDocument>>>,
     pub phase: RwLock<Phase>,
     pub server_cert: Arc<tls::ServerCert>,
+    /// How far this node has verified the audit chain, or where it found it broken.
+    pub audit_chain: Mutex<Result<audit::Checkpoint, String>>,
     bucket: Mutex<(f64, Instant)>,
 }
 
@@ -284,6 +302,7 @@ impl Node {
             platform: RwLock::new(None),
             phase: RwLock::new(Phase::Sealed { shares: Vec::new() }),
             server_cert,
+            audit_chain: Mutex::new(Ok(audit::Checkpoint::default())),
             bucket: Mutex::new((BUCKET_CAPACITY, Instant::now())),
         }))
     }
@@ -311,11 +330,64 @@ impl Node {
         matches!(&*self.phase.read(), Phase::Sealed { .. })
     }
 
-    /// Enters the serving phase: intermediates in memory and a leaf from `ca` on the listener.
-    pub fn start_serving(&self, keys: Intermediates) -> Result<(), ApiError> {
+    /// An audit row in a transaction of its own: sealed while serving, a node fact otherwise.
+    pub async fn audit(&self, row: audit::Audit<'_>) -> Result<i64, ApiError> {
+        let keys = self.intermediates().ok();
+        row.insert_now(&self.pool, keys.as_ref().map(|k| &k.metadata))
+            .await
+    }
+
+    /// Enters the serving phase: unseal → the database's keys → every plaintext row sealed → serve,
+    /// with intermediates in memory and a leaf from `ca` on the listener. A database that cannot be
+    /// sealed keeps the node sealed.
+    pub async fn start_serving(&self, keys: Intermediates) -> Result<(), ApiError> {
+        let sealed = store::seal_plaintext(&self.pool, &keys.metadata).await?;
+        if !sealed.is_empty() {
+            eprintln!("sealed plaintext rows: {sealed:?}");
+        }
         self.issue_own_leaf(&keys)?;
         *self.phase.write() = Phase::Serving(Arc::new(keys));
         Ok(())
+    }
+
+    /// One maintenance pass while serving: rows an older node wrote in the clear are sealed, and
+    /// the audit chain is verified from where the last pass stopped.
+    pub async fn maintain(&self) {
+        let Ok(keys) = self.intermediates() else {
+            return;
+        };
+        match store::seal_plaintext(&self.pool, &keys.metadata).await {
+            Ok(sealed) if !sealed.is_empty() => eprintln!("sealed plaintext rows: {sealed:?}"),
+            Ok(_) => {}
+            Err(e) => eprintln!("sealing plaintext rows: {}", e.message),
+        }
+        let Ok(mut from) = self.audit_chain.lock().clone() else {
+            return;
+        };
+        // The pass above moved the unlinked rows already walked into the chain.
+        from.unlinked.clear();
+        let walked = audit::verify(&self.pool, &keys.metadata, from, |_| {}).await;
+        let broken = match walked {
+            Ok(at) => {
+                *self.audit_chain.lock() = Ok(at);
+                return;
+            }
+            Err(audit::ChainError::Read(e)) => {
+                eprintln!("audit chain: {e}");
+                return;
+            }
+            Err(e) => e.to_string(),
+        };
+        eprintln!("{broken}");
+        *self.audit_chain.lock() = Err(broken.clone());
+        let row = audit::node(
+            "audit.verify",
+            "error",
+            serde_json::json!({ "message": broken }),
+        );
+        if let Err(e) = self.audit(row).await {
+            eprintln!("audit.verify: {}", e.message);
+        }
     }
 
     /// The listener's leaf from `ca`: `alphacompute://kms` and this node's Revision.
@@ -388,13 +460,15 @@ async fn ready(State(node): State<Arc<Node>>) -> Response {
     if let Err(e) = sqlx::query("select 1").execute(&node.pool).await {
         return ApiError::internal(format!("database: {e}")).into_response();
     }
-    let sealed = node.is_sealed();
-    let status = if sealed {
-        axum::http::StatusCode::SERVICE_UNAVAILABLE
-    } else {
-        axum::http::StatusCode::OK
+    if node.is_sealed() {
+        let body = axum::Json(serde_json::json!({ "sealed": true }));
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response();
+    }
+    let audit_chain = match &*node.audit_chain.lock() {
+        Ok(at) => serde_json::json!({ "verified_through": at.seq }),
+        Err(broken) => serde_json::json!({ "broken": broken }),
     };
-    (status, axum::Json(serde_json::json!({ "sealed": sealed }))).into_response()
+    axum::Json(serde_json::json!({ "sealed": false, "audit_chain": audit_chain })).into_response()
 }
 
 pub fn random<const N: usize>() -> Result<[u8; N], ApiError> {

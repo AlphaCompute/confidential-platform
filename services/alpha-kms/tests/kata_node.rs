@@ -365,7 +365,7 @@ async fn a_kata_node_joins_a_prototype_node_and_serves_under_the_same_ca() {
     assert_eq!(details["coco"]["profile"], "kata-tdx/1");
     assert_eq!(details["coco"]["runtime_class"], CPU_RUNTIME_CLASS);
     let reply: JoinReply = serde_json::from_value(reply).unwrap();
-    node::finish_join(&joiner, &reply).unwrap();
+    node::finish_join(&joiner, &reply).await.unwrap();
     assert!(!joiner.is_sealed());
     assert_eq!(joiner.intermediates().unwrap().ca_pem(), h.ca_pem);
 

@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into audit_log (ts, actor_kind, actor, action, outcome, details, link)\n                 values ($1, $2, $3, $4, $5, $6, $7) returning seq",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "seq",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "audit_log",
+            "name": "seq"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "de959231ce7bd6f8943616dfbddfde8be397dd1f4056173a7d8360ae1c68db61"
+}

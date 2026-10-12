@@ -21,6 +21,10 @@ async fn main() {
 }
 
 async fn run() -> Result<(), String> {
+    // ponytail: D10 — how a Kata KMS node authenticates to Postgres (a client certificate from the
+    // KMS CA, or a password released after unseal) is Ryan Tharp's open decision; until then the
+    // node connects with ALPHACOMPUTE_DATABASE_URL as before. The rows are sealed either way
+    // (`store`), so this decides who may connect, not who may read.
     let pool = PgPoolOptions::new()
         .max_connections(8)
         .connect(&alpha_kms::env("ALPHACOMPUTE_DATABASE_URL")?)
@@ -83,7 +87,7 @@ async fn start_phase(node: &Arc<Node>) {
     if let Some(root) = &node.config.dev_root_kek {
         match node::unwrap_intermediates(node, root).await {
             Ok(keys) => {
-                if let Err(e) = node.start_serving(keys) {
+                if let Err(e) = node.start_serving(keys).await {
                     eprintln!("dev root: {}", e.message);
                 }
                 return;
@@ -92,7 +96,10 @@ async fn start_phase(node: &Arc<Node>) {
         }
     }
     match node::try_join(node).await {
-        Ok(()) => eprintln!("joined; serving"),
+        Ok(()) => {
+            eprintln!("joined; serving");
+            node.maintain().await;
+        }
         Err(e) => eprintln!("sealed: {}; waiting for unseal", e.message),
     }
 }
