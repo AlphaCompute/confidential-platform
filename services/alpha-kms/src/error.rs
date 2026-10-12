@@ -38,7 +38,9 @@ impl ApiError {
         match self.code {
             "signature_invalid" | "nonce_invalid" | "malformed" => StatusCode::BAD_REQUEST,
             "cert_invalid" => StatusCode::UNAUTHORIZED,
-            "attestation_failed" | "attestation_unknown" | "policy_denied" => StatusCode::FORBIDDEN,
+            "attestation_failed" | "attestation_unknown" | "policy_denied" | "forbidden" => {
+                StatusCode::FORBIDDEN
+            }
             "revision_revoked" | "already_exists" => StatusCode::CONFLICT,
             "not_found" => StatusCode::NOT_FOUND,
             "rate_limited" => StatusCode::TOO_MANY_REQUESTS,
