@@ -225,7 +225,8 @@ first end-to-end run is at G0 with a B300 pod.
    the init-data digest against MRCONFIGID, and NRAS's token signatures and nonce. Every policy
    decision is the KMS's.
 2. **NRAS keys.** Trustee's NVIDIA verifier trusts the NRAS JWKS it fetches from NVIDIA over web
-   PKI at start (`nras_jwks.rs`, a fixed URL), where alpha-kms pins NRAS's keys by `kid` in the
+   PKI each time the AS builds the verifier, once per attestation (`nras_jwks.rs`, a fixed URL;
+   `to_verifier` in the AS's `evaluate`), where alpha-kms pins NRAS's keys by `kid` in the
    document. Through Trustee a GPU verdict rests on web PKI. Option: keep GPU pods off Option B
    until a pinned or local verifier is used.
 3. **The token-signing key** is the Trustee App's derived key `trustee.as-token`, shared by both
