@@ -29,6 +29,32 @@ async fn run() -> Result<(), String> {
     let options = PgPoolOptions::new()
         .max_connections(8)
         .acquire_timeout(std::time::Duration::from_secs(10));
+    // PRD-05 draft: `alpha-kms digest [--against before.json]`, the Postgres move's row check.
+    if std::env::args().nth(1).as_deref() == Some("digest") {
+        let pool = options
+            .connect(&url)
+            .await
+            .map_err(|e| format!("database: {e}"))?;
+        let digest = alpha_kms::db_digest::digest(&pool).await?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&digest).map_err(|e| e.to_string())?
+        );
+        let args: Vec<String> = std::env::args().collect();
+        if let [_, _, flag, path] = args.as_slice()
+            && flag == "--against"
+        {
+            let text = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+            let before: alpha_kms::db_digest::Digest =
+                serde_json::from_slice(&text).map_err(|e| format!("{path}: {e}"))?;
+            let differences = alpha_kms::db_digest::compare(&before, &digest);
+            if !differences.is_empty() {
+                return Err(format!("differs from {path}: {}", differences.join("; ")));
+            }
+            eprintln!("alpha-kms: identical to {path}");
+        }
+        return Ok(());
+    }
     if std::env::args().nth(1).as_deref() == Some("migrate") {
         let pool = options
             .connect(&url)

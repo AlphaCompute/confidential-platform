@@ -18,6 +18,7 @@ pub mod channel;
 pub mod control;
 pub mod custodians;
 pub mod data_key;
+pub mod db_digest;
 pub mod db_volume;
 pub mod error;
 pub mod instance;
