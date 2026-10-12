@@ -14,7 +14,13 @@ fifth for a wrapped compose.
 `ALPHACOMPUTE_KMS_REVISIONS` (comma-separated `sha256:<hex>`) are in the measured compose and are
 all the runtime trusts: before the first request it refuses a KMS whose chain does not end at a
 CA with that key or whose leaf carries no listed Revision, and moves on to the next entry of
-`ALPHACOMPUTE_KMS_ENDPOINTS`. An empty Revision list is refused at start. `ALPHACOMPUTE_SECRETS`,
+`ALPHACOMPUTE_KMS_ENDPOINTS`. An empty Revision list is refused at start. Opt-in instead (D6,
+`docs/kms-pinning.md`): `ALPHACOMPUTE_KMS_REVISIONS=platform:<min version>` beside
+`ALPHACOMPUTE_PLATFORM_DOCUMENT_URL` (`https://`, also measured) accepts whichever Revisions the
+release-signed platform document lists, refreshed before every attestation: the document must
+verify under the compiled-in release key, be at or above that version and every version the
+process has accepted, carry an unexpired `expires_at` and name the pinned CA, so a KMS upgrade no
+longer changes the App's Revision. The URL without `platform:` is refused at start. `ALPHACOMPUTE_SECRETS`,
 also measured, is a JSON object of service name to the Secret names it declared, for example
 `{"db":["db_password"],"web":["db_password","session_key"]}`, and is absent when nothing is
 declared. Every service and Secret name becomes a path segment, so each must be a lowercase key

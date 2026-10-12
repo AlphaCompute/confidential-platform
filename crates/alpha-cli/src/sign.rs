@@ -12,8 +12,17 @@ use serde_json::Value;
 
 /// Signing garbage is refused: the document must already be a platform document.
 pub fn sign(document: Value, key: &SigningKey) -> Result<SignedDocument, String> {
-    serde_json::from_value::<PlatformDocument>(document.clone())
+    let parsed = serde_json::from_value::<PlatformDocument>(document.clone())
         .map_err(|e| format!("document: {e}"))?;
+    if let Some(expires_at) = &parsed.expires_at {
+        let at = |t: &str| chrono::DateTime::parse_from_rfc3339(t).map_err(|e| format!("{t}: {e}"));
+        if at(expires_at)? <= at(&parsed.issued_at)? {
+            return Err(format!(
+                "document: expires_at {expires_at} is not after issued_at {}",
+                parsed.issued_at
+            ));
+        }
+    }
     platform::sign(document, key).map_err(|e| e.to_string())
 }
 
@@ -109,6 +118,23 @@ mod tests {
         assert!(sign(document.clone(), &key).is_ok());
         document["signer"]["origins"][0] = json!("https://sign.example/path");
         assert!(sign(document, &key).is_err());
+    }
+
+    #[test]
+    fn a_document_expires_after_it_is_issued() {
+        let key = SigningKey::from_bytes(&[8u8; 32]);
+        let mut document = json!({
+            "version": 5, "issued_at": "2026-10-12T00:00:00Z",
+            "policy": { "tcb_statuses": ["UpToDate"], "tolerated_advisories": [] },
+            "reference_values": [], "kms_ca_pem": "", "kms_revisions": [],
+            "expires_at": "2026-11-12T00:00:00Z"
+        });
+        assert!(sign(document.clone(), &key).is_ok());
+        for bad in ["2026-10-12T00:00:00Z", "2026-10-11T00:00:00Z", "next month"] {
+            document["expires_at"] = json!(bad);
+            let e = sign(document.clone(), &key).unwrap_err();
+            assert!(e.contains("expires_at"), "{bad}: {e}");
+        }
     }
 
     /// alpha-infra's draft generator writes `pccs_url`; it used to be refused as an unknown field.

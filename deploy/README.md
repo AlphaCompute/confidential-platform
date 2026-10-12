@@ -164,7 +164,9 @@ answers 200 only once it reaches that database.
 ## Upgrade
 
 1. Release; sign a document whose `kms_revisions[]` lists the old and the new Revision; every
-   tenant App that pins the KMS gets a Revision with `ALPHACOMPUTE_KMS_REVISIONS` listing both.
+   tenant App on the strict pin gets a Revision with `ALPHACOMPUTE_KMS_REVISIONS` listing both.
+   Apps on the platform pin (`docs/kms-pinning.md`) follow the document as it is; give it an
+   `expires_at` and re-sign it before then.
 2. Update the compose of **one** CVM through the Phala API (provision the compose-file update
    with the new `app-compose.json`, check `compose_hash` again, commit). It restarts `sealed`,
    joins the other node, and `GET /ready` turns 200.
