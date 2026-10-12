@@ -2,15 +2,20 @@
 //! three new X-Wing keys and a nonce this node minted; each approval seals the proposal's digest
 //! and the custodian's share to this node's attested X-Wing key. With two, the node rebuilds the
 //! current root KEK, proves it by unwrapping every `intermediate_keys` row and finding the
-//! tenant-kek-root it serves, generates a new root inside the node, and in one transaction
-//! re-wraps every row under it and records the rotation with the new shares sealed to the new
-//! custodians and a signed receipt. Both roots are zeroized when the call returns.
+//! tenant-kek-root (and data key) it serves, generates a new root and a new data key inside the
+//! node, and in one transaction: re-wraps tenant-kek-root and the CA key under the new root,
+//! re-encrypts every sealed row, blind index and Secret value under the new data key
+//! ([`crate::data_key`], [`store::rekey`]), and records the rotation with the new shares sealed to
+//! the new custodians and a signed receipt. Both roots are zeroized when the call returns.
 //!
-//! The intermediates themselves do not change, so nothing derived from them changes either: the
-//! organizations' keys, every App's derived keys, the metadata keys of #95 and the CA. Every
-//! sealed row stays readable, a serving or joined node keeps serving, and a node that joins later
-//! receives the same intermediates. What changes is which shares open the database: before the
-//! commit only the old ones, after it only the new ones, never neither.
+//! What changes at the commit: which shares open the database (before it only the old ones,
+//! after it only the new ones, never neither), and which key everything the database holds is
+//! sealed under. Two old shares and a copy of the database taken before the rotation therefore
+//! open that copy's data and nothing written later. What does not change: tenant-kek-root, from
+//! which every App's derived keys come (customers' volumes are encrypted under them), and the CA
+//! key, which tenants pin through the platform document. Those two are the residual
+//! (`docs/custodian-rotation.md`). A joined node holds the old data key after the commit: its
+//! writes are refused under the chain lock, and its next maintenance pass makes it join again.
 
 use std::sync::Arc;
 
@@ -30,10 +35,11 @@ use zeroize::Zeroizing;
 
 use crate::audit;
 use crate::body::Body;
+use crate::data_key::{self, DataKey};
 use crate::error::ApiError;
 use crate::instance::{check_nonce, decode32};
 use crate::keys::{aead_open, aead_seal};
-use crate::{Intermediates, Node, control, random};
+use crate::{Intermediates, Node, Phase, control, random, store};
 
 /// Approvals of one proposal, held in memory until the second arrives or another proposal
 /// replaces them. Never written anywhere.
@@ -202,6 +208,13 @@ pub async fn rotate_root(
     let nonce = decode32("proposal.nonce", &proposal.nonce)?;
     let new_root = Zeroizing::new(random::<32>()?);
     let mut tx = node.pool.begin().await?;
+    // From the first statement, no node appends, and so commits a route's rows, under the keys
+    // this transaction replaces, and no seal pass runs beside it.
+    audit::lock_chain(&mut tx).await?;
+    store::lock_seal(&mut tx).await?;
+    if store::data_epoch(&mut *tx).await? != keys.metadata.epoch() {
+        return Err(audit::stale_keys());
+    }
     let rows = sqlx::query!(
         r#"select purpose::text as "purpose!", wrapped from intermediate_keys
            order by purpose for update"#
@@ -220,6 +233,16 @@ pub async fn rotate_root(
             return Err(ApiError::internal(
                 "the database's tenant-kek-root is not the one this node serves",
             ));
+        }
+        if row.purpose == data_key::PURPOSE {
+            let held = DataKey::decode(&plain)?;
+            if !keys.data.as_ref().is_some_and(|d| d.same_as(&held)) {
+                return Err(ApiError::internal(
+                    "the database's data key is not the one this node serves",
+                ));
+            }
+            // Replaced below, not re-wrapped.
+            continue;
         }
         let wrapped = aead_seal(&new_root, purpose, &plain)?;
         if aead_open(&new_root, purpose, &wrapped).as_deref() != Some(&plain) {
@@ -244,6 +267,27 @@ pub async fn rotate_root(
             )));
         }
     }
+
+    // The new data key, and every row re-encrypted under it.
+    let data = DataKey::next(
+        keys.metadata.epoch(),
+        keys.metadata.audit_keys_since_first_rotation(),
+    )?;
+    let next = Intermediates::new(
+        keys.tenant_kek_root.clone(),
+        keys.ca_key_der.clone(),
+        keys.ca_cert_der.clone(),
+    )?
+    .with_data(Some(data.clone()))?;
+    sqlx::query!(
+        "insert into intermediate_keys (purpose, wrapped, epoch) values ('data-key', $1, $2)
+           on conflict (purpose) do update set wrapped = $1, epoch = $2",
+        data.wrap(&new_root)?,
+        data.epoch,
+    )
+    .execute(&mut *tx)
+    .await?;
+    let rekeyed = store::rekey(&mut tx, &keys.metadata, &next.metadata).await?;
 
     let shares = Gf256::split_bytes(
         2,
@@ -274,6 +318,8 @@ pub async fn rotate_root(
             .map(sealed_sha256).collect::<Result<Vec<_>, _>>().map_err(malformed)?,
         "approved_by_shares": approved_by,
         "rewrapped": rewrapped,
+        "data_key_epoch": data.epoch,
+        "rekeyed": rekeyed,
     });
     let request = serde_json::to_value(proposal).map_err(malformed)?;
     let receipt = control::receipt(node, ROTATION_ROUTE, &request, response.clone())?;
@@ -299,12 +345,14 @@ pub async fn rotate_root(
             "the proposal's nonce has already rotated the root",
         ));
     }
+    // The first row of the new epoch, sealed under its audit key.
     let appended = audit::node("custodians.rotate", "ok", response)
-        .insert(&mut tx, &node.chain, Some(&keys.metadata))
+        .insert(&mut tx, &node.chain, Some(&next.metadata))
         .await?;
     tx.commit().await?;
     appended.committed(&node.chain);
     drop(new_root);
+    *node.phase.write() = Phase::Serving(Arc::new(next));
     Ok(rotation)
 }
 

@@ -481,6 +481,10 @@ pub struct JoinReply {
     pub tenant_kek_root: String,
     pub ca_key: String,
     pub ca_cert: String,
+    /// The latest custodian rotation's data key (`epoch ‖ key ‖ earlier audit keys`), which every
+    /// row is sealed under since; absent before the first rotation.
+    #[serde(default)]
+    pub data_key: Option<String>,
     /// The serving node's audit head: the joining node refuses to serve a database without it.
     #[serde(default)]
     pub audit_head: Option<AuditHead>,

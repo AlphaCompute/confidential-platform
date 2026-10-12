@@ -12,7 +12,7 @@ Code: `services/alpha-kms/src/store.rs` (keys, blind indexes, sealed rows, the p
 | index | same, info `index` | HMAC-SHA256 blind indexes |
 | audit | same, info `audit` | AES-256-GCM of each audit row, its associated data the chain |
 
-The three keys are derived from tenant-kek-root, not wrapped beside it as a third intermediate. Tenant-kek-root is in memory only on a serving node: after custodians unseal it with two shares, after it joins a serving node, or after bootstrap. So the database keys exist exactly when the intermediates do, without changing the join protocol, and an existing database needs no new intermediate, which only a node holding the root KEK could add. Nothing comes from the environment; the `dev-root` build reaches the same keys through its development root KEK.
+Before the first custodian rotation (epoch 0) the three keys are derived from tenant-kek-root, not wrapped beside it as a third intermediate. Each rotation replaces them: it makes a new data key, derives them from it (same salt and labels, the data key as input) and re-encrypts every row in the same transaction (`docs/custodian-rotation.md`, "What rotates"). The audit log keeps each epoch's rows under that epoch's audit key. Tenant-kek-root is in memory only on a serving node: after custodians unseal it with two shares, after it joins a serving node, or after bootstrap. So the database keys exist exactly when the intermediates do, without changing the join protocol, and an existing database needs no new intermediate, which only a node holding the root KEK could add. Nothing comes from the environment; the `dev-root` build reaches the same keys through its development root KEK.
 
 **Fail closed.**
 - A sealed node holds no metadata key. It reads no tenant row, and it writes no audit row about a tenant (`sealed`).
@@ -79,7 +79,8 @@ The Instance read no longer filters on `app_ids` in SQL. It opens the row and re
 | Column | Class | Why |
 |---|---|---|
 | `platform_document.*` | clear | The release-signed document is public: it is served at an unauthenticated URL, and every stored copy is re-verified against the release key. |
-| `intermediate_keys.wrapped` | already ciphertext | Under the root KEK. A custodian rotation re-wraps it under a new root (`docs/custodian-rotation.md`); what it wraps, and so every key derived here, is unchanged. |
+| `intermediate_keys.wrapped` | already ciphertext | Under the root KEK. A custodian rotation re-wraps it under a new root and replaces the `data-key` row (`docs/custodian-rotation.md`); tenant-kek-root and the CA key keep their values. |
+| `intermediate_keys.epoch` | clear | The data key's epoch (the number of rotations), on its row only: the fence every node checks under the chain lock. The wrapped key carries the epoch it trusts. |
 | `intermediate_keys.public_part` | clear | The CA certificate, pinned in the platform document. |
 | `custodian_rotations.rotation` | clear, its shares already ciphertext | The proposal (the custodians' X-Wing public keys, a spent nonce, the node's key hash), the new shares HPKE-sealed to the custodians, and the node's receipt. No tenant appears in it, and the custodians verify the receipt rather than trust the row. |
 

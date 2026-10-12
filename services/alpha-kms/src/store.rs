@@ -5,7 +5,7 @@
 //! writes no tenant row, and every value the KMS decides on comes out of a sealed blob. The column
 //! classification and its reasons are in `docs/metadata-encryption.md`.
 
-use alpha_core::ComposeHash;
+use alpha_core::{ComposeHash, OrgId};
 use chrono::{DateTime, Utc};
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
@@ -17,22 +17,33 @@ use sqlx::{PgConnection, PgExecutor, PgPool};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use crate::data_key::DataKey;
 use crate::error::ApiError;
 use crate::instance::RevisionRow;
-use crate::keys::{Key32, KeyRow, aead_open, aead_seal};
+use crate::keys::{self, Key32, KeyRow, aead_open, aead_seal};
 
 const SALT: &[u8] = b"alphacompute-kms/metadata/v1";
+const SECRET_SALT: &[u8] = b"alphacompute-kms/secret-key/v1";
 const ROW_AAD: &[u8] = b"alphacompute-kms/row/v1";
 /// Serializes the passes of [`seal_plaintext`] across nodes.
 const SEAL_LOCK: i64 = 0x616c_7068_6173_6c64;
 
-/// The keys over the database's contents, derived from tenant-kek-root rather than wrapped beside
-/// it: they exist exactly when the intermediates do (after unseal, join or bootstrap), and neither
-/// the join protocol nor an existing database needs a new intermediate.
+/// The keys over the database's contents. They exist exactly when the intermediates do (after
+/// unseal, join or bootstrap). Before the first custodian rotation (epoch 0) they are derived from
+/// tenant-kek-root; each rotation derives them from a new data key ([`crate::data_key`]) and
+/// re-encrypts every row under them ([`rekey`]).
+#[derive(Clone)]
 pub struct MetadataKeys {
+    epoch: i32,
     row: Key32,
     index: Key32,
-    audit: Key32,
+    /// One per epoch, epoch 0's first: the last seals new audit rows, the earlier ones open the
+    /// rows sealed before each rotation, which the append-only chain keeps as they were.
+    audit: Vec<Key32>,
+    /// Where a Secret value's key comes from: tenant-kek-root through `org_key` in epoch 0, the
+    /// data key afterwards.
+    secret: Key32,
+    ticket: Key32,
 }
 
 /// A blind index: the column it stands for goes into the HMAC, so equal values in two columns
@@ -85,12 +96,57 @@ fn hkdf(ikm: &[u8; 32], info: &[u8]) -> Result<Key32, ApiError> {
 }
 
 impl MetadataKeys {
+    /// Epoch 0: a database no custodian rotation has re-keyed.
     pub fn derive(tenant_kek_root: &[u8; 32]) -> Result<Self, ApiError> {
         Ok(Self {
+            epoch: 0,
             row: hkdf(tenant_kek_root, b"row")?,
             index: hkdf(tenant_kek_root, b"index")?,
-            audit: hkdf(tenant_kek_root, b"audit")?,
+            audit: vec![hkdf(tenant_kek_root, b"audit")?],
+            secret: Zeroizing::new(*tenant_kek_root),
+            ticket: Zeroizing::new(*tenant_kek_root),
         })
+    }
+
+    /// The epoch of `data`: every key from the data key, except epoch 0's audit key, which only
+    /// opens the rows sealed before the first rotation.
+    pub fn with_data(tenant_kek_root: &[u8; 32], data: &DataKey) -> Result<Self, ApiError> {
+        let mut audit = vec![hkdf(tenant_kek_root, b"audit")?];
+        audit.extend(data.earlier_audit.iter().cloned());
+        audit.push(hkdf(&data.key, b"audit")?);
+        Ok(Self {
+            epoch: data.epoch,
+            row: hkdf(&data.key, b"row")?,
+            index: hkdf(&data.key, b"index")?,
+            audit,
+            secret: hkdf(&data.key, b"secret")?,
+            ticket: hkdf(&data.key, b"ticket")?,
+        })
+    }
+
+    /// 0 before the first custodian rotation, then the data key's epoch.
+    pub fn epoch(&self) -> i32 {
+        self.epoch
+    }
+
+    /// The key a Secret's value is sealed under, for its organization and anchor: `org_key` in
+    /// epoch 0, as before; afterwards the same derivation from the data key, so a rotation changes
+    /// it while every App's derived keys (`org_key` → `app_key`) stay what they were.
+    pub fn secret_key(&self, org: OrgId, anchor_spki: &[u8]) -> Result<Key32, ApiError> {
+        if self.epoch == 0 {
+            return keys::org_key(&self.secret, org, anchor_spki);
+        }
+        keys::derive(&self.secret, SECRET_SALT, org, anchor_spki)
+    }
+
+    /// What channel tickets are sealed under.
+    pub fn ticket_root(&self) -> &[u8; 32] {
+        &self.ticket
+    }
+
+    /// The audit keys after epoch 0's, which the next data key carries forward.
+    pub fn audit_keys_since_first_rotation(&self) -> Vec<Key32> {
+        self.audit.iter().skip(1).cloned().collect()
     }
 
     /// HMAC-SHA256 over `column ‖ 0x00 ‖ value`: equality, never the value. A blind index rather
@@ -135,7 +191,16 @@ impl MetadataKeys {
         serde_json::from_slice(&json).map_err(|_| tampered())
     }
 
-    pub(crate) fn audit_key(&self) -> &[u8; 32] {
+    /// The current epoch's audit key, which seals new rows.
+    pub(crate) fn audit_key(&self) -> Result<&[u8; 32], ApiError> {
+        self.audit
+            .last()
+            .map(|k| &**k)
+            .ok_or_else(|| ApiError::internal("no audit key"))
+    }
+
+    /// Every epoch's audit key, epoch 0's first.
+    pub(crate) fn audit_keys(&self) -> &[Key32] {
         &self.audit
     }
 }
@@ -259,6 +324,118 @@ pub async fn now(conn: &mut PgConnection) -> Result<DateTime<Utc>, ApiError> {
     Ok(sqlx::query_scalar!(r#"select now() as "now!""#)
         .fetch_one(conn)
         .await?)
+}
+
+/// The data key's epoch the database holds, from its row's clear `epoch`: 0 before the first
+/// custodian rotation. Only a fence between nodes; the wrapped key carries the epoch it trusts.
+pub async fn data_epoch(exec: impl PgExecutor<'_>) -> Result<i32, ApiError> {
+    Ok(sqlx::query_scalar!(
+        r#"select coalesce((select epoch from intermediate_keys where purpose = 'data-key'), 0)
+             as "epoch!""#
+    )
+    .fetch_one(exec)
+    .await?)
+}
+
+/// Takes the lock [`seal_plaintext`] runs under, so a rotation and a seal pass never interleave.
+pub async fn lock_seal(conn: &mut PgConnection) -> Result<(), ApiError> {
+    sqlx::query!("select pg_advisory_xact_lock($1)", SEAL_LOCK)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
+/// What one [`rekey`] re-encrypted.
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Rekeyed {
+    pub principal_keys: u64,
+    pub revisions: u64,
+    pub secrets: u64,
+}
+
+/// Re-encrypts, in the caller's transaction, every row `old` protects under `new`: each sealed
+/// blob, each blind index, and each Secret's value (opened under its organization's key of `old`
+/// and sealed under that of `new`). A row still in the clear, or one that does not open, refuses
+/// the whole transaction. The audit log is append-only and keeps its rows as sealed: `new`
+/// carries `old`'s audit keys to read them, and seals new rows under its own.
+pub async fn rekey(
+    conn: &mut PgConnection,
+    old: &MetadataKeys,
+    new: &MetadataKeys,
+) -> Result<Rekeyed, ApiError> {
+    let mut done = Rekeyed::default();
+
+    // The organizations' anchors, which a Secret value's key is derived with.
+    let mut anchors: std::collections::HashMap<Uuid, Vec<u8>> = std::collections::HashMap::new();
+    let rows = sqlx::query!("select id, anchor_check, sealed from principal_keys for update")
+        .fetch_all(&mut *conn)
+        .await?;
+    for r in rows {
+        let sealed = r.sealed.ok_or_else(|| unsealed(Table::PrincipalKeys))?;
+        let record: KeyRecord = old.open(Table::PrincipalKeys, r.id.as_bytes(), &sealed)?;
+        if r.anchor_check.is_some() {
+            anchors.insert(record.org_id, record.public_key.clone());
+        }
+        sqlx::query!(
+            "update principal_keys set org_index = $2, public_key_index = $3, sealed = $4
+              where id = $1",
+            r.id,
+            new.index(Index::KeyOrg, record.org_id.as_bytes())?,
+            new.index(Index::KeyPublicKey, &record.public_key)?,
+            new.seal(Table::PrincipalKeys, r.id.as_bytes(), &record)?,
+        )
+        .execute(&mut *conn)
+        .await?;
+        done.principal_keys = done.principal_keys.saturating_add(1);
+    }
+
+    let rows = sqlx::query!("select compose_hash, sealed from revisions for update")
+        .fetch_all(&mut *conn)
+        .await?;
+    for r in rows {
+        let sealed = r.sealed.ok_or_else(|| unsealed(Table::Revisions))?;
+        let row: RevisionRow = old.open(Table::Revisions, &r.compose_hash, &sealed)?;
+        sqlx::query!(
+            "update revisions set app_index = $2, org_index = $3, sealed = $4
+              where compose_hash = $1",
+            r.compose_hash,
+            new.index(Index::RevisionApp, row.app_id.as_bytes())?,
+            new.index(Index::RevisionOrg, row.org_id.as_bytes())?,
+            new.seal(Table::Revisions, &r.compose_hash, &row)?,
+        )
+        .execute(&mut *conn)
+        .await?;
+        done.revisions = done.revisions.saturating_add(1);
+    }
+
+    let rows = sqlx::query!("select id, ciphertext, sealed from secrets for update")
+        .fetch_all(&mut *conn)
+        .await?;
+    for r in rows {
+        let sealed = r.sealed.ok_or_else(|| unsealed(Table::Secrets))?;
+        let record: SecretRecord = old.open(Table::Secrets, r.id.as_bytes(), &sealed)?;
+        let anchor = anchors.get(&record.org_id).ok_or_else(|| {
+            ApiError::internal("a Secret's organization has no root key to derive its key with")
+        })?;
+        let org = OrgId::from(record.org_id);
+        let value = aead_open(
+            &*old.secret_key(org, anchor)?,
+            r.id.as_bytes(),
+            &r.ciphertext,
+        )
+        .ok_or_else(|| ApiError::internal("a Secret's value does not open under its key"))?;
+        sqlx::query!(
+            "update secrets set name_index = $2, ciphertext = $3, sealed = $4 where id = $1",
+            r.id,
+            secret_index(new, record.org_id, &record.name)?,
+            aead_seal(&*new.secret_key(org, anchor)?, r.id.as_bytes(), &value)?,
+            new.seal(Table::Secrets, r.id.as_bytes(), &record)?,
+        )
+        .execute(&mut *conn)
+        .await?;
+        done.secrets = done.secrets.saturating_add(1);
+    }
+    Ok(done)
 }
 
 pub async fn load_key(
@@ -540,6 +717,10 @@ pub async fn seal_plaintext(
     sqlx::query!("select pg_advisory_xact_lock($1)", SEAL_LOCK)
         .execute(&mut *tx)
         .await?;
+    // Never under keys a custodian rotation has replaced.
+    if data_epoch(&mut *tx).await? != keys.epoch() {
+        return Err(crate::audit::stale_keys());
+    }
     let mut sealed = Sealed::default();
 
     let rows = sqlx::query!(

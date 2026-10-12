@@ -2,9 +2,11 @@
 
 At genesis `alpha bootstrap` splits a random root KEK 2-of-3 among three custodians' X-Wing keys. The root KEK wraps the two intermediates in `intermediate_keys` (tenant-kek-root and the KMS CA key), and everything else derives from tenant-kek-root: every organization's `org_key`, every App's derived keys, and the metadata keys of `docs/metadata-encryption.md`. Until now a departing custodian kept their share. With any other share it would still unseal the root KEK.
 
-Re-splitting the same root KEK would not help: old Shamir shares of an unchanged secret stay valid. `alpha custodians rotate` therefore makes a **new** root KEK inside the serving node, re-wraps both intermediates under it, splits it to the new custodians and forgets both roots. From the commit on, the old shares rebuild a root that unwraps nothing in the database.
+Re-splitting the same root KEK would not help: old Shamir shares of an unchanged secret stay valid. `alpha custodians rotate` therefore makes a **new** root KEK inside the serving node, re-wraps the intermediates under it, splits it to the new custodians and forgets both roots. From the commit on, the old shares rebuild a root that unwraps nothing in the database.
 
-Code: `services/alpha-kms/src/custodians.rs` (routes), `crates/alpha-cli/src/custodians.rs` (commands), `migrations/20261013000000_custodian_rotations.sql`. Tests: `services/alpha-kms/tests/custodians.rs`, and a Kata node's rotation in `tests/kata_node.rs`.
+A new root alone is not enough either (Andrei Pfau's review, D12 item 2). Two old shares and a copy of `intermediate_keys` taken before the rotation still give the old intermediates, and if those did not change they open everything written later too. Each rotation therefore also makes a new random **data key** and, in the same transaction, re-encrypts under it every row the old keys protected. The old shares and an old copy then open that copy, as of the day it was taken, and nothing written since. What still does not rotate, and what that leaves open, is under "What an old backup with old shares still opens".
+
+Code: `services/alpha-kms/src/custodians.rs` (routes), `src/data_key.rs` and `store::rekey` (the data key), `crates/alpha-cli/src/custodians.rs` (commands), `migrations/20261013000000_custodian_rotations.sql` and `20261013100000_data_key.sql`. Tests: `services/alpha-kms/tests/custodians.rs`, and a Kata node's rotation in `tests/kata_node.rs`.
 
 ## Protocol
 
@@ -29,13 +31,16 @@ Code: `services/alpha-kms/src/custodians.rs` (routes), `crates/alpha-cli/src/cus
    - the approval opens and covers this proposal.
 
    A repeated share counts once. A new proposal replaces the pending one. With two distinct shares the node combines them. In **one transaction** it then:
-   - locks and opens every `intermediate_keys` row under the combined root. Any row that does not open, or a tenant-kek-root other than the one it serves, refuses the rotation (`signature_invalid` / `internal`) and clears the pending approvals;
-   - generates a new 256-bit root with the OS RNG and re-seals every row under it, with the same AES-256-GCM and purpose AAD as bootstrap;
+   - takes the audit chain's lock and the seal pass's lock first, so no node commits a route's rows, or seals legacy rows, under the keys this transaction replaces. It refuses if the database's data key is not the one it serves;
+   - locks and opens every `intermediate_keys` row under the combined root. Any row that does not open, or a tenant-kek-root or data key other than the one it serves, refuses the rotation (`signature_invalid` / `internal`) and clears the pending approvals;
+   - generates a new 256-bit root with the OS RNG and re-seals tenant-kek-root and the CA key under it, with the same AES-256-GCM and purpose AAD as bootstrap;
+   - generates a new 256-bit data key, one epoch after the current one, and stores it wrapped under the new root (purpose `data-key`, its epoch also in the clear);
+   - re-encrypts every `principal_keys`, `revisions` and `secrets` row under keys derived from the new data key (`store::rekey`): each sealed blob, each blind index, and each Secret's value. The value is opened under its organization's key of the old epoch and sealed under that of the new one. A row still in the clear, or one that does not open, refuses the rotation;
    - splits the new root 2-of-3 (`vsss_rs::Gf256`, as bootstrap does), checks that every pair of shares combines back, and HPKE-seals share *i* to new custodian *i* under the unseal info string and this node's runtime-key AAD. Each new share is therefore an ordinary share file for `alpha unseal`;
    - inserts the `custodian_rotations` row: the proposal, the three sealed shares and the node's receipt. `nonce` is unique, so a nonce rotates once;
-   - appends a sealed `custodians.rotate` audit row.
+   - appends the `custodians.rotate` audit row, the first row sealed under the new epoch's audit key.
 
-   Then it commits. Both roots and all shares are `Zeroizing` and dropped when the call returns. The reply carries the rotation, and the CLI verifies its receipt before writing `rotation.json`.
+   Then it commits, and serves from the new data key. Both roots and all shares are `Zeroizing` and dropped when the call returns. The reply carries the rotation, and the CLI verifies its receipt before writing `rotation.json`.
 4. **Acceptance.** Each new custodian runs `alpha custodians accept --rotation rotation.json --key new.key --out share.json --endpoint <node>`. Without `--rotation`, the node's last committed rotation is fetched from `GET /v1/node/custodians/rotation`, which a sealed node answers too. The CLI:
    - attests the node at `--endpoint` and checks the baseline;
    - verifies the receipt under a leaf of the KMS CA the platform document pins, issued to a KMS build the document lists, for route `custodians.rotate` and exactly this proposal, naming exactly these three sealed shares;
@@ -44,37 +49,63 @@ Code: `services/alpha-kms/src/custodians.rs` (routes), `crates/alpha-cli/src/cus
 
    The output says whether the attested node is the one that rotated (`rotating_node_attested`).
 
-The receipt's signed response is `{rotation_id, proposal_sha256, kms_node_spki_sha256, custodians_sha256[3], shares_hpke_sha256[3], approved_by_shares, rewrapped}`. `approved_by_shares` holds the Shamir x-coordinates (1–3) of the two shares that approved. The node never learns which person holds which share.
+The receipt's signed response is `{rotation_id, proposal_sha256, kms_node_spki_sha256, custodians_sha256[3], shares_hpke_sha256[3], approved_by_shares, rewrapped, data_key_epoch, rekeyed}`. `rekeyed` counts the rows re-encrypted per table. `approved_by_shares` holds the Shamir x-coordinates (1–3) of the two shares that approved. The node never learns which person holds which share.
 
 ## Atomicity and crash safety
 
-The re-wrap and the record of the new shares are one Postgres transaction. Before the commit only the old root opens the database. After it only the new root does, and the new shares are durable in `custodian_rotations`, sealed to their holders. The node never commits a state that neither root opens:
-- A failure before the commit leaves every row as it was. `tests/custodians.rs` makes the transaction's last write fail after every row was re-wrapped; the rows are unchanged byte for byte and the old shares still unseal a fresh node.
+The re-wrap, the re-encryption of every row and the record of the new shares are one Postgres transaction. Before the commit only the old root and the old data key open the database. After it only the new ones do, and the new shares are durable in `custodian_rotations`, sealed to their holders. The node never commits a state that neither opens:
+- A failure before the commit leaves every row as it was. `tests/custodians.rs` makes the transaction's last write fail after every row was re-wrapped and re-encrypted; the rows are unchanged byte for byte, the node keeps serving under its old keys, and the old shares still unseal a fresh node.
+- The transaction rewrites every tenant row once. It holds the chain lock throughout, so every write route on every node waits for it. Its length grows with the number of keys, Revisions and Secrets: thousands of rows take well under a second. A row locked by another node's transaction can deadlock with it; Postgres then aborts one of the two, and if that is the rotation, nothing changed and the custodians approve again.
 - A reply lost after the commit costs nothing. `accept` fetches the rotation from any node, sealed or serving.
 
 ## Joined nodes and replication
 
-The intermediates do not change, only their wrapping. Every node reads and writes the same Postgres.
-- A node that joined before the rotation keeps serving with the intermediates it holds. It still reads every row and verifies the audit chain across the rotation.
-- A node that joins later gets the same intermediates from a serving node.
-- A node that restarts and is unsealed reads the re-wrapped rows. It needs two **new** shares: old shares, or an old and a new share, combine into a root that unwraps nothing (`does not unwrap under this root`).
-- A joined node never held a root, but it can run the next rotation, because the approvals rebuild the root from the database's rows.
+tenant-kek-root and the CA key do not change, only their wrapping; the data key is replaced. Every node reads and writes the same Postgres.
+- A node that joined before the rotation still holds the old data key. It opens none of the re-encrypted rows, and it writes nothing: every route that writes a sealed row appends its audit row in the same transaction, and every append checks, under the chain lock, that the node's data-key epoch is the database's (`sealed`, "it joins again"). Its next maintenance pass (at most five minutes) drops its keys and joins a serving node again. Until then clients fail over to the rotating node. A database whose epoch is *older* than a node's was restored, and halts that node (`docs/metadata-encryption.md`).
+- A node that joins later gets tenant-kek-root and the CA key unchanged, and the new data key (`JoinReply.data_key`). A join reply from a node that has not yet joined again does not start a node: its epoch is not the database's.
+- A node that restarts and is unsealed reads the re-wrapped rows and the data key. It needs two **new** shares: old shares, or an old and a new share, combine into a root that unwraps nothing (`does not unwrap under this root`).
+- A joined node never held a root, but once it has joined again it can run the next rotation, because the approvals rebuild the root from the database's rows.
+- Every node must run this release before the first rotation: a node of an earlier release ignores `JoinReply.data_key`, and would serve epoch 0's keys over a re-keyed database.
 
-## What does not rotate, and why
+## What rotates
 
-**The metadata and audit keys of #95 do not change, and no table is re-sealed.** They derive from tenant-kek-root (`store::MetadataKeys::derive`), which is re-wrapped, not replaced. So every sealed row, blind index, `anchor_check` and audit-chain link stays valid. That matters for the audit log in particular: its rows are append-only for the service role and could not be re-sealed.
+| Key | Rotates? | Protects |
+|---|---|---|
+| root KEK | yes, new each rotation | the wrapped intermediates |
+| data key (`data-key`, epoch *n*) | yes, new each rotation | through HKDF: the sealed rows (`row`), the blind indexes (`index`), new audit rows (`audit`), Secret values (`secret`, per organization and anchor), channel tickets (`ticket`) |
+| tenant-kek-root | **no**, re-wrapped | every App's derived keys (`org_key` → `app_key`, `keys/derive`), `anchor_check`, and before the first rotation (epoch 0) everything the data key now covers |
+| CA key | **no**, re-wrapped | every KMS and Instance leaf; tenants pin the CA through the platform document |
+| audit rows already written | **no** | the log is append-only and each sealed row's AEAD is part of the chain. A node keeps every epoch's audit key (the data key carries the earlier ones) to walk the chain from genesis. |
 
-Rotating tenant-kek-root as well would change:
-- every `org_key`, and so every Secret's ciphertext;
-- every App's derived keys. Customers' LUKS volumes (`alpha-volume`) and anything else sealed under `keys/derive` would stop opening, and that cannot be done for them;
-- every blind index and `anchor_check`.
+A database from before this release is epoch 0: its keys come from tenant-kek-root, as #95 built them. Its first rotation moves it to epoch 1.
 
-Rotating the CA would re-issue every leaf and need a re-signed platform document. Neither is needed for what this rotation is for.
+Why tenant-kek-root and the CA stay:
+- Rotating tenant-kek-root would change every App's derived keys. Customers' LUKS volumes (`alpha-volume`) and anything else sealed under `keys/derive` would stop opening, and that cannot be done for them. The Secret values no longer depend on it: from epoch 1 their keys come from the data key with the same per-organization derivation, so an App's derived keys and a Secret's key are now separate.
+- Rotating the CA would re-issue every leaf and need a re-signed platform document that every tenant re-pins. That is a release, not a custodian ceremony.
 
-**The residual risk:** old shares opened the old wrapping of the **same** intermediates. Anyone holding two old shares **and** a copy of `intermediate_keys` from before the rotation (a backup, a snapshot, dead tuples on the trust-zone disk before `VACUUM`) still recovers tenant-kek-root. A single departing custodian holds one share. They need a second old share, from another custodian who kept their old share file, and a pre-rotation copy of the database. Keep both out of reach:
+## What an old backup with old shares still opens
+
+Take two shares from before a rotation and a copy of the database from before it: a backup, a snapshot, a WAL archive, or dead tuples on the trust-zone disk before `VACUUM FULL`. A single departing custodian holds one share. They need a second old share, from another custodian who kept their old share file, and such a copy. With both, after this change:
+
+**Still opens:**
+- **Everything in the copy, as of the day it was taken:** its Secrets' values, its sealed metadata, its blind indexes, its audit rows. Nothing re-encrypts a copy.
+- **tenant-kek-root**, and with it **every App's derived keys**, for any App and purpose, now and later: `keys/derive` is deterministic. Anything sealed under them (customers' LUKS volumes, App data) opens for whoever also has its ciphertext, and the host has the disks. This is the residual: closing it needs a new derivation root that customers migrate their volumes to.
+- **The CA key**: leaves for any KMS or Instance identity under the pinned CA, until the CA is re-issued through a new platform document. An attacker who can also intercept traffic can pose as a KMS node to a client that pins the CA, for example to read a Secret value an admin puts later.
+- **Audit rows sealed before the rotation**, in any copy including the current database: they keep the audit key of their epoch.
+- `anchor_check` (a keyed digest; it reveals nothing the copy does not).
+
+**No longer opens** (`tests/custodians.rs`, `an_old_backup_and_old_shares_open_nothing_written_after_the_rotation`):
+- any Secret value, sealed row or blind index the database holds after the rotation: those written after it, and those written before it, which the rotation re-encrypted;
+- any audit row sealed after the rotation;
+- any channel ticket issued after the rotation;
+- any `intermediate_keys` row of the current database, the new data key included.
+
+Two **current** shares open all of it, and an App's derived key is the same before and after the rotation.
+
+Keep old shares and old copies out of reach all the same, because of the residual:
 - every custodian deletes their old share file once they hold a new one;
-- pre-rotation backups of `intermediate_keys` are destroyed or kept under the same custody as shares;
-- the operator runs `VACUUM intermediate_keys` after the ceremony.
+- pre-rotation backups and WAL archives are destroyed or kept under the same custody as shares;
+- the operator runs `VACUUM FULL intermediate_keys, principal_keys, revisions, secrets` after the ceremony, so the pre-rotation row versions leave the table files.
 
 Replacing all three custodians at once leaves three old shares outside the new custody. The same holds there.
 
@@ -88,7 +119,7 @@ Every `custodians` command checks a Kata node's agent policy before it sends any
 - `custodians.rotate` `ok`: the signed response, in the rotation's own transaction.
 - `custodians.rotate` `denied` / `error`: a refused approval or a failed rotation, with the reason.
 
-Each row is sealed under the audit key while the node serves.
+Each row is sealed under the audit key of the node's epoch while it serves; `custodians.rotate` `ok` is the first row of the new epoch.
 
 ## Fail closed
 

@@ -23,6 +23,7 @@ use zeroize::Zeroizing;
 
 use crate::audit;
 use crate::body::Body;
+use crate::data_key::DataKey;
 use crate::error::ApiError;
 use crate::instance::{check_nonce, collateral, decode32};
 use crate::keys::{self, aead_open, aead_seal};
@@ -148,7 +149,7 @@ fn root_kek(_node: &Node) -> Result<Zeroizing<[u8; 32]>, ApiError> {
     Ok(Zeroizing::new(random()?))
 }
 
-/// Unwraps both rows under `root`.
+/// Unwraps the intermediates under `root`, and the latest rotation's data key when there is one.
 pub async fn unwrap_intermediates(node: &Node, root: &[u8; 32]) -> Result<Intermediates, ApiError> {
     let unwrap = |purpose: &str, wrapped: Option<Vec<u8>>| {
         wrapped
@@ -170,11 +171,28 @@ pub async fn unwrap_intermediates(node: &Node, root: &[u8; 32]) -> Result<Interm
         .map(Zeroizing::new)
         .map_err(|_| ApiError::internal("tenant-kek-root is not 32 bytes"))?;
     let ca_key_der = unwrap("ca", ca.as_ref().map(|r| r.wrapped.clone()))?;
+    let data =
+        sqlx::query!("select wrapped, epoch from intermediate_keys where purpose = 'data-key'")
+            .fetch_optional(&node.pool)
+            .await?
+            .map(|row| {
+                let data = DataKey::unwrap(root, &row.wrapped).ok_or_else(|| {
+                    ApiError::malformed("data-key does not unwrap under this root")
+                })??;
+                if row.epoch != Some(data.epoch) {
+                    return Err(ApiError::internal(
+                        "the data key's row names another epoch than the key it wraps",
+                    ));
+                }
+                Ok(data)
+            })
+            .transpose()?;
     Intermediates::new(
         tenant_kek_root,
         ca_key_der,
         ca.and_then(|r| r.public_part).unwrap_or_default(),
-    )
+    )?
+    .with_data(data)
 }
 
 pub async fn unseal(
@@ -334,6 +352,7 @@ async fn join_audited(
         "tenant_kek_root": BASE64_URL_SAFE_NO_PAD.encode(keys.tenant_kek_root.as_slice()),
         "ca_key": BASE64_URL_SAFE_NO_PAD.encode(keys.ca_key_der.as_slice()),
         "ca_cert": BASE64_URL_SAFE_NO_PAD.encode(&keys.ca_cert_der),
+        "data_key": keys.data.as_ref().map(|d| BASE64_URL_SAFE_NO_PAD.encode(d.encode().as_slice())),
         // Includes the `node.join` row above: the joining node must find it in its database.
         "audit_head": node.chain.floor().map(|h| h.to_wire()),
     }))
@@ -460,11 +479,17 @@ pub async fn finish_join(node: &Node, reply: &JoinReply) -> Result<(), ApiError>
         <[u8; 32]>::try_from(field("tenant_kek_root", &reply.tenant_kek_root)?.as_slice())
             .map_err(|_| ApiError::internal("join reply: tenant_kek_root"))?,
     );
+    let data = reply
+        .data_key
+        .as_deref()
+        .map(|text| DataKey::decode(&Zeroizing::new(field("data_key", text)?)))
+        .transpose()?;
     let keys = Intermediates::new(
         tenant_kek_root,
         Zeroizing::new(field("ca_key", &reply.ca_key)?),
         field("ca_cert", &reply.ca_cert)?,
-    )?;
+    )?
+    .with_data(data)?;
     if let Some(head) = &reply.audit_head {
         node.chain
             .observe(

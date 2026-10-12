@@ -17,6 +17,7 @@ pub mod certs;
 pub mod channel;
 pub mod control;
 pub mod custodians;
+pub mod data_key;
 pub mod error;
 pub mod instance;
 pub mod keys;
@@ -196,12 +197,15 @@ pub enum CollateralSource {
     Fixed(Box<Collateral>),
 }
 
-/// The two intermediates in memory after unseal, join or bootstrap, and the database's keys
-/// derived from the first.
+/// The intermediates in memory after unseal, join or bootstrap, and the database's keys: derived
+/// from tenant-kek-root until the first custodian rotation, from the latest rotation's data key
+/// afterwards.
 pub struct Intermediates {
     pub tenant_kek_root: Zeroizing<[u8; 32]>,
     pub ca_key_der: Zeroizing<Vec<u8>>,
     pub ca_cert_der: Vec<u8>,
+    /// The latest custodian rotation's data key; none before the first.
+    pub data: Option<data_key::DataKey>,
     pub metadata: store::MetadataKeys,
 }
 
@@ -216,7 +220,18 @@ impl Intermediates {
             tenant_kek_root,
             ca_key_der,
             ca_cert_der,
+            data: None,
         })
+    }
+
+    /// The database's keys from `data` (epoch 0's from tenant-kek-root when `None`).
+    pub fn with_data(mut self, data: Option<data_key::DataKey>) -> Result<Self, ApiError> {
+        self.metadata = match &data {
+            Some(data) => store::MetadataKeys::with_data(&self.tenant_kek_root, data)?,
+            None => store::MetadataKeys::derive(&self.tenant_kek_root)?,
+        };
+        self.data = data;
+        Ok(self)
     }
 
     pub fn ca_key(&self) -> Result<rcgen::KeyPair, ApiError> {
@@ -370,6 +385,10 @@ impl Node {
         self.chain.refuse_if_halted()?;
         node::learn_peer_heads(self).await?;
         self.chain.check(&self.pool).await?;
+        // Keys from a node that has not yet joined again after a rotation open nothing here.
+        if store::data_epoch(&self.pool).await? != keys.metadata.epoch() {
+            return Err(audit::stale_keys());
+        }
         let sealed = store::seal_plaintext(&self.pool, &self.chain, &keys.metadata).await?;
         if !sealed.is_empty() {
             eprintln!("sealed plaintext rows: {sealed:?}");
@@ -394,6 +413,36 @@ impl Node {
         if let Err(e) = self.chain.check(&self.pool).await {
             eprintln!("audit head: {}", e.message);
             return;
+        }
+        // A rotation on another node replaced the data key: this node's keys open nothing the
+        // database holds now, so it drops them and joins again.
+        match store::data_epoch(&self.pool).await {
+            Ok(epoch) if epoch > keys.metadata.epoch() => {
+                eprintln!(
+                    "data key epoch {epoch} after this node's {}: joining again",
+                    keys.metadata.epoch()
+                );
+                *self.phase.write() = Phase::Sealed { shares: Vec::new() };
+                if let Err(e) = node::try_join(self).await {
+                    eprintln!("sealed: {}; waiting for unseal", e.message);
+                }
+                return;
+            }
+            Ok(epoch) if epoch < keys.metadata.epoch() => {
+                self.chain.halt(
+                    audit::Halt::RolledBack,
+                    &format!(
+                        "the database's data key is from epoch {epoch}, before this node's {}",
+                        keys.metadata.epoch()
+                    ),
+                );
+                return;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("data key epoch: {}", e.message);
+                return;
+            }
         }
         match store::seal_plaintext(&self.pool, &self.chain, &keys.metadata).await {
             Ok(sealed) if !sealed.is_empty() => eprintln!("sealed plaintext rows: {sealed:?}"),

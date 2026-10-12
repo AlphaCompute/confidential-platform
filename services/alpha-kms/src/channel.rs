@@ -22,10 +22,12 @@ pub const TICKET_TTL: Duration = Duration::from_secs(600);
 
 const TICKET_LABEL: &[u8] = b"alphacompute-kms/channel-ticket/v1";
 
-/// The key that seals one channel ticket, from the ticket's own random salt.
-fn ticket_key(tenant_kek_root: &[u8; 32], salt: &[u8; 16]) -> Result<Key32, ApiError> {
+/// The key that seals one channel ticket, from the ticket's own random salt. `ticket_root` is
+/// tenant-kek-root before the first custodian rotation and the data key's ticket key afterwards
+/// (`MetadataKeys::ticket_root`), so a rotation also retires every ticket in flight.
+fn ticket_key(ticket_root: &[u8; 32], salt: &[u8; 16]) -> Result<Key32, ApiError> {
     let mut out = Zeroizing::new([0u8; 32]);
-    Hkdf::<Sha256>::new(Some(TICKET_LABEL), tenant_kek_root)
+    Hkdf::<Sha256>::new(Some(TICKET_LABEL), ticket_root)
         .expand(salt, out.as_mut())
         .map_err(|e| ApiError::internal(format!("hkdf: {e}")))?;
     Ok(out)
@@ -33,7 +35,7 @@ fn ticket_key(tenant_kek_root: &[u8; 32], salt: &[u8; 16]) -> Result<Key32, ApiE
 
 /// `base64url(salt(16) ‖ nonce(12) ‖ AES-256-GCM(channel(16) ‖ c2s(32) ‖ expires_at(8, BE)))`.
 pub fn seal_ticket(
-    tenant_kek_root: &[u8; 32],
+    ticket_root: &[u8; 32],
     channel: &[u8; 16],
     c2s: &[u8; 32],
     expires_at: SystemTime,
@@ -47,21 +49,21 @@ pub fn seal_ticket(
         .as_secs()
         .to_be_bytes();
     let plaintext = Zeroizing::new([channel.as_slice(), c2s, &expires_at].concat());
-    let key = ticket_key(tenant_kek_root, &salt)?;
+    let key = ticket_key(ticket_root, &salt)?;
     let sealed = aead_seal(&key, TICKET_LABEL, &plaintext)?;
     Ok(BASE64_URL_SAFE_NO_PAD.encode([salt.as_slice(), &sealed].concat()))
 }
 
 /// The channel id and `c2s` a ticket carries, while it has not expired at `now`.
 pub fn open_ticket(
-    tenant_kek_root: &[u8; 32],
+    ticket_root: &[u8; 32],
     ticket: &str,
     now: SystemTime,
 ) -> Result<([u8; 16], Zeroizing<[u8; 32]>), ApiError> {
     let bad = || ApiError::malformed("the ticket does not open");
     let bytes = BASE64_URL_SAFE_NO_PAD.decode(ticket).map_err(|_| bad())?;
     let (salt, sealed) = bytes.split_first_chunk::<16>().ok_or_else(bad)?;
-    let key = ticket_key(tenant_kek_root, salt)?;
+    let key = ticket_key(ticket_root, salt)?;
     let plaintext = aead_open(&key, TICKET_LABEL, sealed).ok_or_else(bad)?;
     let (channel, rest) = plaintext.split_first_chunk::<16>().ok_or_else(bad)?;
     let (c2s, rest) = rest.split_first_chunk::<32>().ok_or_else(bad)?;
@@ -93,7 +95,7 @@ pub async fn handshake(
                 other => ApiError::internal(format!("handshake: {other}")),
             })?;
     reply.ticket = Some(seal_ticket(
-        &keys.tenant_kek_root,
+        keys.metadata.ticket_root(),
         &channel,
         &c2s,
         later(now, TICKET_TTL)?,
