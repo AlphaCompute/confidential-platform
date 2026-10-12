@@ -16,6 +16,7 @@
 )]
 
 mod event_log;
+pub mod export;
 pub mod gpu;
 pub mod kata;
 pub mod verifiers;
