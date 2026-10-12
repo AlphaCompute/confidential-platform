@@ -2066,8 +2066,7 @@ policy_data := {
             "/weights"
           ],
           "Env": [
-            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            "HOSTNAME=$(host-name)"
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
           ],
           "Cwd": "/",
           "Capabilities": {
@@ -2335,7 +2334,6 @@ policy_data := {
           ],
           "Env": [
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            "HOSTNAME=$(host-name)",
             "ALPHACOMPUTE_KMS_ENDPOINTS=https://10.20.0.11:8443,https://10.20.0.12:8443",
             "ALPHACOMPUTE_KMS_CA_SPKI_SHA256=sha256:1111111111111111111111111111111111111111111111111111111111111111",
             "ALPHACOMPUTE_KMS_REVISIONS=sha256:2222222222222222222222222222222222222222222222222222222222222222",
@@ -2654,7 +2652,6 @@ policy_data := {
             "UV_LINK_MODE=copy",
             "CUDA_HOME=/usr/local/cuda",
             "VLLM_USAGE_SOURCE=production-docker-image",
-            "HOSTNAME=$(host-name)",
             "HF_HUB_OFFLINE=1",
             "VLLM_NO_USAGE_STATS=1",
             "DO_NOT_TRACK=1"
@@ -3019,7 +3016,7 @@ policy_data := {
   "request_defaults": {
     "CreateContainerRequest": {
       "allow_env_regex": [
-        "^HOSTNAME=$(dns_label)$",
+        "^HOSTNAME=[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$",
         "^KUBERNETES_PORT_$(ip_p)_TCP=tcp://$(ipv4_a):$(ip_p)$",
         "^KUBERNETES_PORT_$(ip_p)_TCP_PROTO=tcp$",
         "^KUBERNETES_PORT_$(ip_p)_TCP_PORT=$(ip_p)$",

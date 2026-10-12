@@ -10,10 +10,12 @@ manifest (`../SHA256SUMS`) pins every file here.
   mounted at `/run/alpha-pod/cc_init_data`). Its header says what it was rendered from.
 - `cpu-app/pod.yaml`: a CPU App on `kata-qemu-tdx` in the shape `alpha coco wrap` emits for a
   compose: `alpha-runtime` as a native sidecar and one App container, in the App's namespace.
-- `*/policy.rego`: genpolicy's policy for that pod, with the baseline below. This is what goes in
-  the init-data's `policy.rego`.
+- `*/policy.rego`: genpolicy's policy for that pod, with the baseline below, and genpolicy's
+  `HOSTNAME=$(host-name)` entries taken out as `alpha coco render` and `wrap` take them out. This
+  is what goes in the init-data's `policy.rego`.
 - `cpu-app/policy-genpolicy-rules.rego`: the same pod with genpolicy's own rules, the baseline
-  settings and no rules patch. The suite checks that it still has the gaps the patch closes.
+  settings, no rules patch and `HOSTNAME` as genpolicy lists it. The suite checks that it still
+  has the gaps the patch and the `HOSTNAME` change close.
 - `requests.json`: one request of each agent API type, every field present as the agent
   serializes it before it asks the policy (`serde_json::to_string(&req)` over Kata's `protocols`
   types; `CopyFile` as the agent's `PolicyCopyFileRequest`). The suite fills in the pod's values.
@@ -33,16 +35,19 @@ genpolicy -u --layers-cache-file-path=<tmp>/layers-cache.json \
 ```
 
 where the settings directory is the release's `genpolicy-settings.json` with
-`genpolicy-settings.d/30-alpha-baseline.json` (an RFC 6902 patch genpolicy applies itself), and
-the rules are the release's `rules.rego` with `alpha-rules.patch` applied. It deletes the download
-and the pulled image layers on exit.
+`genpolicy-settings.d/30-alpha-baseline.json` and `50-alpha-hostname.json` (RFC 6902 patches
+genpolicy applies itself, in name order), and the rules are the release's `rules.rego` with
+`alpha-rules.patch` applied. For the two `policy.rego` files it then takes every
+`"HOSTNAME=$(host-name)"` entry out of `policy_data` (and the comma before it, when it was the last
+of its list), as `alpha coco render` and `wrap` do (`coco::policy::pin_hostname`). It deletes the
+download and the pulled image layers on exit.
 
 ## The Alpha baseline
 
 What `alpha coco render` and `alpha coco wrap` should run genpolicy with, so that the policy in
 a Revision is the one this suite tests.
 
-Settings (`30-alpha-baseline.json`), on top of the 4.1.0 defaults:
+Settings (`30-alpha-baseline.json`, then `50-alpha-hostname.json`), on top of the 4.1.0 defaults:
 
 | Setting | Value | Why |
 |---|---|---|
@@ -52,6 +57,7 @@ Settings (`30-alpha-baseline.json`), on top of the 4.1.0 defaults:
 | `GetDiagnosticDataRequest`, `UpdateEphemeralMountsRequest` | `false` | |
 | `CopyFileRequest` | `$(sfprefix)` only | the host writes only into its shared directory |
 | `CreateContainerRequest.allow_env_regex` | `HOSTNAME` and the API server's `KUBERNETES_*` only | the 4.1.0 default also lets the host add any `<NAME>_PORT=tcp://…`, `<NAME>_SERVICE_HOST`, … (service links), `AZURE_*` and `TERM` to any container; Alpha pods set `enableServiceLinks: false` |
+| its `HOSTNAME` pattern (`50-alpha-hostname.json`) | `^HOSTNAME=[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`, one lowercase DNS label (the default's `0` entry, `^HOSTNAME=$(dns_label)$`, asserted and replaced) | `$(dns_label)` is `[a-zA-Z0-9_\.\-]+`, which admits a sealed secret (`sealed.<JWS>`): a host could copy one from a policy into `HOSTNAME` and have the agent's CDH unseal it into a container never given it |
 | `other_container.Mounts` | without the service-account token and Azure token mounts | the 4.1.0 default lets the host mount either into every container; Alpha pods mount no token |
 
 The 4.1.0 defaults already deny the other calls the suite tries; the drop-in restates the ones the
@@ -67,6 +73,15 @@ Rules (`alpha-rules.patch`), two additions to the 4.1.0 `rules.rego`:
   a host can run any image whose command, environment, user and mounts match the policy.
 - `allow_env_complete`: every variable the policy names literally is set. genpolicy 4.1.0 checks
   only that each variable set is allowed, so a host can unset any of them.
+
+`HOSTNAME`, beyond the drop-in: genpolicy lists `HOSTNAME=$(host-name)` in every container, and
+4.1.0's `allow_var` ("always_allowed") accepts any value for a variable listed with `$(host-name)`,
+so the drop-in alone changes nothing. The entry is taken out of the policy instead, which leaves
+the drop-in's pattern as the only way the host can set `HOSTNAME`. Listing it as
+`$(sandbox-name)` does not work either: `allow_var` matches the sandbox's name as an unanchored
+pattern, so any value that contains the pod's name passes. The suite shows all three in
+genpolicy's own output. Any lowercase DNS label, not only the pod's name, is still admitted;
+pinning the pod's name exactly would take a rules change.
 
 genpolicy's input differs from the deployed spec where genpolicy 4.1.0 refuses a field:
 `automountServiceAccountToken`, `enableServiceLinks` and a claim's `readOnly` are taken out, and

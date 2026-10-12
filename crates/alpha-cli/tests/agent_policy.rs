@@ -202,6 +202,11 @@ struct Pod {
 impl Pod {
     fn load(dir: &'static str, policy_file: &str) -> Self {
         let policy = std::fs::read_to_string(testdata(&format!("{dir}/{policy_file}"))).unwrap();
+        Self::from_policy(dir, policy)
+    }
+
+    /// The pod of `dir` under `policy`, a fixture's policy changed by the test.
+    fn from_policy(dir: &'static str, policy: String) -> Self {
         let start = policy.find("\npolicy_data := ").unwrap();
         let data: Value =
             serde_json::from_str(&policy[start + "\npolicy_data := ".len()..]).unwrap();
@@ -402,8 +407,22 @@ impl Pod {
             .as_array()
             .unwrap()
             .iter()
-            .map(|e| json!(e.as_str().unwrap().replace("$(host-name)", &self.pod_name)))
+            .map(|e| {
+                let e = e.as_str().unwrap();
+                json!(
+                    e.replace("$(host-name)", &self.pod_name)
+                        .replace("$(sandbox-name)", &self.pod_name)
+                )
+            })
             .collect();
+        // containerd sets HOSTNAME, the pod's name, in every container, the pause container
+        // included, whether or not the policy lists it (the baseline's does not).
+        if !env
+            .iter()
+            .any(|e| e.as_str().unwrap().starts_with("HOSTNAME="))
+        {
+            env.push(json!(format!("HOSTNAME={}", self.pod_name)));
+        }
         if !sandbox {
             // The kubelet sets the API server's variables in every container, service links or not.
             for var in [
@@ -1313,6 +1332,152 @@ fn availability_calls_stay_with_the_host() {
             "{}: the runtime without its init-data mount is no longer allowed",
             pod.label
         );
+    }
+}
+
+/// A sealed secret as CDH unseals it from an environment variable (`sealed.<JWS>`), for a
+/// `db_password` Secret of App `01994b3e-…`. The policy never sees its signature checked: a host
+/// that copies one from a policy and has the agent set it in a variable gets it unsealed.
+const SEALED: &str = "sealed.eyJiNjQiOnRydWUsImFsZyI6IkVTMjU2Iiwia2lkIjoia2JzOi8vLzAxOTk0YjNlLTVjOGEtN2QzZS05YTFiLTJjM2Q0ZTVmNmE3Yi9zZWFsZWQtc2VjcmV0LWtleS9kYl9wYXNzd29yZCJ9.eyJ2ZXJzaW9uIjoiMC4xLjAiLCJ0eXBlIjoidmF1bHQiLCJuYW1lIjoia2JzOi8vLzAxOTk0YjNlLTVjOGEtN2QzZS05YTFiLTJjM2Q0ZTVmNmE3Yi9zZWNyZXQvZGJfcGFzc3dvcmQiLCJwcm92aWRlciI6ImticyIsInByb3ZpZGVyX3NldHRpbmdzIjp7fSwiYW5ub3RhdGlvbnMiOnt9fQ.AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-Pw";
+
+/// Container `idx`'s request as a restart under a new id, with `HOSTNAME` set to `value`.
+fn with_hostname(pod: &Pod, idx: usize, value: &str) -> Value {
+    let mut req = pod.create_container_as(idx, &hex(&format!("hostname {idx} {value}")));
+    let env = env_mut(&mut req);
+    let at = env
+        .iter()
+        .position(|e| e.as_str().unwrap().starts_with("HOSTNAME="))
+        .unwrap_or_else(|| panic!("{}: no HOSTNAME in container {idx}", pod.label));
+    env[at] = json!(format!("HOSTNAME={value}"));
+    req
+}
+
+/// genpolicy lists `HOSTNAME=$(host-name)` in every container, and its rules let the host set a
+/// variable that holds `$(host-name)` to anything; its `$(dns_label)` pattern admits dots too. The
+/// baseline's policy lists no `HOSTNAME`, and its `50-alpha-hostname.json` drop-in admits one
+/// lowercase DNS label, so a sealed secret, or any value with a dot, is refused, the pod's name
+/// within it or not.
+#[test]
+fn a_forged_hostname_is_refused() {
+    for pod in pods() {
+        let forged = [
+            SEALED.to_owned(),
+            format!("{SEALED}{}", pod.pod_name),
+            format!("{SEALED}.{}", pod.pod_name),
+            format!("x.{}", pod.pod_name),
+            "attacker.example".to_owned(),
+            "Model_Server".to_owned(),
+            "a".repeat(64),
+            String::new(),
+        ];
+        for idx in pod.app_containers() {
+            let name = pod.container_name(idx).to_owned();
+            for value in &forged {
+                let req = with_hostname(&pod, idx, value);
+                assert_refused(
+                    &pod,
+                    "CreateContainerRequest",
+                    &req,
+                    &format!("{name} with HOSTNAME={value}"),
+                );
+            }
+        }
+    }
+}
+
+/// The HOSTNAME Kubernetes sets, the pod's name, is allowed on a restart too. What the baseline
+/// still leaves the host is any one lowercase DNS label: no dot, so no sealed secret, but not
+/// only the pod's own name. Pinning it to that name would take a rules change (`allow_var` matches
+/// `$(sandbox-name)` as an unanchored pattern), and so is left to the generators' G0 check of
+/// the HOSTNAME containerd sets.
+#[test]
+fn the_pods_own_hostname_is_allowed() {
+    for pod in pods() {
+        let mut agent = pod.launched();
+        for idx in pod.app_containers() {
+            let what = format!("{} {}", pod.label, pod.container_name(idx));
+            let own = with_hostname(&pod, idx, &pod.pod_name);
+            agent.must_allow("CreateContainerRequest", &own, &what);
+            let label = with_hostname(&pod, idx, "another-pod-x2x4z");
+            agent.must_allow("CreateContainerRequest", &label, &what);
+        }
+    }
+}
+
+/// `policy` with its `policy_data` changed by `change`.
+fn edit_data(policy: &str, change: impl Fn(&mut Value)) -> String {
+    let (rules, data) = policy.split_once("\npolicy_data := ").unwrap();
+    let mut data: Value = serde_json::from_str(data).unwrap();
+    change(&mut data);
+    format!(
+        "{rules}\npolicy_data := {}",
+        serde_json::to_string_pretty(&data).unwrap()
+    )
+}
+
+/// `entry` added to the environment every container of `data` lists.
+fn list_in_every_container(data: &mut Value, entry: &str) {
+    for c in data["containers"].as_array_mut().unwrap() {
+        c["OCI"]["Process"]["Env"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(entry));
+    }
+}
+
+/// genpolicy 4.1.0's own output for `HOSTNAME`, and each half of the baseline's fix without the
+/// other: when an upstream release closes a gap, its case fails, and that half can go.
+#[test]
+fn genpolicys_output_alone_lets_the_host_set_hostname_to_a_sealed_secret() {
+    let alpha = std::fs::read_to_string(testdata("cpu-app/policy.rego")).unwrap();
+    let pinned_regex = "\"^HOSTNAME=[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$\"";
+    assert!(alpha.contains(pinned_regex));
+    assert!(!alpha.contains("\"HOSTNAME="));
+    let pod_name = Pod::load("cpu-app", "policy.rego").pod_name;
+    let unpinned = edit_data(&alpha, |d| {
+        list_in_every_container(d, "HOSTNAME=$(host-name)")
+    });
+    let sandbox_name = edit_data(&alpha, |d| {
+        list_in_every_container(d, "HOSTNAME=$(sandbox-name)")
+    });
+    let loose = alpha.replace(pinned_regex, "\"^HOSTNAME=$(dns_label)$\"");
+    assert_ne!(loose, alpha);
+    for (what, pod, value) in [
+        // genpolicy's rules and HOSTNAME=$(host-name), under the baseline's settings: its rules
+        // take any value for a variable listed as $(host-name).
+        (
+            "genpolicy's own rules and output",
+            Pod::load("cpu-app", "policy-genpolicy-rules.rego"),
+            SEALED.to_owned(),
+        ),
+        // The Alpha rules and the drop-in, with HOSTNAME listed as genpolicy writes it.
+        (
+            "HOSTNAME=$(host-name) listed",
+            Pod::from_policy("cpu-app", unpinned),
+            SEALED.to_owned(),
+        ),
+        // Listed as $(sandbox-name): the rules match the sandbox's name as an unanchored
+        // pattern, so any value that contains it passes.
+        (
+            "HOSTNAME=$(sandbox-name) listed",
+            Pod::from_policy("cpu-app", sandbox_name),
+            format!("{SEALED}.{pod_name}"),
+        ),
+        // No HOSTNAME listed, but genpolicy's HOSTNAME pattern, which admits dots.
+        (
+            "genpolicy's HOSTNAME pattern",
+            Pod::from_policy("cpu-app", loose),
+            SEALED.to_owned(),
+        ),
+    ] {
+        for idx in pod.app_containers() {
+            let req = with_hostname(&pod, idx, &value);
+            assert!(
+                pod.launched().allows("CreateContainerRequest", &req),
+                "{what}: a sealed secret as {}'s HOSTNAME is now refused",
+                pod.container_name(idx)
+            );
+        }
     }
 }
 

@@ -65,8 +65,26 @@ EOF
       -p "$rules" -j "$work/settings" -y pod.yaml -r) > "$here/$out"
     rm -rf "$work/run"
   }
+  # What alpha coco render and wrap do to genpolicy's output (coco::policy::pin_hostname):
+  # genpolicy lists HOSTNAME=$(host-name) in every container, whose value its rules let the host
+  # choose freely; the entry is taken out, so that the 50- drop-in's pattern alone admits the
+  # HOSTNAME the host sets. The last entry of a list takes the comma before it along; genpolicy
+  # ends its output without a newline, and so does this.
+  pin_hostname() {
+    awk '
+      { entry = $0; sub(/^[ \t]+/, "", entry) }
+      entry == "\"HOSTNAME=$(host-name)\"," { next }
+      entry == "\"HOSTNAME=$(host-name)\"" { if (held) sub(/,$/, "", line); next }
+      { if (held) print line; line = $0; held = 1 }
+      END { if (held) printf "%s", line }
+    ' "$here/$1" > "$work/pinned.rego"
+    mv "$work/pinned.rego" "$here/$1"
+  }
   run gpu-model-server "$work/alpha-rules.rego" gpu-model-server/policy.rego
+  pin_hostname gpu-model-server/policy.rego
   run cpu-app "$work/alpha-rules.rego" cpu-app/policy.rego
+  pin_hostname cpu-app/policy.rego
+  # genpolicy's own output: its rules, and HOSTNAME as it writes it.
   run cpu-app "$defaults/rules.rego" cpu-app/policy-genpolicy-rules.rego
 }
 
