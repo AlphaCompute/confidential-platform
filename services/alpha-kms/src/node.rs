@@ -242,20 +242,8 @@ pub async fn join(
 /// every step after DCAP, the audit row included, for the client certificate key `spki`. No route
 /// reaches it. The KMS's tests join Kata nodes through it over synthetic quotes, as
 /// [`crate::instance::attest_verified`] attests Kata pods, until B300 Kata captures exist (M1).
-///
-/// `pub(crate)` in production builds; `pub` with the `test-seams` feature so that the crate's
-/// integration tests can call it with synthetic quotes (until B300 Kata captures exist at M1).
-#[cfg(not(feature = "test-seams"))]
-pub(crate) async fn join_verified(
-    node: &Node,
-    spki: &[u8],
-    request: &JoinRequest,
-    verified: VerifiedQuote,
-) -> Result<Value, ApiError> {
-    join_audited(node, spki, request, Some(verified)).await
-}
-
-/// See [`join_verified`]; `pub` only when the `test-seams` feature is enabled.
+/// It exists only with the `test-seams` feature, which the crate's own tests turn on; a
+/// production build has no way to skip DCAP.
 #[cfg(feature = "test-seams")]
 pub async fn join_verified(
     node: &Node,
