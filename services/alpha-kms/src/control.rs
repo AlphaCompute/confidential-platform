@@ -48,19 +48,22 @@ pub struct PutBody {
 
 const ISSUED_AT_WINDOW: Duration = Duration::minutes(5);
 
-fn within_window(at: DateTime<Utc>, now: DateTime<Utc>) -> Result<DateTime<Utc>, ApiError> {
+pub(crate) fn within_window(
+    at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>, ApiError> {
     if at.signed_duration_since(now).abs() > ISSUED_AT_WINDOW {
         return Err(ApiError::malformed("issued_at is outside ±5 minutes"));
     }
     Ok(at)
 }
 
-fn payload<T: serde::de::DeserializeOwned>(value: &Value) -> Result<T, ApiError> {
+pub(crate) fn payload<T: serde::de::DeserializeOwned>(value: &Value) -> Result<T, ApiError> {
     serde_json::from_value(value.clone()).map_err(|e| ApiError::malformed(format!("payload: {e}")))
 }
 
 /// The signer must be active with a chain to the anchor; the signature covers `payload`.
-async fn authorize(
+pub(crate) async fn authorize(
     node: &Node,
     keys: &Intermediates,
     ctx: &str,
@@ -108,7 +111,7 @@ async fn audited(
     Ok(())
 }
 
-async fn denied(node: &Node, key_id: Option<KeyId>, action: &str, error: &ApiError) {
+pub(crate) async fn denied(node: &Node, key_id: Option<KeyId>, action: &str, error: &ApiError) {
     let actor = key_id.map_or_else(|| "unregistered".to_owned(), |k| k.to_string());
     let _ = Audit {
         actor_kind: "principal",
@@ -124,7 +127,7 @@ async fn denied(node: &Node, key_id: Option<KeyId>, action: &str, error: &ApiErr
     .await;
 }
 
-fn receipted(
+pub(crate) fn receipted(
     node: &Node,
     route: &str,
     request: &Value,

@@ -13,6 +13,7 @@
     )
 )]
 pub mod attestation;
+pub mod decisions;
 pub mod platform;
 pub mod runtime;
 pub mod tls;
@@ -521,6 +522,12 @@ impl Client {
 
     pub async fn revoke_key(&self, key_id: KeyId, body: &Signed) -> Result<KeyRevoked, Error> {
         self.post(&format!("/v1/keys/{key_id}/revoke"), body).await
+    }
+
+    /// The organization's own decisions, as the KMS answered them; check the answer with
+    /// [`decisions::verify`].
+    pub async fn export_decisions(&self, body: &Signed) -> Result<Value, Error> {
+        self.post("/v1/decisions/export", body).await
     }
 
     // Node API; the evidence route is [`fetch_node_evidence`], the pin comes from its reply.
