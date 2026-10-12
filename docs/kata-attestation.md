@@ -92,6 +92,8 @@ The leaf is then issued as for a compose: the same one-hour lifetime and the SAN
 
 `AttestationResult.coco` (absent for the prototype profile) carries the profile, `initdata_sha256`, `policy_sha256`, `runtime_class`, every verified GPU (`index`, `device_id`, `model`, driver and VBIOS versions, `cc_mode`, `nonce`; none for a CPU-class pod) and `gpu_verifiers` (also empty for a CPU-class pod): one `{"verifier", "token_sha256"}` per backend the `gpu_policy` lists, naming who vouched for the GPUs and the digest of the signed result it verified. `device_id` is the device's identity as the backend verified it (NRAS's `ueid`); two GPUs of one pod may not share it, so eight copies of one GPU's report cannot pass for eight GPUs.
 
+`AttestationResult.verifiers`, for either profile, names every verifier that attested the workload, and the reply's `attestation_receipt` signs it with the result and the leaf (PRD-06 clear claims; see `clear-claims.md`).
+
 ## Platform document additions
 
 All optional, so documents already signed still parse and keep their meaning:

@@ -437,6 +437,7 @@ mod tests {
             verified_at: "1970-01-01T00:00:00Z".into(),
             policy_version: 1,
             coco: None,
+            verifiers: None,
         }
     }
 
