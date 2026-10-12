@@ -26,8 +26,8 @@ is answered. That is intended.
 | `--account` | `alphacompute-fortanix-account/1`: the owner, the tenancy (`customer`, `customer-exception` or `own`), the DSM and/or CCM endpoint and account id, every credential AlphaCompute holds in the account with its purpose (`workload`, `audit`, `node-agent`), and for `customer-exception` where the written acceptance is kept | The onboarding record |
 | `--roster` | `alphacompute-sod-roster/1`: AlphaCompute's email domains, and every person with their roles (`release-key-holder`, `custodian`, `platform-org-key-holder`, `infrastructure-admin`, `rafay-admin`, `fortanix-admin`), every email they might use and any Fortanix user ids | The separation-of-duties owner, from `<roster location>` |
 | `--dsm-listing` | `{"users": …, "apps": …, "groups": …}`: the bodies of DSM's `GET /sys/v1/users`, `GET /sys/v1/apps` and `GET /sys/v1/groups` | The customer's security admin (export) |
-| `--dsm-login-file` | `{"email", "password"}` of a read-only (ACCOUNTAUDITOR) user the customer created for the check. The tool then reads the three listings itself, TLS 1.3 hybrid only, pinned to `dsm.ca_pem`. `--save-listing-dir` keeps the bytes it read | The customer, if they choose live reads (see Q6) |
-| `--ccm-listing` | `alphacompute-ccm-listing/0`, a shape of this draft's own (`users` and `service_principals`, each with `id`, `email`/`name`, `roles`), because CCM's listing API is not known yet (Q5) | The customer's security admin, by hand from CCM |
+| `--dsm-login-file` | `{"email", "password"}` of a read-only (ACCOUNTAUDITOR) user the customer created for the check. The tool then reads the three listings itself, TLS 1.3 hybrid only, pinned to `dsm.ca_pem`. `--save-listing-dir` keeps the bytes it read | The customer, if they choose live reads (see Q83) |
+| `--ccm-listing` | `alphacompute-ccm-listing/0`, a shape of this draft's own (`users` and `service_principals`, each with `id`, `email`/`name`, `roles`), because CCM's listing API is not known yet (Q81) | The customer's security admin, by hand from CCM |
 
 A customer can make the DSM export with three calls under their own session:
 
@@ -39,7 +39,7 @@ jq -n --slurpfile u users.json --slurpfile a apps.json --slurpfile g groups.json
   '{users: $u[0], apps: $a[0], groups: $g[0]}' > dsm-listing.json
 ```
 
-(`limit` and paging are assumption `dsm-listing`, Q4.)
+(`limit` and paging are assumption `dsm-listing`, Q82.)
 
 ## The rules
 
@@ -48,7 +48,7 @@ jq -n --slurpfile u users.json --slurpfile a apps.json --slurpfile g groups.json
 - A principal is AlphaCompute's if it is a recorded credential, if its email or Fortanix id is on
   the roster, or if its email is in an AlphaCompute domain (subdomains included).
 - A recorded credential may hold only what its purpose allows: `workload` (the I1 trusted-CA
-  App) key use only; `audit` and `node-agent` read-only only (Q8).
+  App) key use only; `audit` and `node-agent` read-only only (Q85).
 - Any other AlphaCompute principal fails the check, whatever it holds. The rule names the
   heaviest right: `tenancy.alphacompute-admin`, `-key-use` or `-member`. This is stricter than
   "no admin rights", and matches `docs/fortanix-dsm-keys.md`: no AlphaCompute identity is a
@@ -99,25 +99,25 @@ Keep the report and the listings it names in `<onboarding record>`.
 
 ## Open questions
 
-The numbers match `QUESTION(PRD-06 Qn)` in the code and the draft PR.
+Numbered program-wide; the same numbers are in `QUESTION(PRD-06 Qn)` in the code and in the draft PR.
 
-1. **Q1 (F3)** DSM user roles: are ACCOUNTADMINISTRATOR and GROUPADMINISTRATOR the key-admin
-   roles, ACCOUNTAUDITOR and GROUPAUDITOR read-only, and ACCOUNTMEMBER without key rights? How
-   do custom roles appear?
-2. **Q2 (F3)** DSM App permissions: which ones administer keys, which use them, which only read?
-3. **Q3 (F3)** CCM roles: which roles can change attestation policy (approve builds, apps or
-   nodes)? Until then ACCOUNT_MEMBER counts as a policy right.
-4. **Q4 (F3)** DSM listing: are `/sys/v1/users`, `/apps` and `/groups` with `limit`/`offset` the
-   complete listing, and may an ACCOUNTAUDITOR user call them?
-5. **Q5 (F3)** CCM listing: what API or export lists CCM users and API principals with roles?
-6. **Q6 (Ryan Tharp)** Should AlphaCompute hold a read-only login in a customer's account at all?
-   Proposed: no by default. The customer's export is the normal path, as
-   `docs/fortanix-tenancy.md` says. A live read only with a time-boxed auditor user the customer
-   creates for the check and deletes after, recorded with purpose `audit`.
-7. **Q7 (Ryan Tharp)** Recognising AlphaCompute identities: roster emails and ids plus domains.
-   A personal address not on the roster is missed, so the refusal test stays mandatory.
-8. **Q8 (F4)** What a recorded credential may hold: node agents' needs are F4. Until then
-   read-only only.
-9. **Q9 (Ryan Tharp, Christopher Freytes)** The roster and account-record formats: keep them in
-   these shapes at `<roster location>` and `<onboarding record>`, or adapt the tool to whatever
-   the separation-of-duties owner keeps.
+- **Q80 (Fortanix, F3)** DSM roles and App permissions. Are ACCOUNTADMINISTRATOR and
+  GROUPADMINISTRATOR the key-admin roles, ACCOUNTAUDITOR and GROUPAUDITOR read-only, and
+  ACCOUNTMEMBER without key rights? How do custom roles appear? Which App permissions administer
+  keys, which use them, and which only read?
+- **Q81 (Fortanix, F3)** CCM roles and listing. Which roles can change attestation policy
+  (approve builds, apps or nodes)? Until F3 answers, ACCOUNT_MEMBER counts as a policy right.
+  What API or export lists CCM users and API principals with their roles?
+- **Q82 (Fortanix, F3)** DSM listing. Are `/sys/v1/users`, `/apps` and `/groups` with
+  `limit`/`offset` the complete listing, and may an ACCOUNTAUDITOR user call them?
+- **Q83 (Ryan Tharp)** Should AlphaCompute hold a read-only login in a customer's account at all?
+  Proposed: no by default. The customer's export is the normal path, as
+  `docs/fortanix-tenancy.md` says. A live read is allowed only with a time-boxed auditor user that
+  the customer creates for the check and deletes after, recorded with purpose `audit`.
+- **Q84 (Ryan Tharp)** Recognising AlphaCompute identities: by roster emails and ids plus
+  domains. A personal address not on the roster is missed, so the refusal test stays mandatory.
+- **Q85 (Fortanix F4; Ryan Tharp)** What a recorded credential may hold. Node agents' needs are
+  F4; until then they may hold read-only rights only.
+- **Q86 (Ryan Tharp, Christopher Freytes)** The roster and account-record formats: keep them in
+  these shapes at `<roster location>` and `<onboarding record>`, or adapt the tool to whatever
+  the separation-of-duties owner keeps.
