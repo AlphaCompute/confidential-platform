@@ -1,0 +1,2 @@
+{"app_id":"01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b","format":"alphacompute-coco-revision/1","initdata_sha256":"sha256:4b2f43697f2d4d9d292aa15916985f7798b17eb8ab310f7d5e368e9a57fcee4f","kbs":{"cert_spki_sha256":"sha256:4d7e6cc449a9bae42927277d06379b6f3b7a22f8efc67c542bf9185d471f99a8","url":"https://kbs.trustee.alphacompute.internal:8080"},"policy_sha256":"sha256:5fdd49add4af371432c58a16bb6ba57641474ad83657498cc2420c0ca69c77cd","runtime_class":"kata-qemu-tdx"}
+sha256:1561dd3ef8d148c92464eee92ebf2644321f565167941a894b66d729d2d896e2

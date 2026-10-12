@@ -1,0 +1,18 @@
+# Option B: the compose opts in to the KBS, so the init-data points the guest components at it.
+# The service takes a sealed secret, which CDH unseals from the KBS before the service starts,
+# and a scratch volume on disk, which CDH encrypts in the guest under a key that never leaves it.
+services:
+  app:
+    image: nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+    ports:
+      - "443:80"
+    environment:
+      DB_PASSWORD: sealed.eyJhbGciOiJFUzI1NiIsImtpZCI6ImticzovLy8wMTk5NGIzZS01YzhhLTdkM2UtOWExYi0yYzNkNGU1ZjZhN2Ivc2VhbGVkLXNlY3JldC1rZXkvc2VhbGluZyJ9.eyJ2ZXJzaW9uIjoiMC4xLjAiLCJ0eXBlIjoidmF1bHQiLCJuYW1lIjoia2JzOi8vLzAxOTk0YjNlLTVjOGEtN2QzZS05YTFiLTJjM2Q0ZTVmNmE3Yi9zZWNyZXQvZGJfcGFzc3dvcmQiLCJwcm92aWRlciI6ImticyIsInByb3ZpZGVyX3NldHRpbmdzIjp7fSwiYW5ub3RhdGlvbnMiOnt9fQ.BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBw
+    volumes:
+      - cache:/var/cache/app
+volumes:
+  cache: {}
+x-alphacompute-kbs: true
+x-alphacompute-scratch:
+  cache:
+    size: 10Gi

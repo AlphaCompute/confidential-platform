@@ -1,0 +1,26 @@
+[
+  {
+    "input_sha256": "3fb2a53d3b4573410ba77feaedcb9651a54e68113c711b6228e83f7f40249b49",
+    "identity": [
+      "alpha-runtime",
+      0,
+      0,
+      [
+        0,
+        1,
+        2,
+        3,
+        4,
+        6,
+        10,
+        11,
+        20,
+        26,
+        27
+      ]
+    ]
+  },
+  {
+    "input_sha256": "ffbfa300ff3da85e251d36887a11affa717dd9611367d8b6fc026e4ab964bc2b"
+  }
+]

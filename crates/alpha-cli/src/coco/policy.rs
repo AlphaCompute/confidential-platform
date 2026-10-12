@@ -37,8 +37,9 @@ pub const GENPOLICY_SHA256: &str =
 /// genpolicy 4.1.0's default `genpolicy-settings.json`, as released.
 const UPSTREAM_SETTINGS: &str = include_str!("genpolicy/genpolicy-settings.json");
 /// The settings drop-ins genpolicy applies to its defaults (RFC 6902 patches, in name order):
-/// #82's Alpha baseline, byte for byte, and the KMS endpoints variable.
-pub const SETTINGS_DROP_INS: [(&str, &str); 2] = [
+/// #82's Alpha baseline, byte for byte, the KMS endpoints variable, and `HOSTNAME` held to a DNS
+/// label.
+pub const SETTINGS_DROP_INS: [(&str, &str); 3] = [
     (
         "30-alpha-baseline.json",
         include_str!("genpolicy/genpolicy-settings.d/30-alpha-baseline.json"),
@@ -46,6 +47,10 @@ pub const SETTINGS_DROP_INS: [(&str, &str); 2] = [
     (
         "40-alpha-kms-endpoints.json",
         include_str!("genpolicy/genpolicy-settings.d/40-alpha-kms-endpoints.json"),
+    ),
+    (
+        "50-alpha-hostname.json",
+        include_str!("genpolicy/genpolicy-settings.d/50-alpha-hostname.json"),
     ),
 ];
 /// genpolicy reads the binary at most this large.
@@ -431,7 +436,7 @@ mod tests {
     #[test]
     fn verify_refuses_every_loosening() {
         type Change = fn(&mut Value);
-        let cases: [(&str, Change); 12] = [
+        let cases: [(&str, Change); 14] = [
             ("ExecProcessRequest", |d| {
                 d["request_defaults"]["ExecProcessRequest"]["allowed_commands"] = json!([["sh"]])
             }),
@@ -452,10 +457,19 @@ mod tests {
             }),
             ("allow_env_regex", |d| {
                 d["request_defaults"]["CreateContainerRequest"]["allow_env_regex"] =
-                    json!(["^HOSTNAME=$(dns_label)$", "^.*$"])
+                    json!([alpha_core::coco::policy::HOSTNAME_ENV_REGEX, "^.*$"])
             }),
             ("guest", |d| {
                 d["cluster_config"]["guest_pull"] = json!(false)
+            }),
+            ("emptydir_type", |d| {
+                d["cluster_config"]["emptydir_type"] = json!("block-plain")
+            }),
+            ("neither in TD memory nor encrypted", |d| {
+                d["containers"][1]["storages"] = json!([{
+                    "driver": "", "driver_options": ["create_filesystem"], "fstype": "ext4",
+                    "source": "", "options": ["discard"], "mount_point": "$(spath)/$(b64_device_id)",
+                }])
             }),
             ("exec commands", |d| {
                 d["containers"][1]["exec_commands"] = json!([["cat", "/etc/passwd"]])

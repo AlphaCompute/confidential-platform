@@ -17,6 +17,12 @@ The KMS pins are those of `testdata/manifest/05-deploy`.
 - `wrap/03-volume` — one service with an encrypted persistent volume (`x-alphacompute-volumes`)
   on a CPU shape, `busybox` standing in for the `alpha-volume` image: the init container, the
   claim under `volume_claims`, and the policy with the two mounts' propagation set.
+- `wrap/04-kbs` — Option B: one service on a CPU shape that opts in to the KBS
+  (`x-alphacompute-kbs`), takes a sealed secret in its environment and has an encrypted scratch
+  volume (`x-alphacompute-scratch`). The KBS is `https://kbs.trustee.alphacompute.internal:8080`
+  with `kbs/cert.pem`, as the adapter would pass them. The sealed value names this App's
+  `secret/db_password` under `sealed-secret-key/sealing`; its signature is 64 bytes of `0x07`,
+  so it is well formed but would not verify in CDH.
 - `wrap-refusals/cases.yaml` — one compose per refusal `coco wrap` adds to `compose wrap`'s
   (`testdata/manifest/09-wrap-refusals`), with a substring of the line the customer sees,
   among them a compose that tries to declare a customer DSM.
@@ -26,3 +32,7 @@ The KMS pins are those of `testdata/manifest/05-deploy`.
 - `render/02-volume` — `01-pod`'s spec and values rendered with
   `--volume pgdata:20Gi:app:/var/lib/data`: the claim appended as a document, the init
   container and the mount added, and genpolicy's policy for that rendering.
+- `render/03-kbs` — `01-pod` with a sealed secret and a disk-backed `emptyDir` on the service,
+  rendered with `--kbs-url` and `--kbs-cert` as for `wrap/04-kbs`.
+- `kbs/cert.pem` — a self-signed P-256 certificate standing in for Trustee's KBS certificate;
+  its SPKI SHA-256 is `4d7e6cc4…99a8`.

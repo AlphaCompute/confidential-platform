@@ -252,6 +252,14 @@ enum CocoCommand {
         /// The alpha-volume image, pinned by digest; required with --volume.
         #[arg(long)]
         volume_image: Option<String>,
+        /// Option B: Trustee's KBS, `https://<host>[:<port>]`, which the init-data's aa.toml and
+        /// cdh.toml point the guest components at. Requires --kbs-cert.
+        #[arg(long)]
+        kbs_url: Option<String>,
+        /// Option B: the PEM certificate the guest trusts for --kbs-url (measured in the
+        /// init-data). Requires --kbs-url.
+        #[arg(long)]
+        kbs_cert: Option<PathBuf>,
     },
     /// A customer's docker-compose as one Kata confidential pod of a shape. Prints
     /// `{revision, revision_hash, initdata, pod_spec, secrets}`; runs genpolicy 4.1.0 from
@@ -276,6 +284,13 @@ enum CocoCommand {
         /// volumes (`x-alphacompute-volumes`); without it such a compose is refused.
         #[arg(long)]
         volume_image: Option<String>,
+        /// Option B: Trustee's KBS, `https://<host>[:<port>]`, for a compose that opts in with
+        /// `x-alphacompute-kbs: true`; without it such a compose is refused. Requires --kbs-cert.
+        #[arg(long)]
+        kbs_url: Option<String>,
+        /// Option B: the PEM certificate the guest trusts for --kbs-url. Requires --kbs-url.
+        #[arg(long)]
+        kbs_cert: Option<PathBuf>,
         compose: PathBuf,
     },
     /// Writes genpolicy's settings directory (genpolicy 4.1.0's defaults plus the Alpha baseline
@@ -735,8 +750,12 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                     env_files,
                     volumes,
                     volume_image,
+                    kbs_url,
+                    kbs_cert,
                 },
         } => {
+            let kbs = coco::cdh::kbs_from_flags(kbs_url.as_deref(), kbs_cert.as_deref())
+                .map_err(Exit::Usage)?;
             let volumes = coco::Volumes {
                 image: volume_image,
                 volumes: volumes
@@ -763,7 +782,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let policy_text = fs::read_to_string(&policy_path)
                 .map_err(|e| Exit::Usage(format!("{}: {e}", policy_path.display())))?;
 
-            let out = coco::render_volumes(&template, &policy_text, &env, &volumes)
+            let out = coco::render_volumes(&template, &policy_text, &env, &volumes, kbs.as_ref())
                 .map_err(Exit::Refused)?;
             print!("{}", out.manifest);
             eprintln!(
@@ -783,9 +802,13 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                     shape,
                     no_resolve,
                     volume_image,
+                    kbs_url,
+                    kbs_cert,
                     compose,
                 },
         } => {
+            let kbs = coco::cdh::kbs_from_flags(kbs_url.as_deref(), kbs_cert.as_deref())
+                .map_err(Exit::Usage)?;
             let bytes = fs::read(&compose)
                 .map_err(|e| Exit::Usage(format!("{}: {e}", compose.display())))?;
             let shape =
@@ -795,6 +818,12 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let persistent = coco::wrap::Persistent {
                 volumes: coco::wrap::persistent_volumes(&bytes)?,
                 image: volume_image,
+            };
+            let ext = coco::wrap::Extensions {
+                persistent,
+                kbs_requested: coco::cdh::kbs_requested(&bytes)?,
+                kbs,
+                scratch: coco::cdh::scratch_volumes(&bytes)?,
             };
             let artifact: SignedDocument = serde_json::from_value(read_json(&platform)?)
                 .map_err(|e| Exit::Refused(format!("artifact: {e}")))?;
@@ -811,16 +840,8 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let genpolicy = coco::policy::Genpolicy::pinned();
             // A refusal is about the compose and exits 1; anything on our side exits 2, so the
             // adapter shows its own message instead of ours.
-            let wrapped = coco::wrap::wrap(
-                plain,
-                &digests,
-                app_id,
-                &runtime,
-                &shape,
-                &persistent,
-                &genpolicy,
-            )
-            .await;
+            let wrapped =
+                coco::wrap::wrap(plain, &digests, app_id, &runtime, &shape, &ext, &genpolicy).await;
             match wrapped {
                 Ok(wrapped) => Ok(json!(wrapped)),
                 Err(coco::wrap::WrapError::Refused(m)) => Err(Exit::Refused(m)),
@@ -962,6 +983,8 @@ mod tests {
         ];
         assert!(wrap(&all));
         assert!(wrap(&[&all[..], &["--no-resolve"]].concat()));
+        let kbs = ["--kbs-url", "https://kbs.example", "--kbs-cert", "kbs.pem"];
+        assert!(wrap(&[&all[..], &kbs[..]].concat()));
         assert!(!wrap(&all[..6]));
         assert!(!wrap(&all[2..]));
     }

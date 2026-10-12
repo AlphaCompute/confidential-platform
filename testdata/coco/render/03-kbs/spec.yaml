@@ -1,0 +1,62 @@
+# 01-pod with Option B: rendered with --kbs-url and --kbs-cert, so the init-data points the
+# guest components at the KBS. The service takes a sealed secret, which CDH unseals from the KBS
+# before it starts, and a scratch volume on disk, which CDH encrypts in the guest.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-${APP_ID}
+  namespace: app-${APP_ID}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      alphacompute.ai/app: ${APP_ID}
+  template:
+    metadata:
+      labels:
+        alphacompute.ai/app: ${APP_ID}
+      annotations:
+        io.katacontainers.config.hypervisor.cc_init_data: "${CC_INIT_DATA}"
+    spec:
+      runtimeClassName: kata-qemu-tdx
+      securityContext:
+        supplementalGroups: [1, 2, 3, 4, 6, 10, 11, 20, 26, 27]
+      initContainers:
+        - name: alpha-runtime
+          image: ${RUNTIME_IMAGE}
+          restartPolicy: Always
+          env:
+            - { name: ALPHACOMPUTE_KMS_ENDPOINTS, value: "${KMS_ENDPOINTS}" }
+            - { name: ALPHACOMPUTE_KMS_CA_SPKI_SHA256, value: "${KMS_CA_SPKI_SHA256}" }
+            - { name: ALPHACOMPUTE_KMS_REVISIONS, value: "${KMS_REVISIONS}" }
+            - { name: ALPHACOMPUTE_QUOTE_SOURCE, value: coco-aa }
+            - { name: ALPHACOMPUTE_TLS_UPSTREAM, value: "127.0.0.1:80" }
+          ports:
+            - { name: https, containerPort: 8443 }
+          startupProbe:
+            tcpSocket: { port: 8443 }
+            periodSeconds: 5
+            failureThreshold: 120
+          volumeMounts:
+            - { name: alpha-run, mountPath: /run/alpha }
+            - { name: alpha-pod, mountPath: /run/alpha-pod, readOnly: true }
+      containers:
+        - name: app
+          image: ${APP_IMAGE}
+          env:
+            - { name: DB_PASSWORD, value: "${SEALED_DB_PASSWORD}" }
+          volumeMounts:
+            - { name: cache, mountPath: /var/cache/app }
+          resources:
+            limits: { cpu: "2", memory: 4096Mi }
+      volumes:
+        - name: cache
+          emptyDir: { sizeLimit: 10Gi }
+        - name: alpha-run
+          emptyDir: { medium: Memory, sizeLimit: 1Mi }
+        - name: alpha-pod
+          downwardAPI:
+            items:
+              - path: cc_init_data
+                fieldRef:
+                  fieldPath: metadata.annotations['io.katacontainers.config.hypervisor.cc_init_data']

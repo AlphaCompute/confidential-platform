@@ -2636,7 +2636,7 @@ policy_data := {
   "request_defaults": {
     "CreateContainerRequest": {
       "allow_env_regex": [
-        "^HOSTNAME=$(dns_label)$",
+        "^HOSTNAME=[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$",
         "^KUBERNETES_PORT_$(ip_p)_TCP=tcp://$(ipv4_a):$(ip_p)$",
         "^KUBERNETES_PORT_$(ip_p)_TCP_PROTO=tcp$",
         "^KUBERNETES_PORT_$(ip_p)_TCP_PORT=$(ip_p)$",

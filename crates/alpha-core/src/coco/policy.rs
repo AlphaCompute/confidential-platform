@@ -31,12 +31,23 @@ pub const DATA_PREFIX: &str = "\npolicy_data := ";
 /// policy admits the variable only as a list of `https://host[:port]` (alpha-cli's `40-` settings
 /// drop-in).
 pub const KMS_ENDPOINTS_ENV_REGEX: &str = "^ALPHACOMPUTE_KMS_ENDPOINTS=https://[a-z0-9.-]{1,253}(:[0-9]{1,5})?(,https://[a-z0-9.-]{1,253}(:[0-9]{1,5})?){0,7}$";
+/// `HOSTNAME` as the host may set it: the pod's name, one lowercase DNS label (alpha-cli's `50-`
+/// settings drop-in). genpolicy's `$(dns_label)` also admits `.` and `_`, so a host could set
+/// `HOSTNAME=sealed.<JWS>` copied from the policy and have the agent unseal one of the App's
+/// Secrets into a container that was never given it (Option B, sealed secrets).
+pub const HOSTNAME_ENV_REGEX: &str = "^HOSTNAME=[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$";
+/// Placeholders genpolicy's rules (`allow_var`, "always_allowed") let the host fill with any
+/// value at all. genpolicy writes `HOSTNAME=$(host-name)` into every container; a host could
+/// then set `HOSTNAME=sealed.<JWS>` copied from the policy and have the agent unseal one of the
+/// App's Secrets into a container never given it. The generators pin `HOSTNAME` to the sandbox's
+/// name instead (`$(sandbox-name)`, which the rules match against the policy's name pattern).
+pub const ANY_VALUE_PLACEHOLDERS: [&str; 3] = ["$(host-name)", "$(node-name)", "$(pod-uid)"];
 /// The only environment variables the host may add to a container beyond those the policy
 /// lists: the pod's hostname, the API server's `KUBERNETES_*` (#82's baseline drop-in), and the
 /// KMS endpoints. Service links and the cloud identity variables genpolicy admits by default are
-/// not among them. A policy may admit fewer.
+/// not among them, and none admits a value that starts `sealed.`. A policy may admit fewer.
 pub const ALLOWED_ENV_REGEX: [&str; 10] = [
-    "^HOSTNAME=$(dns_label)$",
+    HOSTNAME_ENV_REGEX,
     "^KUBERNETES_PORT_$(ip_p)_TCP=tcp://$(ipv4_a):$(ip_p)$",
     "^KUBERNETES_PORT_$(ip_p)_TCP_PROTO=tcp$",
     "^KUBERNETES_PORT_$(ip_p)_TCP_PORT=$(ip_p)$",
@@ -81,6 +92,13 @@ pub const DSM_ENV: &str = "ALPHACOMPUTE_DSM";
 /// deliverable 25), the only ones the baseline lets run privileged in the TD and share a mount
 /// back to the guest (the opened volume, which the App's container then mounts).
 pub const VOLUME_CONTAINER_PREFIX: &str = "alpha-volume-";
+/// How genpolicy is told the runtime classes serve a disk-backed `emptyDir` (Kata 4.1.0's
+/// `emptydir_mode` for its CoCo classes): a block device the agent has the Confidential Data Hub
+/// format with LUKS2 under a random key that never leaves the TD (Option B storage).
+pub const EMPTYDIR_TYPE: &str = "block-encrypted";
+/// The driver options of that storage as the policy pins them. Without the first, the agent
+/// would mount the host's block device unencrypted.
+pub const ENCRYPTED_EMPTYDIR_OPTIONS: [&str; 2] = ["encryption_key=ephemeral", "create_filesystem"];
 /// genpolicy's capability set for an unprivileged container.
 const DEFAULT_CAPS: &str = "$(default_caps)";
 /// genpolicy's placeholders, which let a listed variable take a value the policy does not spell
@@ -156,6 +174,11 @@ pub fn verify(policy: &str) -> Result<Verified, String> {
             "images are not pulled in the guest, so their digests would not bind the root filesystems",
         ));
     }
+    if *at("/cluster_config/emptydir_type") != json!(EMPTYDIR_TYPE) {
+        return Err(bad(
+            "a disk-backed emptyDir would not be encrypted in the guest (emptydir_type is not block-encrypted)",
+        ));
+    }
     let containers = at("/containers")
         .as_array()
         .ok_or_else(|| bad("policy_data has no containers"))?;
@@ -179,11 +202,35 @@ pub fn verify(policy: &str) -> Result<Verified, String> {
         if let Some(token) = token {
             return Err(bad(&format!("a container may mount the token at {token}")));
         }
+        for storage in container
+            .get("storages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if !(in_memory(storage) || encrypted_in_guest(storage)) {
+                return Err(bad(&format!(
+                    "a container has storage that is neither in TD memory nor encrypted in the guest: {storage}"
+                )));
+            }
+        }
         let annotation = |key: &str| {
             container
                 .pointer(&format!("/OCI/Annotations/{}", key.replace('/', "~1")))
                 .and_then(Value::as_str)
         };
+        let any_value = container
+            .pointer("/OCI/Process/Env")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .find(|e| ANY_VALUE_PLACEHOLDERS.iter().any(|p| e.contains(p)));
+        if let Some(var) = any_value {
+            return Err(bad(&format!(
+                "{var} lets the host set any value; regenerate it with alpha coco render or wrap"
+            )));
+        }
         if annotation(TYPE_ANNOTATION) == Some("sandbox") {
             continue;
         }
@@ -242,6 +289,19 @@ pub fn verify(policy: &str) -> Result<Verified, String> {
         elevated,
         data,
     })
+}
+
+/// A memory-backed `emptyDir`: tmpfs in the TD.
+fn in_memory(storage: &Value) -> bool {
+    storage.get("driver") == Some(&json!("ephemeral"))
+        && storage.get("fstype") == Some(&json!("tmpfs"))
+        && storage.get("driver_options") == Some(&json!([]))
+}
+
+/// A disk-backed `emptyDir` that the Confidential Data Hub encrypts in the guest.
+fn encrypted_in_guest(storage: &Value) -> bool {
+    storage.get("driver_options") == Some(&json!(ENCRYPTED_EMPTYDIR_OPTIONS))
+        && storage.get("fstype") == Some(&json!("ext4"))
 }
 
 fn pinned(image: &str) -> bool {
@@ -316,7 +376,7 @@ mod tests {
                 "exec_commands": [],
             }],
             "request_defaults": defaults,
-            "cluster_config": { "guest_pull": true },
+            "cluster_config": { "guest_pull": true, "emptydir_type": EMPTYDIR_TYPE },
         });
         format!("{RULES}{DATA_PREFIX}{data:#}")
     }
@@ -371,6 +431,53 @@ mod tests {
     }
 
     #[test]
+    fn container_storage_is_in_td_memory_or_encrypted_in_the_guest() {
+        let base = policy(&["PATH=/bin"]);
+        let with = |storage: Value| {
+            base.replace(
+                "\"exec_commands\": []",
+                &format!("\"exec_commands\": [], \"storages\": [{storage}]"),
+            )
+        };
+        let memory = json!({ "driver": "ephemeral", "driver_options": [], "fstype": "tmpfs",
+            "source": "tmpfs", "options": [], "mount_point": "^/run/kata-containers/sandbox/ephemeral/x$" });
+        let encrypted = json!({ "driver": "", "driver_options": ENCRYPTED_EMPTYDIR_OPTIONS,
+            "fstype": "ext4", "source": "", "options": [], "mount_point": "$(spath)/$(b64_device_id)" });
+        verify(&with(memory)).unwrap();
+        verify(&with(encrypted.clone())).unwrap();
+        // genpolicy's emptyDir_plain, its shared-fs emptyDir, and the encryption option alone.
+        let mut plain = encrypted.clone();
+        plain["driver_options"] = json!(["create_filesystem"]);
+        let local = json!({ "driver": "local", "driver_options": [], "fstype": "local",
+            "source": "local", "options": ["mode=0777"], "mount_point": "^x$" });
+        let mut no_fs = encrypted;
+        no_fs["driver_options"] = json!(["encryption_key=ephemeral"]);
+        for storage in [plain, local, no_fs] {
+            assert!(
+                verify(&with(storage))
+                    .unwrap_err()
+                    .contains("neither in TD memory")
+            );
+        }
+        let shared = base.replace("\"block-encrypted\"", "\"shared-fs\"");
+        // genpolicy's HOSTNAME, which the rules let the host fill with anything.
+        let any = policy(&["PATH=/bin", "HOSTNAME=$(host-name)"]);
+        assert!(
+            verify(&any)
+                .unwrap_err()
+                .contains("lets the host set any value")
+        );
+        verify(&policy(&["PATH=/bin", "HOSTNAME=$(sandbox-name)"])).unwrap();
+        // genpolicy's own HOSTNAME pattern, which admits a sealed secret's dots and underscores.
+        let loose = base.replace(
+            &format!("{HOSTNAME_ENV_REGEX:?}"),
+            "\"^HOSTNAME=$(dns_label)$\"",
+        );
+        assert!(verify(&loose).unwrap_err().contains("allow_env_regex"));
+        assert!(verify(&shared).unwrap_err().contains("emptydir_type"));
+    }
+
+    #[test]
     fn the_rules_are_genpolicy_4_1_0s_with_82s_patch() {
         use sha2::{Digest, Sha256};
         let sha = |s: &str| {
@@ -420,8 +527,8 @@ mod tests {
         );
         // A policy that lets the host add variables pins nothing.
         let loose = pinned.replace(
-            "\"^HOSTNAME=$(dns_label)$\"",
-            "\"^HOSTNAME=$(dns_label)$\", \"^.*$\"",
+            &format!("{HOSTNAME_ENV_REGEX:?}"),
+            &format!("{HOSTNAME_ENV_REGEX:?}, \"^.*$\""),
         );
         assert!(
             dsm_pinned(&loose, DSM)

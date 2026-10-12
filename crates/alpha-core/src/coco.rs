@@ -8,7 +8,13 @@
 //! v2 is a pure function of the init-data bytes. The KMS rebuilds it from verified evidence and
 //! looks its hash up exactly as it looks up a compose hash today: same `revisions` table, same
 //! signature, same leaf SAN.
+//!
+//! The init-data holds exactly the entries the Revision accounts for ([`ENTRIES`]): our entry and
+//! the policy always, and for a pod that opts in to Option B the guest components' configuration
+//! (`aa.toml`, `cdh.toml`, see [`kbs`]), which the Revision summarizes as its `kbs` section. Any
+//! other entry is refused, so no part of the init-data has a meaning the Revision does not state.
 
+pub mod kbs;
 pub mod policy;
 
 use std::collections::BTreeMap;
@@ -27,6 +33,9 @@ pub const ALPHA_ENTRY_FORMAT: &str = "alphacompute-initdata/1";
 pub const ALPHA_ENTRY: &str = "alpha.json";
 /// The init-data entry that carries the Kata agent policy (Rego), as Kata names it.
 pub const POLICY_ENTRY: &str = "policy.rego";
+/// Every entry an init-data document may hold. Kata 4.1.0's agent reads `policy.rego`,
+/// `aa.toml` and `cdh.toml` and ignores the rest; we read `alpha.json`.
+pub const ENTRIES: [&str; 4] = [ALPHA_ENTRY, POLICY_ENTRY, kbs::AA_ENTRY, kbs::CDH_ENTRY];
 /// The only init-data document version the pinned Kata reads.
 pub const INITDATA_VERSION: &str = "0.1.0";
 /// The confidential runtime class for pods with GPUs: a Kata TD on TDX with the NVIDIA guest image
@@ -90,6 +99,10 @@ pub enum CocoError {
     MissingEntry(&'static str),
     #[error("init-data {ALPHA_ENTRY}: {0}")]
     AlphaEntry(String),
+    #[error("init-data entry {0:?} is not one a Revision v2 accounts for")]
+    UnknownEntry(String),
+    #[error("init-data guest components: {0}")]
+    Kbs(String),
     #[error("revision: {0}")]
     Revision(String),
 }
@@ -192,8 +205,27 @@ impl InitData {
         Ok(entry)
     }
 
+    /// The KBS the guest components are configured for: `None` without `aa.toml` and
+    /// `cdh.toml`, refused with only one of them or with anything but the generator's form.
+    pub fn kbs(&self) -> Result<Option<kbs::KbsConfig>, CocoError> {
+        match (self.data.get(kbs::AA_ENTRY), self.data.get(kbs::CDH_ENTRY)) {
+            (None, None) => Ok(None),
+            (Some(aa), Some(cdh)) => kbs::KbsConfig::from_entries(aa, cdh)
+                .map(Some)
+                .map_err(CocoError::Kbs),
+            _ => Err(CocoError::Kbs(format!(
+                "{} and {} come together",
+                kbs::AA_ENTRY,
+                kbs::CDH_ENTRY
+            ))),
+        }
+    }
+
     /// The Revision v2 this init-data stands for.
     pub fn revision(&self) -> Result<CocoRevision, CocoError> {
+        if let Some(entry) = self.data.keys().find(|k| !ENTRIES.contains(&k.as_str())) {
+            return Err(CocoError::UnknownEntry(entry.clone()));
+        }
         let alpha = self.alpha()?;
         Ok(CocoRevision {
             format: REVISION_FORMAT.into(),
@@ -202,6 +234,7 @@ impl InitData {
             policy_sha256: self.policy_sha256()?,
             runtime_class: alpha.runtime_class,
             gpu: alpha.gpu,
+            kbs: self.kbs()?.map(|k| k.revision()),
         })
     }
 }
@@ -286,6 +319,10 @@ pub struct CocoRevision {
     pub runtime_class: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu: Option<GpuShape>,
+    /// Present only for a pod whose init-data configures the guest components for a KBS
+    /// (Option B): the KBS and the certificate the guest trusts for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kbs: Option<kbs::RevisionKbs>,
 }
 
 impl CocoRevision {
@@ -322,6 +359,9 @@ impl CocoRevision {
             )));
         }
         check_shape(&revision.runtime_class, revision.gpu.as_ref()).map_err(bad)?;
+        if let Some(kbs) = &revision.kbs {
+            kbs.check().map_err(bad)?;
+        }
         if revision.canonical()? != text {
             return Err(bad("not in canonical (JCS) form".into()));
         }
@@ -587,6 +627,7 @@ mod tests {
                 count,
                 model: "B300".into(),
             }),
+            kbs: None,
         };
         let registered = |r: CocoRevision| {
             let text = r.canonical().unwrap();
@@ -606,6 +647,99 @@ mod tests {
             let error = registered(revision(class, gpu)).unwrap_err();
             assert!(error.contains(why), "{class} {gpu:?}: {error}");
         }
+    }
+
+    /// `initdata` with the guest components' entries for the test KBS appended.
+    fn with_kbs(text: &str) -> String {
+        let c = kbs::KbsConfig::new(kbs::tests::URL, kbs::tests::CERT).unwrap();
+        format!(
+            "{text}\"aa.toml\" = '''\n{}'''\n\"cdh.toml\" = '''\n{}'''\n",
+            c.aa_toml(),
+            c.cdh_toml()
+        )
+    }
+
+    #[test]
+    fn the_guest_components_entries_are_measured_and_named_in_the_revision() {
+        let plain = initdata("sha384", &cpu_alpha());
+        let text = with_kbs(&plain);
+        let init = InitData::parse(text.as_bytes()).unwrap();
+        let revision = init.revision().unwrap();
+        let named = revision.kbs.clone().unwrap();
+        assert_eq!(named.url, kbs::tests::URL);
+        assert_eq!(revision.initdata_sha256, crate::compose_hash(&text));
+        let canonical = revision.canonical().unwrap();
+        assert!(
+            canonical.contains("\"kbs\":{\"cert_spki_sha256\":"),
+            "{canonical}"
+        );
+        let app: AppId = APP.parse().unwrap();
+        assert_eq!(
+            CocoRevision::check_registered(&canonical, app).unwrap(),
+            revision
+        );
+        // Without them, the same pod is another Revision with no kbs section.
+        let bare = InitData::parse(plain.as_bytes())
+            .unwrap()
+            .revision()
+            .unwrap();
+        assert_eq!(bare.kbs, None);
+        assert_ne!(bare.hash().unwrap(), revision.hash().unwrap());
+        assert!(!bare.canonical().unwrap().contains("kbs"));
+
+        // Pinned: alpha coco render and wrap, the KMS and the signer page must agree on these.
+        assert_eq!(
+            revision.hash().unwrap().to_string(),
+            "sha256:e0a40fb0755413caf310f791eb240fc26aec45ad42208e275de7fc8eeb097a77"
+        );
+    }
+
+    #[test]
+    fn init_data_holds_only_entries_the_revision_accounts_for() {
+        let plain = initdata("sha384", &cpu_alpha());
+        let c = kbs::KbsConfig::new(kbs::tests::URL, kbs::tests::CERT).unwrap();
+        let entry = |name: &str, body: &str| format!("{plain}\"{name}\" = '''\n{body}'''\n");
+        for (text, why) in [
+            (entry("extra.toml", "x = 1\n"), "extra.toml"),
+            (entry("aa.toml", &c.aa_toml()), "come together"),
+            (entry("cdh.toml", &c.cdh_toml()), "come together"),
+            (
+                with_kbs(&plain)
+                    .replace("[kbc]\n", "skip_sealed_secret_verification = true\n[kbc]\n"),
+                "cdh.toml",
+            ),
+            (
+                with_kbs(&plain).replacen(kbs::tests::URL, "https://kbs.attacker.example", 1),
+                "different",
+            ),
+        ] {
+            let init = InitData::parse(text.as_bytes()).unwrap();
+            let error = init.revision().unwrap_err().to_string();
+            assert!(error.contains(why), "{why}: {error}");
+        }
+    }
+
+    #[test]
+    fn registration_holds_the_kbs_section_to_an_https_url() {
+        let text = with_kbs(&initdata("sha384", &cpu_alpha()));
+        let revision = InitData::parse(text.as_bytes())
+            .unwrap()
+            .revision()
+            .unwrap();
+        let app: AppId = APP.parse().unwrap();
+        let mut value = serde_json::to_value(&revision).unwrap();
+        value["kbs"]["url"] = "http://kbs.example".into();
+        let edited = String::from_utf8(crate::jcs(&value).unwrap()).unwrap();
+        assert!(
+            CocoRevision::check_registered(&edited, app)
+                .unwrap_err()
+                .to_string()
+                .contains("https")
+        );
+        value["kbs"]["url"] = kbs::tests::URL.into();
+        value["kbs"]["extra"] = 1.into();
+        let edited = String::from_utf8(crate::jcs(&value).unwrap()).unwrap();
+        assert!(CocoRevision::check_registered(&edited, app).is_err());
     }
 
     #[test]

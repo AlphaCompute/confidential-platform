@@ -86,3 +86,43 @@ dsm-in-compose:
         ports: ["443:80"]
         environment:
           ALPHACOMPUTE_DSM: '{"binding":"app"}'
+kbs-not-available:
+  refusal: "x-alphacompute-kbs: the key broker is not available for this App yet"
+  compose: |
+    services:
+      app:
+        image: nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+        ports: ["443:80"]
+    x-alphacompute-kbs: true
+sealed-without-kbs:
+  refusal: "app: DB_PASSWORD: a sealed secret is unsealed from the KBS, which this App has not opted in to"
+  compose: |
+    services:
+      app:
+        image: nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+        ports: ["443:80"]
+        environment:
+          DB_PASSWORD: sealed.eyJhbGciOiJFUzI1NiIsImtpZCI6ImticzovLy8wMTk5NGIzZS01YzhhLTdkM2UtOWExYi0yYzNkNGU1ZjZhN2Ivc2VhbGVkLXNlY3JldC1rZXkvc2VhbGluZyJ9.eyJ2ZXJzaW9uIjoiMC4xLjAiLCJ0eXBlIjoidmF1bHQiLCJuYW1lIjoia2JzOi8vLzAxOTk0YjNlLTVjOGEtN2QzZS05YTFiLTJjM2Q0ZTVmNmE3Yi9zZWNyZXQvZGJfcGFzc3dvcmQiLCJwcm92aWRlciI6ImticyIsInByb3ZpZGVyX3NldHRpbmdzIjp7fSwiYW5ub3RhdGlvbnMiOnt9fQ.BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBw
+scratch-undeclared:
+  refusal: "x-alphacompute-scratch.cache: not a volume of this compose"
+  compose: |
+    services:
+      app:
+        image: nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+        ports: ["443:80"]
+    x-alphacompute-scratch:
+      cache: {size: 10Gi}
+scratch-and-persistent:
+  refusal: "a volume is persistent or scratch, not both"
+  compose: |
+    services:
+      app:
+        image: nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+        ports: ["443:80"]
+        volumes: ["data:/data"]
+    volumes:
+      data: {}
+    x-alphacompute-volumes:
+      data: {size: 10Gi}
+    x-alphacompute-scratch:
+      data: {size: 10Gi}

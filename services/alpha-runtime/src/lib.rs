@@ -893,7 +893,10 @@ package agent_policy
                     "CloseStdinRequest": false, "GetDiagnosticDataRequest": false,
                     "UpdateEphemeralMountsRequest": false,
                 },
-                "cluster_config": { "guest_pull": true },
+                "cluster_config": {
+                    "guest_pull": true,
+                    "emptydir_type": alpha_core::coco::policy::EMPTYDIR_TYPE,
+                },
             });
             INITDATA.replace(
                 "package agent_policy\n",

@@ -355,6 +355,65 @@ fn init_data_swapped_after_policy_generation_is_refused() {
     }
 }
 
+/// Option B: init-data whose `aa.toml` and `cdh.toml` point the guest components at a KBS.
+fn with_kbs(initdata: &str, url: &str) -> String {
+    let cert = include_str!("../../../../testdata/coco/kbs/cert.pem");
+    let kbs = alpha_core::coco::kbs::KbsConfig::new(url, cert).unwrap();
+    format!(
+        "{initdata}\"aa.toml\" = '''\n{}'''\n\"cdh.toml\" = '''\n{}'''\n",
+        kbs.aa_toml(),
+        kbs.cdh_toml()
+    )
+}
+
+#[test]
+fn a_pod_configured_for_a_kbs_is_appraised_to_the_revision_that_names_it() {
+    let url = "https://kbs.trustee.alphacompute.internal:8080";
+    let pod = Pod {
+        initdata: with_kbs(&initdata_text(CLASS, POLICY, Some(1)), url),
+        ..Pod::gpu(1)
+    };
+    let appraised = pod.appraise(&doc()).unwrap();
+    assert_eq!(appraised.compose_hash, pod.revision_hash());
+    let revision = InitData::parse(pod.initdata.as_bytes())
+        .unwrap()
+        .revision()
+        .unwrap();
+    assert_eq!(revision.kbs.unwrap().url, url);
+    assert_ne!(appraised.compose_hash, Pod::gpu(1).revision_hash());
+
+    // The host points the guest at its own KBS: other init-data than the TD measured.
+    let mut evidence = pod.evidence();
+    evidence.initdata = with_kbs(
+        &initdata_text(CLASS, POLICY, Some(1)),
+        "https://kbs.host.example",
+    )
+    .into_bytes();
+    refused(
+        pod.appraise_with(&evidence, pod.quote(), &doc(), &pod.gpu_results()),
+        "attestation_failed",
+        "MRCONFIGID",
+    );
+    // A TD booted with entries the Revision does not account for, or one KBS entry alone.
+    for initdata in [
+        format!("{}\"extra.toml\" = '''\nx = 1\n'''\n", pod.initdata),
+        initdata_text(CLASS, POLICY, Some(1))
+            + &pod.initdata[pod.initdata.find("\"cdh.toml\"").unwrap()..],
+    ] {
+        let odd = Pod {
+            initdata,
+            ..Pod::gpu(1)
+        };
+        let mut evidence = odd.evidence();
+        evidence.initdata = odd.initdata.clone().into_bytes();
+        refused(
+            odd.appraise_with(&evidence, odd.quote(), &doc(), &odd.gpu_results()),
+            "attestation_failed",
+            "init-data",
+        );
+    }
+}
+
 #[test]
 fn guest_image_not_in_reference_values_is_unknown() {
     let pod = Pod::gpu(1);

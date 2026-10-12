@@ -10,6 +10,7 @@
 //!
 //! See also: `deploy/coco/render-interim.py` (the Python script this replaces).
 
+pub mod cdh;
 pub mod policy;
 pub mod volume;
 pub mod wrap;
@@ -318,9 +319,14 @@ pub(crate) fn alpha_json(
     String::from_utf8(bytes).map_err(|e| e.to_string())
 }
 
-/// Builds the CoCo init-data TOML document as raw bytes (version 0.1.0, algorithm sha384).
-/// The document has exactly two entries: `alpha.json` and `policy.rego`.
-pub fn build_initdata(policy: &str, alpha: &str) -> Result<Vec<u8>, String> {
+/// Builds the CoCo init-data TOML document as raw bytes (version 0.1.0, algorithm sha384): the
+/// entries `alpha.json` and `policy.rego`, and for a pod that has the KBS (Option B) the guest
+/// components' `aa.toml` and `cdh.toml`.
+pub fn build_initdata(
+    policy: &str,
+    alpha: &str,
+    kbs: Option<&alpha_core::coco::kbs::KbsConfig>,
+) -> Result<Vec<u8>, String> {
     if policy.trim().is_empty() {
         return Err("the agent policy is empty".into());
     }
@@ -340,11 +346,20 @@ pub fn build_initdata(policy: &str, alpha: &str) -> Result<Vec<u8>, String> {
     }
     // The newline right after the opening ''' is dropped by TOML, so the policy is stored
     // byte for byte. alpha.json is a single-line JCS string with no quotes or newlines.
-    let toml = format!(
+    let mut toml = format!(
         "algorithm = \"sha384\"\nversion = \"{INITDATA_VERSION}\"\n\n[data]\n\
          \"alpha.json\" = '''{alpha}'''\n\
          \"policy.rego\" = '''\n{policy}'''\n"
     );
+    // Both are ours: TOML with the certificate in a basic string, never ''' or a trailing '.
+    if let Some(kbs) = kbs {
+        use alpha_core::coco::kbs::{AA_ENTRY, CDH_ENTRY};
+        toml.push_str(&format!(
+            "\"{AA_ENTRY}\" = '''\n{}'''\n\"{CDH_ENTRY}\" = '''\n{}'''\n",
+            kbs.aa_toml(),
+            kbs.cdh_toml()
+        ));
+    }
     Ok(toml.into_bytes())
 }
 
@@ -533,21 +548,23 @@ pub fn render(
     policy_text: &str,
     env: &HashMap<String, String>,
 ) -> Result<RenderOutput, String> {
-    render_volumes(template, policy_text, env, &Volumes::default())
+    render_volumes(template, policy_text, env, &Volumes::default(), None)
 }
 
-/// As [`render`], with encrypted persistent volumes added to the pod. `policy_text` is
-/// genpolicy's output for [`render_volumes_for_genpolicy`]; the init-data carries it with the
-/// volumes' mount propagation set ([`volume::propagate`]).
+/// As [`render`], with encrypted persistent volumes added to the pod and, when `kbs` is given,
+/// the guest components pointed at that KBS (Option B; sealed environment values are allowed only
+/// then). `policy_text` is genpolicy's output for [`render_volumes_for_genpolicy`]; the init-data
+/// carries it with the volumes' mount propagation set ([`volume::propagate`]).
 pub fn render_volumes(
     template: &str,
     policy_text: &str,
     env: &HashMap<String, String>,
     volumes: &Volumes,
+    kbs: Option<&alpha_core::coco::kbs::KbsConfig>,
 ) -> Result<RenderOutput, String> {
     let for_shape = render_volumes_for_genpolicy(template, env, volumes)?;
     let (runtime_class, gpu_count) = extract_shape(&for_shape)?;
-    let policy_text = &volume::propagate(policy_text, &volumes.names())?;
+    let policy_text = &volume::propagate(&cdh::pin_hostname(policy_text), &volumes.names())?;
     let verified = policy::verify(policy_text)?;
     let containers = manifest_containers(&for_shape)?;
     let running = admitted(&containers);
@@ -574,6 +591,7 @@ pub fn render_volumes(
     let app_id: AppId = app_id_str
         .parse()
         .map_err(|_| format!("APP_ID {app_id_str:?} is not a valid App id"))?;
+    cdh::check_sealed_env(&containers, app_id, kbs.is_some(), &verified)?;
 
     let gpu_shape = if gpu_count > 0 {
         let model = env
@@ -588,7 +606,7 @@ pub fn render_volumes(
     };
 
     let alpha = alpha_json(app_id, &runtime_class, gpu_shape)?;
-    let initdata_bytes = build_initdata(policy_text, &alpha)?;
+    let initdata_bytes = build_initdata(policy_text, &alpha, kbs)?;
     let annotation = encode_annotation(&initdata_bytes)?;
 
     let mut values = env.clone();
@@ -704,15 +722,15 @@ spec:
     #[test]
     fn build_initdata_produces_parseable_toml() {
         let alpha = alpha_json(APP.parse().unwrap(), "kata-qemu-tdx", None).unwrap();
-        let bytes = build_initdata(MINIMAL_POLICY, &alpha).unwrap();
+        let bytes = build_initdata(MINIMAL_POLICY, &alpha, None).unwrap();
         let parsed = alpha_core::coco::InitData::parse(&bytes).unwrap();
         let revision = parsed.revision().unwrap();
         assert_eq!(revision.app_id.to_string(), APP);
         assert!(revision.gpu.is_none());
 
-        assert!(build_initdata("", &alpha).is_err());
-        assert!(build_initdata("x'''y", &alpha).is_err());
-        assert!(build_initdata("x'", &alpha).is_err());
+        assert!(build_initdata("", &alpha, None).is_err());
+        assert!(build_initdata("x'''y", &alpha, None).is_err());
+        assert!(build_initdata("x'", &alpha, None).is_err());
     }
 
     #[test]
@@ -769,7 +787,7 @@ spec:
             }),
         )
         .unwrap();
-        let initdata_bytes = build_initdata(&baseline_policy(), &alpha).unwrap();
+        let initdata_bytes = build_initdata(&baseline_policy(), &alpha, None).unwrap();
         let parsed = alpha_core::coco::InitData::parse(&initdata_bytes).unwrap();
         assert_eq!(parsed.revision().unwrap(), output.revision);
     }
@@ -853,6 +871,20 @@ spec:
         }
     }
 
+    /// The test KBS of `testdata/coco/kbs` for the vectors that opt in to it.
+    fn vector_kbs(name: &str) -> Option<alpha_core::coco::kbs::KbsConfig> {
+        (name == "03-kbs").then(|| {
+            let cert = std::fs::read_to_string(
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../testdata/coco/kbs/cert.pem"),
+            )
+            .unwrap();
+            alpha_core::coco::kbs::KbsConfig::new(KBS_URL, &cert).unwrap()
+        })
+    }
+
+    const KBS_URL: &str = "https://kbs.trustee.alphacompute.internal:8080";
+
     /// `testdata/coco/render/<name>`: a template, its values, and the policy genpolicy 4.1.0
     /// printed under `genpolicy-settings` for its `--for-genpolicy` rendering. Under
     /// `WRITE_VECTORS=1` with `ALPHA_TEST_GENPOLICY` naming genpolicy 4.1.0, the policy is
@@ -874,7 +906,14 @@ spec:
             std::fs::write(dir.join("policy.rego"), text).unwrap();
         }
         let policy_text = std::fs::read_to_string(dir.join("policy.rego")).unwrap();
-        let out = render_volumes(&template, &policy_text, &env, &volumes).unwrap();
+        let out = render_volumes(
+            &template,
+            &policy_text,
+            &env,
+            &volumes,
+            vector_kbs(name).as_ref(),
+        )
+        .unwrap();
         let expected = format!("{}\n{}\n", out.revision_canonical, out.revision_hash);
         if write {
             std::fs::write(dir.join("manifest.yaml"), &out.manifest).unwrap();
@@ -933,9 +972,63 @@ spec:
         let mut volumes = vector_volumes("02-volume");
         volumes.image = None;
         assert!(
-            render_volumes(&template, &policy_text, &env, &volumes)
+            render_volumes(&template, &policy_text, &env, &volumes, None)
                 .unwrap_err()
                 .contains("--volume-image")
         );
+    }
+
+    #[tokio::test]
+    async fn render_points_the_guest_components_at_the_kbs() {
+        let out = render_vector("03-kbs").await;
+        let kbs = out.revision.kbs.clone().unwrap();
+        assert_eq!(kbs.url, KBS_URL);
+        let docs: Vec<serde_yaml_ng::Value> = serde_yaml_ng::Deserializer::from_str(&out.manifest)
+            .map(|d| serde_yaml_ng::Value::deserialize(d).unwrap())
+            .collect();
+        let pod = &docs[0]["spec"]["template"]["spec"];
+        let annotation = docs[0]["spec"]["template"]["metadata"]["annotations"]
+            ["io.katacontainers.config.hypervisor.cc_init_data"]
+            .as_str()
+            .unwrap();
+        let init = alpha_core::coco::InitData::parse(
+            &alpha_tsm::coco::decode_annotation(annotation).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(init.revision().unwrap(), out.revision);
+        let config = init.kbs().unwrap().unwrap();
+        assert_eq!(config, vector_kbs("03-kbs").unwrap());
+        // The scratch volume is disk-backed (CDH encrypts it in the guest), the rest in memory.
+        let volumes = pod["volumes"].as_sequence().unwrap();
+        assert!(
+            volumes
+                .iter()
+                .any(|v| v["name"] == "cache" && v["emptyDir"]["medium"].is_null())
+        );
+
+        let dir = vector("03-kbs");
+        let template = std::fs::read_to_string(dir.join("spec.yaml")).unwrap();
+        let env = read_env_files(&[dir.join("values.env").as_path()]).unwrap();
+        let policy_text = std::fs::read_to_string(dir.join("policy.rego")).unwrap();
+        // Without the KBS the sealed value has nothing to unseal it: refused.
+        let error = render(&template, &policy_text, &env).unwrap_err();
+        assert!(error.contains("x-alphacompute-kbs"), "{error}");
+        // A sealed value the policy does not pin is the host's: refused.
+        let mut other = env.clone();
+        let mut payload = cdh::tests::payload(APP);
+        payload["name"] = format!("kbs:///{APP}/secret/other").into();
+        other.insert(
+            "SEALED_DB_PASSWORD".into(),
+            cdh::tests::sealed(&cdh::tests::header(APP), &payload),
+        );
+        let error = render_volumes(
+            &template,
+            &policy_text,
+            &other,
+            &Volumes::default(),
+            vector_kbs("03-kbs").as_ref(),
+        )
+        .unwrap_err();
+        assert!(error.contains("does not pin"), "{error}");
     }
 }

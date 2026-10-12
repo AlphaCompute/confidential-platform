@@ -126,6 +126,21 @@ pub struct Persistent {
     pub image: Option<String>,
 }
 
+/// The compose's `x-alphacompute-*` extensions, with what the adapter gives for them: persistent
+/// volumes and the `alpha-volume` image (Option A, deliverable 25); and what the pod asks of the
+/// Confidential Data Hub (Option B, deliverable 26), the KBS when the compose opts in with
+/// `x-alphacompute-kbs: true` and the adapter has one to give, and the encrypted scratch volumes
+/// of `x-alphacompute-scratch`.
+#[derive(Clone, Debug, Default)]
+pub struct Extensions {
+    pub persistent: Persistent,
+    /// The compose's `x-alphacompute-kbs`.
+    pub kbs_requested: bool,
+    /// The adapter's `--kbs-url` and `--kbs-cert`.
+    pub kbs: Option<alpha_core::coco::kbs::KbsConfig>,
+    pub scratch: BTreeMap<String, String>,
+}
+
 /// The compose's top-level extension that makes named volumes persistent and encrypted:
 /// `x-alphacompute-volumes: {<volume>: {size: 10Gi}}`. `alpha compose wrap` ignores `x-` keys.
 pub const PERSISTENT_KEY: &str = "x-alphacompute-volumes";
@@ -208,9 +223,21 @@ pub async fn wrap(
     app_id: AppId,
     runtime: &Runtime,
     shape: &Shape,
-    persistent: &Persistent,
+    ext: &Extensions,
     source: &impl PolicySource,
 ) -> Result<Wrapped, WrapError> {
+    let (persistent, guest) = (&ext.persistent, ext);
+    // Off by default: only a compose that asks gets the guest components' entries.
+    let kbs = match (guest.kbs_requested, &guest.kbs) {
+        (false, _) => None,
+        (true, Some(kbs)) => Some(kbs),
+        (true, None) => {
+            return Err(WrapError::Refused(format!(
+                "{}: the key broker is not available for this App yet",
+                super::cdh::KBS_KEY
+            )));
+        }
+    };
     let secrets: BTreeSet<String> = plain.secrets.values().flatten().cloned().collect();
     if secrets.len() > MAX_SECRETS {
         return Err(WrapError::Refused(format!(
@@ -218,7 +245,8 @@ pub async fn wrap(
             secrets.len()
         )));
     }
-    let mut spec = pod_spec(&plain, digests, runtime, shape, persistent)?;
+    let mut spec = pod_spec(&plain, digests, runtime, shape, persistent, &guest.scratch)?;
+    let sealed = super::cdh::sealed_env(&yaml_containers(&spec)?, app_id, kbs.is_some())?;
     let expected = containers(&spec);
     let mut attempts = expected.len().saturating_add(1);
     let policy = loop {
@@ -250,6 +278,7 @@ pub async fn wrap(
     };
     let failed = |m: String| WrapError::Failed(m);
     let names: BTreeSet<String> = persistent.volumes.keys().cloned().collect();
+    let policy = super::cdh::pin_hostname(&policy);
     let policy = super::volume::propagate(&policy, &names).map_err(failed)?;
     let verified = policy::verify(&policy).map_err(failed)?;
     if verified.containers != expected {
@@ -258,13 +287,8 @@ pub async fn wrap(
             verified.containers, expected
         )));
     }
-    let containers: Vec<Yaml> = ["initContainers", "containers"]
-        .iter()
-        .filter_map(|k| spec.get(k).and_then(Value::as_array))
-        .flatten()
-        .map(serde_yaml_ng::to_value)
-        .collect::<Result<_, _>>()
-        .map_err(|e| failed(e.to_string()))?;
+    let containers = yaml_containers(&spec).map_err(failed)?;
+    super::cdh::check_pinned(&sealed, &verified).map_err(failed)?;
     // wrap has no DSM input: a compose cannot declare one (PRD-06 I1), so the policy pins none.
     super::check_dsm(&containers, &verified).map_err(failed)?;
     let volume_containers = expected
@@ -279,13 +303,16 @@ pub async fn wrap(
 
     let gpu = shape.gpu.clone();
     let alpha = super::alpha_json(app_id, &shape.runtime_class, gpu.clone()).map_err(failed)?;
-    let initdata = super::build_initdata(&policy, &alpha).map_err(failed)?;
+    let initdata = super::build_initdata(&policy, &alpha, kbs).map_err(failed)?;
     let revision = InitData::parse(&initdata)
         .and_then(|i| i.revision())
         .map_err(|e| failed(e.to_string()))?;
-    if revision.runtime_class != shape.runtime_class || revision.gpu != gpu {
+    if revision.runtime_class != shape.runtime_class
+        || revision.gpu != gpu
+        || revision.kbs != kbs.map(|k| k.revision())
+    {
         return Err(failed(
-            "revision: not the shape's runtime class and GPUs".into(),
+            "revision: not the shape's runtime class and GPUs, or not the KBS asked for".into(),
         ));
     }
     Ok(Wrapped {
@@ -312,6 +339,7 @@ fn pod_spec(
     runtime: &Runtime,
     shape: &Shape,
     persistent: &Persistent,
+    scratch: &BTreeMap<String, String>,
 ) -> Result<Value, String> {
     if !pinned_reference(&runtime.image) {
         return Err(format!(
@@ -340,10 +368,25 @@ fn pod_spec(
             ));
         }
     }
+    let scratch_key = super::cdh::SCRATCH_KEY;
+    for name in scratch.keys() {
+        if !plain.volumes.contains(name) {
+            return Err(format!(
+                "{scratch_key}.{name}: not a volume of this compose; declare it under top-level volumes"
+            ));
+        }
+        if persistent.volumes.contains_key(name) {
+            return Err(format!(
+                "{scratch_key}.{name}: also under {PERSISTENT_KEY}; a volume is persistent or scratch, not both"
+            ));
+        }
+    }
     let mut volume_inits = Vec::new();
     for name in &plain.volumes {
         label(name, "volumes")?;
-        if persistent.volumes.contains_key(name) {
+        if let Some(size) = scratch.get(name) {
+            volumes.push(super::cdh::scratch_volume(name, size));
+        } else if persistent.volumes.contains_key(name) {
             let image = persistent.image.as_deref().ok_or_else(|| {
                 format!(
                     "{PERSISTENT_KEY}.{name}: persistent volumes are not available for this App yet"
@@ -483,6 +526,17 @@ fn pod_spec(
         "containers": regular,
         "volumes": volumes,
     }))
+}
+
+/// Every container of `spec`, as YAML for the checks render and wrap share.
+fn yaml_containers(spec: &Value) -> Result<Vec<Yaml>, String> {
+    ["initContainers", "containers"]
+        .iter()
+        .filter_map(|k| spec.get(k).and_then(Value::as_array))
+        .flatten()
+        .map(serde_yaml_ng::to_value)
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())
 }
 
 fn env_var(name: &str, value: &str) -> Value {
@@ -890,6 +944,15 @@ mod tests {
         "01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b".parse().unwrap()
     }
 
+    /// The KBS the adapter passes (`--kbs-url`, `--kbs-cert`); only a compose that opts in uses it.
+    fn test_kbs() -> alpha_core::coco::kbs::KbsConfig {
+        alpha_core::coco::kbs::KbsConfig::new(
+            "https://kbs.trustee.alphacompute.internal:8080",
+            &fs::read_to_string(dir("coco/kbs/cert.pem")).unwrap(),
+        )
+        .unwrap()
+    }
+
     #[derive(Clone, Debug, Default, Deserialize, Serialize)]
     struct Run {
         input_sha256: String,
@@ -1003,13 +1066,19 @@ mod tests {
             volumes: persistent_volumes(&compose).unwrap(),
             image: Some(VOLUME_IMAGE.into()),
         };
+        let ext = Extensions {
+            persistent,
+            kbs_requested: super::super::cdh::kbs_requested(&compose).unwrap(),
+            kbs: Some(test_kbs()),
+            scratch: super::super::cdh::scratch_volumes(&compose).unwrap(),
+        };
         let wrapped = wrap(
             parse(&compose).unwrap(),
             &BTreeMap::new(),
             app_id(),
             &runtime(),
             &shape,
-            &persistent,
+            &ext,
             &source,
         )
         .await
@@ -1249,13 +1318,22 @@ mod tests {
     async fn wrap_with(compose: &[u8], shape: &Shape, source: &impl PolicySource) -> WrapError {
         match parse(compose) {
             Err(e) => WrapError::Refused(e),
+            // As an adapter that has neither the alpha-volume image nor a KBS to give.
             Ok(plain) => wrap(
                 plain,
                 &BTreeMap::new(),
                 app_id(),
                 &runtime(),
                 shape,
-                &Persistent::default(),
+                &Extensions {
+                    persistent: Persistent {
+                        volumes: persistent_volumes(compose).unwrap_or_default(),
+                        image: None,
+                    },
+                    kbs_requested: super::super::cdh::kbs_requested(compose).unwrap_or(false),
+                    kbs: None,
+                    scratch: super::super::cdh::scratch_volumes(compose).unwrap_or_default(),
+                },
                 source,
             )
             .await
@@ -1267,7 +1345,7 @@ mod tests {
     async fn wrap_refuses_every_vector() {
         let text = fs::read_to_string(dir("coco/wrap-refusals").join("cases.yaml")).unwrap();
         let cases: BTreeMap<String, Case> = serde_yaml_ng::from_str(&text).unwrap();
-        assert_eq!(cases.len(), 10);
+        assert_eq!(cases.len(), 14);
         let shape = Shape::parse(&fs::read(dir("coco/wrap/01-gpu/shape.json")).unwrap()).unwrap();
         let source = Fixed(String::new());
         for (name, case) in cases {
@@ -1349,6 +1427,113 @@ mod tests {
             error.contains("services.app: the user its image runs as"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn wrap_points_an_opted_in_pod_at_the_kbs() {
+        let (w, shape) = wrap_vector("04-kbs").await;
+        check_contract(&w, &shape);
+        let init = InitData::parse(&BASE64_STANDARD.decode(&w.initdata).unwrap()).unwrap();
+        assert_eq!(init.kbs().unwrap(), Some(test_kbs()));
+        let revision: Value = serde_json::from_str(&w.revision).unwrap();
+        assert_eq!(
+            revision["kbs"]["url"],
+            json!("https://kbs.trustee.alphacompute.internal:8080")
+        );
+        let spec = &w.pod_spec;
+        let app = &spec["containers"][0];
+        assert!(
+            env(app)["DB_PASSWORD"]
+                .as_str()
+                .unwrap()
+                .starts_with("sealed.")
+        );
+        // The scratch volume is disk-backed; every other volume lives in TD memory.
+        for v in spec["volumes"].as_array().unwrap() {
+            if v["name"] == json!("cache") {
+                assert_eq!(v["emptyDir"], json!({ "sizeLimit": "10Gi" }));
+            } else {
+                assert!(
+                    v["emptyDir"]["medium"] == json!("Memory") || v.get("downwardAPI").is_some(),
+                    "{v}"
+                );
+            }
+        }
+        // genpolicy pinned the sealed value, and the scratch volume as CDH's encrypted storage.
+        let verified = policy::verify(init.policy().unwrap()).unwrap();
+        assert!(
+            verified.env["app"]
+                .iter()
+                .any(|e| e.starts_with("DB_PASSWORD=sealed."))
+        );
+        let storages: Vec<&Value> = verified.data["containers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|c| c["storages"].as_array().into_iter().flatten())
+            .filter(|s| s["fstype"] == json!("ext4"))
+            .collect();
+        assert_eq!(storages.len(), 1);
+        assert_eq!(
+            storages[0]["driver_options"],
+            json!(alpha_core::coco::policy::ENCRYPTED_EMPTYDIR_OPTIONS)
+        );
+
+        // The same compose without the opt-in has no guest components' entries, and so its
+        // sealed value is refused; with another App's sealed value it is refused too.
+        let compose = fs::read_to_string(dir("coco/wrap/04-kbs/compose.yaml")).unwrap();
+        let source = Fixed(init.policy().unwrap().to_owned());
+        let run = |compose: String, ext: Extensions| {
+            let shape = shape.clone();
+            let source = &source;
+            async move {
+                wrap(
+                    parse(compose.as_bytes()).unwrap(),
+                    &BTreeMap::new(),
+                    app_id(),
+                    &runtime(),
+                    &shape,
+                    &ext,
+                    source,
+                )
+                .await
+            }
+        };
+        let scratch = BTreeMap::from([("cache".to_owned(), "10Gi".to_owned())]);
+        let off = Extensions {
+            persistent: Persistent::default(),
+            kbs_requested: false,
+            kbs: Some(test_kbs()),
+            scratch: scratch.clone(),
+        };
+        let error = run(compose.clone(), off).await.unwrap_err().to_string();
+        assert!(error.contains("not opted in"), "{error}");
+        let other = AppId::mint();
+        let mut header = super::super::cdh::tests::header(&other.to_string());
+        let payload = super::super::cdh::tests::payload(&other.to_string());
+        let sealed = super::super::cdh::tests::sealed(&header, &payload);
+        let value = env(app)["DB_PASSWORD"].as_str().unwrap().to_owned();
+        let on = Extensions {
+            persistent: Persistent::default(),
+            kbs_requested: true,
+            kbs: Some(test_kbs()),
+            scratch,
+        };
+        let error = run(compose.replace(&value, &sealed), on.clone())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not this App"), "{error}");
+        // A policy that does not pin the sealed value is ours to fix, not the customer's.
+        header["kid"] = json!(format!("kbs:///{}/sealed-secret-key/other", app_id()));
+        let resealed = super::super::cdh::tests::sealed(
+            &header,
+            &super::super::cdh::tests::payload(&app_id().to_string()),
+        );
+        match run(compose.replace(&value, &resealed), on).await {
+            Err(WrapError::Failed(m)) => assert!(m.contains("does not pin"), "{m}"),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1439,7 +1624,10 @@ mod tests {
                     app_id(),
                     &runtime(),
                     &shape,
-                    &persistent,
+                    &Extensions {
+                        persistent,
+                        ..Extensions::default()
+                    },
                     &Fixed(String::new()),
                 )
                 .await
