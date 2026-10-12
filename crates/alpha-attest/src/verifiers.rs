@@ -85,6 +85,7 @@ pub struct Verifiers {
     pub format: String,
     /// Every party below, once each, in [`Party`] order.
     pub attested_by: Vec<Party>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cpu: Vec<CpuVouch>,
     /// Every GPU backend the `gpu_policy` listed, each of which verified every GPU. Empty for a
     /// pod without GPUs.
@@ -253,7 +254,6 @@ mod tests {
             json!({
                 "format": "alphacompute-verifiers/1",
                 "attested_by": ["fortanix"],
-                "cpu": [],
                 "composite": [{
                     "verifier": "fortanix-ccm",
                     "zone_ca_spki_sha256": format!("sha256:{}", "11".repeat(32)),
