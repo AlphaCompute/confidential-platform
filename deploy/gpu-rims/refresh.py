@@ -39,6 +39,8 @@ TOOLS = pathlib.Path(__file__).resolve().parents[2] / "testdata" / "gpu" / "tool
 
 
 def canonicalizer():
+    # No __pycache__ under testdata/, whose files are in CI's SHA-256 manifest.
+    sys.dont_write_bytecode = True
     spec = importlib.util.spec_from_file_location("canonicalize", TOOLS / "canonicalize.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
