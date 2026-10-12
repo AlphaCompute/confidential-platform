@@ -203,6 +203,7 @@ pub async fn wrap(
         }
     };
     let failed = |m: String| WrapError::Failed(m);
+    let policy = policy::pin_hostname(&policy);
     let verified = policy::verify(&policy).map_err(failed)?;
     if verified.containers != expected {
         return Err(failed(format!(
