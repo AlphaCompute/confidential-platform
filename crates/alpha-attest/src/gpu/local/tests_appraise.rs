@@ -6,7 +6,6 @@
 
 use std::collections::BTreeMap;
 
-use super::policy::CcSource;
 use super::testkit::*;
 use crate::gpu::{GpuEvidence, GpuVerifier, VerifiedGpu, check_gpus};
 use alpha_core::coco::GpuShape;
@@ -78,13 +77,12 @@ fn nothing_passes_until_the_release_pins_every_field() {
     let world = World::new(1);
     let gpus = world.evidence();
     type Clear = fn(&mut World);
-    let unset: [(&str, Clear); 7] = [
+    let unset: [(&str, Clear); 6] = [
         ("gpu_policy.local is not set", |w| w.policy.local = None),
         ("device_roots", |w| w.local_policy().device_roots.clear()),
         ("rim_roots", |w| w.local_policy().rim_roots.clear()),
         ("rims", |w| w.local_policy().rims.clear()),
         ("fwids", |w| w.local_policy().fwids.clear()),
-        ("cc_mode", |w| w.local_policy().cc_mode = None),
         ("ocsp_max_age_secs", |w| {
             w.local_policy().ocsp_max_age_secs = None
         }),
@@ -268,51 +266,57 @@ fn finding_1_the_certified_fwid_is_appraised() {
 // Finding 2: a GPU not in production CC mode never passes.
 
 #[test]
-fn finding_2_a_devtools_gpu_is_not_in_cc_mode() {
+fn finding_2_a_devtools_gpu_measures_differently_and_is_refused() {
+    // NVIDIA's verifier derives "devtools off" from every measurement matching the production
+    // RIMs; a devtools GPU's driver measurements differ, so no pinned RIM matches it.
     let world = World::new(8);
     let gpus = world.evidence_with(|i| {
         let mut r = Report::default();
         if i == 5 {
-            r.blocks.insert(CC_BLOCK, CC_DEVTOOLS.to_vec());
+            r.blocks.insert(6, vec![0xD7; 48]);
         }
         r
     });
-    let verdict = world.appraise(&gpus).unwrap();
-    assert!(!verdict.gpus[5].cc_mode);
-    assert!(verdict.gpus[4].cc_mode);
-    let (code, reason) = decide(&world, &gpus).unwrap_err();
-    assert_eq!(code, "policy_denied");
-    assert!(reason.contains("gpu 5: not in CC mode"), "{reason}");
-    // CC off: the indicator holds anything else, or is missing.
-    let off = world.evidence_with(|_| {
-        let mut r = Report::default();
-        r.blocks.insert(CC_BLOCK, vec![0; 48]);
-        r
-    });
-    assert_eq!(decide(&world, &off).unwrap_err().0, "policy_denied");
-    let missing = world.evidence_with(|_| {
-        let mut r = Report::default();
-        r.blocks.remove(&CC_BLOCK);
-        r
-    });
-    expect(&world, &missing, "CC-mode measurement 11 is missing");
+    expect(&world, &gpus, "GPU-5: no pinned Driver RIM");
 }
 
 #[test]
-fn finding_2_an_opaque_indicator_works_the_same_way() {
-    let mut world = World::new(1);
-    let rule = world.local_policy().cc_mode.as_mut().unwrap();
-    rule.source = CcSource::Opaque;
-    rule.index = super::opaque::NVDEC0_STATUS;
-    rule.values = vec!["55".into()];
-    assert!(world.appraise(&world.evidence()).unwrap().gpus[0].cc_mode);
-    let rule = world.local_policy().cc_mode.as_mut().unwrap();
-    rule.values = vec!["aa".into()];
-    assert!(!world.appraise(&world.evidence()).unwrap().gpus[0].cc_mode);
+fn finding_2_the_gpu_mode_must_be_the_pods_shape() {
+    // One GPU: single-GPU passthrough (SPT, 1).
+    let one = World::new(1);
+    assert!(one.appraise(&one.evidence()).unwrap().gpus[0].cc_mode);
+    for (flag, name) in [(0, "Mpt"), (2, "Ppcie"), (7, "Other(7)")] {
+        let gpus = one.evidence_with(|_| Report {
+            feature_flag: Some(flag),
+            ..Report::default()
+        });
+        expect(
+            &one,
+            &gpus,
+            &format!("FEATURE_FLAG is {name}, but a pod of 1 GPU(s) needs Spt"),
+        );
+    }
+    let absent = one.evidence_with(|_| Report {
+        feature_flag: None,
+        ..Report::default()
+    });
+    expect(&one, &absent, "the report has no FEATURE_FLAG");
+    // Eight GPUs: multi-GPU passthrough (MPT, 0) on every one of them.
+    let eight = World::new(8);
+    assert_eq!(eight.appraise(&eight.evidence()).unwrap().gpus.len(), 8);
+    let one_spt = eight.evidence_with(|i| Report {
+        feature_flag: Some(if i == 3 { 1 } else { 0 }),
+        ..Report::default()
+    });
+    expect(
+        &eight,
+        &one_spt,
+        "GPU-3: FEATURE_FLAG is Spt, but a pod of 8 GPU(s) needs Mpt",
+    );
 }
 
 #[test]
-fn finding_2_signed_debug_state_and_ppcie_are_not_cc_mode() {
+fn finding_2_signed_debug_state_is_not_cc_mode() {
     // DICE OperationalFlags: debug is bit 3, notSecure bit 1, recovery bit 2.
     for (flag, flags) in [
         ("debug", [0x90u8, 0, 0, 1]),
@@ -324,17 +328,6 @@ fn finding_2_signed_debug_state_and_ppcie_are_not_cc_mode() {
         let verdict = world.appraise(&world.evidence()).unwrap();
         assert!(!verdict.gpus[0].cc_mode, "{flag}");
     }
-    let world = World::new(1);
-    let ppcie = world.evidence_with(|_| Report {
-        feature_flag: Some(2),
-        ..Report::default()
-    });
-    assert!(!world.appraise(&ppcie).unwrap().gpus[0].cc_mode);
-    let spt = world.evidence_with(|_| Report {
-        feature_flag: Some(1),
-        ..Report::default()
-    });
-    assert!(world.appraise(&spt).unwrap().gpus[0].cc_mode);
 }
 
 #[test]
@@ -536,7 +529,6 @@ fn rim_cache_files_round_trip_and_refuse_garbage() {
 
 #[tokio::test]
 async fn the_backend_refuses_before_any_work_and_queries_only_the_pinned_ocsp_endpoint() {
-    use std::io::{BufRead, BufReader, Read, Write};
     let mut world = World::new(1);
     // Nothing pinned: refused without touching the cache or the network.
     let backend = super::Local::new(Default::default())
@@ -550,95 +542,32 @@ async fn the_backend_refuses_before_any_work_and_queries_only_the_pinned_ocsp_en
         .unwrap_err();
     assert_eq!(error.code(), "attestation_unknown");
 
-    // The BROM certificate's status is not cached; the policy names an endpoint that answers
-    // with a response echoing the nonce the backend derives.
-    world.ocsp.retain(|r| {
-        !super::ocsp::parse(r)
-            .unwrap()
-            .is_about(&world.gpus[0].brom.cert, &world.ica.cert)
-    });
-    let nonce: [u8; 16] = {
-        use sha2::{Digest, Sha256};
-        Sha256::new()
-            .chain_update(b"alphacompute/gpu-local/ocsp-nonce/v1")
-            .chain_update(NONCE)
-            .chain_update(
-                world.gpus[0]
-                    .brom
-                    .cert
-                    .tbs_certificate
-                    .serial_number
-                    .as_bytes(),
-            )
-            .finalize()[..16]
-            .try_into()
-            .unwrap()
-    };
-    let answers = [
-        ocsp_response(
-            &world.gpus[0].brom.cert,
-            &world.ica,
-            super::testkit::good(),
-            10,
-            None,
-        ),
-        ocsp_response(
-            &world.gpus[0].brom.cert,
-            &world.ica,
-            super::testkit::good(),
-            10,
-            Some(&nonce),
-        ),
-    ];
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}/", listener.local_addr().unwrap());
-    let served = answers.clone();
-    std::thread::spawn(move || {
-        for (n, stream) in listener.incoming().enumerate() {
-            let Ok(mut stream) = stream else { return };
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut length = 0usize;
-            loop {
-                let mut line = String::new();
-                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                    break;
-                }
-                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    length = v.trim().parse().unwrap();
-                }
-            }
-            let mut body = vec![0; length];
-            let _ = reader.read_exact(&mut body);
-            let answer = &served[n.min(1)];
-            let _ = write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/ocsp-response\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                answer.len()
-            );
-            let _ = stream.write_all(answer);
-        }
-    });
-    world.local_policy().ocsp_url = Some(url);
-    let backend = super::Local::new(world.cache()).unwrap().with_clock(now);
-    // First answer lacks the nonce: not used, so the status is missing.
-    let error = backend
-        .verify(&world.evidence(), &NONCE, &world.policy)
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("no status"), "{error}");
-    // Second answer echoes it: the GPU passes, and the response is kept for the next appraisal.
-    let verdict = backend
-        .verify(&world.evidence(), &NONCE, &world.policy)
-        .await
-        .unwrap();
-    assert!(verdict.gpus[0].cc_mode);
-    world.local_policy().ocsp_url = None;
-    assert!(
-        backend
+    // http:// ocsp_url is rejected at policy-parse time (HTTPS closes an observation channel).
+    {
+        let mut w = World::new(1);
+        w.local_policy().ocsp_url = Some("http://ocsp.example.com/".into());
+        let backend = super::Local::new(w.cache()).unwrap().with_clock(now);
+        let err = backend
+            .verify(&w.evidence(), &NONCE, &w.policy)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("is not an https"),
+            "http:// should be rejected: {err}"
+        );
+    }
+
+    // With all OCSP responses in the cache and an https:// URL, the backend passes without
+    // making any network calls.
+    {
+        world.local_policy().ocsp_url = Some("https://ocsp.example.com/".into());
+        let backend = super::Local::new(world.cache()).unwrap().with_clock(now);
+        let verdict = backend
             .verify(&world.evidence(), &NONCE, &world.policy)
             .await
-            .is_ok()
-    );
+            .unwrap();
+        assert!(verdict.gpus[0].cc_mode);
+    }
 }
 
 #[test]

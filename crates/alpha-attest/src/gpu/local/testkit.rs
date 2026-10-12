@@ -36,7 +36,7 @@ use super::cert::{
     ECDSA_WITH_SHA384, Fwid, ID_EC_PUBLIC_KEY, SECP384R1, SHA384, TCG_DICE_TCB_INFO_BLACKWELL,
     TcbInfoAsn,
 };
-use super::policy::{CcModeRule, CcSource, LocalPolicy};
+use super::policy::LocalPolicy;
 use crate::gpu::{GpuEvidence, GpuPolicy, GpuVerifierKind};
 
 pub const NOW: Duration = Duration::from_secs(1_800_000_000);
@@ -48,12 +48,13 @@ pub const VBIOS: &str = "97.00.88.00.0F";
 /// `97.00.88.00.0F` as the opaque field's eight bytes.
 pub const VBIOS_BYTES: [u8; 8] = [0x00, 0x88, 0x00, 0x97, 0x0F, 0, 0, 0];
 pub const FWID: [u8; 48] = [0xF1; 48];
-/// The CC-mode indicator: SPDM block 11 (RIM index 10, listed inactive by the driver RIM).
-pub const CC_BLOCK: u8 = 11;
-pub const CC_ON: [u8; 48] = [0xC0; 48];
-pub const CC_DEVTOOLS: [u8; 48] = [0xD7; 48];
-/// RIM indices 0..=4 are the VBIOS's, 5..=9 the driver's, 10 the CC-mode indicator.
+/// SPDM block 11 (RIM index 10) is one the driver RIM lists as inactive: measured, not compared.
+pub const INACTIVE_BLOCK: u8 = 11;
+/// RIM indices 0..=4 are the VBIOS's, 5..=9 the driver's, 10 inactive.
 pub const BLOCKS: u8 = 11;
+/// `Report::feature_flag` value meaning "the mode the pod's shape needs": SPT (1) for one GPU,
+/// MPT (0) for several.
+pub const POD_MODE: u64 = u64::MAX;
 
 pub fn now() -> SystemTime {
     UNIX_EPOCH + NOW
@@ -364,7 +365,7 @@ impl Default for Report {
         let mut blocks: BTreeMap<u8, Vec<u8>> = (0..u32::from(BLOCKS - 1))
             .map(|i| (u8::try_from(i + 1).unwrap(), golden(i)))
             .collect();
-        blocks.insert(CC_BLOCK, CC_ON.to_vec());
+        blocks.insert(INACTIVE_BLOCK, vec![0xC0; 48]);
         Self {
             nonce: NONCE,
             driver: DRIVER.into(),
@@ -372,7 +373,7 @@ impl Default for Report {
             nvdec: 0x55,
             fwid: Some(FWID),
             blocks,
-            feature_flag: None,
+            feature_flag: Some(POD_MODE),
         }
     }
 }
@@ -528,11 +529,6 @@ impl World {
                 ]
                 .into(),
                 fwids: vec![format!("sha384:{}", hex::encode(FWID))],
-                cc_mode: Some(CcModeRule {
-                    source: CcSource::Measurement,
-                    index: u16::from(CC_BLOCK),
-                    values: vec![hex::encode(CC_ON)],
-                }),
                 ocsp_max_age_secs: Some(86_400),
                 ocsp_url: None,
                 accept_certificate_hold: false,
@@ -580,11 +576,18 @@ impl World {
 
     /// Every GPU's evidence, each from `report(index)`.
     pub fn evidence_with(&self, report: impl Fn(usize) -> Report) -> Vec<GpuEvidence> {
+        let pod_mode = if self.gpus.len() == 1 { 1 } else { 0 };
         (0..self.gpus.len())
-            .map(|i| GpuEvidence {
-                arch: "BLACKWELL".into(),
-                evidence: report(i).sign(&self.gpus[i].leaf.key),
-                certificate: self.chain(i),
+            .map(|i| {
+                let mut r = report(i);
+                if r.feature_flag == Some(POD_MODE) {
+                    r.feature_flag = Some(pod_mode);
+                }
+                GpuEvidence {
+                    arch: "BLACKWELL".into(),
+                    evidence: r.sign(&self.gpus[i].leaf.key),
+                    certificate: self.chain(i),
+                }
             })
             .collect()
     }

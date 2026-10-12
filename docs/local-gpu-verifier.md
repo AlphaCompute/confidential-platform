@@ -35,7 +35,7 @@ gpu_policy (release-signed platform document)
  ├─ local.rim_roots ────pins──▶ NVIDIA CoRIM signing Root CA ─▶ Reference Value GB1XX CA ─▶ L3 ─▶ RIM L4 Signer
  │                                                                                                 └ signs driver and VBIOS RIMs
  ├─ local.rims ─────────pins──▶ the SHA-384 digest of every RIM the verifier may use
- ├─ local.fwids, local.cc_mode, hwmodels, allowed_models, min versions
+ ├─ local.fwids, hwmodels, allowed_models, min versions
  └─ local.ocsp_max_age_secs, local.ocsp_url, local.accept_certificate_hold
 OCSP (NVIDIA responders, delegated by each issuer) ─▶ every non-root certificate the decision rests on
 ```
@@ -44,7 +44,7 @@ No NVIDIA key, root, URL or measurement is compiled in. The roots are in the pol
 
 ## Appraisal, per GPU
 
-Before any GPU is looked at, the backend refuses (`attestation_unknown`, naming the field, "G0 check") if `gpu_policy.local` is absent or lacks any of `device_roots`, `rim_roots`, `rims`, `fwids`, `cc_mode` or `ocsp_max_age_secs`. Then, for each GPU in order, the first failure refuses the pod:
+Before any GPU is looked at, the backend refuses (`attestation_unknown`, naming the field, "G0 check") if `gpu_policy.local` is absent or lacks any of `device_roots`, `rim_roots`, `rims`, `fwids` or `ocsp_max_age_secs`. Then, for each GPU in order, the first failure refuses the pod:
 
 1. **Chain.** The PEM chain parses (at most 8 certificates, 64 KiB), every certificate is strict DER, issued by the next (ECDSA with the issuer's P-384 key, names chained, CA and key-usage constraints, path length), valid now, has no critical extension the verifier does not process, and the last one is byte-for-byte a `device_roots` entry.
 2. **Hardware model.** The common name of certificate 1 (the per-GPU `BROM` certificate, NVIDIA's `hwmodel`) is in `gpu_policy.hwmodels`, which maps it to a model name (`B300`). The chip is its first word (`GB100`). Only a `GSP` responder is appraised: an `FSP` chain (Blackwell's other responder, which sends no opaque data) is refused.
@@ -54,7 +54,7 @@ Before any GPU is looked at, the backend refuses (`attestation_unknown`, naming 
 6. **Opaque data.** It parses (legacy or `NVDAOD` format, version ≤ 2, no field twice). The reported FWID equals the certificate's, and the FWID is in `local.fwids`. `FEATURE_FLAG` is read for step 9.
 7. **RIMs, selected by measurement.** From the RIM cache, only RIMs that verify (signature, chain to `rim_roots`, OCSP, pinned in `local.rims`) and whose signed `PlatformModel` is the chip are candidates. The driver RIM and the VBIOS RIM are the candidates whose every active golden measurement matches the GPU's block of the same index (block = index + 1), with NVIDIA's one exception: index 35 is skipped when the signed NVDEC0 status is `0x55` (disabled) and compared when it is `0xAA`; any other status refuses. Exactly one driver version and one VBIOS version must match; their active indices must not overlap; a block the GPU reports that neither RIM lists refuses. Minimum-SVN records in the RIMs are compared with the opaque fields they name.
 8. **Versions.** The GPU's driver and VBIOS versions are the matched RIMs' signed `colloquialVersion`s. The versions in the opaque data must equal them; a GPU whose firmware reports another version than the one it measures as refuses.
-9. **CC mode.** The GPU is in CC mode only if the signed indicator `local.cc_mode` names holds one of its production values, no DICE `debug`, `notSecure` or `recovery` flag is set, and `FEATURE_FLAG` is not `ppcie` (protected PCIe, where the GPU's own CC mode is off). Otherwise it is reported with `cc_mode: false`, and `check_gpus` refuses it exactly as it refuses one from NRAS: `policy_denied`, "gpu `<i>`: not in CC mode". An indicator missing from the report refuses outright.
+9. **CC mode.** No signed field says "production CC, devtools off" on its own (confirmed on alpha-1, Oct 12). As in NVIDIA's verifier, which reports `dbgstat: "disabled"` only when every driver and VBIOS measurement matches its RIM (`verify.cpp`, attestation SDK 2026.10.02), production CC is steps 7 and 8 passing: a devtools GPU measures differently, so no pinned RIM matches it and it is refused there. Two signed checks follow. `FEATURE_FLAG` must be the pod's shape: `spt` (1) for a one-GPU pod, `mpt` (0) for a multi-GPU pod (NVLink encrypted between its GPUs); `ppcie`, any other value, or no `FEATURE_FLAG` refuses. A DICE `debug`, `notSecure` or `recovery` flag reports the GPU with `cc_mode: false`, which `check_gpus` refuses exactly as it refuses one from NRAS: `policy_denied`, "gpu `<i>`: not in CC mode".
 10. **Distinct devices.** `device_id` is the leaf certificate's serial number in decimal (NVIDIA's `ueid`); `check_gpus` refuses two GPUs of one pod with the same one.
 
 The verdict's `token_sha256` is SHA-256 over `alphacompute/gpu-local/v1`, then for every GPU its report, its chain and the digests of its two RIMs, each length-prefixed, so the attestation result names exactly what was appraised.
@@ -78,12 +78,11 @@ Negative tests: a GPU whose opaque driver version differs from the RIM it matche
 
 How this design closes it:
 
-- **CC mode is decided only from signed evidence, by a rule the release pins.** `local.cc_mode` names a signed indicator (a measurement block, or an opaque field) and the values that mean production CC mode. Until a release-signed document sets it, the backend refuses every GPU. The indicator is chosen at G0 by capturing the same B300 in `on` and in `devtools` mode and diffing the two signed reports (`ponytail: G0-gpu-capture`); the choice is recorded in the security review before it is signed.
+- **CC mode is decided only from signed evidence, as NVIDIA's verifier decides it.** There is no single CC-mode field to pin (alpha-1's signed report has `CHIP_INFO` `GB110`, `DRIVER_VERSION` `595.58.03` and `FEATURE_FLAG` `1`, and nothing that marks devtools on its own). Production CC is every measurement matching a pinned production driver RIM and VBIOS RIM; a devtools GPU measures differently and matches neither. An earlier draft pinned a separate `local.cc_mode` indicator; it was removed on Oct 12, since no such field exists.
 - **Only production RIMs count.** The signed content of a RIM does not say whether a driver RIM is the CC one: `NV_GPU_CC_DRIVER_GB100_580.159.03` and `NV_GPU_BMSAI_DRIVER_GB100_620.06` carry the same `Meta` fields. `local.rims` pins every acceptable RIM by its signed digest, so a non-CC or debug RIM in the cache is never a candidate.
-- **Other signed debug state counts too.** A DICE `debug`, `notSecure` or `recovery` flag in the leaf's `TcbInfo`, or a `FEATURE_FLAG` of `ppcie`, makes the GPU not in CC mode whatever the indicator says (step 9).
-- **Same refusal as NRAS.** A GPU whose indicator does not hold is `cc_mode: false`, refused by `check_gpus` with `policy_denied`, "not in CC mode", exactly as the `nras` backend reports a DevTools GPU.
+- **Other signed state counts too.** A DICE `debug`, `notSecure` or `recovery` flag in the leaf's `TcbInfo` makes the GPU not in CC mode (`cc_mode: false`, refused by `check_gpus` with `policy_denied`). `FEATURE_FLAG` must match the pod's shape, and `ppcie` never passes (step 9).
 
-Negative tests: devtools (indicator with its devtools value), CC off, a policy with no `cc_mode`, a DICE debug flag set, PPCIe mode, a debug-only RIM present in the cache but not pinned.
+Negative tests: a devtools GPU (one driver measurement differs), a DICE debug, notSecure or recovery flag, `FEATURE_FLAG` `mpt`, `ppcie`, unknown or absent on a one-GPU pod, one `spt` GPU in an eight-GPU pod, a debug-only RIM present in the cache but not pinned.
 
 ## Finding 3: Blackwell evidence refused
 
@@ -109,7 +108,7 @@ Release-signed in the platform document, refusing unknown fields like the rest o
 ```json
 "gpu_policy": {
   "allowed_models": ["B300"],
-  "min_driver_version": "580.159.03",
+  "min_driver_version": "595.58.03",
   "min_vbios_version": "97.00.88.00.0F",
   "verifiers": ["local"],
   "hwmodels": {"<BROM certificate CN of the B300, from G0>": "B300"},
@@ -119,7 +118,6 @@ Release-signed in the platform document, refusing unknown fields like the rest o
     "rims": {"sha384:<hex DigestValue>": "NV_GPU_CC_DRIVER_<chip>_<version>",
              "sha384:<hex DigestValue>": "NV_GPU_VBIOS_<project>_<sku>_<chip sku>_<version>"},
     "fwids": ["sha384:<hex>"],
-    "cc_mode": {"source": "measurement", "index": "<SPDM block, from G0>", "values": ["<hex>"]},
     "ocsp_max_age_secs": 86400,
     "ocsp_url": "https://ocsp.ndis.nvidia.com",
     "accept_certificate_hold": false
@@ -130,7 +128,7 @@ Release-signed in the platform document, refusing unknown fields like the rest o
 - `device_roots`, `rim_roots`: the only roots, as DER. NVIDIA's are in nvtrust (`certs/verifier_device_root.pem`, SHA-256 fingerprint `10:2B:F6:59:…:7B:48`; `certs/verifier_RIM_root.pem`); the release copies them in after checking them against NVIDIA's documentation.
 - `rims`: every RIM the verifier may use, by the SHA-384 its signature covers; the value is the RIM's ID, for people. A RIM in the cache but not here is ignored.
 - `fwids`: the certified FMC firmware IDs the release accepts, captured at G0 from a GPU whose measurements matched NVIDIA's RIMs, and added for each firmware update the release accepts.
-- `cc_mode`: `source` is `measurement` (an SPDM block index) or `opaque` (an opaque field type); `values` the signed values that mean production CC mode.
+- `min_driver_version` in the sample is 595.58.03, the driver NVIDIA's CoCo 1.1.0 validates and the first GB110 CC driver with a published RIM (Q137).
 - `ocsp_max_age_secs`: required, at most 7 days. NVIDIA's responders answer with a one-day `nextUpdate`. NVIDIA's terms (L1; Product-Specific Terms for NVIDIA Confidential Computing, v. July 9, 2026, §1.7) set no refresh interval: a customer that caches their output must publish how often it does, and that NVIDIA may update it more often.
 - `ocsp_url`: optional. When set, the KMS may query exactly this endpoint at appraisal time for a status the cache lacks; when absent, the verifier uses cached responses only and makes no network call.
 - `accept_certificate_hold`: default `false`. NVIDIA's RIM service serves RIMs whose `RIM L4 Signer` is on `certificateHold` (the GB100 VBIOS RIM above, on hold since 2025-06-26, observed 2026-10-12); a release that must accept such RIMs says so here, per document.
@@ -196,7 +194,7 @@ Where this verifier is stricter than NVIDIA's: certificate validity is checked (
 
 On the first B300 in CC mode, in a Kata pod:
 
-1. Save the evidence (`/aa/additional-evidence`) for a known nonce, with CC `on`, then the same GPU with CC `devtools`, then CC `off` if a report can be collected.
-2. Record the `BROM` CN (`hwmodels`), the leaf's `TcbInfo` (model, FWID, flags), the opaque data version and fields, and which blocks differ between `on` and `devtools` (`cc_mode`).
+1. Save the evidence (`/aa/additional-evidence`) for a known nonce, with CC `on`; once with one GPU in the pod and once with eight (the `FEATURE_FLAG` each reports: `spt`, `mpt`); then the same GPU with CC `devtools`, to confirm it fails RIM matching.
+2. Record the `BROM` CN (`hwmodels`), the leaf's `TcbInfo` (model, FWID, flags), the opaque data version and fields, and which blocks differ between `on` and `devtools`.
 3. Fetch the RIMs the GPU's driver and VBIOS correspond to, build the cache, and check that every active measurement matches and no block is unlisted.
 4. Replace the documented-format B300 tests with the capture and pin the values above in a release-signed `gpu_policy`.

@@ -11,7 +11,7 @@ use x509_cert::Certificate;
 use super::cache::RimCache;
 use super::cert::{self, OperationalFlag};
 use super::opaque::{self, FeatureFlag};
-use super::policy::{CcSource, Pinned};
+use super::policy::Pinned;
 use super::rim::{Rim, RimKind};
 use super::{Refused, ocsp, rim, spdm};
 use crate::AppraisalError;
@@ -46,7 +46,16 @@ pub fn appraise(
     for (index, gpu) in gpus.iter().enumerate() {
         let i = u32::try_from(index).map_err(|_| AppraisalError::Failed("gpu index".into()))?;
         let (verified, driver, vbios) = appraise_gpu(
-            i, gpu, nonce, policy, &pinned, &rims, &rejected, &responses, now,
+            i,
+            gpus.len(),
+            gpu,
+            nonce,
+            policy,
+            &pinned,
+            &rims,
+            &rejected,
+            &responses,
+            now,
         )
         .map_err(|e| AppraisalError::Failed(format!("local: GPU-{i}: {e}")))?;
         for part in [
@@ -159,6 +168,7 @@ fn usable_rims(
 #[allow(clippy::too_many_arguments)]
 fn appraise_gpu(
     index: u32,
+    pod_gpus: usize,
     gpu: &GpuEvidence,
     nonce: &[u8; 32],
     policy: &GpuPolicy,
@@ -236,7 +246,6 @@ fn appraise_gpu(
             hex::encode(tcb.fwid)
         ));
     }
-    let ppcie = o.feature_flag()? == Some(FeatureFlag::Ppcie);
 
     // 7. RIMs selected by what the GPU measures.
     let skip_nvdec = match o.nvdec0_status()? {
@@ -251,8 +260,13 @@ fn appraise_gpu(
     let blocks: BTreeMap<u32, &[u8]> = report
         .blocks
         .iter()
-        .map(|(i, b)| (u32::from(*i).saturating_sub(1), b.value.as_slice()))
-        .collect();
+        .map(|(i, b)| {
+            let idx = u32::from(*i).checked_sub(1).ok_or_else(|| {
+                Refused("block index 0 is not a valid SPDM measurement index".into())
+            })?;
+            Ok((idx, b.value.as_slice()))
+        })
+        .collect::<Result<_, Refused>>()?;
     let candidates: Vec<&Rim> = rims.iter().filter(|r| r.platform_model == chip).collect();
     let pick = |kind: RimKind| -> super::Result<&Rim> {
         let matched: Vec<&Rim> = candidates
@@ -335,29 +349,26 @@ fn appraise_gpu(
         ));
     }
 
-    // 9. CC mode, from the signed indicator the release pins.
-    let indicator: &[u8] = match pinned.cc_source {
-        CcSource::Measurement => u8::try_from(pinned.cc_index)
-            .ok()
-            .and_then(|i| report.blocks.get(&i))
-            .map(|b| b.value.as_slice())
-            .ok_or_else(|| {
-                Refused(format!(
-                    "CC-mode measurement {} is missing",
-                    pinned.cc_index
-                ))
-            })?,
-        CcSource::Opaque => o
-            .field(pinned.cc_index)
-            .map(|f| f.data.as_slice())
-            .ok_or_else(|| {
-                Refused(format!(
-                    "CC-mode opaque field {} is missing",
-                    pinned.cc_index
-                ))
-            })?,
+    // 9. CC mode. One GPU in a pod is single-GPU passthrough (SPT); several are multi-GPU
+    // passthrough (MPT, NVLink encrypted between them). PPCIe is Hopper's and never accepted.
+    let expected_mode = if pod_gpus == 1 {
+        FeatureFlag::Spt
+    } else {
+        FeatureFlag::Mpt
     };
-    let production = pinned.cc_values.iter().any(|v| v.as_slice() == indicator);
+    // NVIDIA's verifier reports `dbgstat: "disabled"` only when every measurement
+    // matches the driver and VBIOS RIMs, which steps 7 and 8 already require (a devtools GPU
+    // measures differently and is refused there). No signed field says "production CC" on its
+    // own; FEATURE_FLAG says how the GPU is attached, and must be the pod's shape.
+    match o.feature_flag()? {
+        Some(mode) if mode == expected_mode => {}
+        Some(mode) => {
+            return refuse(format!(
+                "FEATURE_FLAG is {mode:?}, but a pod of {pod_gpus} GPU(s) needs {expected_mode:?}"
+            ));
+        }
+        None => return refuse("the report has no FEATURE_FLAG (opaque data version 1 or later)"),
+    }
 
     Ok((
         VerifiedGpu {
@@ -366,7 +377,7 @@ fn appraise_gpu(
             model,
             driver_version: driver.version.clone(),
             vbios_version: vbios.version.clone(),
-            cc_mode: production && !debug_state && !ppcie,
+            cc_mode: !debug_state,
             nonce: report.nonce,
         },
         driver.digest,

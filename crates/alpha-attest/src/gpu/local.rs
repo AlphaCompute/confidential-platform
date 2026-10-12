@@ -32,7 +32,7 @@ mod tests_appraise;
 
 pub use backend::Local;
 pub use cache::RimCache;
-pub use policy::{CcModeRule, CcSource, LocalPolicy};
+pub use policy::LocalPolicy;
 
 use std::fmt;
 
