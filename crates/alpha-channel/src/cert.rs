@@ -45,6 +45,14 @@ pub fn spki_sha256(cert: &[u8]) -> Option<[u8; 32]> {
     spki_of(cert).ok().map(|spki| Sha256::digest(spki).into())
 }
 
+/// The `notAfter` field of a DER-encoded certificate as a `SystemTime`.
+pub fn not_after_from_der(der: &[u8]) -> Result<SystemTime, Error> {
+    let (_, cert) = X509Certificate::from_der(der)
+        .map_err(|e| Error::Malformed(format!("certificate: {e}")))?;
+    from_unix_seconds(cert.validity().not_after.timestamp())
+        .ok_or_else(|| Error::Malformed("certificate notAfter is before the Unix epoch".into()))
+}
+
 /// The identity an Instance certificate carries: `alphacompute://<org>/<app>/<key sha256>`
 /// then `urn:alphacompute:revision:sha256:<hex>`, in the order the KMS issues them.
 #[derive(Clone, Debug)]
