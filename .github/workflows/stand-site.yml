@@ -17,17 +17,20 @@ name: stand-site
 #     them unless "Allow public repositories" is checked, and this repository is public.
 #   - The runner group's repository access does not include this repository, or its "Selected
 #     workflows" entry is not exactly the one below.
-# Once STAND_TARGET is set, run this workflow by hand (workflow_dispatch on main) and see its job
-# start on the site runner.
+# Once STAND_TARGET is `both` or `owned`, run this workflow by hand (workflow_dispatch on main)
+# and see its job start on the site runner.
 #
 # Every fifteen minutes the job asks whether the site PCCS serves the root CA CRL and fails when
-# it does not, which is what makes GitHub send a notification. The check is
-# .github/stand/check.sh site; a failing round is retried once after two minutes and only the
-# second round's findings are errors. The PCCS is on the path of every attestation: a quote whose
-# collateral cannot be fetched fails appraisal.
+# it does not, which is what makes GitHub send a notification. GitHub sends a scheduled run's
+# notification to the user who last changed its cron line, so this file may notify someone other
+# than stand.yml does. The check is .github/stand/check.sh site; a failing round is retried once
+# after two minutes and only the second round's findings are errors. The PCCS is on the path of
+# every attestation: a quote whose collateral cannot be fetched fails appraisal.
 #
-# It runs when STAND_TARGET (see stand.yml) is `both` or `owned`. Every variable must then be set;
-# an empty or whitespace-only one fails the run.
+# It runs when STAND_TARGET (see stand.yml) is `both` or `owned`. Every variable must then be set:
+# an empty or whitespace-only STAND_PCCS_URL or STAND_SITE_CA_PEM fails the run, and so does an
+# unset or empty STAND_SITE_RUNNER. A STAND_SITE_RUNNER of only whitespace is not empty, so runs-on
+# is given it as the label, as above, and check.sh never sees it.
 #   STAND_SITE_RUNNER   the runner's label. The repository is public, so the runner's group must
 #                       admit only this workflow on main, as "Selected workflows":
 #                       AlphaCompute/confidential-platform/.github/workflows/stand-site.yml@refs/heads/main

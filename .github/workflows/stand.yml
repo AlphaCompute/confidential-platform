@@ -14,9 +14,10 @@ name: stand
 #   STAND_APPS                    the Apps whose copies must all be serving
 #   secret STAND_LIST_KEY         API key that may list the Apps' copies
 # owned, from M-D, from a GitHub-hosted runner, as a client on the internet reaches the platform.
-# Each probe is the alpha CLI's own pinned TLS: the chain must end at the KMS CA of the
-# release-signed platform document and the leaf must name an allowed Revision; the host name is
-# only routing, since KMS-issued leaves carry URI SANs and no DNS name.
+# A target passes only over the alpha CLI's own pinned TLS: the chain must end at the KMS CA of
+# the release-signed platform document and the leaf must name an allowed Revision; the host name
+# is only routing, since KMS-issued leaves carry URI SANs and no DNS name. A target that fails its
+# pin is asked again unpinned, only to say why; nothing read that way counts as serving.
 #   STAND_PLATFORM_DOCUMENT_URL   the release-signed platform document: its KMS CA and node
 #                                 Revisions are the pins
 #   STAND_KMS_ENDPOINTS           the KMS nodes of both failure domains, https:// URLs,

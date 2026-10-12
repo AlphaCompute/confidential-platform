@@ -146,17 +146,19 @@ fn client(pin: Option<Pin>, time: &TimeProvider) -> Result<reqwest::Client, Stri
 
 /// The KMS error envelope as `code: message`; any other body, such as an ingress's HTML error
 /// page, as its first 200 characters. Either is one line, since it goes into a finding: each run
-/// of whitespace, line breaks included, reads as one space, before the body is cut.
+/// of whitespace, line breaks included, reads as one space, before the body is cut, and a cut
+/// that ends on a space drops it.
 fn body_text(bytes: &[u8]) -> String {
     let value: Option<Value> = serde_json::from_slice(bytes).ok();
     if let Some(error) = value.as_ref().and_then(|v| v.get("error")) {
         let field = |name: &str| error.get(name).and_then(Value::as_str).unwrap_or("?");
         return one_line(&format!("{}: {}", field("code"), field("message")));
     }
-    one_line(&String::from_utf8_lossy(bytes))
+    let cut: String = one_line(&String::from_utf8_lossy(bytes))
         .chars()
         .take(200)
-        .collect()
+        .collect();
+    cut.trim_end().to_owned()
 }
 
 /// `text` with each run of whitespace as one space and none at either end.
@@ -449,11 +451,14 @@ mod tests {
             "<html> <head><title>502 Bad Gateway</title></head> <body> \
              <center><h1>502 Bad Gateway</h1></center> </body> </html>"
         );
-        // Collapsed before the cut, so the 200 characters are all the body's own.
+        // Collapsed before the cut, so the 200 characters are all the body's own, and the space
+        // the cut ends on is dropped.
         let spread = format!("\n\n{}", "a\n\t \n".repeat(300));
-        assert_eq!(body_text(spread.as_bytes()), "a ".repeat(100));
+        assert_eq!(body_text(spread.as_bytes()), "a ".repeat(100).trim_end());
         let envelope = br#"{"error":{"code":"internal","message":"database:\n  down"}}"#;
         assert_eq!(body_text(envelope), "internal: database: down");
-        assert_eq!(body_text("ready\u{a0}\u{2028}now".as_bytes()), "ready now");
+        // A no-break space, and the Unicode line breaks: next line, line and paragraph separator.
+        let unicode = "ready\u{a0}\u{2028}now\u{85}and\u{2029}then";
+        assert_eq!(body_text(unicode.as_bytes()), "ready now and then");
     }
 }
