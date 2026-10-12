@@ -212,7 +212,7 @@ async fn attest_audited(
     let evidence_sha256 = Sha256::digest(evidence_json).to_vec();
     let now = node.now();
     let result = match attest_inner(node, &spki, request, verified, now).await {
-        Ok((leaf_der, result)) => attestation_receipt(node, request, &leaf_der, &result, now)
+        Ok((leaf_der, result)) => attestation_receipt(node, request, &leaf_der, &result)
             .map(|receipt| (leaf_der, result, receipt)),
         Err(e) => Err(e),
     };
@@ -256,7 +256,6 @@ fn attestation_receipt(
     request: &AttestRequest,
     leaf_der: &[u8],
     result: &AttestationResult,
-    now: SystemTime,
 ) -> Result<Value, ApiError> {
     let request = json!({
         "runtime_pubkey": request.runtime_pubkey,
