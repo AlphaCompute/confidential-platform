@@ -12,11 +12,13 @@
         clippy::arithmetic_side_effects
     )
 )]
+pub mod attestation;
+pub mod decisions;
 pub mod platform;
 pub mod runtime;
 pub mod tls;
 
-use alpha_attest::{AttestationResult, InstanceEvidence};
+use alpha_attest::{AnyEvidence, AttestationResult, EVIDENCE_FORMAT, EventLogEntry, Evidence};
 use alpha_core::{
     AppId, ComposeHash, KeyId, OrgId, PrincipalId, SecretId, context, signing_digest,
 };
@@ -31,7 +33,6 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
-use std::time::Duration;
 
 pub use tls::{Identity, Pin};
 
@@ -166,7 +167,8 @@ pub struct Nonce {
 pub struct AttestRequest {
     pub runtime_pubkey: String,
     pub nonce: String,
-    pub evidence: InstanceEvidence,
+    /// `alphacompute-evidence/1` from the prototype CVM or `/2` from a Kata pod.
+    pub evidence: AnyEvidence,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -174,6 +176,10 @@ pub struct AttestReply {
     pub certificate_chain: Vec<String>,
     pub not_after: String,
     pub attestation_result: AttestationResult,
+    /// The KMS node's receipt over the request, the result and the leaf; see [`attestation`].
+    /// Absent from a KMS that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_receipt: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -235,10 +241,6 @@ pub struct KeyRegistered {
     /// learns whose root key holds its identifier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
-    /// A delegated key's kind (PRD-06 Q88): `member`, or `auditor` for a read-only key. A root
-    /// key registration does not name one; a root key is a member key.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<alpha_core::KeyKind>,
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipt: Option<Value>,
@@ -253,46 +255,25 @@ pub struct KeyRevoked {
     pub receipt: Option<Value>,
 }
 
-/// `GET /v1/node/evidence`: the node's evidence in the shape an Instance sends, beside
-/// `runtime_pubkey` (the P-256 SPKI DER) and its X-Wing key.
+/// `GET /v1/node/evidence`: the quote is base64url, `runtime_pubkey` the P-256 SPKI DER.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(try_from = "WireNodeEvidence")]
 pub struct NodeEvidence {
-    #[serde(flatten)]
-    pub evidence: InstanceEvidence,
+    pub quote: String,
+    pub event_log: Vec<EventLogEntry>,
     pub runtime_pubkey: String,
     pub xwing_pubkey: PublicKey,
     pub compose_hash: ComposeHash,
 }
 
-/// A node built before Kata nodes names no `format`; its evidence is dstack. Only this reply
-/// gets the default: `/v1/attest` and `join` bodies must name their format.
-#[derive(Deserialize)]
-struct WireNodeEvidence {
-    #[serde(flatten)]
-    evidence: serde_json::Map<String, Value>,
-    runtime_pubkey: String,
-    xwing_pubkey: PublicKey,
-    compose_hash: ComposeHash,
-}
-
-impl TryFrom<WireNodeEvidence> for NodeEvidence {
-    type Error = serde_json::Error;
-
-    fn try_from(mut wire: WireNodeEvidence) -> Result<Self, Self::Error> {
-        wire.evidence
-            .entry("format")
-            .or_insert_with(|| alpha_attest::EVIDENCE_FORMAT.into());
-        Ok(Self {
-            evidence: serde_json::from_value(Value::Object(wire.evidence))?,
-            runtime_pubkey: wire.runtime_pubkey,
-            xwing_pubkey: wire.xwing_pubkey,
-            compose_hash: wire.compose_hash,
+impl NodeEvidence {
+    pub fn evidence(&self) -> Result<Evidence, Error> {
+        Ok(Evidence {
+            format: EVIDENCE_FORMAT.into(),
+            quote: decode("quote", &self.quote)?,
+            event_log: self.event_log.clone(),
         })
     }
-}
 
-impl NodeEvidence {
     pub fn runtime_spki(&self) -> Result<Vec<u8>, Error> {
         decode("runtime_pubkey", &self.runtime_pubkey)
     }
@@ -326,9 +307,6 @@ pub struct BootstrapRequest {
 #[serde(deny_unknown_fields)]
 pub struct BootstrapBody {
     pub custodians: [PublicKey; 3],
-    /// The node login role's one-time genesis password; a Kata node takes it only from here.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub database_password: Option<String>,
 }
 
 /// The reply as received; `payload` is typed only after its signature has been checked.
@@ -390,7 +368,7 @@ pub struct UnsealReply {
 #[serde(deny_unknown_fields)]
 pub struct JoinRequest {
     pub nonce: String,
-    pub evidence: InstanceEvidence,
+    pub evidence: Evidence,
     pub xwing_pubkey: PublicKey,
 }
 
@@ -399,42 +377,6 @@ pub struct JoinReply {
     pub tenant_kek_root: String,
     pub ca_key: String,
     pub ca_cert: String,
-    /// The password a Kata peer reaches the database with; a Phala node sends none.
-    #[serde(default)]
-    pub database_password: Option<String>,
-}
-
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// Covers the slowest route: appraising evidence fetches PCS collateral through a PCCS whose
-/// cache may be cold, and a sealed node generates a quote to answer the evidence route.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-/// A KMS reply: the largest are a Kata node's evidence, which carries init-data of up to
-/// 1 MiB in base64, and a Secret, whose value came in under the KMS's 2 MiB request limit.
-const REPLY_CAP: usize = 4 << 20;
-
-/// Every HTTP client this crate builds: no connection or reply may hold a caller forever.
-pub fn http() -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-}
-
-/// A redirect would leave the pinned peer.
-fn pinned_http(config: rustls::ClientConfig) -> reqwest::ClientBuilder {
-    http()
-        .tls_backend_preconfigured(config)
-        .redirect(reqwest::redirect::Policy::none())
-}
-
-pub async fn read_capped(mut response: reqwest::Response, cap: usize) -> Result<Vec<u8>, String> {
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
-        if chunk.len() > cap.saturating_sub(body.len()) {
-            return Err(format!("reply over {cap} bytes"));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
 }
 
 pub struct Client {
@@ -466,7 +408,8 @@ impl Client {
         if endpoints.is_empty() {
             return Err(Error::Invalid("no endpoints".into()));
         }
-        let http = pinned_http(tls::client_config(Some(pin), identity, time)?)
+        let http = reqwest::Client::builder()
+            .tls_backend_preconfigured(tls::client_config(Some(pin), identity, time)?)
             .build()
             .map_err(|e| Error::Invalid(format!("http client: {e}")))?;
         Ok(Self {
@@ -478,8 +421,7 @@ impl Client {
         })
     }
 
-    /// Walks the endpoints: a connection failure, an unreadable reply or a 5xx moves to the next
-    /// one, a 4xx is final.
+    /// Walks the endpoints: a connection failure or a 5xx moves to the next one, a 4xx is final.
     async fn request<T: DeserializeOwned>(
         &self,
         method: Method,
@@ -502,13 +444,10 @@ impl Client {
                 }
             };
             let status = response.status();
-            let bytes = match read_capped(response, REPLY_CAP).await {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    last = Error::Connect(format!("{endpoint}: {e}"));
-                    continue;
-                }
-            };
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|e| Error::Connect(format!("{endpoint}: {e}")))?;
             if status.is_success() {
                 return serde_json::from_slice(&bytes)
                     .map_err(|e| Error::Invalid(format!("{method} {path}: reply: {e}")));
@@ -585,6 +524,12 @@ impl Client {
         self.post(&format!("/v1/keys/{key_id}/revoke"), body).await
     }
 
+    /// The organization's own decisions, as the KMS answered them; check the answer with
+    /// [`decisions::verify`].
+    pub async fn export_decisions(&self, body: &Signed) -> Result<Value, Error> {
+        self.post("/v1/decisions/export", body).await
+    }
+
     // Node API; the evidence route is [`fetch_node_evidence`], the pin comes from its reply.
 
     pub async fn bootstrap(&self, body: &BootstrapRequest) -> Result<BootstrapReply, Error> {
@@ -616,46 +561,38 @@ pub enum Probe {
 }
 
 /// One attempt, with its own short timeout; the deadline over many attempts is the caller's.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Handshake with `url`, pinning the chain to the KMS CA and reading the Revision out of the
-/// leaf.
+/// leaf. Any HTTP answer means the handshake completed, so the status is not looked at.
 pub async fn probe_instance(
     url: &str,
     kms_ca_pem: &str,
     expected: &ComposeHash,
     time: TimeProvider,
 ) -> Result<Probe, Error> {
-    Ok(match instance_leaf(url, kms_ca_pem, time).await? {
-        Err(why) => Probe::Silent(why),
-        Ok(sans) if sans.compose_hash == *expected => Probe::Attested(sans),
-        Ok(sans) => Probe::OtherRevision(sans),
-    })
-}
-
-/// The SANs of the Instance leaf `url` presents under the KMS CA pin, or why no handshake
-/// completed. Any HTTP answer means the handshake completed, so the status is not looked at.
-pub async fn instance_leaf(
-    url: &str,
-    kms_ca_pem: &str,
-    time: TimeProvider,
-) -> Result<Result<tls::InstanceSans, String>, Error> {
     let ca = tls::cert_from_pem(kms_ca_pem)?;
-    let http = pinned_http(tls::client_config(Some(Pin::Ca(ca)), None, time)?)
+    let http = reqwest::Client::builder()
+        .tls_backend_preconfigured(tls::client_config(Some(Pin::Ca(ca)), None, time)?)
         .tls_info(true)
         .timeout(PROBE_TIMEOUT)
         .build()
         .map_err(|e| Error::Invalid(format!("http client: {e}")))?;
     let response = match http.get(url).send().await {
         Ok(response) => response,
-        Err(e) => return Ok(Err(format!("{url}: {e}"))),
+        Err(e) => return Ok(Probe::Silent(format!("{url}: {e}"))),
     };
     let leaf = response
         .extensions()
         .get::<reqwest::tls::TlsInfo>()
         .and_then(|info| info.peer_certificate().map(<[u8]>::to_vec))
         .ok_or_else(|| Error::Invalid("no server certificate on the connection".into()))?;
-    Ok(Ok(tls::parse_instance_sans(&tls::uri_sans(&leaf)?)?))
+    let sans = tls::parse_instance_sans(&tls::uri_sans(&leaf)?)?;
+    Ok(if sans.compose_hash == *expected {
+        Probe::Attested(sans)
+    } else {
+        Probe::OtherRevision(sans)
+    })
 }
 
 /// A sealed node's evidence over an unpinned connection, together with the SPKI the server
@@ -666,7 +603,8 @@ pub async fn fetch_node_evidence(
     nonce: &[u8; 32],
 ) -> Result<(NodeEvidence, Vec<u8>), Error> {
     let endpoint = endpoint.trim_end_matches('/');
-    let http = pinned_http(tls::client_config(None, None, system_time_provider())?)
+    let http = reqwest::Client::builder()
+        .tls_backend_preconfigured(tls::client_config(None, None, system_time_provider())?)
         .tls_info(true)
         .build()
         .map_err(|e| Error::Invalid(format!("http client: {e}")))?;
@@ -685,7 +623,8 @@ pub async fn fetch_node_evidence(
         .ok_or_else(|| Error::Invalid("no server certificate on the connection".into()))?;
     let spki = tls::spki_of(&leaf)?;
     let status = response.status();
-    let bytes = read_capped(response, REPLY_CAP)
+    let bytes = response
+        .bytes()
         .await
         .map_err(|e| Error::Connect(format!("{endpoint}: {e}")))?;
     if !status.is_success() {

@@ -19,6 +19,14 @@ use crate::{
     ECDSA_P256, Error, NamedSignature, from_unix_seconds, p256_signature, rfc3339, sha256_label,
 };
 
+/// The route name a KMS signs an attestation under: its `POST /v1/attest` reply's
+/// `attestation_receipt`, over the attest request, the attestation result and the leaf.
+pub const ATTEST_ROUTE: &str = "attest";
+
+/// The route name a KMS signs an organization's export of its own decisions under:
+/// `POST /v1/decisions/export` (PRD-06, evidence to the customer).
+pub const DECISIONS_EXPORT_ROUTE: &str = "decisions.export";
+
 /// `{document, signature, certificate_chain}`; the chain is the node's leaf only, because every
 /// verifier pins its own KMS CA.
 #[derive(Clone, Debug, Serialize, Deserialize)]

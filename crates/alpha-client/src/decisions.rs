@@ -1,5 +1,5 @@
 //! Checking an organization's export of the KMS's decisions about it (PRD-06, evidence to the
-//! customer). The KMS answers `POST /v1/decisions/export` with the rows, the request it
+//! customer; draft). The KMS answers `POST /v1/decisions/export` with the rows, the request it
 //! answered, and a node receipt over both, so the answer alone can be checked offline by anyone
 //! pinning the KMS CA and Revisions from the platform document — the customer's auditor included.
 

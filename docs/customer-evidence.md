@@ -60,10 +60,10 @@ alpha evidence verify-decisions --platform platform.signed.json decisions-0.json
 
 - **Completeness.** The receipt proves these rows came from the KMS, not that no row was left
   out. That needs the hash-chained audit log (#95, PRD-05) and the chain position in the
-  receipt (Q89).
+  receipt (Q3).
 - **Refusals the KMS could not attribute.** A failed attestation, or a Control call with a bad
   signature, is recorded with no organization, because the KMS never learned whose it was. Such
-  a row is in no organization's export (Q89).
+  a row is in no organization's export (Q4).
 - **Fortanix's decisions.** DSM's release of a customer key to an Instance (I1) is decided and
   logged by the customer's DSM. The KMS never sees it.
 
@@ -83,26 +83,24 @@ alpha evidence verify-decisions --platform platform.signed.json decisions-0.json
 
 ## Open questions
 
-Numbered program-wide; the same numbers are in `QUESTION(PRD-06 Qn)` in the code and in the draft PR.
+The numbers match `QUESTION(PRD-06 Qn)` in the code and the draft PR.
 
-- **Q87 (Ryan Tharp)** Which audit actions count as decisions. Today: `attest`, `secret.get`,
-  `key.derive` and the exports. Proposed: add the organization's own Control rows
-  (`revision.register`, `revision.revoke`, `secret.put`, `key.register`, `key.revoke`) in a
-  follow-up, because they show who approved what.
-- **Q88 (Ryan Tharp)** Who may export. Today: any active key of the organization. Proposed: a
-  read-only auditor key kind before the pilot. The customer's auditor would then hold no key that
-  can register a Revision or put a Secret.
-- **Q89 (Ryan Tharp)** What the export cannot prove: completeness and unattributed refusals.
-  - Completeness. Proposed: once the chained audit log (#95) lands, the answer carries each row's
-    chain hash and the receipt names the chain head, so a verifier can check that consecutive
-    exports join with no gap.
-  - Unattributed refusals. Proposed: accept for the pilot and document it. Attributing a refused
-    attestation to the organization its evidence *claims* would let anyone write rows into
-    another organization's record.
-- **Q90 (Fortanix, F5 and F8)** The Fortanix side's records:
-  - What do CCM and DSM expose natively to the customer?
-  - Can a CCM attestation record be verified offline?
-  - Do DSM's key-release log and CCM's record name something an auditor can match to the KMS's
-    `attest` row (leaf DNS name or serial, evidence digest, nonce)?
-- **Q91 (Christopher Freytes)** Whether the Rafay portal should show the export to the customer.
-  Proposed: CLI and API for the pilot; a portal view after it.
+1. **Q1 (Ryan Tharp)** Which audit actions count as decisions. Today: `attest`, `secret.get`,
+   `key.derive` and the exports. Proposed: add the organization's own Control rows
+   (`revision.register`, `revision.revoke`, `secret.put`, `key.register`, `key.revoke`) in a
+   follow-up, because they show who approved what.
+2. **Q2 (Ryan Tharp)** Who may export. Today: any active key of the organization. Proposed: a
+   read-only auditor key kind before the pilot. The customer's auditor would then hold no key that
+   can register a Revision or put a Secret.
+3. **Q3 (Ryan Tharp)** Completeness. Proposed: once the chained audit log (#95) lands, the answer
+   carries each row's chain hash and the receipt names the chain head, so a verifier can check
+   that consecutive exports join with no gap.
+4. **Q4 (Ryan Tharp)** Unattributed refusals. Proposed: accept for the pilot and say so in the
+   export's documentation. Attributing a refused attestation to the organization its evidence
+   *claims* would let anyone write rows into another organization's record.
+5. **Q5 (Fortanix, F5)** What CCM and DSM expose natively to the customer, and whether a CCM
+   attestation record can be verified offline.
+6. **Q6 (Fortanix, F5 and F8)** Whether DSM's key-release log and CCM's record name something an
+   auditor can match to the KMS's `attest` row (leaf DNS name or serial, evidence digest, nonce).
+7. **Q7 (Christopher Freytes)** Whether the Rafay portal should show the export to the customer.
+   Proposed: CLI and API for the pilot; a portal view after it.
