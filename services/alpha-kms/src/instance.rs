@@ -187,17 +187,10 @@ pub async fn attest(
 /// [`attest`] for `alphacompute-evidence/2` over a TDX quote the caller has verified: every step
 /// after DCAP, the audit row included. No route reaches it. The KMS's tests run the Kata pod's
 /// cases through it over synthetic quotes, as `alpha_attest::kata` tests its profile, until B300
-/// Kata captures exist (M1).
+/// Kata captures exist (M1). It exists only with the `test-seams` feature, which the crate's own
+/// tests turn on; a production build has no way to skip DCAP.
 #[cfg(feature = "test-seams")]
 pub async fn attest_verified(
-    node: &Node,
-    request: &AttestRequest,
-    verified: VerifiedQuote,
-) -> Result<Value, ApiError> {
-    attest_audited(node, request, Some(verified)).await
-}
-#[cfg(not(feature = "test-seams"))]
-pub(crate) async fn attest_verified(
     node: &Node,
     request: &AttestRequest,
     verified: VerifiedQuote,
@@ -253,7 +246,7 @@ async fn attest_audited(
 }
 
 /// The leaf's DER and the result behind it. A Kata pod's quote is DCAP-verified here unless the
-/// caller of [`attest_verified`] has done so.
+/// caller of `attest_verified` (test builds only) has done so.
 async fn attest_inner(
     node: &Node,
     spki: &[u8],

@@ -302,12 +302,6 @@ async fn a_gpu_pod_whose_gpu_nonce_does_not_match_is_refused() {
     pod2.register(&h2, &admin2).await;
 
     pod2.gpus[0].nonce = Some([0xff; 32]);
-    refused(
-        &h2,
-        pod2.attest(&h2).await,
-        "attestation_failed",
-        "nonce",
-    )
-    .await;
+    refused(&h2, pod2.attest(&h2).await, "attestation_failed", "nonce").await;
     assert_eq!(strict_gpu.calls(), 1);
 }

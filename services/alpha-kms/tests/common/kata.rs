@@ -60,11 +60,12 @@ pub fn initdata(app: AppId, class: &str, gpus: Option<u32>, policy: &str) -> Str
             model: "B300".into(),
         }),
     };
-    let alpha_json = String::from_utf8(
-        alpha_core::jcs(&serde_json::to_value(&entry).unwrap()).unwrap(),
+    let alpha_json =
+        String::from_utf8(alpha_core::jcs(&serde_json::to_value(&entry).unwrap()).unwrap())
+            .unwrap();
+    format!(
+        "algorithm = \"sha384\"\nversion = \"0.1.0\"\n\n[data]\n\"policy.rego\" = '''\n{policy}'''\n\"alpha.json\" = '''{alpha_json}'''\n"
     )
-    .unwrap();
-    format!("algorithm = \"sha384\"\nversion = \"0.1.0\"\n\n[data]\n\"policy.rego\" = '''\n{policy}'''\n\"alpha.json\" = '''{alpha_json}'''\n")
 }
 
 /// A `kata-tdx` reference value for `class`'s guest image.
