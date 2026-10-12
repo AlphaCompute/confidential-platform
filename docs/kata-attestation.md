@@ -2,7 +2,7 @@
 
 How `alpha-kms` decides to issue a Revision leaf to a Kata confidential pod on TDX, CPU-only or with NVIDIA confidential GPUs (PRD-02). Clients see no change: the leaf, its one-hour lifetime and its SANs (`urn:alphacompute:revision:sha256:<hash>`) are what they were. The prototype profile (`alphacompute-evidence/1`) is unchanged and both coexist.
 
-> **Status: the KMS does not run this profile yet.** This document describes the appraisal in `alpha_attest` (`appraise_any`, `kata`, `gpu`) and the behaviour the KMS will have once it is wired in (PRD-02 PR 5, not written yet). Today `alpha-kms` still accepts only `alphacompute-evidence/1` and calls the prototype `appraise` (`services/alpha-kms/src/instance.rs`), so a Kata pod's evidence v2 is refused and no Kata pod gets a leaf. Sentences marked *(PR 5)* describe KMS behaviour that is pending.
+`POST /v1/attest` takes either evidence format (`services/alpha-kms/src/instance.rs`): `alphacompute-evidence/1` goes to the prototype `appraise`, `alphacompute-evidence/2` to `kata-tdx/1` in `alpha_attest` (`kata`, `gpu`) and then to the KMS's own checks below. Any other format is `malformed`.
 
 ## Identity: init-data and the Revision v2
 
@@ -21,7 +21,7 @@ The Revision v2 is then a pure function of the init-data bytes:
  "initdata_sha256":"sha256:<hex>","policy_sha256":"sha256:<hex>","runtime_class":"kata-qemu-nvidia-gpu-tdx"}
 ```
 
-It is registered in its JCS form, signed by the org key or a passkey exactly like a compose (context `alphacompute/revision/v1`, document `{app_id, compose}` with the Revision v2 text as `compose`), and its hash is SHA-256 over those bytes. *(PR 5)* The KMS rebuilds it from the verified init-data and looks the hash up in the same `revisions` table.
+It is registered in its JCS form, signed by the org key or a passkey exactly like a compose (context `alphacompute/revision/v1`, document `{app_id, compose}` with the Revision v2 text as `compose`), and its hash is SHA-256 over those bytes. The KMS rebuilds it from the verified init-data and looks the hash up in the same `revisions` table.
 
 ### Runtime classes
 
@@ -55,7 +55,7 @@ Any other class is refused at registration and at appraisal (`kata-qemu-nvidia-g
 
 `event_log` (the CCEL boot events) is optional; when sent, RTMR0..2 must replay from it. `runtime_class` is the pod's own claim: a class no Revision v2 may name is refused, and any other claim is refused unless it equals the measured init-data's. `kind: "snp"` is refused until the `kata-snp/1` profile exists.
 
-A pod on `kata-qemu-tdx` sends no GPU evidence (`gpus` empty or absent). If it sends any, the appraisal refuses it once the TD checks have passed, without calling a GPU backend, and it refuses a GPU that a backend verified for such a pod the same way: GPU evidence from a CPU pod is refused, never ignored. *(PR 5)* The KMS will refuse it through `appraise_any`.
+A pod on `kata-qemu-tdx` sends no GPU evidence (`gpus` empty or absent). If it sends any, the appraisal refuses it once the TD checks have passed, without calling a GPU backend, and it refuses a GPU that a backend verified for such a pod the same way: GPU evidence from a CPU pod is refused, never ignored. The KMS refuses it the same way.
 
 The quote's `report_data` binds the runtime key and the KMS nonce exactly as for the prototype (`SHA-256(SPKI ‖ nonce)`, then `SHA-256(xwing)` or zeros). Two encodings are accepted: the 64 bytes themselves (configfs-tsm), or the 64 ASCII bytes of lowercase hex `SHA-256(report_data)`, which is how runtime data passes through the CoCo attestation agent's REST API. Both need the same preimage.
 
@@ -80,7 +80,13 @@ In the plan's order (PRD-02 R5). Every step is mandatory; the order only decides
     - `kata-qemu-nvidia-gpu-tdx`: the evidence has exactly `gpu.count` (1 or 8) entries; every backend the `gpu_policy` lists verified every one of them, over this nonce, in CC mode, of the Revision's model, an allowed model, at or above the minimum driver and VBIOS versions. A failure in any backend fails the attestation. The backends (NRAS is a network call) run only after steps 1 to 9 have passed and after the checks that need no backend (a `gpu_policy` exists, lists a verifier and allows the model, one evidence entry per GPU), so evidence that fails earlier costs no verifier call (`alpha_attest::appraise_any`).
     - `kata-qemu-tdx`: no GPU evidence, and no GPU verified by any backend. No backend is called and `gpu_policy` is not consulted, so a document without one still attests CPU pods. This is the only class whose GPU checks are skipped.
 
-*(PR 5)* The KMS then requires the Revision to be registered, unrevoked and validly signed, as today, and refuses a Revision v2 reached through evidence v1 or the reverse. Every refusal is an audit row with its reason. None of this is wired yet: `appraise_any` returns the reasons, but nothing in `alpha-kms` calls it.
+The KMS then requires, after `kata::appraise_kata_tdx` (steps 1 to 10, GPU backends included):
+
+11. The Revision v2 hash is registered. If not, the refusal (`attestation_unknown`) names the init-data's policy digest, so a policy edited after registration is identified as such.
+12. The Revision is unrevoked and validly signed by its organization's key or passkey, as for a compose (`revision_revoked`, `signature_invalid`).
+13. A Revision v2 is attested only through evidence v2 and a compose only through evidence v1, so a prototype CVM whose `app-compose` were a Revision v2's bytes gets no leaf for it. The registered Revision v2's runtime class, init-data and policy digests are the appraised ones, and the GPUs verified are exactly its count, every one of its model (`attestation_failed`; the hash already binds these, so this holds the leaf to the stored row as well).
+
+The leaf is then issued as for a compose: the same one-hour lifetime and the SAN `urn:alphacompute:revision:sha256:<hash>`. Every attestation writes one `attest` audit row with the SHA-256 of the evidence: on success the attestation result (its `coco` included), on a refusal `{"code", "message"}` with the reason the first failing step names. The KMS's tests (`services/alpha-kms/tests/kata.rs`) run these steps over synthetic quotes through `instance::attest_verified`, which no route reaches, until B300 Kata captures exist at M1; the route itself always runs DCAP first.
 
 ## What the result records
 
@@ -116,6 +122,8 @@ The document, its `policy`, its reference values and `gpu_policy` refuse fields 
 - `nras` (`alpha_attest::gpu::nras`): posts every GPU's report and certificate chain with the nonce, verifies the overall EAT and each per-GPU EAT (ES384 under the key `gpu_policy.nras_keys` pins for the token's `kid`, issuer = `nras_url`, unexpired), ties each per-GPU token to the overall token's `submods` digest, and requires the overall result and the nonce. For every GPU it requires, by name (NVIDIA's GPU claims version 3.0, listed in `nras::claims::REQUIRED`): `measres: success`, secure boot, debug disabled, the architecture check, the report parsed, its signature verified, its nonce matching and its FWID matching the certificate chain; for the attestation report's, the driver RIM's and the VBIOS RIM's certificate chains, `x-nvidia-cert-status: valid` and `x-nvidia-cert-ocsp-status: good` (and the OCSP nonce and response checks true when sent), so a revoked GPU or RIM certificate is refused by this backend whatever NRAS's overall result says; the driver and VBIOS RIM signatures and version matches; the `ueid`, `hwmodel`, driver and VBIOS versions; and the CC-mode claim that `gpu_policy.nras_cc_mode` names. Any missing claim refuses. A call NRAS does not answer (no connection, a timeout, `429`, `408` or a `5xx`) is retried with a doubling backoff and jitter, three calls within 40 s by default (`nras::Retry`), then the attestation fails closed (Q12); an answer NRAS gave is never retried.
 - `fortanix-ccm` (`alpha_attest::gpu::ccm`): configured like any backend and refuses every GPU until Fortanix answers F8 with an API.
 - `local`: after Dec 1.
+
+`alpha-kms` always runs the `nras` backend and runs `fortanix-ccm` when `ALPHACOMPUTE_FORTANIX_CCM_URL` names an `https://` endpoint (`alpha_kms::gpu_backends`). A backend the `gpu_policy` lists that the node does not run (`local`, or `fortanix-ccm` without its URL) refuses every GPU pod with `gpu verifier … is not configured`.
 
 ## G0 check: NRAS claim names on a B300
 

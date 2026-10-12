@@ -183,7 +183,9 @@ pub async fn appraise_any(
     }
 }
 
-fn check_cpu_kind(evidence: &EvidenceV2) -> Result<(), AppraisalError> {
+/// The format and CPU kind `kata-tdx/1` appraises: refused before any collateral is fetched or
+/// quote verified, so SEV-SNP evidence is named for what it is.
+pub fn check_cpu_kind(evidence: &EvidenceV2) -> Result<(), AppraisalError> {
     if evidence.format != EVIDENCE_FORMAT_V2 {
         return Err(AppraisalError::Unknown(format!(
             "evidence format {:?}",
