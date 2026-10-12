@@ -18,6 +18,10 @@ pub mod context {
     pub const CONNECTOR_WRITE: &str = "alphacompute/connector-write/v1";
     pub const KMS_RECEIPT: &str = "alphacompute/kms-receipt/v1";
     pub const CATALOG: &str = "alphacompute/catalog/v1";
+    /// An organization allow-listing a Fortanix CCM identity (PRD-06 I5).
+    pub const CCM_IDENTITY: &str = "alphacompute/ccm-identity/v1";
+    /// A CCM-attested workload proving it holds its CCM certificate's key (PRD-06 I5).
+    pub const CCM_POSSESSION: &str = "alphacompute/ccm-possession/v1";
 }
 
 pub fn jcs(document: &Value) -> serde_json::Result<Vec<u8>> {

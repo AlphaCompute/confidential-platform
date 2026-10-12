@@ -29,13 +29,17 @@ Every attestation result now carries `verifiers` (`alpha_attest::Verifiers`,
   must verify every GPU (see `kata-attestation.md`, "GPU backends"). `token_sha256` is the digest
   of the signed result that backend verified. The list is empty, and omitted, for a pod without
   GPUs.
+- `composite`: a verifier that attested the whole workload on its own. Only a Fortanix
+  CCM-attested identity's leaf has one (PRD-06 I5, `fortanix-ccm-identities.md`). It is
+  `{"verifier": "fortanix-ccm", "zone_ca_spki_sha256", "certificate_sha256"}`, and `cpu` and
+  `gpu` are then empty, because alpha-kms appraised no evidence itself.
 - `attested_by`: every party whose verifier appraised some of the evidence, once each, in the
   order `alpha`, `nvidia`, `fortanix`:
   - `alpha`: alpha-kms (CPU, and the `local` GPU verifier after Dec 1);
   - `nvidia`: NVIDIA's hosted NRAS vouched for the GPUs, and alpha-kms applied policy to its
     signed verdict;
-  - `fortanix`: Fortanix CCM vouched for the GPUs (D1's `fortanix-ccm` backend, which fails closed
-    until F8).
+  - `fortanix`: Fortanix CCM vouched for the GPUs (D1's `fortanix-ccm` backend, which fails
+    closed until F8), or for the whole workload (`composite`, I5).
 
   "Alpha, Fortanix, or both" reads off `attested_by`. NVIDIA is named as well, because its
   verdict comes from a third party.

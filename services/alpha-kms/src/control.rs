@@ -780,3 +780,191 @@ mod tests {
         assert_eq!(e.code, "malformed");
     }
 }
+
+/// What an organization signs to allow-list a Fortanix CCM identity (PRD-06 I5).
+#[derive(Clone, Debug, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CcmIdentityPayload {
+    /// A label for the organization's own records, with the key-purpose rules.
+    pub name: String,
+    /// `sha256:<hex>` of the CCM zone Root CA's SubjectPublicKeyInfo; the zone must also be
+    /// pinned in the platform document for any leaf to be issued.
+    pub zone_ca_spki_sha256: String,
+    /// The attested application as CCM's certificate names it (`alpha_attest::ccm::ccm_identity`).
+    pub identity: String,
+}
+
+/// The longest CCM identity accepted; the format is Fortanix's (F5).
+const CCM_IDENTITY_MAX: usize = 512;
+
+pub fn check_ccm_identity_payload(p: &CcmIdentityPayload) -> Result<[u8; 32], ApiError> {
+    if !alpha_core::is_key_purpose(&p.name) {
+        return Err(ApiError::malformed(
+            "name: 1 to 64 of a-z, 0-9, '.', '_', '-', starting with a letter or digit",
+        ));
+    }
+    if p.identity.is_empty()
+        || p.identity.len() > CCM_IDENTITY_MAX
+        || !p
+            .identity
+            .bytes()
+            .all(|b| b.is_ascii_graphic() || b == b' ')
+    {
+        return Err(ApiError::malformed(format!(
+            "identity: 1 to {CCM_IDENTITY_MAX} printable ASCII characters"
+        )));
+    }
+    p.zone_ca_spki_sha256
+        .strip_prefix("sha256:")
+        .and_then(alpha_core::hex_bytes::<32>)
+        .ok_or_else(|| ApiError::malformed("zone_ca_spki_sha256: expected sha256:<64 hex>"))
+}
+
+fn ccm_identity_json(
+    id: Uuid,
+    org_id: Uuid,
+    p: &CcmIdentityPayload,
+    created_at: DateTime<Utc>,
+    revoked_at: Option<DateTime<Utc>>,
+) -> Value {
+    let mut out = json!({
+        "id": id,
+        "org_id": org_id,
+        "name": p.name,
+        "zone_ca_spki_sha256": p.zone_ca_spki_sha256,
+        "identity": p.identity,
+        "created_at": rfc3339(created_at),
+    });
+    if let (Some(t), Some(fields)) = (revoked_at, out.as_object_mut()) {
+        fields.insert("revoked_at".into(), json!(rfc3339(t)));
+    }
+    out
+}
+
+/// `POST /v1/ccm-identities`: the organization of the signing key allow-lists one CCM identity in
+/// one zone. Idempotent per (organization, zone, identity); registering a revoked one again
+/// returns it revoked.
+pub async fn register_ccm_identity(
+    State(node): State<Arc<Node>>,
+    Body(body, request): Body<Signed>,
+) -> Result<Json<Value>, ApiError> {
+    audited_route!(node, body, request, "ccm_identity.register", async {
+        let keys = node.intermediates()?;
+        let p: CcmIdentityPayload = payload(&body.payload)?;
+        let zone = check_ccm_identity_payload(&p)?;
+        let chain = authorize(&node, &keys, context::CCM_IDENTITY, &body, node.now_utc()).await?;
+        let org_id = chain.key.org_id;
+        let mut tx = node.pool.begin().await?;
+        sqlx::query!(
+            "select pg_advisory_xact_lock(hashtext($1))",
+            format!("ccm:{org_id}")
+        )
+        .execute(&mut *tx)
+        .await?;
+        if let Some(existing) = sqlx::query!(
+            "select id, name, created_at, revoked_at from ccm_identities
+             where org_id = $1 and zone_ca_spki_sha256 = $2 and identity = $3",
+            org_id,
+            zone.as_slice(),
+            p.identity,
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            let stored = CcmIdentityPayload {
+                name: existing.name,
+                ..p
+            };
+            return Ok(ccm_identity_json(
+                existing.id,
+                org_id,
+                &stored,
+                existing.created_at,
+                existing.revoked_at,
+            ));
+        }
+        let id = Uuid::now_v7();
+        let created_at = sqlx::query_scalar!(
+            "insert into ccm_identities
+               (id, org_id, name, zone_ca_spki_sha256, identity, document, created_by_key, signature)
+             values ($1, $2, $3, $4, $5, $6, $7, $8) returning created_at",
+            id,
+            org_id,
+            p.name,
+            zone.as_slice(),
+            p.identity,
+            body.payload,
+            chain.key.id,
+            json!(body.signature),
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        audited(
+            &mut tx,
+            &chain,
+            "ccm_identity.register",
+            format!("ccm_identity:{id}"),
+            json!({ "zone_ca_spki_sha256": p.zone_ca_spki_sha256, "identity": p.identity }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(ccm_identity_json(id, org_id, &p, created_at, None))
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevokeCcmIdentityPayload {
+    id: Uuid,
+    issued_at: DateTime<Utc>,
+}
+
+/// `POST /v1/ccm-identities/{id}/revoke`: no leaf is issued for it afterwards. A leaf already
+/// issued runs out within its hour.
+pub async fn revoke_ccm_identity(
+    State(node): State<Arc<Node>>,
+    Path(path_id): Path<String>,
+    Body(body, request): Body<Signed>,
+) -> Result<Json<Value>, ApiError> {
+    audited_route!(node, body, request, "ccm_identity.revoke", async {
+        let keys = node.intermediates()?;
+        let p: RevokeCcmIdentityPayload = payload(&body.payload)?;
+        if path_id != p.id.to_string() {
+            return Err(ApiError::malformed("path and payload id differ"));
+        }
+        let at = within_window(p.issued_at, node.now_utc())?;
+        let chain = authorize(&node, &keys, context::CONTROL, &body, at).await?;
+        let mut tx = node.pool.begin().await?;
+        let row = sqlx::query!(
+            "select revoked_at from ccm_identities where id = $1 and org_id = $2",
+            p.id,
+            chain.key.org_id,
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| ApiError::not_found("no such ccm identity"))?;
+        let revoked_at = match row.revoked_at {
+            Some(t) => t,
+            None => {
+                let t = sqlx::query_scalar!(
+                    "update ccm_identities set revoked_at = now() where id = $1 returning revoked_at",
+                    p.id
+                )
+                .fetch_one(&mut *tx)
+                .await?
+                .ok_or_else(|| ApiError::internal("revoked_at was not set"))?;
+                audited(
+                    &mut tx,
+                    &chain,
+                    "ccm_identity.revoke",
+                    format!("ccm_identity:{}", p.id),
+                    json!({}),
+                )
+                .await?;
+                t
+            }
+        };
+        tx.commit().await?;
+        Ok(json!({ "id": p.id, "revoked_at": rfc3339(revoked_at) }))
+    })
+}

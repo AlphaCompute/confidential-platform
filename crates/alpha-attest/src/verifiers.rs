@@ -46,6 +46,31 @@ impl GpuVerifierKind {
     }
 }
 
+/// A verifier that appraised the whole workload (CPU and GPU together) on its own, rather than
+/// alpha-kms appraising the evidence: Fortanix CCM's composite attestation (PRD-06 I5).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompositeVerifierKind {
+    FortanixCcm,
+}
+
+impl CompositeVerifierKind {
+    pub fn party(self) -> Party {
+        match self {
+            Self::FortanixCcm => Party::Fortanix,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompositeVouch {
+    pub verifier: CompositeVerifierKind,
+    /// `sha256:<hex>` of the pinned zone Root CA's SubjectPublicKeyInfo.
+    pub zone_ca_spki_sha256: String,
+    /// `sha256:<hex>` of the certificate CCM issued the workload.
+    pub certificate_sha256: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CpuVouch {
     pub verifier: CpuVerifierKind,
@@ -65,6 +90,10 @@ pub struct Verifiers {
     /// pod without GPUs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gpu: Vec<GpuVouch>,
+    /// A verifier that attested the whole workload itself; alpha-kms then appraised no evidence,
+    /// and `cpu` and `gpu` are empty. Only a CCM-attested identity's leaf has one (PRD-06 I5).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub composite: Vec<CompositeVouch>,
 }
 
 impl Verifiers {
@@ -90,10 +119,32 @@ impl Verifiers {
     }
 
     pub fn new(cpu: Vec<CpuVouch>, gpu: Vec<GpuVouch>) -> Self {
+        Self::with_composite(cpu, gpu, Vec::new())
+    }
+
+    /// A CCM-attested workload: Fortanix alone vouched for it (PRD-06 I5).
+    pub fn of_ccm(appraised: &crate::ccm::CcmAppraised) -> Self {
+        Self::with_composite(
+            Vec::new(),
+            Vec::new(),
+            vec![CompositeVouch {
+                verifier: CompositeVerifierKind::FortanixCcm,
+                zone_ca_spki_sha256: appraised.zone_ca_spki_sha256.clone(),
+                certificate_sha256: appraised.certificate_sha256.clone(),
+            }],
+        )
+    }
+
+    fn with_composite(
+        cpu: Vec<CpuVouch>,
+        gpu: Vec<GpuVouch>,
+        composite: Vec<CompositeVouch>,
+    ) -> Self {
         let mut attested_by: Vec<Party> = cpu
             .iter()
             .map(|c| c.verifier.party())
             .chain(gpu.iter().map(|g| g.verifier.party()))
+            .chain(composite.iter().map(|c| c.verifier.party()))
             .collect();
         attested_by.sort();
         attested_by.dedup();
@@ -102,6 +153,7 @@ impl Verifiers {
             attested_by,
             cpu,
             gpu,
+            composite,
         }
     }
 
@@ -190,6 +242,25 @@ mod tests {
 
         let local = Verifiers::of(&appraised(Some(pod(vec![vouch(GpuVerifierKind::Local)]))));
         assert_eq!(local.attested_by, [Party::Alpha]);
+
+        let ccm = Verifiers::of_ccm(&crate::ccm::CcmAppraised {
+            zone_ca_spki_sha256: format!("sha256:{}", "11".repeat(32)),
+            identity: "app".into(),
+            certificate_sha256: format!("sha256:{}", "22".repeat(32)),
+        });
+        assert_eq!(
+            json!(ccm),
+            json!({
+                "format": "alphacompute-verifiers/1",
+                "attested_by": ["fortanix"],
+                "cpu": [],
+                "composite": [{
+                    "verifier": "fortanix-ccm",
+                    "zone_ca_spki_sha256": format!("sha256:{}", "11".repeat(32)),
+                    "certificate_sha256": format!("sha256:{}", "22".repeat(32)),
+                }],
+            })
+        );
     }
 
     #[test]

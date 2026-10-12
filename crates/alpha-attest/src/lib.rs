@@ -15,6 +15,7 @@
     )
 )]
 
+pub mod ccm;
 mod event_log;
 pub mod gpu;
 pub mod kata;
@@ -40,7 +41,9 @@ pub use gpu::{
     VerifiedGpu,
 };
 pub use kata::{AnyEvidence, CocoAppraised, CpuEvidence, CpuKind, EvidenceV2, appraise_any};
-pub use verifiers::{CpuVerifierKind, CpuVouch, Party, Verifiers};
+pub use verifiers::{
+    CompositeVerifierKind, CompositeVouch, CpuVerifierKind, CpuVouch, Party, Verifiers,
+};
 
 pub const EVIDENCE_FORMAT: &str = "alphacompute-evidence/1";
 pub const EVIDENCE_FORMAT_V2: &str = "alphacompute-evidence/2";
@@ -152,6 +155,10 @@ pub struct PlatformDocument {
     /// on the GPU runtime class can attest; pods on the CPU class never need it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_policy: Option<GpuPolicy>,
+    /// The Fortanix CCM zones whose attestations alpha-kms accepts as evidence (PRD-06 I5).
+    /// Absent, every CCM evidence is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fortanix_ccm: Option<ccm::CcmPolicy>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -467,6 +474,14 @@ fn check_policy(
         return Err(PolicyDenied("debug TD".into()));
     }
     Ok(())
+}
+
+/// The SubjectPublicKeyInfo DER of a certificate.
+pub fn spki_of(cert_der: &[u8]) -> Result<Vec<u8>, String> {
+    use x509_parser::prelude::{FromDer, X509Certificate};
+    X509Certificate::from_der(cert_der)
+        .map(|(_, cert)| cert.public_key().raw.to_vec())
+        .map_err(|e| format!("certificate: {e}"))
 }
 
 /// The one I/O in the crate: DCAP collateral for `quote` from a PCCS.
