@@ -23,6 +23,10 @@ use crate::{
 /// `attestation_receipt`, over the attest request, the attestation result and the leaf.
 pub const ATTEST_ROUTE: &str = "attest";
 
+/// The route name a KMS signs an organization's export of its own decisions under:
+/// `POST /v1/decisions/export` (PRD-06, evidence to the customer).
+pub const DECISIONS_EXPORT_ROUTE: &str = "decisions.export";
+
 /// `{document, signature, certificate_chain}`; the chain is the node's leaf only, because every
 /// verifier pins its own KMS CA.
 #[derive(Clone, Debug, Serialize, Deserialize)]
