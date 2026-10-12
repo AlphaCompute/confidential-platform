@@ -195,6 +195,10 @@ enum Command {
         #[arg(long)]
         endpoint: String,
     },
+    /// What an App's (or a KMS node's) Endpoint proves: its leaf against the platform document's
+    /// KMS CA, the Revision it names, and the CPU and GPU appraisal behind it. Exits 1 unless
+    /// every check passes.
+    Verify(alpha_cli::verify::Args),
     /// Genesis on an empty database: three custodian public keys.
     Bootstrap {
         /// Three files, each holding a custodian's public key as `keygen --custodian` printed it.
@@ -615,6 +619,15 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let reply = node::unseal(&client, &identity, &share, &custodian, doc.version).await?;
             Ok(json!(reply))
         }
+        Command::Verify(args) => std::process::exit(
+            alpha_cli::verify::run(
+                &args,
+                config.platform_document_url.as_deref(),
+                &config.pccs_url,
+                now,
+            )
+            .await,
+        ),
         Command::Bootstrap {
             custodians,
             endpoint,

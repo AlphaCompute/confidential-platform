@@ -92,6 +92,39 @@ certificate is good for. An Instance that has not attested serves no certificate
 the connection is accepted by the gateway and closes with none, because there is nothing
 behind it to forward to.
 
+## `alpha verify`
+
+```
+alpha verify --platform-document-url <signer>/sign/platform.json [--initdata <file> | --compose <file>] \
+  [--attestation-result <file>] [--json] https://<host>
+```
+
+It verifies the release-signed platform document and handshakes with the Endpoint using the
+hybrid alone. It then checks the served leaf against the document's KMS CA and the current time,
+and checks the leaf's SANs. An Instance's runtime-key SAN must name the key that served the
+connection. A KMS node's Revision must be in `kms_revisions`. The report has four sections:
+
+- **Certificate:** what the leaf says.
+- **Revision:** the hash the leaf names. With `--initdata` (the pod's init-data, which must rebuild
+  that Revision v2 for the leaf's App) it also shows the runtime class, both digests, and the agent
+  policy's exec and log rules and images, read from the Rego. With `--compose` (the registered
+  `app-compose.json` or Revision v2, which must hash to the leaf's Revision) it shows the document.
+- **CPU:**
+  - For an App, the KMS's appraisal that the leaf stands for: the profile and the reference values
+    it could match. An App serves no evidence of its own.
+  - For a KMS node, its quote over a fresh nonce from `/v1/node/evidence`, appraised again locally
+    with DCAP collateral from `--pccs-url`: measurements, TCB status and image.
+- **GPU:** on the GPU class, the Revision's count and model, which every verifier in the
+  `gpu_policy` verified before the KMS issued the leaf.
+
+`--attestation-result` takes the `attestation_result` the runtime received from the KMS. It is not
+signed, so it is shown only where it agrees with the leaf and the Revision: the Revision, App,
+organization, runtime key, init-data and policy digests, and GPU count, model and CC mode. When it
+agrees, its measurements, TCB status, GPU devices and GPU verifiers are printed.
+
+The command exits 0 only if every check passes, 1 if any fails and 2 for a usage error. `--json`
+prints the same report as JSON.
+
 ## Serving the Endpoint from Rust
 
 A service mounting `/run/alpha` reads its own identity with
