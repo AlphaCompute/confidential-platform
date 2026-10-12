@@ -474,7 +474,7 @@ fn real_policy(rim: &str) -> alpha_attest::GpuPolicy {
             cc_mode: Some(CcModeRule {
                 source: CcSource::Measurement,
                 index: 1,
-                values: vec!["00".into()],
+                values: vec!["00".repeat(48)],
             }),
             ocsp_max_age_secs: Some(86_400),
             ocsp_url: None,

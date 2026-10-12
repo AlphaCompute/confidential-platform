@@ -162,15 +162,11 @@ pub fn pinned(policy: Option<&LocalPolicy>) -> Result<Pinned, AppraisalError> {
         .values
         .iter()
         .map(|v| {
-            let decoded =
-                hex::decode(v).map_err(|_| malformed("cc_mode.values", "not hex"))?;
+            let decoded = hex::decode(v).map_err(|_| malformed("cc_mode.values", "not hex"))?;
             if rule.source == CcSource::Measurement && decoded.len() != 48 {
                 return Err(malformed(
                     "cc_mode.values",
-                    &format!(
-                        "measurement value must be 48 bytes, got {}",
-                        decoded.len()
-                    ),
+                    &format!("measurement value must be 48 bytes, got {}", decoded.len()),
                 ));
             }
             Ok(decoded)
