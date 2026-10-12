@@ -16,7 +16,7 @@ use alpha_cli::node::{NodeIdentity, ShareFile};
 use alpha_client::{Client, Pin};
 use alpha_core::{AppId, KeyId, OrgId, PrincipalId, context};
 use alpha_crypto::{INFO_UNSEAL_SHARE, PrivateKey, PublicKey};
-use alpha_kms::{Clock, CollateralSource, Config, Node, platform, rfc3339, tls};
+use alpha_kms::{Clock, CollateralSource, Config, Node, NodeGuest, platform, rfc3339, tls};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use ed25519_dalek::SigningKey;
@@ -248,7 +248,7 @@ pub async fn start_node_with(
         clock,
         CollateralSource::Fixed(Box::new(collateral)),
         nonce_key(),
-        event_log,
+        NodeGuest::prototype(event_log).unwrap(),
         release_key.verifying_key(),
     )
     .unwrap();
