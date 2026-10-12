@@ -15,23 +15,68 @@
 //! genpolicy 4.1.0 writes every `emptyDir` bind mount as `rprivate` whatever the spec's
 //! propagation, which would refuse these two mounts. [`propagate`] sets exactly them, by
 //! container and volume, to what containerd sends for the spec (`rshared` and `rslave`), and the
-//! baseline lets only `alpha-volume-*` share a mount or run privileged.
+//! baseline lets only `alpha-volume-*` share a mount or run privileged, and only as exactly this
+//! init container running an image the release-signed platform document lists
+//! (`alpha_volume_images`, [`listed_images`]): `--volume-image` chooses among those, never adds
+//! one.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use alpha_core::coco::policy::{DATA_PREFIX, VOLUME_CONTAINER_PREFIX};
+use alpha_client::platform::SignedDocument;
+use alpha_core::coco::policy::{
+    DATA_PREFIX, VOLUME_CONTAINER_PREFIX, VOLUME_DEVICE_PATH, VOLUME_MAX_NAME, VOLUME_MOUNT_DIR,
+    VOLUME_SOCKET_DIR,
+};
+use ed25519_dalek::VerifyingKey;
 use serde_json::{Value, json};
 
 use super::policy::{self, PolicyContainer};
 
 /// Where the claim's block device appears in the init container.
-pub const DEVICE_PATH: &str = "/dev/alpha-volume";
+pub const DEVICE_PATH: &str = VOLUME_DEVICE_PATH;
 /// Where the init container mounts the opened filesystem.
-pub const MOUNT_DIR: &str = "/run/alpha-volume";
+pub const MOUNT_DIR: &str = VOLUME_MOUNT_DIR;
 /// The source genpolicy gives a memory `emptyDir` named `<name>`.
 const EPHEMERAL_SOURCE: &str = "/run/kata-containers/sandbox/ephemeral/";
 /// The volume's name, as `alpha-volume` takes it.
-pub const MAX_NAME: usize = 40;
+pub const MAX_NAME: usize = VOLUME_MAX_NAME;
+
+/// The `alpha-volume` images the platform document lists, once `artifact` verifies under
+/// `release_key`: the only images a volume init container may run. Each must be one pinned
+/// image reference.
+pub fn listed_images(
+    artifact: &SignedDocument,
+    release_key: &VerifyingKey,
+    now: std::time::SystemTime,
+) -> Result<BTreeSet<String>, String> {
+    let summary = crate::sign::check(artifact, release_key, now)?;
+    let images: BTreeSet<String> = summary.alpha_volume_images.into_iter().collect();
+    if let Some(bad) = images
+        .iter()
+        .find(|i| !crate::deploy::wrap::pinned_reference(i))
+    {
+        return Err(format!(
+            "the platform document's alpha_volume_images lists {bad:?}, which is not one pinned image reference"
+        ));
+    }
+    Ok(images)
+}
+
+/// `image` for the volume init containers: one the platform document lists.
+pub fn check_image(image: &str, listed: &BTreeSet<String>) -> Result<(), String> {
+    if listed.contains(image) {
+        return Ok(());
+    }
+    if listed.is_empty() {
+        return Err(format!(
+            "volume image {image:?}: the platform document lists no alpha-volume image, so no pod may open a persistent volume"
+        ));
+    }
+    Err(format!(
+        "volume image {image:?}: not an alpha-volume image the platform document lists ({})",
+        listed.iter().cloned().collect::<Vec<_>>().join(", ")
+    ))
+}
 
 pub fn container_name(name: &str) -> String {
     format!("{VOLUME_CONTAINER_PREFIX}{name}")
@@ -71,20 +116,7 @@ pub fn check_size(size: &str) -> Result<(), String> {
 }
 
 pub fn check_name(name: &str, place: &str) -> Result<(), String> {
-    let ok = !name.is_empty()
-        && name.len() <= MAX_NAME
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-        && name
-            .bytes()
-            .next()
-            .is_some_and(|b| b.is_ascii_alphanumeric())
-        && name
-            .bytes()
-            .last()
-            .is_some_and(|b| b.is_ascii_alphanumeric());
-    if ok {
+    if alpha_core::coco::policy::is_volume_name(name) {
         Ok(())
     } else {
         Err(format!(
@@ -118,7 +150,7 @@ pub fn init_container(name: &str, image: &str, socket_volume: &str) -> Value {
         "securityContext": { "privileged": true },
         "volumeDevices": [{ "name": device_volume(name), "devicePath": DEVICE_PATH }],
         "volumeMounts": [
-            { "name": socket_volume, "mountPath": "/run/alpha" },
+            { "name": socket_volume, "mountPath": VOLUME_SOCKET_DIR },
             { "name": name, "mountPath": MOUNT_DIR, "mountPropagation": "Bidirectional" },
         ],
     })
@@ -210,8 +242,25 @@ pub fn propagate(policy: &str, names: &BTreeSet<String>) -> Result<String, Strin
     Ok(format!("{}{DATA_PREFIX}{data}", policy::RULES))
 }
 
+/// The volume init containers `render` or `wrap` added for `names`, with `image`: the only
+/// containers that may be privileged.
+pub fn containers<'a>(
+    names: impl IntoIterator<Item = &'a String>,
+    image: Option<&str>,
+) -> BTreeSet<PolicyContainer> {
+    names
+        .into_iter()
+        .filter_map(|name| {
+            image.map(|image| PolicyContainer {
+                name: container_name(name),
+                image: image.to_owned(),
+            })
+        })
+        .collect()
+}
+
 /// The privileged containers the policy admits must be exactly the volume init containers the
-/// pod declares, each with the image it declares.
+/// generator added, each with the listed image it was given.
 pub fn check_elevated(
     verified: &policy::Verified,
     volume_containers: &BTreeSet<PolicyContainer>,

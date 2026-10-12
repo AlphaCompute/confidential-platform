@@ -92,8 +92,43 @@ pub const TYPE_ANNOTATION: &str = "io.kubernetes.cri.container-type";
 pub const DSM_ENV: &str = "ALPHACOMPUTE_DSM";
 /// The init containers that open encrypted persistent volumes (`alpha-volume`, PRD-02
 /// deliverable 25), the only ones the baseline lets run privileged in the TD and share a mount
-/// back to the guest (the opened volume, which the App's container then mounts).
+/// back to the guest (the opened volume, which the App's container then mounts). The name is
+/// reserved, not a credential: a container under it is admitted only as exactly the volume
+/// opener ([`verify_with_volumes`]), with an image the release-signed platform document lists.
 pub const VOLUME_CONTAINER_PREFIX: &str = "alpha-volume-";
+/// The `alpha-volume` image's `ENTRYPOINT` (`images/volume/Dockerfile`), which genpolicy puts
+/// before the container's args; a stand-in image without one runs the args as they are.
+pub const VOLUME_ENTRYPOINT: &str = "/alpha-volume";
+/// Where the claim's block device appears in the volume container.
+pub const VOLUME_DEVICE_PATH: &str = "/dev/alpha-volume";
+/// Where the volume container mounts the opened filesystem, shared back to the guest.
+pub const VOLUME_MOUNT_DIR: &str = "/run/alpha-volume";
+/// Where the volume container reaches `alpha-runtime`'s socket.
+pub const VOLUME_SOCKET_DIR: &str = "/run/alpha";
+/// The pod volume holding `alpha-runtime`'s socket (alpha-cli's `coco::wrap::SOCKET_VOLUME`).
+pub const VOLUME_SOCKET_VOLUME: &str = "alpha-run";
+/// The longest volume name `alpha-volume` takes.
+pub const VOLUME_MAX_NAME: usize = 40;
+/// The only environment the volume container may list: the image's `PATH` (Alpine's).
+pub const VOLUME_ENV: [&str; 1] =
+    ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"];
+/// Where genpolicy puts a memory `emptyDir`, as the pattern its policy matches the source with.
+const EPHEMERAL_SOURCE: &str = "^/run/kata-containers/sandbox/ephemeral/";
+/// The mounts genpolicy 4.1.0 gives every container, by destination and source; the volume
+/// container may have these besides its two bind mounts and nothing else.
+const STANDARD_MOUNTS: [(&str, &str); 11] = [
+    ("/proc", "proc"),
+    ("/dev", "tmpfs"),
+    ("/dev/pts", "devpts"),
+    ("/dev/shm", "/run/kata-containers/sandbox/shm"),
+    ("/dev/mqueue", "mqueue"),
+    ("/sys", "sysfs"),
+    ("/sys/fs/cgroup", "cgroup"),
+    ("/etc/hosts", "$(sfprefix)hosts$"),
+    ("/dev/termination-log", "$(sfprefix)termination-log$"),
+    ("/etc/hostname", "$(sfprefix)hostname$"),
+    ("/etc/resolv.conf", "$(sfprefix)resolv.conf$"),
+];
 /// genpolicy's capability set for an unprivileged container.
 const DEFAULT_CAPS: &str = "$(default_caps)";
 /// genpolicy's placeholders, which let a listed variable take a value the policy does not spell
@@ -122,8 +157,22 @@ pub struct Verified {
 }
 
 /// Accepts `policy` only as genpolicy 4.1.0's rules followed by `policy_data` that holds the
-/// baseline; a single trailing newline, which an editor adds, is allowed.
+/// baseline; a single trailing newline, which an editor adds, is allowed. No container may be
+/// privileged, share a mount back to the guest or be named `alpha-volume-*`: a pod with
+/// encrypted volumes is checked with [`verify_with_volumes`].
 pub fn verify(policy: &str) -> Result<Verified, String> {
+    verify_with_volumes(policy, &BTreeSet::new())
+}
+
+/// [`verify`], admitting `alpha-volume-<name>` containers that open encrypted persistent
+/// volumes. `volume_images` are the `alpha-volume` images the release-signed platform document
+/// lists (`alpha_volume_images`), never ones the pod's author chose: such a container must run
+/// one of them, exactly as `alpha-volume open <name>` with only its device, its socket and the
+/// volume's mount, and it is then the only container that may be privileged or share a mount.
+pub fn verify_with_volumes(
+    policy: &str,
+    volume_images: &BTreeSet<String>,
+) -> Result<Verified, String> {
     let bad = |m: &str| format!("agent policy: {m}");
     let data = policy
         .strip_prefix(RULES)
@@ -258,10 +307,15 @@ pub fn verify(policy: &str) -> Result<Verified, String> {
             .filter_map(|m| m.get("options").and_then(Value::as_array))
             .flatten()
             .any(|o| o.as_str() == Some("rshared"));
-        if (is_elevated || shares_mounts) && !name.starts_with(VOLUME_CONTAINER_PREFIX) {
-            return Err(bad(&format!(
-                "container {name} is privileged or shares mounts back to the guest; only {VOLUME_CONTAINER_PREFIX}* may"
-            )));
+        match name.strip_prefix(VOLUME_CONTAINER_PREFIX) {
+            Some(volume) => volume_container(container, name, volume, image, volume_images)
+                .map_err(|m| bad(&m))?,
+            None if is_elevated || shares_mounts => {
+                return Err(bad(&format!(
+                    "container {name} is privileged or shares mounts back to the guest; only {VOLUME_CONTAINER_PREFIX}* may"
+                )));
+            }
+            None => {}
         }
         if is_elevated {
             elevated.insert(name.to_owned());
@@ -282,6 +336,121 @@ pub fn verify(policy: &str) -> Result<Verified, String> {
         elevated,
         data,
     })
+}
+
+/// A volume's name as `alpha-volume` takes it: lowercase letters, digits and `-`, starting and
+/// ending with a letter or digit, at most [`VOLUME_MAX_NAME`] characters.
+pub fn is_volume_name(name: &str) -> bool {
+    let edge = |b: Option<u8>| b.is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    name.len() <= VOLUME_MAX_NAME
+        && edge(name.bytes().next())
+        && edge(name.bytes().last())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// `alpha-volume-<volume>` as the policy admits it must be exactly the volume opener: an
+/// image from `volume_images`, the args `open <volume> <device> <mount dir>` (after the image's
+/// entrypoint, or alone), the image's `PATH` and nothing else in its environment, the claim's
+/// device and no other, and besides genpolicy's standard mounts only the runtime's socket and
+/// the volume's own `emptyDir`, which alone it shares back (`rshared`).
+fn volume_container(
+    container: &Value,
+    name: &str,
+    volume: &str,
+    image: &str,
+    volume_images: &BTreeSet<String>,
+) -> Result<(), String> {
+    if !is_volume_name(volume) {
+        return Err(format!(
+            "container {name}: {volume:?} is not a volume name; {VOLUME_CONTAINER_PREFIX}* is reserved for alpha-volume"
+        ));
+    }
+    if !volume_images.contains(image) {
+        return Err(format!(
+            "container {name}'s image {image} is not an alpha-volume image the platform document lists; {VOLUME_CONTAINER_PREFIX}* runs only those"
+        ));
+    }
+    let strings = |pointer: &str| -> Option<Vec<&str>> {
+        container
+            .pointer(pointer)
+            .and_then(Value::as_array)?
+            .iter()
+            .map(Value::as_str)
+            .collect()
+    };
+    let args = strings("/OCI/Process/Args").unwrap_or_default();
+    let open = ["open", volume, VOLUME_DEVICE_PATH, VOLUME_MOUNT_DIR];
+    let entry = [VOLUME_ENTRYPOINT];
+    if args != open && args != [entry.as_slice(), open.as_slice()].concat() {
+        return Err(format!(
+            "container {name} runs {args:?}, not alpha-volume open {volume} {VOLUME_DEVICE_PATH} {VOLUME_MOUNT_DIR}"
+        ));
+    }
+    let env = strings("/OCI/Process/Env").unwrap_or_default();
+    if let Some(var) = env.iter().find(|e| !VOLUME_ENV.contains(e)) {
+        return Err(format!(
+            "container {name} lists {var}; the volume container takes only its image's PATH"
+        ));
+    }
+    let paths = |pointer: &str, key: &str| -> Option<Vec<&str>> {
+        container
+            .pointer(pointer)
+            .and_then(Value::as_array)?
+            .iter()
+            .map(|d| d.get(key).and_then(Value::as_str))
+            .collect()
+    };
+    let devices = paths("/OCI/Linux/Devices", "Path");
+    let device_paths = paths("/devices", "container_path");
+    let only = Some(vec![VOLUME_DEVICE_PATH]);
+    if devices != only || device_paths != only {
+        return Err(format!(
+            "container {name} takes devices {devices:?}; the volume container takes only {VOLUME_DEVICE_PATH}"
+        ));
+    }
+    let volume_source = format!("{EPHEMERAL_SOURCE}{volume}$");
+    let socket_source = format!("{EPHEMERAL_SOURCE}{VOLUME_SOCKET_VOLUME}$");
+    let (mut opened, mut socket) = (0usize, 0usize);
+    let mounts = container
+        .pointer("/OCI/Mounts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("container {name} has no mounts"))?;
+    for mount in mounts {
+        let field = |key: &str| mount.get(key).and_then(Value::as_str).unwrap_or_default();
+        let (destination, source) = (field("destination"), field("source"));
+        let options = mount
+            .get("options")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let shared = options.iter().any(|o| o.as_str() == Some("rshared"));
+        if destination == VOLUME_MOUNT_DIR && source == volume_source {
+            if *options != [json!("rbind"), json!("rshared"), json!("rw")] {
+                return Err(format!(
+                    "container {name}'s mount of {volume} is not rbind, rshared, rw"
+                ));
+            }
+            opened = opened.saturating_add(1);
+        } else if shared {
+            return Err(format!(
+                "container {name} shares {destination} back to the guest; only {VOLUME_MOUNT_DIR} may be"
+            ));
+        } else if destination == VOLUME_SOCKET_DIR && source == socket_source {
+            socket = socket.saturating_add(1);
+        } else if !STANDARD_MOUNTS.contains(&(destination, source)) {
+            return Err(format!(
+                "container {name} mounts {source} at {destination}; the volume container mounts only the runtime's socket and its volume"
+            ));
+        }
+    }
+    if (opened, socket) != (1, 1) {
+        return Err(format!(
+            "container {name} does not mount the runtime's socket and its volume once each"
+        ));
+    }
+    Ok(())
 }
 
 fn pinned(image: &str) -> bool {
@@ -389,25 +558,228 @@ mod tests {
         out
     }
 
+    const VOLUME_IMAGE: &str = "ghcr.io/alphacompute/alpha-volume@sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
+    /// `base` with `extra` added to its containers.
+    fn with_container(base: &str, extra: Value) -> String {
+        let data = base
+            .strip_prefix(RULES)
+            .and_then(|d| d.strip_prefix(DATA_PREFIX))
+            .unwrap();
+        let mut data: Value = serde_json::from_str(data).unwrap();
+        data["containers"].as_array_mut().unwrap().push(extra);
+        format!("{RULES}{DATA_PREFIX}{data:#}")
+    }
+
+    /// `alpha-volume-<volume>` as genpolicy 4.1.0 writes it for the alpha-volume image.
+    fn volume_container(volume: &str, image: &str) -> Value {
+        let mut mounts: Vec<Value> = STANDARD_MOUNTS
+            .iter()
+            .map(|(d, s)| json!({ "destination": d, "source": s, "options": ["rbind"] }))
+            .collect();
+        mounts.push(json!({
+            "destination": VOLUME_SOCKET_DIR,
+            "source": format!("{EPHEMERAL_SOURCE}{VOLUME_SOCKET_VOLUME}$"),
+            "options": ["rbind", "rprivate", "rw"],
+        }));
+        mounts.push(json!({
+            "destination": VOLUME_MOUNT_DIR,
+            "source": format!("{EPHEMERAL_SOURCE}{volume}$"),
+            "options": ["rbind", "rshared", "rw"],
+        }));
+        json!({
+            "OCI": {
+                "Annotations": {
+                    TYPE_ANNOTATION: "container",
+                    NAME_ANNOTATION: format!("{VOLUME_CONTAINER_PREFIX}{volume}"),
+                    IMAGE_ANNOTATION: image,
+                },
+                "Process": {
+                    "Args": [VOLUME_ENTRYPOINT, "open", volume, VOLUME_DEVICE_PATH, VOLUME_MOUNT_DIR],
+                    "Env": VOLUME_ENV,
+                    "Capabilities": { "Bounding": ["$(privileged_caps)"] },
+                },
+                "Mounts": mounts,
+                "Linux": { "Devices": [{ "Type": "", "Path": VOLUME_DEVICE_PATH }] },
+            },
+            "devices": [{ "container_path": VOLUME_DEVICE_PATH, "options": [] }],
+            "exec_commands": [],
+        })
+    }
+
+    fn listed() -> BTreeSet<String> {
+        BTreeSet::from([VOLUME_IMAGE.to_owned()])
+    }
+
     #[test]
     fn only_a_volume_container_runs_privileged_or_shares_a_mount() {
-        let caps = r#""Process": { "Capabilities": { "Bounding": ["$(privileged_caps)"] }, "#;
         let base = policy(&["PATH=/bin"]);
-        let as_volume = base
-            .replace("\"alpha-runtime\"", "\"alpha-volume-pg\"")
-            .replace("\"Process\": {", caps);
-        let verified = verify(&as_volume).unwrap();
+        let good = with_container(&base, volume_container("pg", VOLUME_IMAGE));
+        let verified = verify_with_volumes(&good, &listed()).unwrap();
         assert_eq!(
             verified.elevated,
             BTreeSet::from(["alpha-volume-pg".to_owned()])
         );
+        // A stand-in image without the entrypoint runs the args alone.
+        let mut bare = volume_container("pg", VOLUME_IMAGE);
+        bare["OCI"]["Process"]["Args"] =
+            json!(["open", "pg", VOLUME_DEVICE_PATH, VOLUME_MOUNT_DIR]);
+        verify_with_volumes(&with_container(&base, bare), &listed()).unwrap();
+
+        let caps = r#""Process": { "Capabilities": { "Bounding": ["$(privileged_caps)"] }, "#;
         let as_app = base.replace("\"Process\": {", caps);
-        assert!(verify(&as_app).unwrap_err().contains("privileged"));
+        assert!(
+            verify_with_volumes(&as_app, &listed())
+                .unwrap_err()
+                .contains("privileged")
+        );
         let shared = base.replace(
             "\"Process\": {",
             r#""Mounts": [{ "destination": "/data", "options": ["rbind", "rshared", "rw"] }], "Process": {"#,
         );
-        assert!(verify(&shared).unwrap_err().contains("shares mounts"));
+        assert!(
+            verify_with_volumes(&shared, &listed())
+                .unwrap_err()
+                .contains("shares mounts")
+        );
+    }
+
+    /// ACC-FD-100: the `alpha-volume-` name is not what grants privilege. A container under it
+    /// that runs an image the platform document does not list is refused, digest-pinned or not,
+    /// and so is every one when no list is given.
+    #[test]
+    fn a_volume_container_runs_only_a_listed_image() {
+        let base = policy(&["PATH=/bin"]);
+        let attacker = format!(
+            "registry.example/attacker/volume@sha256:{}",
+            "ab".repeat(32)
+        );
+        let spoofed = with_container(&base, volume_container("x", &attacker));
+        let error = verify_with_volumes(&spoofed, &listed()).unwrap_err();
+        assert!(error.contains("not an alpha-volume image"), "{error}");
+        // The listed image under the same name passes; with no list, nothing does.
+        let good = with_container(&base, volume_container("x", VOLUME_IMAGE));
+        verify_with_volumes(&good, &listed()).unwrap();
+        assert!(
+            verify(&good)
+                .unwrap_err()
+                .contains("not an alpha-volume image")
+        );
+        assert!(dsm_pinned(&good, DSM).is_err());
+        // Unprivileged and sharing nothing, the name is still reserved.
+        let mut quiet = volume_container("x", &attacker);
+        quiet["OCI"]["Process"]["Capabilities"] = json!({ "Bounding": [DEFAULT_CAPS] });
+        assert!(verify_with_volumes(&with_container(&base, quiet), &listed()).is_err());
+    }
+
+    /// The listed image is held to the opener's exact args, environment, device and mounts, so
+    /// a policy cannot run a shell from it or hand it more of the guest.
+    #[test]
+    fn a_volume_container_is_exactly_the_opener() {
+        let base = policy(&["PATH=/bin"]);
+        let refused = |edit: &dyn Fn(&mut Value), why: &str| {
+            let mut container = volume_container("pg", VOLUME_IMAGE);
+            edit(&mut container);
+            let error =
+                verify_with_volumes(&with_container(&base, container), &listed()).unwrap_err();
+            assert!(error.contains(why), "{why}: {error}");
+        };
+        fn args(c: &mut Value) -> &mut Value {
+            &mut c["OCI"]["Process"]["Args"]
+        }
+        fn mounts(c: &mut Value) -> &mut Vec<Value> {
+            c["OCI"]["Mounts"].as_array_mut().unwrap()
+        }
+        refused(
+            &|c| {
+                *args(c) = json!([
+                    "/bin/sh",
+                    "-c",
+                    "id",
+                    "open",
+                    "pg",
+                    VOLUME_DEVICE_PATH,
+                    VOLUME_MOUNT_DIR
+                ])
+            },
+            "runs",
+        );
+        refused(
+            &|c| args(c).as_array_mut().unwrap().push(json!("--debug")),
+            "runs",
+        );
+        refused(
+            &|c| {
+                *args(c) = json!([
+                    VOLUME_ENTRYPOINT,
+                    "open",
+                    "other",
+                    VOLUME_DEVICE_PATH,
+                    VOLUME_MOUNT_DIR
+                ])
+            },
+            "runs",
+        );
+        refused(
+            &|c| c["OCI"]["Process"]["Env"] = json!([VOLUME_ENV[0], "LD_PRELOAD=/run/alpha/x.so"]),
+            "LD_PRELOAD",
+        );
+        refused(
+            &|c| {
+                c["OCI"]["Linux"]["Devices"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({ "Type": "", "Path": "/dev/sda" }));
+            },
+            "devices",
+        );
+        refused(&|c| c["devices"] = json!([]), "devices");
+        refused(
+            &|c| {
+                mounts(c).push(json!({
+                    "destination": "/host", "source": "/", "options": ["rbind", "rprivate", "rw"],
+                }));
+            },
+            "mounts / at /host",
+        );
+        refused(
+            &|c| {
+                mounts(c).push(json!({
+                    "destination": "/data",
+                    "source": format!("{EPHEMERAL_SOURCE}app-data$"),
+                    "options": ["rbind", "rprivate", "rw"],
+                }));
+            },
+            "mounts",
+        );
+        refused(
+            &|c| {
+                mounts(c).push(json!({
+                    "destination": VOLUME_SOCKET_DIR,
+                    "source": format!("{EPHEMERAL_SOURCE}{VOLUME_SOCKET_VOLUME}$"),
+                    "options": ["rbind", "rshared", "rw"],
+                }));
+            },
+            "shares /run/alpha",
+        );
+        refused(
+            &|c| {
+                mounts(c).retain(|m| m["destination"] != json!(VOLUME_MOUNT_DIR));
+            },
+            "once each",
+        );
+        refused(
+            &|c| {
+                let opened = mounts(c).last().unwrap().clone();
+                mounts(c).push(opened);
+            },
+            "once each",
+        );
+        // A name the policy would read as a pattern over other emptyDirs.
+        let mut wild = volume_container("pg", VOLUME_IMAGE);
+        wild["OCI"]["Annotations"][NAME_ANNOTATION] = json!("alpha-volume-.*");
+        let error = verify_with_volumes(&with_container(&base, wild), &listed()).unwrap_err();
+        assert!(error.contains("not a volume name"), "{error}");
     }
 
     #[test]
