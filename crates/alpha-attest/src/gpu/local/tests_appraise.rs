@@ -6,7 +6,6 @@
 
 use std::collections::BTreeMap;
 
-use super::policy::CcSource;
 use super::testkit::*;
 use crate::gpu::{GpuEvidence, GpuVerifier, VerifiedGpu, check_gpus};
 use alpha_core::coco::GpuShape;
@@ -78,13 +77,12 @@ fn nothing_passes_until_the_release_pins_every_field() {
     let world = World::new(1);
     let gpus = world.evidence();
     type Clear = fn(&mut World);
-    let unset: [(&str, Clear); 7] = [
+    let unset: [(&str, Clear); 6] = [
         ("gpu_policy.local is not set", |w| w.policy.local = None),
         ("device_roots", |w| w.local_policy().device_roots.clear()),
         ("rim_roots", |w| w.local_policy().rim_roots.clear()),
         ("rims", |w| w.local_policy().rims.clear()),
         ("fwids", |w| w.local_policy().fwids.clear()),
-        ("cc_mode", |w| w.local_policy().cc_mode = None),
         ("ocsp_max_age_secs", |w| {
             w.local_policy().ocsp_max_age_secs = None
         }),
@@ -268,51 +266,57 @@ fn finding_1_the_certified_fwid_is_appraised() {
 // Finding 2: a GPU not in production CC mode never passes.
 
 #[test]
-fn finding_2_a_devtools_gpu_is_not_in_cc_mode() {
+fn finding_2_a_devtools_gpu_measures_differently_and_is_refused() {
+    // NVIDIA's verifier derives "devtools off" from every measurement matching the production
+    // RIMs; a devtools GPU's driver measurements differ, so no pinned RIM matches it.
     let world = World::new(8);
     let gpus = world.evidence_with(|i| {
         let mut r = Report::default();
         if i == 5 {
-            r.blocks.insert(CC_BLOCK, CC_DEVTOOLS.to_vec());
+            r.blocks.insert(6, vec![0xD7; 48]);
         }
         r
     });
-    let verdict = world.appraise(&gpus).unwrap();
-    assert!(!verdict.gpus[5].cc_mode);
-    assert!(verdict.gpus[4].cc_mode);
-    let (code, reason) = decide(&world, &gpus).unwrap_err();
-    assert_eq!(code, "policy_denied");
-    assert!(reason.contains("gpu 5: not in CC mode"), "{reason}");
-    // CC off: the indicator holds anything else, or is missing.
-    let off = world.evidence_with(|_| {
-        let mut r = Report::default();
-        r.blocks.insert(CC_BLOCK, vec![0; 48]);
-        r
-    });
-    assert_eq!(decide(&world, &off).unwrap_err().0, "policy_denied");
-    let missing = world.evidence_with(|_| {
-        let mut r = Report::default();
-        r.blocks.remove(&CC_BLOCK);
-        r
-    });
-    expect(&world, &missing, "CC-mode measurement 11 is missing");
+    expect(&world, &gpus, "GPU-5: no pinned Driver RIM");
 }
 
 #[test]
-fn finding_2_an_opaque_indicator_works_the_same_way() {
-    let mut world = World::new(1);
-    let rule = world.local_policy().cc_mode.as_mut().unwrap();
-    rule.source = CcSource::Opaque;
-    rule.index = super::opaque::NVDEC0_STATUS;
-    rule.values = vec!["55".into()];
-    assert!(world.appraise(&world.evidence()).unwrap().gpus[0].cc_mode);
-    let rule = world.local_policy().cc_mode.as_mut().unwrap();
-    rule.values = vec!["aa".into()];
-    assert!(!world.appraise(&world.evidence()).unwrap().gpus[0].cc_mode);
+fn finding_2_the_gpu_mode_must_be_the_pods_shape() {
+    // One GPU: single-GPU passthrough (SPT, 1).
+    let one = World::new(1);
+    assert!(one.appraise(&one.evidence()).unwrap().gpus[0].cc_mode);
+    for (flag, name) in [(0, "Mpt"), (2, "Ppcie"), (7, "Other(7)")] {
+        let gpus = one.evidence_with(|_| Report {
+            feature_flag: Some(flag),
+            ..Report::default()
+        });
+        expect(
+            &one,
+            &gpus,
+            &format!("FEATURE_FLAG is {name}, but a pod of 1 GPU(s) needs Spt"),
+        );
+    }
+    let absent = one.evidence_with(|_| Report {
+        feature_flag: None,
+        ..Report::default()
+    });
+    expect(&one, &absent, "the report has no FEATURE_FLAG");
+    // Eight GPUs: multi-GPU passthrough (MPT, 0) on every one of them.
+    let eight = World::new(8);
+    assert_eq!(eight.appraise(&eight.evidence()).unwrap().gpus.len(), 8);
+    let one_spt = eight.evidence_with(|i| Report {
+        feature_flag: Some(if i == 3 { 1 } else { 0 }),
+        ..Report::default()
+    });
+    expect(
+        &eight,
+        &one_spt,
+        "GPU-3: FEATURE_FLAG is Spt, but a pod of 8 GPU(s) needs Mpt",
+    );
 }
 
 #[test]
-fn finding_2_signed_debug_state_and_ppcie_are_not_cc_mode() {
+fn finding_2_signed_debug_state_is_not_cc_mode() {
     // DICE OperationalFlags: debug is bit 3, notSecure bit 1, recovery bit 2.
     for (flag, flags) in [
         ("debug", [0x90u8, 0, 0, 1]),
@@ -324,17 +328,6 @@ fn finding_2_signed_debug_state_and_ppcie_are_not_cc_mode() {
         let verdict = world.appraise(&world.evidence()).unwrap();
         assert!(!verdict.gpus[0].cc_mode, "{flag}");
     }
-    let world = World::new(1);
-    let ppcie = world.evidence_with(|_| Report {
-        feature_flag: Some(2),
-        ..Report::default()
-    });
-    assert!(!world.appraise(&ppcie).unwrap().gpus[0].cc_mode);
-    let spt = world.evidence_with(|_| Report {
-        feature_flag: Some(1),
-        ..Report::default()
-    });
-    assert!(world.appraise(&spt).unwrap().gpus[0].cc_mode);
 }
 
 #[test]

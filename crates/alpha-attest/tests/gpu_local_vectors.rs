@@ -447,7 +447,7 @@ fn parsers_survive_truncations_and_bit_flips_of_real_inputs() {
 }
 
 fn real_policy(rim: &str) -> alpha_attest::GpuPolicy {
-    use alpha_attest::gpu::local::{CcModeRule, CcSource, LocalPolicy};
+    use alpha_attest::gpu::local::LocalPolicy;
     let b64 = |v: Vec<Vec<u8>>| v.iter().map(|d| BASE64_STANDARD.encode(d)).collect();
     let doc = entry(rim).document;
     alpha_attest::GpuPolicy {
@@ -471,11 +471,6 @@ fn real_policy(rim: &str) -> alpha_attest::GpuPolicy {
             )]
             .into(),
             fwids: vec![format!("sha384:{BLACKWELL_FWID}")],
-            cc_mode: Some(CcModeRule {
-                source: CcSource::Measurement,
-                index: 1,
-                values: vec!["00".repeat(48)],
-            }),
             ocsp_max_age_secs: Some(86_400),
             ocsp_url: None,
             accept_certificate_hold: false,

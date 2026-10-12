@@ -1,5 +1,6 @@
 //! `gpu_policy.local`: everything the `local` backend trusts, release-signed in the platform
-//! document. Every field the decision rests on must be set before any GPU is looked at; until a
+//! document. There is no CC-mode field to pin: as in NVIDIA's verifier, production CC mode is
+//! every measurement matching a pinned driver and VBIOS RIM, with no DICE debug state. Every field the decision rests on must be set before any GPU is looked at; until a
 //! document pins them (after the B300 capture at G0), the backend refuses every GPU.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -31,9 +32,6 @@ pub struct LocalPolicy {
     /// Certified FMC firmware IDs (`sha384:<hex>`) the release accepts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fwids: Vec<String>,
-    /// The signed indicator of production CC mode, chosen at G0.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cc_mode: Option<CcModeRule>,
     /// Maximum age of an OCSP response, in seconds (1 to a week).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ocsp_max_age_secs: Option<u64>,
@@ -45,26 +43,6 @@ pub struct LocalPolicy {
     pub accept_certificate_hold: bool,
 }
 
-/// Where the CC-mode indicator is in the signed report.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum CcSource {
-    /// An SPDM measurement block, by its index (1-based).
-    Measurement,
-    /// An NVIDIA opaque field, by its type.
-    Opaque,
-}
-
-/// The signed values that mean production CC mode.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CcModeRule {
-    pub source: CcSource,
-    pub index: u16,
-    /// Hex.
-    pub values: Vec<String>,
-}
-
 /// A policy whose every required field is set and well-formed, decoded.
 #[derive(Clone, Debug)]
 pub struct Pinned {
@@ -72,9 +50,6 @@ pub struct Pinned {
     pub rim_roots: Vec<Vec<u8>>,
     pub rims: BTreeSet<[u8; 48]>,
     pub fwids: BTreeSet<[u8; 48]>,
-    pub cc_source: CcSource,
-    pub cc_index: u16,
-    pub cc_values: Vec<Vec<u8>>,
     pub ocsp: super::ocsp::Freshness,
     pub ocsp_url: Option<String>,
 }
@@ -139,39 +114,6 @@ pub fn pinned(policy: Option<&LocalPolicy>) -> Result<Pinned, AppraisalError> {
         .iter()
         .map(|k| sha384("fwids", k))
         .collect::<Result<_, _>>()?;
-    let rule = p.cc_mode.as_ref().ok_or_else(|| missing("cc_mode"))?;
-    if rule.values.is_empty() {
-        return Err(missing("cc_mode.values"));
-    }
-    match rule.source {
-        CcSource::Measurement if !(1..=254).contains(&rule.index) => {
-            return Err(malformed(
-                "cc_mode.index",
-                "is not a measurement block (1 to 254)",
-            ));
-        }
-        CcSource::Opaque if rule.index == 0 => {
-            return Err(malformed(
-                "cc_mode.index",
-                "opaque field type 0 is not a known NVIDIA type",
-            ));
-        }
-        _ => {}
-    }
-    let cc_values: Vec<Vec<u8>> = rule
-        .values
-        .iter()
-        .map(|v| {
-            let decoded = hex::decode(v).map_err(|_| malformed("cc_mode.values", "not hex"))?;
-            if rule.source == CcSource::Measurement && decoded.len() != 48 {
-                return Err(malformed(
-                    "cc_mode.values",
-                    &format!("measurement value must be 48 bytes, got {}", decoded.len()),
-                ));
-            }
-            Ok(decoded)
-        })
-        .collect::<Result<_, _>>()?;
     let max_age = p
         .ocsp_max_age_secs
         .map(Duration::from_secs)
@@ -189,9 +131,6 @@ pub fn pinned(policy: Option<&LocalPolicy>) -> Result<Pinned, AppraisalError> {
         rim_roots,
         rims,
         fwids,
-        cc_source: rule.source,
-        cc_index: rule.index,
-        cc_values,
         ocsp: super::ocsp::Freshness {
             max_age,
             accept_certificate_hold: p.accept_certificate_hold,
