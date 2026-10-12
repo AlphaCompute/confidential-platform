@@ -438,6 +438,11 @@ mod tests {
                 .unwrap()
                 .contains("OutOfDate")
         );
+        // dcap-qvl 0.7 reports a TD 1.5 launched on an older TCB as TDRelaunchAdvised*; a policy
+        // that does not list it denies it, so the TD must be relaunched.
+        for status in ["TDRelaunchAdvised", "TDRelaunchAdvisedConfigurationNeeded"] {
+            assert!(denied(status, &[], PROD).unwrap().contains(status));
+        }
         assert!(
             denied(
                 "SWHardeningNeeded",
