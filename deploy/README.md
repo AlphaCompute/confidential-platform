@@ -133,6 +133,17 @@ the platform-document URL are served; the signed document lists the Revision.
 Both nodes now serve; a restart of either is a `join` from the other; losing both means
 `alpha unseal` with two of the three shares.
 
+**A halted node.** `GET /ready` answering 503 `{"halted": "audit_chain_broken"}` or
+`{"halted": "audit_chain_rolled_back"}` means the node found the audit chain tampered with, or
+its database without an audit head it, a peer or a custodian saw committed (a restore from an
+older copy, or another copy). It releases nothing and writes nothing; it does not recover on its
+own. Find out what changed the database before anything else. A restart clears its memory and it
+then joins a serving node or waits for custodians, both of which check the heads again. To accept
+a database deliberately restored from a backup, stop every KMS node (their memory holds the head),
+then the custodians whose share files remember a later head unseal with
+`alpha unseal --accept-audit-rollback`, which goes in the ceremony record
+(`docs/metadata-encryption.md`, "Rollback of the whole database").
+
 ## Replacing a custodian
 
 When a custodian leaves, or a share or custodian key may be exposed, replace the custodian set

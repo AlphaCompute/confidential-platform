@@ -238,6 +238,7 @@ async fn a_kata_node_is_bootstrapped_by_three_custodians_and_a_second_one_unseal
             &dir.join(format!("share-{i}.json")),
             &custodians[i - 1],
             1,
+            false,
         )
         .await
         .unwrap();
@@ -309,6 +310,7 @@ async fn a_kata_node_is_bootstrapped_by_three_custodians_and_a_second_one_unseal
             &dir.join(format!("new-share-{i}.json")),
             key,
             1,
+            false,
         )
         .await
         .unwrap();
@@ -437,8 +439,13 @@ async fn a_kata_node_joins_a_prototype_node_and_serves_under_the_same_ca() {
     assert_eq!(details["coco"]["profile"], "kata-tdx/1");
     assert_eq!(details["coco"]["runtime_class"], CPU_RUNTIME_CLASS);
     let reply: JoinReply = serde_json::from_value(reply).unwrap();
+    // The serving node's audit head, its `node.join` row included, travels with the keys.
+    let head = h.node.chain.floor().unwrap();
+    assert_eq!(head.seq, h.audit_rows().await.last().unwrap().seq);
+    assert_eq!(reply.audit_head, Some(head.to_wire()));
     node::finish_join(&joiner, &reply).await.unwrap();
     assert!(!joiner.is_sealed());
+    assert_eq!(joiner.chain.floor().unwrap().seq, head.seq);
     assert_eq!(joiner.intermediates().unwrap().ca_pem(), h.ca_pem);
 
     // Clients keep their CA pin; the listed Revisions now include the Kata build.
