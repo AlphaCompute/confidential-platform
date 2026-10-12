@@ -291,6 +291,7 @@ async fn attest_inner(
                 None,
                 &doc,
                 &node.config.gpu_backends,
+                &node.config.dpu_backends,
             )
             .await?
         }
@@ -357,8 +358,9 @@ fn unregistered(appraised: &Appraised) -> ApiError {
 }
 
 /// A registered compose is attested only by a prototype CVM (`alphacompute-evidence/1`) and a
-/// registered Revision v2 only by a Kata pod (`kata-tdx/1` or `kata-snp/1`), whose findings must then be that
-/// Revision's: its runtime class, init-data and policy digests, and exactly its GPUs, of its model.
+/// registered Revision v2 only by a Kata pod (`kata-tdx/1` or `kata-snp/1`), whose findings must
+/// then be that Revision's: its runtime class, init-data and policy digests, and exactly its GPUs
+/// and NICs/DPUs, of their models.
 /// The Revision hash already binds the init-data; held again here against the registered row, so
 /// no leaf names a Revision whose GPUs were not the ones verified.
 pub fn check_platform(
@@ -405,6 +407,22 @@ pub fn check_platform(
         return Err(failed(format!(
             "gpu {}: model {} is not the registered Revision's",
             gpu.index, gpu.model
+        )));
+    }
+    let (count, model) = registered
+        .dpu
+        .as_ref()
+        .map_or((0, None), |d| (d.count, Some(d.model.as_str())));
+    if usize::try_from(count).ok() != Some(coco.dpus.len()) {
+        return Err(failed(format!(
+            "{} DPUs verified, the registered Revision expects {count}",
+            coco.dpus.len()
+        )));
+    }
+    if let Some(dpu) = coco.dpus.iter().find(|d| Some(d.model.as_str()) != model) {
+        return Err(failed(format!(
+            "dpu {}: model {} is not the registered Revision's",
+            dpu.index, dpu.model
         )));
     }
     Ok(())
@@ -673,6 +691,7 @@ mod tests {
                 count: 8,
                 model: "B300".into(),
             }),
+            dpu: None,
         };
         let found = CocoAppraised {
             profile: kata::PROFILE_KATA_TDX.into(),
@@ -681,6 +700,7 @@ mod tests {
             runtime_class: revision.runtime_class.clone(),
             gpus: (0..8).map(|i| gpu(i, "B300")).collect(),
             gpu_verifiers: Vec::new(),
+            dpus: Vec::new(),
             snp: None,
         };
         (row(revision.canonical().unwrap(), app), found)
@@ -725,6 +745,19 @@ mod tests {
         refused(
             check_platform(&revision, Some(&h100)),
             "gpu 3: model H100 is not the registered Revision's",
+        );
+        // A registered Revision that expects a DPU, and an appraisal that verified none.
+        let mut with_dpu: CocoRevision = serde_json::from_str(&revision.compose).unwrap();
+        with_dpu.dpu = Some(coco::DpuShape {
+            count: 1,
+            model: "BLUEFIELD-3".into(),
+        });
+        let dpu_row = row(with_dpu.canonical().unwrap(), revision.app_id);
+        let mut no_dpu = found.clone();
+        no_dpu.initdata_sha256 = with_dpu.initdata_sha256;
+        refused(
+            check_platform(&dpu_row, Some(&no_dpu)),
+            "0 DPUs verified, the registered Revision expects 1",
         );
         let mut foreign = revision;
         foreign.app_id = Uuid::now_v7();

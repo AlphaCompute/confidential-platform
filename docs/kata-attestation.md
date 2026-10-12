@@ -55,6 +55,8 @@ Any other class is refused at registration and at appraisal. The same App on TDX
 }
 ```
 
+`nic` (optional) carries one SPDM measurement transcript per NIC/DPU the Revision's `dpu` section expects; see `docs/dpu-attestation.md` (`nvidia-dpu/1`).
+
 `event_log` (the CCEL boot events) is optional; when sent, RTMR0..2 must replay from it. `runtime_class` is the pod's own claim: a class no Revision v2 may name, or a class of the other TEE than `cpu.kind`, is refused, and any other claim is refused unless it equals the measured init-data's. `kind: "snp"` evidence (an SNP report in `quote`, optionally its VCEK in `vek`) goes to `kata-snp/1`; a TDX quote with a `vek`, or an SNP report with an `event_log`, is refused.
 
 A pod on `kata-qemu-tdx` sends no GPU evidence (`gpus` empty or absent). If it sends any, the appraisal refuses it once the TD checks have passed, without calling a GPU backend, and it refuses a GPU that a backend verified for such a pod the same way: GPU evidence from a CPU pod is refused, never ignored. The KMS refuses it the same way.

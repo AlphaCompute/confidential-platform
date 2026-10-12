@@ -215,6 +215,7 @@ mod tests {
                 count: 1,
                 model: "B300".into(),
             }),
+            dpu: None,
         };
         let text = revision.canonical().unwrap();
         assert_eq!(
@@ -241,6 +242,7 @@ mod tests {
                     count,
                     model: "B300".into(),
                 }),
+                dpu: None,
             }
             .canonical()
             .unwrap()

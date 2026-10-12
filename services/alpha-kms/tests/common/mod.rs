@@ -241,6 +241,7 @@ pub async fn start_node_with(
         platform_document_url: release_url.to_owned(),
         gpu_backends,
         snp_kds: Arc::new(TestKds),
+        dpu_backends: vec![Arc::new(kata::FakeDpu)],
         #[cfg(feature = "dev-root")]
         dev_root_kek: None,
     };
