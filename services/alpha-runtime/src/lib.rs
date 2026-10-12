@@ -393,6 +393,13 @@ pub struct Attested {
     keys: Mutex<HashMap<String, DerivedKey>>,
 }
 
+impl Attested {
+    /// The KMS client holding this attestation's leaf, for routes this crate does not wrap.
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+}
+
 pub struct Runtime {
     config: Config,
     pkcs8: Zeroizing<Vec<u8>>,

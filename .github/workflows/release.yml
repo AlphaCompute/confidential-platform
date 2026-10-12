@@ -36,6 +36,9 @@ jobs:
             dockerfile: images/guard/Dockerfile
           - name: alpha-cpu-app
             dockerfile: images/cpu-app/Dockerfile
+          # The Trustee pod's own process (Option B, docs/trustee.md).
+          - name: alpha-trustee-feed
+            dockerfile: images/trustee-feed/Dockerfile
     env:
       FEATURES: ${{ matrix.features }}
     steps:

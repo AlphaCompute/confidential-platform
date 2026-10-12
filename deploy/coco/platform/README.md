@@ -17,6 +17,7 @@ manifest as a workload. These templates follow `deploy/coco/model-server.yaml` (
 | `alpha-kms.yaml` | the KMS: a StatefulSet of two nodes on the verifier pool (`alphacompute.ai/role: verifier`), one per zone, rolled one at a time; a headless Service naming every node, a Service for the serving ones, a PodDisruptionBudget |
 | `alpha-broker.yaml` | the connector broker, `alpha-runtime` as a native sidecar |
 | `alpha-guard.yaml` | the content judge, `alpha-runtime` as a native sidecar |
+| `alpha-trustee.yaml` | Trustee v0.21.0 for Option B (`docs/trustee.md`): two pods on the verifier pool, one per zone, each the KBS, Attestation Service and RVPS on the TD's loopback behind `alpha-trustee-feed`, its only port; a Service for the feed's TLS port, a PodDisruptionBudget |
 | `alpha-inference.yaml` | the inference front, `alpha-runtime` as a native sidecar. It matches `services/alpha-inference` on this branch. PRD-04 (#69, #70) changes its environment; the spec changes with it |
 | `env/cluster.env` | per cluster: the runtime image, its share of the VM, the KMS pins |
 | `env/<service>.env` | per service: App id, image, shape, configuration |
@@ -55,6 +56,8 @@ alpha coco render --spec deploy/coco/platform/alpha-inference.yaml --for-genpoli
 alpha coco render --spec deploy/coco/platform/alpha-inference.yaml --policy inference.rego \
   --env deploy/coco/platform/env/cluster.env --env deploy/coco/platform/env/alpha-inference.env > alpha-inference.rendered.yaml
 ```
+
+**Trustee (Option B)** goes after the KMS and before any App that opts in to it. Render it like the KMS (`--env deploy/coco/platform/env/alpha-trustee.env` alone). The release-key holder lists the Revision v2 it prints in `trustee.revisions` of the platform document, with `kbs_hostname` (the name the passthrough ingress routes to the Service `alpha-trustee`, under `.internal` until G0) and `max_state_age_secs`; the platform organization registers the same Revision under the Trustee App, as in step 7; Rafay deploys it as a workload of the `alpha-verifier` project into the namespace `alpha-trustee`. Apps that opt in render with `--kbs-url https://<kbs_hostname>` and `--kbs-cert` the KMS CA certificate (`kms_ca_pem`), and their tenants put a grant (`alpha call trustee-grant`).
 
 7. **The platform organization registers the Revision v2** the renderer printed, under its own admin key: `alpha call register-revision --key platform-admin.key --key-id <id> payload.json` with `{"app_id": "<the service's App>", "compose": "<the Revision v2 JCS>"}`. It also puts the service's Secrets (`alpha call put-secret`, names in each env file). A pod whose Revision is not registered gets no leaf.
 8. **Rafay** deploys the rendered manifest, versioned in the GitOps repository, as a workload of the restricted platform project into an attested namespace of the CPU-CC cluster.

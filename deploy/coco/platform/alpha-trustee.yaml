@@ -1,0 +1,152 @@
+# alpha-trustee: Trustee v0.21.0 (KBS, Attestation Service, RVPS) for Option B (PRD-02 deliverable
+# 26, docs/trustee.md), two Kata TDX pod VMs on the verifier pool (alpha-infra
+# docs/verifier-pool.md), in the namespace alpha-trustee (alpha-infra
+# clusters/verifier-namespaces.example.yaml).
+#
+# Rendered by `alpha coco render` with env/alpha-trustee.env; the Revision v2 it prints is this
+# build's entry in the platform document's trustee.revisions, and the platform organization
+# registers it as the Trustee App's Revision. Each pod VM runs four containers that reach each
+# other only over the TD's loopback:
+#
+# - alpha-trustee-feed, a native sidecar: it attests the pod to alpha-kms as the Trustee App,
+#   writes the other three's configuration and keys into the in-guest emptyDir /run/trustee,
+#   installs what alpha-kms generates through the KBS admin API, and is the pod's only port: TLS
+#   on 8443 with the leaf alpha-kms issues for trustee.kbs_hostname, passing on the attestation
+#   protocol and resource reads only.
+# - kbs, as, rvps: Trustee's upstream images by digest, each listening on 127.0.0.1 only, as the
+#   commands below say and the agent policy pins. No other pod reaches the Attestation Service,
+#   the RVPS or the KBS's admin API, whatever the cluster network does.
+#
+# The feed starts first (a native sidecar with a startup probe), so the three start with their
+# files in place. Nothing here comes from a ConfigMap or a Secret.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alpha-trustee
+  labels:
+    app.kubernetes.io/name: alpha-trustee
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: alpha-trustee
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: alpha-trustee
+        alphacompute.ai/tenant: platform
+        alphacompute.ai/app: ${APP_ID}
+      annotations:
+        # The only Kata annotation: the init-data (agent policy + alpha.json), set by the renderer.
+        io.katacontainers.config.hypervisor.cc_init_data: "${CC_INIT_DATA}"
+    spec:
+      runtimeClassName: kata-qemu-tdx
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        alphacompute.ai/role: verifier
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: alpha-trustee
+      initContainers:
+        - name: alpha-trustee-feed
+          image: ${FEED_IMAGE}                  # ghcr.io/alphacompute/alpha-trustee-feed@sha256:...
+          restartPolicy: Always
+          env:
+            - name: ALPHACOMPUTE_QUOTE_SOURCE
+              value: "coco-aa"
+            - name: ALPHACOMPUTE_KMS_ENDPOINTS
+              value: "${KMS_ENDPOINTS}"
+            - name: ALPHACOMPUTE_KMS_CA_SPKI_SHA256
+              value: "${KMS_CA_SPKI_SHA256}"
+            - name: ALPHACOMPUTE_KMS_REVISIONS
+              value: "${KMS_REVISIONS}"
+            - name: ALPHACOMPUTE_PCCS_URL
+              value: "${PCCS_URL}"
+            - name: ALPHACOMPUTE_TRUSTEE_DIR
+              value: "/run/trustee"
+          ports:
+            - name: https
+              containerPort: 8443
+          # HTTPS from the kubelet, no exec. /healthz answers once the files are written, which
+          # lets the three Trustee containers start; /ready only while the KBS holds a current
+          # state from alpha-kms, so a pod without one gets no traffic.
+          startupProbe:
+            httpGet: { path: /healthz, port: 8443, scheme: HTTPS }
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /ready, port: 8443, scheme: HTTPS }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8443, scheme: HTTPS }
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            requests: { cpu: "${FEED_VCPUS}", memory: "${FEED_MEMORY_MIB}Mi" }
+            limits: { cpu: "${FEED_VCPUS}", memory: "${FEED_MEMORY_MIB}Mi" }
+          volumeMounts:
+            - { name: trustee, mountPath: /run/trustee }
+            - { name: pod-initdata, mountPath: /run/alpha-pod, readOnly: true }
+      containers:
+        - name: rvps
+          image: ${RVPS_IMAGE}                  # ghcr.io/confidential-containers/reference-value-provider-service@sha256:...
+          command: ["rvps", "--address", "127.0.0.1:50003", "--config", "/run/trustee/rvps.json"]
+          resources:
+            requests: { cpu: "${RVPS_VCPUS}", memory: "${RVPS_MEMORY_MIB}Mi" }
+            limits: { cpu: "${RVPS_VCPUS}", memory: "${RVPS_MEMORY_MIB}Mi" }
+          volumeMounts:
+            - { name: trustee, mountPath: /run/trustee, readOnly: true }
+        - name: as
+          image: ${AS_IMAGE}                    # ghcr.io/confidential-containers/attestation-service@sha256:...
+          command: ["grpc-as", "--socket", "127.0.0.1:50004", "--config-file", "/run/trustee/as-config.json"]
+          resources:
+            requests: { cpu: "${AS_VCPUS}", memory: "${AS_MEMORY_MIB}Mi" }
+            limits: { cpu: "${AS_VCPUS}", memory: "${AS_MEMORY_MIB}Mi" }
+          volumeMounts:
+            - { name: trustee, mountPath: /run/trustee, readOnly: true }
+        - name: kbs
+          image: ${KBS_IMAGE}                   # ghcr.io/confidential-containers/key-broker-service@sha256:...
+          command: ["/usr/local/bin/kbs", "--config-file", "/run/trustee/kbs-config.toml"]
+          resources:
+            requests: { cpu: "${KBS_VCPUS}", memory: "${KBS_MEMORY_MIB}Mi" }
+            limits: { cpu: "${KBS_VCPUS}", memory: "${KBS_MEMORY_MIB}Mi" }
+          volumeMounts:
+            - { name: trustee, mountPath: /run/trustee, readOnly: true }
+      volumes:
+        # In TD memory: the keys and configuration the feed writes for the other three.
+        - { name: trustee, emptyDir: { medium: Memory, sizeLimit: 1Mi } }
+        # The pod's own init-data, which the feed sends with its evidence. The host could put
+        # anything here; the KMS refuses any init-data that is not the digest in MRCONFIGID.
+        - name: pod-initdata
+          downwardAPI:
+            items:
+              - path: cc_init_data
+                fieldRef:
+                  fieldPath: metadata.annotations['io.katacontainers.config.hypervisor.cc_init_data']
+---
+# The KBS as workload pods reach it: the feed's TLS port, through alpha-infra's TLS-passthrough
+# ingress (its TLSRoute for trustee.kbs_hostname). Pods pin the KMS CA for this name, never an IP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: alpha-trustee
+spec:
+  selector:
+    app.kubernetes.io/name: alpha-trustee
+  ports:
+    - { name: https, port: 8443, targetPort: https }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: alpha-trustee
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: alpha-trustee

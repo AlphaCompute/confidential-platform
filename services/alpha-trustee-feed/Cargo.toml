@@ -1,0 +1,36 @@
+[package]
+name = "alpha-trustee-feed"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+alpha-client = { path = "../../crates/alpha-client" }
+alpha-core = { path = "../../crates/alpha-core" }
+alpha-runtime = { path = "../alpha-runtime" }
+alpha-trustee = { path = "../../crates/alpha-trustee" }
+alpha-tsm = { path = "../../crates/alpha-tsm" }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query"] }
+base64 = "0.23"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+ed25519-dalek = { version = "3", features = ["pkcs8", "alloc"] }
+getrandom = "0.4"
+hex = "0.4"
+p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
+parking_lot = "0.12"
+pem = "3"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+zeroize = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "test-util"] }
