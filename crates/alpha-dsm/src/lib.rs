@@ -44,6 +44,12 @@ use rustls::{ClientConfig, RootCertStore};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+pub mod own;
+#[cfg(feature = "stand-in")]
+pub mod stand_in;
+
+pub use own::{OwnDsm, OwnDsmConfig, Wrapped};
+
 /// A token is not reused this close to its expiry.
 const TOKEN_MARGIN: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -68,7 +74,7 @@ pub enum Error {
 }
 
 /// The key exchange the client offers the DSM.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum KeyExchange {
     /// TLS 1.3 with `X25519MLKEM768` only, the provider every platform hop uses. A DSM without

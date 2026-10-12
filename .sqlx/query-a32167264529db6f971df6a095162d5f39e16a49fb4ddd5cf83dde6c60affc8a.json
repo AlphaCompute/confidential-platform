@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select api_key_wrapped from root_cofactor",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "api_key_wrapped",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "root_cofactor",
+            "name": "api_key_wrapped"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a32167264529db6f971df6a095162d5f39e16a49fb4ddd5cf83dde6c60affc8a"
+}

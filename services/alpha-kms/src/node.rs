@@ -74,6 +74,13 @@ pub async fn bootstrap(
     let now = node.now();
 
     let root = root_kek(&node)?;
+    let cofactor = crate::cofactor::seal(
+        node.config.root_dsm.as_ref(),
+        &root,
+        body.root_dsm_api_key.as_ref(),
+    )
+    .await?;
+    let kek = cofactor.kek();
     let tenant_kek_root = Zeroizing::new(random()?);
     let (ca_key_der, ca_cert_der) = certs::new_ca(now)?;
     let ca_key_der = Zeroizing::new(ca_key_der);
@@ -81,8 +88,8 @@ pub async fn bootstrap(
     let inserted = sqlx::query!(
         "insert into intermediate_keys (purpose, wrapped, public_part) values
            ('tenant-kek-root', $1, null), ('ca', $2, $3) on conflict (purpose) do nothing",
-        aead_seal(&root, b"tenant-kek-root", tenant_kek_root.as_slice())?,
-        aead_seal(&root, b"ca", &ca_key_der)?,
+        aead_seal(kek, b"tenant-kek-root", tenant_kek_root.as_slice())?,
+        aead_seal(kek, b"ca", &ca_key_der)?,
         ca_cert_der,
     )
     .execute(&mut *tx)
@@ -91,7 +98,13 @@ pub async fn bootstrap(
     if inserted != 2 {
         return Err(ApiError::new("already_exists", "database is not empty"));
     }
-    audit::node("node.bootstrap", "ok", json!({}))
+    cofactor.insert(&mut *tx).await?;
+    let details = if cofactor.bound() {
+        json!({ "root_dsm": true })
+    } else {
+        json!({})
+    };
+    audit::node("node.bootstrap", "ok", details)
         .insert(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -200,7 +213,8 @@ pub async fn unseal(
             .and_then(|r| <[u8; 32]>::try_from(r.as_slice()).ok())
             .map(Zeroizing::new)
             .ok_or_else(|| ApiError::malformed("shares do not combine"))?;
-        let keys = unwrap_intermediates(&node, &root).await?;
+        let kek = crate::cofactor::open(&node, &root).await?;
+        let keys = unwrap_intermediates(&node, &kek).await?;
         node.start_serving(keys)
     }
     .await;
