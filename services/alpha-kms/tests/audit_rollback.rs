@@ -348,3 +348,80 @@ async fn custodians_share_files_carry_the_head_across_a_cold_start() {
         Some(restored)
     );
 }
+
+/// Hacktron ACC-FD-106, narrowed: between cold starts a custodian records the live head from an
+/// attested serving node (`alpha witness`), so a restore to anything before it halts the next cold
+/// start. A restore to after the last head any share file recorded is the residual, shown last.
+#[tokio::test]
+async fn a_custodian_who_witnesses_between_cold_starts_moves_the_floor_forward() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let shares: Vec<std::path::PathBuf> =
+        serde_json::from_value(h.bootstrap["shares"].clone()).unwrap();
+    let wall = || Arc::new(SystemTime::now);
+    let start = || start_node(h.pool.clone(), &h.release.url, &h.release.key, wall());
+    let unseal = |client: alpha_client::Client,
+                  identity: alpha_cli::node::NodeIdentity,
+                  a: usize,
+                  b: usize| {
+        let (h, shares) = (&h, &shares);
+        async move {
+            cli_node::unseal(&client, &identity, &shares[a], &h.custodians[a], 1, false)
+                .await
+                .unwrap();
+            cli_node::unseal(&client, &identity, &shares[b], &h.custodians[b], 1, false).await
+        }
+    };
+
+    // A cold start: custodian 1's file records the head the node serves from.
+    let (second, url2, _s2) = start().await;
+    unseal(spki_client(&url2, &second), node_identity(&second), 2, 0)
+        .await
+        .unwrap();
+    let at_cold_start = cli_node::ShareFile::read(&shares[0])
+        .unwrap()
+        .audit_head
+        .unwrap();
+    let copy = take_copy(&h).await;
+    assert!(copy.head >= at_cold_start.seq);
+
+    // Later writes; custodian 2 witnesses them through the serving node, attested as for unseal.
+    second
+        .audit(audit::node("node.fact", "ok", json!({})))
+        .await
+        .unwrap();
+    let witnessed = cli_node::witness(&spki_client(&url2, &second), &shares[1])
+        .await
+        .unwrap();
+    let live = second.chain.floor().unwrap().to_wire();
+    assert_eq!(witnessed.audit_head, Some(live.clone()));
+    assert!(live.seq > copy.head);
+    assert_eq!(
+        cli_node::ShareFile::read(&shares[1]).unwrap().audit_head,
+        Some(live.clone())
+    );
+
+    // Every node gone, the database restored to the copy, taken after the cold start but before
+    // the witnessed writes: the witness's file halts the next cold start.
+    restore(&h, &copy).await;
+    let (third, url3, _s3) = start().await;
+    let e = unseal(spki_client(&url3, &third), node_identity(&third), 0, 1)
+        .await
+        .unwrap_err();
+    assert!(e.contains("halted"), "{e}");
+    assert_eq!(third.chain.halted(), Some(Halt::RolledBack));
+    // A node serving the copy is refused by the witness's CLI: it is behind the file.
+    let e = cli_node::witness(&spki_client(&url3, &third), &shares[1])
+        .await
+        .unwrap_err();
+    assert!(e.contains("older database"), "{e}");
+
+    // The residual: custodians 3 and 1, whose files hold nothing later than the copy, open it.
+    let (fourth, url4, _s4) = start().await;
+    unseal(spki_client(&url4, &fourth), node_identity(&fourth), 2, 0)
+        .await
+        .unwrap();
+    assert!(!fourth.is_sealed());
+    assert_eq!(fourth.chain.halted(), None);
+}
