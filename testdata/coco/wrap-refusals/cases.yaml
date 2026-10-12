@@ -1,0 +1,79 @@
+# One compose per refusal `alpha coco wrap` adds to `alpha compose wrap`'s (testdata/manifest/
+# 09-wrap-refusals), each with a substring of the one line the customer sees. All run on the
+# b300x1 shape of wrap/01-gpu.
+healthcheck:
+  refusal: "a health check could never pass; remove it"
+  compose: |
+    services:
+      app:
+        image: nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+        ports: ["443:80"]
+        healthcheck:
+          test: ["CMD", "true"]
+user-name:
+  refusal: "names a user or group; give numeric ids"
+  compose: |
+    services:
+      app:
+        image: nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+        ports: ["443:80"]
+        user: nginx
+service-name-underscore:
+  refusal: "in a pod the name is lowercase letters, digits and `-`"
+  compose: |
+    services:
+      my_app:
+        image: nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+        ports: ["443:80"]
+volume-name-dot:
+  refusal: "volumes.data.v1: in a pod the name is lowercase letters"
+  compose: |
+    services:
+      app:
+        image: nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+        ports: ["443:80"]
+        volumes: ["data.v1:/data"]
+    volumes:
+      data.v1: {}
+tls-port:
+  refusal: "container port 8443 is where the pod terminates TLS"
+  compose: |
+    services:
+      app:
+        image: nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+        ports: ["443:8443"]
+command-quoting:
+  refusal: "quoting in a string command is not supported; write it as a list"
+  compose: |
+    services:
+      app:
+        image: nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+        ports: ["443:80"]
+        command: sh -c "nginx -g 'daemon off;'"
+secret-service-name-long:
+  refusal: "a service with secrets has a name of at most 49 characters"
+  compose: |
+    services:
+      a-very-long-service-name-that-is-fine-without-secrets:
+        image: nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+        ports: ["443:80"]
+        secrets: [token]
+    secrets:
+      token: {}
+secrets-seventeen:
+  refusal: "17 are declared; declare at most 16"
+  compose: |
+    services:
+      app:
+        image: nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+        ports: ["443:80"]
+        secrets: [s01, s02, s03, s04, s05, s06, s07, s08, s09, s10, s11, s12, s13, s14, s15, s16, s17]
+    secrets: {s01: {}, s02: {}, s03: {}, s04: {}, s05: {}, s06: {}, s07: {}, s08: {}, s09: {}, s10: {}, s11: {}, s12: {}, s13: {}, s14: {}, s15: {}, s16: {}, s17: {}}
+working-dir:
+  refusal: "working_dir: not supported in a confidential pod; set WORKDIR in the image"
+  compose: |
+    services:
+      app:
+        image: nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+        ports: ["443:80"]
+        working_dir: /srv

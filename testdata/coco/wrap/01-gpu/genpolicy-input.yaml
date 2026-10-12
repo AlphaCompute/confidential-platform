@@ -1,0 +1,121 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b
+  namespace: app-01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      alphacompute.ai/app: 01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b
+  template:
+    metadata:
+      labels:
+        alphacompute.ai/app: 01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b
+      annotations:
+        io.katacontainers.config.hypervisor.cc_init_data: ''
+    spec:
+      runtimeClassName: kata-qemu-nvidia-gpu-tdx
+      securityContext:
+        supplementalGroups:
+        - 1
+        - 2
+        - 3
+        - 4
+        - 6
+        - 10
+        - 11
+        - 20
+        - 26
+        - 27
+      volumes:
+      - name: alpha-run
+        emptyDir:
+          medium: Memory
+          sizeLimit: 1Mi
+      - name: alpha-pod
+        downwardAPI:
+          items:
+          - path: cc_init_data
+            fieldRef:
+              fieldPath: metadata.annotations['io.katacontainers.config.hypervisor.cc_init_data']
+      - name: scratch
+        emptyDir:
+          medium: Memory
+      - name: alpha-secrets-web
+        emptyDir:
+          medium: Memory
+          sizeLimit: 1Mi
+      initContainers:
+      - name: alpha-runtime
+        image: alpine@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8
+        restartPolicy: Always
+        env:
+        - name: ALPHACOMPUTE_KMS_CA_SPKI_SHA256
+          value: sha256:c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1
+        - name: ALPHACOMPUTE_KMS_REVISIONS
+          value: sha256:e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1,sha256:e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2
+        - name: ALPHACOMPUTE_QUOTE_SOURCE
+          value: coco-aa
+        - name: ALPHACOMPUTE_TLS_UPSTREAM
+          value: 127.0.0.1:80
+        - name: ALPHACOMPUTE_SECRETS
+          value: '{"web":["api_key"]}'
+        ports:
+        - name: https
+          containerPort: 8443
+        startupProbe:
+          tcpSocket:
+            port: 8443
+          periodSeconds: 5
+          failureThreshold: 17280
+        securityContext:
+          allowPrivilegeEscalation: false
+        volumeMounts:
+        - name: alpha-run
+          mountPath: /run/alpha
+        - name: alpha-pod
+          mountPath: /run/alpha-pod
+          readOnly: true
+        - name: alpha-secrets-web
+          mountPath: /run/alpha-secrets/web
+      containers:
+      - name: web
+        image: nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+        env:
+        - name: MODE
+          value: production
+        - name: WORKERS
+          value: '4'
+        volumeMounts:
+        - name: scratch
+          mountPath: /var/cache/scratch
+        - name: alpha-secrets-web
+          mountPath: /run/secrets
+          readOnly: true
+        resources:
+          limits:
+            cpu: '8'
+            memory: 98304Mi
+            nvidia.com/pgpu: '1'
+          requests:
+            cpu: '8'
+            memory: 98304Mi
+            nvidia.com/pgpu: '1'
+      - name: worker
+        image: busybox@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
+        args:
+        - sh
+        - -c
+        - while true; do ls /data; sleep 60; done
+        volumeMounts:
+        - name: scratch
+          mountPath: /data
+          readOnly: true
+        resources:
+          limits:
+            cpu: '8'
+            memory: 98304Mi
+          requests:
+            cpu: '8'
+            memory: 98304Mi
