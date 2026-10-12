@@ -1,0 +1,106 @@
+# alpha-inference: the inference front, in a Kata TDX pod VM on the CPU-CC cluster's attested
+# namespace. Rendered by `alpha coco render` with env/cluster.env and env/alpha-inference.env; its
+# configuration is the environment below, measured into the agent policy (services/alpha-inference
+# as of this branch: an attested external upstream). PRD-04 (#69, #70) moves it to our own model
+# servers and the guard on every model, which changes this environment; update the spec with it.
+# Secrets, released by the KMS to this App's Revision only and read over the runtime socket:
+# redpill-api-key and caller-bearer.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alpha-inference
+  labels:
+    app.kubernetes.io/name: alpha-inference
+spec:
+  replicas: ${REPLICAS}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: alpha-inference
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: alpha-inference
+        alphacompute.ai/tenant: platform
+        alphacompute.ai/app: ${APP_ID}
+      annotations:
+        # The only Kata annotation: the init-data (agent policy + alpha.json), set by the renderer.
+        io.katacontainers.config.hypervisor.cc_init_data: "${CC_INIT_DATA}"
+    spec:
+      runtimeClassName: kata-qemu-tdx
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      initContainers:
+        # Native sidecar: attests with the pod's init-data, holds the leaf and serves it, the
+        # Secrets and derived keys to alpha-inference on /run/alpha. It opens no port of its own.
+        - name: alpha-runtime
+          image: ${RUNTIME_IMAGE}            # ghcr.io/alphacompute/alpha-runtime@sha256:...
+          restartPolicy: Always
+          env:
+            - name: ALPHACOMPUTE_KMS_ENDPOINTS
+              value: "${KMS_ENDPOINTS}"
+            - name: ALPHACOMPUTE_KMS_CA_SPKI_SHA256
+              value: "${KMS_CA_SPKI_SHA256}"
+            - name: ALPHACOMPUTE_KMS_REVISIONS
+              value: "${KMS_REVISIONS}"
+            - name: ALPHACOMPUTE_QUOTE_SOURCE
+              value: "coco-aa"
+          resources:
+            requests: { cpu: "${RUNTIME_VCPUS}", memory: "${RUNTIME_MEMORY_MIB}Mi" }
+            limits: { cpu: "${RUNTIME_VCPUS}", memory: "${RUNTIME_MEMORY_MIB}Mi" }
+          volumeMounts:
+            - { name: runtime-socket, mountPath: /run/alpha }
+            - { name: pod-initdata, mountPath: /run/alpha-pod, readOnly: true }
+      containers:
+        - name: alpha-inference
+          image: ${INFERENCE_IMAGE}            # ghcr.io/alphacompute/alpha-inference@sha256:...
+          env:
+            - name: UPSTREAM_URL
+              value: "${UPSTREAM_URL}"
+            - name: MODELS
+              value: "${MODELS}"
+            - name: PCCS_URL
+              value: "${PCCS_URL}"
+            # The upstream gateway's TCB policy, JSON, so written here rather than in an env file (the
+            # renderer refuses quotes in values). Changing it is a new Revision.
+            # ponytail: G0 — reviewed with the platform document's own policy before production.
+            - name: UPSTREAM_POLICY
+              value: '{"tcb_statuses":["UpToDate"],"tolerated_advisories":[]}'
+          ports:
+            - name: https
+              containerPort: 8443
+          # HTTPS from the kubelet (it does not check the leaf), no exec: the agent policy refuses
+          # exec. 8443 serves only once the runtime has attested and handed over the leaf.
+          readinessProbe:
+            httpGet: { path: /ready, port: 8443, scheme: HTTPS }
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8443, scheme: HTTPS }
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+            # The pod VM is sized from the containers' limits (Kata's static sandbox sizing on TDX).
+            requests: { cpu: "${VCPUS}", memory: "${MEMORY_MIB}Mi" }
+            limits: { cpu: "${VCPUS}", memory: "${MEMORY_MIB}Mi" }
+          volumeMounts:
+            - { name: runtime-socket, mountPath: /run/alpha }
+      volumes:
+        - { name: runtime-socket, emptyDir: { medium: Memory, sizeLimit: 1Mi } }
+        # The pod's own init-data, which the runtime sends with its evidence. The host could put
+        # anything here; the KMS refuses any init-data that is not the digest in MRCONFIGID.
+        - name: pod-initdata
+          downwardAPI:
+            items:
+              - path: cc_init_data
+                fieldRef:
+                  fieldPath: metadata.annotations['io.katacontainers.config.hypervisor.cc_init_data']
+---
+# Its callers pin the KMS CA and this service's Revision (or App), never this name.
+apiVersion: v1
+kind: Service
+metadata:
+  name: alpha-inference
+spec:
+  selector:
+    app.kubernetes.io/name: alpha-inference
+  ports:
+    - { name: https, port: 8443, targetPort: https }

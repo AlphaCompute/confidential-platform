@@ -1,5 +1,8 @@
 # The KMS nodes on Phala Cloud
 
+On owned hardware the nodes run as Kata pods instead, deployed by Rafay from manifests that
+`alpha coco render` renders: `deploy/coco/platform/README.md`.
+
 Two CVMs in two regions run one Revision of `alpha-kms` over one trust-zone Postgres. The
 production nodes are deployed neither by CI nor by shroud-go's deploy route: the operator creates
 and upgrades the two CVMs by hand through the Phala Cloud API (or the `phala` CLI), one at a
