@@ -12,19 +12,52 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
 
-/// genpolicy 4.1.0's `rules.rego` (kata-containers' `kata-tools-static-4.1.0-amd64.tar.zst`),
-/// which every accepted policy starts with.
-pub const RULES: &str = include_str!("genpolicy/rules.rego");
+/// genpolicy 4.1.0's `rules.rego` (kata-containers' `kata-tools-static-4.1.0-amd64.tar.zst`), as
+/// released.
+#[cfg(test)]
+const UPSTREAM_RULES: &str = include_str!("genpolicy/rules.rego");
+/// The Alpha rules patch (`alpha-rules.patch`, byte for byte as in #82's
+/// `testdata/agent-policy/`, which holds its regression tests): the guest pulls exactly the image
+/// the policy names (`allow_guest_pull_image`), and every variable the policy lists is set
+/// (`allow_env_complete`).
+pub const RULES_PATCH: &str = include_str!("genpolicy/alpha-rules.patch");
+/// genpolicy 4.1.0's `rules.rego` with [`RULES_PATCH`] applied, which every accepted policy
+/// starts with.
+pub const RULES: &str = include_str!("genpolicy/alpha-rules.rego");
 /// What genpolicy prints between the rules and the data.
 pub const DATA_PREFIX: &str = "\npolicy_data := ";
 /// `ALPHACOMPUTE_KMS_ENDPOINTS` comes from the namespace's `alpha-kms` ConfigMap, not the policy:
 /// the endpoints are only where to connect, since the runtime pins the KMS CA and Revisions. The
-/// policy admits the variable only as a list of `https://host[:port]`.
+/// policy admits the variable only as a list of `https://host[:port]` (alpha-cli's `40-` settings
+/// drop-in).
 pub const KMS_ENDPOINTS_ENV_REGEX: &str = "^ALPHACOMPUTE_KMS_ENDPOINTS=https://[a-z0-9.-]{1,253}(:[0-9]{1,5})?(,https://[a-z0-9.-]{1,253}(:[0-9]{1,5})?){0,7}$";
 /// The only environment variables the host may add to a container beyond those the policy
-/// lists: the pod's hostname (set by the runtime) and the KMS endpoints. Kubernetes service links
-/// and the cloud identity variables genpolicy admits by default are not among them.
-pub const ALLOWED_ENV_REGEX: [&str; 2] = ["^HOSTNAME=$(dns_label)$", KMS_ENDPOINTS_ENV_REGEX];
+/// lists: the pod's hostname, the API server's `KUBERNETES_*` (#82's baseline drop-in), and the
+/// KMS endpoints. Service links and the cloud identity variables genpolicy admits by default are
+/// not among them. A policy may admit fewer.
+pub const ALLOWED_ENV_REGEX: [&str; 10] = [
+    "^HOSTNAME=$(dns_label)$",
+    "^KUBERNETES_PORT_$(ip_p)_TCP=tcp://$(ipv4_a):$(ip_p)$",
+    "^KUBERNETES_PORT_$(ip_p)_TCP_PROTO=tcp$",
+    "^KUBERNETES_PORT_$(ip_p)_TCP_PORT=$(ip_p)$",
+    "^KUBERNETES_PORT_$(ip_p)_TCP_ADDR=$(ipv4_a)$",
+    "^KUBERNETES_SERVICE_HOST=$(ipv4_a)$",
+    "^KUBERNETES_SERVICE_PORT=$(ip_p)$",
+    "^KUBERNETES_SERVICE_PORT_HTTPS=$(ip_p)$",
+    "^KUBERNETES_PORT=tcp://$(ipv4_a):$(ip_p)$",
+    KMS_ENDPOINTS_ENV_REGEX,
+];
+/// Mounts genpolicy admits by default for a host-provided identity token; a confidential pod
+/// takes none.
+pub const TOKEN_MOUNTS: [&str; 2] = [
+    "/var/run/secrets/kubernetes.io/serviceaccount",
+    "/var/run/secrets/azure/tokens",
+];
+/// Rules the patch adds; a policy without them has genpolicy's unpatched rules.
+const PATCH_RULES: [&str; 2] = [
+    "\nallow_guest_pull_image(p_oci, i_oci, i_storages) if {\n",
+    "\nallow_env_complete(p_process, i_process) if {\n",
+];
 /// Requests the baseline refuses outright (logs, stdin, diagnostics, remounts).
 pub const REFUSED_REQUESTS: [&str; 5] = [
     "ReadStreamRequest",
@@ -74,7 +107,11 @@ pub fn verify(policy: &str) -> Result<Verified, String> {
         .strip_prefix(RULES)
         .and_then(|rest| rest.strip_prefix(DATA_PREFIX))
         .ok_or_else(|| {
-            bad("not genpolicy 4.1.0's rules.rego followed by policy_data; regenerate it with `alpha coco genpolicy-settings` and genpolicy 4.1.0 rather than editing the rules")
+            if PATCH_RULES.iter().any(|r| !policy.contains(r)) {
+                bad("its rules lack the Alpha rules patch (allow_guest_pull_image, allow_env_complete); regenerate it with the rules `alpha coco genpolicy-settings` writes")
+            } else {
+                bad("not genpolicy 4.1.0's rules.rego with the Alpha patch, followed by policy_data; regenerate it with `alpha coco genpolicy-settings` and genpolicy 4.1.0 rather than editing the rules")
+            }
         })?;
     let data = data.strip_suffix('\n').unwrap_or(data);
     let data = crate::parse(data.as_bytes()).map_err(|e| bad(&format!("policy_data: {e}")))?;
@@ -96,9 +133,13 @@ pub fn verify(policy: &str) -> Result<Verified, String> {
             "CopyFileRequest allows paths outside the shared-files prefix",
         ));
     }
-    if *at("/request_defaults/CreateContainerRequest/allow_env_regex") != json!(ALLOWED_ENV_REGEX) {
+    let admitted_env = at("/request_defaults/CreateContainerRequest/allow_env_regex");
+    if !admitted_env.as_array().is_some_and(|list| {
+        list.iter()
+            .all(|r| r.as_str().is_some_and(|r| ALLOWED_ENV_REGEX.contains(&r)))
+    }) {
         return Err(bad(
-            "allow_env_regex admits host-provided environment variables beyond HOSTNAME and the KMS endpoints",
+            "allow_env_regex admits host-provided environment variables beyond HOSTNAME, KUBERNETES_* and the KMS endpoints",
         ));
     }
     if *at("/cluster_config/guest_pull") != json!(true) {
@@ -117,6 +158,16 @@ pub fn verify(policy: &str) -> Result<Verified, String> {
             return Err(bad(
                 "a container allows exec commands (an exec probe or hook)",
             ));
+        }
+        let token = container
+            .pointer("/OCI/Mounts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m.get("destination").and_then(Value::as_str))
+            .find(|d| TOKEN_MOUNTS.contains(d));
+        if let Some(token) = token {
+            return Err(bad(&format!("a container may mount the token at {token}")));
         }
         let annotation = |key: &str| {
             container
@@ -238,6 +289,61 @@ mod tests {
     }
 
     const DSM: &str = r#"{"binding":"revision","endpoint":"https://dsm.example"}"#;
+
+    /// `patch` for a unified diff that only adds lines, as `alpha-rules.patch` does.
+    fn apply(original: &str, patch: &str) -> String {
+        let lines: Vec<&str> = original.split_inclusive('\n').collect();
+        let (mut out, mut at, mut in_hunk) = (String::new(), 0, false);
+        for line in patch.split_inclusive('\n') {
+            if let Some(header) = line.strip_prefix("@@ -") {
+                let start: usize = header.split([',', ' ']).next().unwrap().parse().unwrap();
+                while at + 1 < start {
+                    out.push_str(lines[at]);
+                    at += 1;
+                }
+                in_hunk = true;
+            } else if !in_hunk {
+                continue;
+            } else if let Some(added) = line.strip_prefix('+') {
+                out.push_str(added);
+            } else {
+                assert_eq!(lines[at], &line[1..], "context");
+                out.push_str(lines[at]);
+                at += 1;
+            }
+        }
+        lines[at..].iter().for_each(|l| out.push_str(l));
+        out
+    }
+
+    #[test]
+    fn the_rules_are_genpolicy_4_1_0s_with_82s_patch() {
+        use sha2::{Digest, Sha256};
+        let sha = |s: &str| {
+            Sha256::digest(s.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        assert_eq!(
+            sha(UPSTREAM_RULES),
+            "a1ad4280a7d1db83649de18640fb30f08cc160fadd7f4360d1dde09977b090b7"
+        );
+        assert_eq!(
+            sha(RULES_PATCH),
+            "970cf8d718ccb660c76c08cdcdafbffdc0a71e4638d1cd819bce9f28808a1e59"
+        );
+        assert_eq!(apply(UPSTREAM_RULES, RULES_PATCH), RULES);
+        for rule in PATCH_RULES {
+            assert!(RULES.contains(rule) && !UPSTREAM_RULES.contains(rule));
+        }
+        let unpatched = policy(&[]).replacen(RULES, UPSTREAM_RULES, 1);
+        assert!(
+            verify(&unpatched)
+                .unwrap_err()
+                .contains("Alpha rules patch")
+        );
+    }
 
     #[test]
     fn a_dsm_counts_only_as_the_policy_pins_it() {
