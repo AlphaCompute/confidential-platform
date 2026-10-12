@@ -50,10 +50,10 @@ const MANIFEST_TYPES: &str = "application/vnd.oci.image.index.v1+json, applicati
 /// A compose that passed the allowlist, in the customer's order.
 #[derive(Debug)]
 pub struct Plain {
-    services: Vec<(String, Mapping)>,
-    volumes: Vec<String>,
-    secrets: BTreeMap<String, BTreeSet<String>>,
-    endpoint: (String, u16),
+    pub(crate) services: Vec<(String, Mapping)>,
+    pub(crate) volumes: Vec<String>,
+    pub(crate) secrets: BTreeMap<String, BTreeSet<String>>,
+    pub(crate) endpoint: (String, u16),
 }
 
 #[derive(Debug, Serialize)]
@@ -434,7 +434,7 @@ fn name(value: Yaml, place: &str) -> Result<String, String> {
     }
 }
 
-fn shown(value: &Yaml) -> String {
+pub(crate) fn shown(value: &Yaml) -> String {
     match value {
         Yaml::String(s) => s.clone(),
         other => serde_json::to_string(other).unwrap_or_else(|_| format!("{other:?}")),
@@ -700,7 +700,7 @@ fn grammatical(rest: &str) -> Option<(&str, &str)> {
 }
 
 /// `<image>@sha256:<hex>` whose image is one token of the grammar [`tagged`] holds tags to.
-fn pinned_reference(image: &str) -> bool {
+pub(crate) fn pinned_reference(image: &str) -> bool {
     let Some((name, d)) = image.split_once('@') else {
         return false;
     };
@@ -719,7 +719,7 @@ fn pinned_reference(image: &str) -> bool {
         && grammatical(rest).is_some()
 }
 
-fn pin(image: &str, digests: &BTreeMap<String, String>) -> Result<String, String> {
+pub(crate) fn pin(image: &str, digests: &BTreeMap<String, String>) -> Result<String, String> {
     if pinned(image) {
         return Ok(image.to_owned());
     }
