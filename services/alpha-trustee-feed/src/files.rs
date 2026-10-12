@@ -36,8 +36,9 @@ pub const ADMIN_ROLE: &str = "alpha-trustee-feed";
 pub const ADMIN_ENDPOINTS: &str = "^/kbs/v0/(resource-policy|attestation-policy|reference-value)$";
 
 /// The Trustee App's derived key the Attestation Service signs tokens with: the same in every
-/// Trustee pod, so a token one replica's KBS issued verifies at the other's.
-pub const AS_TOKEN_PURPOSE: &str = "trustee.as-token";
+/// Trustee pod, so a token one replica's KBS issued verifies at the other's, and the one alpha-kms
+/// verifies every token the feed reports under.
+pub use alpha_trustee::ear::AS_TOKEN_PURPOSE;
 /// Attestation tokens live five minutes (Trustee's default).
 pub const AS_TOKEN_MINUTES: u32 = 5;
 
@@ -158,8 +159,7 @@ pub fn rvps_config() -> String {
 
 /// The token-signing key from the 32 bytes the KMS derives for [`AS_TOKEN_PURPOSE`].
 pub fn as_signing_key(derived: &[u8; 32]) -> Result<SigningKey, Error> {
-    SigningKey::from_bytes(derived.into())
-        .map_err(|e| Error::Key(format!("attestation token key: {e}")))
+    alpha_trustee::ear::token_signing_key(derived).map_err(Error::Key)
 }
 
 /// [`SigningKey`] as rcgen signs with it: RFC 6979, so the certificate below is the same bytes in

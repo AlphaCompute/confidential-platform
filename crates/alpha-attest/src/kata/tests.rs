@@ -378,6 +378,51 @@ fn guest_image_not_in_reference_values_is_unknown() {
 }
 
 #[test]
+fn the_guest_image_is_mrtd_and_rtmr0_to_2_and_rtmr3_is_the_guests_own() {
+    // Each of MRTD and RTMR0..2 one byte off its captured value: unknown, in the predicate and
+    // in the appraisal that uses it.
+    let pod = Pod::cpu();
+    let quote = pod.quote();
+    let doc = doc();
+    assert_eq!(
+        kata_tdx_reference(&doc, CPU_CLASS, &quote.measured).map(|rv| rv.name.as_str()),
+        Some("kata-tdx/cpu")
+    );
+    for register in 0..4 {
+        let mut off = quote.clone();
+        let r = match register {
+            0 => &mut off.measured.mrtd,
+            1 => &mut off.measured.rtmr0,
+            2 => &mut off.measured.rtmr1,
+            _ => &mut off.measured.rtmr2,
+        };
+        r.0[47] ^= 1;
+        assert!(kata_tdx_reference(&doc, CPU_CLASS, &off.measured).is_none());
+        refused(
+            pod.appraise_with(&pod.evidence(), off, &doc, &[]),
+            "attestation_unknown",
+            "kata-tdx reference value",
+        );
+    }
+    // RTMR3 is extended inside the guest at run time; no reference value holds it (a document
+    // naming one does not parse: `results_accept_new_fields_and_platform_documents_refuse_them`),
+    // and the profile chooses the guest image without it. alpha-kms's Trustee path takes this
+    // predicate too.
+    for rtmr3 in [m(0), m(5), m(0xee)] {
+        let mut q = quote.clone();
+        q.measured.rtmr3 = rtmr3;
+        assert!(kata_tdx_reference(&doc, CPU_CLASS, &q.measured).is_some());
+        assert_eq!(
+            pod.appraise_with(&pod.evidence(), q, &doc, &[])
+                .unwrap()
+                .measured
+                .rtmr3,
+            rtmr3
+        );
+    }
+}
+
+#[test]
 fn stale_nonce_and_replayed_quote_are_refused() {
     let pod = Pod::gpu(1);
     let other = report_data(SPKI, &[4; 32], None);

@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into trustee_attestations (token_sha256, trustee_revision, revision, app_id, org_id, mrconfigid, expires_at, token)\n         values ($1, $2, $3, $4, $5, $6, $7, $8) on conflict (token_sha256) do nothing",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Bytea",
+        "Bytea",
+        "Uuid",
+        "Uuid",
+        "Bytea",
+        "Timestamptz",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "05ef67093334bdc80f48b24e3833965b8096abdc8d5354da8d132de80adc44a1"
+}

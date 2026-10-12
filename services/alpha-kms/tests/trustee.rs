@@ -1,9 +1,10 @@
 //! Option B (PRD-02 deliverable 26) against a real Postgres (`DATABASE_URL`; skipped without
 //! it): a Trustee pod, itself an attested Kata pod over a synthetic quote, reports the KBS
 //! attestations of tenant pods and asks for their resources (`docs/trustee.md`). Every refusal the
-//! design promises is here with its audit row: an unregistered, foreign or revoked Revision, an
-//! App that has not opted in, another App's resource, stale state, a Trustee build the platform
-//! document does not list, and the platform's own keys.
+//! design promises is here with its audit row: a token the Trustee App's key did not sign, an
+//! unregistered, foreign or revoked Revision, an App that has not opted in, another App's
+//! resource, stale state, measurements the platform document no longer lists, a Trustee build it
+//! does not list, and the platform's own keys.
 
 #![allow(
     clippy::unwrap_used,
@@ -20,8 +21,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alpha_core::coco::{GPU_RUNTIME_CLASS, InitData};
 use alpha_core::{AppId, KeyId, OrgId, context};
 use alpha_kms::rfc3339;
-use alpha_trustee::ear::sample::{payload, token};
-use alpha_trustee::ear::token_sha256;
+use alpha_trustee::ear::sample::{payload, signed, signed_with, token};
+use alpha_trustee::ear::{AS_TOKEN_PURPOSE, token_sha256, token_signing_key};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use common::kata::*;
@@ -138,6 +139,22 @@ impl Trustee {
     async fn grant(&self, app: AppId, resources: Value, at: SystemTime) -> (StatusCode, Value) {
         grant(&self.h, &self.admin, app, resources, at).await
     }
+
+    /// The key the Trustee App's Attestation Service signs with: its derived key for
+    /// `trustee.as-token`, which the feed gets from `/v1/keys/derive`.
+    fn as_key(&self) -> p256::ecdsa::SigningKey {
+        token_signing_key(&self.h.app_key(self.pod.app, AS_TOKEN_PURPOSE)).unwrap()
+    }
+
+    /// `payload` as this Trustee's KBS issues it.
+    fn sign(&self, payload: &Value) -> String {
+        signed(payload, &self.as_key())
+    }
+
+    /// The token this Trustee's KBS issues for `pod`.
+    fn pod_token(&self, pod: &Pod, gpus: &[Value]) -> String {
+        self.sign(&pod_payload(&self.h, pod, gpus))
+    }
 }
 
 async fn grant(
@@ -160,9 +177,9 @@ async fn grant(
     .await
 }
 
-/// The token Trustee's KBS issues for `pod`: its class's registers, its init-data's MRCONFIGID,
-/// one NVIDIA submodule per GPU claim set.
-fn pod_token(h: &Harness, pod: &Pod, gpus: &[Value]) -> String {
+/// The claims of the token Trustee's KBS issues for `pod`: its class's registers, its init-data's
+/// MRCONFIGID, one NVIDIA submodule per GPU claim set.
+fn pod_payload(h: &Harness, pod: &Pod, gpus: &[Value]) -> Value {
     let [mrtd, rtmr0, rtmr1, rtmr2] = registers(&pod.runtime_class);
     let (mrtd, rtmr0, rtmr1, rtmr2) = (hex48(mrtd), hex48(rtmr0), hex48(rtmr1), hex48(rtmr2));
     let mrconfigid = hex::encode(
@@ -171,12 +188,12 @@ fn pod_token(h: &Harness, pod: &Pod, gpus: &[Value]) -> String {
             .mrconfigid(),
     );
     let exp = h.now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 300;
-    token(&payload(
+    payload(
         [&mrtd, &rtmr0, &rtmr1, &rtmr2, &hex48(m(5))],
         &mrconfigid,
         gpus,
         exp,
-    ))
+    )
 }
 
 /// One B300's NRAS claims, every claim the KMS's NRAS backend requires holding.
@@ -274,7 +291,7 @@ async fn a_pod_trustee_attested_gets_exactly_its_granted_resources_each_release_
         json!({ "app_id": app, "org_id": h.org }),
     );
 
-    let tok = pod_token(h, &pod, &[]);
+    let tok = t.pod_token(&pod, &[]);
     let (status, admitted) = t.attest(&tok, &pod.initdata).await;
     assert_eq!(status, StatusCode::OK, "{admitted}");
     assert_eq!(admitted["revision"], json!(hash));
@@ -434,7 +451,7 @@ async fn trustee_admits_no_pod_the_kms_would_not() {
     refused_with(
         h,
         "trustee.attest",
-        t.attest(&pod_token(h, &pod, &[]), &pod.initdata).await,
+        t.attest(&t.pod_token(&pod, &[]), &pod.initdata).await,
         "attestation_unknown",
         "is not registered",
     )
@@ -446,7 +463,7 @@ async fn trustee_admits_no_pod_the_kms_would_not() {
     refused_with(
         h,
         "trustee.attest",
-        t.attest(&pod_token(h, &pod, &[]), &other.initdata).await,
+        t.attest(&t.pod_token(&pod, &[]), &other.initdata).await,
         "attestation_failed",
         "MRCONFIGID is not the digest",
     )
@@ -457,28 +474,28 @@ async fn trustee_admits_no_pod_the_kms_would_not() {
     refused_with(
         h,
         "trustee.attest",
-        t.attest(&pod_token(h, &as_gpu, &[]), &pod.initdata).await,
+        t.attest(&t.pod_token(&as_gpu, &[]), &pod.initdata).await,
         "attestation_unknown",
         "no kata-tdx reference value",
     )
     .await;
     // A token Trustee marked anything but affirming, and one already expired.
-    let mut warned: Value = alpha_trustee::ear::token_payload(&pod_token(h, &pod, &[])).unwrap();
+    let mut warned = pod_payload(h, &pod, &[]);
     warned["submods"]["cpu0"]["ear.status"] = json!("warning");
     refused_with(
         h,
         "trustee.attest",
-        t.attest(&token(&warned), &pod.initdata).await,
+        t.attest(&t.sign(&warned), &pod.initdata).await,
         "attestation_failed",
         "not affirming",
     )
     .await;
-    let mut expired = alpha_trustee::ear::token_payload(&pod_token(h, &pod, &[])).unwrap();
+    let mut expired = pod_payload(h, &pod, &[]);
     expired["exp"] = json!(h.now().duration_since(UNIX_EPOCH).unwrap().as_secs());
     refused_with(
         h,
         "trustee.attest",
-        t.attest(&token(&expired), &pod.initdata).await,
+        t.attest(&t.sign(&expired), &pod.initdata).await,
         "attestation_failed",
         "expired",
     )
@@ -487,7 +504,7 @@ async fn trustee_admits_no_pod_the_kms_would_not() {
     refused_with(
         h,
         "trustee.attest",
-        t.attest(&pod_token(h, &pod, &[b300("u0")]), &pod.initdata)
+        t.attest(&t.pod_token(&pod, &[b300("u0")]), &pod.initdata)
             .await,
         "attestation_failed",
         "runs none",
@@ -499,13 +516,13 @@ async fn trustee_admits_no_pod_the_kms_would_not() {
     gpu_pod.register(h, &t.admin).await;
     let eight: Vec<Value> = (0..8).map(|i| b300(&format!("u{i}"))).collect();
     let (status, reply) = t
-        .attest(&pod_token(h, &gpu_pod, &eight), &gpu_pod.initdata)
+        .attest(&t.pod_token(&gpu_pod, &eight), &gpu_pod.initdata)
         .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
     refused_with(
         h,
         "trustee.attest",
-        t.attest(&pod_token(h, &gpu_pod, &eight[..7]), &gpu_pod.initdata)
+        t.attest(&t.pod_token(&gpu_pod, &eight[..7]), &gpu_pod.initdata)
             .await,
         "attestation_failed",
         "7",
@@ -516,7 +533,7 @@ async fn trustee_admits_no_pod_the_kms_would_not() {
     refused_with(
         h,
         "trustee.attest",
-        t.attest(&pod_token(h, &gpu_pod, &off), &gpu_pod.initdata)
+        t.attest(&t.pod_token(&gpu_pod, &off), &gpu_pod.initdata)
             .await,
         "attestation_failed",
         "gpu 4",
@@ -538,7 +555,7 @@ async fn a_revocation_reaches_trustee_at_the_next_release_and_the_next_state() {
         .grant(app, json!([{ "type": "secret", "tag": "*" }]), h.now())
         .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
-    let tok = pod_token(h, &pod, &[]);
+    let tok = t.pod_token(&pod, &[]);
     assert_eq!(t.attest(&tok, &pod.initdata).await.0, StatusCode::OK);
     let (_, state) = t.state().await;
     assert_eq!(state["admitted"].as_array().unwrap().len(), 1);
@@ -566,7 +583,7 @@ async fn a_revocation_reaches_trustee_at_the_next_release_and_the_next_state() {
     refused_with(
         h,
         "trustee.attest",
-        t.attest(&pod_token(h, &pod, &[]), &pod.initdata).await,
+        t.attest(&t.pod_token(&pod, &[]), &pod.initdata).await,
         "revision_revoked",
         "revision is revoked",
     )
@@ -595,7 +612,7 @@ async fn an_app_releases_nothing_through_trustee_until_its_tenant_opts_in() {
     let pod = Pod::cpu(app);
     pod.register(h, &t.admin).await;
     h.put_secret("db", &[app], b"v", h.now(), &t.admin).await;
-    let tok = pod_token(h, &pod, &[]);
+    let tok = t.pod_token(&pod, &[]);
     assert_eq!(t.attest(&tok, &pod.initdata).await.0, StatusCode::OK);
     let resource = format!("kbs:///{app}/secret/db");
     refused_with(
@@ -730,7 +747,7 @@ async fn trustee_acting_on_stale_state_releases_nothing() {
     h.put_secret("db", &[app], b"v", h.now(), &t.admin).await;
     t.grant(app, json!([{ "type": "secret", "tag": "db" }]), h.now())
         .await;
-    let tok = pod_token(h, &pod, &[]);
+    let tok = t.pod_token(&pod, &[]);
     assert_eq!(t.attest(&tok, &pod.initdata).await.0, StatusCode::OK);
     let resource = format!("kbs:///{app}/secret/db");
     let now = h.now();
@@ -776,7 +793,7 @@ async fn a_trustee_build_the_document_does_not_list_gets_nothing() {
     let app = AppId::mint();
     let pod = Pod::cpu(app);
     pod.register(h, &t.admin).await;
-    let tok = pod_token(h, &pod, &[]);
+    let tok = t.pod_token(&pod, &[]);
     let body = json!({ "token": tok, "initdata": BASE64_URL_SAFE_NO_PAD.encode(&pod.initdata) });
     for (path, body) in [
         ("/v1/trustee/attestations", Some(body)),
@@ -881,7 +898,7 @@ async fn the_policy_never_admits_a_trustee_app_and_a_tampered_grant_stops_the_st
     let h = &t.h;
     // The Trustee pod attested through a Trustee, with a validly signed grant written past the
     // route's refusal: still not in the policy, and nothing of it released.
-    let tok = pod_token(h, &t.pod, &[]);
+    let tok = t.pod_token(&t.pod, &[]);
     assert_eq!(t.attest(&tok, &t.pod.initdata).await.0, StatusCode::OK);
     let at = h.now();
     let document = json!({ "app_id": t.pod.app, "resources": [{ "type": "key", "tag": "*" }],
@@ -917,4 +934,132 @@ async fn the_policy_never_admits_a_trustee_app_and_a_tampered_grant_stops_the_st
         .await
         .unwrap();
     refused_with(h, "trustee.state", t.state().await, "signature_invalid", "").await;
+}
+
+#[tokio::test]
+async fn no_claim_is_believed_from_a_token_the_trustee_apps_key_did_not_sign() {
+    let Some(t) = trustee().await else {
+        return;
+    };
+    let h = &t.h;
+    let app = AppId::mint();
+    let pod = Pod::cpu(app);
+    pod.register(h, &t.admin).await;
+    h.put_secret("db", &[app], b"v", h.now(), &t.admin).await;
+    t.grant(app, json!([{ "type": "secret", "tag": "db" }]), h.now())
+        .await;
+    let claims = pod_payload(h, &pod, &[]);
+    let other = token_signing_key(&[42u8; 32]).unwrap();
+    let none = format!(
+        "{}.{}.",
+        BASE64_URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#),
+        BASE64_URL_SAFE_NO_PAD.encode(claims.to_string())
+    );
+    let mut expired = claims.clone();
+    expired["exp"] = json!(h.now().duration_since(UNIX_EPOCH).unwrap().as_secs() - 1);
+    // Another Trustee App's key: a pod of another App, registered like any, signs as Trustee.
+    let rogue = h.app_key(AppId::mint(), AS_TOKEN_PURPOSE);
+    for (tok, reason) in [
+        (token(&claims), "signature is not 64 bytes"),
+        (signed(&claims, &other), "other than the Trustee App's"),
+        (
+            signed_with(&json!({ "alg": "ES256" }), &claims, &other),
+            "does not verify",
+        ),
+        (
+            signed(&claims, &token_signing_key(&rogue).unwrap()),
+            "other than the Trustee App's",
+        ),
+        (none, "alg \"none\" is not ES256"),
+        (
+            signed_with(&json!({ "alg": "HS256" }), &claims, &t.as_key()),
+            "is not ES256",
+        ),
+        (
+            signed_with(
+                &json!({ "alg": "ES256", "kid": "as" }),
+                &claims,
+                &t.as_key(),
+            ),
+            "kid is not pinned",
+        ),
+        (t.sign(&expired), "expired"),
+    ] {
+        refused_with(
+            h,
+            "trustee.attest",
+            t.attest(&tok, &pod.initdata).await,
+            "attestation_failed",
+            reason,
+        )
+        .await;
+        // Nothing was admitted on it.
+        refused_with(
+            h,
+            "trustee.release",
+            t.release(&tok, &format!("kbs:///{app}/secret/db"), h.now())
+                .await,
+            "attestation_unknown",
+            "no admitted attestation",
+        )
+        .await;
+    }
+    // The same claims under the Trustee App's own key: admitted and released.
+    let tok = t.sign(&claims);
+    let (status, reply) = t.attest(&tok, &pod.initdata).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let (status, reply) = t
+        .release(&tok, &format!("kbs:///{app}/secret/db"), h.now())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+}
+
+#[tokio::test]
+async fn a_release_holds_the_admitted_pod_to_the_platform_document_as_it_is_now() {
+    let Some(t) = trustee().await else {
+        return;
+    };
+    let h = &t.h;
+    let app = AppId::mint();
+    let pod = Pod::cpu(app);
+    pod.register(h, &t.admin).await;
+    h.put_secret("db", &[app], b"v", h.now(), &t.admin).await;
+    t.grant(app, json!([{ "type": "secret", "tag": "db" }]), h.now())
+        .await;
+    let tok = t.pod_token(&pod, &[]);
+    assert_eq!(t.attest(&tok, &pod.initdata).await.0, StatusCode::OK);
+    let resource = format!("kbs:///{app}/secret/db");
+    assert_eq!(t.release(&tok, &resource, h.now()).await.0, StatusCode::OK);
+
+    // A new document no longer lists the CPU guest image the pod was admitted on.
+    let mut recaptured = document(4, &[t.pod.hash()], 300);
+    for rv in recaptured["reference_values"].as_array_mut().unwrap() {
+        if rv["runtime_class"] == json!(alpha_core::coco::CPU_RUNTIME_CLASS) {
+            rv["values"]["mrtd"] = json!(m(0x77));
+        }
+    }
+    publish(h, recaptured).await;
+    refused_with(
+        h,
+        "trustee.release",
+        t.release(&tok, &resource, h.now()).await,
+        "attestation_unknown",
+        "no kata-tdx reference value",
+    )
+    .await;
+    // Nor the TCB status it was admitted with.
+    let mut stricter = document(5, &[t.pod.hash()], 300);
+    stricter["policy"]["tcb_statuses"] = json!(["OutOfDate"]);
+    publish(h, stricter).await;
+    refused_with(
+        h,
+        "trustee.release",
+        t.release(&tok, &resource, h.now()).await,
+        "policy_denied",
+        "tcb_status UpToDate",
+    )
+    .await;
+    // Listed again: released again, so it was the document that refused.
+    publish(h, document(6, &[t.pod.hash()], 300)).await;
+    assert_eq!(t.release(&tok, &resource, h.now()).await.0, StatusCode::OK);
 }

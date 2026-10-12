@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select trustee_revision, revision, app_id, org_id, mrconfigid, expires_at\n         from trustee_attestations where token_sha256 = $1",
+  "query": "select trustee_revision, revision, app_id, org_id, mrconfigid, expires_at, token\n         from trustee_attestations where token_sha256 = $1",
   "describe": {
     "columns": [
       {
@@ -68,6 +68,17 @@
             "name": "expires_at"
           }
         }
+      },
+      {
+        "ordinal": 6,
+        "name": "token",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "trustee_attestations",
+            "name": "token"
+          }
+        }
       }
     ],
     "parameters": {
@@ -81,8 +92,9 @@
       false,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "0d63d90afcb93fa9210f338493866dfb7fd2936232fb0bf3dc67f87e211f4dcc"
+  "hash": "f5a491c7af517517cad48df06e32f7e38e67672e459f8d2414b1fd5462af908c"
 }

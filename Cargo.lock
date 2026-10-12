@@ -357,6 +357,7 @@ dependencies = [
  "alpha-core",
  "base64 0.23.1",
  "hex",
+ "p256 0.14.0",
  "serde",
  "serde_json",
  "sha2 0.11.0",

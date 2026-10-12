@@ -10,12 +10,18 @@
 //! (`deps/verifier/src/nvidia/nras_response.rs`).
 //!
 //! The KMS reads a token its own Trustee pod's KBS issued and the pod's feed handed it from inside
-//! the same TD. It does not check the token's signature, which the KBS does; it checks what the
-//! claims say against its own platform document and Revisions.
+//! the same TD, and believes no claim of it before [`verify_token`] has checked its signature
+//! under the Trustee App's token-signing key, which the KMS derives itself (the key the feed
+//! gives the Attestation Service, [`AS_TOKEN_PURPOSE`]); it then checks what the claims say
+//! against its own platform document and Revisions.
 
-use alpha_attest::Measurement;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use alpha_attest::{Measured, Measurement};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
+use p256::ecdsa::signature::Verifier;
+use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -26,7 +32,105 @@ const ANNOTATED: &str = "ear.veraison.annotated-evidence";
 /// A TDX quote's `tee_type`, as Trustee writes it (little-endian `0x81`).
 pub const TDX_TEE_TYPE: &str = "81000000";
 
-/// The JSON payload of a JWT, unverified.
+/// The purpose of the Trustee App's derived key (`/v1/keys/derive`) that its Attestation Service
+/// signs tokens with: the same in every Trustee pod of the App, so a token one replica's KBS
+/// issued verifies at the other's, and the KMS, which derives it, verifies every token under it.
+pub const AS_TOKEN_PURPOSE: &str = "trustee.as-token";
+/// The one algorithm Trustee v0.21.0's Attestation Service signs EARs with
+/// (`attestation-service/src/ear_token/broker.rs`: `ear::new_jwt_header(&Algorithm::ES256)`, a
+/// P-256 signer key and no other).
+pub const TOKEN_ALG: &str = "ES256";
+/// How far ahead of the KMS's clock a token's `iat` or `nbf` may be.
+const CLOCK_SKEW: Duration = Duration::from_secs(60);
+
+/// The P-256 key the 32 bytes the KMS derives for [`AS_TOKEN_PURPOSE`] are the scalar of.
+pub fn token_signing_key(derived: &[u8; 32]) -> Result<SigningKey, String> {
+    SigningKey::from_bytes(derived.into()).map_err(|e| format!("attestation token key: {e}"))
+}
+
+/// A token's JSON payload once its signature and lifetime hold. Trustee v0.21.0's Attestation
+/// Service signs ES256 with its configured key and puts that key's public JWK in the header (and
+/// no `kid`). The key is never taken from the token: it is the one the caller passes, the Trustee
+/// App's derived key. Refused: a header naming any `alg` but ES256 (`none` included), a `crit`
+/// header, a `kid` (none is pinned), a header `jwk` that is not `key`, a signature that does not
+/// verify under `key`, no `exp` or `iat`, `exp` not after now, `iat` or `nbf` after now (with a
+/// minute's skew).
+pub fn verify_token(token: &str, key: &VerifyingKey, now: SystemTime) -> Result<Value, String> {
+    let bad = |m: &str| format!("token: {m}");
+    let mut parts = token.split('.');
+    let (Some(h), Some(p), Some(s), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(bad("not a compact JWS"));
+    };
+    let decode = |what: &str, part: &str| {
+        BASE64_URL_SAFE_NO_PAD
+            .decode(part)
+            .map_err(|_| bad(&format!("{what} is not base64url")))
+    };
+    let header: Value =
+        serde_json::from_slice(&decode("header", h)?).map_err(|e| bad(&format!("header: {e}")))?;
+    let header = header
+        .as_object()
+        .ok_or_else(|| bad("header is not an object"))?;
+    match header.get("alg").and_then(Value::as_str) {
+        Some(TOKEN_ALG) => {}
+        Some(alg) => return Err(bad(&format!("alg {alg:?} is not {TOKEN_ALG}"))),
+        None => return Err(bad("names no alg")),
+    }
+    if header.contains_key("crit") {
+        return Err(bad("the header names critical extensions"));
+    }
+    if header.contains_key("kid") {
+        return Err(bad("kid is not pinned: Trustee's tokens name none"));
+    }
+    if let Some(jwk) = header.get("jwk")
+        && !is_public_jwk_of(jwk, key)
+    {
+        return Err(bad("signed by a key other than the Trustee App's"));
+    }
+    let signature = Signature::from_slice(&decode("signature", s)?)
+        .map_err(|_| bad("signature is not 64 bytes"))?;
+    key.verify(format!("{h}.{p}").as_bytes(), &signature)
+        .map_err(|_| bad("signature does not verify under the Trustee App's key"))?;
+    let payload: Value = serde_json::from_slice(&decode("payload", p)?)
+        .map_err(|e| bad(&format!("payload: {e}")))?;
+
+    let now = now.duration_since(UNIX_EPOCH).unwrap_or_default();
+    let at = |name: &str| {
+        payload
+            .get(name)
+            .and_then(Value::as_u64)
+            .map(Duration::from_secs)
+    };
+    let exp = at("exp").ok_or_else(|| bad("no exp"))?;
+    if exp <= now {
+        return Err(bad("expired"));
+    }
+    let iat = at("iat").ok_or_else(|| bad("no iat"))?;
+    let early = now.saturating_add(CLOCK_SKEW);
+    if iat > early || at("nbf").is_some_and(|nbf| nbf > early) {
+        return Err(bad("not yet valid"));
+    }
+    Ok(payload)
+}
+
+/// `jwk` is `key` as an EC P-256 public JWK (as Trustee writes it, coordinates 32 bytes each).
+fn is_public_jwk_of(jwk: &Value, key: &VerifyingKey) -> bool {
+    let text = |name: &str| jwk.get(name).and_then(Value::as_str);
+    let coord = |name: &str| text(name).and_then(|c| BASE64_URL_SAFE_NO_PAD.decode(c).ok());
+    let (Some(x), Some(y)) = (coord("x"), coord("y")) else {
+        return false;
+    };
+    let point = [&[4u8][..], &x, &y].concat();
+    text("kty") == Some("EC")
+        && text("crv") == Some("P-256")
+        && jwk.get("d").is_none()
+        && point.as_slice() == key.to_sec1_point(false).as_bytes()
+}
+
+/// The JSON payload of a JWT, unverified: for bookkeeping (the feed's session expiry), never for a
+/// decision, which takes [`verify_token`].
 pub fn token_payload(token: &str) -> Result<Value, String> {
     let mut parts = token.split('.');
     let (Some(_), Some(payload), Some(_), None) =
@@ -94,6 +198,20 @@ fn index_of(name: &str, class: &str) -> Option<usize> {
 }
 
 impl PodClaims {
+    /// The TD's registers as the KMS's own appraisal holds them, every one of them, so the
+    /// reference value is chosen by the one rule `kata-tdx/1` uses
+    /// ([`alpha_attest::kata::kata_tdx_reference`]).
+    pub fn measured(&self) -> Measured {
+        Measured {
+            mrtd: self.mrtd,
+            rtmr0: self.rtmr0,
+            rtmr1: self.rtmr1,
+            rtmr2: self.rtmr2,
+            rtmr3: self.rtmr3,
+            mrconfigid: Some(self.mrconfigid),
+        }
+    }
+
     /// Every submodule affirming, one TD, GPUs `gpu0` to `gpu<n-1>` with NRAS claims each.
     pub fn from_payload(payload: &Value) -> Result<Self, String> {
         let submods = object(
@@ -232,7 +350,8 @@ pub mod sample {
         })
     }
 
-    /// `payload` as the unsigned JWT the feed would pass on (the signature is the KBS's business).
+    /// `payload` as a JWT with a placeholder signature: what the feed passes on is opaque to it,
+    /// and the KMS refuses this one ([`super::verify_token`]).
     pub fn token(payload: &Value) -> String {
         use base64::Engine;
         use base64::prelude::BASE64_URL_SAFE_NO_PAD;
@@ -240,6 +359,44 @@ pub mod sample {
             "{}.{}.c2ln",
             BASE64_URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT"}"#),
             BASE64_URL_SAFE_NO_PAD.encode(payload.to_string())
+        )
+    }
+
+    /// `key`'s public JWK as Trustee's Attestation Service writes it into a token's header.
+    pub fn public_jwk(key: &p256::ecdsa::SigningKey) -> Value {
+        use base64::Engine;
+        use base64::prelude::BASE64_URL_SAFE_NO_PAD;
+        let point = key.verifying_key().to_sec1_point(false);
+        let coord = |c: Option<&[u8]>| BASE64_URL_SAFE_NO_PAD.encode(c.unwrap_or_default());
+        json!({ "alg": "ES256", "kty": "EC", "crv": "P-256",
+                "x": coord(point.x().map(|x| x.as_slice())),
+                "y": coord(point.y().map(|y| y.as_slice())) })
+    }
+
+    /// `payload` signed with `header` by `key`, ES256 as a JWS signature (r ‖ s).
+    pub fn signed_with(header: &Value, payload: &Value, key: &p256::ecdsa::SigningKey) -> String {
+        use base64::Engine;
+        use base64::prelude::BASE64_URL_SAFE_NO_PAD;
+        use p256::ecdsa::signature::Signer;
+        let input = format!(
+            "{}.{}",
+            BASE64_URL_SAFE_NO_PAD.encode(header.to_string()),
+            BASE64_URL_SAFE_NO_PAD.encode(payload.to_string())
+        );
+        let signature: p256::ecdsa::Signature = key.sign(input.as_bytes());
+        format!(
+            "{input}.{}",
+            BASE64_URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        )
+    }
+
+    /// `payload` as Trustee v0.21.0's Attestation Service signs an EAR with `key`: ES256, typ
+    /// JWT, the key's public JWK in the header, no `kid`.
+    pub fn signed(payload: &Value, key: &p256::ecdsa::SigningKey) -> String {
+        signed_with(
+            &json!({ "typ": "JWT", "alg": "ES256", "jwk": public_jwk(key) }),
+            payload,
+            key,
         )
     }
 }
@@ -382,5 +539,149 @@ mod tests {
         assert!(token_payload("a.b").is_err());
         assert!(token_payload("a.!!.c").is_err());
         assert!(token_payload("a.b.c.d").is_err());
+    }
+
+    fn as_key(byte: u8) -> SigningKey {
+        token_signing_key(&[byte; 32]).unwrap()
+    }
+
+    /// Within the sample's lifetime (`iat` 300 s before its `exp`, 1_800_000_000).
+    const NOW: u64 = 1_800_000_000 - 100;
+
+    fn at(secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    fn verify(token: &str) -> Result<Value, String> {
+        verify_token(token, as_key(1).verifying_key(), at(NOW))
+    }
+
+    #[test]
+    fn a_token_the_trustee_apps_key_signed_is_read() {
+        let p = sample(&[]);
+        let t = sample::signed(&p, &as_key(1));
+        assert_eq!(verify(&t).unwrap(), p);
+        // Trustee's header without the jwk, and with a key-pinning hint the KMS ignores.
+        let key = as_key(1);
+        for header in [
+            json!({ "alg": "ES256" }),
+            json!({ "alg": "ES256", "typ": "JWT", "jwk": sample::public_jwk(&key),
+                    "x5c": ["AAAA"] }),
+        ] {
+            assert_eq!(
+                verify(&sample::signed_with(&header, &p, &key)).unwrap(),
+                p,
+                "{header}"
+            );
+        }
+        // Valid from a minute ahead of the KMS's clock.
+        let mut early = p.clone();
+        early["iat"] = json!(NOW + 60);
+        early["nbf"] = json!(NOW + 60);
+        assert!(verify(&sample::signed(&early, &key)).is_ok());
+    }
+
+    #[test]
+    fn no_claim_is_read_from_a_token_the_trustee_apps_key_did_not_sign() {
+        let p = sample(&[]);
+        let key = as_key(1);
+        let other = as_key(2);
+        let none = format!(
+            "{}.{}.",
+            BASE64_URL_SAFE_NO_PAD.encode(br#"{"alg":"none","typ":"JWT"}"#),
+            BASE64_URL_SAFE_NO_PAD.encode(p.to_string())
+        );
+        let with_payload = |edit: &dyn Fn(&mut Value)| {
+            let mut p = p.clone();
+            edit(&mut p);
+            sample::signed(&p, &key)
+        };
+        let mut tampered = sample::signed(&p, &key);
+        let mut changed = p.clone();
+        changed["submods"]["cpu0"]["ear.status"] = json!("affirming!");
+        let body = BASE64_URL_SAFE_NO_PAD.encode(changed.to_string());
+        let parts: Vec<&str> = tampered.split('.').collect();
+        tampered = format!("{}.{body}.{}", parts[0], parts[2]);
+        let cases: Vec<(String, &str)> = vec![
+            // Unsigned: the sample's placeholder signature.
+            (sample::token(&p), "signature is not 64 bytes"),
+            (none.clone(), "alg \"none\" is not ES256"),
+            (format!("{none}c2ln"), "alg \"none\""),
+            (
+                sample::signed_with(&json!({ "typ": "JWT" }), &p, &key),
+                "names no alg",
+            ),
+            (
+                sample::signed_with(&json!({ "alg": "HS256" }), &p, &key),
+                "alg \"HS256\"",
+            ),
+            (
+                sample::signed_with(&json!({ "alg": "ES384" }), &p, &key),
+                "is not ES256",
+            ),
+            (
+                sample::signed_with(&json!({ "alg": "ES256", "kid": "k1" }), &p, &key),
+                "kid is not pinned",
+            ),
+            (
+                sample::signed_with(&json!({ "alg": "ES256", "crit": ["b64"] }), &p, &key),
+                "critical",
+            ),
+            // Signed by another key, naming it or naming the Trustee App's.
+            (sample::signed(&p, &other), "other than the Trustee App's"),
+            (
+                sample::signed_with(
+                    &json!({ "alg": "ES256", "jwk": sample::public_jwk(&key) }),
+                    &p,
+                    &other,
+                ),
+                "does not verify",
+            ),
+            (
+                sample::signed_with(&json!({ "alg": "ES256" }), &p, &other),
+                "does not verify",
+            ),
+            (tampered, "does not verify"),
+            (with_payload(&|p| p["exp"] = json!(NOW)), "expired"),
+            (with_payload(&|p| p["exp"] = json!(NOW - 1)), "expired"),
+            (
+                with_payload(&|p| {
+                    p.as_object_mut().unwrap().remove("exp");
+                }),
+                "no exp",
+            ),
+            (
+                with_payload(&|p| {
+                    p.as_object_mut().unwrap().remove("iat");
+                }),
+                "no iat",
+            ),
+            (
+                with_payload(&|p| p["iat"] = json!(NOW + 61)),
+                "not yet valid",
+            ),
+            (
+                with_payload(&|p| p["nbf"] = json!(NOW + 61)),
+                "not yet valid",
+            ),
+            ("a.b".into(), "not a compact JWS"),
+            ("a.b.c.d".into(), "not a compact JWS"),
+            ("!!.b.c".into(), "header is not base64url"),
+        ];
+        for (token, reason) in cases {
+            let error = verify(&token).unwrap_err();
+            assert!(error.contains(reason), "{reason}: {error}");
+        }
+    }
+
+    #[test]
+    fn the_registers_are_handed_on_whole() {
+        let claims = PodClaims::from_payload(&sample(&[])).unwrap();
+        let m = claims.measured();
+        assert_eq!(
+            [m.mrtd, m.rtmr0, m.rtmr1, m.rtmr2, m.rtmr3],
+            [1, 2, 3, 4, 5].map(|b| Measurement([b; 48]))
+        );
+        assert_eq!(m.mrconfigid, Some(Measurement([9; 48])));
     }
 }

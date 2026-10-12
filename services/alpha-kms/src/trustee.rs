@@ -3,13 +3,16 @@
 //! Revision v2, which must be registered here and listed in the platform document's
 //! `trustee.revisions`. Over mTLS with that leaf its feed:
 //!
-//! - reports each KBS attestation (`POST /v1/trustee/attestations`): the KMS reads the token's
-//!   claims, rebuilds the pod's Revision v2 from the init-data the pod sent, and admits the pod
-//!   only if its own rules would (reference values, TCB policy, the registered and unrevoked
-//!   Revision, its GPUs);
+//! - reports each KBS attestation (`POST /v1/trustee/attestations`): the KMS verifies the token's
+//!   signature under the Trustee App's token key, which it derives itself
+//!   ([`alpha_trustee::ear::AS_TOKEN_PURPOSE`]), reads its claims, rebuilds the pod's Revision v2
+//!   from the init-data the pod sent, and admits the pod only if its own rules would (reference
+//!   values, TCB policy, the registered and unrevoked Revision, its GPUs);
 //! - asks for one resource for one admitted pod (`POST /v1/trustee/releases`): released only if
-//!   the pod's Revision is still good, the resource is its own App's, the App's tenant-signed
-//!   grant covers it, and the pod's state is fresh; audited with the pod's Revision;
+//!   the admitted token still verifies and its claims still pass those rules under the platform
+//!   document as it is now, the pod's Revision is still good, the resource is its own App's, the
+//!   App's tenant-signed grant covers it, and the pod's state is fresh; audited with the pod's
+//!   Revision;
 //! - fetches what its Trustee decides by (`GET /v1/trustee/state`), generated now from the
 //!   Revisions, grants and platform document, valid for `trustee.max_state_age_secs`;
 //! - gets its KBS's TLS leaf (`POST /v1/trustee/kbs-leaf`), over its own attested key, naming
@@ -20,13 +23,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use alpha_attest::gpu::{self, GpuAppraisal, nras};
-use alpha_attest::{
-    AppraisalError, GpuVerifierKind, Measurement, PlatformDocument, ReferenceKind, VerifiedGpu,
-};
+use alpha_attest::kata::kata_tdx_reference;
+use alpha_attest::{AppraisalError, GpuVerifierKind, Measurement, PlatformDocument, VerifiedGpu};
 use alpha_client::tls::PeerCerts;
 use alpha_core::coco::{CocoRevision, InitData};
 use alpha_core::{AppId, ComposeHash, OrgId, Trustee, context};
-use alpha_trustee::ear::{PodClaims, token_payload};
+use alpha_trustee::ear::{AS_TOKEN_PURPOSE, PodClaims, token_signing_key, verify_token};
 use alpha_trustee::policy::{self, AS_POLICY_CPU, AS_POLICY_GPU};
 use alpha_trustee::resource::{GrantEntry, Resource, ResourceType};
 use alpha_trustee::wire;
@@ -36,8 +38,10 @@ use axum::extract::{Extension, State};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
+use p256::ecdsa::VerifyingKey;
 use serde_json::{Value, json};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::audit::Audit;
 use crate::certs::{self, InstanceIdentity};
@@ -174,10 +178,13 @@ fn body<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, ApiError> {
 }
 
 /// What the KMS's own rules say of a pod Trustee attested: the registers one `kata-tdx` reference
-/// value of the Revision's runtime class, the TCB policy, no debug, and exactly the Revision's GPUs
-/// as the KMS's GPU decision (`alpha_attest::gpu::check_gpus`) takes them. Trustee has checked the
+/// value of the Revision's runtime class by `kata-tdx/1`'s own rule (every register handed to
+/// [`kata_tdx_reference`], which compares MRTD and RTMR0..2 and, as the profile does, not the
+/// guest's runtime register RTMR3), the TCB policy, no debug, and exactly the Revision's GPUs as
+/// the KMS's GPU decision (`alpha_attest::gpu::check_gpus`) takes them. Trustee has checked the
 /// quote's signature and collateral, the init-data's digest against MRCONFIGID, the nonces and
-/// NRAS's signatures; this is every policy decision on what those checks found.
+/// NRAS's signatures, and the KMS that Trustee's key signed the token; this is every policy
+/// decision on what those checks found.
 pub fn check_claims(
     doc: &PlatformDocument,
     revision: &CocoRevision,
@@ -185,15 +192,7 @@ pub fn check_claims(
 ) -> Result<(), ApiError> {
     use AppraisalError::*;
 
-    let reference = doc.reference_values.iter().find(|rv| {
-        rv.kind == ReferenceKind::KataTdx
-            && rv.runtime_class.as_deref() == Some(revision.runtime_class.as_str())
-            && rv.values.mrtd == claims.mrtd
-            && rv.values.rtmr0 == claims.rtmr0
-            && rv.values.rtmr1 == claims.rtmr1
-            && rv.values.rtmr2 == claims.rtmr2
-    });
-    if reference.is_none() {
+    if kata_tdx_reference(doc, &revision.runtime_class, &claims.measured()).is_none() {
         return Err(Unknown(format!(
             "no kata-tdx reference value for mrtd {} and runtime class {}",
             claims.mrtd, revision.runtime_class
@@ -270,6 +269,43 @@ pub fn check_claims(
         &[0; 32],
     )?;
     Ok(())
+}
+
+/// The key the Attestation Service of `trustee`'s App signs tokens with: the App's derived key for
+/// [`AS_TOKEN_PURPOSE`], derived here exactly as the Trustee pod's feed got it from
+/// `/v1/keys/derive`. Pinned by the KMS's own key hierarchy to a Trustee build the release-signed
+/// platform document lists, never taken from a token's header nor fetched.
+async fn token_key(
+    node: &Node,
+    keys: &Intermediates,
+    trustee: &InstanceIdentity,
+) -> Result<VerifyingKey, ApiError> {
+    let derived =
+        instance::derive_key_inner(node, &keys.tenant_kek_root, trustee, AS_TOKEN_PURPOSE).await?;
+    let bytes = Zeroizing::new(
+        BASE64_URL_SAFE_NO_PAD
+            .decode(derived.key.as_bytes())
+            .map_err(|_| ApiError::internal("derived key"))?,
+    );
+    let scalar = Zeroizing::new(
+        <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| ApiError::internal("derived key"))?,
+    );
+    Ok(*token_signing_key(&scalar)
+        .map_err(ApiError::internal)?
+        .verifying_key())
+}
+
+/// A token's claims once it verifies under `trustee`'s token key, now.
+async fn verified_claims(
+    node: &Node,
+    keys: &Intermediates,
+    trustee: &InstanceIdentity,
+    token: &str,
+) -> Result<PodClaims, ApiError> {
+    let key = token_key(node, keys, trustee).await?;
+    verify_token(token, &key, node.now())
+        .and_then(|p| PodClaims::from_payload(&p))
+        .map_err(|e| ApiError::new("attestation_failed", e))
 }
 
 /// The pod's registered Revision v2, rebuilt from the init-data it sent, whose digest must be the
@@ -370,9 +406,7 @@ async fn admit(
     token_sha256: Option<&[u8]>,
 ) -> Result<(wire::Admitted, OrgId), ApiError> {
     let token_sha256 = token_sha256.ok_or_else(|| ApiError::internal("token digest"))?;
-    let claims = token_payload(&request.token)
-        .and_then(|p| PodClaims::from_payload(&p))
-        .map_err(|e| ApiError::new("attestation_failed", e))?;
+    let claims = verified_claims(node, keys, &caller.identity, &request.token).await?;
     let now = node.now();
     let expires = SystemTime::UNIX_EPOCH
         .checked_add(Duration::from_secs(claims.expires))
@@ -400,8 +434,8 @@ async fn admit(
     .execute(&mut *tx)
     .await?;
     let inserted = sqlx::query!(
-        "insert into trustee_attestations (token_sha256, trustee_revision, revision, app_id, org_id, mrconfigid, expires_at)
-         values ($1, $2, $3, $4, $5, $6, $7) on conflict (token_sha256) do nothing",
+        "insert into trustee_attestations (token_sha256, trustee_revision, revision, app_id, org_id, mrconfigid, expires_at, token)
+         values ($1, $2, $3, $4, $5, $6, $7, $8) on conflict (token_sha256) do nothing",
         token_sha256,
         caller.identity.compose_hash.as_bytes().as_slice(),
         hash.as_bytes().as_slice(),
@@ -409,6 +443,7 @@ async fn admit(
         row.org_id,
         &mrconfigid,
         expires_at,
+        request.token,
     )
     .execute(&mut *tx)
     .await?
@@ -595,7 +630,7 @@ async fn release_inner(
         .and_then(alpha_core::hex_bytes)
         .ok_or_else(|| ApiError::malformed("token_sha256: expected sha256:<hex>"))?;
     let row = sqlx::query!(
-        "select trustee_revision, revision, app_id, org_id, mrconfigid, expires_at
+        "select trustee_revision, revision, app_id, org_id, mrconfigid, expires_at, token
          from trustee_attestations where token_sha256 = $1",
         token_sha256.as_slice()
     )
@@ -616,6 +651,16 @@ async fn release_inner(
         ));
     }
     let revision = stored_hash(&row.revision)?;
+    recheck(
+        node,
+        keys,
+        caller,
+        &row.token,
+        &token_sha256,
+        registered_by,
+        revision,
+    )
+    .await?;
     let pod = Pod {
         org_id: row.org_id,
         app_id: row.app_id,
@@ -680,6 +725,41 @@ async fn release_inner(
         },
         pod,
     ))
+}
+
+/// The admitted row is not trusted alone: its token must still verify under the key of the Trustee
+/// App that reported it, and its claims must still pass [`check_claims`] for the pod's registered
+/// Revision v2 under the platform document as it is now. A reference value, TCB status, tolerated
+/// advisory or GPU rule withdrawn since admission refuses the release.
+async fn recheck(
+    node: &Node,
+    keys: &Intermediates,
+    caller: &Caller,
+    token: &str,
+    token_sha256: &[u8; 32],
+    registered_by: ComposeHash,
+    revision: ComposeHash,
+) -> Result<(), ApiError> {
+    if alpha_trustee::ear::token_sha256(token) != *token_sha256 {
+        return Err(ApiError::internal("stored token digest"));
+    }
+    let unknown = |m: &str| ApiError::new("attestation_unknown", m);
+    let reporter = load_revision(&node.pool, registered_by)
+        .await?
+        .ok_or_else(|| unknown("the Trustee build that reported this attestation is gone"))?;
+    let reporter = InstanceIdentity {
+        org_id: reporter.org_id.into(),
+        app_id: reporter.app_id.into(),
+        runtime_pubkey_sha256_hex: String::new(),
+        compose_hash: registered_by,
+    };
+    let claims = verified_claims(node, keys, &reporter, token).await?;
+    let row = load_revision(&node.pool, revision)
+        .await?
+        .ok_or_else(|| unknown("the attested pod's Revision is gone"))?;
+    let registered = CocoRevision::check_registered(&row.compose, row.app_id.into())
+        .map_err(|e| ApiError::new("attestation_failed", format!("registered Revision v2: {e}")))?;
+    check_claims(&caller.doc, &registered, &claims)
 }
 
 /// What the guest does with the value decides its form: a key-encryption key is 32 bytes, a
@@ -1034,6 +1114,45 @@ mod tests {
             "policy_denied",
             "driver version",
         );
+    }
+
+    /// Hacktron ACC-FD-102: the guest image is chosen by `kata-tdx/1`'s own rule, from every
+    /// register the token carries, so no TD passes here that the KMS's own appraisal refuses.
+    #[test]
+    fn the_guest_image_is_chosen_by_kata_tdx_1s_rule_from_every_register() {
+        let d = doc();
+        let cpu = revision(CPU_RUNTIME_CLASS, None);
+        let base = claims(0x10, &[]);
+        assert!(check_claims(&d, &cpu, &base).is_ok());
+        for register in 0..4 {
+            let mut c = base.clone();
+            let r = match register {
+                0 => &mut c.mrtd,
+                1 => &mut c.rtmr0,
+                2 => &mut c.rtmr1,
+                _ => &mut c.rtmr2,
+            };
+            r.0[47] ^= 1;
+            refused(
+                check_claims(&d, &cpu, &c),
+                "attestation_unknown",
+                "no kata-tdx reference value",
+            );
+        }
+        // RTMR3 alone differing gets kata-tdx/1's verdict on the same registers: the profile
+        // leaves the guest's runtime register out of the guest image, and binds what the pod runs
+        // by MRCONFIGID instead.
+        for byte in [0u8, 6, 0xee] {
+            let mut c = base.clone();
+            c.rtmr3 = Measurement([byte; 48]);
+            let kms = kata_tdx_reference(&d, CPU_RUNTIME_CLASS, &c.measured()).is_some();
+            assert_eq!(check_claims(&d, &cpu, &c).is_ok(), kms, "rtmr3 {byte:#x}");
+        }
+        // And no document can name an RTMR3 for either path to compare: it does not parse.
+        let mut pinned = serde_json::to_value(&d).unwrap();
+        pinned["reference_values"][0]["values"]["rtmr3"] = json!(format!("sha384:{}", hex48(5)));
+        let error = serde_json::from_value::<PlatformDocument>(pinned).unwrap_err();
+        assert!(error.to_string().contains("rtmr3"), "{error}");
     }
 
     #[test]

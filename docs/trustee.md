@@ -71,21 +71,34 @@ the value handed over once, for that path only, then dropped).
    (DCAP, the init-data against MRCONFIGID, RVPS reference values) and each GPU (NRAS) and issues a
    token. The gate passes that token back **only after** `POST /v1/trustee/attestations` with the
    token and the init-data the AA sent. alpha-kms:
+   - verifies the token before reading any claim (`alpha_trustee::ear::verify_token`): ES256 and
+     nothing else (Trustee v0.21.0's AS signs EARs ES256 with a P-256 key only), no `crit`, no
+     `kid`, a header `jwk` only if it is that key, the signature under the **Trustee App's
+     `trustee.as-token` key, which the KMS derives itself** for the reporting Trustee pod's App
+     (exactly as the feed got it from `/v1/keys/derive`), `exp` after now, `iat`/`nbf` not ahead
+     by more than a minute. The key is never taken from the token or fetched;
    - reads the token's claims (`alpha_trustee::ear`): every submodule `affirming`, one TDX TD,
      GPUs `gpu0..`;
    - rebuilds the pod's Revision v2 from the init-data, checks that its digest is the token's
      MRCONFIGID, that the Revision is registered, unrevoked and validly signed;
-   - applies its own rules to what Trustee found (`trustee::check_claims`): MRTD and RTMR0..2 one
-     `kata-tdx` reference value **of the Revision's runtime class**, `tcb_status` and advisories by
+   - applies its own rules to what Trustee found (`trustee::check_claims`): the guest image chosen
+     by `kata-tdx/1`'s own rule (`alpha_attest::kata::kata_tdx_reference`, handed every register):
+     MRTD and RTMR0..2 one `kata-tdx` reference value **of the Revision's runtime class**, RTMR3
+     not compared, as the profile does not (the guest's runtime register; a reference value
+     cannot name it, and what the pod runs is bound by MRCONFIGID), `tcb_status` and advisories by
      the document's `policy`, no debug TD, and for GPUs the same decision `/v1/attest` takes
      (`gpu::check_gpus`: count and model of the Revision, distinct devices, CC mode, every NRAS
      claim `nras::claim_report` requires, driver and VBIOS minimums);
-   - records the attestation (`trustee_attestations`, by the token's digest) and audits
+   - records the attestation (`trustee_attestations`, by the token's digest, with the token) and audits
      `trustee.attest` with the pod's Revision.
    Refused or unreachable, the pod gets no token.
 2. **Resource.** CDH asks `GET /kbs/v0/resource/<app>/<type>/<tag>` with the token. The gate asks
    `POST /v1/trustee/releases` first; alpha-kms releases only if:
    - the token is one a listed Trustee build reported and it has not expired (at most an hour);
+   - the stored token still verifies under the reporting Trustee App's key, and its claims still
+     pass `check_claims` for the pod's registered Revision **under the platform document as it is
+     now**: a reference value, TCB status, advisory or GPU rule withdrawn since admission refuses
+     the next read;
    - the pod's Revision is still registered, unrevoked and validly signed: **a revocation refuses
      the next read at once**;
    - the resource is the pod's own App's, never a Trustee App's, never a reserved purpose
@@ -131,7 +144,8 @@ use, so an edited row stops the state rather than admitting anything.
 |---|---|---|
 | TD genuine, collateral current | AS DCAP (`intel_dcap`), `collateral_expiration_status == "0"` | trusted from Trustee: the quote never reaches the KMS |
 | TCB status, advisories, debug | `default_cpu` from the document's `policy` | the same `policy`, re-applied to the token's claims |
-| Guest image | `default_cpu`: MRTD and RTMR0..2 one tuple of the RVPS value `alpha_kata_tdx`, generated from the document's `kata-tdx` reference values | one `kata-tdx` reference value **of the Revision's runtime class** |
+| Token | KBS: signed under the AS's certificate (`trusted_certs_paths`) | ES256 under the Trustee App's `trustee.as-token` key, derived by the KMS; re-verified on every release |
+| Guest image | `default_cpu`: MRTD and RTMR0..2 one tuple of the RVPS value `alpha_kata_tdx`, generated from the document's `kata-tdx` reference values | `kata-tdx/1`'s own rule (MRTD and RTMR0..2, not RTMR3) for one `kata-tdx` reference value **of the Revision's runtime class**, on every attestation and release |
 | Init-data binding | AS checks the init-data the AA sent against MRCONFIGID; `default_cpu` requires it was sent | rebuilds the Revision from the same init-data, checks its MRCONFIGID |
 | Revision | resource policy: MRCONFIGID one of the App's admitted Revisions (registered, unrevoked, signed, seen by a Trustee attestation); stale within the refresh interval | registered, unrevoked, signed **now**, on every attestation and release |
 | GPUs | `default_gpu`: every claim `nras::claims::REQUIRED` lists, an allowed hardware model, the document's CC-mode claim; resource policy: count and hardware model per Revision | `check_gpus` on the claims, versions included; refused unless `gpu_policy.verifiers` is exactly `[nras]` |
@@ -215,8 +229,11 @@ first end-to-end run is at G0 with a B300 pod.
    document. Through Trustee a GPU verdict rests on web PKI. Option: keep GPU pods off Option B
    until a pinned or local verifier is used.
 3. **The token-signing key** is the Trustee App's derived key `trustee.as-token`, shared by both
-   replicas; anyone with the Trustee App's leaf can derive it. The KMS never releases on a token
-   it was not given by a listed Trustee build, so a forged token is refused there too.
+   replicas; anyone with the Trustee App's leaf can derive it. The KMS derives the same key and
+   verifies every token's ES256 signature under it before believing a claim, at admission and
+   again at each release, and never releases on a token it was not given by a listed Trustee
+   build. Pinned by the KMS's own key hierarchy to the Trustee builds the release-signed document
+   lists: nothing is fetched, and nothing extra is copied into the document.
 4. **One request at a time** through the KBS's backend per Trustee pod: availability, not safety.
 5. **TLS** offers `X25519` beside `X25519MLKEM768` until G0; values are sealed to the TEE key
    (P-256) either way.

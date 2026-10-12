@@ -26,8 +26,8 @@ use crate::gpu::{
 };
 use crate::{
     AppraisalError, Appraised, Collateral, EVIDENCE_FORMAT, EVIDENCE_FORMAT_V2, EventLogEntry,
-    Evidence, Measurement, PlatformDocument, ReferenceKind, VerifiedQuote, base64url, event_log,
-    report_data,
+    Evidence, Measured, Measurement, PlatformDocument, ReferenceKind, ReferenceMeasurements,
+    ReferenceValue, VerifiedQuote, base64url, event_log, report_data,
 };
 
 pub const PROFILE_KATA_TDX: &str = "kata-tdx/1";
@@ -309,6 +309,43 @@ impl CpuAppraised {
     }
 }
 
+/// The `kata-tdx` reference value captured for `runtime_class` that a TD's registers match: the
+/// one rule `kata-tdx/1` chooses a guest image by, and the only one, so the KMS's Trustee path
+/// (alpha-kms `trustee::check_claims`) holds a pod Trustee attested to exactly this.
+///
+/// MRTD and RTMR0..2 must equal the value's. RTMR3 is not compared, by design: it is the guest's
+/// runtime register, extended from inside the TD after boot (the attestation agent's event log,
+/// the images it pulls), so no captured value could hold it, and a reference value that names one
+/// does not parse ([`crate::ReferenceMeasurements`]). What a Kata pod runs past its guest image is
+/// bound by MRCONFIGID, its init-data and agent policy, which the profile requires next. Both
+/// registers sets are destructured whole, so a register added to either is a compile error here
+/// until this rule decides it.
+pub fn kata_tdx_reference<'a>(
+    doc: &'a PlatformDocument,
+    runtime_class: &str,
+    measured: &Measured,
+) -> Option<&'a ReferenceValue> {
+    let Measured {
+        mrtd,
+        rtmr0,
+        rtmr1,
+        rtmr2,
+        rtmr3: _,
+        mrconfigid: _,
+    } = measured;
+    doc.reference_values.iter().find(|rv| {
+        let ReferenceMeasurements {
+            mrtd: ref_mrtd,
+            rtmr0: ref_rtmr0,
+            rtmr1: ref_rtmr1,
+            rtmr2: ref_rtmr2,
+        } = &rv.values;
+        rv.kind == ReferenceKind::KataTdx
+            && rv.runtime_class.as_deref() == Some(runtime_class)
+            && [ref_mrtd, ref_rtmr0, ref_rtmr1, ref_rtmr2] == [mrtd, rtmr0, rtmr1, rtmr2]
+    })
+}
+
 /// The TD half of `kata-tdx/1`, over a quote [`crate::verify_quote`] has already verified. Pure,
 /// so the malicious-host cases are tests over synthetic quotes.
 pub fn appraise_kata_cpu(
@@ -352,24 +389,13 @@ pub fn appraise_kata_cpu(
     // that names no class, never stands in, so a TD booted from the NVIDIA guest image cannot pass
     // as the CPU class (whose GPU checks are skipped), nor the CPU guest as the GPU class, provided
     // the two guests' captured registers differ (confirmed at capture).
-    let reference = doc
-        .reference_values
-        .iter()
-        .find(|rv| {
-            rv.kind == ReferenceKind::KataTdx
-                && rv.runtime_class.as_deref() == Some(class.name())
-                && rv.values.mrtd == measured.mrtd
-                && rv.values.rtmr0 == measured.rtmr0
-                && rv.values.rtmr1 == measured.rtmr1
-                && rv.values.rtmr2 == measured.rtmr2
-        })
-        .ok_or_else(|| {
-            Unknown(format!(
-                "no kata-tdx reference value for mrtd {} and runtime class {}",
-                measured.mrtd,
-                class.name()
-            ))
-        })?;
+    let reference = kata_tdx_reference(doc, class.name(), &measured).ok_or_else(|| {
+        Unknown(format!(
+            "no kata-tdx reference value for mrtd {} and runtime class {}",
+            measured.mrtd,
+            class.name()
+        ))
+    })?;
 
     let initdata =
         InitData::parse(&evidence.initdata).map_err(|e| Failed(format!("init-data: {e}")))?;
