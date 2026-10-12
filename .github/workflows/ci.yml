@@ -91,3 +91,28 @@ jobs:
       - name: malicious-host core suite
         run: cargo test -p alpha-kms --test malicious_host
       - run: cargo test --workspace
+
+  # PRD-02 deliverable 18, live layer: the hostile actions done against a deployed test App
+  # (scripts/malicious-host-live.sh). Skipped unless the repository variable LIVE_CLUSTER is set;
+  # the runner (LIVE_CLUSTER_RUNNER) must reach the cluster's API server.
+  malicious-host-live:
+    if: ${{ vars.LIVE_CLUSTER != '' }}
+    runs-on: ${{ vars.LIVE_CLUSTER_RUNNER || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: malicious-host full suite (live)
+        shell: bash
+        env:
+          LIVE_CLUSTER_KUBECONFIG: ${{ secrets.LIVE_CLUSTER_KUBECONFIG }}
+          MHS_NAMESPACE: ${{ vars.MHS_NAMESPACE }}
+          MHS_DEPLOYMENT: ${{ vars.MHS_DEPLOYMENT }}
+        run: |
+          if [ -z "$LIVE_CLUSTER_KUBECONFIG" ]; then
+            echo "LIVE_CLUSTER is set but the LIVE_CLUSTER_KUBECONFIG secret is not: skipped"
+            exit 0
+          fi
+          export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
+          ( umask 077 && printf '%s' "$LIVE_CLUSTER_KUBECONFIG" > "$KUBECONFIG" )
+          scripts/malicious-host-live.sh
