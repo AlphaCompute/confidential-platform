@@ -24,6 +24,7 @@ use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 
 pub mod cert;
+pub mod coco;
 pub mod compose;
 pub mod frame;
 pub mod handshake;
