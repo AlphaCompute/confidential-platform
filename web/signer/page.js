@@ -71,7 +71,7 @@ const MESSAGES = {
   unreadable:
     "This page cannot read what the service asked you to approve, so it cannot show it to you. Nothing was signed.",
   no_initdata:
-    "The service did not send this pod's init-data, so this page cannot show its images or agent policy. Approving registers them by the digests under Technical details.",
+    "The service did not send this pod's init-data, so this page cannot show its images or agent policy. Nothing was signed.",
   approved: "Approved. You can close this tab.",
   declined: "Declined. You can close this tab.",
   secret_missing: "Enter a value for every secret.",
@@ -783,7 +783,8 @@ function revisionLaunch(read, extra) {
     return { refusal: MESSAGES.mismatch };
   }
   const initdata = read.initdata == null ? undefined : read.initdata;
-  if (initdata !== undefined && typeof initdata !== "string") {
+  if (initdata === undefined) return { refusal: MESSAGES.no_initdata };
+  if (typeof initdata !== "string") {
     return { refusal: MESSAGES.unreadable };
   }
   try {
