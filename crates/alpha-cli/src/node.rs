@@ -204,6 +204,10 @@ pub struct ShareFile {
     pub share_hpke: Sealed,
     pub kms_node_spki_sha256: String,
     pub platform_document_version: u64,
+    /// The database's volume key wrapped under the root KEK (M2(a)): sent with the share, it lets
+    /// a node unsealed while the database is closed open it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db_volume_wrapped: Option<String>,
 }
 
 impl ShareFile {
@@ -287,6 +291,7 @@ pub async fn bootstrap(
             share_hpke,
             kms_node_spki_sha256: sha256_label(&node.runtime_spki),
             platform_document_version: doc_version,
+            db_volume_wrapped: payload.db_volume_wrapped.clone(),
         }
         .write(&path)?;
         paths.push(path);
@@ -316,7 +321,11 @@ pub async fn unseal(
         file.write(share_path)?;
     }
     client
-        .unseal(&UnsealRequest { share_hpke })
+        .unseal(&UnsealRequest {
+            share_hpke,
+            db_volume_wrapped: file.db_volume_wrapped.clone(),
+            platform_document_version: Some(doc_version),
+        })
         .await
         .map_err(|e| e.to_string())
 }
@@ -448,6 +457,7 @@ mod tests {
             },
             kms_node_spki_sha256: sha256_label(b"node"),
             platform_document_version: 3,
+            db_volume_wrapped: Some("d2".into()),
         };
         file.write(&path).unwrap();
         let back = ShareFile::read(&path).unwrap();

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into intermediate_keys (purpose, wrapped) values ('db-volume', $1)\n           on conflict (purpose) do nothing",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "dbb104e34ce1a0c81a4142f8b1a0e1ce894798bf988fdb2698fa7c4c1c735188"
+}

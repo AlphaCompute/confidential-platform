@@ -162,6 +162,14 @@ pub fn verify_rotation(rotation: &Rotation, doc: &PlatformDocument) -> Result<Va
         response.insert(k.clone(), v.clone());
     }
     response.insert("shares_hpke_sha256".into(), json!(shares));
+    // Present or null, so a rotation stripped of its volume key does not verify.
+    let db_volume = rotation
+        .db_volume_wrapped
+        .as_deref()
+        .map(|w| alpha_client::decode("db_volume_wrapped", w).map(|b| sha256_label(&b)))
+        .transpose()
+        .map_err(|e| e.to_string())?;
+    response.insert("db_volume_wrapped_sha256".into(), json!(db_volume));
     let request = serde_json::to_value(proposal).map_err(|e| e.to_string())?;
     let expected = Expected {
         route: ROTATION_ROUTE.into(),
@@ -200,6 +208,7 @@ pub fn accept(
         share_hpke,
         kms_node_spki_sha256: rotation.proposal.kms_node_spki_sha256.clone(),
         platform_document_version: doc.version,
+        db_volume_wrapped: rotation.db_volume_wrapped.clone(),
     };
     // Opens, so the custodian learns now, not at the next unseal, that the share is theirs.
     file.open(custodian)?;

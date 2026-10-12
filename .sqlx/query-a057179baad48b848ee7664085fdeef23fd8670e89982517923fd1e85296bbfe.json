@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into intermediate_keys (purpose, wrapped, public_part)\n                   values ($1::text::intermediate_purpose, $2, $3)\n                   on conflict (purpose) do nothing",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a057179baad48b848ee7664085fdeef23fd8670e89982517923fd1e85296bbfe"
+}

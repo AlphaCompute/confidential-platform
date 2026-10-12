@@ -1,6 +1,6 @@
 # Replacing custodians: re-share with root rotation
 
-At genesis `alpha bootstrap` splits a random root KEK 2-of-3 among three custodians' X-Wing keys. The root KEK wraps the two intermediates in `intermediate_keys` (tenant-kek-root and the KMS CA key), and everything else derives from tenant-kek-root: every organization's `org_key`, every App's derived keys, and the metadata keys of `docs/metadata-encryption.md`. Until now a departing custodian kept their share. With any other share it would still unseal the root KEK.
+At genesis `alpha bootstrap` splits a random root KEK 2-of-3 among three custodians' X-Wing keys. The root KEK wraps the intermediates in `intermediate_keys` (tenant-kek-root, the KMS CA key and, with M2(a), the database's volume key, `docs/db-volume-key.md`), and everything else derives from tenant-kek-root: every organization's `org_key`, every App's derived keys, and the metadata keys of `docs/metadata-encryption.md`. Until now a departing custodian kept their share. With any other share it would still unseal the root KEK.
 
 Re-splitting the same root KEK would not help: old Shamir shares of an unchanged secret stay valid. `alpha custodians rotate` therefore makes a **new** root KEK inside the serving node, re-wraps both intermediates under it, splits it to the new custodians and forgets both roots. From the commit on, the old shares rebuild a root that unwraps nothing in the database.
 
@@ -44,7 +44,7 @@ Code: `services/alpha-kms/src/custodians.rs` (routes), `crates/alpha-cli/src/cus
 
    The output says whether the attested node is the one that rotated (`rotating_node_attested`).
 
-The receipt's signed response is `{rotation_id, proposal_sha256, kms_node_spki_sha256, custodians_sha256[3], shares_hpke_sha256[3], approved_by_shares, rewrapped}`. `approved_by_shares` holds the Shamir x-coordinates (1–3) of the two shares that approved. The node never learns which person holds which share.
+The receipt's signed response is `{rotation_id, proposal_sha256, kms_node_spki_sha256, custodians_sha256[3], shares_hpke_sha256[3], approved_by_shares, rewrapped, db_volume_wrapped_sha256}`. The rotation carries the database's volume key re-wrapped under the new root (`db_volume_wrapped`, its hash in the receipt, `null` when the database has none), and `accept` writes it into the new share file, so the new custodians can unseal a node while the database is closed. The volume key's value does not change, so the LUKS volume is not re-keyed. `approved_by_shares` holds the Shamir x-coordinates (1–3) of the two shares that approved. The node never learns which person holds which share.
 
 ## Atomicity and crash safety
 

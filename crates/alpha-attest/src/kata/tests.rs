@@ -213,6 +213,7 @@ fn doc() -> PlatformDocument {
         ],
         kms_ca_pem: String::new(),
         kms_revisions: Vec::new(),
+        db_revisions: Vec::new(),
         signer: None,
         catalog_key: None,
         gpu_policy: Some(GpuPolicy {

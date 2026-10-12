@@ -143,6 +143,13 @@ pub struct PlatformDocument {
     pub reference_values: Vec<ReferenceValue>,
     pub kms_ca_pem: String,
     pub kms_revisions: Vec<KmsRevision>,
+    /// The builds of the trust-zone Postgres pod (M2(a)): a Kata pod on the CPU class whose
+    /// Revision v2 is listed here, with `"kind": "kata-tdx"`, receives the database's volume key
+    /// from an unsealed KMS node (`POST /v1/node/db-key`). Not in the KMS's `revisions` table,
+    /// because the key opens the volume that table lives on. An entry of another kind never
+    /// matches.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub db_revisions: Vec<KmsRevision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signer: Option<Signer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

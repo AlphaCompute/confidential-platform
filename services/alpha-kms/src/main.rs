@@ -25,17 +25,25 @@ async fn run() -> Result<(), String> {
     // KMS CA, or a password released after unseal) is Ryan Tharp's open decision; until then the
     // node connects with ALPHACOMPUTE_DATABASE_URL as before. The rows are sealed either way
     // (`store`), so this decides who may connect, not who may read.
-    let pool = PgPoolOptions::new()
+    let url = alpha_kms::env("ALPHACOMPUTE_DATABASE_URL")?;
+    let options = PgPoolOptions::new()
         .max_connections(8)
-        .connect(&alpha_kms::env("ALPHACOMPUTE_DATABASE_URL")?)
-        .await
-        .map_err(|e| format!("database: {e}"))?;
+        .acquire_timeout(std::time::Duration::from_secs(10));
     if std::env::args().nth(1).as_deref() == Some("migrate") {
+        let pool = options
+            .connect(&url)
+            .await
+            .map_err(|e| format!("database: {e}"))?;
         alpha_kms::migrate(&pool)
             .await
             .map_err(|e| format!("migrate: {e}"))?;
         return Ok(());
     }
+    // Lazy: with M2(a) the database's volume opens only after custodians unseal this node and it
+    // hands the Postgres pod its key, so the node starts, and answers the Node API, without it.
+    let pool = options
+        .connect_lazy(&url)
+        .map_err(|e| format!("database: {e}"))?;
     let release_key = alpha_core::hex_bytes::<32>(RELEASE_KEY_HEX.trim())
         .and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok())
         .ok_or("release-key.pub is not an Ed25519 public key")?;
@@ -85,7 +93,7 @@ async fn run() -> Result<(), String> {
 async fn start_phase(node: &Arc<Node>) {
     #[cfg(feature = "dev-root")]
     if let Some(root) = &node.config.dev_root_kek {
-        match node::unwrap_intermediates(node, root).await {
+        match alpha_kms::db_volume::open_database(node, root).await {
             Ok(keys) => {
                 if let Err(e) = node.start_serving(keys).await {
                     eprintln!("dev root: {}", e.message);

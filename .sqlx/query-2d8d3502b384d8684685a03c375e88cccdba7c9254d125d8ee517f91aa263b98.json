@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select wrapped from intermediate_keys where purpose = 'db-volume'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "wrapped",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "intermediate_keys",
+            "name": "wrapped"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "2d8d3502b384d8684685a03c375e88cccdba7c9254d125d8ee517f91aa263b98"
+}

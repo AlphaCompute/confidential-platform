@@ -67,7 +67,19 @@ pub async fn load_stored(node: &Node) -> Result<Option<Verified>, ApiError> {
 pub async fn apply(node: &Node, verified: Verified) -> Result<(), ApiError> {
     let version = i32::try_from(verified.document.version)
         .map_err(|_| ApiError::internal("platform document version overflows"))?;
-    let mut tx = node.pool.begin().await?;
+    let mut tx = match node.pool.begin().await {
+        Ok(tx) => tx,
+        // A node waiting for its database (M2(a)) still needs the document to appraise the
+        // Postgres pod: kept in memory only, never below the custodians' version
+        // (`db_volume::Unsealed::min_document_version`), and stored at the first tick it opens.
+        Err(e) if crate::db_volume::unreachable(&e) => {
+            remember(node, verified.document);
+            return Err(ApiError::internal(format!(
+                "platform document version {version} in memory only: database: {e}"
+            )));
+        }
+        Err(e) => return Err(e.into()),
+    };
     let stored = sqlx::query_scalar!("select version from platform_document for update")
         .fetch_optional(&mut *tx)
         .await?;
@@ -106,14 +118,19 @@ pub async fn apply(node: &Node, verified: Verified) -> Result<(), ApiError> {
         }
     }
     tx.commit().await?;
+    remember(node, verified.document);
+    Ok(())
+}
+
+/// Memory follows only a higher version.
+fn remember(node: &Node, document: PlatformDocument) {
     let mut platform = node.platform.write();
     if platform
         .as_ref()
-        .is_none_or(|d| d.version < verified.document.version)
+        .is_none_or(|d| d.version < document.version)
     {
-        *platform = Some(Arc::new(verified.document));
+        *platform = Some(Arc::new(document));
     }
-    Ok(())
 }
 
 pub async fn reload(node: &Node) -> Result<(), ApiError> {

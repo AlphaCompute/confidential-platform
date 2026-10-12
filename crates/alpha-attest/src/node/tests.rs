@@ -336,3 +336,72 @@ fn a_prototype_node_is_admitted_only_under_a_prototype_build() {
     });
     assert!(keyed.appraise().is_ok());
 }
+
+/// The database pod: its X-Wing key in `report_data[..32]`, nothing in `[32..]`.
+fn db_quote(pod: &KataNode, xwing: &[u8]) -> VerifiedQuote {
+    pod.quote_over(report_data(xwing, &NONCE, None))
+}
+
+#[test]
+fn the_database_pod_is_admitted_only_when_listed_in_db_revisions_as_a_kata_build() {
+    let pod = KataNode::cpu();
+    let mut listed = doc(&[]);
+    listed.db_revisions = doc(&[(pod.hash(), KmsRevisionKind::KataTdx)]).kms_revisions;
+    let appraised = appraise_db_pod_verified(
+        &pod.evidence(),
+        db_quote(&pod, XWING),
+        &NONCE,
+        XWING,
+        &listed,
+    )
+    .unwrap();
+    assert_eq!(appraised.compose_hash, pod.hash());
+
+    // Listed only as a KMS build, as a prototype build, or not at all.
+    let as_kms = doc(&[(pod.hash(), KmsRevisionKind::KataTdx)]);
+    let mut as_prototype = doc(&[]);
+    as_prototype.db_revisions = doc(&[(pod.hash(), KmsRevisionKind::PrototypeTdx)]).kms_revisions;
+    for doc in [&as_kms, &as_prototype, &doc(&[])] {
+        refused(
+            appraise_db_pod_verified(&pod.evidence(), db_quote(&pod, XWING), &NONCE, XWING, doc),
+            "attestation_unknown",
+            "db revision",
+        );
+    }
+    // The quote must bind the X-Wing key the reply is sealed to, alone and with this nonce.
+    for report_data in [
+        report_data(b"the host's xwing", &NONCE, None),
+        report_data(XWING, &[9; 32], None),
+        report_data(SPKI, &NONCE, Some(XWING)),
+    ] {
+        refused(
+            appraise_db_pod_verified(
+                &pod.evidence(),
+                pod.quote_over(report_data),
+                &NONCE,
+                XWING,
+                &listed,
+            ),
+            "attestation_failed",
+            "report_data is not bound",
+        );
+    }
+    // A pod on the GPU class is no database pod.
+    let gpu = KataNode {
+        initdata: initdata(GPU_RUNTIME_CLASS),
+        class: GPU_RUNTIME_CLASS,
+        gpus: 0,
+    };
+    let mut gpu_listed = doc(&[]);
+    gpu_listed.db_revisions = doc(&[(gpu.hash(), KmsRevisionKind::KataTdx)]).kms_revisions;
+    assert!(
+        appraise_db_pod_verified(
+            &gpu.evidence(),
+            db_quote(&gpu, XWING),
+            &NONCE,
+            XWING,
+            &gpu_listed
+        )
+        .is_err()
+    );
+}

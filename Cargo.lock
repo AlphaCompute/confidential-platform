@@ -168,6 +168,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "ed25519-dalek 3.0.0",
+ "getrandom 0.4.3",
  "http-body-util",
  "hyper",
  "hyper-util",

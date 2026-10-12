@@ -167,6 +167,10 @@ throughout. A copy of the database from before the rotation plus two old shares 
 so pre-rotation backups of `intermediate_keys` are destroyed or kept like shares. The dev App
 refuses to rotate: its root comes from the environment.
 
+## The database's volume key (Kata, M2(a))
+
+On the Kata platform the trust-zone Postgres runs as a Kata pod whose data volume is LUKS2 under a key only the KMS holds (`docs/db-volume-key.md`). Its Revision v2 goes into the platform document's `db_revisions` before the pod starts. Genesis and every cold start then run in this order: custodians unseal a KMS node (their share files carry the wrapped volume key); the Postgres pod's init container attests that node and receives the key; Postgres opens; the node serves. Until Postgres answers, the node's `/ready` says `{"sealed": false, "database": "waiting"}`. The Phala prototype below keeps its Postgres in a CVM without this.
+
 ## The broker's database
 
 `alpha-broker` keeps its connections in its own database on the same trust-zone Postgres, and no
