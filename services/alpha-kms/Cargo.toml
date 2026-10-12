@@ -12,6 +12,9 @@ dev-root = []
 
 [dependencies]
 aes-gcm = "0.11"
+# RFC 3394 key wrap for the KBS facade's ECDH-ES+A256KW; the exact version guest-components
+# d4dce5ce and Trustee 258ea4ac pin.
+aes-kw = "=0.3.1"
 alpha-attest = { path = "../../crates/alpha-attest" }
 alpha-channel = { path = "../../crates/alpha-channel" }
 alpha-client = { path = "../../crates/alpha-client" }
@@ -29,7 +32,7 @@ hmac = "0.13"
 rand_core = "0.10"
 pem = "3"
 parking_lot = "0.12"
-p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
+p256 = { version = "0.14", features = ["ecdh", "ecdsa", "pkcs8"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }

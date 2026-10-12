@@ -83,17 +83,49 @@ pub fn issue_leaf(
     sans: [String; 2],
     now: SystemTime,
 ) -> Result<Vec<u8>, ApiError> {
+    leaf(ca_key, ca_cert_der, spki_der, uri_sans_of(sans)?, now)
+}
+
+/// A node's own leaf: [`node_sans`] and, when the KBS facade is enabled, its hostname as a DNS
+/// SAN. No other leaf `ca` issues carries a DNS name.
+pub fn issue_node_leaf(
+    ca_key: &KeyPair,
+    ca_cert_der: &[u8],
+    spki_der: &[u8],
+    compose_hash: ComposeHash,
+    kbs_hostname: Option<&str>,
+    now: SystemTime,
+) -> Result<Vec<u8>, ApiError> {
+    let mut sans = uri_sans_of(node_sans(compose_hash))?;
+    if let Some(name) = kbs_hostname {
+        sans.push(SanType::DnsName(
+            Ia5String::try_from(name).map_err(|e| ApiError::internal(format!("san: {e}")))?,
+        ));
+    }
+    leaf(ca_key, ca_cert_der, spki_der, sans, now)
+}
+
+fn uri_sans_of(sans: [String; 2]) -> Result<Vec<SanType>, ApiError> {
+    sans.into_iter()
+        .map(|s| Ia5String::try_from(s).map(SanType::URI))
+        .collect::<Result<_, _>>()
+        .map_err(|e| ApiError::internal(format!("san: {e}")))
+}
+
+fn leaf(
+    ca_key: &KeyPair,
+    ca_cert_der: &[u8],
+    spki_der: &[u8],
+    sans: Vec<SanType>,
+    now: SystemTime,
+) -> Result<Vec<u8>, ApiError> {
     let spki = SubjectPublicKeyInfo::from_der(spki_der)
         .map_err(|e| ApiError::malformed(format!("runtime_pubkey: {e}")))?;
     let issuer = Issuer::from_ca_cert_der(&ca_cert_der.into(), ca_key)
         .map_err(|e| ApiError::internal(format!("ca certificate: {e}")))?;
     let mut params = CertificateParams::default();
     params.distinguished_name = DistinguishedName::new();
-    params.subject_alt_names = sans
-        .into_iter()
-        .map(|s| Ia5String::try_from(s).map(SanType::URI))
-        .collect::<Result<_, _>>()
-        .map_err(|e| ApiError::internal(format!("san: {e}")))?;
+    params.subject_alt_names = sans;
     params.is_ca = IsCa::ExplicitNoCa;
     params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
     params.extended_key_usages = vec![

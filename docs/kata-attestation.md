@@ -4,6 +4,8 @@ How `alpha-kms` decides to issue a Revision leaf to a Kata confidential pod on T
 
 `POST /v1/attest` takes either evidence format (`services/alpha-kms/src/instance.rs`): `alphacompute-evidence/1` goes to the prototype `appraise`, `alphacompute-evidence/2` to `kata-tdx/1` in `alpha_attest` (`kata`, `gpu`) and then to the KMS's own checks below. Any other format is `malformed`.
 
+The KBS facade (`docs/kbs.md`) appraises a pod's KBS-protocol attestation through these same steps and the same KMS checks; only the `report_data` binding differs (the attestation agent's runtime-data digest, byte for byte, in place of the runtime key and KMS nonce).
+
 ## Identity: init-data and the Revision v2
 
 Kata binds the digest of the pod's init-data into the TD's `MRCONFIGID` when it launches the VM, and the Kata agent policy the pod runs under is the init-data's `policy.rego` entry. The policy pins images by digest and fixes each container's command, environment and mounts, and denies exec and log reads. So the init-data, not the pod spec the host holds, says what may run.

@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 pub mod kata;
+pub mod kbs;
 
 use std::fs;
 use std::path::PathBuf;
@@ -221,16 +222,18 @@ pub async fn start_node(
     release_key: &SigningKey,
     clock: Clock,
 ) -> (Arc<Node>, String, tokio::sync::oneshot::Sender<()>) {
-    start_node_with(pool, release_url, release_key, clock, Vec::new()).await
+    start_node_with(pool, release_url, release_key, clock, Vec::new(), None).await
 }
 
-/// [`start_node`] with these GPU verifier backends.
+/// [`start_node`] with these GPU verifier backends and, if named, the KBS facade enabled under
+/// `kbs_hostname`.
 pub async fn start_node_with(
     pool: PgPool,
     release_url: &str,
     release_key: &SigningKey,
     clock: Clock,
     gpu_backends: Vec<Arc<dyn GpuVerifier>>,
+    kbs_hostname: Option<&str>,
 ) -> (Arc<Node>, String, tokio::sync::oneshot::Sender<()>) {
     let event_log: Vec<EventLogEntry> =
         serde_json::from_slice(&read(KEYED, "event_log.json")).unwrap();
@@ -239,6 +242,7 @@ pub async fn start_node_with(
         kms_endpoints: vec![],
         platform_document_url: release_url.to_owned(),
         gpu_backends,
+        kbs_hostname: kbs_hostname.map(str::to_owned),
         #[cfg(feature = "dev-root")]
         dev_root_kek: None,
     };
@@ -287,6 +291,15 @@ pub async fn harness_with(
     clock: Clock,
     gpu_backends: Vec<Arc<dyn GpuVerifier>>,
 ) -> Option<Harness> {
+    harness_with_kbs(clock, gpu_backends, None).await
+}
+
+/// [`harness_with`], the KBS facade enabled under `kbs_hostname` if named.
+pub async fn harness_with_kbs(
+    clock: Clock,
+    gpu_backends: Vec<Arc<dyn GpuVerifier>>,
+    kbs_hostname: Option<&str>,
+) -> Option<Harness> {
     let pool = fresh_database().await?;
     let release = ReleaseServer::start(platform_document(KEYED)).await;
     let (node, base, shutdown) = start_node_with(
@@ -295,6 +308,7 @@ pub async fn harness_with(
         &release.key,
         clock,
         gpu_backends,
+        kbs_hostname,
     )
     .await;
     let custodians: Vec<PrivateKey> = (0..3).map(|_| PrivateKey::generate().unwrap()).collect();

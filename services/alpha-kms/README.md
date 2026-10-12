@@ -1,10 +1,12 @@
 # alpha-kms
 
-The key broker of the trust plane: six tables, fourteen `/v1` routes on one TLS port (`:8443`, TLS 1.3, `X25519MLKEM768`), plus `GET /healthz` (process only) and `GET /ready` (database checked, `{"sealed": …}`).
+The key broker of the trust plane: six tables, fourteen `/v1` routes and the KBS facade's three `/kbs/v0` routes on one TLS port (`:8443`, TLS 1.3, `X25519MLKEM768`), plus `GET /healthz` (process only) and `GET /ready` (database checked, `{"sealed": …}`).
 
 The Instance API is `POST /v1/attest/nonce`, `POST /v1/attest`, and two routes that need the Instance's leaf as a client certificate: `GET /v1/secrets/{name}` and `POST /v1/keys/derive`. The last answers `{"key"}`, 32 bytes derived from the organization's `org_key` and the leaf's App id for the requested `purpose`, the same for every Revision of the App; it is how an App holds a key no person ever sees, and nothing but an attested Instance reaches it.
 
 `POST /v1/channel` answers an inner-channel handshake with the node's leaf and a ticket, and `PUT /v1/secrets/{name}` then takes the value either as `value` or as `sealed: {ticket, frame}`, whose plaintext begins with the signing digest of the put's payload, so a relay sees only ciphertext; any node of the deployment opens the ticket within ten minutes.
+
+The KBS facade (`docs/kbs.md`) serves CoCo's guest components on the same port: `POST /kbs/v0/auth`, `POST /kbs/v0/attest` and `GET /kbs/v0/resource/{app}/{secret|key}/{name}`, KBS protocol 0.4.0 as guest-components `d4dce5ce` (Kata 4.1.0) speaks it. A pod attests through `kata-tdx/1` and the Revision v2 checks exactly as on `POST /v1/attest`, and gets back its own App's Secrets and derived keys sealed to the TEE key its quote bound. It is off unless `ALPHACOMPUTE_KBS_HOSTNAME` is set.
 
 Control bodies are signed `ed25519` or `webauthn-es256`, a passkey's WebAuthn assertion over the same signing digest, accepted only on the origins and `rp_id` of the current platform document's `signer` and refused everywhere, stored signatures included, when the document has none; a passkey can be an organization's root key.
 
@@ -17,6 +19,7 @@ Control bodies are signed `ed25519` or `webauthn-es256`, a passkey's WebAuthn as
 | `ALPHACOMPUTE_PCCS_URL` | PCCS for DCAP collateral, fetched per attestation |
 | `ALPHACOMPUTE_PLATFORM_DOCUMENT_URL` | the release-signed platform document, fetched on start and every five minutes |
 | `ALPHACOMPUTE_FORTANIX_CCM_URL` | optional `https://` endpoint of the Fortanix CCM GPU backend, which refuses every GPU until F8; unset, a `gpu_policy` listing `fortanix-ccm` refuses every GPU pod |
+| `ALPHACOMPUTE_KBS_HOSTNAME` | optional lowercase DNS name Kata pods reach the KBS facade under; it goes into this node's own leaf as a DNS SAN. Unset (the default until the deployment picks one), every `/kbs/v0` route refuses |
 | `ALPHACOMPUTE_KMS_DEV_ROOT_KEK` | `dev-root` feature only: 64 hex digits used as the root KEK instead of the custodians' shares |
 
 `alpha-kms migrate` applies `migrations/` (expand-only) and returns; run it as the schema owner. The service then reads its event log from the CCEL table and `/run/log/dstack`, generates its P-256 runtime key and X-Wing key, and comes up sealed: it joins the first ready endpoint or waits for two `unseal` shares (or, on an empty database, a `bootstrap`).
@@ -32,6 +35,8 @@ The image is `images/kms/Dockerfile` (`alpha-kms`, or `alpha-kms-dev` with `--bu
 `tests/passkey.rs`, on the same database, covers passkey signatures: a captured iCloud Keychain assertion claiming an organization, software passkeys on every Control route, attestation, secret read and key derivation, and the refusals without a signer, on a dropped origin, under another organization's key and for a stored row missing its fields.
 
 `tests/kata.rs`, on the same database, covers Kata confidential pods (`docs/kata-attestation.md`) over synthetic quotes: Revision v2 registration, a GPU pod's and a CPU pod's leaf naming their Revision v2, evidence v2 through the route reaching DCAP, and an audit row for an unregistered or revoked Revision v2, a GPU backend the node does not run or that refuses, and a failed TD or GPU check. `tests/malicious_host.rs` is the malicious-host core suite (`docs/kata-attestation.md`): every case a hostile host can try on a Kata pod's attestation, each refused with its named reason and audit row; CI runs it as its own step.
+
+`tests/kbs.rs`, on the same database, covers the KBS facade (`docs/kbs.md`) over synthetic quotes: a GPU pod's and a CPU pod's handshake with their audit rows, their Secret and derived key opened as the guest's `decrypt_response` opens them, every hostile-attestation case (wrong or replayed nonce, a swapped `tee-pubkey`, edited GPU evidence, another pod's init-data, an unregistered or revoked Revision), resources only of the token's own App and only with a valid token, the routes over TLS to a client trusting only the KMS CA, and the facade off without a hostname.
 
 `tests/cli.rs` drives `alpha-cli`'s library functions against the same in-process node (`crates/alpha-cli/README.md`).
 

@@ -1,4 +1,5 @@
-//! The key broker: six tables, fourteen routes on one TLS port, one process-wide state.
+//! The key broker: six tables, fourteen routes and the KBS facade's three on one TLS port, one
+//! process-wide state.
 
 #![cfg_attr(
     test,
@@ -18,6 +19,7 @@ pub mod channel;
 pub mod control;
 pub mod error;
 pub mod instance;
+pub mod kbs;
 pub mod keys;
 pub mod node;
 pub mod platform;
@@ -51,6 +53,9 @@ pub struct Config {
     /// The GPU verifier backends a Kata pod's GPUs may be verified by; the platform document's
     /// `gpu_policy` decides which of them must all pass. See [`gpu_backends`].
     pub gpu_backends: Vec<Arc<dyn GpuVerifier>>,
+    /// The DNS name Kata pods reach the KBS facade under; this node's own leaf carries it. Unset,
+    /// the facade refuses every request. See [`kbs_hostname`].
+    pub kbs_hostname: Option<String>,
     #[cfg(feature = "dev-root")]
     pub dev_root_kek: Option<Zeroizing<[u8; 32]>>,
 }
@@ -69,6 +74,7 @@ impl Config {
                 .collect(),
             platform_document_url: env("ALPHACOMPUTE_PLATFORM_DOCUMENT_URL")?,
             gpu_backends: gpu_backends(std::env::var("ALPHACOMPUTE_FORTANIX_CCM_URL").ok())?,
+            kbs_hostname: kbs_hostname(std::env::var("ALPHACOMPUTE_KBS_HOSTNAME").ok())?,
             #[cfg(feature = "dev-root")]
             dev_root_kek: std::env::var("ALPHACOMPUTE_KMS_DEV_ROOT_KEK")
                 .ok()
@@ -98,6 +104,30 @@ pub fn gpu_backends(ccm_url: Option<String>) -> Result<Vec<Arc<dyn GpuVerifier>>
         backends.push(Arc::new(FortanixCcm { endpoint }));
     }
     Ok(backends)
+}
+
+/// The hostname the KBS facade answers under, which goes into this node's leaf as a DNS SAN so
+/// the guest's KBS client, trusting only the KMS CA, verifies it. Only nodes' own leaves carry a
+/// DNS name (Instance leaves have URI SANs only), so a pod trusting the CA for this name reaches a
+/// KMS node and nothing else.
+// ponytail: the hostname (behind the verifier pool's ingress or the dstack gateway) is chosen at
+// the first deploy, with the init-data generator's CDH/KBS settings; unset, the facade is off.
+pub fn kbs_hostname(name: Option<String>) -> Result<Option<String>, String> {
+    let Some(name) = name.map(|n| n.trim().to_owned()).filter(|n| !n.is_empty()) else {
+        return Ok(None);
+    };
+    let label = |l: &str| {
+        !l.is_empty()
+            && l.len() <= 63
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
+    if name.len() > 253 || !name.contains('.') || !name.split('.').all(label) {
+        return Err("ALPHACOMPUTE_KBS_HOSTNAME is not a lowercase DNS name".into());
+    }
+    Ok(Some(name))
 }
 
 /// Where DCAP collateral comes from: the PCCS in production, a fixed capture in tests.
@@ -231,13 +261,15 @@ impl Node {
         Ok(())
     }
 
-    /// The listener's leaf from `ca`: `alphacompute://kms` and this node's Revision.
+    /// The listener's leaf from `ca`: `alphacompute://kms`, this node's Revision and, when the KBS
+    /// facade is enabled, its hostname.
     pub fn issue_own_leaf(&self, keys: &Intermediates) -> Result<(), ApiError> {
-        let leaf = certs::issue_leaf(
+        let leaf = certs::issue_node_leaf(
             &keys.ca_key()?,
             &keys.ca_cert_der,
             &self.runtime_spki,
-            certs::node_sans(self.compose_hash),
+            self.compose_hash,
+            self.config.kbs_hostname.as_deref(),
             self.now(),
         )?;
         self.server_cert
@@ -292,6 +324,12 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/v1/node/bootstrap", post(node::bootstrap))
         .route("/v1/node/unseal", post(node::unseal))
         .route("/v1/node/join", post(node::join))
+        .route("/kbs/v0/auth", post(kbs::auth))
+        .route("/kbs/v0/attest", post(kbs::attest))
+        .route(
+            "/kbs/v0/resource/{repository}/{type}/{tag}",
+            get(kbs::resource),
+        )
         .layer(middleware::from_fn_with_state(node.clone(), gate))
         .fallback(|| async { ApiError::not_found("no such route").into_response() })
         .with_state(node)
@@ -346,5 +384,26 @@ mod tests {
             [GpuVerifierKind::Nras, GpuVerifierKind::FortanixCcm]
         );
         assert!(gpu_backends(Some("http://ccm.example".into())).is_err());
+    }
+
+    #[test]
+    fn kbs_hostname_is_a_lowercase_dns_name_or_the_facade_is_off() {
+        assert_eq!(kbs_hostname(None), Ok(None));
+        assert_eq!(kbs_hostname(Some(" ".into())), Ok(None));
+        assert_eq!(
+            kbs_hostname(Some("kbs.alpha-1.example".into())),
+            Ok(Some("kbs.alpha-1.example".into()))
+        );
+        for bad in [
+            "localhost",
+            "KBS.example",
+            "kbs..example",
+            "-kbs.example",
+            "kbs.example/x",
+            "10.0.0.1:8443",
+            "*.example",
+        ] {
+            assert!(kbs_hostname(Some(bad.into())).is_err(), "{bad}");
+        }
     }
 }
