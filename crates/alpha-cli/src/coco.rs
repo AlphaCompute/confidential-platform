@@ -125,6 +125,21 @@ pub fn parse(bytes: &[u8]) -> Result<Pod, String> {
                     "{list}: HOSTNAME is set by the pod's name; remove it from env"
                 ));
             }
+            // genpolicy is given no ConfigMap or Secret to resolve these from, and Kata 4.0.0's
+            // genpolicy panics on a reference it cannot resolve.
+            let refers = container.get("envFrom").is_some()
+                || container
+                    .get("env")
+                    .and_then(Yaml::as_sequence)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|e| e.get("valueFrom"))
+                    .any(|v| v.get("configMapKeyRef").is_some() || v.get("secretKeyRef").is_some());
+            if refers {
+                return Err(format!(
+                    "{list}: envFrom and ConfigMap or Secret env references are unsupported; write the values into env"
+                ));
+            }
             let image = container.get("image").and_then(Yaml::as_str).unwrap_or("");
             if !has_sha256_digest(image) {
                 return Err(format!(
@@ -397,6 +412,16 @@ mod tests {
         );
         let env = POD.replace("name: MODE", "name: HOSTNAME");
         assert!(parse(env.as_bytes()).err().unwrap().contains("HOSTNAME"));
+        let env_from = POD.replace(
+            "    env:",
+            "    envFrom:\n    - configMapRef: {name: cfg}\n    env:",
+        );
+        assert!(
+            parse(env_from.as_bytes())
+                .err()
+                .unwrap()
+                .contains("envFrom")
+        );
         let not_list = POD.replace("  containers:", "  initContainers: {}\n  containers:");
         assert!(
             parse(not_list.as_bytes())
