@@ -54,9 +54,9 @@ async fn run() -> Result<Exit, Error> {
         Substrate::Dstack => Some(
             alpha_tsm::app_compose().map_err(|e| Error::Evidence(format!("app_compose: {e}")))?,
         ),
-        // ponytail: in a Kata pod the KMS pins above come from the pod spec, which the host
-        // writes; they are as trustworthy as the measured compose's only once the init-data's
-        // agent policy pins this container's environment, and nothing generates that policy yet.
+        // In a Kata pod the KMS pins above come from the pod spec the host writes; the agent
+        // policy in the init-data, which the KMS requires, refuses this container unless every
+        // variable has its rendered value.
         Substrate::Kata => None,
     };
     let runtime = Runtime::new(

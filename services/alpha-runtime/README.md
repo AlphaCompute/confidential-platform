@@ -14,15 +14,16 @@ write) and sends the quote alone. The KMS reads the Revision, the digest of the 
 from the quote's `MRCONFIGID`. The container cannot read that init-data, so on Kata there is no
 compose to check against the leaf and `/v1/identity` answers `app_compose: null`.
 
-On Kata the environment variables below are written by the host and are not measured unless the
-init-data's agent policy pins this container's environment. Until it does, a host can point the
-runtime at a KMS of its choosing with matching pins, and a Kata Instance's secrets and keys are
-only as trustworthy as the host.
+On Kata the host writes the environment variables below, and the init-data's agent policy is
+what makes them trustworthy: `alpha coco render` pins every variable of every container to its
+rendered value, the guest agent refuses to create a container whose environment differs, and the
+KMS registers no init-data without that pinned policy. A pod spec not produced by `render` gets no
+Revision.
 
 Configuration is three environment variables, a fourth when a service declared a Secret and a
 fifth for a wrapped compose.
 `ALPHACOMPUTE_KMS_CA_SPKI_SHA256` (`sha256:<hex>` of the KMS CA's SubjectPublicKeyInfo) and
-`ALPHACOMPUTE_KMS_REVISIONS` (comma-separated `sha256:<hex>`) are in the measured compose (on dstack) and are
+`ALPHACOMPUTE_KMS_REVISIONS` (comma-separated `sha256:<hex>`) are in the measured compose on dstack, and in the policy-pinned environment on Kata, and are
 all the runtime trusts: before the first request it refuses a KMS whose chain does not end at a
 CA with that key or whose leaf carries no listed Revision, and moves on to the next entry of
 `ALPHACOMPUTE_KMS_ENDPOINTS`. An empty Revision list is refused at start. `ALPHACOMPUTE_SECRETS`,
