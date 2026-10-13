@@ -8,10 +8,22 @@ the KMS answers `revision_revoked` — at the first attestation, a renewal, a se
 process exits with code 78 and the socket disappears. Startup and configuration refusals exit
 with 1 and name the check; a drain on SIGTERM exits with 0.
 
+In a Kata TDX pod there is no guest agent socket: the runtime quotes through configfs-tsm
+(`/sys/kernel/config/tsm/report`, which the container needs mounted and must run as uid 0 to
+write) and sends the quote alone. The KMS reads the Revision, the digest of the pod's init-data,
+from the quote's `MRCONFIGID`. The container cannot read that init-data, so on Kata there is no
+compose to check against the leaf and `/v1/identity` answers `app_compose: null`.
+
+On Kata the host writes the environment variables below, and the init-data's agent policy is
+what makes them trustworthy: `alpha coco render` pins every variable of every container to its
+rendered value, the guest agent refuses to create a container whose environment differs, and the
+KMS registers no init-data without that pinned policy. A pod spec not produced by `render` gets no
+Revision.
+
 Configuration is three environment variables, a fourth when a service declared a Secret and a
 fifth for a wrapped compose.
 `ALPHACOMPUTE_KMS_CA_SPKI_SHA256` (`sha256:<hex>` of the KMS CA's SubjectPublicKeyInfo) and
-`ALPHACOMPUTE_KMS_REVISIONS` (comma-separated `sha256:<hex>`) are in the measured compose and are
+`ALPHACOMPUTE_KMS_REVISIONS` (comma-separated `sha256:<hex>`) are in the measured compose on dstack, and in the policy-pinned environment on Kata, and are
 all the runtime trusts: before the first request it refuses a KMS whose chain does not end at a
 CA with that key or whose leaf carries no listed Revision, and moves on to the next entry of
 `ALPHACOMPUTE_KMS_ENDPOINTS`. An empty Revision list is refused at start. `ALPHACOMPUTE_SECRETS`,
@@ -29,7 +41,7 @@ to the socket), and comes up only after the first attestation succeeded:
 
 | Route | Reply |
 |---|---|
-| `GET /v1/identity` | `{app_id, org_id, compose_hash, certificate_chain, tls_private_key, attestation_result, app_compose}` — the ids and the hash are read from the leaf's SANs; `tls_private_key` is the PKCS#8 DER, base64url; `app_compose` is the Instance's `app-compose.json`, read once at start from the guest agent's `Info` and refused unless its SHA-256 is the leaf's Revision digest, so a service can show a client which compose it runs |
+| `GET /v1/identity` | `{app_id, org_id, compose_hash, certificate_chain, tls_private_key, attestation_result, app_compose}` — the ids and the hash are read from the leaf's SANs; `tls_private_key` is the PKCS#8 DER, base64url; `app_compose` is the Instance's `app-compose.json`, read once at start from the guest agent's `Info` and refused unless its SHA-256 is the leaf's Revision digest, so a service can show a client which compose it runs; `null` on Kata, where the Revision is init-data the container cannot read |
 | `GET /v1/secrets/{name}` | the KMS reply for the Secret of that KMS name (a declared Secret's is `<app_id>.<name>`), fetched over mTLS with the leaf and cached until the leaf expires; a KMS error passes through in its envelope with its status |
 | `GET /v1/keys/{purpose}` | the KMS reply to `POST /v1/keys/derive` for that purpose, `{key}`, 32 bytes base64url: the App's own key, the same for every Revision of the App; fetched and cached like a secret, up to 64 purposes per leaf, beyond which a key is derived again on every read |
 | `GET /v1/evidence-bundle` | the current leaf's evidence bundle (`alphacompute-evidence-bundle/1`): the attest request as sent, the `[leaf, KMS CA]` chain and the KMS's `attestation_receipt`, which signs the result and the verifiers that attested this workload (PRD-06 clear claims, `docs/clear-claims.md`); 404 when the KMS sent no receipt |
