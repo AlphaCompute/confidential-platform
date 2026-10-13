@@ -19,17 +19,17 @@ use ed25519_dalek::SigningKey;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
-/// The App `k2-app.toml` names in its `[data]`.
+/// The App `k3-app.toml` names in its `[data]`.
 fn kata_app() -> AppId {
     "0199e000-0000-7000-8000-00000000a11d".parse().unwrap()
 }
 
-fn k2() -> String {
-    text(KATA, "k2-app.toml")
+fn k3() -> String {
+    text(KATA, "k3-app.toml")
 }
 
-fn k2_digest() -> ComposeHash {
-    InitData::parse(k2()).unwrap().digest()
+fn k3_digest() -> ComposeHash {
+    InitData::parse(k3()).unwrap().digest()
 }
 
 fn registration(app: AppId, init_data: &str, digest: ComposeHash) -> Value {
@@ -41,7 +41,7 @@ async fn register(h: &Harness, signer: &(KeyId, SigningKey)) -> (StatusCode, Val
         "/v1/revisions",
         h.signed(
             context::REVISION,
-            registration(kata_app(), &k2(), k2_digest()),
+            registration(kata_app(), &k3(), k3_digest()),
             signer,
         ),
     )
@@ -64,11 +64,11 @@ async fn attest(h: &Harness, quote: &str) -> (StatusCode, Value) {
     .await
 }
 
-/// Serves `change`d reference values as the next document version.
+/// Serves the `change`d document as its next version.
 async fn republish(h: &Harness, change: impl FnOnce(&mut Value)) {
     let mut document = h.release.document.read().unwrap().clone();
     document["version"] = json!(document["version"].as_u64().unwrap() + 1);
-    change(&mut document["kata_reference_values"]);
+    change(&mut document);
     h.release.set(document);
     platform::reload(&h.node).await.unwrap();
 }
@@ -83,10 +83,10 @@ async fn an_init_data_revision_is_registered_as_signed() {
 
     let (status, reply) = register(&h, &admin).await;
     assert_eq!(status, StatusCode::OK, "{reply}");
-    assert_eq!(reply["compose_hash"], json!(k2_digest()));
+    assert_eq!(reply["compose_hash"], json!(k3_digest()));
     assert_eq!(reply["app_id"], json!(app));
     assert_eq!(reply["org_id"], json!(h.org));
-    let digest = k2_digest();
+    let digest = k3_digest();
     let row = sqlx::query!(
         "select compose, init_data from revisions where compose_hash = $1",
         digest.as_bytes().as_slice()
@@ -94,10 +94,15 @@ async fn an_init_data_revision_is_registered_as_signed() {
     .fetch_one(&h.pool)
     .await
     .unwrap();
-    assert_eq!((row.compose, row.init_data), (None, Some(k2())));
+    assert_eq!((row.compose, row.init_data), (None, Some(k3())));
 
     let t1 = text(KATA, "t1-sha256.toml");
-    let another_app = k2().replace("a11d", "a11e");
+    let another_app = k3().replace("a11d", "a11e");
+    let no_policy = k3().replace("\"policy.rego\"", "\"policy.txt\"");
+    let read_stream = k3().replace(
+        "\"ReadStreamRequest\": false",
+        "\"ReadStreamRequest\": true",
+    );
     let refusals = [
         (
             registration(app, "not toml", compose_hash("not toml")),
@@ -108,9 +113,17 @@ async fn an_init_data_revision_is_registered_as_signed() {
             "app_id",
         ),
         (registration(app, &t1, compose_hash(&t1)), "app_id"),
-        (registration(app, &k2(), compose_hash(&t1)), "digest"),
+        (registration(app, &k3(), compose_hash(&t1)), "digest"),
         (
-            json!({ "app_id": app, "init_data": k2(), "digest": k2_digest(), "compose": "{}" }),
+            registration(app, &no_policy, compose_hash(&no_policy)),
+            "policy.rego",
+        ),
+        (
+            registration(app, &read_stream, compose_hash(&read_stream)),
+            "pinned data",
+        ),
+        (
+            json!({ "app_id": app, "init_data": k3(), "digest": k3_digest(), "compose": "{}" }),
             "unknown field",
         ),
     ];
@@ -134,10 +147,10 @@ async fn an_init_data_revision_is_registered_as_signed() {
         );
     }
 
-    let tampered = k2().replace("[data]\n", "[data]\n\"note\" = \"tampered\"\n");
+    let tampered = k3().replace("[data]\n", "[data]\n\"note\" = \"tampered\"\n");
     let mut unsigned = h.signed(
         context::REVISION,
-        registration(app, &k2(), k2_digest()),
+        registration(app, &k3(), k3_digest()),
         &admin,
     );
     unsigned["payload"]["init_data"] = json!(tampered);
@@ -150,6 +163,24 @@ async fn an_init_data_revision_is_registered_as_signed() {
 }
 
 #[tokio::test]
+async fn no_init_data_registers_while_the_document_pins_no_agent_policy() {
+    let Some(h) = kata_harness().await else {
+        return;
+    };
+    let admin = h.register_key(&h.root, 33).await;
+    republish(&h, |d| {
+        d.as_object_mut().unwrap().remove("kata_policy");
+    })
+    .await;
+    let (status, reply) = register(&h, &admin).await;
+    assert_eq!(
+        (status, code(&reply)),
+        (StatusCode::FORBIDDEN, "policy_denied"),
+        "{reply}"
+    );
+}
+
+#[tokio::test]
 async fn a_kata_pod_gets_a_leaf_naming_the_revision_in_its_mrconfigid() {
     let Some(h) = kata_harness().await else {
         return;
@@ -157,7 +188,7 @@ async fn a_kata_pod_gets_a_leaf_naming_the_revision_in_its_mrconfigid() {
     let admin = h.register_key(&h.root, 32).await;
     let app = kata_app();
 
-    let (status, reply) = attest(&h, "k2-app.quote.bin").await;
+    let (status, reply) = attest(&h, "k3-app.quote.bin").await;
     assert_eq!(
         (status, code(&reply)),
         (StatusCode::FORBIDDEN, "attestation_unknown"),
@@ -167,19 +198,19 @@ async fn a_kata_pod_gets_a_leaf_naming_the_revision_in_its_mrconfigid() {
         reply["error"]["message"]
             .as_str()
             .unwrap()
-            .contains(&k2_digest().to_string())
+            .contains(&k3_digest().to_string())
     );
 
     let (status, reply) = register(&h, &admin).await;
     assert_eq!(status, StatusCode::OK, "{reply}");
-    let (status, reply) = attest(&h, "k2-app.quote.bin").await;
+    let (status, reply) = attest(&h, "k3-app.quote.bin").await;
     assert_eq!(status, StatusCode::OK, "{reply}");
     let result = &reply["attestation_result"];
     assert_eq!(result["verdict"], "verified");
     assert_eq!(result["os_image"], "kata-qemu-tdx");
     assert_eq!(
         result["revision"],
-        json!({ "compose_hash": k2_digest(), "app_id": app, "org_id": h.org })
+        json!({ "compose_hash": k3_digest(), "app_id": app, "org_id": h.org })
     );
     let runtime_sha = alpha_kms::keys::sha256_hex(&read(KATA, "runtime_spki.der"));
     assert_eq!(
@@ -196,7 +227,7 @@ async fn a_kata_pod_gets_a_leaf_naming_the_revision_in_its_mrconfigid() {
         certs::uri_sans(&leaf).unwrap(),
         [
             format!("alphacompute://{}/{app}/{runtime_sha}", h.org),
-            format!("urn:alphacompute:revision:{}", k2_digest()),
+            format!("urn:alphacompute:revision:{}", k3_digest()),
         ]
     );
     let audited = h.audit("attest").await;
@@ -233,7 +264,7 @@ async fn a_kata_pod_gets_a_leaf_naming_the_revision_in_its_mrconfigid() {
         other.public_key().to_public_key_der().unwrap().into_vec()
     };
     let (status, reply) = h
-        .post("/v1/attest", attest_body("k2-app.quote.bin", &other_spki))
+        .post("/v1/attest", attest_body("k3-app.quote.bin", &other_spki))
         .await;
     assert_eq!(
         (status, code(&reply)),
@@ -246,7 +277,7 @@ async fn a_kata_pod_gets_a_leaf_naming_the_revision_in_its_mrconfigid() {
             .contains("report_data")
     );
 
-    let mut dstack = attest_body("k2-app.quote.bin", &read(KATA, "runtime_spki.der"));
+    let mut dstack = attest_body("k3-app.quote.bin", &read(KATA, "runtime_spki.der"));
     dstack["evidence"]["event_log"] = json!([]);
     let (status, reply) = h.post("/v1/attest", dstack).await;
     assert_eq!(
@@ -263,8 +294,8 @@ async fn a_class_passing_gpus_through_gets_no_leaf() {
     };
     let admin = h.register_key(&h.root, 34).await;
     register(&h, &admin).await;
-    republish(&h, |classes| classes[0]["gpu"] = json!(true)).await;
-    let (status, reply) = attest(&h, "k2-app.quote.bin").await;
+    republish(&h, |d| d["kata_reference_values"][0]["gpu"] = json!(true)).await;
+    let (status, reply) = attest(&h, "k3-app.quote.bin").await;
     assert_eq!(
         (status, code(&reply)),
         (StatusCode::FORBIDDEN, "policy_denied")
@@ -282,15 +313,15 @@ async fn a_revoked_init_data_revision_gets_no_leaf() {
     };
     let admin = h.register_key(&h.root, 35).await;
     register(&h, &admin).await;
-    let payload = json!({ "compose_hash": k2_digest(), "issued_at": rfc3339(h.now()) });
+    let payload = json!({ "compose_hash": k3_digest(), "issued_at": rfc3339(h.now()) });
     let (status, reply) = h
         .post(
-            &format!("/v1/revisions/{}/revoke", k2_digest()),
+            &format!("/v1/revisions/{}/revoke", k3_digest()),
             h.signed(context::CONTROL, payload, &admin),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
-    let (status, reply) = attest(&h, "k2-app.quote.bin").await;
+    let (status, reply) = attest(&h, "k3-app.quote.bin").await;
     assert_eq!(
         (status, code(&reply)),
         (StatusCode::CONFLICT, "revision_revoked")
@@ -304,13 +335,13 @@ async fn a_compose_revision_is_not_an_init_data_one() {
     };
     let admin = h.register_key(&h.root, 36).await;
     let app = kata_app();
-    let document = json!({ "app_id": app, "compose": k2() });
+    let document = json!({ "app_id": app, "compose": k3() });
     let signature = h.signed(context::REVISION, document, &admin)["signature"].clone();
     let hash = h
-        .insert_signed_revision(h.org, app, k2(), admin.0, signature)
+        .insert_signed_revision(h.org, app, k3(), admin.0, signature)
         .await;
-    assert_eq!(hash, k2_digest());
-    let (status, reply) = attest(&h, "k2-app.quote.bin").await;
+    assert_eq!(hash, k3_digest());
+    let (status, reply) = attest(&h, "k3-app.quote.bin").await;
     assert_eq!(
         (status, code(&reply)),
         (StatusCode::FORBIDDEN, "attestation_unknown")

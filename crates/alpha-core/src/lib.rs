@@ -25,7 +25,7 @@ pub use compose::{
 };
 pub use id::{AppId, KeyId, OrgId, PrincipalId, RequestId, SecretId};
 pub use initdata::{InitData, InitDataError};
-pub use platform::{CatalogKey, KmsRevision, Signer};
+pub use platform::{CatalogKey, KataPolicy, KmsRevision, Signer};
 pub use signing::{context, jcs, parse, signing_digest};
 
 /// `{algorithm, signature}`, the signature in base64url.

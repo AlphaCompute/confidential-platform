@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use alpha_core::{AppId, ComposeHash, KeyId, OrgId, PrincipalId, SecretId, context};
+use alpha_core::{AppId, ComposeHash, KataPolicy, KeyId, OrgId, PrincipalId, SecretId, context};
 use axum::Json;
 use axum::extract::{Path, State};
 use base64::Engine;
@@ -183,6 +183,7 @@ struct InitDataRevisionPayload {
 /// compose, init-data.
 fn revision_payload(
     value: &Value,
+    kata_policy: Option<&KataPolicy>,
 ) -> Result<(ComposeHash, AppId, Option<String>, Option<String>), ApiError> {
     if value.get("init_data").is_none() {
         let p: RevisionPayload = payload(value)?;
@@ -204,6 +205,15 @@ fn revision_payload(
             "digest is not the init-data's {digest}"
         )));
     }
+    let pinned = kata_policy.ok_or_else(|| {
+        ApiError::new(
+            "policy_denied",
+            "the platform document pins no Kata agent policy",
+        )
+    })?;
+    init_data
+        .check_policy(pinned)
+        .map_err(|e| ApiError::malformed(e.to_string()))?;
     Ok((digest, p.app_id, None, Some(p.init_data)))
 }
 
@@ -213,7 +223,10 @@ pub async fn register_revision(
 ) -> Result<Json<Value>, ApiError> {
     audited_route!(node, body, request, "revision.register", async {
         let keys = node.intermediates()?;
-        let (compose_hash, app_id, compose, init_data) = revision_payload(&body.payload)?;
+        let doc = node.platform_document();
+        let kata_policy = doc.as_deref().and_then(|d| d.kata_policy.as_ref());
+        let (compose_hash, app_id, compose, init_data) =
+            revision_payload(&body.payload, kata_policy)?;
         let chain = authorize(&node, &keys, context::REVISION, &body, node.now_utc()).await?;
         let org_id = chain.key.org_id;
         let mut tx = node.pool.begin().await?;

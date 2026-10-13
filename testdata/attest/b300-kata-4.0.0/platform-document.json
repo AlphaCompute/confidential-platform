@@ -32,6 +32,10 @@
       "gpu": true
     }
   ],
+  "kata_policy": {
+    "rules_sha256": "sha256:0986ca3f6f867c0f339152bdf509dbe010db43676123184d2d9851a0f55fbec7",
+    "data_sha256": "sha256:f717030738d8ec48b62fd3630303b1d5309617ab274899d0e507e23359a28ca2"
+  },
   "kms_ca_pem": "",
   "kms_revisions": []
 }
