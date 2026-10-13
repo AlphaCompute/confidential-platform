@@ -89,7 +89,7 @@ impl RuntimeSocket {
             certificate_chain: Vec<String>,
             tls_private_key: String,
             attestation_result: AttestationResult,
-            app_compose: String,
+            app_compose: Option<String>,
         }
 
         let (status, body) = self.get("/v1/identity").await?;
@@ -203,7 +203,9 @@ pub struct RuntimeIdentity {
     pub tls_private_key: Zeroizing<Vec<u8>>,
     pub attestation_result: AttestationResult,
     /// The Instance's measured `app-compose.json`, exact bytes; its SHA-256 is `compose_hash`.
-    pub app_compose: String,
+    /// None in a Kata pod, whose container cannot read the init-data its Revision is the
+    /// digest of.
+    pub app_compose: Option<String>,
 }
 
 impl std::fmt::Debug for RuntimeIdentity {
