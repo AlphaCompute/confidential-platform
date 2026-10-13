@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: render
+spec:
+  runtimeClassName: kata-qemu-tdx
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  securityContext:
+    supplementalGroups: [1, 2, 3, 4, 6, 10, 11, 20, 26, 27]
+  containers:
+  - name: app
+    image: public.ecr.aws/docker/library/alpine@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8
+    command: [sleep, infinity]
+    env:
+    - {name: MODE, value: golden}
