@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 pub mod catalog;
 pub mod compose;
 pub mod id;
+pub mod initdata;
 pub mod phala;
 pub mod platform;
 pub mod signing;
@@ -23,6 +24,7 @@ pub use compose::{
     hex_bytes,
 };
 pub use id::{AppId, KeyId, OrgId, PrincipalId, RequestId, SecretId};
+pub use initdata::{InitData, InitDataError};
 pub use platform::{CatalogKey, KmsRevision, Signer};
 pub use signing::{context, jcs, parse, signing_digest};
 

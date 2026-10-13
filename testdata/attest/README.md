@@ -39,3 +39,12 @@ Each directory has an `expected.json` naming the capture and the quote shape (`i
 | `10-keyed-node` | — (capture `phala-0.5.9-1c-2g-keyed`) | `Appraised` for the keyed production capture, node-shaped |
 
 The debug-bit and TCB-status/advisory policy checks cannot be produced as real quotes (Phala Cloud does not hand out debug TDs or out-of-date platforms on request), so they are unit tests in `crates/alpha-attest/src/lib.rs` over synthetic report attributes and status strings, not vectors here. The expired-collateral and wrong-format cases are unit tests over the real capture with a shifted `now` and a changed `format`, respectively.
+
+## Kata on owned hardware
+
+`b300-kata-4.0.0` holds two quotes from CPU pods of runtime class `kata-qemu-tdx` (Kata 4.0.0) on our B300 host, taken through configfs-tsm with `report_data` all zero, read by `crates/alpha-attest/tests/kata.rs`:
+
+- `p1-sha256.quote.bin` — a pod booted with the init-data `t1-sha256.toml` in its `io.katacontainers.config.hypervisor.cc_init_data` annotation; `MRCONFIGID` is `SHA-256(t1-sha256.toml)` followed by 16 zero bytes;
+- `p0-none.quote.bin` — the same pod without the annotation; `MRCONFIGID` is all zero.
+
+`collateral.json` was fetched for both quotes (they share one platform) with `fetch_collateral` against Phala's PCCS at `captured_at.txt`, after the hex quote was written with `xxd -p <quote> | tr -d '\n'`.
