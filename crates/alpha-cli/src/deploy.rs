@@ -556,7 +556,7 @@ mod tests {
         assert!(services.contains("command: sh -c 'sleep 1'"), "{services}");
         assert_ne!(
             alpha_core::compose_hash(&compose).to_string(),
-            alpha_core::compose_hash(&super::compose(&parse(&base).unwrap()).unwrap()).to_string()
+            alpha_core::compose_hash(super::compose(&parse(&base).unwrap()).unwrap()).to_string()
         );
     }
 
