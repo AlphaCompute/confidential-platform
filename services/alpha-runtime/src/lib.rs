@@ -1,7 +1,8 @@
 //! The in-CVM sidecar: one P-256 key for the life of the Instance, attested to the KMS into a
 //! one-hour leaf renewed ten minutes before it expires, handed to the tenant's containers over
 //! a unix socket with four routes. Trust comes from the measured compose (the KMS CA's SPKI
-//! hash and the allowed KMS Revisions); the KMS endpoints are only where to look.
+//! hash and the allowed KMS Revisions); the KMS endpoints are only where to look. In a Kata pod
+//! the same variables come from the pod spec, and the evidence is the quote alone.
 
 #![cfg_attr(
     test,
@@ -21,13 +22,16 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use alpha_attest::{AnyEvidence, AttestationResult, EVIDENCE_FORMAT, Evidence};
+use alpha_attest::{
+    AttestationResult, EVIDENCE_FORMAT, Evidence, KATA_EVIDENCE_FORMAT, KataEvidence,
+};
 use alpha_client::tls::{self, InstanceSans};
 use alpha_client::{
-    AttestReply, AttestRequest, Client, DerivedKey, Identity, Pin, Secret, TimeProvider,
+    AttestReply, AttestRequest, Client, DerivedKey, Identity, InstanceEvidence, Pin, Secret,
+    TimeProvider,
 };
 use alpha_core::ComposeHash;
 use base64::Engine;
@@ -290,112 +294,49 @@ pub enum Delivery {
 
 pub type Clock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 
-/// A quote over `report_data` and the evidence behind it; the guest in `main`, a capture in tests.
-pub type EvidenceSource = Arc<dyn Fn(&[u8; 64]) -> Result<AnyEvidence, String> + Send + Sync>;
+/// A quote over `report_data`, with the event log behind it on dstack; the TD in `main`, a
+/// capture in tests.
+pub type EvidenceSource = Arc<dyn Fn(&[u8; 64]) -> Result<InstanceEvidence, String> + Send + Sync>;
 
-/// The prototype CVM: the guest agent's quote and the replayable event log.
-pub fn tsm_evidence() -> EvidenceSource {
-    Arc::new(|report_data| {
-        Ok(Evidence {
-            format: EVIDENCE_FORMAT.into(),
-            quote: alpha_tsm::quote(report_data).map_err(|e| e.to_string())?,
-            event_log: alpha_tsm::event_log().map_err(|e| e.to_string())?,
-        }
-        .into())
-    })
-}
-
-/// `ALPHACOMPUTE_QUOTE_SOURCE`: unset or `dstack` for the prototype CVM, `coco-aa` or `coco-tsm`
-/// for a Kata confidential pod. The agent policy pins it with the rest of the container's env.
-pub const QUOTE_SOURCE_ENV: &str = "ALPHACOMPUTE_QUOTE_SOURCE";
-
-/// PRD-06 I1 on a Kata pod: the host writes the pod's environment, so a customer DSM declared in
-/// [`alpha_core::coco::policy::DSM_ENV`] counts only if the init-data's agent policy pins that
-/// exact value. Checked against the init-data this runtime attests with: a host that hands it
-/// other init-data gets no leaf, and without a leaf no DSM session.
-pub fn check_coco_dsm(initdata: &[u8], dsm: Option<&str>) -> Result<(), Error> {
-    let Some(value) = dsm else {
-        return Ok(());
-    };
-    let refused = |m: String| Error::Config(m);
-    let init = alpha_core::coco::InitData::parse(initdata)
-        .map_err(|e| refused(format!("init-data: {e}")))?;
-    let policy = init.policy().map_err(|e| refused(e.to_string()))?;
-    alpha_core::coco::policy::dsm_pinned(policy, value).map_err(refused)
-}
-
-/// When the Endpoint's TLS listener opens.
-pub enum Tls {
-    /// No upstream: no listener.
-    Off,
-    /// Already bound (the prototype CVM, where compose's health check orders the services).
-    Bound(proxy::Endpoint),
-    /// Bound on this address once every declared Secret is written: in a Kata pod the port
-    /// opening is what the sidecar's startup probe waits for before the services start, so a
-    /// service never starts without its Secret files.
-    AfterSecrets(std::net::SocketAddr),
-}
-
-/// Which guest this runtime is in.
+/// What the runtime runs on, and so what it proves itself with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Guest {
-    Prototype,
-    Coco(alpha_tsm::coco::QuoteSource),
+pub enum Substrate {
+    /// A dstack CVM: the guest agent quotes and serves the measured compose.
+    Dstack,
+    /// A Kata TDX pod: configfs-tsm quotes, and the KMS reads the Revision from `MRCONFIGID`.
+    Kata,
 }
 
-pub fn parse_guest(var: Option<&str>) -> Result<Guest, Error> {
-    use alpha_tsm::coco::QuoteSource::*;
-    match var {
-        None | Some("dstack") => Ok(Guest::Prototype),
-        Some("coco-aa") => Ok(Guest::Coco(AttestationAgent)),
-        Some("coco-tsm") => Ok(Guest::Coco(ConfigfsTsm)),
-        Some(other) => Err(Error::Config(format!(
-            "{QUOTE_SOURCE_ENV}={other:?} is not dstack, coco-aa or coco-tsm"
-        ))),
+impl Substrate {
+    /// Dstack exactly when its guest agent's socket exists; anywhere else the quote has to come
+    /// from configfs-tsm, which `alpha_tsm::quote` then uses.
+    pub fn detect(dstack_socket: &Path) -> Self {
+        if dstack_socket.exists() {
+            Substrate::Dstack
+        } else {
+            Substrate::Kata
+        }
     }
 }
 
-/// What a Kata pod's runtime knows about itself before attesting: the init-data it booted with,
-/// the Revision v2 that init-data stands for (served as `app_compose`, whose hash the leaf must
-/// name), and its evidence source.
-pub struct CocoIdentity {
-    pub initdata: Vec<u8>,
-    pub revision: String,
-    pub evidence: EvidenceSource,
+pub fn kata_evidence(quote: Vec<u8>) -> InstanceEvidence {
+    InstanceEvidence::Kata(KataEvidence {
+        format: KATA_EVIDENCE_FORMAT.into(),
+        quote,
+    })
 }
 
-pub fn coco_identity(
-    quote: alpha_tsm::coco::QuoteSource,
-    initdata: Vec<u8>,
-) -> Result<CocoIdentity, Error> {
-    let parsed = alpha_core::coco::InitData::parse(&initdata)
-        .map_err(|e| Error::Evidence(format!("init-data: {e}")))?;
-    let revision = parsed
-        .revision()
-        .map_err(|e| Error::Evidence(format!("init-data: {e}")))?;
-    let canonical = revision
-        .canonical()
-        .map_err(|e| Error::Evidence(e.to_string()))?;
-    let gpu_count = revision
-        .gpu
-        .as_ref()
-        .map_or(Ok(0), |g| usize::try_from(g.count))
-        .map_err(|_| Error::Evidence("gpu count".into()))?;
-    let source = alpha_tsm::coco::Source {
-        quote,
-        initdata: initdata.clone(),
-        runtime_class: revision.runtime_class,
-        gpu_count,
-    };
-    Ok(CocoIdentity {
-        initdata,
-        revision: canonical,
-        evidence: Arc::new(move |report_data| {
-            source
-                .evidence(report_data)
-                .map(Into::into)
-                .map_err(|e| e.to_string())
-        }),
+pub fn tsm_evidence(substrate: Substrate) -> EvidenceSource {
+    Arc::new(move |report_data| {
+        let quote = alpha_tsm::quote(report_data).map_err(|e| e.to_string())?;
+        Ok(match substrate {
+            Substrate::Dstack => InstanceEvidence::Dstack(Evidence {
+                format: EVIDENCE_FORMAT.into(),
+                quote,
+                event_log: alpha_tsm::event_log().map_err(|e| e.to_string())?,
+            }),
+            Substrate::Kata => kata_evidence(quote),
+        })
     })
 }
 
@@ -427,16 +368,12 @@ pub struct Runtime {
     clock: Clock,
     time: TimeProvider,
     evidence: EvidenceSource,
-    /// The guest agent's (prototype) or the Revision v2 rebuilt from the init-data (Kata); served
-    /// to the tenant's services only once a leaf names its hash.
-    app_compose: String,
-    /// A Kata pod's init-data, served beside `app_compose` in `/v1/identity`.
-    initdata: OnceLock<Vec<u8>>,
+    /// The guest agent's; served to the tenant's services only once a leaf names its hash.
+    /// None in a Kata pod, where the KMS names the Revision from the verified `MRCONFIGID`.
+    app_compose: Option<String>,
     kms: Client,
     attested: RwLock<Option<Arc<Attested>>>,
     revoked: watch::Sender<bool>,
-    /// Set once every declared Secret has been written (at once when none is declared).
-    delivered: watch::Sender<bool>,
 }
 
 impl Runtime {
@@ -446,7 +383,7 @@ impl Runtime {
         clock: Clock,
         evidence: EvidenceSource,
         time: TimeProvider,
-        app_compose: String,
+        app_compose: Option<String>,
     ) -> Result<Arc<Self>, Error> {
         let key_error = |e: p256::pkcs8::Error| Error::Key(e.to_string());
         let spki = key
@@ -469,11 +406,9 @@ impl Runtime {
             time,
             evidence,
             app_compose,
-            initdata: OnceLock::new(),
             kms,
             attested: RwLock::new(None),
             revoked: watch::Sender::new(false),
-            delivered: watch::Sender::new(false),
         }))
     }
 
@@ -491,15 +426,6 @@ impl Runtime {
 
     pub fn tls_private_key(&self) -> &[u8] {
         &self.pkcs8
-    }
-
-    /// Records a Kata pod's init-data for `/v1/identity`; set once, before serving.
-    pub fn set_initdata(&self, initdata: Vec<u8>) {
-        let _ = self.initdata.set(initdata);
-    }
-
-    pub fn initdata(&self) -> Option<&[u8]> {
-        self.initdata.get().map(Vec::as_slice)
     }
 
     pub fn is_revoked(&self) -> bool {
@@ -572,10 +498,13 @@ impl Runtime {
         let identity = tls::uri_sans(leaf)
             .and_then(|sans| tls::parse_instance_sans(&sans))
             .map_err(alpha_client::Error::from)?;
-        if alpha_core::compose_hash(&self.app_compose) != identity.compose_hash {
+        if self
+            .app_compose
+            .as_ref()
+            .is_some_and(|compose| alpha_core::compose_hash(compose) != identity.compose_hash)
+        {
             return Err(Error::Certificate(
-                "this guest's app_compose (compose or Revision v2) is not the leaf's Revision"
-                    .into(),
+                "the guest agent's app_compose is not the leaf's Revision".into(),
             ));
         }
         let certified =
@@ -702,7 +631,6 @@ impl Runtime {
 
     async fn deliver_forever(&self, root: PathBuf) {
         if self.config.secrets.is_empty() {
-            self.delivered.send_replace(true);
             return;
         }
         let mut retry = SECRETS_FIRST_RETRY;
@@ -711,7 +639,6 @@ impl Runtime {
             match self.deliver(&root).await {
                 Delivery::Revoked => return,
                 Delivery::Complete => {
-                    self.delivered.send_replace(true);
                     retry = SECRETS_FIRST_RETRY;
                     waiting.clear();
                     tokio::time::sleep(SECRETS_POLL).await;
@@ -749,11 +676,6 @@ impl Runtime {
         }
     }
 
-    /// Resolves once every declared Secret file has been written.
-    pub async fn secrets_delivered(&self) {
-        let _ = self.delivered.subscribe().wait_for(|d| *d).await;
-    }
-
     /// Serves the socket, renews the leaf, keeps the declared Secret files under
     /// `secrets_root` current and, given `tls` and an upstream, proxies the Endpoint until
     /// `shutdown` resolves or the Revision is revoked. Socket connections drain either way;
@@ -762,7 +684,7 @@ impl Runtime {
         self: Arc<Self>,
         listener: UnixListener,
         secrets_root: PathBuf,
-        tls: Tls,
+        tls: Option<proxy::Endpoint>,
         shutdown: impl Future<Output = ()>,
     ) -> Exit {
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -778,26 +700,11 @@ impl Runtime {
             async move { runtime.deliver_forever(secrets_root).await }
         });
         let (stop_proxy, proxy_stopped) = tokio::sync::oneshot::channel::<Exit>();
-        let stopping = async move { proxy_stopped.await.unwrap_or(Exit::Revoked) };
-        let proxy = match tls {
-            Tls::Off => None,
-            Tls::Bound(endpoint) => Some(tokio::spawn(endpoint.serve(stopping))),
-            Tls::AfterSecrets(addr) => {
-                let runtime = self.clone();
-                Some(tokio::spawn(async move {
-                    let mut stopping = std::pin::pin!(stopping);
-                    tokio::select! {
-                        () = runtime.secrets_delivered() => {}
-                        _ = &mut stopping => return,
-                    }
-                    match proxy::Endpoint::bind(runtime, addr).await {
-                        Ok(Some(endpoint)) => endpoint.serve(stopping).await,
-                        Ok(None) => {}
-                        Err(e) => eprintln!("alpha-runtime: {e}"),
-                    }
-                }))
-            }
-        };
+        let proxy = tls.map(|endpoint| {
+            tokio::spawn(
+                endpoint.serve(async move { proxy_stopped.await.unwrap_or(Exit::Revoked) }),
+            )
+        });
         let mut revoked = self.revoked.subscribe();
         let exit = tokio::select! {
             () = shutdown => Exit::Drained,
@@ -822,117 +729,6 @@ mod tests {
     use super::*;
 
     const HASH: &str = "sha256:ee097e09c4824eb6424202fe20ed882d19a33a563f3b3dd5988f3ff8ee1b8335";
-
-    #[test]
-    fn quote_source_selects_the_guest() {
-        use alpha_tsm::coco::QuoteSource::*;
-        assert_eq!(parse_guest(None).unwrap(), Guest::Prototype);
-        assert_eq!(parse_guest(Some("dstack")).unwrap(), Guest::Prototype);
-        assert_eq!(
-            parse_guest(Some("coco-aa")).unwrap(),
-            Guest::Coco(AttestationAgent)
-        );
-        assert_eq!(
-            parse_guest(Some("coco-tsm")).unwrap(),
-            Guest::Coco(ConfigfsTsm)
-        );
-        let error = parse_guest(Some("tdx")).unwrap_err().to_string();
-        assert!(error.contains(QUOTE_SOURCE_ENV), "{error}");
-    }
-
-    const INITDATA: &str = r#"algorithm = "sha384"
-version = "0.1.0"
-
-[data]
-"policy.rego" = '''
-package agent_policy
-'''
-"alpha.json" = '''{"app_id":"01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b","format":"alphacompute-initdata/1","gpu":{"count":8,"model":"B300"},"runtime_class":"kata-qemu-nvidia-gpu-tdx"}'''
-"#;
-
-    #[test]
-    fn a_kata_pod_serves_the_revision_v2_its_initdata_stands_for() {
-        let source = alpha_tsm::coco::QuoteSource::ConfigfsTsm;
-        let coco = coco_identity(source, INITDATA.as_bytes().to_vec()).unwrap();
-        let expected = alpha_core::coco::InitData::parse(INITDATA.as_bytes())
-            .unwrap()
-            .revision()
-            .unwrap();
-        assert_eq!(coco.revision, expected.canonical().unwrap());
-        assert_eq!(coco.initdata, INITDATA.as_bytes());
-        // No TSM tree here: the source fails at the pod rather than sending something partial.
-        assert!((coco.evidence)(&[0; 64]).is_err());
-        assert!(coco_identity(source, b"not toml".to_vec()).is_err());
-    }
-
-    #[test]
-    fn a_kata_pod_uses_a_dsm_only_as_its_measured_policy_pins_it() {
-        use alpha_core::coco::policy::{DSM_ENV, RULES};
-        let dsm = r#"{"binding":"app","endpoint":"https://dsm.example"}"#;
-        // The baseline's request defaults, and one container that lists `env`.
-        let initdata = |env: &str| {
-            let data = serde_json::json!({
-                "containers": [{
-                    "OCI": {
-                        "Annotations": {
-                            "io.kubernetes.cri.container-type": "container",
-                            "io.kubernetes.cri.container-name": "alpha-runtime",
-                            "io.kubernetes.cri.image-name": format!("r@sha256:{}", "ab".repeat(32)),
-                        },
-                        "Process": { "Env": [env] },
-                    },
-                    "exec_commands": [],
-                }],
-                "request_defaults": {
-                    "ExecProcessRequest": { "allowed_commands": [], "regex": [] },
-                    "CopyFileRequest": alpha_core::coco::policy::COPY_FILE_PATHS,
-                    "CreateContainerRequest": {
-                        "allow_env_regex": alpha_core::coco::policy::ALLOWED_ENV_REGEX,
-                    },
-                    "ReadStreamRequest": false, "WriteStreamRequest": false,
-                    "CloseStdinRequest": false, "GetDiagnosticDataRequest": false,
-                    "UpdateEphemeralMountsRequest": false,
-                },
-                "cluster_config": { "guest_pull": true },
-            });
-            INITDATA.replace(
-                "package agent_policy\n",
-                &format!("{RULES}\npolicy_data := {data:#}\n"),
-            )
-        };
-        let pinned = initdata(&format!("{DSM_ENV}={dsm}"));
-        check_coco_dsm(pinned.as_bytes(), Some(dsm)).unwrap();
-        check_coco_dsm(pinned.as_bytes(), None).unwrap();
-        let unpinned = initdata("PATH=/bin");
-        check_coco_dsm(unpinned.as_bytes(), None).unwrap();
-        let error = check_coco_dsm(unpinned.as_bytes(), Some(dsm))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("does not pin"), "{error}");
-        let other = dsm.replace("dsm.example", "attacker.example");
-        assert!(check_coco_dsm(pinned.as_bytes(), Some(&other)).is_err());
-    }
-
-    #[test]
-    fn a_cpu_class_pod_serves_a_revision_v2_without_gpus() {
-        let source = alpha_tsm::coco::QuoteSource::AttestationAgent;
-        let cpu = INITDATA
-            .replace(r#""gpu":{"count":8,"model":"B300"},"#, "")
-            .replace("kata-qemu-nvidia-gpu-tdx", "kata-qemu-tdx");
-        let coco = coco_identity(source, cpu.into_bytes()).unwrap();
-        let revision: alpha_core::coco::CocoRevision =
-            serde_json::from_str(&coco.revision).unwrap();
-        assert_eq!(revision.runtime_class, alpha_core::coco::CPU_RUNTIME_CLASS);
-        assert_eq!(revision.gpu, None);
-
-        // A CPU-class init-data that expects GPUs fails at the pod, before it asks for a leaf.
-        let with_gpus = INITDATA.replace("kata-qemu-nvidia-gpu-tdx", "kata-qemu-tdx");
-        let error = coco_identity(source, with_gpus.into_bytes())
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(error.contains("runs no GPU"), "{error}");
-    }
 
     #[test]
     fn config_parses_the_three_variables_and_refuses_empty_or_malformed_ones() {
@@ -1115,6 +911,61 @@ package agent_policy
             renewal_delay(not_after, t0 + Duration::from_secs(7200)),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn dstack_is_chosen_by_its_guest_agent_socket_alone() {
+        let dir = temp_dir();
+        let socket = dir.join("dstack.sock");
+        assert_eq!(Substrate::detect(&socket), Substrate::Kata);
+        std::fs::write(&socket, b"").unwrap();
+        assert_eq!(Substrate::detect(&socket), Substrate::Dstack);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn kata_testdata(name: &str) -> Vec<u8> {
+        std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../testdata/attest/b300-kata-4.0.0")
+                .join(name),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn kata_evidence_is_the_quote_alone_and_the_kms_appraises_it() {
+        let quote = kata_testdata("k3-app.quote.bin");
+        let body = serde_json::to_value(kata_evidence(quote.clone())).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "format": "alphacompute-evidence/kata/1",
+                "quote": BASE64_URL_SAFE_NO_PAD.encode(&quote),
+            })
+        );
+
+        let evidence: KataEvidence = serde_json::from_value(body).unwrap();
+        let doc: alpha_attest::PlatformDocument =
+            serde_json::from_slice(&kata_testdata("platform-document.json")).unwrap();
+        let collateral: alpha_attest::Collateral =
+            serde_json::from_slice(&kata_testdata("collateral.json")).unwrap();
+        let captured_at = String::from_utf8(kata_testdata("captured_at.txt")).unwrap();
+        let now: SystemTime = chrono::DateTime::parse_from_rfc3339(captured_at.trim())
+            .unwrap()
+            .into();
+        let nonce: [u8; 32] = kata_testdata("nonce.bin").try_into().unwrap();
+        let (appraised, gpu) = alpha_attest::appraise_kata_instance(
+            &evidence,
+            &nonce,
+            &kata_testdata("runtime_spki.der"),
+            &doc,
+            &collateral,
+            now,
+        )
+        .unwrap();
+        assert!(!gpu);
+        let init_data = String::from_utf8(kata_testdata("k3-app.toml")).unwrap();
+        assert_eq!(appraised.compose_hash, alpha_core::compose_hash(&init_data));
     }
 
     #[test]
