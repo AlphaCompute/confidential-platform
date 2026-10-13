@@ -4,7 +4,10 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use alpha_attest::{AttestationResult, Evidence, RESULT_FORMAT, Revision, Verdict, appraise};
+use alpha_attest::{
+    AttestationResult, Evidence, KATA_EVIDENCE_FORMAT, KataEvidence, RESULT_FORMAT, Revision,
+    Verdict, appraise, appraise_kata_instance,
+};
 use alpha_client::DerivedKey;
 use alpha_client::tls::PeerCerts;
 use alpha_core::{ComposeHash, Signer, context};
@@ -85,7 +88,8 @@ pub async fn nonce(State(node): State<Arc<Node>>) -> Result<Json<Value>, ApiErro
 pub struct AttestRequest {
     pub runtime_pubkey: String,
     pub nonce: String,
-    pub evidence: Evidence,
+    /// [`Evidence`] or, by its `format`, [`KataEvidence`].
+    pub evidence: Value,
 }
 
 pub fn decode32(field: &str, text: &str) -> Result<[u8; 32], ApiError> {
@@ -103,15 +107,35 @@ pub async fn collateral(node: &Node, quote: &[u8]) -> Result<alpha_attest::Colla
     })
 }
 
-/// A `revisions` row with what the checks need.
+/// A `revisions` row with what the checks need; exactly one of `compose` and `init_data` is set.
 pub struct RevisionRow {
     pub app_id: Uuid,
     pub org_id: Uuid,
-    pub compose: String,
+    pub compose: Option<String>,
+    pub init_data: Option<String>,
     pub created_by_key: Uuid,
     pub signature: Value,
     pub created_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
+}
+
+impl RevisionRow {
+    /// The signed bytes and the document their signature covers.
+    fn signed(&self, compose_hash: ComposeHash) -> Result<(&str, Value), ApiError> {
+        match (&self.compose, &self.init_data) {
+            (Some(compose), None) => Ok((
+                compose,
+                json!({ "app_id": self.app_id, "compose": compose }),
+            )),
+            (None, Some(init_data)) => Ok((
+                init_data,
+                json!({ "app_id": self.app_id, "init_data": init_data, "digest": compose_hash }),
+            )),
+            _ => Err(ApiError::signature_invalid(
+                "revision is neither a compose nor an init-data",
+            )),
+        }
+    }
 }
 
 pub async fn load_revision(
@@ -120,7 +144,7 @@ pub async fn load_revision(
 ) -> Result<Option<RevisionRow>, ApiError> {
     Ok(sqlx::query_as!(
         RevisionRow,
-        "select app_id, org_id, compose, created_by_key, signature, created_at, revoked_at
+        "select app_id, org_id, compose, init_data, created_by_key, signature, created_at, revoked_at
          from revisions where compose_hash = $1",
         compose_hash.as_bytes().as_slice()
     )
@@ -140,7 +164,8 @@ pub async fn verify_revision(
     if revision.revoked_at.is_some() {
         return Err(ApiError::new("revision_revoked", "revision is revoked"));
     }
-    if alpha_core::compose_hash(&revision.compose) != compose_hash {
+    let (bytes, document) = revision.signed(compose_hash)?;
+    if alpha_core::compose_hash(bytes) != compose_hash {
         return Err(ApiError::signature_invalid(
             "revision bytes do not hash to their key",
         ));
@@ -152,7 +177,6 @@ pub async fn verify_revision(
             "revision signer does not match",
         ));
     }
-    let document = json!({ "app_id": revision.app_id, "compose": revision.compose });
     let chain = keys::verify_signed(
         exec,
         tenant_kek_root,
@@ -181,7 +205,7 @@ pub async fn attest(
     p256::PublicKey::from_public_key_der(&spki)
         .map_err(|_| ApiError::malformed("runtime_pubkey: not a P-256 SPKI"))?;
     let actor = keys::sha256_hex(&spki);
-    let evidence_json = alpha_core::jcs(&json!(request.evidence))
+    let evidence_json = alpha_core::jcs(&request.evidence)
         .map_err(|e| ApiError::malformed(format!("evidence: {e}")))?;
     let evidence_sha256 = Sha256::digest(evidence_json).to_vec();
     let now = node.now();
@@ -229,19 +253,43 @@ async fn attest_inner(
     let doc = node
         .platform_document()
         .ok_or_else(|| ApiError::new("attestation_unknown", "no platform document"))?;
-    let collateral = collateral(node, &request.evidence.quote).await?;
-    let appraised = appraise(
-        &request.evidence,
-        &nonce,
-        spki,
-        None,
-        &doc,
-        &collateral,
-        now,
-    )?;
+    let kata = request.evidence.get("format").and_then(Value::as_str) == Some(KATA_EVIDENCE_FORMAT);
+    let appraised = if kata {
+        let evidence: KataEvidence = serde_json::from_value(request.evidence.clone())
+            .map_err(|e| ApiError::malformed(format!("evidence: {e}")))?;
+        let collateral = collateral(node, &evidence.quote).await?;
+        let (appraised, gpu) =
+            appraise_kata_instance(&evidence, &nonce, spki, &doc, &collateral, now)?;
+        // ponytail: no GPU evidence is appraised yet, so a GPU class gets no leaf at all; NRAS
+        // appraisal of the passed-through GPUs lifts this.
+        if gpu {
+            return Err(ApiError::new(
+                "policy_denied",
+                format!(
+                    "runtime class {} passes GPUs through, and GPU evidence is not appraised",
+                    appraised.os_image
+                ),
+            ));
+        }
+        appraised
+    } else {
+        let evidence: Evidence = serde_json::from_value(request.evidence.clone())
+            .map_err(|e| ApiError::malformed(format!("evidence: {e}")))?;
+        let collateral = collateral(node, &evidence.quote).await?;
+        appraise(&evidence, &nonce, spki, None, &doc, &collateral, now)?
+    };
     let keys = node.intermediates()?;
+    // A Revision is measured only in the form it was registered in: a compose through the dstack
+    // event log, an init-data through MRCONFIGID.
     let revision = load_revision(&node.pool, appraised.compose_hash)
         .await?
+        .filter(|r| {
+            if kata {
+                r.init_data.is_some()
+            } else {
+                r.compose.is_some()
+            }
+        })
         .ok_or_else(|| {
             ApiError::new(
                 "attestation_unknown",
@@ -256,6 +304,11 @@ async fn attest_inner(
         doc.signer.as_ref(),
     )
     .await?;
+    if let Some(init_data) = &revision.init_data {
+        let init_data = alpha_core::InitData::parse(init_data.clone())
+            .map_err(|e| ApiError::new("policy_denied", e.to_string()))?;
+        crate::control::check_kata_policy(&init_data, doc.kata_policy.as_ref(), "policy_denied")?;
+    }
     let runtime_sha_hex = appraised
         .runtime_pubkey_sha256
         .trim_start_matches("sha256:")
