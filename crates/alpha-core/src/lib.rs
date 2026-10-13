@@ -15,6 +15,7 @@ pub mod catalog;
 pub mod coco;
 pub mod compose;
 pub mod id;
+pub mod initdata;
 pub mod phala;
 pub mod platform;
 pub mod principal;
@@ -22,10 +23,11 @@ pub mod signing;
 
 pub use compose::{
     ComposeHash, ParseComposeHashError, RegistrationError, check_registration, compose_hash,
-    hex_bytes,
+    has_sha256_digest, hex_bytes,
 };
 pub use id::{AppId, KeyId, OrgId, PrincipalId, RequestId, SecretId};
-pub use platform::{CatalogKey, KmsRevision, Signer};
+pub use initdata::{InitData, InitDataError};
+pub use platform::{CatalogKey, KataPolicy, KmsRevision, Signer};
 pub use principal::KeyKind;
 pub use signing::{context, jcs, parse, signing_digest};
 
