@@ -45,6 +45,41 @@ Every GPU report is bound to `SHA-256("alphacompute/gpu-nonce/v1" ‖ report_dat
 
 In the pod, `alpha-runtime` (`alpha_tsm::coco`) takes the quote from the CoCo attestation agent's REST API (`GET /aa/evidence`, `ALPHACOMPUTE_QUOTE_SOURCE=coco-aa`) or from configfs-tsm (`coco-tsm`). GPU reports always come from the attestation agent: `GET /aa/additional-evidence` with the GPU nonce as the runtime data, sent raw (`encoding=base64`), returns `{"nvidia": {"device_evidence_list": [{"arch", "evidence", "certificate"}, …]}}` from the agent's NVIDIA attester, which asks every confidential GPU for a report over the first 32 bytes of the runtime data through NVIDIA's attestation SDK. guest-components v0.21.0 has that attester (`nvidia-attester`) and endpoint; Kata 4.0.0's guest init starts the NVIDIA-attester build of the agent when a GPU is passed through. NVSwitch entries (`arch: LS10`) are left out of the GPU count and are not appraised yet. Nothing the agent returns is trusted: the KMS's GPU backend verifies every report and its nonce. To confirm at M-B on the pinned stack: that the endpoint is enabled in NVIDIA's guest image (Q11) and that the agent's NVIDIA attester runs in GPU pods.
 
+## Guest REST prerequisites and preflight
+
+Kata's default REST feature selection is `resource`, which serves CDH resource
+requests but returns HTTP 404, `Attestation Feature Not Enabled`, for `/aa/*`.
+The presence of the REST listener or of an NVIDIA GPU does not enable those routes.
+For guests whose runtime uses `coco-aa`, and every GPU pod even with `coco-tsm`,
+configure the node's Kata runtime with `agent.guest_components_rest_api=all` in
+its guest `kernel_params`. Preserve the existing parameters when adding it; a
+Kata configuration drop-in is preferred to editing kata-deploy's managed file.
+This affects newly launched guests, so recreate a test pod to verify the change.
+Do not expose the pod-local service outside the guest.
+
+Before collecting evidence, `alpha-tsm` checks `GET /info` on the pod-local REST
+service. It requires `feature` to be `all` or `attestation`, `tee` to be `tdx`,
+and, for GPU pods, `additional_tees` to contain `nvidia`. A disabled feature
+produces an error naming the Kata startup setting. These are collection
+capabilities, not trusted attestation claims; quote and GPU verification remain
+the KMS's responsibility. CPU-only `coco-tsm` pods do not need REST access. A
+configfs fallback also requires a mounted, accessible TSM report tree inside
+the guest; mounting it in a privileged diagnostic container does not establish
+that access for the normal runtime container.
+
+Hardware check on 12 October 2026: on a Kata 4.0.0 B300 guest with guest-components
+`da8d93f`, both routes were initially feature-disabled. Adding the startup flag
+made `/info` advertise TDX and NVIDIA, `/aa/evidence` return a fresh TDX v4 quote
+with the requested runtime data, and `/aa/additional-evidence` return one BLACKWELL
+report with the requested nonce. A new pod without a kernel-parameter annotation
+confirmed the persistent node drop-in. The GPU report signature verified against
+its returned leaf public key; chain trust, OCSP, RIM matching, CPU DCAP/TCB,
+init-data binding and KMS leaf issuance were not verified by that check.
+
+The policy-generator suite targets Kata 4.1.0. The collection result on 4.0.0 does
+not qualify those generated policies on that guest version; match and validate
+the guest agent, genpolicy, rules and settings before running the live suite.
+
 ## Appraisal steps
 
 In the plan's order (PRD-02 R5). Every step is mandatory; the order only decides which reason is named when evidence has several faults.
