@@ -16,6 +16,7 @@ pub mod call;
 pub mod catalog;
 pub mod coco;
 pub mod deploy;
+pub mod fortanix;
 pub mod instances;
 pub mod keyfile;
 pub mod node;
