@@ -541,8 +541,10 @@ fn kata_runtime_class<'a>(
     if quote.mr_signer_seam != [0; 48] {
         return Err(PolicyDenied("mrsignerseam is not zero".into()));
     }
-    // Parsing refuses overlapping entries, but a document built in code skips that.
-    let mut matching = references.iter().filter(|r| r.matches(&quote.measured));
+    // Parsing refuses empty and overlapping entries, but a document built in code skips that.
+    let mut matching = references
+        .iter()
+        .filter(|r| !r.runtime_class.is_empty() && r.matches(&quote.measured));
     match (matching.next(), matching.next()) {
         (Some(r), None) => Ok(r.runtime_class.as_str()),
         (None, _) => Err(Unknown(format!(

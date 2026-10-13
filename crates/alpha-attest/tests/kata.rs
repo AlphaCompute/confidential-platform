@@ -224,3 +224,16 @@ fn two_classes_matching_one_td_are_refused() {
         "more than one",
     );
 }
+
+#[test]
+fn a_class_without_a_name_matches_nothing() {
+    let mut doc = doc();
+    for class in &mut doc.kata_reference_values {
+        class.runtime_class.clear();
+    }
+    refused(
+        appraise("p1-sha256.quote.bin", &t1_digest(), &doc),
+        "attestation_unknown",
+        "no kata runtime class",
+    );
+}
