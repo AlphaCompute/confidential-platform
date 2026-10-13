@@ -66,8 +66,8 @@ jobs:
             fail=1
           fi
 
-          ids='\b(PRD|ADR)[- ]?[0-9]+|\b[DIMP][0-9]{1,2}\b'
-          words='\b(phase|plan|milestone|deliverable) [0-9]|generated with|co-authored-by:.*(claude|codex|copilot|cursor|chatgpt|gemini|gpt|\[bot\])'
+          ids='\b[DIMP][0-9]{1,2}\b'
+          words='\b(prd|adr)[- ]?[0-9]+|\b(phase|plan|milestone|deliverable) [0-9]|generated with|co-authored-by:.*(claude|codex|copilot|cursor|chatgpt|gemini|gpt|\[bot\])'
           [ -n "$EXTRA_TERMS" ] && words="$words|$EXTRA_TERMS"
           text=$(printf '%s\n%s\n' "$TITLE" "$BODY"; git log --format=%B "$BASE_SHA..$HEAD_SHA")
           hits=$(printf '%s\n' "$text" | grep -E "$ids"; printf '%s\n' "$text" | grep -iE "$words" || true)
