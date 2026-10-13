@@ -56,6 +56,9 @@ sed -e "s|@STYLE_NAME@|$style|" -e "s|@STYLE_SRI@|$(sri "$out/$style")|" \
   "$here/index.html.in" > "$out/index.html"
 unfilled "$out/index.html"
 cp "$here/headers" "$out/headers"
+# The headers of /sign/embed (PRD-03 S5, draft): the host replaces @EMBED_ANCESTORS@ with the
+# platform document's signer.embed_ancestors, space-separated, or 'none' when it lists none.
+cp "$here/headers-embed" "$out/headers-embed"
 cp "$here/fonts/OFL.txt" "$out/OFL.txt"
 
 echo "bundle_sha256 sha256:$(hex "$out/index.html")"

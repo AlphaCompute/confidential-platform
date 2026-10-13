@@ -504,7 +504,8 @@ impl Runtime {
             .is_some_and(|compose| alpha_core::compose_hash(compose) != identity.compose_hash)
         {
             return Err(Error::Certificate(
-                "the guest agent's app_compose is not the leaf's Revision".into(),
+                "this guest's app_compose (compose or Revision v2) is not the leaf's Revision"
+                    .into(),
             ));
         }
         let certified =

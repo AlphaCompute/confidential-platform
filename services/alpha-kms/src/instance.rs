@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alpha_attest::{
     AttestationResult, Evidence, KATA_EVIDENCE_FORMAT, KataEvidence, RESULT_FORMAT, Revision,
-    Verdict, appraise, appraise_kata_instance,
+    Verdict, VerifiedQuote, appraise, appraise_kata_instance,
 };
 use alpha_client::DerivedKey;
 use alpha_client::tls::PeerCerts;
@@ -199,6 +199,26 @@ pub async fn attest(
     State(node): State<Arc<Node>>,
     Body(request, _): Body<AttestRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    attest_audited(&node, &request, None).await.map(Json)
+}
+
+/// [`attest`] for `alphacompute-evidence/2` over a TDX quote the caller has verified: every step
+/// after DCAP, the audit row included. No route reaches it. The KMS's tests run the Kata pod's
+/// cases through it over synthetic quotes, as `alpha_attest::kata` tests its profile, until B300
+/// Kata captures exist (M1).
+pub async fn attest_verified(
+    node: &Node,
+    request: &AttestRequest,
+    verified: VerifiedQuote,
+) -> Result<Value, ApiError> {
+    attest_audited(node, request, Some(verified)).await
+}
+
+async fn attest_audited(
+    node: &Node,
+    request: &AttestRequest,
+    verified: Option<VerifiedQuote>,
+) -> Result<Value, ApiError> {
     let spki = BASE64_URL_SAFE_NO_PAD
         .decode(&request.runtime_pubkey)
         .map_err(|_| ApiError::malformed("runtime_pubkey: not base64url"))?;
@@ -209,7 +229,7 @@ pub async fn attest(
         .map_err(|e| ApiError::malformed(format!("evidence: {e}")))?;
     let evidence_sha256 = Sha256::digest(evidence_json).to_vec();
     let now = node.now();
-    let result = attest_inner(&node, &spki, &request, now).await;
+    let result = attest_inner(node, &spki, request, verified, now).await;
     let (outcome, details, org_id) = match &result {
         Ok((_, result)) => (
             "ok",
@@ -234,18 +254,20 @@ pub async fn attest(
     .insert(&node.pool)
     .await?;
     let (leaf_der, result) = result?;
-    Ok(Json(json!({
+    Ok(json!({
         "certificate_chain": [certs::pem(&leaf_der), node.intermediates()?.ca_pem()],
         "not_after": rfc3339(crate::later(now, certs::LEAF_TTL)?),
         "attestation_result": result,
-    })))
+    }))
 }
 
-/// The leaf's DER and the result behind it.
+/// The leaf's DER and the result behind it. A Kata pod's quote is DCAP-verified here unless the
+/// caller of [`attest_verified`] has done so.
 async fn attest_inner(
     node: &Node,
     spki: &[u8],
     request: &AttestRequest,
+    _verified: Option<VerifiedQuote>,
     now: SystemTime,
 ) -> Result<(Vec<u8>, AttestationResult), ApiError> {
     let nonce = decode32("nonce", &request.nonce)?;
@@ -341,6 +363,7 @@ async fn attest_inner(
         evidence_sha256: appraised.evidence_sha256,
         verified_at: rfc3339(now),
         policy_version: appraised.policy_version,
+        coco: appraised.coco,
     };
     Ok((leaf_der, result))
 }
@@ -570,4 +593,5 @@ mod tests {
             mint_nonce(&key, t0 + Duration::from_secs(1)).unwrap()
         );
     }
+
 }

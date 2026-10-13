@@ -62,7 +62,8 @@ pub async fn load_stored(node: &Node) -> Result<Option<Verified>, ApiError> {
 }
 
 /// Applies a verified document: the row moves only to a higher version (with a
-/// `platform.reload` audit row), memory follows the row.
+/// `platform.reload` audit row), memory follows the row. A lower version, a rollback to a document
+/// the release key once signed, is refused with a denied `platform.reload` row.
 pub async fn apply(node: &Node, verified: Verified) -> Result<(), ApiError> {
     let version = i32::try_from(verified.document.version)
         .map_err(|_| ApiError::internal("platform document version overflows"))?;
@@ -72,9 +73,17 @@ pub async fn apply(node: &Node, verified: Verified) -> Result<(), ApiError> {
         .await?;
     match stored {
         Some(stored) if stored > version => {
-            return Err(ApiError::internal(format!(
-                "platform document version {version} is below the stored {stored}"
-            )));
+            drop(tx);
+            let message =
+                format!("platform document version {version} is below the stored {stored}");
+            audit::node(
+                "platform.reload",
+                "denied",
+                json!({ "version": version, "stored": stored, "message": message }),
+            )
+            .insert(&node.pool)
+            .await?;
+            return Err(ApiError::internal(message));
         }
         Some(stored) if stored == version => {}
         _ => {

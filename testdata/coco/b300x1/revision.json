@@ -1,0 +1,1 @@
+{"app_id":"01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b","format":"alphacompute-coco-revision/1","gpu":{"count":1,"model":"B300"},"initdata_sha256":"sha256:f5a81ee64a9a5719d55877e03e96a3c19567fe3e7202fcca18ba5a9043ef58b0","policy_sha256":"sha256:5aeaa3e7d2806e6f02fa8edc08f3712e4e7998abddd828cdd79e5c4fb8dfc2ea","runtime_class":"kata-qemu-nvidia-gpu-tdx"}
