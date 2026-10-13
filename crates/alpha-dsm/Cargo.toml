@@ -1,0 +1,36 @@
+[package]
+name = "alpha-dsm"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# A stand-in for our own DSM (PRD-06 I3), for tests here and in alpha-kms.
+stand-in = ["dep:aes-gcm", "dep:axum", "dep:ed25519-dalek", "dep:rcgen", "dep:tokio"]
+
+[dependencies]
+aes-gcm = { version = "0.11", optional = true }
+alpha-client = { path = "../alpha-client" }
+alpha-core = { path = "../alpha-core" }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"], optional = true }
+base64 = "0.23"
+ed25519-dalek = { version = "3", optional = true }
+parking_lot = "0.12"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["net", "rt"], optional = true }
+zeroize = { version = "1", features = ["serde"] }
+
+[dev-dependencies]
+alpha-dsm = { path = ".", features = ["stand-in"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+ed25519-dalek = "3"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }

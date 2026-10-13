@@ -16,6 +16,7 @@ Control bodies are signed `ed25519` or `webauthn-es256`, a passkey's WebAuthn as
 | `ALPHACOMPUTE_KMS_ENDPOINTS` | comma-separated `https://…` of the KMS nodes; walked on a sealed start to `join` |
 | `ALPHACOMPUTE_PCCS_URL` | PCCS for DCAP collateral, fetched per attestation |
 | `ALPHACOMPUTE_PLATFORM_DOCUMENT_URL` | the release-signed platform document, fetched on start and every five minutes |
+| `ALPHACOMPUTE_KMS_ROOT_DSM` | optional, PRD-06 I3: `{endpoint, ca_pem, key, key_exchange?}` of our own on-prem Fortanix DSM and the AES-256 key holding the root KEK's co-factor; with it, unsealing needs two custodian shares and that DSM (`docs/hsm-backed-roots.md`). Read at bootstrap and unseal; it must match what the database's root was bootstrapped with |
 | `ALPHACOMPUTE_KMS_DEV_ROOT_KEK` | `dev-root` feature only: 64 hex digits used as the root KEK instead of the custodians' shares |
 
 `alpha-kms migrate` applies `migrations/` (expand-only) and returns; run it as the schema owner. The service then reads its event log from the CCEL table and `/run/log/dstack`, generates its P-256 runtime key and X-Wing key, and comes up sealed: it joins the first ready endpoint or waits for two `unseal` shares (or, on an empty database, a `bootstrap`).

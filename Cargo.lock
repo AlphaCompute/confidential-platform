@@ -134,6 +134,7 @@ dependencies = [
  "alpha-client",
  "alpha-core",
  "alpha-crypto",
+ "alpha-dsm",
  "axum",
  "base64 0.23.1",
  "chrono",
@@ -235,6 +236,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "alpha-dsm"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "alpha-client",
+ "alpha-core",
+ "alpha-dsm",
+ "axum",
+ "base64 0.23.1",
+ "ed25519-dalek 3.0.0",
+ "parking_lot",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
 name = "alpha-guard"
 version = "0.1.0"
 dependencies = [
@@ -295,6 +318,7 @@ dependencies = [
  "alpha-core",
  "alpha-cpu-app",
  "alpha-crypto",
+ "alpha-dsm",
  "alpha-runtime",
  "alpha-tsm",
  "axum",
@@ -332,6 +356,7 @@ dependencies = [
  "alpha-attest",
  "alpha-client",
  "alpha-core",
+ "alpha-dsm",
  "alpha-tsm",
  "axum",
  "base64 0.23.1",

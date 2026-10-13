@@ -90,6 +90,7 @@ fn config(h: &Harness, endpoints: Vec<String>) -> Config {
         kms_endpoints: endpoints,
         secrets: Secrets::new(),
         tls_upstream: None,
+        dsm: None,
     }
 }
 
@@ -1522,4 +1523,180 @@ async fn a_revoked_revision_gets_no_new_secret_files() {
     assert_eq!(std::fs::read_dir(fresh.join("web")).unwrap().count(), 0);
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&fresh);
+}
+
+const DSM_KEY: &[u8] = b"customer data key, 32 bytes long";
+
+/// A customer's Fortanix DSM (PRD-06 I1) under its own CA: one trusted-CA App, `app-1`, that
+/// trusts the KMS CA (judged at the capture's instant, like the rest of this file) and matches
+/// one DNS name of the client leaf, as `docs/fortanix-dsm-keys.md` has the customer set it up.
+struct CustomerDsm {
+    url: String,
+    ca_pem: String,
+    matches: String,
+    sessions: AtomicUsize,
+    exports: AtomicUsize,
+}
+
+impl CustomerDsm {
+    async fn start(h: &Harness, matches: String) -> Arc<Self> {
+        use axum::http::StatusCode as Http;
+        use axum::response::IntoResponse;
+
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = params.self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::new(params, ca_key);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.subject_alt_names = vec![rcgen::SanType::IpAddress([127, 0, 0, 1].into())];
+        let leaf = params.signed_by(&key, &issuer).unwrap();
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(tls::cert_from_pem(&h.ca_pem).unwrap()).unwrap();
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            tls::provider(),
+        )
+        .build()
+        .unwrap();
+        let server = ServerConfig::builder_with_details(tls::provider(), pinned_time(h.now()))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(
+                vec![leaf.der().clone(), ca.der().clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+            )
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dsm = Arc::new(Self {
+            url: format!("https://{}", listener.local_addr().unwrap()),
+            ca_pem: ca.pem(),
+            matches,
+            sessions: AtomicUsize::new(0),
+            exports: AtomicUsize::new(0),
+        });
+        let auth = |axum::extract::State(dsm): axum::extract::State<Arc<Self>>,
+                    axum::Extension(peer): axum::Extension<tls::PeerCerts>| async move {
+            let named = peer
+                .0
+                .first()
+                .and_then(|leaf| tls::dns_sans(leaf).ok())
+                .is_some_and(|names| names.contains(&dsm.matches));
+            if !named {
+                return (Http::UNAUTHORIZED, "no trusted-CA App matches").into_response();
+            }
+            let n = dsm.sessions.fetch_add(1, Ordering::SeqCst) + 1;
+            axum::Json(json!({ "access_token": format!("t-{n}"), "expires_in": 600 }))
+                .into_response()
+        };
+        let export = |axum::extract::State(dsm): axum::extract::State<Arc<Self>>,
+                      headers: axum::http::HeaderMap| async move {
+            let bearer = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.starts_with("Bearer t-"));
+            if !bearer {
+                return (Http::UNAUTHORIZED, "bad token").into_response();
+            }
+            dsm.exports.fetch_add(1, Ordering::SeqCst);
+            axum::Json(json!({
+                "kid": "k-1", "obj_type": "AES",
+                "value": base64::prelude::BASE64_STANDARD.encode(DSM_KEY),
+            }))
+            .into_response()
+        };
+        let app = axum::Router::new()
+            .route("/sys/v1/session/auth", axum::routing::post(auth))
+            .route("/crypto/v1/keys/export", axum::routing::post(export))
+            .with_state(dsm.clone());
+        tokio::spawn(tls::serve(
+            listener,
+            Arc::new(server),
+            app,
+            std::future::pending(),
+        ));
+        dsm
+    }
+
+    fn config(&self, binding: &str) -> alpha_dsm::DsmConfig {
+        let text = json!({
+            "endpoint": self.url, "app_id": "app-1", "ca_pem": self.ca_pem,
+            "keys": { "data": { "kid": "k-1" } }, "binding": binding,
+        })
+        .to_string();
+        alpha_dsm::DsmConfig::parse(Some(&text)).unwrap().unwrap()
+    }
+
+    fn counts(&self) -> (usize, usize) {
+        (
+            self.sessions.load(Ordering::SeqCst),
+            self.exports.load(Ordering::SeqCst),
+        )
+    }
+}
+
+/// End to end with the leaf this KMS issues: it carries the App's and the Revision's DNS names,
+/// a customer DSM bound to the Revision releases the key once per leaf, a renewal asks again, and
+/// a DSM App bound to another Revision of the same App releases nothing (PRD-06 I1, review X15).
+#[tokio::test]
+async fn a_customer_dsm_bound_to_the_revision_releases_its_keys_to_this_leaf_only() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    let (app, hash, _) = app_with_secret(&h, b"v1").await;
+    let dsm = CustomerDsm::start(&h, tls::revision_dns_name(h.org, app, hash)).await;
+    let (runtime, _) = start_runtime(
+        &h,
+        config(&h, vec![h.url.clone()]).with_dsm(Some(dsm.config("revision"))),
+    );
+    runtime.attest().await.unwrap();
+    let socket = Socket::start(runtime.clone());
+
+    let (_, identity) = socket.get("/v1/identity").await;
+    let leaf = tls::cert_from_pem(identity["certificate_chain"][0].as_str().unwrap()).unwrap();
+    assert_eq!(
+        tls::dns_sans(&leaf).unwrap(),
+        [
+            tls::app_dns_name(h.org, app),
+            tls::revision_dns_name(h.org, app, hash)
+        ]
+    );
+
+    let (status, key) = socket.get("/v1/customer-keys/data").await;
+    assert_eq!(status, 200, "{key}");
+    assert_eq!(key["value"], json!(b64(DSM_KEY)));
+    assert_eq!(key["kid"], "k-1");
+    let (status, _) = socket.get("/v1/customer-keys/data").await;
+    assert_eq!(status, 200);
+    assert_eq!(dsm.counts(), (1, 1), "cached with the leaf");
+    let (status, reply) = socket.get("/v1/customer-keys/other").await;
+    assert_eq!((status, code(&reply)), (404, "not_found"), "{reply}");
+
+    // A renewal builds a new DSM client from the new leaf, and the next read asks again.
+    runtime.attest().await.unwrap();
+    let (status, _) = socket.get("/v1/customer-keys/data").await;
+    assert_eq!(status, 200);
+    assert_eq!(dsm.counts(), (2, 2));
+    assert_eq!(socket.stop().await, Exit::Drained);
+
+    // A DSM App bound to another Revision of this App: the leaf is presented, and refused.
+    let other = CustomerDsm::start(
+        &h,
+        tls::revision_dns_name(h.org, app, alpha_core::compose_hash("{}")),
+    )
+    .await;
+    let (runtime, _) = start_runtime(
+        &h,
+        config(&h, vec![h.url.clone()]).with_dsm(Some(other.config("revision"))),
+    );
+    runtime.attest().await.unwrap();
+    let socket = Socket::start(runtime.clone());
+    let (status, reply) = socket.get("/v1/customer-keys/data").await;
+    assert_eq!((status, code(&reply)), (403, "dsm_refused"), "{reply}");
+    assert_eq!(other.counts(), (0, 0));
+    assert_eq!(socket.stop().await, Exit::Drained);
 }

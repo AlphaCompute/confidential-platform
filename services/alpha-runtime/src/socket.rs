@@ -1,4 +1,4 @@
-//! The four routes on the unix socket: HTTP/1.1, JSON, no authentication — access is the
+//! The five routes on the unix socket: HTTP/1.1, JSON, no authentication — access is the
 //! right to the socket. KMS errors pass through in their own envelope with their status.
 
 use std::sync::Arc;
@@ -21,6 +21,7 @@ pub fn router(runtime: Arc<Runtime>) -> Router {
         .route("/v1/identity", get(identity))
         .route("/v1/secrets/{name}", get(secret))
         .route("/v1/keys/{purpose}", get(key))
+        .route("/v1/customer-keys/{name}", get(customer_key))
         .route("/healthz", get(healthz))
         .fallback(|| async { envelope(StatusCode::NOT_FOUND, "not_found", "no such route") })
         .with_state(runtime)
@@ -47,6 +48,21 @@ impl IntoResponse for Error {
                 }})),
             )
                 .into_response(),
+            Error::Dsm(alpha_dsm::Error::Undeclared(_)) => {
+                envelope(StatusCode::NOT_FOUND, "not_found", self.to_string())
+            }
+            // The leaf does not name this App or Revision as the DSM App binds to: nothing was
+            // sent, because a DSM could check the leaf only against the shared KMS CA.
+            Error::Dsm(alpha_dsm::Error::Unbound(_)) => {
+                envelope(StatusCode::FORBIDDEN, "dsm_unbound", self.to_string())
+            }
+            // The customer's DSM said no: its policy does not grant this Revision the key.
+            Error::Dsm(alpha_dsm::Error::Refused { status, .. })
+                if status == 401 || status == 403 =>
+            {
+                envelope(StatusCode::FORBIDDEN, "dsm_refused", self.to_string())
+            }
+            Error::Dsm(_) => envelope(StatusCode::BAD_GATEWAY, "dsm_unavailable", self.to_string()),
             Error::NotAttested => envelope(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "not_attested",
@@ -92,6 +108,19 @@ async fn key(
     runtime.key(&purpose).await.map(Json)
 }
 
+async fn customer_key(
+    State(runtime): State<Arc<Runtime>>,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, Error> {
+    let key = runtime.customer_key(&name).await?;
+    Ok(Json(json!({
+        "name": name,
+        "kid": key.kid,
+        "obj_type": key.obj_type,
+        "value": BASE64_URL_SAFE_NO_PAD.encode(&key.value[..]),
+    })))
+}
+
 pub fn healthz_json(runtime: &Runtime) -> Value {
     json!({
         "attested": runtime.attested().is_some(),
@@ -101,4 +130,30 @@ pub fn healthz_json(runtime: &Runtime) -> Value {
 
 async fn healthz(State(runtime): State<Arc<Runtime>>) -> Json<Value> {
     Json(healthz_json(&runtime))
+}
+
+#[cfg(test)]
+mod dsm_tests {
+    use super::*;
+
+    #[test]
+    fn a_customer_dsm_refusal_is_forbidden_and_an_outage_a_bad_gateway() {
+        use alpha_dsm::Error::*;
+        let status = |e: alpha_dsm::Error| Error::Dsm(e).into_response().status();
+        assert_eq!(status(Undeclared("x".into())), StatusCode::NOT_FOUND);
+        assert_eq!(status(Unbound("no name".into())), StatusCode::FORBIDDEN);
+        for refused in [401, 403] {
+            let e = Refused {
+                status: refused,
+                message: String::new(),
+            };
+            assert_eq!(status(e), StatusCode::FORBIDDEN);
+        }
+        let e = Refused {
+            status: 500,
+            message: String::new(),
+        };
+        assert_eq!(status(e), StatusCode::BAD_GATEWAY);
+        assert_eq!(status(Transport("down".into())), StatusCode::BAD_GATEWAY);
+    }
 }
