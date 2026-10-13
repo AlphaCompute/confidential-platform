@@ -25,7 +25,9 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{Harness, KEYED, b64, captured_at, harness_with, platform_document};
+use super::{
+    Harness, KATA, KEYED, b64, captured_at, harness_on, harness_with, platform_document,
+};
 
 /// A baseline agent policy: exec and log reads denied.
 pub const POLICY: &str = "package agent_policy\ndefault ExecProcessRequest := false\ndefault ReadStreamRequest := false\n";
@@ -84,6 +86,17 @@ pub fn kata_document(version: u64) -> Value {
 pub async fn publish(h: &Harness, doc: Value) {
     h.release.set(doc);
     platform::reload(&h.node).await.unwrap();
+}
+
+/// A Kata harness at the Kata capture's time, with Kata reference values and agent policy, for
+/// init-data attestation tests that do not exercise GPU backends.
+pub async fn kata_init_harness() -> Option<Harness> {
+    let mut document = platform_document(KEYED);
+    let kata = platform_document(KATA);
+    document["kata_reference_values"] = kata["kata_reference_values"].clone();
+    document["kata_policy"] = kata["kata_policy"].clone();
+    let now = captured_at(KATA);
+    harness_on(std::sync::Arc::new(move || now), KATA, document).await
 }
 
 /// A harness whose node runs `gpu` as its NRAS backend and the Fortanix CCM backend, under

@@ -226,6 +226,7 @@ async fn a_node_halts_when_a_peer_has_seen_a_head_its_database_lacks() {
         h.node.clock.clone(),
         Vec::new(),
         vec![h.url.clone()],
+        KEYED,
     )
     .await;
     node::finish_join(&peer, &join_reply(&h.node))
