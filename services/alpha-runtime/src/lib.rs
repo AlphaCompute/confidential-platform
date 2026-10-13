@@ -934,7 +934,7 @@ mod tests {
 
     #[test]
     fn kata_evidence_is_the_quote_alone_and_the_kms_appraises_it() {
-        let quote = kata_testdata("k2-app.quote.bin");
+        let quote = kata_testdata("k3-app.quote.bin");
         let body = serde_json::to_value(kata_evidence(quote.clone())).unwrap();
         assert_eq!(
             body,
@@ -964,7 +964,7 @@ mod tests {
         )
         .unwrap();
         assert!(!gpu);
-        let init_data = String::from_utf8(kata_testdata("k2-app.toml")).unwrap();
+        let init_data = String::from_utf8(kata_testdata("k3-app.toml")).unwrap();
         assert_eq!(appraised.compose_hash, alpha_core::compose_hash(&init_data));
     }
 
