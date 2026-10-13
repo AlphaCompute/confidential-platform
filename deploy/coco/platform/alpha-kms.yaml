@@ -64,6 +64,9 @@ spec:
             # harmless: the join pins the KMS CA and kms_revisions.
             - name: ALPHACOMPUTE_KMS_ENDPOINTS
               value: "${KMS_NODE_ENDPOINTS}"
+            # The trust-zone Postgres, with no password: this value is public with the rest of
+            # the init-data, and a Kata node refuses to start with a password here
+            # (alpha_kms::measured_env; README.md, "The database credential").
             - name: ALPHACOMPUTE_DATABASE_URL
               value: "${DATABASE_URL}"
             - name: ALPHACOMPUTE_PCCS_URL
