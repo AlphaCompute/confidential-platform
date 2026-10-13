@@ -5,6 +5,26 @@ Both commands produce what a Kata confidential pod is identified by (PRD-02 D4):
 - `alpha coco render` takes a pod-spec template, `KEY=VALUE` files and an agent policy. It serves our own platform services, whose specs live in a repository.
 - `alpha coco wrap` takes a customer's docker-compose and a shape, and runs genpolicy itself. It serves the Rafay offers. Its interface is fixed by rafay-plugins' `rafay-integration/coco-gpu.md` ("The `alpha coco wrap` contract"), and the adapter checks the output with `checkCocoWrapped` and `checkPodSpec`.
 
+## Deployment preflight
+
+`wrap` and `render` produce workloads; they do not enable guest services on the
+node. Their `coco-aa` runtime needs the Kata guest startup setting
+`agent.guest_components_rest_api=all`. Add it to the selected runtime's existing
+`kernel_params` through a node configuration drop-in and recreate a test guest.
+The default REST feature mode is `resource`, which responds to `/aa/*` with
+`Attestation Feature Not Enabled`. Do not add a pod-level `kernel_params`
+annotation to bypass node setup: it is outside the workload's allowed annotation
+contract and may be rejected by admission.
+
+Before evidence collection, `alpha-tsm` checks the pod-local `/info` response for
+attestation feature access, TDX and, for a GPU shape, the NVIDIA attester. This is
+a capability check; the KMS still verifies quotes and GPU evidence. A configfs
+CPU fallback does not eliminate the GPU REST requirement. Also provision the
+KMS endpoints ConfigMap and use matching, qualified guest-agent/genpolicy
+versions; successful wrap output alone establishes none of these deployment
+prerequisites. See `kata-attestation.md` for the verified B300 startup fix and
+remaining hardware checks.
+
 ## `alpha coco wrap`
 
 ```
