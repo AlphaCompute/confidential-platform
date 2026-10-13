@@ -324,7 +324,6 @@ pub fn check_coco_dsm(initdata: &[u8], dsm: Option<&str>) -> Result<(), Error> {
     alpha_core::coco::policy::dsm_pinned(policy, value).map_err(refused)
 }
 
-
 /// When the Endpoint's TLS listener opens.
 pub enum Tls {
     /// No upstream: no listener.

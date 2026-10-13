@@ -361,7 +361,6 @@ mod tests {
     /// genpolicy 4.1.0's released `rules.rego`, vendored in alpha-core beside the patched rules.
     const UPSTREAM_RULES: &str = include_str!("../../../alpha-core/src/coco/genpolicy/rules.rego");
 
-
     /// A policy as genpolicy prints it, from `policy_data`.
     pub(crate) fn policy(data: &Value) -> String {
         format!(
