@@ -149,7 +149,7 @@ fn check_images(node: &Yaml) -> Result<(), RegistrationError> {
     }
 }
 
-fn has_sha256_digest(image: &str) -> bool {
+pub fn has_sha256_digest(image: &str) -> bool {
     image
         .rsplit_once("@sha256:")
         .is_some_and(|(_, hex)| hex_bytes::<32>(hex).is_some())
