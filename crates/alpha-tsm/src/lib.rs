@@ -14,6 +14,8 @@
     )
 )]
 
+pub mod coco;
+
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;

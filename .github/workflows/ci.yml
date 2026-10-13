@@ -83,4 +83,7 @@ jobs:
           else
             echo "no service crate yet; skipping"
           fi
+      # PRD-02 deliverable 7, named so its result shows on its own; the workspace run repeats it.
+      - name: malicious-host core suite
+        run: cargo test -p alpha-kms --test malicious_host
       - run: cargo test --workspace

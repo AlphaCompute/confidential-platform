@@ -28,6 +28,7 @@ use std::time::{Duration, SystemTime};
 use alpha_attest::{
     AttestationResult, EVIDENCE_FORMAT, Evidence, KATA_EVIDENCE_FORMAT, KataEvidence,
 };
+use alpha_client::attestation::{BUNDLE_FORMAT, EvidenceBundle};
 use alpha_client::tls::{self, InstanceSans};
 use alpha_client::{
     AttestReply, AttestRequest, Client, DerivedKey, Identity, InstanceEvidence, Pin, Secret,
@@ -40,6 +41,7 @@ use p256::ecdsa::SigningKey;
 use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
 use parking_lot::{Mutex, RwLock};
 use rustls::sign::CertifiedKey;
+use serde_json::Value;
 use tokio::net::UnixListener;
 use tokio::sync::watch;
 use zeroize::Zeroizing;
@@ -354,6 +356,8 @@ pub struct Attested {
     pub chain_pem: Vec<String>,
     pub not_after: SystemTime,
     pub result: AttestationResult,
+    /// The evidence bundle (PRD-06 clear claims), when the KMS sent its receipt.
+    pub bundle: Option<EvidenceBundle>,
     /// The leaf and the runtime key as the TLS listener serves them.
     pub certified: Arc<CertifiedKey>,
     client: Client,
@@ -463,20 +467,20 @@ impl Runtime {
             .map_err(|_| alpha_client::Error::Invalid("nonce is not 32 bytes".into()))?;
         let report_data = alpha_attest::report_data(&self.spki, &nonce, None);
         let evidence = (self.evidence)(&report_data).map_err(Error::Evidence)?;
-        let reply = self
-            .kms
-            .attest(&AttestRequest {
-                runtime_pubkey: BASE64_URL_SAFE_NO_PAD.encode(&self.spki),
-                nonce: BASE64_URL_SAFE_NO_PAD.encode(nonce),
-                evidence,
-            })
-            .await?;
-        self.accept(reply)
+        let request = AttestRequest {
+            runtime_pubkey: BASE64_URL_SAFE_NO_PAD.encode(&self.spki),
+            nonce: BASE64_URL_SAFE_NO_PAD.encode(nonce),
+            evidence,
+        };
+        let reply = self.kms.attest(&request).await?;
+        let request = serde_json::to_value(&request)
+            .map_err(|e| Error::Evidence(format!("attest request: {e}")))?;
+        self.accept(reply, request)
     }
 
     /// The reply's chain is ours only if the leaf carries our key and the root the pinned one;
     /// the ids come from the leaf's SANs, never from the reply's text.
-    fn accept(&self, reply: AttestReply) -> Result<Arc<Attested>, Error> {
+    fn accept(&self, reply: AttestReply, request: Value) -> Result<Arc<Attested>, Error> {
         let chain: Vec<Vec<u8>> = reply
             .certificate_chain
             .iter()
@@ -504,7 +508,8 @@ impl Runtime {
             .is_some_and(|compose| alpha_core::compose_hash(compose) != identity.compose_hash)
         {
             return Err(Error::Certificate(
-                "the guest agent's app_compose is not the leaf's Revision".into(),
+                "this guest's app_compose (compose or Revision v2) is not the leaf's Revision"
+                    .into(),
             ));
         }
         let certified =
@@ -521,11 +526,20 @@ impl Runtime {
             }),
             self.time.clone(),
         )?;
+        // Kept as received: whoever reads it checks it against the KMS CA (see
+        // `alpha_client::attestation::verify_bundle`), so the runtime need not trust it.
+        let bundle = reply.attestation_receipt.map(|receipt| EvidenceBundle {
+            format: BUNDLE_FORMAT.into(),
+            request,
+            receipt,
+            certificate_chain: reply.certificate_chain.clone(),
+        });
         Ok(Arc::new(Attested {
             identity,
             chain_pem: reply.certificate_chain,
             not_after,
             result: reply.attestation_result,
+            bundle,
             certified,
             client,
             secrets: Mutex::new(HashMap::new()),

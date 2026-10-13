@@ -1,4 +1,4 @@
-//! The key broker: six tables, fourteen routes on one TLS port, one process-wide state.
+//! The key broker: six tables, fifteen routes on one TLS port, one process-wide state.
 
 #![cfg_attr(
     test,
@@ -16,6 +16,7 @@ pub mod body;
 pub mod certs;
 pub mod channel;
 pub mod control;
+pub mod decisions;
 pub mod error;
 pub mod instance;
 pub mod keys;
@@ -27,7 +28,9 @@ pub mod webauthn;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
-use alpha_attest::{Collateral, EventLogEntry, PlatformDocument};
+use alpha_attest::gpu::ccm::FortanixCcm;
+use alpha_attest::gpu::nras::Nras;
+use alpha_attest::{Collateral, EventLogEntry, GpuVerifier, PlatformDocument};
 use alpha_core::ComposeHash;
 use axum::Router;
 use axum::extract::{Request, State};
@@ -46,6 +49,9 @@ use crate::error::ApiError;
 pub struct Config {
     pub kms_endpoints: Vec<String>,
     pub platform_document_url: String,
+    /// The GPU verifier backends a Kata pod's GPUs may be verified by; the platform document's
+    /// `gpu_policy` decides which of them must all pass. See [`gpu_backends`].
+    pub gpu_backends: Vec<Arc<dyn GpuVerifier>>,
     #[cfg(feature = "dev-root")]
     pub dev_root_kek: Option<Zeroizing<[u8; 32]>>,
 }
@@ -63,6 +69,7 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .collect(),
             platform_document_url: env("ALPHACOMPUTE_PLATFORM_DOCUMENT_URL")?,
+            gpu_backends: gpu_backends(std::env::var("ALPHACOMPUTE_FORTANIX_CCM_URL").ok())?,
             #[cfg(feature = "dev-root")]
             dev_root_kek: std::env::var("ALPHACOMPUTE_KMS_DEV_ROOT_KEK")
                 .ok()
@@ -74,6 +81,24 @@ impl Config {
                 .transpose()?,
         })
     }
+}
+
+/// The GPU verifier backends this node runs: NRAS always (it refuses every GPU until the release-signed
+/// `gpu_policy` pins NRAS's keys and names the CC-mode claim), Fortanix CCM when `ccm_url` names its
+/// endpoint (it refuses every GPU until F8), and never `local`, which is built after Dec 1. A backend
+/// the `gpu_policy` lists that is not here refuses every GPU pod.
+// ponytail: F8 — whether the CCM endpoint stays node configuration or moves into the release-signed
+// `gpu_policy`, as `nras_url` is, is settled with Fortanix's API.
+pub fn gpu_backends(ccm_url: Option<String>) -> Result<Vec<Arc<dyn GpuVerifier>>, String> {
+    let nras = Nras::new().map_err(|e| e.to_string())?;
+    let mut backends: Vec<Arc<dyn GpuVerifier>> = vec![Arc::new(nras)];
+    if let Some(endpoint) = ccm_url {
+        if !endpoint.starts_with("https://") {
+            return Err("ALPHACOMPUTE_FORTANIX_CCM_URL is not an https:// URL".into());
+        }
+        backends.push(Arc::new(FortanixCcm { endpoint }));
+    }
+    Ok(backends)
 }
 
 /// Where DCAP collateral comes from: the PCCS in production, a fixed capture in tests.
@@ -264,6 +289,7 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/v1/secrets/{name}", put(control::put_secret))
         .route("/v1/keys", post(control::register_key))
         .route("/v1/keys/{id}/revoke", post(control::revoke_key))
+        .route("/v1/decisions/export", post(decisions::export))
         .route("/v1/node/evidence", get(node::evidence))
         .route("/v1/node/bootstrap", post(node::bootstrap))
         .route("/v1/node/unseal", post(node::unseal))
@@ -303,4 +329,24 @@ pub fn rfc3339(t: impl Into<chrono::DateTime<chrono::Utc>>) -> String {
 
 pub async fn migrate(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
     sqlx::migrate!("./migrations").run(pool).await
+}
+
+#[cfg(test)]
+mod tests {
+    use alpha_attest::GpuVerifierKind;
+
+    use super::*;
+
+    #[test]
+    fn gpu_backends_are_nras_and_fortanix_ccm_when_named_never_local() {
+        let kinds = |backends: Vec<Arc<dyn GpuVerifier>>| {
+            backends.iter().map(|b| b.kind()).collect::<Vec<_>>()
+        };
+        assert_eq!(kinds(gpu_backends(None).unwrap()), [GpuVerifierKind::Nras]);
+        assert_eq!(
+            kinds(gpu_backends(Some("https://ccm.example".into())).unwrap()),
+            [GpuVerifierKind::Nras, GpuVerifierKind::FortanixCcm]
+        );
+        assert!(gpu_backends(Some("http://ccm.example".into())).is_err());
+    }
 }

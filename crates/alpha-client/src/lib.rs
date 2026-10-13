@@ -12,6 +12,8 @@
         clippy::arithmetic_side_effects
     )
 )]
+pub mod attestation;
+pub mod decisions;
 pub mod platform;
 pub mod runtime;
 pub mod tls;
@@ -181,6 +183,10 @@ pub struct AttestReply {
     pub certificate_chain: Vec<String>,
     pub not_after: String,
     pub attestation_result: AttestationResult,
+    /// The KMS node's receipt over the request, the result and the leaf; see [`attestation`].
+    /// Absent from a KMS that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_receipt: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -242,6 +248,10 @@ pub struct KeyRegistered {
     /// learns whose root key holds its identifier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
+    /// A delegated key's kind (PRD-06 Q88): `member`, or `auditor` for a read-only key. A root
+    /// key registration does not name one; a root key is a member key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<alpha_core::KeyKind>,
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receipt: Option<Value>,
@@ -523,6 +533,12 @@ impl Client {
 
     pub async fn revoke_key(&self, key_id: KeyId, body: &Signed) -> Result<KeyRevoked, Error> {
         self.post(&format!("/v1/keys/{key_id}/revoke"), body).await
+    }
+
+    /// The organization's own decisions, as the KMS answered them; check the answer with
+    /// [`decisions::verify`].
+    pub async fn export_decisions(&self, body: &Signed) -> Result<Value, Error> {
+        self.post("/v1/decisions/export", body).await
     }
 
     // Node API; the evidence route is [`fetch_node_evidence`], the pin comes from its reply.

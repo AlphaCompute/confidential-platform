@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use alpha_core::{AppId, ComposeHash, KataPolicy, KeyId, OrgId, PrincipalId, SecretId, context};
+use alpha_core::{AppId, ComposeHash, KataPolicy, KeyId, KeyKind, OrgId, PrincipalId, SecretId, context};
 use axum::Json;
 use axum::extract::{Path, State};
 use base64::Engine;
@@ -48,19 +48,22 @@ pub struct PutBody {
 
 const ISSUED_AT_WINDOW: Duration = Duration::minutes(5);
 
-fn within_window(at: DateTime<Utc>, now: DateTime<Utc>) -> Result<DateTime<Utc>, ApiError> {
+pub(crate) fn within_window(
+    at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>, ApiError> {
     if at.signed_duration_since(now).abs() > ISSUED_AT_WINDOW {
         return Err(ApiError::malformed("issued_at is outside ±5 minutes"));
     }
     Ok(at)
 }
 
-fn payload<T: serde::de::DeserializeOwned>(value: &Value) -> Result<T, ApiError> {
+pub(crate) fn payload<T: serde::de::DeserializeOwned>(value: &Value) -> Result<T, ApiError> {
     serde_json::from_value(value.clone()).map_err(|e| ApiError::malformed(format!("payload: {e}")))
 }
 
 /// The signer must be active with a chain to the anchor; the signature covers `payload`.
-async fn authorize(
+pub(crate) async fn authorize(
     node: &Node,
     keys: &Intermediates,
     ctx: &str,
@@ -108,7 +111,7 @@ async fn audited(
     Ok(())
 }
 
-async fn denied(node: &Node, key_id: Option<KeyId>, action: &str, error: &ApiError) {
+pub(crate) async fn denied(node: &Node, key_id: Option<KeyId>, action: &str, error: &ApiError) {
     let actor = key_id.map_or_else(|| "unregistered".to_owned(), |k| k.to_string());
     let _ = Audit {
         actor_kind: "principal",
@@ -124,7 +127,7 @@ async fn denied(node: &Node, key_id: Option<KeyId>, action: &str, error: &ApiErr
     .await;
 }
 
-fn receipted(
+pub(crate) fn receipted(
     node: &Node,
     route: &str,
     request: &Value,
@@ -527,6 +530,9 @@ struct KeyPayload {
     #[allow(dead_code)]
     label: String,
     issued_at: DateTime<Utc>,
+    /// PRD-06 Q88: `auditor` registers a read-only key; absent, a member key.
+    #[serde(default)]
+    kind: KeyKind,
 }
 
 /// The degenerate registration: the organization's own identifier, because the signer is not in
@@ -615,13 +621,13 @@ async fn register_endorsed_key(
         &chain,
         "key.register",
         format!("key:{id}"),
-        json!({ "principal_id": p.principal_id }),
+        json!({ "principal_id": p.principal_id, "kind": p.kind }),
     )
     .await?;
     tx.commit().await?;
     Ok(json!({
         "id": id, "principal_id": p.principal_id, "org_id": chain.key.org_id,
-        "created_at": rfc3339(created_at),
+        "kind": p.kind, "created_at": rfc3339(created_at),
     }))
 }
 

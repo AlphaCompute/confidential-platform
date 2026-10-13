@@ -10,6 +10,7 @@ use alpha_attest::{
 };
 use alpha_client::DerivedKey;
 use alpha_client::tls::PeerCerts;
+use alpha_core::coco::{self, CocoRevision};
 use alpha_core::{ComposeHash, Signer, context};
 use axum::Json;
 use axum::body::Bytes;
@@ -199,6 +200,26 @@ pub async fn attest(
     State(node): State<Arc<Node>>,
     Body(request, _): Body<AttestRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    attest_audited(&node, &request, None).await.map(Json)
+}
+
+/// [`attest`] for `alphacompute-evidence/2` over a TDX quote the caller has verified: every step
+/// after DCAP, the audit row included. No route reaches it. The KMS's tests run the Kata pod's
+/// cases through it over synthetic quotes, as `alpha_attest::kata` tests its profile, until B300
+/// Kata captures exist (M1).
+pub async fn attest_verified(
+    node: &Node,
+    request: &AttestRequest,
+    verified: VerifiedQuote,
+) -> Result<Value, ApiError> {
+    attest_audited(node, request, Some(verified)).await
+}
+
+async fn attest_audited(
+    node: &Node,
+    request: &AttestRequest,
+    verified: Option<VerifiedQuote>,
+) -> Result<Value, ApiError> {
     let spki = BASE64_URL_SAFE_NO_PAD
         .decode(&request.runtime_pubkey)
         .map_err(|_| ApiError::malformed("runtime_pubkey: not base64url"))?;
@@ -209,9 +230,13 @@ pub async fn attest(
         .map_err(|e| ApiError::malformed(format!("evidence: {e}")))?;
     let evidence_sha256 = Sha256::digest(evidence_json).to_vec();
     let now = node.now();
-    let result = attest_inner(&node, &spki, &request, now).await;
+    let result = match attest_inner(node, &spki, request, verified, now).await {
+        Ok((leaf_der, result)) => attestation_receipt(node, request, &leaf_der, &result)
+            .map(|receipt| (leaf_der, result, receipt)),
+        Err(e) => Err(e),
+    };
     let (outcome, details, org_id) = match &result {
-        Ok((_, result)) => (
+        Ok((_, result, _)) => (
             "ok",
             json!(result),
             Some(Uuid::from(result.revision.org_id)),
@@ -226,26 +251,66 @@ pub async fn attest(
         object: result
             .as_ref()
             .ok()
-            .map(|(_, result)| format!("revision:{}", result.revision.compose_hash)),
+            .map(|(_, result, _)| format!("revision:{}", result.revision.compose_hash)),
         outcome,
         details,
         evidence_sha256: Some(evidence_sha256),
     }
     .insert(&node.pool)
     .await?;
-    let (leaf_der, result) = result?;
-    Ok(Json(json!({
+    let (leaf_der, result, receipt) = result?;
+    Ok(json!({
         "certificate_chain": [certs::pem(&leaf_der), node.intermediates()?.ca_pem()],
         "not_after": rfc3339(crate::later(now, certs::LEAF_TTL)?),
         "attestation_result": result,
-    })))
+        "attestation_receipt": receipt,
+    }))
 }
 
-/// The leaf's DER and the result behind it.
+/// The KMS's signature over this attestation: the request as the KMS parsed it, the result (with
+/// the verifiers that attested, PRD-06 clear claims) and the leaf it issued. Unlike the reply's
+/// `attestation_result`, it can be checked by anyone pinning the KMS CA, after the leaf expires.
+fn attestation_receipt(
+    node: &Node,
+    request: &AttestRequest,
+    leaf_der: &[u8],
+    result: &AttestationResult,
+) -> Result<Value, ApiError> {
+    let request = json!({
+        "runtime_pubkey": request.runtime_pubkey,
+        "nonce": request.nonce,
+        "evidence": request.evidence,
+    });
+    let not_after = alpha_channel::cert::not_after_from_der(leaf_der)
+        .map_err(|e| ApiError::internal(format!("leaf not_after: {e}")))?;
+    let response = json!({
+        "attestation_result": result,
+        "certificate_sha256": format!("sha256:{}", hex::encode(Sha256::digest(leaf_der))),
+        "not_after": rfc3339(not_after),
+    });
+    let leaf = certs::pem(&node.server_cert.leaf_der()?);
+    // Read after the node's leaf, so a renewal in between cannot put issued_at before its
+    // notBefore.
+    let issued_at = node.now();
+    let receipt = alpha_channel::receipt::issue(
+        &node.runtime_key,
+        leaf,
+        alpha_channel::receipt::ATTEST_ROUTE,
+        &request,
+        response,
+        issued_at,
+    )
+    .map_err(|e| ApiError::internal(format!("receipt: {e}")))?;
+    serde_json::to_value(receipt).map_err(|e| ApiError::internal(format!("receipt: {e}")))
+}
+
+/// The leaf's DER and the result behind it. A Kata pod's quote is DCAP-verified here unless the
+/// caller of [`attest_verified`] has done so.
 async fn attest_inner(
     node: &Node,
     spki: &[u8],
     request: &AttestRequest,
+    verified: Option<VerifiedQuote>,
     now: SystemTime,
 ) -> Result<(Vec<u8>, AttestationResult), ApiError> {
     let nonce = decode32("nonce", &request.nonce)?;
@@ -325,6 +390,7 @@ async fn attest_inner(
         ),
         now,
     )?;
+    let verifiers = Verifiers::of(&appraised);
     let result = AttestationResult {
         format: RESULT_FORMAT.into(),
         verdict: Verdict::Verified,
@@ -341,8 +407,75 @@ async fn attest_inner(
         evidence_sha256: appraised.evidence_sha256,
         verified_at: rfc3339(now),
         policy_version: appraised.policy_version,
+        coco: appraised.coco,
+        verifiers: Some(verifiers),
     };
     Ok((leaf_der, result))
+}
+
+fn unregistered(appraised: &Appraised) -> ApiError {
+    let message = match &appraised.coco {
+        None => format!("no revision {}", appraised.compose_hash),
+        Some(coco) => format!(
+            "no revision {}: the Revision v2 of this init-data (policy {}) is not registered",
+            appraised.compose_hash, coco.policy_sha256
+        ),
+    };
+    ApiError::new("attestation_unknown", message)
+}
+
+/// A registered compose is attested only by a prototype CVM (`alphacompute-evidence/1`) and a
+/// registered Revision v2 only by a Kata pod (`kata-tdx/1`), whose findings must then be that
+/// Revision's: its runtime class, init-data and policy digests, and exactly its GPUs, of its model.
+/// The Revision hash already binds the init-data; held again here against the registered row, so
+/// no leaf names a Revision whose GPUs were not the ones verified.
+pub fn check_platform(
+    revision: &RevisionRow,
+    coco: Option<&CocoAppraised>,
+) -> Result<(), ApiError> {
+    let failed = |message: String| ApiError::new("attestation_failed", message);
+    let is_v2 = coco::is_revision_v2(&revision.compose);
+    let Some(coco) = coco else {
+        if is_v2 {
+            return Err(failed(
+                "a Revision v2 is attested only by a Kata pod (alphacompute-evidence/2)".into(),
+            ));
+        }
+        return Ok(());
+    };
+    if !is_v2 {
+        return Err(failed(
+            "a compose Revision is attested only by a prototype CVM (alphacompute-evidence/1)"
+                .into(),
+        ));
+    }
+    let registered = CocoRevision::check_registered(&revision.compose, revision.app_id.into())
+        .map_err(|e| failed(format!("registered Revision v2: {e}")))?;
+    if registered.runtime_class != coco.runtime_class
+        || registered.initdata_sha256 != coco.initdata_sha256
+        || registered.policy_sha256 != coco.policy_sha256
+    {
+        return Err(failed(
+            "the appraised init-data is not the registered Revision v2's".into(),
+        ));
+    }
+    let (count, model) = registered
+        .gpu
+        .as_ref()
+        .map_or((0, None), |g| (g.count, Some(g.model.as_str())));
+    if usize::try_from(count).ok() != Some(coco.gpus.len()) {
+        return Err(failed(format!(
+            "{} GPUs verified, the registered Revision expects {count}",
+            coco.gpus.len()
+        )));
+    }
+    if let Some(gpu) = coco.gpus.iter().find(|g| Some(g.model.as_str()) != model) {
+        return Err(failed(format!(
+            "gpu {}: model {} is not the registered Revision's",
+            gpu.index, gpu.model
+        )));
+    }
+    Ok(())
 }
 
 pub async fn get_secret(
@@ -568,6 +701,103 @@ mod tests {
         assert_ne!(
             mint_nonce(&key, t0).unwrap(),
             mint_nonce(&key, t0 + Duration::from_secs(1)).unwrap()
+        );
+    }
+
+    fn row(compose: String, app_id: Uuid) -> RevisionRow {
+        RevisionRow {
+            app_id,
+            org_id: Uuid::now_v7(),
+            compose,
+            created_by_key: Uuid::now_v7(),
+            signature: json!({}),
+            created_at: Utc::now(),
+            revoked_at: None,
+        }
+    }
+
+    fn gpu(index: u32, model: &str) -> alpha_attest::VerifiedGpu {
+        alpha_attest::VerifiedGpu {
+            index,
+            device_id: format!("ueid-{index}"),
+            model: model.into(),
+            driver_version: "575.51.03".into(),
+            vbios_version: "97.00.9a.00.01".into(),
+            cc_mode: true,
+            nonce: [0; 32],
+        }
+    }
+
+    /// A registered Revision v2 of eight B300s and what `kata-tdx/1` found for its pod.
+    fn kata_pod() -> (RevisionRow, CocoAppraised) {
+        let app = Uuid::now_v7();
+        let revision = CocoRevision {
+            format: coco::REVISION_FORMAT.into(),
+            app_id: app.into(),
+            initdata_sha256: alpha_core::compose_hash("init-data"),
+            policy_sha256: alpha_core::compose_hash("policy"),
+            runtime_class: coco::GPU_RUNTIME_CLASS.into(),
+            gpu: Some(coco::GpuShape {
+                count: 8,
+                model: "B300".into(),
+            }),
+        };
+        let found = CocoAppraised {
+            profile: kata::PROFILE_KATA_TDX.into(),
+            initdata_sha256: revision.initdata_sha256,
+            policy_sha256: revision.policy_sha256,
+            runtime_class: revision.runtime_class.clone(),
+            gpus: (0..8).map(|i| gpu(i, "B300")).collect(),
+            gpu_verifiers: Vec::new(),
+        };
+        (row(revision.canonical().unwrap(), app), found)
+    }
+
+    fn refused(result: Result<(), ApiError>, reason: &str) {
+        let error = result.unwrap_err();
+        assert_eq!(error.code, "attestation_failed");
+        assert!(error.message.contains(reason), "{}", error.message);
+    }
+
+    #[test]
+    fn a_revision_is_attested_only_by_its_own_platform_and_exactly_its_gpus() {
+        let (revision, found) = kata_pod();
+        assert!(check_platform(&revision, Some(&found)).is_ok());
+
+        refused(
+            check_platform(&revision, None),
+            "a Revision v2 is attested only by a Kata pod",
+        );
+        let compose = row(r#"{"name":"app"}"#.into(), revision.app_id);
+        assert!(check_platform(&compose, None).is_ok());
+        refused(
+            check_platform(&compose, Some(&found)),
+            "a compose Revision is attested only by a prototype CVM",
+        );
+
+        let mut other = found.clone();
+        other.policy_sha256 = alpha_core::compose_hash("another policy");
+        refused(
+            check_platform(&revision, Some(&other)),
+            "not the registered Revision v2's",
+        );
+        let mut seven = found.clone();
+        seven.gpus.pop();
+        refused(
+            check_platform(&revision, Some(&seven)),
+            "7 GPUs verified, the registered Revision expects 8",
+        );
+        let mut h100 = found.clone();
+        h100.gpus[3] = gpu(3, "H100");
+        refused(
+            check_platform(&revision, Some(&h100)),
+            "gpu 3: model H100 is not the registered Revision's",
+        );
+        let mut foreign = revision;
+        foreign.app_id = Uuid::now_v7();
+        refused(
+            check_platform(&foreign, Some(&found)),
+            "registered Revision v2",
         );
     }
 }

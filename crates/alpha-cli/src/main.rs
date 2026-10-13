@@ -200,6 +200,11 @@ enum Command {
         #[arg(long)]
         endpoint: String,
     },
+    /// What the KMS decided about the organization's Instances (PRD-06).
+    Evidence {
+        #[command(subcommand)]
+        command: EvidenceCommand,
+    },
     /// Genesis on an empty database: three custodian public keys.
     Bootstrap {
         /// Three files, each holding a custodian's public key as `keygen --custodian` printed it.
@@ -207,6 +212,31 @@ enum Command {
         custodians: Vec<PathBuf>,
         #[arg(long)]
         endpoint: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum EvidenceCommand {
+    /// Export the organization's attest, secret.get and key.derive audit rows, signed by the
+    /// KMS node; prints the answer once its receipt verifies against the platform document.
+    Decisions {
+        /// Any active key of the organization.
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        key_id: KeyId,
+        /// Rows after this audit sequence number; the answer's `next_after_seq` continues.
+        #[arg(long, default_value_t = 0)]
+        after_seq: i64,
+        #[arg(long, default_value_t = 500)]
+        limit: i64,
+    },
+    /// Check an exported answer offline, as an auditor would: prints what the KMS signed.
+    VerifyDecisions {
+        /// The signed platform document, as `alpha sign --check` reads it.
+        #[arg(long)]
+        platform: PathBuf,
+        reply: PathBuf,
     },
 }
 
@@ -655,6 +685,43 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                     .await?;
             let reply = node::unseal(&client, &identity, &share, &custodian, doc.version).await?;
             Ok(json!(reply))
+        }
+        Command::Evidence {
+            command:
+                EvidenceCommand::Decisions {
+                    key,
+                    key_id,
+                    after_seq,
+                    limit,
+                },
+        } => {
+            let key = read_ed25519(&key)?;
+            let (client, doc) = admin_client_and_document(config, now).await?;
+            let payload = json!({
+                "after_seq": after_seq,
+                "limit": limit,
+                "issued_at": alpha_cli::rfc3339(now),
+            });
+            let signed =
+                alpha_client::sign(alpha_core::context::DECISIONS_EXPORT, payload, key_id, &key)?;
+            let reply = client.export_decisions(&signed).await?;
+            let bytes =
+                serde_json::to_vec(&reply).map_err(|e| Exit::Refused(format!("decisions: {e}")))?;
+            let revisions: Vec<_> = doc.kms_revisions.iter().map(|r| r.compose_hash).collect();
+            alpha_client::decisions::verify(&bytes, &doc.kms_ca_pem, &revisions)?;
+            Ok(reply)
+        }
+        Command::Evidence {
+            command: EvidenceCommand::VerifyDecisions { platform, reply },
+        } => {
+            let artifact: SignedDocument = serde_json::from_value(read_json(&platform)?)
+                .map_err(|e| Exit::Refused(format!("artifact: {e}")))?;
+            let doc = alpha_client::platform::verify(&artifact, &alpha_cli::release_key()?, now)?;
+            let bytes =
+                fs::read(&reply).map_err(|e| Exit::Usage(format!("{}: {e}", reply.display())))?;
+            let revisions: Vec<_> = doc.kms_revisions.iter().map(|r| r.compose_hash).collect();
+            let signed = alpha_client::decisions::verify(&bytes, &doc.kms_ca_pem, &revisions)?;
+            Ok(json!(signed))
         }
         Command::Bootstrap {
             custodians,
