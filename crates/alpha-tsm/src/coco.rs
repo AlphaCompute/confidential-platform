@@ -41,6 +41,39 @@ pub const NVSWITCH_ARCH: &str = "LS10";
 
 const TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Deserialize)]
+struct AgentInfo {
+    feature: String,
+    tee: Option<String>,
+    #[serde(default)]
+    additional_tees: Vec<String>,
+}
+
+/// Check collection capabilities, not trust: the KMS still verifies every report.
+fn check_agent(addr: &str, gpu_count: usize) -> Result<(), Error> {
+    let body = tcp_get(addr, "/info")?;
+    let info: AgentInfo = serde_json::from_slice(&body)
+        .map_err(|e| Error::Agent(format!("attestation agent /info: {e}")))?;
+    if !matches!(info.feature.as_str(), "all" | "attestation") {
+        return Err(Error::Agent(
+            "guest REST attestation is disabled; configure Kata with \
+             agent.guest_components_rest_api=all before launching the pod"
+                .into(),
+        ));
+    }
+    if info.tee.as_deref() != Some("tdx") {
+        return Err(Error::Agent(
+            "guest REST /info does not advertise a TDX attester".into(),
+        ));
+    }
+    if gpu_count > 0 && !info.additional_tees.iter().any(|tee| tee == NVIDIA_TEE) {
+        return Err(Error::Agent(
+            "guest REST /info does not advertise the NVIDIA attester required by this pod".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Where the TDX quote comes from; chosen by `ALPHACOMPUTE_QUOTE_SOURCE`, which the agent policy
 /// pins with the rest of the runtime container's environment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -329,6 +362,9 @@ pub struct Source {
 
 impl Source {
     pub fn evidence(&self, report_data: &[u8; 64]) -> Result<EvidenceV2, Error> {
+        if self.quote == QuoteSource::AttestationAgent || self.gpu_count > 0 {
+            check_agent(ATTESTATION_AGENT, self.gpu_count)?;
+        }
         let (quote, event_log) = quote(self.quote, report_data)?;
         let gpus = agent_gpu_evidence(
             ATTESTATION_AGENT,
@@ -519,6 +555,32 @@ mod tests {
                 .unwrap();
         });
         (addr, rx)
+    }
+
+    #[test]
+    fn agent_preflight_checks_features_tdx_and_the_required_gpu_attester() {
+        for feature in ["all", "attestation"] {
+            let (addr, request) = agent_once(format!(
+                "{{\"feature\":\"{feature}\",\"tee\":\"tdx\",\"additional_tees\":[\"nvidia\"]}}"
+            ));
+            check_agent(&addr, 1).unwrap();
+            assert!(request.recv().unwrap().starts_with("GET /info "));
+        }
+        let (addr, _) = agent_once("{\"feature\":\"attestation\",\"tee\":\"tdx\"}".into());
+        check_agent(&addr, 0).unwrap();
+        for (body, reason) in [
+            (
+                "{\"feature\":\"resource\"}",
+                "agent.guest_components_rest_api=all",
+            ),
+            ("{\"feature\":\"all\",\"tee\":\"snp\"}", "TDX attester"),
+            ("{\"feature\":\"all\",\"tee\":\"tdx\"}", "NVIDIA attester"),
+            ("{}", "/info"),
+        ] {
+            let (addr, _) = agent_once(body.into());
+            let error = check_agent(&addr, 1).unwrap_err().to_string();
+            assert!(error.contains(reason), "{error}");
+        }
     }
 
     #[test]
