@@ -43,7 +43,7 @@ The node then:
    - the Revision v2 rebuilt from the init-data listed in the platform document's `db_revisions` with `"kind": "kata-tdx"`.
 5. Answers `{key_hpke}`: the key HPKE-sealed (X-Wing) to `xwing_pubkey` under `alphacompute/db-volume-key/v1`, its aad this node's runtime-key hash.
 
-Every release and refusal writes a `db.key` audit row naming the Revision, its policy digest and the X-Wing key's hash. While the node waits for its database the row is held in memory and appended, sealed, before the node serves, with `held_at`.
+Every release and refusal writes a `db.key` audit row naming the Revision, its policy digest and the X-Wing key's hash. While the node waits for its database the row is held in memory and appended, sealed, before the node serves, with `held_at`. The queue is bounded (Hacktron ACC-FD-107): at most 1,000 held refusals, past which refusals are only counted (one `audit.held_dropped` row with the count when the node serves), and 1,024 rows in all, past which a release is refused (`rate_limited`) rather than made without its row. Unauthenticated `db-key` calls therefore cannot grow the node's memory while the database is down, nor crowd out a release's row.
 
 `db_revisions` is a new optional field of the release-signed platform document, the same shape as `kms_revisions`:
 
@@ -64,7 +64,7 @@ The KMS's pool connects lazily (`main.rs`), so a node starts and answers the Nod
    - `/ready` answers 503 `{"sealed": false, "database": "waiting"}`;
    - every route outside `/v1/node/*` is `sealed`.
 2. The Postgres pod's init container attests the node and receives the key (below). It opens the volume and Postgres starts.
-3. The node tries the database every second. Once it answers, the node unwraps every intermediate under the root it held, writes the held audit rows and serves, and the root is dropped. If the rows do not open under that root, the node returns to sealed and writes a denied `node.unseal` row.
+3. The node tries the database every second. Once it answers, the node unwraps every intermediate under the root it held, checks that the database holds every audit head the custodians' share files remembered (`docs/metadata-encryption.md`, "Rollback of the whole database"), writes the held audit rows and serves, and the root is dropped. If the rows do not open under that root, the node returns to sealed and writes a denied `node.unseal` row. If the database lacks a custodian's head, it was restored from an older copy: the node halts, releases the volume key no more, and writes nothing.
 
 **Genesis** works the same way: the volume key has to exist before the volume it opens. `alpha bootstrap` on a node whose database does not answer:
 - makes the root, both intermediates and the volume key;

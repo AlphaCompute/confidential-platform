@@ -537,9 +537,11 @@ async fn get_secret_inner(
             "secret signer is not of its organization",
         ));
     }
-    let org_key = keys::org_key(&keys.tenant_kek_root, identity.org_id, &chain.anchor_spki)?;
-    let value = keys::aead_open(&org_key, id.as_bytes(), &ciphertext)
-        .ok_or_else(|| ApiError::internal("secret does not decrypt under org_key"))?;
+    let value_key = keys
+        .metadata
+        .secret_key(identity.org_id, &chain.anchor_spki)?;
+    let value = keys::aead_open(&value_key, id.as_bytes(), &ciphertext)
+        .ok_or_else(|| ApiError::internal("secret does not decrypt under its key"))?;
     Ok(json!({
         "value": BASE64_URL_SAFE_NO_PAD.encode(&*value),
         "content_sha256": content_sha256,

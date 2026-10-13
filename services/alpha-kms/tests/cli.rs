@@ -439,7 +439,7 @@ async fn bootstrap_once_never_again_then_unseal_the_second_node() {
 
     // Unseal through the CLI: one share leaves it sealed, the second opens it; the share file
     // remembers the higher document version it was verified against.
-    let reply = cli_node::unseal(&client2, &identity2, &shares[2], &h.custodians[2], 3)
+    let reply = cli_node::unseal(&client2, &identity2, &shares[2], &h.custodians[2], 3, false)
         .await
         .unwrap();
     assert!(reply.sealed);
@@ -450,11 +450,11 @@ async fn bootstrap_once_never_again_then_unseal_the_second_node() {
             .platform_document_version,
         3
     );
-    let err = cli_node::unseal(&client2, &identity2, &shares[0], &h.custodians[2], 1)
+    let err = cli_node::unseal(&client2, &identity2, &shares[0], &h.custodians[2], 1, false)
         .await
         .unwrap_err();
     assert!(err.contains("share file"), "{err}");
-    let reply = cli_node::unseal(&client2, &identity2, &shares[0], &h.custodians[0], 1)
+    let reply = cli_node::unseal(&client2, &identity2, &shares[0], &h.custodians[0], 1, false)
         .await
         .unwrap();
     assert!(!reply.sealed);

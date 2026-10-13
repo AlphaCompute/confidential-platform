@@ -12,7 +12,7 @@ Code: `services/alpha-kms/src/store.rs` (keys, blind indexes, sealed rows, the p
 | index | same, info `index` | HMAC-SHA256 blind indexes |
 | audit | same, info `audit` | AES-256-GCM of each audit row, its associated data the chain |
 
-The three keys are derived from tenant-kek-root, not wrapped beside it as a third intermediate. Tenant-kek-root is in memory only on a serving node: after custodians unseal it with two shares, after it joins a serving node, or after bootstrap. So the database keys exist exactly when the intermediates do, without changing the join protocol, and an existing database needs no new intermediate, which only a node holding the root KEK could add. Nothing comes from the environment; the `dev-root` build reaches the same keys through its development root KEK.
+Before the first custodian rotation (epoch 0) the three keys are derived from tenant-kek-root, not wrapped beside it as a third intermediate. Each rotation replaces them: it makes a new data key, derives them from it (same salt and labels, the data key as input) and re-encrypts every row in the same transaction (`docs/custodian-rotation.md`, "What rotates"). The audit log keeps each epoch's rows under that epoch's audit key. Tenant-kek-root is in memory only on a serving node: after custodians unseal it with two shares, after it joins a serving node, or after bootstrap. So the database keys exist exactly when the intermediates do, without changing the join protocol, and an existing database needs no new intermediate, which only a node holding the root KEK could add. Nothing comes from the environment; the `dev-root` build reaches the same keys through its development root KEK.
 
 **Fail closed.**
 - A sealed node holds no metadata key. It reads no tenant row, and it writes no audit row about a tenant (`sealed`).
@@ -79,7 +79,8 @@ The Instance read no longer filters on `app_ids` in SQL. It opens the row and re
 | Column | Class | Why |
 |---|---|---|
 | `platform_document.*` | clear | The release-signed document is public: it is served at an unauthenticated URL, and every stored copy is re-verified against the release key. |
-| `intermediate_keys.wrapped` | already ciphertext | Under the root KEK: tenant-kek-root, the CA key and the database's volume key (`db-volume`). A custodian rotation re-wraps it under a new root (`docs/custodian-rotation.md`); what it wraps, and so every key derived here, is unchanged. |
+| `intermediate_keys.wrapped` | already ciphertext | Under the root KEK: tenant-kek-root, the CA key, the database's volume key (`db-volume`) and, after the first custodian rotation, the data key (`data-key`). A rotation re-wraps them under a new root and replaces the data key (`docs/custodian-rotation.md`); tenant-kek-root, the CA key and the volume key keep their values. |
+| `intermediate_keys.epoch` | clear | The data key's epoch (the number of rotations), on its row only: the fence every node checks under the chain lock. The wrapped key carries the epoch it trusts. |
 | `intermediate_keys.public_part` | clear | The CA certificate, pinned in the platform document. |
 | `custodian_rotations.rotation` | clear, its shares already ciphertext | The proposal (the custodians' X-Wing public keys, a spent nonce, the node's key hash), the new shares HPKE-sealed to the custodians, and the node's receipt. No tenant appears in it, and the custodians verify the receipt rather than trust the row. |
 
@@ -110,11 +111,42 @@ link = SHA-256("alphacompute-kms/audit/v1" ‖ previous link ‖ ts (µs, BE) �
 
 `audit::verify` walks the log in `seq` order. It recomputes each link, opens each sealed row with the link before it, and refuses a plaintext row that names more than the node. Each sealed row therefore authenticates everything before it. A row that is changed, inserted, reordered, removed, given another `ts`, or replayed elsewhere breaks the chain at that row or at the next sealed row. `tests/sealed_store.rs` shows each case.
 
-A serving node walks the whole chain on its first maintenance pass after start, then on each platform tick (five minutes) walks the rows appended since. It reports `{"audit_chain": {"verified_through": seq}}` or `{"broken": …}` on `/ready` and appends a sealed `audit.verify` error row. It keeps serving: whether a broken chain should stop the node is for security sign-off.
+A serving node walks the whole chain on its first maintenance pass after start, then on each platform tick (five minutes) walks the rows appended since. It reports `{"audit_chain": {"verified_through": seq}}` on `/ready`.
 
-**Limits:**
-- Cutting the tail back to an earlier row, or rolling the whole database back to an earlier copy, is not visible to the chain. No trusted monotonic counter exists outside the database. Option (a), a checkpoint in a KMS receipt, or an external log would add one.
-- A plaintext node fact is authenticated only from the next sealed row on. Anyone with write access can append a fake node fact at the head before that.
+**A broken chain halts the node** (Hacktron ACC-FD-103). A node that finds a break:
+- refuses every route that releases a key or reads a tenant row (`503 halted`): `Node::intermediates` refuses before the phase is read, and the gate refuses every route outside `/v1/node/*`, `/healthz` and `/ready`;
+- answers `/ready` with `503 {"sealed": …, "halted": "audit_chain_broken"}`, a fixed reason; the detail goes only to the log. Peers do not join it, since `try_join` needs a `200`;
+- writes nothing further: every append checks the halt first, both before and after taking the chain lock, so no `audit.verify` row, no `denied` row and no maintenance write follows. The node fact it could have written would be appended to a chain it can no longer vouch for;
+- stays halted. Recovery is an operator restarting the pod, then a join or a custodian unseal, both of which check the heads below.
+
+A database writer could already stop the KMS by stopping Postgres, so halting gives the host nothing new.
+
+### Rollback of the whole database
+
+The chain alone cannot see the whole database restored from an older copy, or its tail cut back: the copy is internally consistent, and its chain verifies up to an older head. Andrei Pfau's review asked for a detection that holds against the host, who controls Postgres. Without new infrastructure, the only state the host cannot roll back is what the KMS nodes hold in memory and what the custodians hold in their share files. The design uses both.
+
+**The head.** `audit::Head` is a linked row's `(seq, link)`. Its link commits to every row before it, and the service role can never update or delete a linked row. A database that does not hold a head (no row at that `seq`, or one with another link) is therefore not the one in which that head was committed. It was restored from an older copy, cut back, or is another copy.
+
+**Each node's floor (`audit::Watch`, in memory).** The highest head the node has seen committed. It rises with:
+- the node's own appends, once their transaction commits (`Appended::committed`; every Control route, bootstrap, the platform reload and the audit import call it after `commit`, and `Node::audit` does so itself);
+- the head it reads under the chain lock at each append, which was committed by whoever held the lock before;
+- each walk of the chain;
+- heads from outside, once the database turns out to hold them (below).
+
+**The check.** Every append, under the chain lock, and every maintenance pass first checks that the database holds the floor. If it does not, the node halts with `audit_chain_rolled_back`. Every route that releases a key or a stored value (attest, secret read, key derivation, join) appends its audit row before it answers, so a restored copy is refused at the first request: the copy's values are never released.
+
+**Heads from outside.**
+- **Join.** `JoinReply.audit_head` carries the serving node's floor, its `node.join` row included. The joining node refuses, and halts, if its own database does not hold it. A node pointed at another or an older copy than the node it joins therefore never serves it.
+- **Peers.** `GET /v1/node/audit-head` answers a node's floor, also once halted. On every maintenance pass, and before it starts serving, a node reads each `kms_endpoints` peer's head over a channel pinned as a join is: the KMS CA, and a Revision listed in `kms_revisions`, with a 5-second timeout. Its database must hold each head. So a rollback that only one node's writes would reveal, or two nodes pointed at two copies, halts every node within one tick. A halted node keeps renewing its own leaf, so its peers can still read its head.
+- **Custodians (cold start).** A custodian's share file already remembers the highest platform-document version they verified. It now also remembers `audit_head`: the head the node served from after the unseal that custodian completed (`UnsealReply.audit_head`), or a later one from `alpha witness --share share.json --endpoint <node>`, which attests a serving node as `unseal` does, reads its head and sends nothing. `alpha unseal` sends it as `UnsealRequest.audit_floor`. The node collects each floor beside its share, and checks them only once the two shares open the database, so a made-up request cannot plant a floor. It halts if the database lacks one. Accepting a restore deliberately (disaster recovery) is explicit: the custodians whose files remember a later head run `alpha unseal --accept-audit-rollback`. That sends no floor, the share file then remembers the restored head, and the command's output records the choice.
+
+**Residual (what this does not catch):**
+- **A full cold restart with every node's memory lost** (Hacktron ACC-FD-106), onto a copy taken after the last head that the two unsealing custodians' share files recorded. Only the second custodian of a cold start records a head from the unseal itself; `alpha witness` records later ones. A copy restored after the last recorded head therefore loses everything written since, undetected. How much that is depends on how often custodians witness: the runbook asks two of them to witness at least daily, and after every revocation or Secret change that matters. Closing it needs a counter outside the host's reach: the release-signed platform document carrying a head floor, an external transparency log, or signed heads in KMS receipts that clients present back.
+- **Writes after the last head a node saw**, when the host rolls back between a commit and the next time any node reads the head. Each node records its own commits, so this is limited to another node's commits that no node has read yet: at most one maintenance tick of another node's writes, if that node is then stopped before its next pass.
+- **Peers the host cuts off.** A peer that does not answer tells nothing. The host can partition nodes so that each serves its own copy, as long as no node joins another and the custodians do not unseal.
+- **Rolling back a single row.** Restoring an older sealed blob of one row (for example a Secret's previous value, or a key or Revision before its revocation) while keeping the audit log is not a whole-database rollback. The row's AEAD binds its table and primary key, not a version. The audit chain records the revocation or put, but the row is not checked against it. This is open: binding each row's version to the chain is a follow-up.
+- **Between start and the first full walk**, a node checks the heads it knows but has not yet walked the whole chain. A row tampered with in the middle of the log is found on its first maintenance pass, then the node halts.
+- **A plaintext node fact** is authenticated only from the next sealed row on. Anyone with write access can append a fake node fact at the head before that.
 
 ## Rows an earlier release wrote
 

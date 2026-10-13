@@ -375,6 +375,24 @@ impl BootstrapReply {
     }
 }
 
+/// A point of a KMS node's audit chain: a linked row's `seq` and its `link` (base64url of 32
+/// bytes), which commits to every row before it. A node that knows a head refuses a database that
+/// does not hold it: one restored from an older copy, or another copy altogether.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditHead {
+    pub seq: i64,
+    pub link: String,
+}
+
+/// `GET /v1/node/audit-head`: the highest head the node has seen committed, `None` before it has
+/// seen any.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditHeadReply {
+    pub head: Option<AuditHead>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UnsealRequest {
@@ -387,12 +405,20 @@ pub struct UnsealRequest {
     /// before its database opens appraises nothing under an older document.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform_document_version: Option<u64>,
+    /// The head the custodian's share file remembers from an earlier unseal: the node refuses to
+    /// serve a database that does not hold it. Sent only when present, so an earlier release's
+    /// node still takes a request without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_floor: Option<AuditHead>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UnsealReply {
     pub sealed: bool,
     pub shares: usize,
+    /// Once serving: the audit head the node serves from, for the custodian's share file.
+    #[serde(default)]
+    pub audit_head: Option<AuditHead>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -479,6 +505,13 @@ pub struct JoinReply {
     /// The database's volume key, when the database has one (M2(a)).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub db_volume_key: Option<String>,
+    /// The latest custodian rotation's data key (`epoch ‖ key ‖ earlier audit keys`), which every
+    /// row is sealed under since; absent before the first rotation.
+    #[serde(default)]
+    pub data_key: Option<String>,
+    /// The serving node's audit head: the joining node refuses to serve a database without it.
+    #[serde(default)]
+    pub audit_head: Option<AuditHead>,
 }
 
 /// The Postgres pod's request for the database's volume key: Kata evidence v2 whose
@@ -675,6 +708,10 @@ impl Client {
     pub async fn last_rotation(&self) -> Result<Rotation, Error> {
         self.request(Method::GET, "/v1/node/custodians/rotation", None)
             .await
+    }
+
+    pub async fn audit_head(&self) -> Result<AuditHeadReply, Error> {
+        self.request(Method::GET, "/v1/node/audit-head", None).await
     }
 }
 

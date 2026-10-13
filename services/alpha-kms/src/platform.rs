@@ -83,6 +83,7 @@ pub async fn apply(node: &Node, verified: Verified) -> Result<(), ApiError> {
     let stored = sqlx::query_scalar!("select version from platform_document for update")
         .fetch_optional(&mut *tx)
         .await?;
+    let mut appended = None;
     match stored {
         Some(stored) if stored > version => {
             drop(tx);
@@ -108,16 +109,21 @@ pub async fn apply(node: &Node, verified: Verified) -> Result<(), ApiError> {
             .execute(&mut *tx)
             .await?;
             let keys = node.intermediates().ok();
-            audit::node(
-                "platform.reload",
-                "ok",
-                json!({ "version": version, "previous": stored }),
-            )
-            .insert(&mut tx, keys.as_ref().map(|k| &k.metadata))
-            .await?;
+            appended = Some(
+                audit::node(
+                    "platform.reload",
+                    "ok",
+                    json!({ "version": version, "previous": stored }),
+                )
+                .insert(&mut tx, &node.chain, keys.as_ref().map(|k| &k.metadata))
+                .await?,
+            );
         }
     }
     tx.commit().await?;
+    if let Some(appended) = appended {
+        appended.committed(&node.chain);
+    }
     remember(node, verified.document);
     Ok(())
 }
@@ -169,9 +175,10 @@ pub async fn run(node: Arc<Node>) {
     }
 }
 
-/// The node's own one-hour leaf is simply reissued on every tick.
+/// The node's own one-hour leaf is simply reissued on every tick, also once it has halted: it
+/// then releases nothing, but its peers still read its audit head over a channel pinned to the CA.
 fn renew_leaf(node: &Node) {
-    if let Ok(keys) = node.intermediates()
+    if let Some(keys) = node.held_intermediates()
         && let Err(e) = node.issue_own_leaf(&keys)
     {
         eprintln!("leaf renewal: {}", e.message);

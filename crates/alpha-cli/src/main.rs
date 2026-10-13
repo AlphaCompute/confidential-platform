@@ -199,6 +199,18 @@ enum Command {
         key: PathBuf,
         #[arg(long)]
         endpoint: String,
+        /// Send no audit head: accept a KMS database restored from before the head this share
+        /// file remembers. A recorded custodian decision, never a retry.
+        #[arg(long)]
+        accept_audit_rollback: bool,
+    },
+    /// Record in a share file the audit head an attested serving node has seen committed, so the
+    /// next unseal refuses a database restored from before it. Sends nothing to the node.
+    Witness {
+        #[arg(long)]
+        share: PathBuf,
+        #[arg(long)]
+        endpoint: String,
     },
     /// Genesis on an empty database: three custodian public keys.
     Bootstrap {
@@ -764,6 +776,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             share,
             key,
             endpoint,
+            accept_audit_rollback,
         } => {
             let remembered = node::ShareFile::read(&share)?.platform_document_version;
             let doc = platform_document(config, now).await?;
@@ -771,11 +784,35 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let (attested, client) =
                 node::attested_node(&endpoint, &config.pccs_url, &doc, Some(remembered), now)
                     .await?;
-            let reply =
-                node::unseal(&client, &attested.identity, &share, &custodian, doc.version).await?;
-            Ok(
-                json!({ "sealed": reply.sealed, "shares": reply.shares, "node": attested.summary() }),
+            let reply = node::unseal(
+                &client,
+                &attested.identity,
+                &share,
+                &custodian,
+                doc.version,
+                accept_audit_rollback,
             )
+            .await?;
+            Ok(json!({
+                "sealed": reply.sealed,
+                "shares": reply.shares,
+                "audit_head": reply.audit_head,
+                "audit_rollback_accepted": accept_audit_rollback,
+                "node": attested.summary(),
+            }))
+        }
+        Command::Witness { share, endpoint } => {
+            let remembered = node::ShareFile::read(&share)?.platform_document_version;
+            let doc = platform_document(config, now).await?;
+            let (attested, client) =
+                node::attested_node(&endpoint, &config.pccs_url, &doc, Some(remembered), now)
+                    .await?;
+            let witnessed = node::witness(&client, &share).await?;
+            Ok(json!({
+                "audit_head": witnessed.audit_head,
+                "node_audit_head": witnessed.node_audit_head,
+                "node": attested.summary(),
+            }))
         }
         Command::Bootstrap {
             custodians,
