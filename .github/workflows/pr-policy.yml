@@ -25,9 +25,13 @@ jobs:
           EXTRA_TERMS: ${{ secrets.PR_POLICY_FORBIDDEN_TERMS }}
         run: |
           fail=0
+          # Fork and Dependabot runs get no repository secrets; fail rather than skip the checks.
           for re in "$EXTRA_PATHS" "$EXTRA_TERMS"; do
             rc=0; grep -E "$re" </dev/null || rc=$?
-            if [ "$rc" -gt 1 ]; then echo "::error::A PR_POLICY_FORBIDDEN_* variable is not a valid regex."; fail=1; fi
+            if [ -z "$re" ] || [ "$rc" -gt 1 ]; then
+              echo "::error::A PR_POLICY_FORBIDDEN_* secret is missing or not a valid regex; push the branch to this repository."
+              fail=1
+            fi
           done
           if [ "$BASE_REF" != main ]; then
             echo "::error::Open the pull request against main, not $BASE_REF."
@@ -55,7 +59,7 @@ jobs:
           done
 
           cc='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9-]+\))?!?: [^ ]'
-          bad=$( (printf '%s\n' "$TITLE"; git log --no-merges --format=%s "$BASE_SHA..$HEAD_SHA") | grep -vE "$cc" || true)
+          bad=$( (printf '%s\n' "$TITLE"; git log --format=%s "$BASE_SHA..$HEAD_SHA") | grep -vE "$cc" || true)
           if [ -n "$bad" ]; then
             echo "::error::Not a Conventional Commits subject (type(scope): description):"
             printf '%s\n' "$bad"
@@ -63,8 +67,8 @@ jobs:
           fi
 
           ids='\b(PRD|ADR)[- ]?[0-9]+|\b[DIMP][0-9]{1,2}\b'
-          [ -n "$EXTRA_TERMS" ] && ids="$ids|$EXTRA_TERMS"
-          words='\b(phase|plan|milestone|deliverable) [0-9]|generated with'
+          words='\b(phase|plan|milestone|deliverable) [0-9]|generated with|co-authored-by:.*(claude|codex|copilot|cursor|chatgpt|gemini|gpt|\[bot\])'
+          [ -n "$EXTRA_TERMS" ] && words="$words|$EXTRA_TERMS"
           text=$(printf '%s\n%s\n' "$TITLE" "$BODY"; git log --format=%B "$BASE_SHA..$HEAD_SHA")
           hits=$(printf '%s\n' "$text" | grep -E "$ids"; printf '%s\n' "$text" | grep -iE "$words" || true)
           if [ -n "$hits" ]; then

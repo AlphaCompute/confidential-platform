@@ -42,7 +42,7 @@ both axes. One-shot. Read-only: never edit, never write a flag, never apply fixe
 ## What NOT to flag
 
 Input validation at trust boundaries, error handling that prevents data loss,
-security, accessibility, deliberate `// ponytail:` / `// ponytail:` shortcuts already
+security, accessibility, deliberate `// ponytail:` shortcuts already
 documented, or domain comments that explain *why* (not *what*).
 
 ## Output
