@@ -64,10 +64,14 @@ impl Channels {
 
 /// The runtime hands the chain over as one PEM text; the responder sends it as leaf and CA.
 pub fn responder(identity: &RuntimeIdentity) -> Result<Responder, Error> {
+    let compose = identity
+        .app_compose
+        .clone()
+        .ok_or_else(|| Error::internal("channel responder: the Instance runs no compose"))?;
     Responder::new(
         pem_blocks(&identity.certificate_chain),
         &identity.tls_private_key,
-        identity.app_compose.clone(),
+        compose,
     )
     .map_err(|e| Error::internal(format!("channel responder: {e}")))
 }
