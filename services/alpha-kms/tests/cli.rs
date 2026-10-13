@@ -196,7 +196,7 @@ async fn call_signs_all_five_control_routes() {
     assert_eq!(reply["compose_hash"], expected["compose_hash"]);
     assert_eq!(reply["receipt"]["document"]["route"], "revision.register");
     let stored: String = sqlx::query_scalar!(
-        "select compose from revisions where app_id = $1",
+        "select compose as \"compose!\" from revisions where app_id = $1",
         Uuid::from(app_id)
     )
     .fetch_one(&h.pool)
@@ -319,7 +319,7 @@ async fn deploy_register_only_registers_the_generated_compose() {
         "register-only stops before shroud-go"
     );
     let stored: String = sqlx::query_scalar!(
-        "select compose from revisions where app_id = $1",
+        "select compose as \"compose!\" from revisions where app_id = $1",
         Uuid::from(spec.app_id)
     )
     .fetch_one(&h.pool)
@@ -418,6 +418,7 @@ async fn bootstrap_once_never_again_then_unseal_the_second_node() {
         &h.release.url,
         &h.release.key,
         Arc::new(SystemTime::now),
+        KEYED,
     )
     .await;
     assert!(node2.is_sealed());
