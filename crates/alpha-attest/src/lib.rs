@@ -20,7 +20,7 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use alpha_core::KmsRevision;
-use alpha_core::{AppId, ComposeHash, OrgId, hex_bytes};
+use alpha_core::{AppId, ComposeHash, InitData, OrgId, hex_bytes};
 use alpha_core::{CatalogKey, Signer};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
@@ -236,6 +236,7 @@ pub fn report_data(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedQuote {
     pub report_data: [u8; 64],
+    pub mr_config_id: [u8; 48],
     pub measured: Measured,
     pub tcb_status: String,
     pub advisories: Vec<String>,
@@ -278,6 +279,7 @@ pub fn verify_quote(
     };
     Ok(VerifiedQuote {
         report_data: report.report_data,
+        mr_config_id: report.mr_config_id,
         measured,
         tcb_status,
         advisories,
@@ -304,6 +306,7 @@ pub fn appraise(
     }
     let VerifiedQuote {
         report_data: verified_report_data,
+        mr_config_id: _,
         measured,
         tcb_status,
         advisories,
@@ -370,6 +373,35 @@ pub fn appraise(
         ),
         policy_version: doc.version,
     })
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum InitDataMismatch {
+    // A host can drop the init-data annotation and the pod still boots, under the guest image's
+    // default agent policy, which allows exec.
+    #[error("MRCONFIGID is zero: the pod was booted without init-data")]
+    Absent,
+    #[error("MRCONFIGID is not the digest of this init-data")]
+    Different,
+}
+
+/// Kata's QEMU copies the init-data's SHA-256 into a zeroed 48-byte `MRCONFIGID`.
+pub fn check_init_data(
+    quote: &VerifiedQuote,
+    init_data: &InitData,
+) -> Result<(), InitDataMismatch> {
+    if quote.mr_config_id == [0; 48] {
+        return Err(InitDataMismatch::Absent);
+    }
+    let digest = init_data.digest();
+    if !quote
+        .mr_config_id
+        .iter()
+        .eq(digest.as_bytes().iter().chain(&[0; 16]))
+    {
+        return Err(InitDataMismatch::Different);
+    }
+    Ok(())
 }
 
 fn check_policy(
