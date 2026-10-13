@@ -541,16 +541,16 @@ fn kata_runtime_class<'a>(
     if quote.mr_signer_seam != [0; 48] {
         return Err(PolicyDenied("mrsignerseam is not zero".into()));
     }
-    references
-        .iter()
-        .find(|r| r.matches(&quote.measured))
-        .map(|r| r.runtime_class.as_str())
-        .ok_or_else(|| {
-            Unknown(format!(
-                "no kata runtime class for mrtd {} rtmr0 {}",
-                quote.measured.mrtd, quote.measured.rtmr0
-            ))
-        })
+    // Parsing refuses overlapping entries, but a document built in code skips that.
+    let mut matching = references.iter().filter(|r| r.matches(&quote.measured));
+    match (matching.next(), matching.next()) {
+        (Some(r), None) => Ok(r.runtime_class.as_str()),
+        (None, _) => Err(Unknown(format!(
+            "no kata runtime class for mrtd {} rtmr0 {}",
+            quote.measured.mrtd, quote.measured.rtmr0
+        ))),
+        (Some(_), Some(_)) => Err(Unknown("more than one kata runtime class matches".into())),
+    }
 }
 
 fn check_policy(

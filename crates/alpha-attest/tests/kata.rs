@@ -211,3 +211,16 @@ fn a_quote_over_other_report_data_is_refused() {
         "report_data",
     );
 }
+
+#[test]
+fn two_classes_matching_one_td_are_refused() {
+    let mut doc = doc();
+    let mut twin = doc.kata_reference_values[0].clone();
+    twin.runtime_class = "kata-qemu-tdx-twin".into();
+    doc.kata_reference_values.push(twin);
+    refused(
+        appraise("p1-sha256.quote.bin", &t1_digest(), &doc),
+        "attestation_unknown",
+        "more than one",
+    );
+}
