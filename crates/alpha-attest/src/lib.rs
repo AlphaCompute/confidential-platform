@@ -25,7 +25,7 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use alpha_core::KmsRevision;
-use alpha_core::{AppId, ComposeHash, OrgId, hex_bytes};
+use alpha_core::{AppId, ComposeHash, KataPolicy, OrgId, hex_bytes};
 use alpha_core::{CatalogKey, Signer};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
@@ -43,6 +43,7 @@ pub use kata::{AnyEvidence, CocoAppraised, CpuEvidence, CpuKind, EvidenceV2, app
 
 pub const EVIDENCE_FORMAT: &str = "alphacompute-evidence/1";
 pub const EVIDENCE_FORMAT_V2: &str = "alphacompute-evidence/2";
+pub const KATA_EVIDENCE_FORMAT: &str = "alphacompute-evidence/kata/1";
 pub const RESULT_FORMAT: &str = "alphacompute-attestation-result/1";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -54,7 +55,17 @@ pub struct Evidence {
     pub event_log: Vec<EventLogEntry>,
 }
 
-pub(crate) mod base64url {
+/// A Kata pod's evidence is its quote alone: the container cannot read its init-data, and the
+/// quote's `MRCONFIGID` names the Revision.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KataEvidence {
+    pub format: String,
+    #[serde(with = "base64url")]
+    pub quote: Vec<u8>,
+}
+
+mod base64url {
     use super::*;
 
     pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
@@ -161,6 +172,15 @@ pub struct PlatformDocument {
         deserialize_with = "alpha_core::platform::deserialize_pccs_url"
     )]
     pub pccs_url: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "kata_reference_values"
+    )]
+    pub kata_reference_values: Vec<KataReference>,
+    /// Absent, no init-data Revision registers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kata_policy: Option<KataPolicy>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,6 +232,64 @@ pub struct ReferenceMeasurements {
     pub rtmr0: Measurement,
     pub rtmr1: Measurement,
     pub rtmr2: Measurement,
+}
+
+/// The measurements of every Kata TD booted under one runtime class. RTMR0 differs per pod
+/// shape (vCPUs and memory reach the guest as ACPI, SMBIOS and the TD HOB), so it is a set with
+/// one value per offered shape.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KataReference {
+    pub runtime_class: String,
+    pub mrtd: Measurement,
+    pub rtmr0: Vec<Measurement>,
+    pub rtmr1: Measurement,
+    pub rtmr2: Measurement,
+    /// Whether the class passes GPUs through, whose evidence the TD quote does not cover.
+    /// Required, so that an entry which forgets it cannot pass for a CPU class.
+    pub gpu: bool,
+}
+
+impl KataReference {
+    fn matches(&self, m: &Measured) -> bool {
+        self.mrtd == m.mrtd
+            && self.rtmr1 == m.rtmr1
+            && self.rtmr2 == m.rtmr2
+            && self.rtmr0.contains(&m.rtmr0)
+    }
+
+    fn overlaps(&self, other: &KataReference) -> bool {
+        self.mrtd == other.mrtd
+            && self.rtmr1 == other.rtmr1
+            && self.rtmr2 == other.rtmr2
+            && self.rtmr0.iter().any(|r| other.rtmr0.contains(r))
+    }
+}
+
+/// The runtime class is read off the measurements, so no two entries may accept the same TD:
+/// otherwise a GPU class could be reported for a CPU pod, or the other way round.
+fn kata_reference_values<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<KataReference>, D::Error> {
+    use serde::de::Error;
+
+    let entries = Vec::<KataReference>::deserialize(deserializer)?;
+    for (i, entry) in entries.iter().enumerate() {
+        let class = &entry.runtime_class;
+        if class.is_empty() {
+            return Err(D::Error::custom(
+                "kata_reference_values: runtime_class is empty",
+            ));
+        }
+        for other in entries.iter().skip(i.saturating_add(1)) {
+            if entry.overlaps(other) {
+                return Err(D::Error::custom(format!(
+                    "kata_reference_values: {class} and {} accept the same measurements",
+                    other.runtime_class
+                )));
+            }
+        }
+    }
+    Ok(entries)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,6 +385,12 @@ pub fn report_data(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedQuote {
     pub report_data: [u8; 64],
+    pub td_attributes: [u8; 8],
+    pub xfam: [u8; 8],
+    pub mr_config_id: [u8; 48],
+    pub mr_owner: [u8; 48],
+    pub mr_owner_config: [u8; 48],
+    pub mr_signer_seam: [u8; 48],
     pub measured: Measured,
     /// TD10 MR_CONFIG_ID, whatever the profile; only `kata-tdx/1` reads it.
     pub mrconfigid: Measurement,
@@ -352,6 +436,12 @@ pub fn verify_quote(
     };
     Ok(VerifiedQuote {
         report_data: report.report_data,
+        td_attributes: report.td_attributes,
+        xfam: report.xfam,
+        mr_config_id: report.mr_config_id,
+        mr_owner: report.mr_owner,
+        mr_owner_config: report.mr_owner_config,
+        mr_signer_seam: report.mr_signer_seam,
         measured,
         mrconfigid: Measurement(report.mr_config_id),
         tcb_status,
@@ -428,26 +518,167 @@ pub fn appraise(
         return Err(Unknown(format!("kms revision {compose_hash}")));
     }
 
-    let evidence_json = serde_json::to_value(evidence).map_err(|e| Failed(e.to_string()))?;
     Ok(Appraised {
         measured,
         tcb_status,
         advisories,
         os_image,
         compose_hash,
-        runtime_pubkey_sha256: format!(
-            "sha256:{}",
-            hex::encode(Sha256::digest(runtime_pubkey_spki))
-        ),
-        evidence_sha256: format!(
-            "sha256:{}",
-            hex::encode(Sha256::digest(
-                alpha_core::jcs(&evidence_json).map_err(|e| Failed(e.to_string()))?
-            ))
-        ),
+        runtime_pubkey_sha256: sha256_text(runtime_pubkey_spki),
+        evidence_sha256: evidence_sha256(evidence)?,
         policy_version: doc.version,
         coco: None,
     })
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum InitDataMismatch {
+    // A host can drop the init-data annotation and the pod still boots, under the guest image's
+    // default agent policy, which allows exec.
+    #[error("MRCONFIGID is zero: the pod was booted without init-data")]
+    Absent,
+    #[error("MRCONFIGID is not a SHA-256 init-data digest followed by zeros")]
+    NotSha256,
+}
+
+/// The [`InitData::digest`](alpha_core::InitData::digest) a Kata TD booted with: Kata's QEMU
+/// copies the init-data's SHA-256 into a zeroed 48-byte `MRCONFIGID`.
+pub fn init_data_digest(quote: &VerifiedQuote) -> Result<ComposeHash, InitDataMismatch> {
+    if quote.mr_config_id == [0; 48] {
+        return Err(InitDataMismatch::Absent);
+    }
+    match quote.mr_config_id.split_first_chunk::<32>() {
+        Some((digest, tail)) if tail.iter().all(|b| *b == 0) => Ok(ComposeHash::from(*digest)),
+        _ => Err(InitDataMismatch::NotSha256),
+    }
+}
+
+/// SEPT_VE_DISABLE alone. Compared whole, not as a mask, so DEBUG, MIGRATABLE, PKS, KL or
+/// PERFMON appearing after a QEMU or Kata config change is refused too.
+const KATA_TD_ATTRIBUTES: u64 = 0x1000_0000;
+/// x87, SSE, AVX, AVX-512, PKRU, CET and AMX: what `-cpu host` yields on our B300 hosts.
+// ponytail: one host CPU class, so one XFAM for every runtime class; a second CPU generation
+// moves this into each `kata_reference_values` entry.
+const KATA_XFAM: u64 = 0x61ae7;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KataAppraised {
+    /// The class whose reference values the measurements matched, never a host's claim.
+    pub runtime_class: String,
+    /// The matched class's [`KataReference::gpu`].
+    pub gpu: bool,
+    /// What the TD booted with, from `MRCONFIGID`: the digest of its Revision.
+    pub init_data: ComposeHash,
+    pub quote: VerifiedQuote,
+}
+
+/// Appraisal of a Kata TD's quote, bound to this request by `expected_report_data` (see
+/// [`report_data`]), against `doc.kata_reference_values`. No event log is replayed: the events
+/// that vary between TDs carry only digests, so the final registers say as much. The caller
+/// looks the Revision up by [`KataAppraised::init_data`], and appraises GPU evidence when
+/// [`KataAppraised::gpu`] says so.
+pub fn appraise_kata(
+    quote: &[u8],
+    expected_report_data: &[u8; 64],
+    doc: &PlatformDocument,
+    collateral: &Collateral,
+    now: SystemTime,
+) -> Result<KataAppraised, AppraisalError> {
+    let quote = verify_quote(quote, collateral, &doc.policy, now)?;
+    if &quote.report_data != expected_report_data {
+        return Err(AppraisalError::Failed(
+            "report_data is not bound to this request".into(),
+        ));
+    }
+    let reference = kata_reference(&quote, &doc.kata_reference_values)?;
+    let init_data = init_data_digest(&quote).map_err(|e| AppraisalError::Failed(e.to_string()))?;
+    Ok(KataAppraised {
+        runtime_class: reference.runtime_class.clone(),
+        gpu: reference.gpu,
+        init_data,
+        quote,
+    })
+}
+
+/// [`appraise_kata`] of an Instance's evidence over its runtime key and nonce, in the shape
+/// [`appraise`] gives: the init-data digest is `compose_hash` and the class is `os_image`. The
+/// flag is the class's [`KataReference::gpu`].
+pub fn appraise_kata_instance(
+    evidence: &KataEvidence,
+    nonce: &[u8; 32],
+    runtime_pubkey_spki: &[u8],
+    doc: &PlatformDocument,
+    collateral: &Collateral,
+    now: SystemTime,
+) -> Result<(Appraised, bool), AppraisalError> {
+    if evidence.format != KATA_EVIDENCE_FORMAT {
+        return Err(AppraisalError::Unknown(format!(
+            "evidence format {:?}",
+            evidence.format
+        )));
+    }
+    let expected = report_data(runtime_pubkey_spki, nonce, None);
+    let kata = appraise_kata(&evidence.quote, &expected, doc, collateral, now)?;
+    let appraised = Appraised {
+        measured: kata.quote.measured,
+        tcb_status: kata.quote.tcb_status,
+        advisories: kata.quote.advisories,
+        os_image: kata.runtime_class,
+        compose_hash: kata.init_data,
+        runtime_pubkey_sha256: sha256_text(runtime_pubkey_spki),
+        evidence_sha256: evidence_sha256(evidence)?,
+        policy_version: doc.version,
+    };
+    Ok((appraised, kata.gpu))
+}
+
+fn sha256_text(bytes: &[u8]) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+}
+
+fn evidence_sha256(evidence: &impl Serialize) -> Result<String, AppraisalError> {
+    let json = serde_json::to_value(evidence).map_err(|e| AppraisalError::Failed(e.to_string()))?;
+    let jcs = alpha_core::jcs(&json).map_err(|e| AppraisalError::Failed(e.to_string()))?;
+    Ok(sha256_text(&jcs))
+}
+
+fn kata_reference<'a>(
+    quote: &VerifiedQuote,
+    references: &'a [KataReference],
+) -> Result<&'a KataReference, AppraisalError> {
+    use AppraisalError::*;
+
+    let td_attributes = u64::from_le_bytes(quote.td_attributes);
+    if td_attributes != KATA_TD_ATTRIBUTES {
+        return Err(PolicyDenied(format!("td_attributes {td_attributes:#x}")));
+    }
+    let xfam = u64::from_le_bytes(quote.xfam);
+    if xfam != KATA_XFAM {
+        return Err(PolicyDenied(format!("xfam {xfam:#x}")));
+    }
+    // Nothing of ours extends RTMR3, and Kata never sets the owner fields.
+    if quote.measured.rtmr3 != Measurement([0; 48]) {
+        return Err(Unknown(format!("rtmr3 {}", quote.measured.rtmr3)));
+    }
+    if quote.mr_owner != [0; 48] || quote.mr_owner_config != [0; 48] {
+        return Err(Unknown("mrowner or mrownerconfig is not zero".into()));
+    }
+    // Zero means Intel signed the TDX module; anything else is a module TCB levels say nothing about.
+    if quote.mr_signer_seam != [0; 48] {
+        return Err(PolicyDenied("mrsignerseam is not zero".into()));
+    }
+    // Parsing refuses empty and overlapping entries, but a document built in code skips that.
+    let mut matching = references
+        .iter()
+        .filter(|r| !r.runtime_class.is_empty() && r.matches(&quote.measured));
+    match (matching.next(), matching.next()) {
+        (Some(r), None) => Ok(r),
+        (None, _) => Err(Unknown(format!(
+            "no kata runtime class for mrtd {} rtmr0 {}",
+            quote.measured.mrtd, quote.measured.rtmr0
+        ))),
+        (Some(_), Some(_)) => Err(Unknown("more than one kata runtime class matches".into())),
+    }
 }
 
 fn check_policy(
@@ -538,13 +769,20 @@ mod tests {
         }
     }
 
+    fn captured_at(dir: &std::path::Path) -> SystemTime {
+        let text = std::fs::read_to_string(dir.join("captured_at.txt")).unwrap();
+        let secs = chrono::DateTime::parse_from_rfc3339(text.trim())
+            .unwrap()
+            .timestamp();
+        UNIX_EPOCH + std::time::Duration::from_secs(secs as u64)
+    }
+
     /// `verify_quote` used standalone, over a third party's quote and our own policy —
     /// the shape `services/alpha-inference` needs, proven here on a real capture rather
     /// than a synthetic one.
     #[test]
     fn verify_quote_reports_the_capture_report_data() {
         use std::path::PathBuf;
-        use std::time::Duration;
 
         let dir =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/attest/phala-dev-0.5.9");
@@ -552,12 +790,7 @@ mod tests {
         let quote = hex::decode(read("quote.instance.hex").trim()).unwrap();
         let collateral: Collateral = serde_json::from_str(&read("collateral.json")).unwrap();
         let doc: PlatformDocument = serde_json::from_str(&read("platform-document.json")).unwrap();
-        let now = UNIX_EPOCH
-            + Duration::from_secs(
-                chrono::DateTime::parse_from_rfc3339(read("captured_at.txt").trim())
-                    .unwrap()
-                    .timestamp() as u64,
-            );
+        let now = captured_at(&dir);
 
         let verified = verify_quote(&quote, &collateral, &doc.policy, now).unwrap();
 
@@ -566,5 +799,102 @@ mod tests {
             read("report_data.instance.hex").trim()
         );
         assert_eq!(verified.tcb_status, "UpToDate");
+    }
+
+    type QuoteChange = fn(&mut VerifiedQuote);
+
+    fn kata_dir() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/attest/b300-kata-4.0.0")
+    }
+
+    fn kata_doc_json() -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(kata_dir().join("platform-document.json")).unwrap())
+            .unwrap()
+    }
+
+    /// The real CPU-pod quote, so each test below changes exactly one field the hardware
+    /// would not produce on request.
+    fn kata_cpu_quote() -> (VerifiedQuote, PlatformDocument) {
+        let read = |name: &str| std::fs::read(kata_dir().join(name)).unwrap();
+        let collateral: Collateral = serde_json::from_slice(&read("collateral.json")).unwrap();
+        let doc: PlatformDocument = serde_json::from_value(kata_doc_json()).unwrap();
+        let now = captured_at(&kata_dir());
+        let quote =
+            verify_quote(&read("p1-sha256.quote.bin"), &collateral, &doc.policy, now).unwrap();
+        (quote, doc)
+    }
+
+    #[test]
+    fn kata_td_fields_outside_the_reference_are_refused() {
+        let (quote, doc) = kata_cpu_quote();
+        let refs = &doc.kata_reference_values;
+        assert_eq!(
+            kata_reference(&quote, refs).unwrap().runtime_class,
+            "kata-qemu-tdx"
+        );
+
+        let cases: [(QuoteChange, &str, &str); 8] = [
+            (
+                |q| q.td_attributes[0] |= 0x01,
+                "policy_denied",
+                "td_attributes",
+            ),
+            (|q| q.td_attributes[3] = 0, "policy_denied", "td_attributes"),
+            (
+                |q| q.td_attributes[3] |= 0x40,
+                "policy_denied",
+                "td_attributes",
+            ),
+            (|q| q.xfam[0] ^= 0x01, "policy_denied", "xfam"),
+            (
+                |q| q.measured.rtmr3.0[47] = 1,
+                "attestation_unknown",
+                "rtmr3",
+            ),
+            (|q| q.mr_owner[0] = 1, "attestation_unknown", "mrowner"),
+            (
+                |q| q.mr_owner_config[47] = 1,
+                "attestation_unknown",
+                "mrownerconfig",
+            ),
+            (|q| q.mr_signer_seam[0] = 1, "policy_denied", "mrsignerseam"),
+        ];
+        for (change, code, fragment) in cases {
+            let mut q = quote.clone();
+            change(&mut q);
+            let err = kata_reference(&q, refs).unwrap_err();
+            assert_eq!(err.code(), code, "{err}");
+            assert!(err.to_string().contains(fragment), "{err}");
+        }
+    }
+
+    #[test]
+    fn kata_reference_values_that_could_match_anything_or_twice_are_refused() {
+        let parse = |change: &dyn Fn(&mut serde_json::Value)| {
+            let mut doc = kata_doc_json();
+            change(&mut doc);
+            serde_json::from_value::<PlatformDocument>(doc)
+                .err()
+                .map(|e| e.to_string())
+        };
+        let empty = parse(&|d| d["kata_reference_values"][0]["runtime_class"] = "".into());
+        assert!(empty.is_some_and(|e| e.contains("runtime_class is empty")));
+        let unsaid = parse(&|d| {
+            d["kata_reference_values"][1]
+                .as_object_mut()
+                .unwrap()
+                .remove("gpu");
+        });
+        assert!(unsaid.is_some_and(|e| e.contains("missing field `gpu`")));
+        let gpu_rtmr0 = kata_doc_json()["kata_reference_values"][1]["rtmr0"][0].clone();
+        let overlap = parse(&|d| {
+            let cpu = d["kata_reference_values"][0].clone();
+            d["kata_reference_values"][1] = cpu;
+            d["kata_reference_values"][1]["runtime_class"] = "kata-qemu-tdx-2".into();
+            d["kata_reference_values"][1]["rtmr0"] =
+                serde_json::json!([gpu_rtmr0, d["kata_reference_values"][0]["rtmr0"][4]]);
+        });
+        assert!(overlap.is_some_and(|e| e.contains("accept the same measurements")));
     }
 }

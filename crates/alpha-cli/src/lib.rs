@@ -15,6 +15,7 @@
 pub mod approvals;
 pub mod call;
 pub mod catalog;
+pub mod coco;
 pub mod deploy;
 pub mod instances;
 pub mod keyfile;
