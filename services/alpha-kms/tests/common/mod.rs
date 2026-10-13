@@ -270,11 +270,13 @@ pub async fn harness_with_clock(clock: Clock) -> Option<Harness> {
     harness_on(clock, KEYED, platform_document(KEYED)).await
 }
 
-/// A node at the Kata capture's time, with its collateral, and the Kata reference values added
-/// to the keyed capture's platform document.
+/// A node at the Kata capture's time, with its collateral, and the Kata reference values and agent
+/// policy added to the keyed capture's platform document.
 pub async fn kata_harness() -> Option<Harness> {
     let mut document = platform_document(KEYED);
-    document["kata_reference_values"] = platform_document(KATA)["kata_reference_values"].clone();
+    let kata = platform_document(KATA);
+    document["kata_reference_values"] = kata["kata_reference_values"].clone();
+    document["kata_policy"] = kata["kata_policy"].clone();
     let now = captured_at(KATA);
     harness_on(Arc::new(move || now), KATA, document).await
 }
