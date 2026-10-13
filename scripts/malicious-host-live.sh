@@ -11,28 +11,59 @@
 # MHS_NODE_SHELL                  optional: a command that runs its arguments as root on the pod's
 #                                 node (e.g. "ssh root@b300-01"), for the crictl cases.
 #
-# Without KUBECONFIG, or with a cluster that does not answer, it prints why and exits 0 (skipped).
+# Without KUBECONFIG it exits 0 (skipped); a configured but unreachable cluster is an error.
 # Every pod it creates is labelled alphacompute.ai/malicious-host=1 and deleted on exit. It never
 # changes the test Deployment itself.
 set -uo pipefail
 
 skip() { echo "malicious-host live suite: skipped: $*"; exit 0; }
 [ -n "${KUBECONFIG:-}" ] || skip "no cluster configured (set KUBECONFIG, MHS_NAMESPACE and MHS_DEPLOYMENT)"
-[ -n "${MHS_NAMESPACE:-}" ] && [ -n "${MHS_DEPLOYMENT:-}" ] || skip "MHS_NAMESPACE and MHS_DEPLOYMENT are not set"
-for tool in kubectl jq base64 gzip python3; do
+[ -n "${MHS_NAMESPACE:-}" ] && [ -n "${MHS_DEPLOYMENT:-}" ] || { echo "MHS_NAMESPACE and MHS_DEPLOYMENT are required" >&2; exit 2; }
+for tool in kubectl jq base64 gzip python3 timeout; do
   command -v "$tool" >/dev/null 2>&1 || { echo "malicious-host live suite: $tool is required" >&2; exit 2; }
 done
-kubectl version --request-timeout=10s >/dev/null 2>&1 || skip "the cluster in KUBECONFIG does not answer"
+kubectl version --request-timeout=10s >/dev/null 2>&1 || { echo "the configured cluster does not answer" >&2; exit 2; }
 
 ns="$MHS_NAMESPACE"
-timeout="${MHS_TIMEOUT:-180}"
+timeout_secs="${MHS_TIMEOUT:-180}"
+[[ "$timeout_secs" =~ ^[1-9][0-9]*$ ]] || { echo "MHS_TIMEOUT must be positive seconds" >&2; exit 2; }
 k() { kubectl -n "$ns" --request-timeout=30s "$@"; }
 work="$(mktemp -d)"
 trap 'k delete pod -l alphacompute.ai/malicious-host=1 --wait=false >/dev/null 2>&1; rm -rf "$work"' EXIT
 
 failures=0
+skipped=0
 pass() { printf 'refused  %s\n' "$1"; }
-fail() { printf 'ALLOWED  %s: %s\n' "$1" "$2"; failures=$((failures + 1)); }
+fail() { printf 'FAILED   %s: %s\n' "$1" "$2"; failures=$((failures + 1)); }
+
+skip_case() { printf 'skipped  %s\n' "$1"; skipped=$((skipped + 1)); }
+
+# A nonzero exit alone is not a policy verdict: missing tools, RBAC and transport
+# failures must not pass a security test. Keep arbitrary output out of the report.
+policy_denied() {
+  local what="$1" request="$2" status
+  shift 2
+  if "$@" >"$work/out" 2>"$work/err"; then
+    fail "$what" "operation succeeded"
+  else
+    status=$?
+    if [ "$status" -ne 124 ] && grep -Eq "($request) is blocked by policy" "$work/out" "$work/err"; then
+      pass "$what"
+    else
+      fail "$what" "no explicit agent-policy denial (exit $status)"
+    fi
+  fi
+}
+
+empty_logs() {
+  local what="$1"
+  shift
+  if "$@" >"$work/out" 2>"$work/err"; then
+    if [ -s "$work/out" ]; then fail "$what" "log data returned"; else pass "$what (empty stream)"; fi
+  else
+    fail "$what" "log request failed; an error is not an empty denied stream"
+  fi
+}
 
 selector="$(k get deployment "$MHS_DEPLOYMENT" -o json | jq -r '.spec.selector.matchLabels | to_entries | map("\(.key)=\(.value)") | join(",")')"
 pod="$(k get pods -l "$selector" -o json | jq -r '[.items[] | select(.status.phase == "Running")][0].metadata.name // empty')"
@@ -43,63 +74,59 @@ k get pod "$pod" -o json > "$work/pod.json"
 containers="$(jq -r '[.spec.initContainers[]? | select(.restartPolicy == "Always") | .name] + [.spec.containers[].name] | .[]' "$work/pod.json")"
 echo "malicious-host live suite against $ns/$pod ($(echo $containers))"
 
-# kubectl exec: the agent refuses ExecProcessRequest. The message names the policy.
+# The test workload must emit stdout/stderr by construction; empty logs from a
+# silent application do not demonstrate the stream policy (see the runbook).
 for c in $containers; do
-  out="$(k exec "$pod" -c "$c" -- sh -c 'echo reached' 2>&1)"
-  if echo "$out" | grep -q '^reached$'; then fail "exec into $c" "the command ran"
-  else pass "exec into $c ($(echo "$out" | grep -o 'ExecProcessRequest is blocked by policy' | head -1 || true))"; fi
-  out="$(k exec -i "$pod" -c "$c" -- cat /proc/1/environ 2>&1 </dev/null)"
-  if echo "$out" | grep -q 'PATH='; then fail "exec -i into $c" "read the environment"; else pass "exec -i into $c"; fi
+  policy_denied "exec into $c" ExecProcessRequest k exec "$pod" -c "$c" -- sh -c 'echo reached'
+  policy_denied "exec -i into $c" ExecProcessRequest k exec -i "$pod" -c "$c" -- cat /proc/1/environ </dev/null
+  empty_logs "logs of $c" k logs "$pod" -c "$c"
+  restarts="$(jq -r --arg c "$c" '[.status.containerStatuses[]?, .status.initContainerStatuses[]?] | map(select(.name == $c)) | .[0].restartCount // 0' "$work/pod.json")"
+  if [ "$restarts" -gt 0 ]; then
+    empty_logs "previous logs of $c" k logs "$pod" -c "$c" --previous
+  else
+    skip_case "previous logs of $c (no previous container instance)"
+  fi
 done
 
-# kubectl logs: the agent answers ReadStdout/ReadStderr with the data cleared, so nothing comes back.
-for c in $containers; do
-  bytes="$(k logs "$pod" -c "$c" 2>/dev/null | wc -c)"
-  if [ "$bytes" -gt 0 ]; then fail "logs of $c" "$bytes bytes of log came back"; else pass "logs of $c (empty)"; fi
-  bytes="$(k logs "$pod" -c "$c" --previous 2>/dev/null | wc -c)"
-  if [ "$bytes" -gt 0 ]; then fail "previous logs of $c" "$bytes bytes"; else pass "previous logs of $c"; fi
-done
-
-# kubectl cp and attach go through exec and the streams.
 first="$(echo "$containers" | head -1)"
 echo probe > "$work/probe"
-if k cp "$work/probe" "$pod:/tmp/probe" -c "$first" >/dev/null 2>&1; then fail "cp into $first" "copied"; else pass "cp into $first"; fi
-if k cp "$pod:/etc/hostname" "$work/out" -c "$first" >/dev/null 2>&1 && [ -s "$work/out" ]; then
-  fail "cp out of $first" "copied"; else pass "cp out of $first"; fi
-if timeout 20 kubectl -n "$ns" attach "$pod" -c "$first" -i </dev/null 2>/dev/null | grep -q .; then
-  fail "attach to $first" "output came back"; else pass "attach to $first"; fi
+policy_denied "cp into $first" 'ExecProcessRequest|CopyFileRequest' k cp "$work/probe" "$pod:/tmp/probe" -c "$first"
+policy_denied "cp out of $first" 'ExecProcessRequest|CopyFileRequest' k cp "$pod:/etc/hostname" "$work/out-copy" -c "$first"
+policy_denied "attach to $first" 'ReadStreamRequest|WriteStreamRequest|CloseStdinRequest' timeout 20 kubectl -n "$ns" attach "$pod" -c "$first" -i </dev/null
 
 # Waits for container $2 of pod $1 to be refused at creation (CreateContainerRequest blocked by the
-# policy), and checks the pod never became Ready, so no runtime of it attested.
+# policy). A cloned pod must not be Ready. For an ephemeral debug container the
+# original pod may stay Ready; only the attempted new container must be refused.
 refused_at_create() {
-  local p="$1" c="$2" what="$3" deadline=$((SECONDS + timeout)) msg
+  local p="$1" c="$2" what="$3" require_not_ready="${4:-true}" deadline=$((SECONDS + timeout_secs)) msg status
   while [ $SECONDS -lt $deadline ]; do
-    msg="$(k get pod "$p" -o json 2>/dev/null | jq -r --arg c "$c" \
+    status="$(k get pod "$p" -o json 2>"$work/err")" || { fail "$what" "pod status request failed"; return; }
+    msg="$(printf '%s' "$status" | jq -r --arg c "$c" \
       '[.status.containerStatuses[]?, .status.initContainerStatuses[]?, .status.ephemeralContainerStatuses[]?]
        | map(select(.name == $c)) | .[0].state.waiting.message // .[0].state.terminated.message // empty')"
-    if echo "$msg" | grep -q 'blocked by policy'; then
-      if [ "$(k get pod "$p" -o json | jq -r '.status.conditions[]? | select(.type == "Ready") | .status')" = True ]; then
+    if echo "$msg" | grep -q 'CreateContainerRequest is blocked by policy'; then
+      if [ "$require_not_ready" = true ] && [ "$(printf '%s' "$status" | jq -r '.status.conditions[]? | select(.type == "Ready") | .status')" = True ]; then
         fail "$what" "refused, but the pod is Ready"
       else
         pass "$what"
       fi
       return
     fi
-    if [ "$(k get pod "$p" -o json 2>/dev/null | jq -r --arg c "$c" \
+    if [ "$(printf '%s' "$status" | jq -r --arg c "$c" \
       '[.status.containerStatuses[]?, .status.initContainerStatuses[]?] | map(select(.name == $c)) | .[0].state.running // empty')" != "" ]; then
       fail "$what" "container $c is running"
       return
     fi
     sleep 5
   done
-  fail "$what" "no refusal within ${timeout}s (status: $(k get pod "$p" -o json | jq -c '.status.containerStatuses'))"
+  fail "$what" "no refusal within ${timeout_secs}s (status: $(k get pod "$p" -o json | jq -c '.status.containerStatuses'))"
 }
 
 # kubectl debug: an ephemeral container is a CreateContainerRequest the policy has no entry for.
 if k debug "$pod" -c mhs-debug --image=busybox:1.37 -- sleep 600 >/dev/null 2>&1; then
-  refused_at_create "$pod" mhs-debug "ephemeral debug container"
+  refused_at_create "$pod" mhs-debug "ephemeral debug container" false
 else
-  pass "ephemeral debug container (refused by the API server or admission)"
+  fail "ephemeral debug container" "API request failed before agent-policy enforcement could be tested"
 fi
 
 # The test pod's spec, cloned with one change into a new pod: what a host that rewrites the
@@ -123,7 +150,7 @@ hostile() {
     refused_at_create "$name" "$container" "$what"
     k delete pod "$name" --wait=false >/dev/null 2>&1
   else
-    pass "$what (refused by the API server or admission: $(head -c 200 "$work/err"))"
+    fail "$what" "pod creation failed before agent-policy enforcement could be tested"
   fi
 }
 image="$(jq -r --arg c "$main" '.spec.containers[] | select(.name == $c) | .image' "$work/pod.json")"
@@ -152,25 +179,32 @@ out, n = re.subn(r"(\"policy\.rego\" = ''')\n.*?(''')", lambda m: m.group(1) + "
 assert n == 1, "no policy.rego entry"
 sys.stdout.write(out)
 EOF
-hostile_initdata="$(gzip -9n < "$work/hostile.toml" | base64 -w0)"
+hostile_initdata="$(gzip -9n < "$work/hostile.toml" | base64 | tr -d '\n')"
 name=mhs-initdata
 clone "$name" ".metadata.annotations[\"$annotation\"] = \"$hostile_initdata\""
 if k create -f "$work/$name.json" >/dev/null 2>"$work/err"; then
-  deadline=$((SECONDS + timeout)); verdict=""
+  deadline=$((SECONDS + timeout_secs)); verdict=""
   while [ $SECONDS -lt $deadline ] && [ -z "$verdict" ]; do
-    ready="$(k get pod "$name" -o json | jq -r '.status.conditions[]? | select(.type == "Ready") | .status')"
-    [ "$ready" = True ] && verdict="ready"
-    k logs "$name" -c alpha-runtime 2>/dev/null | grep -q 'attestation_unknown' && verdict="refused"
-    sleep 5
+    if ! k get pod "$name" -o json >"$work/status" 2>"$work/err"; then
+      verdict="error"
+      break
+    fi
+    ready="$(jq -r '.status.conditions[]? | select(.type == "Ready") | .status' "$work/status")" || { verdict="error"; break; }
+    if [ "$ready" = True ]; then
+      verdict="ready"
+    elif k logs "$name" -c alpha-runtime >"$work/kms-result" 2>"$work/err" && grep -q 'attestation_unknown' "$work/kms-result"; then
+      verdict="refused"
+    fi
+    [ -n "$verdict" ] || sleep 1
   done
   case "$verdict" in
     refused) pass "the host's own policy in the init-data (the KMS refused: attestation_unknown)" ;;
     ready) fail "the host's own policy in the init-data" "the pod became Ready: its runtime got a leaf" ;;
-    *) pass "the host's own policy in the init-data (never Ready within ${timeout}s)" ;;
+    *) fail "the host's own policy in the init-data" "no confirmed KMS rejection within ${timeout_secs}s; not becoming Ready is inconclusive" ;;
   esac
   k delete pod "$name" --wait=false >/dev/null 2>&1
 else
-  pass "the host's own policy in the init-data (refused by the API server or admission)"
+  fail "the host's own policy in the init-data" "pod creation failed before KMS appraisal could be tested"
 fi
 
 # The init-data annotation edited on the running pod: the downward-API copy changes, the TD's
@@ -178,28 +212,36 @@ fi
 # expires (at most an hour) and gets no new one; here only that it stays the pod it was is checked.
 before="$(k get pod "$pod" -o json | jq -r '.metadata.uid')"
 if k annotate pod "$pod" --overwrite "$annotation=$hostile_initdata" >/dev/null 2>&1; then
-  k annotate pod "$pod" --overwrite "$annotation=$(jq -r --arg a "$annotation" '.metadata.annotations[$a]' "$work/pod.json")" >/dev/null 2>&1
-  pass "init-data annotation edited on the running pod (allowed by the API server; the KMS check is the core suite's MRCONFIGID case)"
+  if k annotate pod "$pod" --overwrite "$annotation=$(jq -r --arg a "$annotation" '.metadata.annotations[$a]' "$work/pod.json")" >/dev/null 2>&1; then
+    printf '%s\n' "observed init-data annotation edit and restoration (KMS MRCONFIGID rejection is not asserted by this operation)"
+  else
+    fail "restore original init-data annotation" "API request failed"
+  fi
 else
-  pass "init-data annotation edited on the running pod (refused by the API server or admission)"
+  fail "init-data annotation edit" "API request failed; no KMS check occurred"
 fi
 [ "$(k get pod "$pod" -o json | jq -r '.metadata.uid')" = "$before" ] || fail "test pod" "was replaced during the run"
 
 # On the node: the container runtime's own exec and logs reach the same agent calls.
 if [ -n "${MHS_NODE_SHELL:-}" ]; then
-  sandbox="$($MHS_NODE_SHELL crictl pods --namespace "$ns" --name "$pod" -q 2>/dev/null | head -1)"
-  for cid in $($MHS_NODE_SHELL crictl ps --pod "$sandbox" -q 2>/dev/null); do
-    if $MHS_NODE_SHELL crictl exec "$cid" sh -c 'echo reached' 2>/dev/null | grep -q reached; then
-      fail "crictl exec $cid" "the command ran"; else pass "crictl exec $cid"; fi
-    if [ "$($MHS_NODE_SHELL crictl logs "$cid" 2>/dev/null | wc -c)" -gt 0 ]; then
-      fail "crictl logs $cid" "log came back"; else pass "crictl logs $cid (empty)"; fi
+  sandbox="$($MHS_NODE_SHELL crictl pods --namespace "$ns" --name "$pod" -q 2>"$work/err")" ||
+    { echo "node sandbox lookup failed" >&2; exit 2; }
+  [ -n "$sandbox" ] && [ "$(printf '%s\n' "$sandbox" | wc -l)" -eq 1 ] ||
+    { echo "expected one node sandbox" >&2; exit 2; }
+  ids="$($MHS_NODE_SHELL crictl ps --pod "$sandbox" -q 2>"$work/err")" ||
+    { echo "node container lookup failed" >&2; exit 2; }
+  [ -n "$ids" ] || { echo "no node containers to test" >&2; exit 2; }
+  for cid in $ids; do
+    policy_denied "crictl exec $cid" ExecProcessRequest $MHS_NODE_SHELL crictl exec "$cid" sh -c 'echo reached'
+    empty_logs "crictl logs $cid" $MHS_NODE_SHELL crictl logs "$cid"
   done
-  if $MHS_NODE_SHELL kata-runtime exec "$sandbox" </dev/null 2>/dev/null | grep -q .; then
-    fail "kata-runtime exec (debug console)" "a console answered"; else pass "kata-runtime exec (debug console)"; fi
+  policy_denied "kata-runtime exec (debug console)" 'ExecProcessRequest|debug console' timeout 20 $MHS_NODE_SHELL kata-runtime exec "$sandbox" </dev/null
+else
+  skip_case "node-runtime checks (MHS_NODE_SHELL not configured)"
 fi
 
 if [ "$failures" -gt 0 ]; then
-  echo "malicious-host live suite: $failures hostile action(s) were not refused" >&2
+  echo "malicious-host live suite: $failures required check(s) failed or lacked denial evidence" >&2
   exit 1
 fi
-echo "malicious-host live suite: every hostile action was refused"
+echo "malicious-host live suite: required checks passed; $skipped optional checks skipped"

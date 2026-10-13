@@ -26,6 +26,8 @@ jobs:
       - run: cargo clippy -p alpha-channel --target wasm32-unknown-unknown --all-targets -- -D warnings
       # PRD-02 deliverable 18, policy layer, named so its result shows on its own; the workspace run
       # repeats it.
+      - name: malicious-host live runner regressions
+        run: python3 scripts/test-malicious-host-live.py
       - name: malicious-host full suite (policy)
         run: cargo test -p alpha-cli --test agent_policy
       - run: cargo test --workspace

@@ -197,6 +197,34 @@ The baseline (`testdata/agent-policy/README.md`) is two settings drop-ins (`genp
 To run it at G0:
 
 1. Deploy a test App on each runtime class (`kata-qemu-tdx`, and `kata-qemu-nvidia-gpu-tdx` on a B300 in CC mode), rendered with the baseline, its Revision registered, and wait until its pod is Ready (its runtime attested).
-2. `KUBECONFIG=<admin kubeconfig> MHS_NAMESPACE=app-<id> MHS_DEPLOYMENT=app-<id> MHS_NODE_SHELL="ssh root@<node>" scripts/malicious-host-live.sh` (needs `kubectl`, `jq`, `python3`). Every line must read `refused`; the script exits 1 otherwise. `MHS_TIMEOUT` (default 180 s) bounds each wait.
+2. `KUBECONFIG=<admin kubeconfig> MHS_NAMESPACE=app-<id> MHS_DEPLOYMENT=app-<id> MHS_NODE_SHELL="ssh root@<node>" scripts/malicious-host-live.sh` (needs `kubectl`, `jq`, `python3`). Required checks must have attributable refusal evidence; failures or inconclusive results exit 1. Optional previous-log checks with no prior container and node checks without `MHS_NODE_SHELL` are explicitly reported as skipped. `MHS_TIMEOUT` (default 180 s) bounds each wait.
 3. Run the policy layer against the real launch too: with the agent's log level at debug (`kernel_params = "agent.log=debug"` in the node's Kata configuration, on a debug node only), the agent writes each request it evaluates to `/tmp/policy.jsonl` in the guest. Put the legitimate launch's `CreateContainerRequest`s next to the fixtures and check the suite's launch builds the same requests; fix the suite where they differ (the PVC volume of the model server, which genpolicy models as a shared-directory bind, and the OCI version containerd sends are the first to confirm).
 4. For CI, set the repository variable `LIVE_CLUSTER` (any value), `MHS_NAMESPACE` and `MHS_DEPLOYMENT`, the secret `LIVE_CLUSTER_KUBECONFIG`, and `LIVE_CLUSTER_RUNNER` to a runner label that reaches the API server. Without `LIVE_CLUSTER` the job is skipped.
+
+### Live-runner verdicts and regression tests
+
+The test App must emit stdout/stderr by construction, so an empty successful
+log request tests stream suppression rather than a silent workload. A failed
+log request is a failure, not an empty-stream pass. A previous-log check is
+skipped when that container has never restarted. Node checks are skipped unless
+`MHS_NODE_SHELL` is configured; the summary reports that partial coverage.
+
+Exec, copy and attach checks require a nonzero result with the corresponding
+agent-policy denial. Missing commands, transport failures, API/RBAC denials and
+timeouts cannot pass. Container-creation mutations must reach the agent and
+report `CreateContainerRequest is blocked by policy`; admission rejection does
+not demonstrate guest enforcement. The original pod may remain Ready when an
+ephemeral debug container is denied. A cloned hostile pod must not be Ready.
+
+The hostile-init-data case requires an observed `attestation_unknown` rejection
+from the runtime's KMS exchange. Never becoming Ready is inconclusive and fails;
+a Ready pod fails even if its logs also contain an older rejection. The live
+annotation edit/restoration is reported as an observation, not evidence that
+renewal was refused. The core suite covers the MRCONFIGID refusal separately.
+
+`python3 scripts/test-malicious-host-live.py` exercises the real Bash runner with
+a fake kubectl, including transport errors, absent shell/tar, readable logs,
+attach timeout, admission failure, unavailable status, missing KMS rejection
+and a Ready pod with a rejection in its logs. No cluster is used. CI runs these
+regressions alongside the policy layer. A configured unreachable cluster fails;
+an invocation without `KUBECONFIG` retains the explicitly reported local skip.
