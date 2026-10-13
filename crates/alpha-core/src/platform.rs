@@ -11,6 +11,14 @@ pub struct KmsRevision {
     pub source_url: String,
 }
 
+/// The Kata agent policy every init-data Revision must carry, as
+/// [`InitData::check_policy`](crate::InitData::check_policy) reads it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KataPolicy {
+    pub rules_sha256: ComposeHash,
+    pub data_sha256: ComposeHash,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "SignerFields")]
 pub struct Signer {
