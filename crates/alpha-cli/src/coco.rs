@@ -169,15 +169,33 @@ fn extract_shape(rendered: &str) -> Result<(String, u32), String> {
         return Err("use nvidia.com/pgpu (whole GPU passthrough), not nvidia.com/gpu".into());
     }
 
-    let gpus: u32 = rendered
-        .lines()
-        .filter_map(|l| {
-            l.trim_start()
+    // Count only GPUs from `limits:` blocks; `requests:` may repeat the same count and must
+    // not be double-counted.
+    let mut gpus: u32 = 0;
+    let mut in_limits = false;
+    let mut limits_indent: usize = 0;
+    for line in rendered.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let indent = line.len().saturating_sub(trimmed.len());
+        // Leave the limits context when we return to the same or a shallower indentation level.
+        if in_limits && indent <= limits_indent {
+            in_limits = false;
+        }
+        if trimmed.starts_with("limits:") {
+            in_limits = true;
+            limits_indent = indent;
+        } else if in_limits
+            && let Some(n) = trimmed
                 .strip_prefix("nvidia.com/pgpu:")
                 .and_then(|v| v.split_whitespace().next())
                 .and_then(|n| n.parse::<u32>().ok())
-        })
-        .fold(0u32, |a, n| a.saturating_add(n));
+        {
+            gpus = gpus.saturating_add(n);
+        }
+    }
 
     if gpus > 0 && !GPU_COUNTS.contains(&gpus) {
         return Err(format!(
@@ -300,6 +318,7 @@ fn check_dsm_value(value: &str) -> Result<(), String> {
     }
 }
 
+
 /// Builds the `alpha.json` init-data entry in JCS (JSON Canonicalization Scheme) form.
 pub(crate) fn alpha_json(
     app_id: AppId,
@@ -323,11 +342,12 @@ pub fn build_initdata(policy: &str, alpha: &str) -> Result<Vec<u8>, String> {
     if policy.trim().is_empty() {
         return Err("the agent policy is empty".into());
     }
-    // TOML multi-line literal strings cannot contain ''' or end with a lone '.
-    if policy.contains("'''") || policy.ends_with('\'') {
+    // TOML multi-line literal strings cannot contain '''.  One or two trailing single quotes
+    // before the closing ''' terminator are valid per TOML 1.0, so do not reject them.
+    if policy.contains("'''") {
         return Err(
             "the agent policy cannot be embedded as a TOML literal string: \
-             it contains ''' or ends with '"
+             it contains '''"
                 .into(),
         );
     }
@@ -531,7 +551,8 @@ spec:
 
         assert!(build_initdata("", &alpha).is_err());
         assert!(build_initdata("x'''y", &alpha).is_err());
-        assert!(build_initdata("x'", &alpha).is_err());
+        // A single trailing quote is valid TOML (one or two quotes before ''' terminator are ok).
+        assert!(build_initdata("x'", &alpha).is_ok());
     }
 
     #[test]
@@ -648,6 +669,7 @@ spec:
         let error = render(&spec("alpha-runtime", &unbound), &pinned, &env).unwrap_err();
         assert!(error.contains("binding"), "{error}");
     }
+
 
     fn vector(name: &str) -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

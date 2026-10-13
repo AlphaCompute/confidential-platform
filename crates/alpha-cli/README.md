@@ -45,3 +45,21 @@ What `unseal` and `bootstrap` check, in this order, before anything is sealed to
 `cargo test -p alpha-kms --test request` sends `alpha request` to copies serving real KMS-issued Instance leaves: the bearer and body arrive once at a leaf of the named App, never at a leaf of another App or from another CA, `--all` serves every listed copy in order while reporting the foreign one as an error, and an unlisted `--instance` is refused before any connection.
 
 What needs a live CVM and is not tested here: `GET /v1/node/evidence` itself (the quote comes from the guest agent's socket, so the in-process tests take the node's X-Wing key from the `Node` and cover the evidence path with the pure function), a real `unseal`/`bootstrap` run against a Phala node with collateral from the PCCS, and the shroud-go half of `deploy`, which only a live deploy exercises.
+
+## Kata pod deployment prerequisites
+
+Rendering a manifest does not configure the node's guest services. Before
+applying a CoCo pod whose runtime uses `coco-aa`, configure the chosen Kata
+runtime's guest `kernel_params` with `agent.guest_components_rest_api=all`,
+appending it to the existing parameters in a node configuration drop-in.
+Kata defaults to `resource`, so a listening REST server alone is insufficient.
+Recreate a test guest after changing the node setting. Do not put a
+`kernel_params` override in the generated pod: admission may prohibit it,
+and it would give the pod author control of other guest startup settings.
+
+`alpha-tsm` checks pod-local `GET /info` before collecting evidence. It requires
+REST attestation features and TDX, plus the NVIDIA attester for GPU pods.
+CPU-only `coco-tsm` avoids the REST CPU path, but GPU evidence always uses REST.
+See `docs/kata-attestation.md` for the startup setting, configfs permissions,
+version qualification and the limits of the B300 collection check. Successful
+rendering is not proof of live policy enforcement or KMS attestation.
