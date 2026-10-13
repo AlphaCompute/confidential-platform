@@ -188,10 +188,11 @@ impl Upstream {
     /// `now` and `report_timeout` are injected so tests never wait out a real clock or a real
     /// network timeout.
     pub fn build(config: &Config, now: Clock, report_timeout: Duration) -> Result<Self, Error> {
+        // Only the models the external provider serves get a slot; ours are checked by `own`.
         let slots = config
-            .models
-            .iter()
-            .map(|model| (model.clone(), Mutex::new(None)))
+            .external_models()
+            .into_iter()
+            .map(|model| (model, Mutex::new(None)))
             .collect();
         Ok(Self {
             upstream_url: config.upstream_url.clone(),
@@ -619,6 +620,20 @@ mod tests {
         Arc<AtomicUsize>,
         Arc<parking_lot::Mutex<Option<String>>>,
     ) {
+        spawn_tls_fake_answering(cert, key, 200, "").await
+    }
+
+    /// As `spawn_tls_fake`, every request answered `status` with `body`.
+    async fn spawn_tls_fake_answering(
+        cert: CertificateDer<'static>,
+        key: PrivatePkcs8KeyDer<'static>,
+        status: u16,
+        body: &'static str,
+    ) -> (
+        String,
+        Arc<AtomicUsize>,
+        Arc<parking_lot::Mutex<Option<String>>>,
+    ) {
         let server_config =
             rustls::ServerConfig::builder_with_provider(alpha_client::tls::provider())
                 .with_protocol_versions(&[&rustls::version::TLS13])
@@ -657,11 +672,12 @@ mod tests {
                                     .get(hyper::header::AUTHORIZATION)
                                     .and_then(|v| v.to_str().ok())
                                     .map(String::from);
-                                async move {
-                                    Ok::<_, std::convert::Infallible>(hyper::Response::new(
-                                        http_body_util::Full::new(hyper::body::Bytes::new()),
-                                    ))
-                                }
+                                let mut response = hyper::Response::new(http_body_util::Full::new(
+                                    hyper::body::Bytes::from_static(body.as_bytes()),
+                                ));
+                                *response.status_mut() =
+                                    hyper::StatusCode::from_u16(status).unwrap();
+                                async move { Ok::<_, std::convert::Infallible>(response) }
                             },
                         );
                         let _ = hyper_util::server::conn::auto::Builder::new(
@@ -712,7 +728,13 @@ mod tests {
     #[tokio::test]
     async fn chat_completions_forwards_the_provider_key_never_the_callers_bearer() {
         let (cert, key, spki) = self_signed_leaf();
-        let (base, hits, last_auth) = spawn_tls_fake(cert, key).await;
+        let (base, hits, last_auth) = spawn_tls_fake_answering(
+            cert,
+            key,
+            200,
+            r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        )
+        .await;
 
         let state = test_state(
             test_config(&base, &["m1"]),
@@ -729,13 +751,83 @@ mod tests {
         let response = http
             .post(format!("{base}/v1/chat/completions"))
             .header(reqwest::header::AUTHORIZATION, "Bearer the-callers-bearer")
-            .json(&serde_json::json!({ "model": "m1" }))
+            .json(&serde_json::json!({
+                "model": "m1",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
             .send()
             .await
             .unwrap();
         assert!(response.status().is_success());
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         assert_eq!(last_auth.lock().as_deref(), Some("Bearer the-provider-key"));
+    }
+
+    /// A verified upstream answers; what the judge thinks of the answer decides whether a
+    /// single byte of it reaches the caller. An upstream error, or a body that is no completion
+    /// the front can read, releases none of the upstream's text either.
+    #[tokio::test]
+    async fn a_completion_is_released_whole_only_when_the_judge_allows_it() {
+        use crate::guard::Refusal::{Blocked, Unavailable};
+        use reqwest::StatusCode as S;
+        const COMPLETION: &str =
+            r#"{"choices":[{"message":{"role":"assistant","content":"the answer"}}]}"#;
+        for (upstream_status, upstream_body, output, status) in [
+            (200, COMPLETION, Ok(()), S::OK),
+            (200, COMPLETION, Err(Blocked), S::FORBIDDEN),
+            (200, COMPLETION, Err(Unavailable), S::SERVICE_UNAVAILABLE),
+            (
+                400,
+                r#"{"error":"the answer, unjudged"}"#,
+                Ok(()),
+                S::BAD_REQUEST,
+            ),
+            (
+                200,
+                "the answer, in no completion",
+                Ok(()),
+                S::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let (cert, key, spki) = self_signed_leaf();
+            let (base, hits, _last_auth) =
+                spawn_tls_fake_answering(cert, key, upstream_status, upstream_body).await;
+            let config = test_config(&base, &["m1"]);
+            let state = Arc::new(crate::AppState {
+                upstream: Upstream::new(&config).unwrap(),
+                config,
+                secrets: parking_lot::RwLock::new(crate::Secrets {
+                    provider_key: zeroize::Zeroizing::new("provider-key".into()),
+                    caller_bearer: zeroize::Zeroizing::new(b"member".to_vec()),
+                    model_server_bearer: zeroize::Zeroizing::new(String::new()),
+                    judge_bearer: zeroize::Zeroizing::new(b"judge".to_vec()),
+                }),
+                own: crate::own::Servers::none(),
+                guard: crate::guard::Guard::fixed(Ok(()), output),
+            });
+            *state.upstream.slots.get("m1").unwrap().lock().await = Some(Checked {
+                at: SystemTime::now(),
+                outcome: Ok(pinned_client(&spki).unwrap()),
+            });
+            let base = spawn_router(crate::router(state)).await;
+            let response = reqwest::Client::new()
+                .post(format!("{base}/v1/chat/completions"))
+                .header(reqwest::header::AUTHORIZATION, "Bearer member")
+                .json(&serde_json::json!({
+                    "model": "m1",
+                    "messages": [{"role": "user", "content": "q"}],
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            let body = response.text().await.unwrap();
+            assert_eq!(body.contains("the answer"), status.is_success(), "{body}");
+            if upstream_status != 200 {
+                assert!(body.contains("upstream_refused"), "{body}");
+            }
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+        }
     }
 
     fn live_config() -> crate::Config {
@@ -748,6 +840,13 @@ mod tests {
             "UPSTREAM_POLICY" => {
                 Some(r#"{"tcb_statuses":["UpToDate"],"tolerated_advisories":[]}"#.to_string())
             }
+            "GUARD_URL" => Some("https://guard.example".to_string()),
+            "GUARD_REVISIONS" => Some(format!("sha256:{}", "3".repeat(64))),
+            "GUARD_POLICY" => Some(
+                r#"{"model":"nvidia/nemotron-3.5-lightning","categories":["Violence"]}"#
+                    .to_string(),
+            ),
+            "JUDGE_MODELS" => Some("nvidia/nemotron-3.5-lightning".to_string()),
             _ => None,
         })
         .unwrap()

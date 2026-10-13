@@ -1,6 +1,8 @@
 //! Verifier for the evidence an Instance sends to the KMS: DCAP through `dcap-qvl`, then the
 //! checks that are ours — `report_data` binding, RTMR replay, reference values, the measured
-//! `compose_hash`. Pure over its arguments except [`fetch_collateral`].
+//! `compose_hash`, and for a Kata pod its init-data and GPUs. Pure over its arguments except
+//! [`fetch_collateral`] and the GPU backends: [`gpu::nras`] calls NRAS over HTTPS, and
+//! [`kata::appraise_any`] calls the backends it is given.
 
 #![cfg_attr(
     test,
@@ -14,6 +16,8 @@
 )]
 
 mod event_log;
+pub mod gpu;
+pub mod kata;
 
 use std::fmt;
 use std::str::FromStr;
@@ -30,12 +34,18 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 pub use event_log::{EventLogEntry, compose_hash as event_log_compose_hash};
+pub use gpu::{
+    GpuAppraisal, GpuEvidence, GpuPolicy, GpuVerdict, GpuVerifier, GpuVerifierKind, GpuVouch,
+    VerifiedGpu,
+};
+pub use kata::{AnyEvidence, CocoAppraised, CpuEvidence, CpuKind, EvidenceV2, appraise_any};
 
 pub const EVIDENCE_FORMAT: &str = "alphacompute-evidence/1";
+pub const EVIDENCE_FORMAT_V2: &str = "alphacompute-evidence/2";
 pub const KATA_EVIDENCE_FORMAT: &str = "alphacompute-evidence/kata/1";
 pub const RESULT_FORMAT: &str = "alphacompute-attestation-result/1";
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Evidence {
     pub format: String,
@@ -54,7 +64,7 @@ pub struct KataEvidence {
     pub quote: Vec<u8>,
 }
 
-mod base64url {
+pub(crate) mod base64url {
     use super::*;
 
     pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
@@ -121,10 +131,21 @@ pub struct Measured {
     pub rtmr1: Measurement,
     pub rtmr2: Measurement,
     pub rtmr3: Measurement,
+    /// Set by the `kata-tdx/1` profile only: the init-data binding. The prototype profile leaves
+    /// it out, so its results are byte-for-byte what they were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mrconfigid: Option<Measurement>,
 }
 
 /// The platform document (release-signed; the signature is checked by whoever fetched it).
+///
+/// It refuses fields it does not know, as do its policy and reference values: `alpha sign`
+/// validates a document through this type, so a misspelled field (a reference value's
+/// `runtime_class`, say) is refused at signing instead of being signed and ignored, and a KMS
+/// never reads past a rule it does not understand. Pages that only display a document read it
+/// through `alpha_channel::platform::PlatformView`, which tolerates new fields.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlatformDocument {
     pub version: u64,
     pub issued_at: String,
@@ -136,6 +157,10 @@ pub struct PlatformDocument {
     pub signer: Option<Signer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_key: Option<CatalogKey>,
+    /// What a GPU must prove before a Kata pod that expects GPUs gets a leaf. Absent, no Revision
+    /// with a `gpu` shape can attest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_policy: Option<GpuPolicy>,
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
@@ -148,19 +173,48 @@ pub struct PlatformDocument {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Policy {
     pub tcb_statuses: Vec<String>,
     pub tolerated_advisories: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReferenceValue {
     pub name: String,
+    /// Which evidence profile the measurements belong to; a document written before Kata had
+    /// none, and every value in it is a prototype guest's.
+    #[serde(default, skip_serializing_if = "ReferenceKind::is_prototype")]
+    pub kind: ReferenceKind,
+    /// For a Kata guest: the runtime class whose guest image these are. A Revision naming another
+    /// class does not match.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_class: Option<String>,
     pub values: ReferenceMeasurements,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReferenceKind {
+    /// The prototype CVM guest: `alphacompute-evidence/1`.
+    #[default]
+    PrototypeTdx,
+    /// A Kata pod VM on TDX with the NVIDIA guest image: `kata-tdx/1`.
+    KataTdx,
+    /// A Kata pod VM on SEV-SNP (PRD-02 P2; no profile appraises it yet).
+    KataSnp,
+}
+
+impl ReferenceKind {
+    pub fn is_prototype(&self) -> bool {
+        *self == Self::PrototypeTdx
+    }
 }
 
 /// rtmr3 is not a reference value: it holds the measured `compose_hash` and per-Instance ids.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReferenceMeasurements {
     pub mrtd: Measurement,
     pub rtmr0: Measurement,
@@ -239,6 +293,9 @@ pub struct AttestationResult {
     pub evidence_sha256: String,
     pub verified_at: String,
     pub policy_version: u64,
+    /// The `kata-tdx/1` profile's findings: init-data, policy, runtime class and every GPU.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coco: Option<CocoAppraised>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -268,6 +325,8 @@ pub struct Appraised {
     pub runtime_pubkey_sha256: String,
     pub evidence_sha256: String,
     pub policy_version: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coco: Option<CocoAppraised>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -321,6 +380,8 @@ pub struct VerifiedQuote {
     pub mr_owner_config: [u8; 48],
     pub mr_signer_seam: [u8; 48],
     pub measured: Measured,
+    /// TD10 MR_CONFIG_ID, whatever the profile; only `kata-tdx/1` reads it.
+    pub mrconfigid: Measurement,
     pub tcb_status: String,
     pub advisories: Vec<String>,
 }
@@ -359,6 +420,7 @@ pub fn verify_quote(
         rtmr1: Measurement(report.rt_mr1),
         rtmr2: Measurement(report.rt_mr2),
         rtmr3: Measurement(report.rt_mr3),
+        mrconfigid: None,
     };
     Ok(VerifiedQuote {
         report_data: report.report_data,
@@ -369,6 +431,7 @@ pub fn verify_quote(
         mr_owner_config: report.mr_owner_config,
         mr_signer_seam: report.mr_signer_seam,
         measured,
+        mrconfigid: Measurement(report.mr_config_id),
         tcb_status,
         advisories,
     })
@@ -423,7 +486,8 @@ pub fn appraise(
         .reference_values
         .iter()
         .find(|rv| {
-            rv.values.mrtd == measured.mrtd
+            rv.kind == ReferenceKind::PrototypeTdx
+                && rv.values.mrtd == measured.mrtd
                 && rv.values.rtmr0 == measured.rtmr0
                 && rv.values.rtmr1 == measured.rtmr1
                 && rv.values.rtmr2 == measured.rtmr2
@@ -451,6 +515,7 @@ pub fn appraise(
         runtime_pubkey_sha256: sha256_text(runtime_pubkey_spki),
         evidence_sha256: evidence_sha256(evidence)?,
         policy_version: doc.version,
+        coco: None,
     })
 }
 

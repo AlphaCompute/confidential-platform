@@ -55,7 +55,7 @@ async fn run() -> Result<(), Error> {
         alpha_client::tls::kms_ca(&identity).map_err(|e| Error::internal(format!("tls: {e}")))?;
     let tls_config = alpha_client::tls::mtls_server_config(cert.clone(), kms_ca.clone())
         .map_err(|e| Error::internal(format!("tls: {e}")))?;
-    let front = front_client(kms_ca, config.inference_revisions.clone())?;
+    let front = front_client(kms_ca, config.inference_apps.clone())?;
 
     let state = Arc::new(AppState {
         config,

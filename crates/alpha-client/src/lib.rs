@@ -16,7 +16,7 @@ pub mod platform;
 pub mod runtime;
 pub mod tls;
 
-use alpha_attest::{AttestationResult, EVIDENCE_FORMAT, EventLogEntry, Evidence, KataEvidence};
+use alpha_attest::{AnyEvidence, AttestationResult, EVIDENCE_FORMAT, EventLogEntry, Evidence, KataEvidence};
 use alpha_core::{
     AppId, ComposeHash, KeyId, OrgId, PrincipalId, SecretId, context, signing_digest,
 };
