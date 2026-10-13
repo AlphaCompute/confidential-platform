@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use alpha_attest::{EVIDENCE_FORMAT, EventLogEntry, Evidence};
+use alpha_attest::{EVIDENCE_FORMAT, EventLogEntry, Evidence, GpuVerifier};
 use alpha_channel::receipt::{self, Expected};
 use alpha_cli::node::{NodeIdentity, ShareFile};
 use alpha_client::{Client, Pin};
@@ -221,12 +221,25 @@ pub async fn start_node(
     clock: Clock,
     collateral_of: &str,
 ) -> (Arc<Node>, String, tokio::sync::oneshot::Sender<()>) {
+    start_node_with(pool, release_url, release_key, clock, collateral_of, Vec::new()).await
+}
+
+/// [`start_node`] with these GPU verifier backends.
+pub async fn start_node_with(
+    pool: PgPool,
+    release_url: &str,
+    release_key: &SigningKey,
+    clock: Clock,
+    collateral_of: &str,
+    gpu_backends: Vec<Arc<dyn GpuVerifier>>,
+) -> (Arc<Node>, String, tokio::sync::oneshot::Sender<()>) {
     let event_log: Vec<EventLogEntry> =
         serde_json::from_slice(&read(KEYED, "event_log.json")).unwrap();
     let collateral = serde_json::from_slice(&read(collateral_of, "collateral.json")).unwrap();
     let config = Config {
         kms_endpoints: vec![],
         platform_document_url: release_url.to_owned(),
+        gpu_backends,
         #[cfg(feature = "dev-root")]
         dev_root_kek: None,
     };
@@ -267,7 +280,76 @@ pub async fn harness() -> Option<Harness> {
 }
 
 pub async fn harness_with_clock(clock: Clock) -> Option<Harness> {
-    harness_on(clock, KEYED, platform_document(KEYED)).await
+    harness_with(clock, Vec::new()).await
+}
+
+/// [`harness_with_clock`] on a node with these GPU verifier backends.
+pub async fn harness_with(
+    clock: Clock,
+    gpu_backends: Vec<Arc<dyn GpuVerifier>>,
+) -> Option<Harness> {
+    let pool = fresh_database().await?;
+    let release = ReleaseServer::start(platform_document(KEYED)).await;
+    let (node, base, shutdown) = start_node_with(
+        pool.clone(),
+        &release.url,
+        &release.key,
+        clock,
+        KEYED,
+        gpu_backends,
+    )
+    .await;
+    let custodians: Vec<PrivateKey> = (0..3).map(|_| PrivateKey::generate().unwrap()).collect();
+    let dir = std::env::temp_dir().join(format!("alpha-harness-{}", Uuid::now_v7()));
+    fs::create_dir_all(&dir).unwrap();
+    let identity = node_identity(&node);
+    let bootstrap = alpha_cli::node::bootstrap(
+        &spki_client(&base, &node),
+        &identity,
+        custodian_pubs(&custodians),
+        1,
+        &dir,
+    )
+    .await
+    .unwrap();
+    let org = OrgId::mint();
+    let root_key = SigningKey::from_bytes(&[7u8; 32]);
+    let (status, reply) = send(
+        client()
+            .post(format!("{base}/v1/keys"))
+            .json(&root_key_registration(org, &root_key, node.now())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let root_id: KeyId = reply["id"].as_str().unwrap().parse().unwrap();
+    let shares = (1..=3)
+        .zip(&custodians)
+        .map(|(i, custodian)| {
+            let file = ShareFile::read(&dir.join(format!("share-{i}.json"))).unwrap();
+            alpha_crypto::open(
+                custodian,
+                INFO_UNSEAL_SHARE,
+                &identity.aad(),
+                &file.share_hpke,
+            )
+            .unwrap()
+            .to_vec()
+        })
+        .collect();
+    Some(Harness {
+        node,
+        pool,
+        url: base,
+        release,
+        org,
+        root: (root_id, root_key),
+        custodians,
+        shares,
+        ca_pem: bootstrap["kms_ca_pem"].as_str().unwrap().to_owned(),
+        bootstrap,
+        dir,
+        _shutdown: shutdown,
+    })
 }
 
 /// A node at the Kata capture's time, with its collateral, and the Kata reference values and agent

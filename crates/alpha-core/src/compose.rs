@@ -99,6 +99,8 @@ pub enum RegistrationError {
     ImageWithoutDigest(String),
     #[error("a build: key is present; every service must resolve to a pinned image")]
     BuildNotAllowed,
+    #[error(transparent)]
+    Coco(#[from] crate::coco::CocoError),
 }
 
 impl RegistrationError {
@@ -107,7 +109,14 @@ impl RegistrationError {
     }
 }
 
+/// A registered document is either a compose (the prototype platform) or a Revision v2 (a Kata
+/// confidential pod); both are stored and signed the same way and hash to the Revision the leaf
+/// names.
 pub fn check_registration(compose: &str, app_id: AppId) -> Result<ComposeHash, RegistrationError> {
+    if crate::coco::is_revision_v2(compose) {
+        crate::coco::CocoRevision::check_registered(compose, app_id)?;
+        return Ok(compose_hash(compose));
+    }
     let value: Value = serde_json::from_str(compose)?;
     let object = value.as_object().ok_or(RegistrationError::NotObject)?;
     let name = object
@@ -191,6 +200,69 @@ mod tests {
             format!("sha256:{}", hex(&digest)),
             expected["signing_digest"]
         );
+    }
+
+    #[test]
+    fn registration_takes_a_revision_v2_document() {
+        let app_id = AppId::mint();
+        let revision = crate::coco::CocoRevision {
+            format: crate::coco::REVISION_FORMAT.into(),
+            app_id,
+            initdata_sha256: compose_hash("initdata"),
+            policy_sha256: compose_hash("policy"),
+            runtime_class: "kata-qemu-nvidia-gpu-tdx".into(),
+            gpu: Some(crate::coco::GpuShape {
+                count: 1,
+                model: "B300".into(),
+            }),
+        };
+        let text = revision.canonical().unwrap();
+        assert_eq!(
+            check_registration(&text, app_id).unwrap(),
+            compose_hash(&text)
+        );
+        let error = check_registration(&text, AppId::mint()).unwrap_err();
+        assert_eq!(error.code(), "malformed");
+        assert!(error.to_string().contains("registering App"), "{error}");
+    }
+
+    #[test]
+    fn registration_takes_a_cpu_class_revision_v2_without_gpus_only() {
+        use crate::coco::{CPU_RUNTIME_CLASS, CocoRevision, GPU_RUNTIME_CLASS, GpuShape};
+        let app_id = AppId::mint();
+        let revision = |class: &str, gpu: Option<u32>| {
+            CocoRevision {
+                format: crate::coco::REVISION_FORMAT.into(),
+                app_id,
+                initdata_sha256: compose_hash("initdata"),
+                policy_sha256: compose_hash("policy"),
+                runtime_class: class.into(),
+                gpu: gpu.map(|count| GpuShape {
+                    count,
+                    model: "B300".into(),
+                }),
+            }
+            .canonical()
+            .unwrap()
+        };
+
+        // A CPU-only confidential pod (KMS, broker, signer, guard, front, supervisor).
+        let cpu = revision(CPU_RUNTIME_CLASS, None);
+        assert_eq!(
+            check_registration(&cpu, app_id).unwrap(),
+            compose_hash(&cpu)
+        );
+
+        for (text, why) in [
+            (revision(CPU_RUNTIME_CLASS, Some(1)), "runs no GPU"),
+            (revision(CPU_RUNTIME_CLASS, Some(0)), "runs no GPU"),
+            (revision(GPU_RUNTIME_CLASS, None), "needs a gpu section"),
+            (revision(GPU_RUNTIME_CLASS, Some(0)), "gpu.count 0"),
+        ] {
+            let error = check_registration(&text, app_id).unwrap_err();
+            assert_eq!(error.code(), "malformed");
+            assert!(error.to_string().contains(why), "{why}: {error}");
+        }
     }
 
     #[test]

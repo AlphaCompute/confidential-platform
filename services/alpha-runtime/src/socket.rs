@@ -1,4 +1,4 @@
-//! The four routes on the unix socket: HTTP/1.1, JSON, no authentication — access is the
+//! The routes on the unix socket: HTTP/1.1, JSON, no authentication — access is the
 //! right to the socket. KMS errors pass through in their own envelope with their status.
 
 use std::sync::Arc;
@@ -6,7 +6,7 @@ use std::sync::Arc;
 use alpha_client::DerivedKey;
 use alpha_core::RequestId;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -21,6 +21,8 @@ pub fn router(runtime: Arc<Runtime>) -> Router {
         .route("/v1/identity", get(identity))
         .route("/v1/secrets/{name}", get(secret))
         .route("/v1/keys/{purpose}", get(key))
+        .route("/v1/evidence-bundle", get(evidence_bundle))
+        .route("/v1/evidence", get(evidence))
         .route("/healthz", get(healthz))
         .fallback(|| async { envelope(StatusCode::NOT_FOUND, "not_found", "no such route") })
         .with_state(runtime)
@@ -63,7 +65,7 @@ impl IntoResponse for Error {
 
 pub fn identity_json(runtime: &Runtime) -> Result<Value, Error> {
     let attested = runtime.attested().ok_or(Error::NotAttested)?;
-    Ok(json!({
+    let mut identity = json!({
         "app_id": attested.identity.app_id,
         "org_id": attested.identity.org_id,
         "compose_hash": attested.identity.compose_hash,
@@ -71,7 +73,8 @@ pub fn identity_json(runtime: &Runtime) -> Result<Value, Error> {
         "tls_private_key": BASE64_URL_SAFE_NO_PAD.encode(runtime.tls_private_key()),
         "attestation_result": attested.result,
         "app_compose": runtime.app_compose,
-    }))
+    });
+    Ok(identity)
 }
 
 async fn identity(State(runtime): State<Arc<Runtime>>) -> Result<Json<Value>, Error> {
@@ -90,6 +93,75 @@ async fn key(
     Path(purpose): Path<String>,
 ) -> Result<Json<DerivedKey>, Error> {
     runtime.key(&purpose).await.map(Json)
+}
+
+/// The current leaf's evidence bundle (PRD-06 clear claims): the request, the leaf and the KMS's
+/// receipt naming the verifiers that attested this workload. 404 from a KMS that sends no receipt.
+async fn evidence_bundle(State(runtime): State<Arc<Runtime>>) -> Result<Response, Error> {
+    let attested = runtime.attested().ok_or(Error::NotAttested)?;
+    Ok(match &attested.bundle {
+        Some(bundle) => Json(bundle).into_response(),
+        None => envelope(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "the KMS sent no attestation receipt",
+        ),
+    })
+}
+
+/// PRD-06 I2: `GET /v1/evidence?nonce=<32 bytes base64url>[&format=alphacompute|fortanix-ccm]`.
+/// 404 unless `ALPHACOMPUTE_EVIDENCE_EXPORT` turned it on; `fortanix-ccm` answers 501 until F8.
+async fn evidence(State(runtime): State<Arc<Runtime>>, uri: Uri) -> Result<Response, Error> {
+    let mut nonce = None;
+    let mut format = "alphacompute";
+    for pair in uri.query().unwrap_or_default().split('&') {
+        match pair.split_once('=') {
+            Some(("nonce", value)) if nonce.is_none() => nonce = Some(value),
+            Some(("format", value)) => format = value,
+            _ => {
+                return Ok(envelope(
+                    StatusCode::BAD_REQUEST,
+                    "malformed",
+                    "query: nonce=<base64url>, optionally format=alphacompute|fortanix-ccm",
+                ));
+            }
+        }
+    }
+    let Some(nonce) = nonce
+        .and_then(|n| BASE64_URL_SAFE_NO_PAD.decode(n).ok())
+        .and_then(|n| <[u8; 32]>::try_from(n).ok())
+    else {
+        return Ok(envelope(
+            StatusCode::BAD_REQUEST,
+            "malformed",
+            "nonce: expected 32 bytes base64url",
+        ));
+    };
+    if !matches!(format, "alphacompute" | "fortanix-ccm") {
+        return Ok(envelope(
+            StatusCode::BAD_REQUEST,
+            "malformed",
+            "format: alphacompute or fortanix-ccm",
+        ));
+    }
+    let Some(export) = runtime.export_evidence(&nonce).await? else {
+        return Ok(envelope(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "evidence export is off: the measured configuration does not set ALPHACOMPUTE_EVIDENCE_EXPORT",
+        ));
+    };
+    if format == "fortanix-ccm" {
+        return Ok(match alpha_attest::export::ccm_input(&export) {
+            Ok(input) => Json(input).into_response(),
+            Err(e) => envelope(
+                StatusCode::NOT_IMPLEMENTED,
+                "not_implemented",
+                e.to_string(),
+            ),
+        });
+    }
+    Ok(Json(export).into_response())
 }
 
 pub fn healthz_json(runtime: &Runtime) -> Value {

@@ -90,7 +90,26 @@ fn config(h: &Harness, endpoints: Vec<String>) -> Config {
         kms_endpoints: endpoints,
         secrets: Secrets::new(),
         tls_upstream: None,
+        evidence_export: false,
     }
+}
+
+/// [`capture_evidence`] for the attestation, and for any other `report_data` (an export's) a
+/// stand-in v1 evidence whose quote is that `report_data`, recorded in `seen`.
+fn exporting_evidence(seen: Arc<Mutex<Vec<[u8; 64]>>>) -> EvidenceSource {
+    let capture = capture_evidence();
+    Arc::new(move |report_data| {
+        if let Ok(evidence) = capture(report_data) {
+            return Ok(evidence);
+        }
+        seen.lock().unwrap().push(*report_data);
+        Ok(alpha_attest::Evidence {
+            format: alpha_attest::EVIDENCE_FORMAT.into(),
+            quote: report_data.to_vec(),
+            event_log: vec![],
+        }
+        .into())
+    })
 }
 
 fn config_with_secrets(h: &Harness, endpoints: Vec<String>, secrets: &str) -> Config {
@@ -398,6 +417,27 @@ async fn runtime_attests_with_the_captures_key_and_serves_the_three_routes() {
     assert_eq!(
         health,
         json!({ "attested": true, "cert_not_after": rfc3339(h.now() + certs::LEAF_TTL) })
+    );
+
+    // The evidence bundle (PRD-06 clear claims) verifies against the KMS CA alone and names
+    // alpha-kms's DCAP appraisal of the prototype CVM as the only verifier.
+    let (status, bundle) = socket.get("/v1/evidence-bundle").await;
+    assert_eq!(status, 200, "{bundle}");
+    let verified = alpha_client::attestation::verify_bundle(
+        &serde_json::to_vec(&bundle).unwrap(),
+        &h.ca_pem,
+        &[h.node.compose_hash],
+    )
+    .unwrap();
+    assert_eq!(verified.result.revision.compose_hash, hash);
+    assert_eq!(json!(verified.verifiers.attested_by), json!(["alpha"]));
+    assert_eq!(
+        json!(verified.verifiers.cpu),
+        json!([{ "verifier": "alpha-kms-dcap", "profile": "alphacompute-evidence/1" }])
+    );
+    assert_eq!(
+        identity["attestation_result"]["verifiers"],
+        json!(verified.verifiers)
     );
 
     // Secrets over mTLS with the leaf, cached with it: a later put is not seen until renewal.
@@ -1522,4 +1562,72 @@ async fn a_revoked_revision_gets_no_new_secret_files() {
     assert_eq!(std::fs::read_dir(fresh.join("web")).unwrap().count(), 0);
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&fresh);
+}
+
+/// PRD-06 I2: the export route is off unless the measured configuration turns it on, and its
+/// quote is over the caller's nonce as `alpha_attest::export` derives it, never a nonce alpha-kms
+/// could have minted.
+#[tokio::test]
+async fn evidence_export_is_off_by_default_and_binds_the_callers_nonce_when_on() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    let (_, _, _) = app_with_secret(&h, b"v1").await;
+    let caller = [0x5au8; 32];
+    let route = format!("/v1/evidence?nonce={}", b64(&caller));
+
+    let (runtime, _) = start_runtime(&h, config(&h, vec![h.url.clone()]));
+    runtime.attest().await.unwrap();
+    let socket = Socket::start(runtime);
+    let (status, reply) = socket.get(&route).await;
+    assert_eq!((status, code(&reply)), (404, "not_found"), "{reply}");
+    socket.stop().await;
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let key = P256Key::from_pkcs8_der(&read(KEYED, "runtime.key.pkcs8.der")).unwrap();
+    let runtime = Runtime::new(
+        Config {
+            evidence_export: true,
+            ..config(&h, vec![h.url.clone()])
+        },
+        &key,
+        Arc::new({
+            let now = h.now();
+            move || now
+        }),
+        exporting_evidence(seen.clone()),
+        pinned_time(h.now()),
+        text(KEYED, "app-compose.json"),
+    )
+    .unwrap();
+    runtime.attest().await.unwrap();
+    let socket = Socket::start(runtime);
+    let (status, export) = socket.get(&route).await;
+    assert_eq!(status, 200, "{export}");
+    let spki = read(KEYED, "runtime_spki.der");
+    let export: alpha_attest::export::EvidenceExport = serde_json::from_value(export).unwrap();
+    assert_eq!(export.format, "alphacompute-evidence-export/1");
+    assert_eq!(export.certificate_chain.len(), 2);
+    let (nonce, key_spki) = export.binding(&caller).unwrap();
+    assert_eq!(key_spki, spki);
+    let expected = alpha_attest::report_data(&spki, &nonce, None);
+    assert_eq!(*seen.lock().unwrap(), vec![expected]);
+    assert_eq!(export.evidence.quote(), expected.as_slice());
+    // Not the report_data a KMS attestation over the same 32 bytes would bind.
+    assert_ne!(expected, alpha_attest::report_data(&spki, &caller, None));
+    assert!(export.binding(&[0u8; 32]).is_err());
+
+    let (status, reply) = socket.get(&format!("{route}&format=fortanix-ccm")).await;
+    assert_eq!((status, code(&reply)), (501, "not_implemented"), "{reply}");
+    assert!(reply["error"]["message"].as_str().unwrap().contains("F8"));
+    for bad in [
+        "/v1/evidence".to_owned(),
+        "/v1/evidence?nonce=abcd".to_owned(),
+        format!("{route}&format=sev"),
+        format!("{route}&other=1"),
+    ] {
+        let (status, reply) = socket.get(&bad).await;
+        assert_eq!((status, code(&reply)), (400, "malformed"), "{bad}: {reply}");
+    }
+    socket.stop().await;
 }

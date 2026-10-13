@@ -25,9 +25,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use alpha_attest::{
-    AttestationResult, EVIDENCE_FORMAT, Evidence, KATA_EVIDENCE_FORMAT, KataEvidence,
-};
+use alpha_attest::export::{EXPORT_FORMAT, EvidenceExport, export_report_data};
+use alpha_attest::{AttestationResult, EVIDENCE_FORMAT, Evidence, KATA_EVIDENCE_FORMAT, KataEvidence};
+use alpha_client::attestation::{BUNDLE_FORMAT, EvidenceBundle};
 use alpha_client::tls::{self, InstanceSans};
 use alpha_client::{
     AttestReply, AttestRequest, Client, DerivedKey, Identity, InstanceEvidence, Pin, Secret,
@@ -40,6 +40,7 @@ use p256::ecdsa::SigningKey;
 use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
 use parking_lot::{Mutex, RwLock};
 use rustls::sign::CertifiedKey;
+use serde_json::Value;
 use tokio::net::UnixListener;
 use tokio::sync::watch;
 use zeroize::Zeroizing;
@@ -166,8 +167,25 @@ pub fn parse_upstream(text: Option<&str>) -> Result<Option<String>, Error> {
     Ok(Some(text.to_owned()))
 }
 
+/// `ALPHACOMPUTE_EVIDENCE_EXPORT`: the one value that turns on `GET /v1/evidence` (PRD-06 I2).
+pub const EVIDENCE_EXPORT_ENV: &str = "ALPHACOMPUTE_EVIDENCE_EXPORT";
+
+/// Unset, the export route answers 404; set, it must name the export format, so a typo stops the
+/// runtime at start instead of leaving the route silently off or on.
+pub fn parse_evidence_export(text: Option<&str>) -> Result<bool, Error> {
+    match text {
+        None => Ok(false),
+        Some(alpha_attest::export::EXPORT_FORMAT) => Ok(true),
+        Some(other) => Err(Error::Config(format!(
+            "{EVIDENCE_EXPORT_ENV}={other:?} is not {:?}",
+            alpha_attest::export::EXPORT_FORMAT
+        ))),
+    }
+}
+
 /// The three environment variables and, when a service declared a Secret,
-/// `ALPHACOMPUTE_SECRETS`; for a wrapped compose, `ALPHACOMPUTE_TLS_UPSTREAM`.
+/// `ALPHACOMPUTE_SECRETS`; for a wrapped compose, `ALPHACOMPUTE_TLS_UPSTREAM`; for a pod that
+/// lets a second verifier appraise it, `ALPHACOMPUTE_EVIDENCE_EXPORT`.
 #[derive(Clone, Debug)]
 pub struct Config {
     pub kms_ca_spki_sha256: [u8; 32],
@@ -175,6 +193,8 @@ pub struct Config {
     pub kms_endpoints: Vec<String>,
     pub secrets: Secrets,
     pub tls_upstream: Option<String>,
+    /// Whether `GET /v1/evidence` serves; off unless the measured configuration turns it on.
+    pub evidence_export: bool,
 }
 
 impl Config {
@@ -182,13 +202,18 @@ impl Config {
         let var = |name: &str| {
             std::env::var(name).map_err(|_| Error::Config(format!("{name} is not set")))
         };
-        Self::parse(
-            &var("ALPHACOMPUTE_KMS_CA_SPKI_SHA256")?,
-            &var("ALPHACOMPUTE_KMS_REVISIONS")?,
-            &var("ALPHACOMPUTE_KMS_ENDPOINTS")?,
-            std::env::var("ALPHACOMPUTE_SECRETS").ok().as_deref(),
-            std::env::var("ALPHACOMPUTE_TLS_UPSTREAM").ok().as_deref(),
-        )
+        Ok(Self {
+            evidence_export: parse_evidence_export(
+                std::env::var(EVIDENCE_EXPORT_ENV).ok().as_deref(),
+            )?,
+            ..Self::parse(
+                &var("ALPHACOMPUTE_KMS_CA_SPKI_SHA256")?,
+                &var("ALPHACOMPUTE_KMS_REVISIONS")?,
+                &var("ALPHACOMPUTE_KMS_ENDPOINTS")?,
+                std::env::var("ALPHACOMPUTE_SECRETS").ok().as_deref(),
+                std::env::var("ALPHACOMPUTE_TLS_UPSTREAM").ok().as_deref(),
+            )?
+        })
     }
 
     pub fn parse(
@@ -231,6 +256,7 @@ impl Config {
             kms_endpoints,
             secrets,
             tls_upstream,
+            evidence_export: false,
         })
     }
 
@@ -354,6 +380,8 @@ pub struct Attested {
     pub chain_pem: Vec<String>,
     pub not_after: SystemTime,
     pub result: AttestationResult,
+    /// The evidence bundle (PRD-06 clear claims), when the KMS sent its receipt.
+    pub bundle: Option<EvidenceBundle>,
     /// The leaf and the runtime key as the TLS listener serves them.
     pub certified: Arc<CertifiedKey>,
     client: Client,
@@ -374,6 +402,8 @@ pub struct Runtime {
     kms: Client,
     attested: RwLock<Option<Arc<Attested>>>,
     revoked: watch::Sender<bool>,
+    /// One export at a time: each asks the guest for a quote and every GPU's report.
+    exporting: tokio::sync::Mutex<()>,
 }
 
 impl Runtime {
@@ -409,6 +439,7 @@ impl Runtime {
             kms,
             attested: RwLock::new(None),
             revoked: watch::Sender::new(false),
+            exporting: tokio::sync::Mutex::new(()),
         }))
     }
 
@@ -463,20 +494,44 @@ impl Runtime {
             .map_err(|_| alpha_client::Error::Invalid("nonce is not 32 bytes".into()))?;
         let report_data = alpha_attest::report_data(&self.spki, &nonce, None);
         let evidence = (self.evidence)(&report_data).map_err(Error::Evidence)?;
-        let reply = self
-            .kms
-            .attest(&AttestRequest {
-                runtime_pubkey: BASE64_URL_SAFE_NO_PAD.encode(&self.spki),
-                nonce: BASE64_URL_SAFE_NO_PAD.encode(nonce),
-                evidence,
-            })
-            .await?;
-        self.accept(reply)
+        let request = AttestRequest {
+            runtime_pubkey: BASE64_URL_SAFE_NO_PAD.encode(&self.spki),
+            nonce: BASE64_URL_SAFE_NO_PAD.encode(nonce),
+            evidence,
+        };
+        let reply = self.kms.attest(&request).await?;
+        let request = serde_json::to_value(&request)
+            .map_err(|e| Error::Evidence(format!("attest request: {e}")))?;
+        self.accept(reply, request)
+    }
+
+    /// PRD-06 I2: the evidence this runtime would send alpha-kms, over a second verifier's
+    /// nonce (`alpha_attest::export`). `None` when the measured configuration leaves it off.
+    pub async fn export_evidence(
+        &self,
+        caller_nonce: &[u8; 32],
+    ) -> Result<Option<EvidenceExport>, Error> {
+        if !self.config.evidence_export {
+            return Ok(None);
+        }
+        let _one = self.exporting.lock().await;
+        let report_data = export_report_data(&self.spki, caller_nonce);
+        let evidence = (self.evidence)(&report_data).map_err(Error::Evidence)?;
+        Ok(Some(EvidenceExport {
+            format: EXPORT_FORMAT.into(),
+            nonce: BASE64_URL_SAFE_NO_PAD.encode(caller_nonce),
+            runtime_pubkey: BASE64_URL_SAFE_NO_PAD.encode(&self.spki),
+            evidence,
+            certificate_chain: self
+                .attested()
+                .map(|a| a.chain_pem.clone())
+                .unwrap_or_default(),
+        }))
     }
 
     /// The reply's chain is ours only if the leaf carries our key and the root the pinned one;
     /// the ids come from the leaf's SANs, never from the reply's text.
-    fn accept(&self, reply: AttestReply) -> Result<Arc<Attested>, Error> {
+    fn accept(&self, reply: AttestReply, request: Value) -> Result<Arc<Attested>, Error> {
         let chain: Vec<Vec<u8>> = reply
             .certificate_chain
             .iter()
@@ -504,7 +559,8 @@ impl Runtime {
             .is_some_and(|compose| alpha_core::compose_hash(compose) != identity.compose_hash)
         {
             return Err(Error::Certificate(
-                "the guest agent's app_compose is not the leaf's Revision".into(),
+                "this guest's app_compose (compose or Revision v2) is not the leaf's Revision"
+                    .into(),
             ));
         }
         let certified =
@@ -521,11 +577,20 @@ impl Runtime {
             }),
             self.time.clone(),
         )?;
+        // Kept as received: whoever reads it checks it against the KMS CA (see
+        // `alpha_client::attestation::verify_bundle`), so the runtime need not trust it.
+        let bundle = reply.attestation_receipt.map(|receipt| EvidenceBundle {
+            format: BUNDLE_FORMAT.into(),
+            request,
+            receipt,
+            certificate_chain: reply.certificate_chain.clone(),
+        });
         Ok(Arc::new(Attested {
             identity,
             chain_pem: reply.certificate_chain,
             not_after,
             result: reply.attestation_result,
+            bundle,
             certified,
             client,
             secrets: Mutex::new(HashMap::new()),
@@ -763,6 +828,18 @@ mod tests {
         assert!(refused("", HASH, "x").contains("CA_SPKI"));
         assert!(c.secrets.is_empty());
         assert!(c.tls_upstream.is_none());
+    }
+
+    #[test]
+    fn evidence_export_is_on_only_for_its_exact_format() {
+        assert!(!parse_evidence_export(None).unwrap());
+        assert!(parse_evidence_export(Some("alphacompute-evidence-export/1")).unwrap());
+        for bad in ["", "1", "true", "on", "alphacompute-evidence-export/2"] {
+            let Err(Error::Config(m)) = parse_evidence_export(Some(bad)) else {
+                panic!("{bad:?} was accepted");
+            };
+            assert!(m.starts_with("ALPHACOMPUTE_EVIDENCE_EXPORT="), "{m}");
+        }
     }
 
     #[test]
