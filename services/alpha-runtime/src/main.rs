@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use alpha_runtime::{
-    Config, EXIT_REFUSED, Error, Exit, Runtime, SECRETS_DIR, SOCKET_PATH, TLS_PORT, proxy,
+    Config, EXIT_REFUSED, Error, Exit, Runtime, SECRETS_DIR, SOCKET_PATH, Substrate, TLS_PORT,
+    proxy,
 };
 use p256::ecdsa::SigningKey;
 use tokio::net::UnixListener;
@@ -48,19 +49,27 @@ async fn run() -> Result<Exit, Error> {
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).map_err(|e| Error::Key(format!("rng: {e}")))?;
     let key = SigningKey::from_bytes(&seed.into()).map_err(|e| Error::Key(e.to_string()))?;
-    let app_compose =
-        alpha_tsm::app_compose().map_err(|e| Error::Evidence(format!("app_compose: {e}")))?;
+    let substrate = Substrate::detect(Path::new(alpha_tsm::DSTACK_SOCKET));
+    let app_compose = match substrate {
+        Substrate::Dstack => Some(
+            alpha_tsm::app_compose().map_err(|e| Error::Evidence(format!("app_compose: {e}")))?,
+        ),
+        // ponytail: in a Kata pod the KMS pins above come from the pod spec, which the host
+        // writes; they are as trustworthy as the measured compose's only once the init-data's
+        // agent policy pins this container's environment, and nothing generates that policy yet.
+        Substrate::Kata => None,
+    };
     let runtime = Runtime::new(
         config,
         &key,
         Arc::new(SystemTime::now),
-        alpha_runtime::tsm_evidence(),
+        alpha_runtime::tsm_evidence(substrate),
         alpha_client::system_time_provider(),
         app_compose,
     )?;
     let attested = runtime.attest().await?;
     eprintln!(
-        "alpha-runtime: attested as app {} revision {} until {}",
+        "alpha-runtime: attested on {substrate:?} as app {} revision {} until {}",
         attested.identity.app_id,
         attested.identity.compose_hash,
         alpha_runtime::socket::rfc3339(attested.not_after)

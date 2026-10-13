@@ -1,7 +1,8 @@
 //! The in-CVM sidecar: one P-256 key for the life of the Instance, attested to the KMS into a
 //! one-hour leaf renewed ten minutes before it expires, handed to the tenant's containers over
 //! a unix socket with four routes. Trust comes from the measured compose (the KMS CA's SPKI
-//! hash and the allowed KMS Revisions); the KMS endpoints are only where to look.
+//! hash and the allowed KMS Revisions); the KMS endpoints are only where to look. In a Kata pod
+//! the same variables come from the pod spec, and the evidence is the quote alone.
 
 #![cfg_attr(
     test,
@@ -24,10 +25,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use alpha_attest::{AttestationResult, EVIDENCE_FORMAT, Evidence};
+use alpha_attest::{
+    AttestationResult, EVIDENCE_FORMAT, Evidence, KATA_EVIDENCE_FORMAT, KataEvidence,
+};
 use alpha_client::tls::{self, InstanceSans};
 use alpha_client::{
-    AttestReply, AttestRequest, Client, DerivedKey, Identity, Pin, Secret, TimeProvider,
+    AttestReply, AttestRequest, Client, DerivedKey, Identity, InstanceEvidence, Pin, Secret,
+    TimeProvider,
 };
 use alpha_core::ComposeHash;
 use base64::Engine;
@@ -290,15 +294,48 @@ pub enum Delivery {
 
 pub type Clock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 
-/// A quote over `report_data` and the event log behind it; the guest agent in `main`, a capture in tests.
-pub type EvidenceSource = Arc<dyn Fn(&[u8; 64]) -> Result<Evidence, String> + Send + Sync>;
+/// A quote over `report_data`, with the event log behind it on dstack; the TD in `main`, a
+/// capture in tests.
+pub type EvidenceSource = Arc<dyn Fn(&[u8; 64]) -> Result<InstanceEvidence, String> + Send + Sync>;
 
-pub fn tsm_evidence() -> EvidenceSource {
-    Arc::new(|report_data| {
-        Ok(Evidence {
-            format: EVIDENCE_FORMAT.into(),
-            quote: alpha_tsm::quote(report_data).map_err(|e| e.to_string())?,
-            event_log: alpha_tsm::event_log().map_err(|e| e.to_string())?,
+/// What the runtime runs on, and so what it proves itself with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Substrate {
+    /// A dstack CVM: the guest agent quotes and serves the measured compose.
+    Dstack,
+    /// A Kata TDX pod: configfs-tsm quotes, and the KMS reads the Revision from `MRCONFIGID`.
+    Kata,
+}
+
+impl Substrate {
+    /// Dstack exactly when its guest agent's socket exists; anywhere else the quote has to come
+    /// from configfs-tsm, which `alpha_tsm::quote` then uses.
+    pub fn detect(dstack_socket: &Path) -> Self {
+        if dstack_socket.exists() {
+            Substrate::Dstack
+        } else {
+            Substrate::Kata
+        }
+    }
+}
+
+pub fn kata_evidence(quote: Vec<u8>) -> InstanceEvidence {
+    InstanceEvidence::Kata(KataEvidence {
+        format: KATA_EVIDENCE_FORMAT.into(),
+        quote,
+    })
+}
+
+pub fn tsm_evidence(substrate: Substrate) -> EvidenceSource {
+    Arc::new(move |report_data| {
+        let quote = alpha_tsm::quote(report_data).map_err(|e| e.to_string())?;
+        Ok(match substrate {
+            Substrate::Dstack => InstanceEvidence::Dstack(Evidence {
+                format: EVIDENCE_FORMAT.into(),
+                quote,
+                event_log: alpha_tsm::event_log().map_err(|e| e.to_string())?,
+            }),
+            Substrate::Kata => kata_evidence(quote),
         })
     })
 }
@@ -332,7 +369,8 @@ pub struct Runtime {
     time: TimeProvider,
     evidence: EvidenceSource,
     /// The guest agent's; served to the tenant's services only once a leaf names its hash.
-    app_compose: String,
+    /// None in a Kata pod, where the KMS names the Revision from the verified `MRCONFIGID`.
+    app_compose: Option<String>,
     kms: Client,
     attested: RwLock<Option<Arc<Attested>>>,
     revoked: watch::Sender<bool>,
@@ -345,7 +383,7 @@ impl Runtime {
         clock: Clock,
         evidence: EvidenceSource,
         time: TimeProvider,
-        app_compose: String,
+        app_compose: Option<String>,
     ) -> Result<Arc<Self>, Error> {
         let key_error = |e: p256::pkcs8::Error| Error::Key(e.to_string());
         let spki = key
@@ -460,7 +498,11 @@ impl Runtime {
         let identity = tls::uri_sans(leaf)
             .and_then(|sans| tls::parse_instance_sans(&sans))
             .map_err(alpha_client::Error::from)?;
-        if alpha_core::compose_hash(&self.app_compose) != identity.compose_hash {
+        if self
+            .app_compose
+            .as_ref()
+            .is_some_and(|compose| alpha_core::compose_hash(compose) != identity.compose_hash)
+        {
             return Err(Error::Certificate(
                 "the guest agent's app_compose is not the leaf's Revision".into(),
             ));
@@ -869,6 +911,61 @@ mod tests {
             renewal_delay(not_after, t0 + Duration::from_secs(7200)),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn dstack_is_chosen_by_its_guest_agent_socket_alone() {
+        let dir = temp_dir();
+        let socket = dir.join("dstack.sock");
+        assert_eq!(Substrate::detect(&socket), Substrate::Kata);
+        std::fs::write(&socket, b"").unwrap();
+        assert_eq!(Substrate::detect(&socket), Substrate::Dstack);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn kata_testdata(name: &str) -> Vec<u8> {
+        std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../testdata/attest/b300-kata-4.0.0")
+                .join(name),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn kata_evidence_is_the_quote_alone_and_the_kms_appraises_it() {
+        let quote = kata_testdata("k2-app.quote.bin");
+        let body = serde_json::to_value(kata_evidence(quote.clone())).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "format": "alphacompute-evidence/kata/1",
+                "quote": BASE64_URL_SAFE_NO_PAD.encode(&quote),
+            })
+        );
+
+        let evidence: KataEvidence = serde_json::from_value(body).unwrap();
+        let doc: alpha_attest::PlatformDocument =
+            serde_json::from_slice(&kata_testdata("platform-document.json")).unwrap();
+        let collateral: alpha_attest::Collateral =
+            serde_json::from_slice(&kata_testdata("collateral.json")).unwrap();
+        let captured_at = String::from_utf8(kata_testdata("captured_at.txt")).unwrap();
+        let now: SystemTime = chrono::DateTime::parse_from_rfc3339(captured_at.trim())
+            .unwrap()
+            .into();
+        let nonce: [u8; 32] = kata_testdata("nonce.bin").try_into().unwrap();
+        let (appraised, gpu) = alpha_attest::appraise_kata_instance(
+            &evidence,
+            &nonce,
+            &kata_testdata("runtime_spki.der"),
+            &doc,
+            &collateral,
+            now,
+        )
+        .unwrap();
+        assert!(!gpu);
+        let init_data = String::from_utf8(kata_testdata("k2-app.toml")).unwrap();
+        assert_eq!(appraised.compose_hash, alpha_core::compose_hash(&init_data));
     }
 
     #[test]
