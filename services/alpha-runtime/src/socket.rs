@@ -1,4 +1,4 @@
-//! The routes on the unix socket: HTTP/1.1, JSON, no authentication — access is the
+//! The four routes on the unix socket: HTTP/1.1, JSON, no authentication — access is the
 //! right to the socket. KMS errors pass through in their own envelope with their status.
 
 use std::sync::Arc;
@@ -21,7 +21,6 @@ pub fn router(runtime: Arc<Runtime>) -> Router {
         .route("/v1/identity", get(identity))
         .route("/v1/secrets/{name}", get(secret))
         .route("/v1/keys/{purpose}", get(key))
-        .route("/v1/evidence-bundle", get(evidence_bundle))
         .route("/healthz", get(healthz))
         .fallback(|| async { envelope(StatusCode::NOT_FOUND, "not_found", "no such route") })
         .with_state(runtime)
@@ -64,7 +63,7 @@ impl IntoResponse for Error {
 
 pub fn identity_json(runtime: &Runtime) -> Result<Value, Error> {
     let attested = runtime.attested().ok_or(Error::NotAttested)?;
-    let mut identity = json!({
+    Ok(json!({
         "app_id": attested.identity.app_id,
         "org_id": attested.identity.org_id,
         "compose_hash": attested.identity.compose_hash,
@@ -72,14 +71,7 @@ pub fn identity_json(runtime: &Runtime) -> Result<Value, Error> {
         "tls_private_key": BASE64_URL_SAFE_NO_PAD.encode(runtime.tls_private_key()),
         "attestation_result": attested.result,
         "app_compose": runtime.app_compose,
-    });
-    if let (Some(initdata), Some(fields)) = (runtime.initdata(), identity.as_object_mut()) {
-        fields.insert(
-            "initdata".into(),
-            json!(BASE64_URL_SAFE_NO_PAD.encode(initdata)),
-        );
-    }
-    Ok(identity)
+    }))
 }
 
 async fn identity(State(runtime): State<Arc<Runtime>>) -> Result<Json<Value>, Error> {
@@ -98,20 +90,6 @@ async fn key(
     Path(purpose): Path<String>,
 ) -> Result<Json<DerivedKey>, Error> {
     runtime.key(&purpose).await.map(Json)
-}
-
-/// The current leaf's evidence bundle (PRD-06 clear claims): the request, the leaf and the KMS's
-/// receipt naming the verifiers that attested this workload. 404 from a KMS that sends no receipt.
-async fn evidence_bundle(State(runtime): State<Arc<Runtime>>) -> Result<Response, Error> {
-    let attested = runtime.attested().ok_or(Error::NotAttested)?;
-    Ok(match &attested.bundle {
-        Some(bundle) => Json(bundle).into_response(),
-        None => envelope(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "the KMS sent no attestation receipt",
-        ),
-    })
 }
 
 pub fn healthz_json(runtime: &Runtime) -> Value {
