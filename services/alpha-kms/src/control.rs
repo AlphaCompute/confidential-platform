@@ -190,9 +190,15 @@ fn revision_payload(
         return Ok((hash, p.app_id, Some(p.compose), None));
     }
     let p: InitDataRevisionPayload = payload(value)?;
-    let digest = alpha_core::InitData::parse(p.init_data.clone())
-        .map_err(|e| ApiError::malformed(e.to_string()))?
-        .digest();
+    let init_data = alpha_core::InitData::parse(p.init_data.clone())
+        .map_err(|e| ApiError::malformed(e.to_string()))?;
+    if init_data.app_id() != Some(p.app_id) {
+        return Err(ApiError::malformed(format!(
+            "init-data [data] app_id is not the app_id {}",
+            p.app_id
+        )));
+    }
+    let digest = init_data.digest();
     if digest != p.digest {
         return Err(ApiError::malformed(format!(
             "digest is not the init-data's {digest}"

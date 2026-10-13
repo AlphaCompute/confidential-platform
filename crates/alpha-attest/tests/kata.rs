@@ -191,14 +191,15 @@ fn a_pod_quoting_over_a_runtime_key_and_nonce_is_bound_to_them() {
     let nonce: [u8; 32] = read("nonce.bin").try_into().unwrap();
     let expected = alpha_attest::report_data(&read("runtime_spki.der"), &nonce, None);
     let appraised = appraise_kata(
-        &read("k1-sha256.quote.bin"),
+        &read("k2-app.quote.bin"),
         &expected,
         &doc(),
         &collateral(),
         now(),
     )
     .unwrap();
-    assert_eq!(appraised.init_data, t1_digest());
+    let k2 = String::from_utf8(read("k2-app.toml")).unwrap();
+    assert_eq!(appraised.init_data, InitData::parse(k2).unwrap().digest());
 }
 
 #[test]
