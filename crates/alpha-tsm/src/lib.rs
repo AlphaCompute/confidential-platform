@@ -471,6 +471,26 @@ mod tests {
     }
 
     #[test]
+    fn refuses_a_v5_td_body_under_a_non_tdx_header() {
+        let ours: [u8; 64] = unhex(KATA_REPORT_DATA).unwrap().try_into().unwrap();
+        let v5 = |tee_type: u32| {
+            let (header, rest) = KATA_QUOTE.split_at(48);
+            let (report, auth) = rest.split_at(584);
+            let mut quote = header.to_vec();
+            quote[0..2].copy_from_slice(&5u16.to_le_bytes());
+            quote[4..8].copy_from_slice(&tee_type.to_le_bytes());
+            quote.extend_from_slice(&2u16.to_le_bytes());
+            quote.extend_from_slice(&584u32.to_le_bytes());
+            quote.extend_from_slice(report);
+            quote.extend_from_slice(auth);
+            quote
+        };
+        check_quote(&v5(TEE_TYPE_TDX), &ours).unwrap();
+        let error = check_quote(&v5(0), &ours).unwrap_err().to_string();
+        assert!(error.contains("not a TDX quote"), "{error}");
+    }
+
+    #[test]
     fn tsm_entries_are_unique_and_removed_on_error() {
         let root = std::env::temp_dir().join(format!("alpha-tsm-{}", tsm_entry_name()));
         fs::create_dir(&root).unwrap();
