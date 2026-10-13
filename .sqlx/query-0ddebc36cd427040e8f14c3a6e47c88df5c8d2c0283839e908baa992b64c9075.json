@@ -1,11 +1,26 @@
 {
   "db_name": "PostgreSQL",
+<<<<<<<< HEAD:.sqlx/query-34acee1da489901e6d596cc896b1a4f98bfa55c7bc79d4ce56bd562d6c63e295.json
+  "query": "select compose_hash, app_id as \"app_id!\", org_id as \"org_id!\", compose as \"compose!\",\n                  created_by_key as \"created_by_key!\", signature as \"signature!\", created_at, revoked_at\n           from revisions where sealed is null for update",
+========
   "query": "select app_id, org_id, compose, init_data, created_by_key, signature, created_at, revoked_at\n         from revisions where compose_hash = $1",
+>>>>>>>> origin/main:.sqlx/query-0ddebc36cd427040e8f14c3a6e47c88df5c8d2c0283839e908baa992b64c9075.json
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "app_id",
+        "name": "compose_hash",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "revisions",
+            "name": "compose_hash"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "app_id!",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -15,8 +30,8 @@
         }
       },
       {
-        "ordinal": 1,
-        "name": "org_id",
+        "ordinal": 2,
+        "name": "org_id!",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -26,8 +41,8 @@
         }
       },
       {
-        "ordinal": 2,
-        "name": "compose",
+        "ordinal": 3,
+        "name": "compose!",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -37,6 +52,10 @@
         }
       },
       {
+<<<<<<<< HEAD:.sqlx/query-34acee1da489901e6d596cc896b1a4f98bfa55c7bc79d4ce56bd562d6c63e295.json
+        "ordinal": 4,
+        "name": "created_by_key!",
+========
         "ordinal": 3,
         "name": "init_data",
         "type_info": "Text",
@@ -50,6 +69,7 @@
       {
         "ordinal": 4,
         "name": "created_by_key",
+>>>>>>>> origin/main:.sqlx/query-0ddebc36cd427040e8f14c3a6e47c88df5c8d2c0283839e908baa992b64c9075.json
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -60,7 +80,11 @@
       },
       {
         "ordinal": 5,
+<<<<<<<< HEAD:.sqlx/query-34acee1da489901e6d596cc896b1a4f98bfa55c7bc79d4ce56bd562d6c63e295.json
+        "name": "signature!",
+========
         "name": "signature",
+>>>>>>>> origin/main:.sqlx/query-0ddebc36cd427040e8f14c3a6e47c88df5c8d2c0283839e908baa992b64c9075.json
         "type_info": "Jsonb",
         "origin": {
           "Table": {
@@ -93,20 +117,30 @@
       }
     ],
     "parameters": {
-      "Left": [
-        "Bytea"
-      ]
+      "Left": []
     },
     "nullable": [
       false,
+<<<<<<<< HEAD:.sqlx/query-34acee1da489901e6d596cc896b1a4f98bfa55c7bc79d4ce56bd562d6c63e295.json
+      true,
+      true,
+      true,
+      true,
+      true,
+========
       false,
       true,
       true,
       false,
       false,
+>>>>>>>> origin/main:.sqlx/query-0ddebc36cd427040e8f14c3a6e47c88df5c8d2c0283839e908baa992b64c9075.json
       false,
       true
     ]
   },
+<<<<<<<< HEAD:.sqlx/query-34acee1da489901e6d596cc896b1a4f98bfa55c7bc79d4ce56bd562d6c63e295.json
+  "hash": "34acee1da489901e6d596cc896b1a4f98bfa55c7bc79d4ce56bd562d6c63e295"
+========
   "hash": "0ddebc36cd427040e8f14c3a6e47c88df5c8d2c0283839e908baa992b64c9075"
+>>>>>>>> origin/main:.sqlx/query-0ddebc36cd427040e8f14c3a6e47c88df5c8d2c0283839e908baa992b64c9075.json
 }

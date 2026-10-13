@@ -19,11 +19,12 @@ use sqlx::PgTransaction;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::audit::Audit;
+use crate::audit::{self, Audit};
 use crate::body::Body;
 use crate::error::ApiError;
-use crate::instance::load_revision;
+use crate::instance::RevisionRow;
 use crate::keys::{self, Chain, SignatureObject};
+use crate::store::{self, KeyRecord, SecretRecord};
 use crate::{Intermediates, Node, certs, rfc3339};
 
 #[derive(Deserialize)]
@@ -72,7 +73,7 @@ async fn authorize(
     keys::check_shape(&body.signature)?;
     let chain = keys::verify_signed(
         &node.pool,
-        &keys.tenant_kek_root,
+        keys,
         &body.signature,
         ctx,
         &body.payload,
@@ -86,13 +87,16 @@ async fn authorize(
     Ok(chain)
 }
 
+/// The route's audit row in its transaction; [`audit::Appended::committed`] once that commits.
 async fn audited(
     tx: &mut PgTransaction<'_>,
+    node: &Node,
+    keys: &Intermediates,
     chain: &Chain,
     action: &str,
     object: String,
     details: Value,
-) -> Result<(), ApiError> {
+) -> Result<audit::Appended, ApiError> {
     Audit {
         actor_kind: "principal",
         actor: &chain.key.id.to_string(),
@@ -103,25 +107,40 @@ async fn audited(
         details,
         evidence_sha256: None,
     }
-    .insert(&mut **tx)
-    .await?;
-    Ok(())
+    .insert(tx, &node.chain, Some(&keys.metadata))
+    .await
 }
 
 async fn denied(node: &Node, key_id: Option<KeyId>, action: &str, error: &ApiError) {
     let actor = key_id.map_or_else(|| "unregistered".to_owned(), |k| k.to_string());
-    let _ = Audit {
-        actor_kind: "principal",
-        actor: &actor,
-        action,
-        org_id: None,
-        object: None,
-        outcome: error.outcome(),
-        details: error.details(),
-        evidence_sha256: None,
-    }
-    .insert(&node.pool)
-    .await;
+    let _ = node
+        .audit(Audit {
+            actor_kind: "principal",
+            actor: &actor,
+            action,
+            org_id: None,
+            object: None,
+            outcome: error.outcome(),
+            details: error.details(),
+            evidence_sha256: None,
+        })
+        .await;
+}
+
+/// The node's receipt over `route`, `request` and `response`, under its current leaf.
+pub(crate) fn receipt(
+    node: &Node,
+    route: &str,
+    request: &Value,
+    response: Value,
+) -> Result<Value, ApiError> {
+    let leaf = certs::pem(&node.server_cert.leaf_der()?);
+    // Read after the leaf, so a renewal in between cannot put issued_at before its notBefore.
+    let issued_at = node.now();
+    let receipt =
+        alpha_channel::receipt::issue(&node.runtime_key, leaf, route, request, response, issued_at)
+            .map_err(|e| ApiError::internal(format!("receipt: {e}")))?;
+    serde_json::to_value(receipt).map_err(|e| ApiError::internal(format!("receipt: {e}")))
 }
 
 fn receipted(
@@ -133,20 +152,7 @@ fn receipted(
     let Value::Object(mut fields) = response else {
         return Err(ApiError::internal("a Control response is not an object"));
     };
-    let leaf = certs::pem(&node.server_cert.leaf_der()?);
-    // Read after the leaf, so a renewal in between cannot put issued_at before its notBefore.
-    let issued_at = node.now();
-    let receipt = alpha_channel::receipt::issue(
-        &node.runtime_key,
-        leaf,
-        route,
-        request,
-        Value::Object(fields.clone()),
-        issued_at,
-    )
-    .map_err(|e| ApiError::internal(format!("receipt: {e}")))?;
-    let receipt =
-        serde_json::to_value(receipt).map_err(|e| ApiError::internal(format!("receipt: {e}")))?;
+    let receipt = receipt(node, route, request, Value::Object(fields.clone()))?;
     fields.insert("receipt".into(), receipt);
     Ok(Value::Object(fields))
 }
@@ -242,7 +248,8 @@ pub async fn register_revision(
         let chain = authorize(&node, &keys, context::REVISION, &body, node.now_utc()).await?;
         let org_id = chain.key.org_id;
         let mut tx = node.pool.begin().await?;
-        if let Some(existing) = load_revision(&mut *tx, compose_hash).await? {
+        if let Some(existing) = store::load_revision(&mut *tx, &keys.metadata, compose_hash).await?
+        {
             if existing.org_id != org_id {
                 return Err(ApiError::not_found("no such revision"));
             }
@@ -282,8 +289,10 @@ pub async fn register_revision(
         )
         .fetch_one(&mut *tx)
         .await?;
-        audited(
+        let appended = audited(
             &mut tx,
+            &node,
+            &keys,
             &chain,
             "revision.register",
             format!("revision:{compose_hash}"),
@@ -291,6 +300,7 @@ pub async fn register_revision(
         )
         .await?;
         tx.commit().await?;
+        appended.committed(&node.chain);
         Ok(revision_json(
             compose_hash,
             app_id.into(),
@@ -335,32 +345,32 @@ pub async fn revoke_revision(
         let at = within_window(p.issued_at, node.now_utc())?;
         let chain = authorize(&node, &keys, context::CONTROL, &body, at).await?;
         let mut tx = node.pool.begin().await?;
-        let revision = load_revision(&mut *tx, p.compose_hash)
+        let revision = store::lock_revision(&mut tx, &keys.metadata, p.compose_hash)
             .await?
             .filter(|r| r.org_id == chain.key.org_id)
             .ok_or_else(|| ApiError::not_found("no such revision"))?;
-        let revoked_at = match revision.revoked_at {
-            Some(t) => t,
+        let (revoked_at, appended) = match revision.revoked_at {
+            Some(t) => (t, None),
             None => {
-                let t = sqlx::query_scalar!(
-                    "update revisions set revoked_at = now() where compose_hash = $1 returning revoked_at",
-                    p.compose_hash.as_bytes().as_slice()
-                )
-                .fetch_one(&mut *tx)
-                .await?
-                .ok_or_else(|| ApiError::internal("revoked_at was not set"))?;
-                audited(
+                let t = store::revoke_revision(&mut tx, &keys.metadata, p.compose_hash, &revision)
+                    .await?;
+                let appended = audited(
                     &mut tx,
+                    &node,
+                    &keys,
                     &chain,
                     "revision.revoke",
                     format!("revision:{}", p.compose_hash),
                     json!({}),
                 )
                 .await?;
-                t
+                (t, Some(appended))
             }
         };
         tx.commit().await?;
+        if let Some(appended) = appended {
+            appended.committed(&node.chain);
+        }
         Ok(json!({ "compose_hash": p.compose_hash, "revoked_at": rfc3339(revoked_at) }))
     })
 }
@@ -414,8 +424,11 @@ pub async fn put_secret(
                 ),
             ),
             (None, Some(sealed)) => {
-                let (channel, c2s) =
-                    crate::channel::open_ticket(&keys.tenant_kek_root, &sealed.ticket, node.now())?;
+                let (channel, c2s) = crate::channel::open_ticket(
+                    keys.metadata.ticket_root(),
+                    &sealed.ticket,
+                    node.now(),
+                )?;
                 let (sealed_for, value) = alpha_channel::secret::open(
                     &channel,
                     &c2s,
@@ -454,27 +467,14 @@ pub async fn put_secret(
         )
         .execute(&mut *tx)
         .await?;
-        let foreign = sqlx::query_scalar!(
-            "select exists(select 1 from revisions where app_id = any($1) and org_id <> $2)",
-            &app_ids,
-            org_id
-        )
-        .fetch_one(&mut *tx)
-        .await?;
-        if foreign.unwrap_or(false) {
+        if store::apps_of_another_org(&mut *tx, &keys.metadata, &app_ids, org_id).await? {
             return Err(ApiError::not_found(
                 "an app belongs to another organization",
             ));
         }
-        let existing = sqlx::query!(
-            "select id, issued_at from secrets where org_id = $1 and name = $2",
-            org_id,
-            name
-        )
-        .fetch_optional(&mut *tx)
-        .await?;
+        let existing = store::load_secret(&mut *tx, &keys.metadata, org_id, &name).await?;
         let id = match &existing {
-            Some(row) if row.issued_at >= at => {
+            Some(row) if row.record.issued_at >= at => {
                 return Err(ApiError::new(
                     "already_exists",
                     "a put with a later issued_at is stored",
@@ -483,28 +483,25 @@ pub async fn put_secret(
             Some(row) => row.id,
             None => SecretId::mint().into(),
         };
-        let org_key = keys::org_key(&keys.tenant_kek_root, org_id.into(), &chain.anchor_spki)?;
-        let ciphertext = keys::aead_seal(&org_key, id.as_bytes(), &value)?;
-        sqlx::query!(
-            "insert into secrets (id, org_id, name, app_ids, ciphertext, content_sha256, document, signed_by_key, signature, issued_at)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-             on conflict (org_id, name) do update set app_ids = $4, ciphertext = $5, content_sha256 = $6,
-               document = $7, signed_by_key = $8, signature = $9, issued_at = $10",
-            id,
+        let value_key = keys
+            .metadata
+            .secret_key(org_id.into(), &chain.anchor_spki)?;
+        let ciphertext = keys::aead_seal(&value_key, id.as_bytes(), &value)?;
+        let record = SecretRecord {
             org_id,
-            name,
-            &app_ids,
-            ciphertext,
-            content_sha256.as_slice(),
-            body.payload,
-            chain.key.id,
-            json!(body.signature),
-            at,
-        )
-        .execute(&mut *tx)
-        .await?;
-        audited(
+            name: name.clone(),
+            app_ids: app_ids.clone(),
+            content_sha256: content_sha256.to_vec(),
+            document: body.payload.clone(),
+            signed_by_key: chain.key.id,
+            signature: json!(body.signature),
+            issued_at: at,
+        };
+        store::upsert_secret(&mut *tx, &keys.metadata, id, &ciphertext, &record).await?;
+        let appended = audited(
             &mut tx,
+            &node,
+            &keys,
             &chain,
             "secret.put",
             format!("secret:{name}"),
@@ -512,6 +509,7 @@ pub async fn put_secret(
         )
         .await?;
         tx.commit().await?;
+        appended.committed(&node.chain);
         Ok(json!({
             "id": id, "name": name, "org_id": org_id, "app_ids": app_ids,
             "content_sha256": p.content_sha256, "issued_at": rfc3339(at),
@@ -587,31 +585,23 @@ async fn register_endorsed_key(
     let chain = authorize(node, keys, context::PRINCIPAL_KEY, body, at).await?;
     let id: Uuid = KeyId::mint().into();
     let mut tx = node.pool.begin().await?;
-    let inserted = sqlx::query_scalar!(
-        "insert into principal_keys (id, org_id, principal_id, public_key, document, registered_by_key, signature)
-         values ($1, $2, $3, $4, $5, $6, $7) returning created_at",
-        id,
-        chain.key.org_id,
-        Uuid::from(p.principal_id),
-        spki,
-        body.payload,
-        chain.key.id,
-        json!(body.signature),
-    )
-    .fetch_one(&mut *tx)
-    .await;
-    let created_at = match inserted {
-        Ok(t) => t,
-        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
-            return Err(ApiError::new(
-                "already_exists",
-                "public_key is already registered",
-            ));
-        }
-        Err(e) => return Err(e.into()),
+    let record = KeyRecord {
+        org_id: chain.key.org_id,
+        principal_id: p.principal_id.into(),
+        public_key: spki,
+        document: body.payload.clone(),
+        registered_by_key: Some(chain.key.id),
+        signature: json!(body.signature),
+        revoked_at: None,
+        revocation_reason: None,
     };
-    audited(
+    let created_at = store::insert_key(&mut tx, &keys.metadata, id, None, &record)
+        .await?
+        .ok_or_else(|| ApiError::new("already_exists", "public_key is already registered"))?;
+    let appended = audited(
         &mut tx,
+        node,
+        keys,
         &chain,
         "key.register",
         format!("key:{id}"),
@@ -619,6 +609,7 @@ async fn register_endorsed_key(
     )
     .await?;
     tx.commit().await?;
+    appended.committed(&node.chain);
     Ok(json!({
         "id": id, "principal_id": p.principal_id, "org_id": chain.key.org_id,
         "created_at": rfc3339(created_at),
@@ -650,54 +641,40 @@ async fn register_root_key(
     )
     .execute(&mut *tx)
     .await?;
-    let claimed = sqlx::query!(
-        "select id, principal_id, public_key, created_at from principal_keys
-         where org_id = $1 and registered_by_key is null",
-        org_id
-    )
-    .fetch_optional(&mut *tx)
-    .await?;
-    if let Some(row) = claimed {
-        if row.public_key != spki {
+    if let Some((id, claimed, created_at)) =
+        store::root_key(&mut *tx, &keys.metadata, org_id).await?
+    {
+        if claimed.public_key != spki {
             return Err(ApiError::new(
                 "already_exists",
                 "org_id is registered to another root key",
             ));
         }
         return Ok(root_key_json(
-            row.id,
-            row.principal_id,
+            id,
+            claimed.principal_id,
             org_id,
-            &row.public_key,
-            row.created_at,
+            &claimed.public_key,
+            created_at,
         ));
     }
     let id: Uuid = KeyId::mint().into();
     let check = keys::anchor_check(&keys.tenant_kek_root, p.org_id, &spki)?;
-    let inserted = sqlx::query_scalar!(
-        "insert into principal_keys (id, org_id, principal_id, public_key, document, signature, anchor_check)
-         values ($1, $2, $3, $4, $5, $6, $7) returning created_at",
-        id,
+    let record = KeyRecord {
         org_id,
-        Uuid::from(p.principal_id),
-        spki,
-        body.payload,
-        json!(body.signature),
-        check.as_slice(),
-    )
-    .fetch_one(&mut *tx)
-    .await;
-    let created_at = match inserted {
-        Ok(t) => t,
-        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
-            return Err(ApiError::new(
-                "already_exists",
-                "public_key is already registered",
-            ));
-        }
-        Err(e) => return Err(e.into()),
+        principal_id: p.principal_id.into(),
+        public_key: spki.clone(),
+        document: body.payload.clone(),
+        registered_by_key: None,
+        signature: json!(body.signature),
+        revoked_at: None,
+        revocation_reason: None,
     };
-    Audit {
+    let created_at =
+        store::insert_key(&mut tx, &keys.metadata, id, Some(check.as_slice()), &record)
+            .await?
+            .ok_or_else(|| ApiError::new("already_exists", "public_key is already registered"))?;
+    let appended = Audit {
         actor_kind: "principal",
         actor: &id.to_string(),
         action: "key.register",
@@ -707,9 +684,10 @@ async fn register_root_key(
         details: json!({ "principal_id": p.principal_id, "root": true }),
         evidence_sha256: None,
     }
-    .insert(&mut *tx)
+    .insert(&mut tx, &node.chain, Some(&keys.metadata))
     .await?;
     tx.commit().await?;
+    appended.committed(&node.chain);
     Ok(root_key_json(
         id,
         Uuid::from(p.principal_id),
@@ -762,34 +740,31 @@ pub async fn revoke_key(
         let at = within_window(p.issued_at, node.now_utc())?;
         let chain = authorize(&node, &keys, context::CONTROL, &body, at).await?;
         let mut tx = node.pool.begin().await?;
-        let target = keys::load_key(&mut *tx, p.key_id.into())
+        let target = store::lock_key(&mut tx, &keys.metadata, p.key_id.into())
             .await?
             .filter(|k| k.org_id == chain.key.org_id)
             .ok_or_else(|| ApiError::not_found("no such key"))?;
-        let (revoked_at, reason) = match (target.revoked_at, target.revocation_reason) {
-            (Some(t), Some(reason)) => (t, reason),
+        let (revoked_at, reason, appended) = match (target.revoked_at, &target.revocation_reason) {
+            (Some(t), Some(reason)) => (t, reason.clone(), None),
             _ => {
-                let t = sqlx::query_scalar!(
-                    "update principal_keys set revoked_at = now(), revocation_reason = $2::principal_key_revocation
-                     where id = $1 returning revoked_at",
-                    target.id,
-                    p.reason as _,
-                )
-                .fetch_one(&mut *tx)
-                .await?
-                .ok_or_else(|| ApiError::internal("revoked_at was not set"))?;
-                audited(
+                let t = store::revoke_key(&mut tx, &keys.metadata, &target, &p.reason).await?;
+                let appended = audited(
                     &mut tx,
+                    &node,
+                    &keys,
                     &chain,
                     "key.revoke",
                     format!("key:{}", target.id),
                     json!({ "reason": p.reason }),
                 )
                 .await?;
-                (t, p.reason.clone())
+                (t, p.reason.clone(), Some(appended))
             }
         };
         tx.commit().await?;
+        if let Some(appended) = appended {
+            appended.committed(&node.chain);
+        }
         Ok(json!({ "key_id": target.id, "revoked_at": rfc3339(revoked_at), "reason": reason }))
     })
 }

@@ -1,5 +1,6 @@
-//! HPKE (RFC 9180, `mode_base`) with the X-Wing KEM, HKDF-SHA256 and AES-256-GCM, for the two
-//! bodies that cross a custodian's boundary: unseal shares and the bootstrap request and reply.
+//! HPKE (RFC 9180, `mode_base`) with the X-Wing KEM, HKDF-SHA256 and AES-256-GCM, for the bodies
+//! that cross a custodian's boundary: unseal shares, the bootstrap request and reply, and a
+//! custodian's approval of a rotation.
 
 #![cfg_attr(
     test,
@@ -26,6 +27,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 pub const INFO_UNSEAL_SHARE: &[u8] = b"alphacompute/unseal-share/v1";
 pub const INFO_NODE_BOOTSTRAP: &[u8] = b"alphacompute/node-bootstrap/v1";
+/// A current custodian's approval of a rotation: the proposal's digest followed by their share.
+pub const INFO_CUSTODIAN_APPROVAL: &[u8] = b"alphacompute/custodian-approval/v1";
 pub const KEM_NAME: &str = "x-wing";
 pub const PUBLIC_KEY_LEN: usize = 1216;
 

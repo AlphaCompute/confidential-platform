@@ -1,20 +1,23 @@
 //! `alpha bootstrap` and `alpha unseal`: nothing is sealed to a node the CLI has not verified.
 //! [`verify_node`] is the whole decision, pure over its arguments; the two commands only
-//! move bytes once it has said yes.
+//! move bytes once it has said yes. A prototype node and a Kata node (`kata-tdx/1`, its identity
+//! the Revision v2 of its init-data) are appraised by `alpha_attest::node`, the same function the
+//! serving node runs before a `join`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use alpha_attest::{Collateral, PlatformDocument, appraise};
+use alpha_attest::{AnyEvidence, Appraised, Collateral, PlatformDocument, VerifiedQuote, kata};
 use alpha_client::{
-    BootstrapBody, BootstrapRequest, Client, NodeEvidence, Pin, UnsealReply, UnsealRequest,
-    fetch_node_evidence,
+    AuditHead, BootstrapBody, BootstrapRequest, Client, NodeEvidence, Pin, UnsealReply,
+    UnsealRequest, fetch_node_evidence,
 };
 use alpha_crypto::{INFO_NODE_BOOTSTRAP, INFO_UNSEAL_SHARE, PublicKey, Sealed};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use alpha_channel::sha256_label;
 
@@ -33,10 +36,34 @@ impl NodeIdentity {
     }
 }
 
+/// A node that passed [`verify_node`]: what the CLI seals to, and what it found.
+#[derive(Clone, Debug)]
+pub struct AttestedNode {
+    pub identity: NodeIdentity,
+    pub appraised: Appraised,
+    /// A Kata node's agent policy, from the init-data its quote binds; none for a prototype node.
+    pub policy: Option<String>,
+}
+
+impl AttestedNode {
+    /// What the custodian is told about the node a share or the bootstrap body went to.
+    pub fn summary(&self) -> Value {
+        let a = &self.appraised;
+        json!({
+            "profile": a.coco.as_ref().map_or("prototype-tdx", |c| c.profile.as_str()),
+            "revision": a.compose_hash,
+            "os_image": a.os_image,
+            "tcb_status": a.tcb_status,
+            "policy_sha256": a.coco.as_ref().map(|c| c.policy_sha256),
+            "runtime_pubkey_sha256": a.runtime_pubkey_sha256,
+        })
+    }
+}
+
 /// The custodian-side checks, in order: the document is not older than the one
-/// remembered, the evidence appraises with the X-Wing key bound in `report_data`, the node's
-/// Revision is in `kms_revisions`, and the TLS server the evidence came from holds the attested
-/// runtime key.
+/// remembered, the evidence appraises with the X-Wing key bound in `report_data` (a Kata node's
+/// on the CPU runtime class), the node's Revision is in `kms_revisions` for the profile it was
+/// appraised under, and the TLS server the evidence came from holds the attested runtime key.
 pub fn verify_node(
     evidence: &NodeEvidence,
     nonce: &[u8; 32],
@@ -45,7 +72,51 @@ pub fn verify_node(
     remembered_version: Option<u64>,
     collateral: &Collateral,
     now: SystemTime,
-) -> Result<NodeIdentity, String> {
+) -> Result<AttestedNode, String> {
+    check_version(doc, remembered_version)?;
+    let runtime_spki = evidence.runtime_spki().map_err(|e| e.to_string())?;
+    let appraised = alpha_attest::node::appraise_node(
+        &evidence.evidence().map_err(|e| e.to_string())?,
+        nonce,
+        &runtime_spki,
+        evidence.xwing_pubkey.as_bytes(),
+        doc,
+        collateral,
+        now,
+    )
+    .map_err(|e| format!("{}: {e}", e.code()))?;
+    attested(evidence, runtime_spki, server_spki, appraised)
+}
+
+/// [`verify_node`] for a Kata node's evidence over a quote `alpha_attest::verify_quote` has
+/// verified: every check after DCAP. The KMS's tests run the CLI's half of a Kata genesis through
+/// it over synthetic quotes until B300 Kata captures exist (M1); the commands never call it.
+pub fn verify_kata_node(
+    evidence: &NodeEvidence,
+    verified: VerifiedQuote,
+    nonce: &[u8; 32],
+    server_spki: &[u8],
+    doc: &PlatformDocument,
+    remembered_version: Option<u64>,
+) -> Result<AttestedNode, String> {
+    check_version(doc, remembered_version)?;
+    let runtime_spki = evidence.runtime_spki().map_err(|e| e.to_string())?;
+    let AnyEvidence::V2(v2) = evidence.evidence().map_err(|e| e.to_string())? else {
+        return Err("a verified quote comes with alphacompute-evidence/2 only".into());
+    };
+    let appraised = alpha_attest::node::appraise_kata_node(
+        &v2,
+        verified,
+        nonce,
+        &runtime_spki,
+        evidence.xwing_pubkey.as_bytes(),
+        doc,
+    )
+    .map_err(|e| format!("{}: {e}", e.code()))?;
+    attested(evidence, runtime_spki, server_spki, appraised)
+}
+
+fn check_version(doc: &PlatformDocument, remembered_version: Option<u64>) -> Result<(), String> {
     if let Some(remembered) = remembered_version
         && doc.version < remembered
     {
@@ -54,23 +125,34 @@ pub fn verify_node(
             doc.version
         ));
     }
-    let runtime_spki = evidence.runtime_spki().map_err(|e| e.to_string())?;
-    appraise(
-        &evidence.evidence().map_err(|e| e.to_string())?,
-        nonce,
-        &runtime_spki,
-        Some(evidence.xwing_pubkey.as_bytes()),
-        doc,
-        collateral,
-        now,
-    )
-    .map_err(|e| format!("{}: {e}", e.code()))?;
+    Ok(())
+}
+
+fn attested(
+    evidence: &NodeEvidence,
+    runtime_spki: Vec<u8>,
+    server_spki: &[u8],
+    appraised: Appraised,
+) -> Result<AttestedNode, String> {
     if server_spki != runtime_spki {
         return Err("server TLS key is not the attested runtime_pubkey".into());
     }
-    Ok(NodeIdentity {
-        runtime_spki,
-        xwing: evidence.xwing_pubkey.clone(),
+    // The appraisal bound this init-data to the quote; its policy is what the node runs under.
+    let policy = match evidence.evidence().map_err(|e| e.to_string())? {
+        AnyEvidence::V1(_) => None,
+        AnyEvidence::V2(v2) => Some(
+            alpha_core::coco::InitData::parse(&v2.initdata)
+                .and_then(|d| d.policy().map(str::to_owned))
+                .map_err(|e| format!("init-data: {e}"))?,
+        ),
+    };
+    Ok(AttestedNode {
+        identity: NodeIdentity {
+            runtime_spki,
+            xwing: evidence.xwing_pubkey.clone(),
+        },
+        appraised,
+        policy,
     })
 }
 
@@ -81,16 +163,20 @@ pub async fn attested_node(
     doc: &PlatformDocument,
     remembered_version: Option<u64>,
     now: SystemTime,
-) -> Result<(NodeIdentity, Client), String> {
+) -> Result<(AttestedNode, Client), String> {
     let nonce = random::<32>()?;
     let (evidence, server_spki) = fetch_node_evidence(endpoint, &nonce)
         .await
         .map_err(|e| e.to_string())?;
-    let quote = evidence.evidence().map_err(|e| e.to_string())?.quote;
-    let collateral = alpha_attest::fetch_collateral(pccs_url, &quote)
+    let any = evidence.evidence().map_err(|e| e.to_string())?;
+    // SEV-SNP evidence is named for what it is, before any collateral is fetched.
+    if let AnyEvidence::V2(v2) = &any {
+        kata::check_cpu_kind(v2).map_err(|e| format!("{}: {e}", e.code()))?;
+    }
+    let collateral = alpha_attest::fetch_collateral(pccs_url, any.quote())
         .await
         .map_err(|e| e.to_string())?;
-    let identity = verify_node(
+    let node = verify_node(
         &evidence,
         &nonce,
         &server_spki,
@@ -101,16 +187,17 @@ pub async fn attested_node(
     )?;
     let client = Client::new(
         vec![endpoint.to_owned()],
-        Pin::Spki(identity.runtime_spki.clone()),
+        Pin::Spki(node.identity.runtime_spki.clone()),
     )
     .map_err(|e| e.to_string())?;
-    Ok((identity, client))
+    Ok((node, client))
 }
 
 pub const SHARE_FORMAT: &str = "alphacompute-share/1";
 
 /// What a custodian keeps: their share sealed to their X-Wing key, the SPKI hash of the node
-/// that sealed it (the HPKE aad), and the highest platform-document version they have verified.
+/// that sealed it (the HPKE aad), the highest platform-document version they have verified, and
+/// the latest KMS audit head a node they unsealed served from.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ShareFile {
@@ -118,6 +205,9 @@ pub struct ShareFile {
     pub share_hpke: Sealed,
     pub kms_node_spki_sha256: String,
     pub platform_document_version: u64,
+    /// Sent with the next unseal: the node refuses a database restored from before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_head: Option<AuditHead>,
 }
 
 impl ShareFile {
@@ -134,6 +224,24 @@ impl ShareFile {
     pub fn write(&self, path: &Path) -> Result<(), String> {
         let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())? + "\n";
         fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// [`ShareFile::write`] to a path that must not exist yet, readable by its owner only.
+    pub fn create(&self, path: &Path) -> Result<(), String> {
+        let text = serde_json::to_string_pretty(self).map_err(|e| e.to_string())? + "\n";
+        let mut out = fs::OpenOptions::new();
+        out.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut out, 0o600);
+        out.open(path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()))
+            .map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// Opens the share under the custodian's key.
+    pub fn open(&self, custodian: &alpha_crypto::PrivateKey) -> Result<Zeroizing<Vec<u8>>, String> {
+        alpha_crypto::open(custodian, INFO_UNSEAL_SHARE, &self.aad()?, &self.share_hpke)
+            .map_err(|e| format!("share file: {e}"))
     }
 
     fn aad(&self) -> Result<[u8; 32], String> {
@@ -183,6 +291,7 @@ pub async fn bootstrap(
             share_hpke,
             kms_node_spki_sha256: sha256_label(&node.runtime_spki),
             platform_document_version: doc_version,
+            audit_head: None,
         }
         .write(&path)?;
         paths.push(path);
@@ -194,28 +303,92 @@ pub async fn bootstrap(
     }))
 }
 
-/// Opens the custodian's share under their key, seals it to the verified node and posts it;
-/// the share file then remembers the document version the node was verified against.
+/// Opens the custodian's share under their key, seals it to the verified node and posts it with
+/// the audit head the share file remembers; the share file then remembers the document version the
+/// node was verified against and the head the node serves from. `accept_rollback` sends no head and
+/// lets the file remember an earlier one: the custodian's explicit acceptance of a database
+/// restored from an older copy.
 pub async fn unseal(
     client: &Client,
     node: &NodeIdentity,
     share_path: &Path,
     custodian: &alpha_crypto::PrivateKey,
     doc_version: u64,
+    accept_rollback: bool,
 ) -> Result<UnsealReply, String> {
     let mut file = ShareFile::read(share_path)?;
-    let share = alpha_crypto::open(custodian, INFO_UNSEAL_SHARE, &file.aad()?, &file.share_hpke)
-        .map_err(|e| format!("share file: {e}"))?;
+    let share = file.open(custodian)?;
     let share_hpke = alpha_crypto::seal(&node.xwing, INFO_UNSEAL_SHARE, &node.aad(), &share)
         .map_err(|e| e.to_string())?;
     if doc_version > file.platform_document_version {
         file.platform_document_version = doc_version;
         file.write(share_path)?;
     }
-    client
-        .unseal(&UnsealRequest { share_hpke })
+    let audit_floor = if accept_rollback {
+        None
+    } else {
+        file.audit_head.clone()
+    };
+    let reply = client
+        .unseal(&UnsealRequest {
+            share_hpke,
+            audit_floor,
+        })
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    let remember = match (&reply.audit_head, &file.audit_head) {
+        // Accepted: the file forgets the later head, and keeps the restored one if this reply has it.
+        _ if accept_rollback => true,
+        (Some(head), Some(known)) => known.seq < head.seq,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    if remember {
+        file.audit_head = reply.audit_head.clone();
+        file.write(share_path)?;
+    }
+    Ok(reply)
+}
+
+/// What `alpha witness` found: the head the share file now remembers, and the attested node's.
+#[derive(Debug, Serialize)]
+pub struct Witnessed {
+    pub audit_head: Option<AuditHead>,
+    pub node_audit_head: Option<AuditHead>,
+}
+
+/// Records in the share file the audit head an attested, serving node has seen committed, when it
+/// is later than the one the file remembers. Run between cold starts, it keeps the floor the
+/// custodian's next unseal sends close to the live head, so a restore to anything older halts the
+/// node instead of serving. Nothing is sent to the node. A node that reports another link at the
+/// same row, or a head behind the file's, is refused: it serves another or an older database.
+pub async fn witness(client: &Client, share_path: &Path) -> Result<Witnessed, String> {
+    let mut file = ShareFile::read(share_path)?;
+    let node_audit_head = client.audit_head().await.map_err(|e| e.to_string())?.head;
+    if let (Some(node), Some(known)) = (&node_audit_head, &file.audit_head) {
+        if node.seq == known.seq && node.link != known.link {
+            return Err(format!(
+                "the node's audit row {} differs from the one this share file remembers: it serves another database",
+                node.seq
+            ));
+        }
+        if node.seq < known.seq {
+            return Err(format!(
+                "the node has seen audit rows up to {} only, and this share file remembers {}: it may serve an older database",
+                node.seq, known.seq
+            ));
+        }
+    }
+    if let Some(head) = &node_audit_head
+        && file.audit_head.as_ref().is_none_or(|h| h.seq < head.seq)
+    {
+        file.audit_head = Some(head.clone());
+        file.write(share_path)?;
+    }
+    Ok(Witnessed {
+        audit_head: file.audit_head,
+        node_audit_head,
+    })
 }
 
 #[cfg(test)]
@@ -251,6 +424,7 @@ mod tests {
         let evidence = NodeEvidence {
             quote: BASE64_URL_SAFE_NO_PAD.encode(quote),
             event_log: serde_json::from_slice(&read("event_log.json")).unwrap(),
+            evidence_v2: None,
             runtime_pubkey: BASE64_URL_SAFE_NO_PAD.encode(read("runtime_spki.der")),
             xwing_pubkey: PublicKey::try_from(read("node_xwing_pubkey.bin").as_slice()).unwrap(),
             compose_hash: alpha_core::compose_hash("ignored: the measured one is used"),
@@ -281,6 +455,7 @@ mod tests {
             &c.collateral,
             c.now,
         )
+        .map(|node| node.identity)
     }
 
     #[test]
@@ -311,6 +486,25 @@ mod tests {
     }
 
     #[test]
+    fn node_evidence_in_both_forms_or_neither_or_under_a_kata_build_is_refused() {
+        let mut c = capture();
+        let spki = read("runtime_spki.der");
+        let mut neither = c.evidence.clone();
+        neither.quote.clear();
+        neither.event_log.clear();
+        let err = verify(&c, &neither, &spki, None).unwrap_err();
+        assert!(
+            err.contains("either quote and event_log or evidence"),
+            "{err}"
+        );
+        // A prototype node's quote is never read as a Kata node's, nor a listed prototype build
+        // as a Kata one.
+        c.doc.kms_revisions[0].kind = alpha_core::KmsRevisionKind::KataTdx;
+        let err = verify(&c, &c.evidence, &spki, None).unwrap_err();
+        assert!(err.contains("not listed as a prototype-tdx build"), "{err}");
+    }
+
+    #[test]
     fn share_file_round_trips_and_needs_its_format() {
         let dir = std::env::temp_dir().join(format!("alpha-share-{}", alpha_core::KeyId::mint()));
         fs::create_dir_all(&dir).unwrap();
@@ -324,10 +518,23 @@ mod tests {
             },
             kms_node_spki_sha256: sha256_label(b"node"),
             platform_document_version: 3,
+            audit_head: None,
         };
         file.write(&path).unwrap();
         let back = ShareFile::read(&path).unwrap();
         assert_eq!(back.platform_document_version, 3);
+        assert!(!fs::read_to_string(&path).unwrap().contains("audit_head"));
+        let head = AuditHead {
+            seq: 7,
+            link: "AAAA".into(),
+        };
+        ShareFile {
+            audit_head: Some(head.clone()),
+            ..file.clone()
+        }
+        .write(&path)
+        .unwrap();
+        assert_eq!(ShareFile::read(&path).unwrap().audit_head, Some(head));
         assert_eq!(
             back.aad().unwrap(),
             <[u8; 32]>::from(Sha256::digest(b"node"))

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use alpha_kms::{CollateralSource, Config, Node, node, platform, tls};
+use alpha_kms::{CollateralSource, Config, Node, NodeGuest, node, platform, tls};
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 
@@ -21,6 +21,10 @@ async fn main() {
 }
 
 async fn run() -> Result<(), String> {
+    // ponytail: D10 — how a Kata KMS node authenticates to Postgres (a client certificate from the
+    // KMS CA, or a password released after unseal) is Ryan Tharp's open decision; until then the
+    // node connects with ALPHACOMPUTE_DATABASE_URL as before. The rows are sealed either way
+    // (`store`), so this decides who may connect, not who may read.
     let pool = PgPoolOptions::new()
         .max_connections(8)
         .connect(&alpha_kms::env("ALPHACOMPUTE_DATABASE_URL")?)
@@ -35,14 +39,26 @@ async fn run() -> Result<(), String> {
     let release_key = alpha_core::hex_bytes::<32>(RELEASE_KEY_HEX.trim())
         .and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok())
         .ok_or("release-key.pub is not an Ed25519 public key")?;
-    let event_log = alpha_tsm::event_log().map_err(|e| format!("event log: {e}"))?;
+    let guest = match alpha_kms::quote_source(
+        std::env::var("ALPHACOMPUTE_QUOTE_SOURCE").ok().as_deref(),
+    )? {
+        None => {
+            NodeGuest::prototype(alpha_tsm::event_log().map_err(|e| format!("event log: {e}"))?)?
+        }
+        Some(source) => {
+            let path = std::path::Path::new(alpha_tsm::coco::INITDATA_PATH);
+            let initdata =
+                alpha_tsm::coco::initdata(path).map_err(|e| format!("init-data: {e}"))?;
+            NodeGuest::coco(source, initdata)?
+        }
+    };
     let node = Node::new(
         pool,
         Config::from_env()?,
         Arc::new(SystemTime::now),
         CollateralSource::Pccs(alpha_kms::env("ALPHACOMPUTE_PCCS_URL")?),
         alpha_kms::random().map_err(|e| e.message)?,
-        event_log,
+        guest,
         release_key,
     )?;
     platform::start(&node).await;
@@ -71,7 +87,7 @@ async fn start_phase(node: &Arc<Node>) {
     if let Some(root) = &node.config.dev_root_kek {
         match node::unwrap_intermediates(node, root).await {
             Ok(keys) => {
-                if let Err(e) = node.start_serving(keys) {
+                if let Err(e) = node.start_serving(keys).await {
                     eprintln!("dev root: {}", e.message);
                 }
                 return;
@@ -80,7 +96,10 @@ async fn start_phase(node: &Arc<Node>) {
         }
     }
     match node::try_join(node).await {
-        Ok(()) => eprintln!("joined; serving"),
+        Ok(()) => {
+            eprintln!("joined; serving");
+            node.maintain().await;
+        }
         Err(e) => eprintln!("sealed: {}; waiting for unseal", e.message),
     }
 }

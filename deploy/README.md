@@ -133,6 +133,62 @@ the platform-document URL are served; the signed document lists the Revision.
 Both nodes now serve; a restart of either is a `join` from the other; losing both means
 `alpha unseal` with two of the three shares.
 
+**A halted node.** `GET /ready` answering 503 `{"halted": "audit_chain_broken"}` or
+`{"halted": "audit_chain_rolled_back"}` means the node found the audit chain tampered with, or
+its database without an audit head it, a peer or a custodian saw committed (a restore from an
+older copy, or another copy). It releases nothing and writes nothing; it does not recover on its
+own. Find out what changed the database before anything else. A restart clears its memory and it
+then joins a serving node or waits for custodians, both of which check the heads again. To accept
+a database deliberately restored from a backup, stop every KMS node (their memory holds the head),
+then the custodians whose share files remember a later head unseal with
+`alpha unseal --accept-audit-rollback`, which goes in the ceremony record
+(`docs/metadata-encryption.md`, "Rollback of the whole database").
+
+**Custodians witness the audit head.** At least two custodians run `alpha witness --share
+share-N.json --endpoint https://<node>` daily and after any revocation or Secret change that
+matters. It records the head a serving node has seen in their share file, and their next unseal
+refuses a database restored from before it. A full cold restart onto a copy newer than every
+witnessed head is not caught.
+
+## Replacing a custodian
+
+When a custodian leaves, or a share or custodian key may be exposed, replace the custodian set
+the day it happens (`docs/custodian-rotation.md`). The node makes a new root KEK, and the old
+shares open nothing in the database from the commit on. Two current custodians and every new
+custodian take part; the platform document and every tenant are untouched.
+
+1. Each new custodian runs `alpha keygen --custodian --out new.key` and hands over the public
+   key it prints. A custodian who stays may keep their key and is listed again.
+2. Anyone runs `alpha custodians propose --custodians n1.pub,n2.pub,n3.pub --endpoint
+   https://<node>` against one serving node. It writes `proposal.json`, which is not secret, and
+   prints `check`: the proposal's digest and each new key's SHA-256. Its nonce lasts five
+   minutes, so the two approvers are ready before it runs.
+3. Two current custodians each run `alpha custodians rotate --proposal proposal.json --share
+   share-N.json --key custodian.key --endpoint https://<node>`, after comparing `check` with
+   the new custodians' keys out of band. Each attests the node first. The first approval prints
+   `{"rotated": false, "approvals": 1}`; the second rotates and writes `rotation.json` (the new
+   shares, sealed to the new keys, and the node's receipt). The departing custodian may be one
+   of the two.
+4. Each new custodian runs `alpha custodians accept --rotation rotation.json --key new.key --out
+   share.json --endpoint https://<node>`; without `--rotation` it fetches the node's last
+   rotation, so a lost reply costs nothing. It verifies the node and the receipt, and writes
+   the share file.
+5. Every custodian who held an old share deletes it now. Two new custodians unseal a node,
+   started for the purpose, as the ceremony's check that the new shares work, and each new
+   custodian runs `alpha witness` against a serving node, since a new share file remembers no
+   audit head. The operator runs `VACUUM FULL intermediate_keys, principal_keys, revisions,
+   secrets` as the schema owner.
+
+The commands check a Kata node's agent policy against the Alpha baseline by default. Until that
+checker is in the build they refuse a Kata node and name `--no-policy-baseline`. Passing it is
+recorded in each command's output and goes in the ceremony record. The rotation also replaces the
+data key and re-encrypts every row under it: the other node refuses writes until its next
+five-minute pass, when it joins again, so clients fail over to the rotating node meanwhile. A copy
+of the database from before the rotation plus two old shares still opens that copy as it was,
+every App's derived keys and the CA key (`docs/custodian-rotation.md`), so pre-rotation backups and
+WAL archives are destroyed or kept like shares. The dev App refuses to rotate: its root comes from
+the environment.
+
 ## The broker's database
 
 `alpha-broker` keeps its connections in its own database on the same trust-zone Postgres, and no

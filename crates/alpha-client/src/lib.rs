@@ -256,23 +256,40 @@ pub struct KeyRevoked {
     pub receipt: Option<Value>,
 }
 
-/// `GET /v1/node/evidence`: the quote is base64url, `runtime_pubkey` the P-256 SPKI DER.
+/// `GET /v1/node/evidence`. A prototype node sends `quote` (base64url) and `event_log`, as it
+/// always has; a Kata node sends its `alphacompute-evidence/2` as `evidence` instead, the init-data
+/// it booted with included. `runtime_pubkey` is the P-256 SPKI DER in base64url.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeEvidence {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub quote: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub event_log: Vec<EventLogEntry>,
+    #[serde(default, rename = "evidence", skip_serializing_if = "Option::is_none")]
+    pub evidence_v2: Option<EvidenceV2>,
     pub runtime_pubkey: String,
     pub xwing_pubkey: PublicKey,
+    /// What the node says it is; never trusted, the appraisal rebuilds it from the evidence.
     pub compose_hash: ComposeHash,
 }
 
 impl NodeEvidence {
-    pub fn evidence(&self) -> Result<Evidence, Error> {
-        Ok(Evidence {
-            format: EVIDENCE_FORMAT.into(),
-            quote: decode("quote", &self.quote)?,
-            event_log: self.event_log.clone(),
-        })
+    /// The evidence to appraise: exactly one of the two forms, never both or neither.
+    pub fn evidence(&self) -> Result<AnyEvidence, Error> {
+        match (
+            &self.evidence_v2,
+            self.quote.is_empty() && self.event_log.is_empty(),
+        ) {
+            (Some(v2), true) => Ok(AnyEvidence::V2(v2.clone())),
+            (None, false) => Ok(AnyEvidence::V1(Evidence {
+                format: EVIDENCE_FORMAT.into(),
+                quote: decode("quote", &self.quote)?,
+                event_log: self.event_log.clone(),
+            })),
+            _ => Err(Error::Invalid(
+                "node evidence: expected either quote and event_log or evidence".into(),
+            )),
+        }
     }
 
     pub fn runtime_spki(&self) -> Result<Vec<u8>, Error> {
@@ -353,24 +370,115 @@ impl BootstrapReply {
     }
 }
 
+/// A point of a KMS node's audit chain: a linked row's `seq` and its `link` (base64url of 32
+/// bytes), which commits to every row before it. A node that knows a head refuses a database that
+/// does not hold it: one restored from an older copy, or another copy altogether.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditHead {
+    pub seq: i64,
+    pub link: String,
+}
+
+/// `GET /v1/node/audit-head`: the highest head the node has seen committed, `None` before it has
+/// seen any.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditHeadReply {
+    pub head: Option<AuditHead>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UnsealRequest {
     pub share_hpke: Sealed,
+    /// The head the custodian's share file remembers from an earlier unseal: the node refuses to
+    /// serve a database that does not hold it. Sent only when present, so an earlier release's
+    /// node still takes a request without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_floor: Option<AuditHead>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UnsealReply {
     pub sealed: bool,
     pub shares: usize,
+    /// Once serving: the audit head the node serves from, for the custodian's share file.
+    #[serde(default)]
+    pub audit_head: Option<AuditHead>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JoinRequest {
     pub nonce: String,
-    pub evidence: Evidence,
+    /// `alphacompute-evidence/1` from a prototype node, `/2` from a Kata node.
+    pub evidence: AnyEvidence,
     pub xwing_pubkey: PublicKey,
+}
+
+pub const ROTATION_FORMAT: &str = "alphacompute-custodian-rotation/1";
+
+/// What two current custodians approve: a new root KEK split to exactly these three X-Wing keys,
+/// on the node whose runtime key `kms_node_spki_sha256` names, over a nonce that node minted.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RotationProposal {
+    pub format: String,
+    pub nonce: String,
+    pub kms_node_spki_sha256: String,
+    pub custodians: [PublicKey; 3],
+}
+
+impl RotationProposal {
+    /// `signing_digest(CUSTODIAN_ROTATION, proposal)`: what each approval is bound to.
+    pub fn digest(&self) -> Result<[u8; 32], Error> {
+        let value = serde_json::to_value(self)
+            .map_err(|e| Error::Invalid(format!("rotation proposal: {e}")))?;
+        signing_digest(context::CUSTODIAN_ROTATION, &value)
+            .map_err(|e| Error::Invalid(format!("rotation proposal: {e}")))
+    }
+}
+
+/// One current custodian's approval: `approval_hpke` seals `digest(proposal) ‖ share` to the
+/// node's X-Wing key under `INFO_CUSTODIAN_APPROVAL`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RotateRequest {
+    pub proposal: RotationProposal,
+    pub approval_hpke: Sealed,
+}
+
+/// A committed rotation as the node stores and serves it: the proposal, the new root's three
+/// shares sealed to the new custodians in the proposal's order, and the node's receipt, whose
+/// signed response carries the digests of everything beside it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rotation {
+    pub id: String,
+    pub proposal: RotationProposal,
+    pub shares_hpke: Vec<Sealed>,
+    pub receipt: Value,
+}
+
+/// What a rotation's receipt names a sealed share by: SHA-256 of its canonical JSON.
+pub fn sealed_sha256(sealed: &Sealed) -> Result<String, Error> {
+    let value = serde_json::to_value(sealed).map_err(|e| Error::Invalid(e.to_string()))?;
+    let bytes = alpha_core::jcs(&value).map_err(|e| Error::Invalid(e.to_string()))?;
+    Ok(alpha_channel::sha256_label(&bytes))
+}
+
+/// The route name a rotation's receipt carries.
+pub const ROTATION_ROUTE: &str = "custodians.rotate";
+
+/// `rotation` is present once the second approval has rotated the root.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RotateReply {
+    pub rotated: bool,
+    pub approvals: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation: Option<Rotation>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -378,6 +486,13 @@ pub struct JoinReply {
     pub tenant_kek_root: String,
     pub ca_key: String,
     pub ca_cert: String,
+    /// The latest custodian rotation's data key (`epoch ‖ key ‖ earlier audit keys`), which every
+    /// row is sealed under since; absent before the first rotation.
+    #[serde(default)]
+    pub data_key: Option<String>,
+    /// The serving node's audit head: the joining node refuses to serve a database without it.
+    #[serde(default)]
+    pub audit_head: Option<AuditHead>,
 }
 
 pub struct Client {
@@ -537,6 +652,20 @@ impl Client {
 
     pub async fn join(&self, body: &JoinRequest) -> Result<JoinReply, Error> {
         self.post("/v1/node/join", body).await
+    }
+
+    pub async fn rotate_custodians(&self, body: &RotateRequest) -> Result<RotateReply, Error> {
+        self.post("/v1/node/custodians/rotate", body).await
+    }
+
+    /// The last committed rotation, which the node keeps for a reply that never arrived.
+    pub async fn last_rotation(&self) -> Result<Rotation, Error> {
+        self.request(Method::GET, "/v1/node/custodians/rotation", None)
+            .await
+    }
+
+    pub async fn audit_head(&self) -> Result<AuditHeadReply, Error> {
+        self.request(Method::GET, "/v1/node/audit-head", None).await
     }
 }
 

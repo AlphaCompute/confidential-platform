@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select compose_hash from revisions where compose_hash = $1 for update",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "compose_hash",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "revisions",
+            "name": "compose_hash"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "071c68e336d1e74503b2d3a89f14fb98a4406f5d3ebf7ebb9e1a6865c9118e92"
+}

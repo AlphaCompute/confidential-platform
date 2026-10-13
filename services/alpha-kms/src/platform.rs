@@ -62,7 +62,8 @@ pub async fn load_stored(node: &Node) -> Result<Option<Verified>, ApiError> {
 }
 
 /// Applies a verified document: the row moves only to a higher version (with a
-/// `platform.reload` audit row), memory follows the row.
+/// `platform.reload` audit row), memory follows the row. A lower version, a rollback to a document
+/// the release key once signed, is refused with a denied `platform.reload` row.
 pub async fn apply(node: &Node, verified: Verified) -> Result<(), ApiError> {
     let version = i32::try_from(verified.document.version)
         .map_err(|_| ApiError::internal("platform document version overflows"))?;
@@ -70,11 +71,19 @@ pub async fn apply(node: &Node, verified: Verified) -> Result<(), ApiError> {
     let stored = sqlx::query_scalar!("select version from platform_document for update")
         .fetch_optional(&mut *tx)
         .await?;
+    let mut appended = None;
     match stored {
         Some(stored) if stored > version => {
-            return Err(ApiError::internal(format!(
-                "platform document version {version} is below the stored {stored}"
-            )));
+            drop(tx);
+            let message =
+                format!("platform document version {version} is below the stored {stored}");
+            node.audit(audit::node(
+                "platform.reload",
+                "denied",
+                json!({ "version": version, "stored": stored, "message": message }),
+            ))
+            .await?;
+            return Err(ApiError::internal(message));
         }
         Some(stored) if stored == version => {}
         _ => {
@@ -87,16 +96,22 @@ pub async fn apply(node: &Node, verified: Verified) -> Result<(), ApiError> {
             )
             .execute(&mut *tx)
             .await?;
-            audit::node(
-                "platform.reload",
-                "ok",
-                json!({ "version": version, "previous": stored }),
-            )
-            .insert(&mut *tx)
-            .await?;
+            let keys = node.intermediates().ok();
+            appended = Some(
+                audit::node(
+                    "platform.reload",
+                    "ok",
+                    json!({ "version": version, "previous": stored }),
+                )
+                .insert(&mut tx, &node.chain, keys.as_ref().map(|k| &k.metadata))
+                .await?,
+            );
         }
     }
     tx.commit().await?;
+    if let Some(appended) = appended {
+        appended.committed(&node.chain);
+    }
     let mut platform = node.platform.write();
     if platform
         .as_ref()
@@ -139,12 +154,14 @@ pub async fn run(node: Arc<Node>) {
             eprintln!("platform document: {}", e.message);
         }
         renew_leaf(&node);
+        node.maintain().await;
     }
 }
 
-/// The node's own one-hour leaf is simply reissued on every tick.
+/// The node's own one-hour leaf is simply reissued on every tick, also once it has halted: it
+/// then releases nothing, but its peers still read its audit head over a channel pinned to the CA.
 fn renew_leaf(node: &Node) {
-    if let Ok(keys) = node.intermediates()
+    if let Some(keys) = node.held_intermediates()
         && let Err(e) = node.issue_own_leaf(&keys)
     {
         eprintln!("leaf renewal: {}", e.message);

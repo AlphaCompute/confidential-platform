@@ -9,7 +9,7 @@ use alpha_cli::call::Route;
 use alpha_cli::deploy::{Shroud, wrap};
 use alpha_cli::keyfile::{self, Algorithm};
 use alpha_cli::request::Call;
-use alpha_cli::{coco, instances, node, sign};
+use alpha_cli::{coco, custodians, instances, node, sign};
 use alpha_client::platform::SignedDocument;
 use alpha_client::{Client, Pin};
 use alpha_core::{AppId, KeyId, OrgId, PrincipalId};
@@ -20,7 +20,7 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
 
 /// The alphacompute CLI: keys, Control calls, the platform document, deploys, and the
-/// custodians' bootstrap and unseal.
+/// custodians' bootstrap, unseal and rotation.
 #[derive(Parser)]
 #[command(name = "alpha", version)]
 struct Cli {
@@ -199,6 +199,18 @@ enum Command {
         key: PathBuf,
         #[arg(long)]
         endpoint: String,
+        /// Send no audit head: accept a KMS database restored from before the head this share
+        /// file remembers. A recorded custodian decision, never a retry.
+        #[arg(long)]
+        accept_audit_rollback: bool,
+    },
+    /// Record in a share file the audit head an attested serving node has seen committed, so the
+    /// next unseal refuses a database restored from before it. Sends nothing to the node.
+    Witness {
+        #[arg(long)]
+        share: PathBuf,
+        #[arg(long)]
+        endpoint: String,
     },
     /// Genesis on an empty database: three custodian public keys.
     Bootstrap {
@@ -208,6 +220,124 @@ enum Command {
         #[arg(long)]
         endpoint: String,
     },
+    /// Replace the custodians: a new root KEK split to three new keys, approved by two current
+    /// custodians; the old shares open nothing afterwards.
+    Custodians {
+        #[command(subcommand)]
+        command: CustodiansCommand,
+    },
+}
+
+/// What every custodian command takes beside its own flags.
+#[derive(Args)]
+struct NodeFlags {
+    /// The serving node, attested before anything is sent to it.
+    #[arg(long)]
+    endpoint: String,
+    /// Skip the D9 check that a Kata node's agent policy holds the Alpha baseline; the output
+    /// records `"policy_baseline": "skipped"`.
+    #[arg(long)]
+    no_policy_baseline: bool,
+}
+
+#[derive(Subcommand)]
+enum CustodiansCommand {
+    /// Writes the proposal: the attested node, a nonce it minted (five minutes) and the three new
+    /// custodians' public keys. Hand it to the two approving custodians.
+    Propose {
+        /// Three files, each holding a new custodian's public key as `keygen --custodian` printed it.
+        #[arg(long, value_delimiter = ',', num_args = 3)]
+        custodians: Vec<PathBuf>,
+        #[arg(long, default_value = "proposal.json")]
+        out: PathBuf,
+        #[command(flatten)]
+        node: NodeFlags,
+    },
+    /// A current custodian approves the proposal with their share. The second approval rotates
+    /// and writes the rotation (new shares sealed to the new custodians, and the receipt).
+    Rotate {
+        #[arg(long)]
+        proposal: PathBuf,
+        #[arg(long)]
+        share: PathBuf,
+        /// Custodian key file.
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long, default_value = "rotation.json")]
+        out: PathBuf,
+        #[command(flatten)]
+        node: NodeFlags,
+    },
+    /// A new custodian verifies the rotation and the node, then keeps their share. Without
+    /// `--rotation`, the node's last committed rotation is fetched.
+    Accept {
+        #[arg(long)]
+        rotation: Option<PathBuf>,
+        /// The new custodian's key file.
+        #[arg(long)]
+        key: PathBuf,
+        /// The new share file; it must not exist.
+        #[arg(long)]
+        out: PathBuf,
+        #[command(flatten)]
+        node: NodeFlags,
+    },
+}
+
+fn read_custodian_keys(paths: &[PathBuf], flag: &str) -> Result<[PublicKey; 3], Exit> {
+    let mut keys = Vec::new();
+    for path in paths {
+        let text = fs::read_to_string(path)
+            .map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))?;
+        let bytes = BASE64_URL_SAFE_NO_PAD
+            .decode(text.trim())
+            .map_err(|_| Exit::Usage(format!("{}: not base64url", path.display())))?;
+        keys.push(
+            PublicKey::try_from(bytes.as_slice())
+                .map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))?,
+        );
+    }
+    keys.try_into()
+        .map_err(|_| Exit::Usage(format!("--{flag} takes exactly three files")))
+}
+
+/// The node attested as `unseal` attests it, then its agent policy against the baseline.
+async fn attested_custodian_node(
+    config: &Config,
+    flags: &NodeFlags,
+    doc: &PlatformDocument,
+    remembered: Option<u64>,
+    now: SystemTime,
+) -> Result<(node::AttestedNode, Client, Value), Exit> {
+    let (attested, client) =
+        node::attested_node(&flags.endpoint, &config.pccs_url, doc, remembered, now).await?;
+    let baseline = if flags.no_policy_baseline {
+        custodians::Baseline::Skip
+    } else {
+        custodians::Baseline::Check(custodians::alpha_baseline)
+    };
+    let held = custodians::check_baseline(attested.policy.as_deref(), baseline)?;
+    let mut summary = attested.summary();
+    if let Some(fields) = summary.as_object_mut() {
+        fields.insert("policy_baseline".into(), json!(held));
+    }
+    Ok((attested, client, summary))
+}
+
+fn write_new(path: &Path, value: &impl serde::Serialize) -> Result<(), Exit> {
+    let text =
+        serde_json::to_string_pretty(value).map_err(|e| Exit::Refused(e.to_string()))? + "\n";
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, text.as_bytes()))
+        .map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))
+}
+
+fn read_typed<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Exit> {
+    serde_json::from_value(read_json(path)?)
+        .map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))
 }
 
 #[derive(Subcommand)]
@@ -646,42 +776,150 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             share,
             key,
             endpoint,
+            accept_audit_rollback,
         } => {
             let remembered = node::ShareFile::read(&share)?.platform_document_version;
             let doc = platform_document(config, now).await?;
             let custodian = keyfile::read(&key, &passphrase("passphrase: ")?)?.xwing()?;
-            let (identity, client) =
+            let (attested, client) =
                 node::attested_node(&endpoint, &config.pccs_url, &doc, Some(remembered), now)
                     .await?;
-            let reply = node::unseal(&client, &identity, &share, &custodian, doc.version).await?;
-            Ok(json!(reply))
+            let reply = node::unseal(
+                &client,
+                &attested.identity,
+                &share,
+                &custodian,
+                doc.version,
+                accept_audit_rollback,
+            )
+            .await?;
+            Ok(json!({
+                "sealed": reply.sealed,
+                "shares": reply.shares,
+                "audit_head": reply.audit_head,
+                "audit_rollback_accepted": accept_audit_rollback,
+                "node": attested.summary(),
+            }))
+        }
+        Command::Witness { share, endpoint } => {
+            let remembered = node::ShareFile::read(&share)?.platform_document_version;
+            let doc = platform_document(config, now).await?;
+            let (attested, client) =
+                node::attested_node(&endpoint, &config.pccs_url, &doc, Some(remembered), now)
+                    .await?;
+            let witnessed = node::witness(&client, &share).await?;
+            Ok(json!({
+                "audit_head": witnessed.audit_head,
+                "node_audit_head": witnessed.node_audit_head,
+                "node": attested.summary(),
+            }))
         }
         Command::Bootstrap {
             custodians,
             endpoint,
         } => {
-            let mut keys = Vec::new();
-            for path in &custodians {
-                let text = fs::read_to_string(path)
-                    .map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))?;
-                let bytes = BASE64_URL_SAFE_NO_PAD
-                    .decode(text.trim())
-                    .map_err(|_| Exit::Usage(format!("{}: not base64url", path.display())))?;
-                keys.push(
-                    PublicKey::try_from(bytes.as_slice())
-                        .map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))?,
-                );
-            }
-            let custodians: [PublicKey; 3] = keys
-                .try_into()
-                .map_err(|_| Exit::Usage("--custodians takes exactly three files".into()))?;
+            let custodians = read_custodian_keys(&custodians, "custodians")?;
             let doc = platform_document(config, now).await?;
-            let (identity, client) =
+            let (attested, client) =
                 node::attested_node(&endpoint, &config.pccs_url, &doc, None, now).await?;
-            Ok(
-                node::bootstrap(&client, &identity, custodians, doc.version, Path::new("."))
-                    .await?,
+            let mut out = node::bootstrap(
+                &client,
+                &attested.identity,
+                custodians,
+                doc.version,
+                Path::new("."),
             )
+            .await?;
+            if let Some(fields) = out.as_object_mut() {
+                fields.insert("node".into(), attested.summary());
+            }
+            Ok(out)
+        }
+        Command::Custodians { command } => custodians_command(config, command, now).await,
+    }
+}
+
+async fn custodians_command(
+    config: &Config,
+    command: CustodiansCommand,
+    now: SystemTime,
+) -> Result<Value, Exit> {
+    match command {
+        CustodiansCommand::Propose {
+            custodians: paths,
+            out,
+            node: flags,
+        } => {
+            let keys = read_custodian_keys(&paths, "custodians")?;
+            let doc = platform_document(config, now).await?;
+            let (attested, client, summary) =
+                attested_custodian_node(config, &flags, &doc, None, now).await?;
+            let proposal = custodians::propose(&client, &attested.identity, keys).await?;
+            write_new(&out, &proposal)?;
+            Ok(json!({
+                "proposal": out,
+                "check": custodians::describe(&proposal)?,
+                "node": summary,
+            }))
+        }
+        CustodiansCommand::Rotate {
+            proposal,
+            share,
+            key,
+            out,
+            node: flags,
+        } => {
+            let proposal: alpha_client::RotationProposal = read_typed(&proposal)?;
+            let remembered = node::ShareFile::read(&share)?.platform_document_version;
+            let doc = platform_document(config, now).await?;
+            let custodian = keyfile::read(&key, &passphrase("passphrase: ")?)?.xwing()?;
+            let (attested, client, summary) =
+                attested_custodian_node(config, &flags, &doc, Some(remembered), now).await?;
+            let reply = custodians::approve(
+                &client,
+                &attested.identity,
+                &proposal,
+                &share,
+                &custodian,
+                &doc,
+            )
+            .await?;
+            let mut result = json!({
+                "rotated": reply.rotated,
+                "approvals": reply.approvals,
+                "check": custodians::describe(&proposal)?,
+                "node": summary,
+            });
+            if let (Some(rotation), Some(fields)) = (&reply.rotation, result.as_object_mut()) {
+                write_new(&out, rotation)?;
+                fields.insert("rotation".into(), json!(out));
+                fields.insert("rotation_id".into(), json!(rotation.id));
+            }
+            Ok(result)
+        }
+        CustodiansCommand::Accept {
+            rotation,
+            key,
+            out,
+            node: flags,
+        } => {
+            let doc = platform_document(config, now).await?;
+            let custodian = keyfile::read(&key, &passphrase("passphrase: ")?)?.xwing()?;
+            let (attested, client, summary) =
+                attested_custodian_node(config, &flags, &doc, None, now).await?;
+            let rotation = match rotation {
+                Some(path) => read_typed(&path)?,
+                None => client.last_rotation().await?,
+            };
+            let mut result = custodians::accept(&rotation, &doc, &custodian, &out)?;
+            if let Some(fields) = result.as_object_mut() {
+                fields.insert(
+                    "rotating_node_attested".into(),
+                    json!(custodians::is_rotating_node(&rotation, &attested.identity)),
+                );
+                fields.insert("node".into(), summary);
+            }
+            Ok(result)
         }
     }
 }

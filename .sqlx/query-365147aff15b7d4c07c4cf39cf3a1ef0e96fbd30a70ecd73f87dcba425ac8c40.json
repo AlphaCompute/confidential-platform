@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update secrets set name_index = $2, sealed = $3,\n               org_id = null, name = null, app_ids = null, content_sha256 = null, document = null,\n               signed_by_key = null, signature = null, issued_at = null\n             where id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bytea",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "365147aff15b7d4c07c4cf39cf3a1ef0e96fbd30a70ecd73f87dcba425ac8c40"
+}

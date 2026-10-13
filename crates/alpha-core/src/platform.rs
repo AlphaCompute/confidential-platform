@@ -9,6 +9,28 @@ pub struct KmsRevision {
     pub compose_hash: ComposeHash,
     pub build: String,
     pub source_url: String,
+    /// The evidence profile this build's nodes attest under. A document written before Kata has
+    /// none, and every build in it is a prototype CVM's. During the migration (PRD-05) one
+    /// document lists the prototype build and the Kata build side by side.
+    #[serde(default, skip_serializing_if = "KmsRevisionKind::is_prototype")]
+    pub kind: KmsRevisionKind,
+}
+
+/// What a KMS build's `compose_hash` is the hash of: a prototype CVM's measured compose
+/// (`alphacompute-evidence/1`) or a Kata pod's Revision v2 rebuilt from its init-data
+/// (`kata-tdx/1`). A node is admitted only under the profile its build is listed for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KmsRevisionKind {
+    #[default]
+    PrototypeTdx,
+    KataTdx,
+}
+
+impl KmsRevisionKind {
+    pub fn is_prototype(&self) -> bool {
+        *self == Self::PrototypeTdx
+    }
 }
 
 /// The Kata agent policy every init-data Revision must carry, as
@@ -348,5 +370,23 @@ mod tests {
                 "{algorithm:?} {public_key:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_kms_revision_without_kind_is_a_prototype_build_and_a_kata_build_says_so() {
+        let hash = crate::compose_hash("{}");
+        let old = json!({ "compose_hash": hash, "build": "kms v1", "source_url": "u" });
+        let revision: KmsRevision = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(revision.kind, KmsRevisionKind::PrototypeTdx);
+        assert_eq!(serde_json::to_value(&revision).unwrap(), old);
+
+        let mut kata = old;
+        kata["kind"] = json!("kata-tdx");
+        let revision: KmsRevision = serde_json::from_value(kata.clone()).unwrap();
+        assert_eq!(revision.kind, KmsRevisionKind::KataTdx);
+        assert_eq!(serde_json::to_value(&revision).unwrap(), kata);
+
+        kata["kind"] = json!("kata-snp");
+        assert!(serde_json::from_value::<KmsRevision>(kata).is_err());
     }
 }

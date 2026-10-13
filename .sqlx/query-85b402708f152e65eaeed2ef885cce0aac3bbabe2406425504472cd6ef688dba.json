@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into intermediate_keys (purpose, wrapped, epoch) values ('data-key', $1, $2)\n           on conflict (purpose) do update set wrapped = $1, epoch = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "85b402708f152e65eaeed2ef885cce0aac3bbabe2406425504472cd6ef688dba"
+}

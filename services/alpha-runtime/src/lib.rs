@@ -731,6 +731,69 @@ mod tests {
     const HASH: &str = "sha256:ee097e09c4824eb6424202fe20ed882d19a33a563f3b3dd5988f3ff8ee1b8335";
 
     #[test]
+    fn quote_source_selects_the_guest() {
+        use alpha_tsm::coco::QuoteSource::*;
+        assert_eq!(parse_guest(None).unwrap(), Guest::Prototype);
+        assert_eq!(parse_guest(Some("dstack")).unwrap(), Guest::Prototype);
+        assert_eq!(
+            parse_guest(Some("coco-aa")).unwrap(),
+            Guest::Coco(AttestationAgent)
+        );
+        assert_eq!(
+            parse_guest(Some("coco-tsm")).unwrap(),
+            Guest::Coco(ConfigfsTsm)
+        );
+        let error = parse_guest(Some("tdx")).unwrap_err().to_string();
+        assert!(error.contains(QUOTE_SOURCE_ENV), "{error}");
+    }
+
+    const INITDATA: &str = r#"algorithm = "sha384"
+version = "0.1.0"
+
+[data]
+"policy.rego" = '''
+package agent_policy
+'''
+"alpha.json" = '''{"app_id":"01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b","format":"alphacompute-initdata/1","gpu":{"count":8,"model":"B300"},"runtime_class":"kata-qemu-nvidia-gpu-tdx"}'''
+"#;
+
+    #[test]
+    fn a_kata_pod_serves_the_revision_v2_its_initdata_stands_for() {
+        let source = alpha_tsm::coco::QuoteSource::ConfigfsTsm;
+        let coco = coco_identity(source, INITDATA.as_bytes().to_vec()).unwrap();
+        let expected = alpha_core::coco::InitData::parse(INITDATA.as_bytes())
+            .unwrap()
+            .revision()
+            .unwrap();
+        assert_eq!(coco.revision, expected.canonical().unwrap());
+        assert_eq!(coco.initdata, INITDATA.as_bytes());
+        // No TSM tree here: the source fails at the pod rather than sending something partial.
+        assert!((coco.evidence)(&[0; 64]).is_err());
+        assert!(coco_identity(source, b"not toml".to_vec()).is_err());
+    }
+
+    #[test]
+    fn a_cpu_class_pod_serves_a_revision_v2_without_gpus() {
+        let source = alpha_tsm::coco::QuoteSource::AttestationAgent;
+        let cpu = INITDATA
+            .replace(r#""gpu":{"count":8,"model":"B300"},"#, "")
+            .replace("kata-qemu-nvidia-gpu-tdx", "kata-qemu-tdx");
+        let coco = coco_identity(source, cpu.into_bytes()).unwrap();
+        let revision: alpha_core::coco::CocoRevision =
+            serde_json::from_str(&coco.revision).unwrap();
+        assert_eq!(revision.runtime_class, alpha_core::coco::CPU_RUNTIME_CLASS);
+        assert_eq!(revision.gpu, None);
+
+        // A CPU-class init-data that expects GPUs fails at the pod, before it asks for a leaf.
+        let with_gpus = INITDATA.replace("kata-qemu-nvidia-gpu-tdx", "kata-qemu-tdx");
+        let error = coco_identity(source, with_gpus.into_bytes())
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("runs no GPU"), "{error}");
+    }
+
+    #[test]
     fn config_parses_the_three_variables_and_refuses_empty_or_malformed_ones() {
         let c = Config::parse(
             &format!(" {HASH} "),

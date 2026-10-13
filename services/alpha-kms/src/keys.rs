@@ -17,11 +17,16 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::error::ApiError;
-use crate::webauthn;
+use crate::{Intermediates, store, webauthn};
 
 pub type Key32 = Zeroizing<[u8; 32]>;
 
-fn derive(ikm: &[u8; 32], salt: &[u8], org: OrgId, anchor_spki: &[u8]) -> Result<Key32, ApiError> {
+pub(crate) fn derive(
+    ikm: &[u8; 32],
+    salt: &[u8],
+    org: OrgId,
+    anchor_spki: &[u8],
+) -> Result<Key32, ApiError> {
     let info = [org.as_bytes().as_slice(), &Sha256::digest(anchor_spki)].concat();
     let mut out = Zeroizing::new([0u8; 32]);
     Hkdf::<Sha256>::new(Some(salt), ikm)
@@ -124,11 +129,13 @@ pub fn verify_signature(
     }
 }
 
-/// A `principal_keys` row as the chain walk needs it.
-#[derive(Clone)]
+/// A `principal_keys` row as the chain walk needs it, opened from its sealed blob
+/// ([`crate::store::load_key`]).
+#[derive(Clone, Debug)]
 pub struct KeyRow {
     pub id: Uuid,
     pub org_id: Uuid,
+    pub principal_id: Uuid,
     pub public_key: Vec<u8>,
     pub document: Value,
     pub signature: Value,
@@ -136,18 +143,6 @@ pub struct KeyRow {
     pub anchor_check: Option<Vec<u8>>,
     pub revoked_at: Option<DateTime<Utc>>,
     pub revocation_reason: Option<String>,
-}
-
-pub async fn load_key(exec: impl PgExecutor<'_>, id: Uuid) -> Result<Option<KeyRow>, ApiError> {
-    Ok(sqlx::query_as!(
-        KeyRow,
-        r#"select id, org_id, public_key, document, signature, registered_by_key, anchor_check, revoked_at,
-                  revocation_reason::text as "revocation_reason"
-           from principal_keys where id = $1"#,
-        id
-    )
-    .fetch_optional(exec)
-    .await?)
 }
 
 /// The organization's anchor SPKI, for `org_key`.
@@ -164,13 +159,13 @@ pub struct Chain {
 /// the moment the link itself was registered.
 pub async fn walk_chain(
     exec: impl PgExecutor<'_> + Copy,
-    tenant_kek_root: &[u8; 32],
+    keys: &Intermediates,
     key_id: Uuid,
     mut signed_at: DateTime<Utc>,
     signer: Option<&Signer>,
 ) -> Result<Chain, ApiError> {
     let invalid = |m: &str| ApiError::signature_invalid(m.to_owned());
-    let first = load_key(exec, key_id)
+    let first = store::load_key(exec, &keys.metadata, key_id)
         .await?
         .ok_or_else(|| invalid("unknown key"))?;
     let mut current = Some(first.clone());
@@ -191,8 +186,11 @@ pub async fn walk_chain(
         }
         match link.registered_by_key {
             None => {
-                let expected =
-                    anchor_check(tenant_kek_root, OrgId::from(link.org_id), &link.public_key)?;
+                let expected = anchor_check(
+                    &keys.tenant_kek_root,
+                    OrgId::from(link.org_id),
+                    &link.public_key,
+                )?;
                 if link.anchor_check.as_deref() != Some(expected.as_slice()) {
                     return Err(invalid(
                         "the chain does not end at the organization's anchor",
@@ -216,7 +214,7 @@ pub async fn walk_chain(
                 if hops > 64 {
                     return Err(invalid("the chain does not end"));
                 }
-                current = load_key(exec, parent).await?;
+                current = store::load_key(exec, &keys.metadata, parent).await?;
                 child = Some(link);
             }
         }
@@ -322,7 +320,7 @@ pub fn check_shape(signature: &SignatureObject) -> Result<(), ApiError> {
 /// Verifies a signature object over `document` under `context` and walks the signer's chain.
 pub async fn verify_signed(
     exec: impl PgExecutor<'_> + Copy,
-    tenant_kek_root: &[u8; 32],
+    keys: &Intermediates,
     signature: &SignatureObject,
     context: &str,
     document: &Value,
@@ -332,7 +330,7 @@ pub async fn verify_signed(
     let key_id = signature
         .key_id
         .ok_or_else(|| ApiError::malformed("signature: key_id is required"))?;
-    let chain = walk_chain(exec, tenant_kek_root, key_id.into(), signed_at, signer).await?;
+    let chain = walk_chain(exec, keys, key_id.into(), signed_at, signer).await?;
     let digest = signing_digest(context, document)
         .map_err(|e| ApiError::malformed(format!("payload: {e}")))?;
     verify_signature(&chain.key.public_key, &digest, signature, signer)?;

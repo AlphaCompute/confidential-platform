@@ -1,6 +1,10 @@
 {
   "db_name": "PostgreSQL",
+<<<<<<<< HEAD:.sqlx/query-658fcecafef0233e004b43d1ed28c5760743aa5a610308146ad46f2088d0361f.json
+  "query": "insert into principal_keys (id, org_index, public_key_index, anchor_check, sealed)\n         values ($1, $2, $3, $4, $5) returning created_at",
+========
   "query": "insert into revisions (compose_hash, app_id, org_id, compose, init_data, created_by_key, signature)\n             values ($1, $2, $3, $4, $5, $6, $7) returning created_at",
+>>>>>>>> origin/main:.sqlx/query-51ef251def55df0dc33b565f92f701f03bc4729ced44a05bff5e8c8d9bbb9600.json
   "describe": {
     "columns": [
       {
@@ -9,7 +13,7 @@
         "type_info": "Timestamptz",
         "origin": {
           "Table": {
-            "table": "revisions",
+            "table": "principal_keys",
             "name": "created_at"
           }
         }
@@ -17,18 +21,29 @@
     ],
     "parameters": {
       "Left": [
+        "Uuid",
         "Bytea",
+<<<<<<<< HEAD:.sqlx/query-658fcecafef0233e004b43d1ed28c5760743aa5a610308146ad46f2088d0361f.json
+        "Bytea",
+        "Bytea",
+        "Bytea"
+========
         "Uuid",
         "Uuid",
         "Text",
         "Text",
         "Uuid",
         "Jsonb"
+>>>>>>>> origin/main:.sqlx/query-51ef251def55df0dc33b565f92f701f03bc4729ced44a05bff5e8c8d9bbb9600.json
       ]
     },
     "nullable": [
       false
     ]
   },
+<<<<<<<< HEAD:.sqlx/query-658fcecafef0233e004b43d1ed28c5760743aa5a610308146ad46f2088d0361f.json
+  "hash": "658fcecafef0233e004b43d1ed28c5760743aa5a610308146ad46f2088d0361f"
+========
   "hash": "51ef251def55df0dc33b565f92f701f03bc4729ced44a05bff5e8c8d9bbb9600"
+>>>>>>>> origin/main:.sqlx/query-51ef251def55df0dc33b565f92f701f03bc4729ced44a05bff5e8c8d9bbb9600.json
 }

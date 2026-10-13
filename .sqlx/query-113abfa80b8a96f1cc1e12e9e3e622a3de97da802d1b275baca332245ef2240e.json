@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update revisions set sealed = $2 where compose_hash = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "113abfa80b8a96f1cc1e12e9e3e622a3de97da802d1b275baca332245ef2240e"
+}

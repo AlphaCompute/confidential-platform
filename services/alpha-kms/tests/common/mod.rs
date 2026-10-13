@@ -3,18 +3,22 @@
 //! HTTP server standing in for the release artifact URL, and a bootstrapped organization.
 #![allow(dead_code)]
 
+pub mod kata;
+
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use alpha_attest::{EVIDENCE_FORMAT, EventLogEntry, Evidence};
+use alpha_attest::{EVIDENCE_FORMAT, EventLogEntry, Evidence, GpuVerifier};
 use alpha_channel::receipt::{self, Expected};
 use alpha_cli::node::{NodeIdentity, ShareFile};
 use alpha_client::{Client, Pin};
 use alpha_core::{AppId, KeyId, OrgId, PrincipalId, context};
 use alpha_crypto::{INFO_UNSEAL_SHARE, PrivateKey, PublicKey};
-use alpha_kms::{Clock, CollateralSource, Config, Node, platform, rfc3339, tls};
+use alpha_kms::instance::RevisionRow;
+use alpha_kms::store::{self, Index, KeyRecord, MetadataKeys, SecretRecord, Table};
+use alpha_kms::{Clock, CollateralSource, Config, Node, NodeGuest, audit, platform, rfc3339, tls};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use ed25519_dalek::SigningKey;
@@ -227,6 +231,7 @@ pub async fn start_node(
     let config = Config {
         kms_endpoints: vec![],
         platform_document_url: release_url.to_owned(),
+        gpu_backends: vec![],
         #[cfg(feature = "dev-root")]
         dev_root_kek: None,
     };
@@ -236,7 +241,62 @@ pub async fn start_node(
         clock,
         CollateralSource::Fixed(Box::new(collateral)),
         nonce_key(),
-        event_log,
+        NodeGuest::prototype(event_log).unwrap(),
+        release_key.verifying_key(),
+    )
+    .unwrap();
+    platform::start(&node).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("https://{}", listener.local_addr().unwrap());
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let app = alpha_kms::router(node.clone());
+    let cert = node.server_cert.clone();
+    tokio::spawn(async move {
+        alpha_client::tls::serve(listener, tls::server_config(cert).unwrap(), app, async {
+            let _ = rx.await;
+        })
+        .await
+    });
+    (node, base, tx)
+}
+
+/// [`start_node`] with these GPU verifier backends.
+pub async fn start_node_with(
+    pool: PgPool,
+    release_url: &str,
+    release_key: &SigningKey,
+    clock: Clock,
+    gpu_backends: Vec<Arc<dyn GpuVerifier>>,
+) -> (Arc<Node>, String, tokio::sync::oneshot::Sender<()>) {
+    start_node_with_peers(pool, release_url, release_key, clock, gpu_backends, vec![]).await
+}
+
+/// [`start_node_with`] whose `kms_endpoints` are `peers`.
+pub async fn start_node_with_peers(
+    pool: PgPool,
+    release_url: &str,
+    release_key: &SigningKey,
+    clock: Clock,
+    gpu_backends: Vec<Arc<dyn GpuVerifier>>,
+    peers: Vec<String>,
+) -> (Arc<Node>, String, tokio::sync::oneshot::Sender<()>) {
+    let event_log: Vec<EventLogEntry> =
+        serde_json::from_slice(&read(KEYED, "event_log.json")).unwrap();
+    let collateral = serde_json::from_slice(&read(KEYED, "collateral.json")).unwrap();
+    let config = Config {
+        kms_endpoints: peers,
+        platform_document_url: release_url.to_owned(),
+        gpu_backends,
+        #[cfg(feature = "dev-root")]
+        dev_root_kek: None,
+    };
+    let node = Node::new(
+        pool,
+        config,
+        clock,
+        CollateralSource::Fixed(Box::new(collateral)),
+        nonce_key(),
+        NodeGuest::prototype(event_log).unwrap(),
         release_key.verifying_key(),
     )
     .unwrap();
@@ -267,7 +327,75 @@ pub async fn harness() -> Option<Harness> {
 }
 
 pub async fn harness_with_clock(clock: Clock) -> Option<Harness> {
-    harness_on(clock, KEYED, platform_document(KEYED)).await
+    harness_with(clock, Vec::new()).await
+}
+
+/// [`harness_with_clock`] on a node with these GPU verifier backends.
+pub async fn harness_with(
+    clock: Clock,
+    gpu_backends: Vec<Arc<dyn GpuVerifier>>,
+) -> Option<Harness> {
+    let pool = fresh_database().await?;
+    let release = ReleaseServer::start(platform_document(KEYED)).await;
+    let (node, base, shutdown) = start_node_with(
+        pool.clone(),
+        &release.url,
+        &release.key,
+        clock,
+        gpu_backends,
+    )
+    .await;
+    let custodians: Vec<PrivateKey> = (0..3).map(|_| PrivateKey::generate().unwrap()).collect();
+    let dir = std::env::temp_dir().join(format!("alpha-harness-{}", Uuid::now_v7()));
+    fs::create_dir_all(&dir).unwrap();
+    let identity = node_identity(&node);
+    let bootstrap = alpha_cli::node::bootstrap(
+        &spki_client(&base, &node),
+        &identity,
+        custodian_pubs(&custodians),
+        1,
+        &dir,
+    )
+    .await
+    .unwrap();
+    let org = OrgId::mint();
+    let root_key = SigningKey::from_bytes(&[7u8; 32]);
+    let (status, reply) = send(
+        client()
+            .post(format!("{base}/v1/keys"))
+            .json(&root_key_registration(org, &root_key, node.now())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let root_id: KeyId = reply["id"].as_str().unwrap().parse().unwrap();
+    let shares = (1..=3)
+        .zip(&custodians)
+        .map(|(i, custodian)| {
+            let file = ShareFile::read(&dir.join(format!("share-{i}.json"))).unwrap();
+            alpha_crypto::open(
+                custodian,
+                INFO_UNSEAL_SHARE,
+                &identity.aad(),
+                &file.share_hpke,
+            )
+            .unwrap()
+            .to_vec()
+        })
+        .collect();
+    Some(Harness {
+        node,
+        pool,
+        url: base,
+        release,
+        org,
+        root: (root_id, root_key),
+        custodians,
+        shares,
+        ca_pem: bootstrap["kms_ca_pem"].as_str().unwrap().to_owned(),
+        bootstrap,
+        dir,
+        _shutdown: shutdown,
+    })
 }
 
 /// A node at the Kata capture's time, with its collateral, and the Kata reference values and agent
@@ -425,19 +553,135 @@ impl Harness {
         signature: Value,
     ) -> alpha_core::ComposeHash {
         let hash = alpha_core::compose_hash(&compose);
-        sqlx::query!("insert into revisions (compose_hash, app_id, org_id, compose, created_by_key, signature, created_at) values ($1, $2, $3, $4, $5, $6, $7)",
-            hash.as_bytes().as_slice(), Uuid::from(app_id), Uuid::from(org), compose, Uuid::from(key), signature,
-            chrono::DateTime::<chrono::Utc>::from(self.now()))
-            .execute(&self.pool).await.unwrap();
+        let row = RevisionRow {
+            app_id: app_id.into(),
+            org_id: org.into(),
+            compose,
+            created_by_key: key.into(),
+            signature,
+            created_at: self.now().into(),
+            revoked_at: None,
+        };
+        store::insert_revision(&self.pool, &self.metadata(), hash, &row)
+            .await
+            .unwrap();
         hash
     }
 
+    /// Across every organization: the database's rows are opened, not queried by name.
     pub async fn secrets_named(&self, name: &str) -> i64 {
-        sqlx::query_scalar::<_, i64>("select count(*) from secrets where name = $1")
-            .bind(name)
-            .fetch_one(&self.pool)
+        self.secrets()
             .await
-            .unwrap()
+            .iter()
+            .filter(|(_, s)| s.name == name)
+            .count() as i64
+    }
+
+    /// The keys over the database's contents, as a test holding them reads and forges rows.
+    /// The serving node's keys over the database: epoch 0's, or the latest rotation's.
+    pub fn metadata(&self) -> MetadataKeys {
+        self.node.held_intermediates().unwrap().metadata.clone()
+    }
+
+    pub async fn keys(&self) -> Vec<(Uuid, KeyRecord)> {
+        let rows: Vec<(Uuid, Vec<u8>)> =
+            sqlx::query_as("select id, sealed from principal_keys order by created_at")
+                .fetch_all(&self.pool)
+                .await
+                .unwrap();
+        let keys = self.metadata();
+        rows.into_iter()
+            .map(|(id, sealed)| {
+                let record = keys
+                    .open(Table::PrincipalKeys, id.as_bytes(), &sealed)
+                    .unwrap();
+                (id, record)
+            })
+            .collect()
+    }
+
+    pub async fn revisions(&self) -> Vec<(Vec<u8>, RevisionRow)> {
+        let rows: Vec<(Vec<u8>, Vec<u8>)> =
+            sqlx::query_as("select compose_hash, sealed from revisions order by created_at")
+                .fetch_all(&self.pool)
+                .await
+                .unwrap();
+        let keys = self.metadata();
+        rows.into_iter()
+            .map(|(hash, sealed)| {
+                let row = keys.open(Table::Revisions, &hash, &sealed).unwrap();
+                (hash, row)
+            })
+            .collect()
+    }
+
+    pub async fn secrets(&self) -> Vec<(Uuid, SecretRecord)> {
+        let rows: Vec<(Uuid, Vec<u8>)> = sqlx::query_as("select id, sealed from secrets")
+            .fetch_all(&self.pool)
+            .await
+            .unwrap();
+        let keys = self.metadata();
+        rows.into_iter()
+            .map(|(id, sealed)| {
+                let record = keys.open(Table::Secrets, id.as_bytes(), &sealed).unwrap();
+                (id, record)
+            })
+            .collect()
+    }
+
+    /// What someone holding the metadata key could do to a `principal_keys` row: `edit` its
+    /// sealed fields and seal it again, its blind indexes following.
+    pub async fn edit_key(&self, id: impl Into<Uuid>, edit: impl FnOnce(&mut KeyRecord)) {
+        let id = id.into();
+        let keys = self.metadata();
+        let (_, mut record) = self
+            .keys()
+            .await
+            .into_iter()
+            .find(|(k, _)| *k == id)
+            .unwrap();
+        edit(&mut record);
+        sqlx::query("update principal_keys set sealed = $2, org_index = $3, public_key_index = $4 where id = $1")
+            .bind(id)
+            .bind(keys.seal(Table::PrincipalKeys, id.as_bytes(), &record).unwrap())
+            .bind(keys.index(Index::KeyOrg, record.org_id.as_bytes()).unwrap())
+            .bind(keys.index(Index::KeyPublicKey, &record.public_key).unwrap())
+            .execute(&self.pool)
+            .await
+            .unwrap();
+    }
+
+    /// [`Harness::edit_key`] for every Revision.
+    pub async fn edit_revisions(&self, edit: impl Fn(&mut RevisionRow)) {
+        let keys = self.metadata();
+        for (hash, mut row) in self.revisions().await {
+            edit(&mut row);
+            sqlx::query("update revisions set sealed = $2, app_index = $3, org_index = $4 where compose_hash = $1")
+                .bind(&hash)
+                .bind(keys.seal(Table::Revisions, &hash, &row).unwrap())
+                .bind(keys.index(Index::RevisionApp, row.app_id.as_bytes()).unwrap())
+                .bind(keys.index(Index::RevisionOrg, row.org_id.as_bytes()).unwrap())
+                .execute(&self.pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// [`Harness::edit_key`] for the Secrets named `name`.
+    pub async fn edit_secrets(&self, name: &str, edit: impl Fn(&mut SecretRecord)) {
+        let keys = self.metadata();
+        for (id, mut record) in self.secrets().await {
+            if record.name != name {
+                continue;
+            }
+            edit(&mut record);
+            sqlx::query("update secrets set sealed = $2 where id = $1")
+                .bind(id)
+                .bind(keys.seal(Table::Secrets, id.as_bytes(), &record).unwrap())
+                .execute(&self.pool)
+                .await
+                .unwrap();
+        }
     }
 
     pub async fn put_secret(
@@ -514,17 +758,27 @@ impl Harness {
         *alpha_kms::keys::app_key(&org_key, app, purpose).unwrap()
     }
 
-    pub async fn audit(&self, action: &str) -> Vec<(i64, String, Value)> {
-        sqlx::query!(
-            "select seq, outcome, details from audit_log where action = $1 order by seq",
-            action
+    /// Every row of the audit chain, verified and opened.
+    pub async fn audit_rows(&self) -> Vec<audit::Row> {
+        let mut rows = Vec::new();
+        audit::verify(
+            &self.pool,
+            &self.metadata(),
+            audit::Checkpoint::default(),
+            |row| rows.push(row),
         )
-        .fetch_all(&self.pool)
         .await
-        .unwrap()
-        .into_iter()
-        .map(|r| (r.seq, r.outcome, r.details))
-        .collect()
+        .unwrap();
+        rows
+    }
+
+    pub async fn audit(&self, action: &str) -> Vec<(i64, String, Value)> {
+        self.audit_rows()
+            .await
+            .into_iter()
+            .filter(|r| r.entry.action == action)
+            .map(|r| (r.seq, r.entry.outcome, r.entry.details))
+            .collect()
     }
 }
 
@@ -709,4 +963,62 @@ impl Ca {
         });
         url
     }
+}
+
+/// ACC-FD-103: a halted node is not ready, names only the fixed reason, releases nothing on any
+/// route and appends nothing to the chain, maintenance passes included.
+pub async fn assert_halted(h: &Harness, instance: &reqwest::Client, reason: &str) {
+    let rows = audit_count(h).await;
+    let (status, ready) = send(client().get(format!("{}/ready", h.url))).await;
+    assert_eq!(
+        (status, ready),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({ "sealed": false, "halted": reason })
+        )
+    );
+    let refused = |(status, reply): (StatusCode, Value)| {
+        assert_eq!(
+            (status, code(&reply)),
+            (StatusCode::SERVICE_UNAVAILABLE, "halted"),
+            "{reply}"
+        );
+    };
+    refused(send(instance.get(format!("{}/v1/secrets/chained", h.url))).await);
+    refused(
+        send(
+            instance
+                .post(format!("{}/v1/keys/derive", h.url))
+                .json(&json!({ "purpose": "disk" })),
+        )
+        .await,
+    );
+    refused(h.attest(KEYED).await);
+    refused(
+        h.put_secret("chained", &[AppId::mint()], b"w", h.now(), &h.root)
+            .await,
+    );
+    assert_eq!(h.node.intermediates().err().map(|e| e.code), Some("halted"));
+    let e = h
+        .node
+        .audit(audit::node("node.fact", "ok", json!({})))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, "halted");
+    h.node.maintain().await;
+    assert_eq!(audit_count(h).await, rows, "a halted node appends nothing");
+    // Its head stays readable, for its peers.
+    let (status, reply) = send(client().get(format!("{}/v1/node/audit-head", h.url))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        reply["head"],
+        json!(h.node.chain.floor().map(|f| f.to_wire()))
+    );
+}
+
+pub async fn audit_count(h: &Harness) -> i64 {
+    sqlx::query_scalar("select count(*) from audit_log")
+        .fetch_one(&h.pool)
+        .await
+        .unwrap()
 }
