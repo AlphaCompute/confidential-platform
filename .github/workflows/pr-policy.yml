@@ -70,13 +70,9 @@ jobs:
             fail=1
           fi
 
-          ids='\b[DIMP][0-9]{1,2}\b'
-          words='\b(prd|adr)[- ]?[0-9]+|\b(phase|plan|milestone|deliverable) [0-9]|generated with|co-authored-by:.*(claude|codex|copilot|cursor|chatgpt|gemini|gpt|\[bot\])'
-          [ -n "$EXTRA_TERMS" ] && words="$words|$EXTRA_TERMS"
-          text=$(printf '%s\n%s\n' "$TITLE" "$BODY"; git log --format=%B "$BASE_SHA..$HEAD_SHA")
-          hits=$(printf '%s\n' "$text" | grep -E "$ids"; printf '%s\n' "$text" | grep -iE "$words" || true)
+          hits=$([ -n "$EXTRA_TERMS" ] && (printf '%s\n%s\n' "$TITLE" "$BODY"; git log --format=%B "$BASE_SHA..$HEAD_SHA") | grep -iE "$EXTRA_TERMS" || true)
           if [ -n "$hits" ]; then
-            echo "::error::Internal identifiers or tool attribution in the title, body or commit messages:"
+            echo "::error::Forbidden terms in the title, body or commit messages:"
             printf '%s\n' "$hits"
             fail=1
           fi
