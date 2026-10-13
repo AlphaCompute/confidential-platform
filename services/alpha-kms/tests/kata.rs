@@ -347,3 +347,53 @@ async fn a_compose_revision_is_not_an_init_data_one() {
         (StatusCode::FORBIDDEN, "attestation_unknown")
     );
 }
+
+async fn attest_after_republishing(h: &Harness, change: impl FnOnce(&mut Value)) -> Value {
+    let admin = h.register_key(&h.root, 37).await;
+    let (status, reply) = register(h, &admin).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    republish(h, change).await;
+    let (status, reply) = attest(h, "k3-app.quote.bin").await;
+    assert_eq!(
+        (status, code(&reply)),
+        (StatusCode::FORBIDDEN, "policy_denied"),
+        "{reply}"
+    );
+    reply
+}
+
+#[tokio::test]
+async fn a_revision_registered_under_another_pin_gets_no_leaf() {
+    let Some(h) = kata_harness().await else {
+        return;
+    };
+    let reply = attest_after_republishing(&h, |d| {
+        d["kata_policy"]["rules_sha256"] = json!(compose_hash("other rules"));
+    })
+    .await;
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("pinned rules"),
+        "{reply}"
+    );
+}
+
+#[tokio::test]
+async fn no_leaf_is_issued_while_the_document_pins_no_agent_policy() {
+    let Some(h) = kata_harness().await else {
+        return;
+    };
+    let reply = attest_after_republishing(&h, |d| {
+        d.as_object_mut().unwrap().remove("kata_policy");
+    })
+    .await;
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("pins no Kata agent policy"),
+        "{reply}"
+    );
+}

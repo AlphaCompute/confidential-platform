@@ -205,6 +205,19 @@ fn revision_payload(
             "digest is not the init-data's {digest}"
         )));
     }
+    check_kata_policy(&init_data, kata_policy, "malformed")?;
+    Ok((digest, p.app_id, None, Some(p.init_data)))
+}
+
+/// An init-data passes only under the agent policy the current platform document pins, at
+/// registration and again on every attestation, so a Revision stored under an earlier pin, or
+/// before any, gets no leaf once the pin moves. `miss` is the code for a policy off the pin; no
+/// pin at all is always `policy_denied`.
+pub(crate) fn check_kata_policy(
+    init_data: &alpha_core::InitData,
+    kata_policy: Option<&KataPolicy>,
+    miss: &'static str,
+) -> Result<(), ApiError> {
     let pinned = kata_policy.ok_or_else(|| {
         ApiError::new(
             "policy_denied",
@@ -213,8 +226,7 @@ fn revision_payload(
     })?;
     init_data
         .check_policy(pinned)
-        .map_err(|e| ApiError::malformed(e.to_string()))?;
-    Ok((digest, p.app_id, None, Some(p.init_data)))
+        .map_err(|e| ApiError::new(miss, e.to_string()))
 }
 
 pub async fn register_revision(
