@@ -41,7 +41,6 @@ pub const RUNTIME_EVENTS_PATH: &str = "/run/log/dstack/runtime_events.log";
 pub const TSM_REPORT_DIR: &str = "/sys/kernel/config/tsm/report";
 
 const DSTACK_RUNTIME_EVENT_TYPE: u32 = 0x0800_0001;
-const TEE_TYPE_TDX: u32 = 0x81;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -136,17 +135,10 @@ fn tsm_quote(root: &Path, report_data: &[u8; 64]) -> Result<Vec<u8>, Error> {
 /// The quote is a v4 or v5 TDX quote whose TD report carries `report_data`.
 fn check_quote(quote: &[u8], report_data: &[u8; 64]) -> Result<(), Error> {
     let parsed = Quote::parse(quote).map_err(|e| Error::Quote(format!("{e:#}")))?;
-    let header = &parsed.header;
-    if !matches!(header.version, 4 | 5) || header.tee_type != TEE_TYPE_TDX {
-        return Err(Error::Quote(format!(
-            "version {} TEE type {:#x} is not a TDX quote",
-            header.version, header.tee_type
-        )));
-    }
     let report = parsed
         .report
         .as_td10()
-        .ok_or_else(|| Error::Quote("no TD report".into()))?;
+        .ok_or_else(|| Error::Quote("not a TDX quote".into()))?;
     if &report.report_data != report_data {
         return Err(Error::Quote("report_data is not ours".into()));
     }
