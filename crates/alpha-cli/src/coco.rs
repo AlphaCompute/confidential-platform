@@ -318,7 +318,6 @@ fn check_dsm_value(value: &str) -> Result<(), String> {
     }
 }
 
-
 /// Builds the `alpha.json` init-data entry in JCS (JSON Canonicalization Scheme) form.
 pub(crate) fn alpha_json(
     app_id: AppId,
@@ -669,7 +668,6 @@ spec:
         let error = render(&spec("alpha-runtime", &unbound), &pinned, &env).unwrap_err();
         assert!(error.contains("binding"), "{error}");
     }
-
 
     fn vector(name: &str) -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

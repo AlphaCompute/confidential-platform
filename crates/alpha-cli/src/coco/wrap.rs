@@ -1115,7 +1115,6 @@ mod tests {
         }
     }
 
-
     #[derive(Deserialize)]
     struct Case {
         compose: String,
