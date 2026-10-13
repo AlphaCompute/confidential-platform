@@ -63,7 +63,15 @@ fn appraise(
     init_data: &ComposeHash,
     doc: &PlatformDocument,
 ) -> Result<KataAppraised, AppraisalError> {
-    appraise_kata(&read(quote), init_data, doc, &collateral(), now())
+    let report_data = verify(quote).report_data;
+    appraise_kata(
+        &read(quote),
+        &report_data,
+        init_data,
+        doc,
+        &collateral(),
+        now(),
+    )
 }
 
 fn refused(result: Result<KataAppraised, AppraisalError>, code: &str, fragment: &str) {
@@ -182,5 +190,24 @@ fn gpu_pod_against_cpu_only_reference_values_is_refused() {
         appraise("g1b-gpu.quote.bin", &t1_digest(), &doc()),
         "attestation_failed",
         "not the digest of this init-data",
+    );
+}
+
+#[test]
+fn a_quote_over_other_report_data_is_refused() {
+    let doc = doc();
+    let mut other = verify("p1-sha256.quote.bin").report_data;
+    other[0] ^= 1;
+    refused(
+        appraise_kata(
+            &read("p1-sha256.quote.bin"),
+            &other,
+            &t1_digest(),
+            &doc,
+            &collateral(),
+            now(),
+        ),
+        "attestation_failed",
+        "report_data",
     );
 }

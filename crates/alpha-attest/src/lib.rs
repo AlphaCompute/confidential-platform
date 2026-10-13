@@ -490,17 +490,24 @@ pub struct KataAppraised {
     pub quote: VerifiedQuote,
 }
 
-/// Appraisal of a Kata TD's quote against `doc.kata_reference_values` and the init-data digest
-/// of the Revision it claims to run. No event log is replayed: the events that vary between
-/// TDs carry only digests, so the final registers say as much.
+/// Appraisal of a Kata TD's quote, bound to this request by `expected_report_data` (see
+/// [`report_data`]), against `doc.kata_reference_values` and the init-data digest of the
+/// Revision it claims to run. No event log is replayed: the events that vary between TDs carry
+/// only digests, so the final registers say as much.
 pub fn appraise_kata(
     quote: &[u8],
+    expected_report_data: &[u8; 64],
     init_data: &ComposeHash,
     doc: &PlatformDocument,
     collateral: &Collateral,
     now: SystemTime,
 ) -> Result<KataAppraised, AppraisalError> {
     let quote = verify_quote(quote, collateral, &doc.policy, now)?;
+    if &quote.report_data != expected_report_data {
+        return Err(AppraisalError::Failed(
+            "report_data is not bound to this request".into(),
+        ));
+    }
     let runtime_class = kata_runtime_class(&quote, &doc.kata_reference_values)?.to_owned();
     check_init_data(&quote, init_data).map_err(|e| AppraisalError::Failed(e.to_string()))?;
     Ok(KataAppraised {
