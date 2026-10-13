@@ -29,6 +29,7 @@ use uuid::Uuid;
 
 pub const KEYED: &str = "phala-0.5.9-1c-2g-keyed";
 pub const DEV_KEYED: &str = "phala-dev-0.5.9-keyed";
+pub const KATA: &str = "b300-kata-4.0.0";
 
 pub fn testdata() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata")
@@ -210,18 +211,19 @@ pub fn client_with(identity_pem: &str) -> reqwest::Client {
         .unwrap()
 }
 
-/// A node acting as the keyed capture's CVM: its event log, nonce key and collateral, and `clock`
-/// (the capture's time when a test attests with its quote, the wall clock when a pinned TLS
-/// client must accept the node's one-hour leaf).
+/// A node acting as the keyed capture's CVM: its event log and nonce key, the collateral captured
+/// beside `collateral_of`, and `clock` (the capture's time when a test attests with its quote, the
+/// wall clock when a pinned TLS client must accept the node's one-hour leaf).
 pub async fn start_node(
     pool: PgPool,
     release_url: &str,
     release_key: &SigningKey,
     clock: Clock,
+    collateral_of: &str,
 ) -> (Arc<Node>, String, tokio::sync::oneshot::Sender<()>) {
     let event_log: Vec<EventLogEntry> =
         serde_json::from_slice(&read(KEYED, "event_log.json")).unwrap();
-    let collateral = serde_json::from_slice(&read(KEYED, "collateral.json")).unwrap();
+    let collateral = serde_json::from_slice(&read(collateral_of, "collateral.json")).unwrap();
     let config = Config {
         kms_endpoints: vec![],
         platform_document_url: release_url.to_owned(),
@@ -265,9 +267,29 @@ pub async fn harness() -> Option<Harness> {
 }
 
 pub async fn harness_with_clock(clock: Clock) -> Option<Harness> {
+    harness_on(clock, KEYED, platform_document(KEYED)).await
+}
+
+/// A node at the Kata capture's time, with its collateral, and the Kata reference values added
+/// to the keyed capture's platform document.
+pub async fn kata_harness() -> Option<Harness> {
+    let mut document = platform_document(KEYED);
+    document["kata_reference_values"] = platform_document(KATA)["kata_reference_values"].clone();
+    let now = captured_at(KATA);
+    harness_on(Arc::new(move || now), KATA, document).await
+}
+
+pub async fn harness_on(clock: Clock, collateral_of: &str, document: Value) -> Option<Harness> {
     let pool = fresh_database().await?;
-    let release = ReleaseServer::start(platform_document(KEYED)).await;
-    let (node, base, shutdown) = start_node(pool.clone(), &release.url, &release.key, clock).await;
+    let release = ReleaseServer::start(document).await;
+    let (node, base, shutdown) = start_node(
+        pool.clone(),
+        &release.url,
+        &release.key,
+        clock,
+        collateral_of,
+    )
+    .await;
     let custodians: Vec<PrivateKey> = (0..3).map(|_| PrivateKey::generate().unwrap()).collect();
     let dir = std::env::temp_dir().join(format!("alpha-harness-{}", Uuid::now_v7()));
     fs::create_dir_all(&dir).unwrap();

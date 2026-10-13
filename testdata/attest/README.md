@@ -42,16 +42,17 @@ The debug-bit and TCB-status/advisory policy checks cannot be produced as real q
 
 ## Kata on owned hardware
 
-`b300-kata-4.0.0` holds quotes from Kata 4.0.0 pods on our B300 host, taken through configfs-tsm, read by `crates/alpha-attest/tests/kata.rs` and the Kata unit tests in `crates/alpha-attest/src/lib.rs`. Every pod ran the same OVMF, the same QEMU and the kernel and rootfs bundle of 2026-10-12; a CPU pod is 1 vCPU and 2048 MiB unless said otherwise:
+`b300-kata-4.0.0` holds quotes from Kata 4.0.0 pods on our B300 host, taken through configfs-tsm, read by `crates/alpha-attest/tests/kata.rs`, the Kata unit tests in `crates/alpha-attest/src/lib.rs` and `services/alpha-kms/tests/kata.rs`. Every pod ran the same OVMF, the same QEMU and the kernel and rootfs bundle of 2026-10-12; a CPU pod is 1 vCPU and 2048 MiB unless said otherwise:
 
 - `p1-sha256.quote.bin` — a `kata-qemu-tdx` pod booted with the init-data `t1-sha256.toml` in its `io.katacontainers.config.hypervisor.cc_init_data` annotation; `MRCONFIGID` is `SHA-256(t1-sha256.toml)` followed by 16 zero bytes, `report_data` all zero;
 - `p0-none.quote.bin` — the same pod without the annotation; `MRCONFIGID` is all zero, and RTMR0 differs from `p1` because the init-data disk is gone from the ACPI tables;
 - `r10-debug-console.quote.bin` — a `kata-qemu-tdx` pod with `agent.debug_console agent.debug_console_vport=1026` added through the `kernel_params` annotation; only RTMR2 differs from `p1`;
 - `r14-2c-4096.quote.bin` — a `kata-qemu-tdx` pod of 2 vCPUs and 4096 MiB; only RTMR0 differs;
-- `g1b-gpu.quote.bin` — a `kata-qemu-nvidia-gpu-tdx` pod with one B300 passed through; RTMR0, RTMR1 (another kernel) and RTMR2 (another cmdline and rootfs) differ, `report_data` is not zero.
+- `g1b-gpu.quote.bin` — a `kata-qemu-nvidia-gpu-tdx` pod with one B300 passed through; RTMR0, RTMR1 (another kernel) and RTMR2 (another cmdline and rootfs) differ, `report_data` is not zero;
+- `k1-sha256.quote.bin` — a `kata-qemu-tdx` pod as `p1` (init-data `t1-sha256.toml`), run unprivileged as uid 0 with no capabilities and a hostPath of `/sys/kernel/config`, quoting over `report_data(runtime_spki.der, nonce.bin, None)`: `runtime_spki.der` is the P-256 key whose scalar is `0x4b` repeated 32 times, and `nonce.bin` is what a KMS with `capture/nonce_key.hex` mints at `captured_at.txt`, so a node clocked there accepts it at age zero. Taken later the same day, verified with the same collateral; registers equal `p1`'s.
 
-The last three pods booted with a sha384 init-data that `alpha_core::InitData` refuses, so their `MRCONFIGID` matches no Revision; the tests only use them where the refusal comes earlier, from the reference values.
+`r10`, `r14` and `g1b` booted with a sha384 init-data that `alpha_core::InitData` refuses, so their `MRCONFIGID` matches no Revision; the tests only use them where the refusal comes earlier, from the reference values.
 
-`platform-document.json` is unsigned and lists two classes: `kata-qemu-tdx` with the quoted MRTD, RTMR1 and RTMR2 and the RTMR0 of five shapes captured with init-data (1 vCPU at 2048, 3072 and 4096 MiB; 2 and 4 vCPUs at 2048 MiB), deliberately without the 2-vCPU, 4096-MiB shape of `r14`; and `kata-qemu-nvidia-gpu-tdx` with the registers of `g1b`.
+`platform-document.json` is unsigned and lists two classes: `kata-qemu-tdx` with the quoted MRTD, RTMR1 and RTMR2 and the RTMR0 of five shapes captured with init-data (1 vCPU at 2048, 3072 and 4096 MiB; 2 and 4 vCPUs at 2048 MiB), deliberately without the 2-vCPU, 4096-MiB shape of `r14`; and `kata-qemu-nvidia-gpu-tdx` with the registers of `g1b`. Each class says whether it passes GPUs through (`gpu`).
 
-`collateral.json` is Intel's, fetched once for all five quotes (they share one platform) from the PCS with `cargo run -p alpha-attest --example fetch_collateral -- https://api.trustedservices.intel.com <quote.hex>`, after the hex quote was written with `xxd -p <quote> | tr -d '\n'`. `captured_at.txt` is the time the fetch finished, and the tests verify at that time.
+`collateral.json` is Intel's, fetched once for the first five quotes (they share one platform) from the PCS with `cargo run -p alpha-attest --example fetch_collateral -- https://api.trustedservices.intel.com <quote.hex>`, after the hex quote was written with `xxd -p <quote> | tr -d '\n'`. `captured_at.txt` is the time the fetch finished, and the tests verify at that time.

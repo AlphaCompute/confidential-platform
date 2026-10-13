@@ -70,12 +70,6 @@ fn refused(result: Result<KataAppraised, AppraisalError>, code: &str, fragment: 
 }
 
 #[test]
-fn quote_names_the_init_data_it_booted_with() {
-    let digest = init_data_digest(&verify("p1-sha256.quote.bin")).unwrap();
-    assert_eq!(digest, t1_digest());
-}
-
-#[test]
 fn quote_of_a_pod_without_init_data_is_refused() {
     let quote = verify("p0-none.quote.bin");
     assert_eq!(quote.mr_config_id, [0; 48]);

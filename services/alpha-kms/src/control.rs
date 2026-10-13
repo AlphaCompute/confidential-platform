@@ -171,14 +171,43 @@ struct RevisionPayload {
     compose: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InitDataRevisionPayload {
+    app_id: AppId,
+    init_data: String,
+    digest: ComposeHash,
+}
+
+/// A compose Revision or a Kata init-data Revision, as the `revisions` row holds it: digest, App,
+/// compose, init-data.
+fn revision_payload(
+    value: &Value,
+) -> Result<(ComposeHash, AppId, Option<String>, Option<String>), ApiError> {
+    if value.get("init_data").is_none() {
+        let p: RevisionPayload = payload(value)?;
+        let hash = alpha_core::check_registration(&p.compose, p.app_id)?;
+        return Ok((hash, p.app_id, Some(p.compose), None));
+    }
+    let p: InitDataRevisionPayload = payload(value)?;
+    let digest = alpha_core::InitData::parse(p.init_data.clone())
+        .map_err(|e| ApiError::malformed(e.to_string()))?
+        .digest();
+    if digest != p.digest {
+        return Err(ApiError::malformed(format!(
+            "digest is not the init-data's {digest}"
+        )));
+    }
+    Ok((digest, p.app_id, None, Some(p.init_data)))
+}
+
 pub async fn register_revision(
     State(node): State<Arc<Node>>,
     Body(body, request): Body<Signed>,
 ) -> Result<Json<Value>, ApiError> {
     audited_route!(node, body, request, "revision.register", async {
         let keys = node.intermediates()?;
-        let p: RevisionPayload = payload(&body.payload)?;
-        let compose_hash = alpha_core::check_registration(&p.compose, p.app_id)?;
+        let (compose_hash, app_id, compose, init_data) = revision_payload(&body.payload)?;
         let chain = authorize(&node, &keys, context::REVISION, &body, node.now_utc()).await?;
         let org_id = chain.key.org_id;
         let mut tx = node.pool.begin().await?;
@@ -195,13 +224,13 @@ pub async fn register_revision(
         }
         sqlx::query!(
             "select pg_advisory_xact_lock(hashtext($1))",
-            p.app_id.to_string()
+            app_id.to_string()
         )
         .execute(&mut *tx)
         .await?;
         let other_org = sqlx::query_scalar!(
             "select exists(select 1 from revisions where app_id = $1 and org_id <> $2)",
-            Uuid::from(p.app_id),
+            Uuid::from(app_id),
             org_id
         )
         .fetch_one(&mut *tx)
@@ -210,12 +239,13 @@ pub async fn register_revision(
             return Err(ApiError::not_found("app belongs to another organization"));
         }
         let created_at = sqlx::query_scalar!(
-            "insert into revisions (compose_hash, app_id, org_id, compose, created_by_key, signature)
-             values ($1, $2, $3, $4, $5, $6) returning created_at",
+            "insert into revisions (compose_hash, app_id, org_id, compose, init_data, created_by_key, signature)
+             values ($1, $2, $3, $4, $5, $6, $7) returning created_at",
             compose_hash.as_bytes().as_slice(),
-            Uuid::from(p.app_id),
+            Uuid::from(app_id),
             org_id,
-            p.compose,
+            compose,
+            init_data,
             chain.key.id,
             json!(body.signature),
         )
@@ -226,13 +256,13 @@ pub async fn register_revision(
             &chain,
             "revision.register",
             format!("revision:{compose_hash}"),
-            json!({ "app_id": p.app_id }),
+            json!({ "app_id": app_id }),
         )
         .await?;
         tx.commit().await?;
         Ok(revision_json(
             compose_hash,
-            p.app_id.into(),
+            app_id.into(),
             org_id,
             created_at,
         ))
