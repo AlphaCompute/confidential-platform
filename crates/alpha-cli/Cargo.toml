@@ -23,7 +23,6 @@ flate2 = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = { version = "3", features = ["pkcs8", "alloc"] }
-flate2 = "1"
 getrandom = "0.4"
 hex = "0.4"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
