@@ -16,7 +16,7 @@ pub mod platform;
 pub mod runtime;
 pub mod tls;
 
-use alpha_attest::{AttestationResult, EVIDENCE_FORMAT, EventLogEntry, Evidence};
+use alpha_attest::{AttestationResult, EVIDENCE_FORMAT, EventLogEntry, Evidence, KataEvidence};
 use alpha_core::{
     AppId, ComposeHash, KeyId, OrgId, PrincipalId, SecretId, context, signing_digest,
 };
@@ -165,7 +165,15 @@ pub struct Nonce {
 pub struct AttestRequest {
     pub runtime_pubkey: String,
     pub nonce: String,
-    pub evidence: Evidence,
+    pub evidence: InstanceEvidence,
+}
+
+/// A dstack CVM's quote with the event log that replays it, or a Kata pod's quote alone.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum InstanceEvidence {
+    Dstack(Evidence),
+    Kata(KataEvidence),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
