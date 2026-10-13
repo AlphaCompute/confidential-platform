@@ -17,7 +17,7 @@ use serde::Serialize;
 use serde_yaml_ng::{Mapping, Value as Yaml};
 use sha2::{Digest, Sha256};
 
-pub const ANNOTATION: &str = "io.katacontainers.config.hypervisor.cc_init_data";
+const ANNOTATION: &str = "io.katacontainers.config.hypervisor.cc_init_data";
 
 /// `bin/genpolicy` of `kata-tools-static-4.0.0-amd64.tar.zst`, the Kata 4.0.0 release build.
 const GENPOLICY_SHA256: &str = "4fa1cabd8d6e757c271caa991b889e1c2ccdbbdce58872b8b581720b3867be36";
@@ -152,10 +152,7 @@ impl Kata {
         Ok(Self {
             genpolicy: pinned(&dir.join("bin/genpolicy"), GENPOLICY_SHA256)?,
             settings: pinned(&defaults.join("genpolicy-settings.json"), SETTINGS_SHA256)?,
-            rules: patch_rules(
-                fs::read(defaults.join("rules.rego"))
-                    .map_err(|e| format!("{}: {e}", defaults.join("rules.rego").display()))?,
-            )?,
+            rules: patch_rules(pinned(&defaults.join("rules.rego"), RULES_SHA256)?)?,
         })
     }
 
@@ -181,18 +178,14 @@ impl Kata {
             .recursive(true)
             .create(&drop_ins)
             .map_err(|e| format!("{}: {e}", drop_ins.display()))?;
-        let mut files: Vec<(PathBuf, &[u8])> = vec![
-            (dir.join("rules.rego"), self.rules.as_bytes()),
-            (dir.join("pod.yaml"), pod.genpolicy_input.as_bytes()),
-            (settings.join("genpolicy-settings.json"), &self.settings),
-        ];
-        files.extend(
-            SETTINGS_DROP_INS
-                .iter()
-                .map(|(name, json)| (drop_ins.join(name), json.as_bytes())),
-        );
-        for (path, bytes) in files {
-            fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+        let write = |path: PathBuf, bytes: &[u8]| {
+            fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))
+        };
+        write(dir.join("rules.rego"), self.rules.as_bytes())?;
+        write(dir.join("pod.yaml"), pod.genpolicy_input.as_bytes())?;
+        write(settings.join("genpolicy-settings.json"), &self.settings)?;
+        for (name, json) in SETTINGS_DROP_INS {
+            write(drop_ins.join(name), json.as_bytes())?;
         }
         let binary = dir.join("genpolicy");
         fs::OpenOptions::new()
@@ -234,11 +227,6 @@ fn pinned(path: &Path, sha256: &str) -> Result<Vec<u8>, String> {
 }
 
 fn patch_rules(upstream: Vec<u8>) -> Result<String, String> {
-    if sha256_hex(&upstream) != RULES_SHA256 {
-        return Err(format!(
-            "rules.rego: not Kata 4.0.0's (sha256 {RULES_SHA256}); extract kata-tools-static-4.0.0-amd64.tar.zst"
-        ));
-    }
     let mut rules = String::from_utf8(upstream).map_err(|_| "rules.rego: not UTF-8")?;
     for (old, new) in RULE_EDITS {
         rules = rules.replacen(old, new, 1);
@@ -405,7 +393,7 @@ mod tests {
         assert_eq!(sha256_hex(&upstream), RULES_SHA256);
         assert_eq!(patch_rules(upstream.into_bytes()).unwrap(), patched);
         let err = patch_rules(b"package agent_policy\n".to_vec()).unwrap_err();
-        assert!(err.contains("not Kata 4.0.0's"));
+        assert!(err.contains("the patch did not apply"));
     }
 
     #[test]
