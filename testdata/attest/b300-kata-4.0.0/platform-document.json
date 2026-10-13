@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "issued_at": "2026-10-13T02:26:44Z",
+  "policy": {
+    "tcb_statuses": ["UpToDate", "SWHardeningNeeded"],
+    "tolerated_advisories": []
+  },
+  "reference_values": [],
+  "kata_reference_values": [
+    {
+      "runtime_class": "kata-qemu-tdx",
+      "mrtd": "sha384:c78e2b8b2f66207f3807d8d999f51e04f5eab8f7aa02614a86ddd81b61f4e79c5d7616664fcb190b8eaae2e26d60b12a",
+      "rtmr0": [
+        "sha384:86b3efbf4cfe8e99ee42143ce65b28f9c7ec551d914f663f3b372934b227270cc4a36a898e7643494aa51f5235c75430",
+        "sha384:67b6ae86625cd5010b36bad42db4ca7d6bdf8b44da0b421057949cfcb02fa33eed657c937700f572c7024d42ab5db48a",
+        "sha384:1285d20cf1a2850d99714cdd739c925f486f2b6fd8e6323075b2d9e5dc7e6f0181f56b8d595779a5bd8fdfaf4c8caa6b",
+        "sha384:8dddc3bea3226b2f7573841d0bb4a0e6be342659205f77224eb00f72d6c3bf822f6ba644b319af16c45c40c27ef8cf2c",
+        "sha384:73becac781a07521d93498481344c8cfb51f05ff21bd5126ba4cc340df20bb170da3980c60b79b3ac954a8e5f0083c79"
+      ],
+      "rtmr1": "sha384:2bc5f4530adf0b51f5f89047ffbece35cbd1ccf80acdd458b809d3fe402b68305352c20b6089774d52457c4f552d6874",
+      "rtmr2": "sha384:3661c5ad2aa8c26d3389061ad0f752e71ecf9047c11c14a9c4c99f3eb0bb5a6f91628bf81334ae4794a3f0b5e28f57ab"
+    },
+    {
+      "runtime_class": "kata-qemu-nvidia-gpu-tdx",
+      "mrtd": "sha384:c78e2b8b2f66207f3807d8d999f51e04f5eab8f7aa02614a86ddd81b61f4e79c5d7616664fcb190b8eaae2e26d60b12a",
+      "rtmr0": [
+        "sha384:b9e9fb283cc9a0e43961822b813748aa64555e41518a20e9cc0d3404f62e6665c00c4dd3b1c78f3a09c585645320529f"
+      ],
+      "rtmr1": "sha384:493e7266c34c9b158af04b43acf0bb667670a093d64d7f436031667431205e1098975cf4fd9b0f1cddfaf367e874e291",
+      "rtmr2": "sha384:7cd6f2627a5004a31c75dded2a4ad05f6eae2f24a2e0ff3e6e4fe9a2ad82a868e6fd6a5ad904137d1852c1f7b2a8e4f6"
+    }
+  ],
+  "kms_ca_pem": "",
+  "kms_revisions": []
+}
