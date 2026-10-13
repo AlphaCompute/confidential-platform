@@ -25,7 +25,7 @@ const GENPOLICY_SHA256: &str = "4fa1cabd8d6e757c271caa991b889e1c2ccdbbdce58872b8
 const RULES_SHA256: &str = "c3e17ef9f1e8c1accde820774033459580c0fa431056fca2a51283beb9aad1d6";
 const SETTINGS_SHA256: &str = "c7d95bc2e45be20643304cb4915a7ab1a3f070c6b270f685b0f0970faf23d5b1";
 const PATCHED_RULES_SHA256: &str =
-    "0986ca3f6f867c0f339152bdf509dbe010db43676123184d2d9851a0f55fbec7";
+    "dff8e4b6c1e86828fdf11b49200b1f84c7c0e3a33f9e793f7bc4a6978729551a";
 
 /// The upstream rules check neither the image a container pulls, nor that every pinned variable
 /// is set, nor HOSTNAME and the sandbox hostname: the host could swap the image, drop or add
@@ -103,13 +103,28 @@ pub fn parse(bytes: &[u8]) -> Result<Pod, String> {
     let Some(Yaml::Mapping(pod)) = spec.get_mut("spec") else {
         return Err("pod spec: no spec mapping".into());
     };
+    // The rules accept HOSTNAME only as the sandbox name, which the host chooses.
+    if pod.get("hostname").is_some() {
+        return Err("spec.hostname: remove it; the pod's hostname is its name".into());
+    }
     for list in ["initContainers", "containers"] {
-        for container in pod
-            .get(list)
-            .and_then(Yaml::as_sequence)
-            .into_iter()
-            .flatten()
-        {
+        let containers = match pod.get(list) {
+            None => &[][..],
+            Some(Yaml::Sequence(containers)) => containers,
+            Some(_) => return Err(format!("spec.{list}: not a list")),
+        };
+        for container in containers {
+            if container
+                .get("env")
+                .and_then(Yaml::as_sequence)
+                .into_iter()
+                .flatten()
+                .any(|e| e.get("name").and_then(Yaml::as_str) == Some("HOSTNAME"))
+            {
+                return Err(format!(
+                    "{list}: HOSTNAME is set by the pod's name; remove it from env"
+                ));
+            }
             let image = container.get("image").and_then(Yaml::as_str).unwrap_or("");
             if !has_sha256_digest(image) {
                 return Err(format!(
@@ -373,6 +388,22 @@ mod tests {
         );
         let token = POD.replace("Token: false", "Token: true");
         assert!(parse(token.as_bytes()).is_err());
+        let hostname = POD.replace("  containers:", "  hostname: evil\n  containers:");
+        assert!(
+            parse(hostname.as_bytes())
+                .err()
+                .unwrap()
+                .contains("hostname")
+        );
+        let env = POD.replace("name: MODE", "name: HOSTNAME");
+        assert!(parse(env.as_bytes()).err().unwrap().contains("HOSTNAME"));
+        let not_list = POD.replace("  containers:", "  initContainers: {}\n  containers:");
+        assert!(
+            parse(not_list.as_bytes())
+                .err()
+                .unwrap()
+                .contains("not a list")
+        );
         let other_rules = GENPOLICY.replacen("package agent_policy", "package other", 1);
         let pod = parse(POD.as_bytes()).unwrap();
         let err = render(pod, APP_ID.parse().unwrap(), &other_rules).unwrap_err();

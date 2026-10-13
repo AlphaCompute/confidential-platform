@@ -2,10 +2,9 @@
 # Additions
 
 allow_env_present(p_var, i_process) if {
-    contains(p_var, "$(")
+    p_var == "HOSTNAME=$(host-name)"
 }
 allow_env_present(p_var, i_process) if {
-    not contains(p_var, "$(")
     some i_var in i_process.Env
     i_var == p_var
 }
