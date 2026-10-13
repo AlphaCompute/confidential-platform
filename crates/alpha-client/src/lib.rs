@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-pub use tls::{Identity, Pin};
+pub use tls::{Identity, ListedRevisions, Pin};
 
 pub type TimeProvider = Arc<dyn rustls::time_provider::TimeProvider>;
 
@@ -263,6 +263,7 @@ pub struct NodeEvidence {
     pub event_log: Vec<EventLogEntry>,
     pub runtime_pubkey: String,
     pub xwing_pubkey: PublicKey,
+    /// What the node says it is; never trusted, the appraisal rebuilds it from the evidence.
     pub compose_hash: ComposeHash,
 }
 

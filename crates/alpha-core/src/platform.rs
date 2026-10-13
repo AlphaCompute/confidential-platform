@@ -9,6 +9,28 @@ pub struct KmsRevision {
     pub compose_hash: ComposeHash,
     pub build: String,
     pub source_url: String,
+    /// The evidence profile this build's nodes attest under. A document written before Kata has
+    /// none, and every build in it is a prototype CVM's. During the migration (PRD-05) one
+    /// document lists the prototype build and the Kata build side by side.
+    #[serde(default, skip_serializing_if = "KmsRevisionKind::is_prototype")]
+    pub kind: KmsRevisionKind,
+}
+
+/// What a KMS build's `compose_hash` is the hash of: a prototype CVM's measured compose
+/// (`alphacompute-evidence/1`) or a Kata pod's Revision v2 rebuilt from its init-data
+/// (`kata-tdx/1`). A node is admitted only under the profile its build is listed for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KmsRevisionKind {
+    #[default]
+    PrototypeTdx,
+    KataTdx,
+}
+
+impl KmsRevisionKind {
+    pub fn is_prototype(&self) -> bool {
+        *self == Self::PrototypeTdx
+    }
 }
 
 /// The Kata agent policy every init-data Revision must carry, as
@@ -142,6 +164,38 @@ impl TryFrom<CatalogKeyFields> for CatalogKey {
     }
 }
 
+/// The PCCS a platform document names (PRD-05: our own): `https://<lowercase host>[:port][/path]`,
+/// the base URL a DCAP collateral client is given. No query, fragment, user info or whitespace.
+pub fn check_pccs_url(url: &str) -> Result<(), String> {
+    let refused = || format!("pccs_url {url:?} is not an https URL on a lowercase host");
+    let rest = url.strip_prefix("https://").ok_or_else(refused)?;
+    let authority = rest.split('/').next().unwrap_or_default();
+    let host = match authority.split_once(':') {
+        None => authority,
+        Some((host, port)) => {
+            if port.starts_with('0') || !matches!(port.parse::<u16>(), Ok(p) if p != 0) {
+                return Err(refused());
+            }
+            host
+        }
+    };
+    if !is_host(host) || url.contains(['?', '#', '@', '\\']) || url.contains(char::is_whitespace) {
+        return Err(refused());
+    }
+    Ok(())
+}
+
+/// `pccs_url` of a platform document, checked as it is read.
+pub fn deserialize_pccs_url<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<String>, D::Error> {
+    let url = Option::<String>::deserialize(d)?;
+    if let Some(url) = &url {
+        check_pccs_url(url).map_err(serde::de::Error::custom)?;
+    }
+    Ok(url)
+}
+
 /// The host of a serialized `https` origin. A non-canonical origin is refused rather than
 /// normalized, because the passkey check later compares origins byte for byte.
 fn origin_host(origin: &str) -> Option<&str> {
@@ -188,6 +242,32 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+
+    #[test]
+    fn a_pccs_url_is_https_on_a_lowercase_host() {
+        for good in [
+            "https://pccs.site1.alphacompute.internal:8081/sgx/certification/v4/",
+            "https://pccs.example",
+            "https://pccs.example/",
+        ] {
+            assert_eq!(check_pccs_url(good), Ok(()), "{good}");
+        }
+        for bad in [
+            "http://pccs.example/",
+            "https://PCCS.example/",
+            "https://pccs.example:0/",
+            "https://pccs.example:08081/",
+            "https://pccs.example:99999/",
+            "https://user@pccs.example/",
+            "https://pccs.example/?x=1",
+            "https://pccs.example/#f",
+            "https://pccs.example/ v4",
+            "https:///v4",
+            "pccs.example",
+        ] {
+            assert!(check_pccs_url(bad).is_err(), "{bad}");
+        }
+    }
 
     fn signer_on(rp_id: &str, field: &str, value: Value) -> Result<Signer, serde_json::Error> {
         let mut s = json!({
@@ -348,5 +428,23 @@ mod tests {
                 "{algorithm:?} {public_key:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_kms_revision_without_kind_is_a_prototype_build_and_a_kata_build_says_so() {
+        let hash = crate::compose_hash("{}");
+        let old = json!({ "compose_hash": hash, "build": "kms v1", "source_url": "u" });
+        let revision: KmsRevision = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(revision.kind, KmsRevisionKind::PrototypeTdx);
+        assert_eq!(serde_json::to_value(&revision).unwrap(), old);
+
+        let mut kata = old;
+        kata["kind"] = json!("kata-tdx");
+        let revision: KmsRevision = serde_json::from_value(kata.clone()).unwrap();
+        assert_eq!(revision.kind, KmsRevisionKind::KataTdx);
+        assert_eq!(serde_json::to_value(&revision).unwrap(), kata);
+
+        kata["kind"] = json!("kata-snp");
+        assert!(serde_json::from_value::<KmsRevision>(kata).is_err());
     }
 }

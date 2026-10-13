@@ -103,7 +103,8 @@ the platform-document URL are served; the signed document lists the Revision.
    URLs, `https://<app id>-8443s.<gateway base>`, so provision the second CVM first to learn its
    app id: the values are not measured, but a later env update rewrites the stored
    `allowed_envs` and changes what the CVM measures, see "Deploying the dev node"),
-   `ALPHACOMPUTE_PCCS_URL`, `ALPHACOMPUTE_PLATFORM_DOCUMENT_URL`, and after the commit check that
+   `ALPHACOMPUTE_PCCS_URL` (read only while the platform document names no `pccs_url`),
+   `ALPHACOMPUTE_PLATFORM_DOCUMENT_URL`, and after the commit check that
    the stored compose still hashes to `manifest.json`'s `compose_hash`. The node comes up
    `sealed`: `GET /ready` answers 503 `{"sealed": true}`.
 3. **Bootstrap** on the first node: `alpha bootstrap --custodians c1.pub c2.pub c3.pub
@@ -163,7 +164,9 @@ answers 200 only once it reaches that database.
 ## Upgrade
 
 1. Release; sign a document whose `kms_revisions[]` lists the old and the new Revision; every
-   tenant App that pins the KMS gets a Revision with `ALPHACOMPUTE_KMS_REVISIONS` listing both.
+   tenant App on the strict pin gets a Revision with `ALPHACOMPUTE_KMS_REVISIONS` listing both.
+   Apps on the platform pin (`docs/kms-pinning.md`) follow the document as it is; give it an
+   `expires_at` and re-sign it before then.
 2. Update the compose of **one** CVM through the Phala API (provision the compose-file update
    with the new `app-compose.json`, check `compose_hash` again, commit). It restarts `sealed`,
    joins the other node, and `GET /ready` turns 200.

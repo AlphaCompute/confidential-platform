@@ -36,8 +36,13 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 uuid = "1"
 zeroize = "1"
 
+[features]
+# Adds `node::verify_kata_node`, the DCAP-bypass seam alpha-kms's Kata node tests use. alpha-kms
+# turns it on through its dev-dependency on this crate; production builds never have it.
+test-seams = []
+
 [dev-dependencies]
-axum = { version = "0.8", default-features = false }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }

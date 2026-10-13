@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use alpha_kms::{CollateralSource, Config, Node, node, platform, tls};
+use alpha_kms::{CollateralSource, Config, Node, NodeGuest, node, platform, tls};
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 
@@ -35,14 +35,28 @@ async fn run() -> Result<(), String> {
     let release_key = alpha_core::hex_bytes::<32>(RELEASE_KEY_HEX.trim())
         .and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok())
         .ok_or("release-key.pub is not an Ed25519 public key")?;
-    let event_log = alpha_tsm::event_log().map_err(|e| format!("event log: {e}"))?;
+    let guest = match alpha_kms::quote_source(
+        std::env::var("ALPHACOMPUTE_QUOTE_SOURCE").ok().as_deref(),
+    )? {
+        None => {
+            NodeGuest::prototype(alpha_tsm::event_log().map_err(|e| format!("event log: {e}"))?)?
+        }
+        Some(source) => {
+            let path = std::path::Path::new(alpha_tsm::coco::INITDATA_PATH);
+            let initdata =
+                alpha_tsm::coco::initdata(path).map_err(|e| format!("init-data: {e}"))?;
+            NodeGuest::coco(source, initdata)?
+        }
+    };
     let node = Node::new(
         pool,
         Config::from_env()?,
         Arc::new(SystemTime::now),
-        CollateralSource::Pccs(alpha_kms::env("ALPHACOMPUTE_PCCS_URL")?),
+        CollateralSource::Pccs {
+            env: std::env::var("ALPHACOMPUTE_PCCS_URL").ok(),
+        },
         alpha_kms::random().map_err(|e| e.message)?,
-        event_log,
+        guest,
         release_key,
     )?;
     platform::start(&node).await;

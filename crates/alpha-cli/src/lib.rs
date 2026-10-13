@@ -12,6 +12,7 @@
         clippy::arithmetic_side_effects
     )
 )]
+pub mod approvals;
 pub mod call;
 pub mod catalog;
 pub mod coco;

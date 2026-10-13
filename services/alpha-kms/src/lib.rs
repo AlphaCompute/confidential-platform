@@ -27,8 +27,11 @@ pub mod webauthn;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
-use alpha_attest::{Collateral, EventLogEntry, PlatformDocument};
+use alpha_attest::gpu::ccm::FortanixCcm;
+use alpha_attest::gpu::nras::Nras;
+use alpha_attest::{AnyEvidence, Collateral, EventLogEntry, GpuVerifier, PlatformDocument};
 use alpha_core::ComposeHash;
+use alpha_core::coco::{CPU_RUNTIME_CLASS, InitData};
 use axum::Router;
 use axum::extract::{Request, State};
 use axum::middleware::{self, Next};
@@ -46,6 +49,9 @@ use crate::error::ApiError;
 pub struct Config {
     pub kms_endpoints: Vec<String>,
     pub platform_document_url: String,
+    /// The GPU verifier backends a Kata pod's GPUs may be verified by; the platform document's
+    /// `gpu_policy` decides which of them must all pass. See [`gpu_backends`].
+    pub gpu_backends: Vec<Arc<dyn GpuVerifier>>,
     #[cfg(feature = "dev-root")]
     pub dev_root_kek: Option<Zeroizing<[u8; 32]>>,
 }
@@ -63,6 +69,7 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .collect(),
             platform_document_url: env("ALPHACOMPUTE_PLATFORM_DOCUMENT_URL")?,
+            gpu_backends: gpu_backends(std::env::var("ALPHACOMPUTE_FORTANIX_CCM_URL").ok())?,
             #[cfg(feature = "dev-root")]
             dev_root_kek: std::env::var("ALPHACOMPUTE_KMS_DEV_ROOT_KEK")
                 .ok()
@@ -76,10 +83,129 @@ impl Config {
     }
 }
 
-/// Where DCAP collateral comes from: the PCCS in production, a fixed capture in tests.
+/// The GPU verifier backends this node runs: NRAS always (it refuses every GPU until the release-signed
+/// `gpu_policy` pins NRAS's keys and names the CC-mode claim), Fortanix CCM when `ccm_url` names its
+/// endpoint (it refuses every GPU until F8), and never `local`, which is built after Dec 1. A backend
+/// the `gpu_policy` lists that is not here refuses every GPU pod.
+// ponytail: F8 — whether the CCM endpoint stays node configuration or moves into the release-signed
+// `gpu_policy`, as `nras_url` is, is settled with Fortanix's API.
+pub fn gpu_backends(ccm_url: Option<String>) -> Result<Vec<Arc<dyn GpuVerifier>>, String> {
+    let nras = Nras::new().map_err(|e| e.to_string())?;
+    let mut backends: Vec<Arc<dyn GpuVerifier>> = vec![Arc::new(nras)];
+    if let Some(endpoint) = ccm_url {
+        if !endpoint.starts_with("https://") {
+            return Err("ALPHACOMPUTE_FORTANIX_CCM_URL is not an https:// URL".into());
+        }
+        backends.push(Arc::new(FortanixCcm { endpoint }));
+    }
+    Ok(backends)
+}
+
+/// A quote over `report_data` and the evidence behind it.
+pub type EvidenceSource = Arc<dyn Fn(&[u8; 64]) -> Result<AnyEvidence, String> + Send + Sync>;
+
+/// What this node is and where its evidence comes from. A prototype CVM is the compose-hash event
+/// of its event log and quotes through the dstack guest agent. A Kata pod is the Revision v2 its
+/// init-data stands for (the init-data's digest is the TD's MRCONFIGID) and quotes through the
+/// CoCo source `alpha-runtime` uses, so a node is appraised as an Instance is.
+pub struct NodeGuest {
+    /// The node's Revision: what its leaf names and `kms_revisions` must list.
+    pub compose_hash: ComposeHash,
+    evidence: EvidenceSource,
+}
+
+impl NodeGuest {
+    pub fn prototype(event_log: Vec<EventLogEntry>) -> Result<Self, String> {
+        let compose_hash = alpha_attest::event_log_compose_hash(&event_log)
+            .ok_or("the event log carries no compose-hash event")?;
+        Ok(Self {
+            compose_hash,
+            evidence: Arc::new(move |report_data| {
+                Ok(alpha_attest::Evidence {
+                    format: alpha_attest::EVIDENCE_FORMAT.into(),
+                    quote: alpha_tsm::quote(report_data).map_err(|e| format!("quote: {e}"))?,
+                    event_log: event_log.clone(),
+                }
+                .into())
+            }),
+        })
+    }
+
+    /// A Kata pod with this init-data, quoting through `quote`. A KMS node runs on the CPU class,
+    /// so it never asks for GPU evidence.
+    pub fn coco(quote: alpha_tsm::coco::QuoteSource, initdata: Vec<u8>) -> Result<Self, String> {
+        let source = alpha_tsm::coco::Source {
+            quote,
+            initdata: initdata.clone(),
+            runtime_class: CPU_RUNTIME_CLASS.into(),
+            gpu_count: 0,
+        };
+        Self::coco_with(
+            &initdata,
+            Arc::new(move |report_data| {
+                source
+                    .evidence(report_data)
+                    .map(Into::into)
+                    .map_err(|e| e.to_string())
+            }),
+        )
+    }
+
+    /// A Kata pod with this init-data and another evidence source (a test's synthetic one).
+    pub fn coco_with(initdata: &[u8], evidence: EvidenceSource) -> Result<Self, String> {
+        let revision = InitData::parse(initdata)
+            .and_then(|d| d.revision())
+            .map_err(|e| format!("init-data: {e}"))?;
+        if revision.runtime_class != CPU_RUNTIME_CLASS {
+            return Err(format!(
+                "init-data: a KMS node runs on {CPU_RUNTIME_CLASS}, not {}",
+                revision.runtime_class
+            ));
+        }
+        Ok(Self {
+            compose_hash: revision.hash().map_err(|e| format!("init-data: {e}"))?,
+            evidence,
+        })
+    }
+
+    pub fn evidence(&self, report_data: &[u8; 64]) -> Result<AnyEvidence, ApiError> {
+        (self.evidence)(report_data).map_err(ApiError::internal)
+    }
+}
+
+/// `ALPHACOMPUTE_QUOTE_SOURCE`, as `alpha-runtime` reads it: unset or `dstack` for a prototype
+/// CVM, `coco-aa` or `coco-tsm` for a Kata pod. The agent policy pins it with the rest of the
+/// container's environment.
+pub fn quote_source(var: Option<&str>) -> Result<Option<alpha_tsm::coco::QuoteSource>, String> {
+    use alpha_tsm::coco::QuoteSource::*;
+    match var {
+        None | Some("dstack") => Ok(None),
+        Some("coco-aa") => Ok(Some(AttestationAgent)),
+        Some("coco-tsm") => Ok(Some(ConfigfsTsm)),
+        Some(other) => Err(format!(
+            "ALPHACOMPUTE_QUOTE_SOURCE={other:?} is not dstack, coco-aa or coco-tsm"
+        )),
+    }
+}
+
+/// Where DCAP collateral comes from: a PCCS in production, a fixed capture in tests.
 pub enum CollateralSource {
-    Pccs(String),
+    /// The PCCS the platform document names. `ALPHACOMPUTE_PCCS_URL` (`env`) is read only when
+    /// the document names none, as one signed before `pccs_url` existed, except in a `dev-root`
+    /// build, where it overrides the document so a development node can use a test PCCS.
+    Pccs {
+        env: Option<String>,
+    },
     Fixed(Box<Collateral>),
+}
+
+/// The PCCS to fetch from, by the rule on [`CollateralSource::Pccs`].
+pub fn pccs_url<'a>(document: Option<&'a str>, env: Option<&'a str>, dev: bool) -> Option<&'a str> {
+    match (document, env) {
+        (Some(_), Some(env)) if dev => Some(env),
+        (Some(document), _) => Some(document),
+        (None, env) => env,
+    }
 }
 
 /// The two intermediates in memory after unseal, join or bootstrap.
@@ -120,7 +246,7 @@ pub struct Node {
     pub runtime_pkcs8: Zeroizing<Vec<u8>>,
     pub runtime_spki: Vec<u8>,
     pub xwing_key: alpha_crypto::PrivateKey,
-    pub event_log: Vec<EventLogEntry>,
+    pub guest: NodeGuest,
     pub compose_hash: ComposeHash,
     pub release_key: ed25519_dalek::VerifyingKey,
     pub platform: RwLock<Option<Arc<PlatformDocument>>>,
@@ -136,11 +262,10 @@ impl Node {
         clock: Clock,
         collateral: CollateralSource,
         nonce_key: [u8; 32],
-        event_log: Vec<EventLogEntry>,
+        guest: NodeGuest,
         release_key: ed25519_dalek::VerifyingKey,
     ) -> Result<Arc<Self>, String> {
-        let compose_hash = alpha_attest::event_log_compose_hash(&event_log)
-            .ok_or("the event log carries no compose-hash event")?;
+        let compose_hash = guest.compose_hash;
         let runtime_key = SigningKey::from_bytes((&random::<32>().map_err(|e| e.message)?).into())
             .map_err(|e| format!("runtime key: {e}"))?;
         let runtime_spki = runtime_key
@@ -167,7 +292,7 @@ impl Node {
             runtime_pkcs8,
             runtime_spki,
             xwing_key: alpha_crypto::PrivateKey::generate().map_err(|e| e.to_string())?,
-            event_log,
+            guest,
             compose_hash,
             release_key,
             platform: RwLock::new(None),
@@ -303,4 +428,45 @@ pub fn rfc3339(t: impl Into<chrono::DateTime<chrono::Utc>>) -> String {
 
 pub async fn migrate(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
     sqlx::migrate!("./migrations").run(pool).await
+}
+
+#[cfg(test)]
+mod tests {
+    use alpha_attest::GpuVerifierKind;
+
+    use super::*;
+
+    #[test]
+    fn the_document_names_the_pccs_and_the_environment_overrides_it_only_in_development() {
+        let (doc, env) = (Some("https://pccs.site"), Some("https://pccs.test"));
+        assert_eq!(pccs_url(doc, env, false), doc);
+        assert_eq!(pccs_url(doc, None, false), doc);
+        assert_eq!(pccs_url(None, env, false), env);
+        assert_eq!(pccs_url(None, None, false), None);
+        assert_eq!(pccs_url(doc, env, true), env);
+        assert_eq!(pccs_url(doc, None, true), doc);
+    }
+
+    #[test]
+    fn quote_source_is_read_as_alpha_runtime_reads_it() {
+        use alpha_tsm::coco::QuoteSource::*;
+        assert_eq!(quote_source(None), Ok(None));
+        assert_eq!(quote_source(Some("dstack")), Ok(None));
+        assert_eq!(quote_source(Some("coco-aa")), Ok(Some(AttestationAgent)));
+        assert_eq!(quote_source(Some("coco-tsm")), Ok(Some(ConfigfsTsm)));
+        assert!(quote_source(Some("tdx")).is_err());
+    }
+
+    #[test]
+    fn gpu_backends_are_nras_and_fortanix_ccm_when_named_never_local() {
+        let kinds = |backends: Vec<Arc<dyn GpuVerifier>>| {
+            backends.iter().map(|b| b.kind()).collect::<Vec<_>>()
+        };
+        assert_eq!(kinds(gpu_backends(None).unwrap()), [GpuVerifierKind::Nras]);
+        assert_eq!(
+            kinds(gpu_backends(Some("https://ccm.example".into())).unwrap()),
+            [GpuVerifierKind::Nras, GpuVerifierKind::FortanixCcm]
+        );
+        assert!(gpu_backends(Some("http://ccm.example".into())).is_err());
+    }
 }

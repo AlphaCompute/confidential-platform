@@ -30,6 +30,20 @@ struct Cli {
     command: Command,
 }
 
+/// The site PCCS, as alpha-infra's blueprints name it (`blueprints/alpha-coco-*/pins.json`), for
+/// a platform document that names none. It answers only inside the site, under a certificate
+/// from the site CA.
+// ponytail: Q2 — the site domain is undecided; `alphacompute.internal` stands in for it, as in
+// alpha-infra.
+const PCCS_URL: &str = "https://pccs.site1.alphacompute.internal:8081/sgx/certification/v4/";
+
+/// The PCCS `unseal` and `bootstrap` fetch collateral from: `--pccs-url` when given (development,
+/// or a custodian outside the site), else the one the verified platform document names, else
+/// the site PCCS. Collateral is Intel-signed whoever serves it.
+fn pccs_url<'a>(flag: Option<&'a str>, doc: &'a PlatformDocument) -> &'a str {
+    flag.or(doc.pccs_url.as_deref()).unwrap_or(PCCS_URL)
+}
+
 /// Everything from flags or `ALPHACOMPUTE_*`; each command asks for what it needs.
 #[derive(Args)]
 struct Config {
@@ -44,14 +58,10 @@ struct Config {
     /// The release-signed platform document.
     #[arg(long, global = true, env = "ALPHACOMPUTE_PLATFORM_DOCUMENT_URL")]
     platform_document_url: Option<String>,
-    /// PCCS for DCAP collateral.
-    #[arg(
-        long,
-        global = true,
-        env = "ALPHACOMPUTE_PCCS_URL",
-        default_value = "https://pccs.phala.network"
-    )]
-    pccs_url: String,
+    /// PCCS for DCAP collateral, over the one the platform document names (development, or a
+    /// custodian outside the site). Unset: the document's, else our site PCCS.
+    #[arg(long, global = true, env = "ALPHACOMPUTE_PCCS_URL")]
+    pccs_url: Option<String>,
     #[arg(long, global = true, env = "ALPHACOMPUTE_SHROUD_URL")]
     shroud_url: Option<String>,
     #[arg(
@@ -200,6 +210,11 @@ enum Command {
         #[arg(long)]
         endpoint: String,
     },
+    /// Approval requests for the re-approval campaign (PRD-05 M3).
+    Approvals {
+        #[command(subcommand)]
+        command: ApprovalsCommand,
+    },
     /// Genesis on an empty database: three custodian public keys.
     Bootstrap {
         /// Three files, each holding a custodian's public key as `keygen --custodian` printed it.
@@ -227,7 +242,23 @@ enum ComposeCommand {
         /// Refuse every tag instead of asking its registry for the digest.
         #[arg(long)]
         no_resolve: bool,
+        /// D6's opt-in: pin the KMS by its CA and whatever the platform document served at this
+        /// https:// URL lists, from `--platform`'s version on, instead of `--platform`'s Revision
+        /// list. KMS upgrades then leave the App's Revision as it is.
+        #[arg(long)]
+        kms_platform_pin: Option<String>,
         compose: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApprovalsCommand {
+    /// Opens, or finds, one approval request per App in the batch through shroud-go, under the
+    /// organization's API key, and prints each signer link; rerun to refresh expired links.
+    Prepare {
+        /// `{"requests": [{"wrapped", "title", "machine"}, ...]}`: each App's `alpha coco wrap`
+        /// output (relative to this file), its Rafay environment name and its machine shape.
+        batch: PathBuf,
     },
 }
 
@@ -509,6 +540,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                     platform,
                     runtime_image,
                     no_resolve,
+                    kms_platform_pin,
                     compose,
                 },
         } => {
@@ -517,8 +549,13 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let plain = wrap::parse(&bytes)?;
             let artifact: SignedDocument = serde_json::from_value(read_json(&platform)?)
                 .map_err(|e| Exit::Refused(format!("artifact: {e}")))?;
-            let runtime =
-                wrap::runtime(&artifact, &alpha_cli::release_key()?, now, &runtime_image)?;
+            let runtime = wrap::runtime(
+                &artifact,
+                &alpha_cli::release_key()?,
+                now,
+                &runtime_image,
+                kms_platform_pin.as_deref(),
+            )?;
             let digests = if no_resolve {
                 BTreeMap::new()
             } else {
@@ -642,6 +679,19 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             }
             Ok(out)
         }
+        Command::Approvals {
+            command: ApprovalsCommand::Prepare { batch },
+        } => {
+            let shroud = Shroud {
+                url: need(config.shroud_url.clone(), "shroud-url")?,
+                api_key: need(config.shroud_api_key.clone(), "shroud-api-key")?,
+            };
+            let (out, failed) = alpha_cli::approvals::prepare_all(&shroud, &batch).await?;
+            if failed {
+                return Err(Exit::Partial(out));
+            }
+            Ok(out)
+        }
         Command::Unseal {
             share,
             key,
@@ -650,11 +700,19 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let remembered = node::ShareFile::read(&share)?.platform_document_version;
             let doc = platform_document(config, now).await?;
             let custodian = keyfile::read(&key, &passphrase("passphrase: ")?)?.xwing()?;
-            let (identity, client) =
-                node::attested_node(&endpoint, &config.pccs_url, &doc, Some(remembered), now)
-                    .await?;
-            let reply = node::unseal(&client, &identity, &share, &custodian, doc.version).await?;
-            Ok(json!(reply))
+            let (attested, client) = node::attested_node(
+                &endpoint,
+                pccs_url(config.pccs_url.as_deref(), &doc),
+                &doc,
+                Some(remembered),
+                now,
+            )
+            .await?;
+            let reply =
+                node::unseal(&client, &attested.identity, &share, &custodian, doc.version).await?;
+            Ok(
+                json!({ "sealed": reply.sealed, "shares": reply.shares, "node": attested.summary() }),
+            )
         }
         Command::Bootstrap {
             custodians,
@@ -676,12 +734,26 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 .try_into()
                 .map_err(|_| Exit::Usage("--custodians takes exactly three files".into()))?;
             let doc = platform_document(config, now).await?;
-            let (identity, client) =
-                node::attested_node(&endpoint, &config.pccs_url, &doc, None, now).await?;
-            Ok(
-                node::bootstrap(&client, &identity, custodians, doc.version, Path::new("."))
-                    .await?,
+            let (attested, client) = node::attested_node(
+                &endpoint,
+                pccs_url(config.pccs_url.as_deref(), &doc),
+                &doc,
+                None,
+                now,
             )
+            .await?;
+            let mut out = node::bootstrap(
+                &client,
+                &attested.identity,
+                custodians,
+                doc.version,
+                Path::new("."),
+            )
+            .await?;
+            if let Some(fields) = out.as_object_mut() {
+                fields.insert("node".into(), attested.summary());
+            }
+            Ok(out)
         }
     }
 }
@@ -707,10 +779,13 @@ async fn main() {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
+    use alpha_attest::PlatformDocument;
     use clap::Parser;
+    use serde_json::json;
 
-    use super::Cli;
+    use super::{Cli, pccs_url};
 
     #[test]
     fn stop_takes_force_or_a_drain_not_both() {
@@ -732,6 +807,41 @@ mod tests {
         assert!(stop(&["--force"]));
         assert!(stop(&["--drain-seconds", "60"]));
         assert!(!stop(&["--force", "--drain-seconds", "60"]));
+    }
+
+    #[test]
+    fn the_platform_documents_pccs_is_used_over_the_site_default_and_the_flag_over_both() {
+        let flag = |args: &[&str]| {
+            Cli::try_parse_from(args)
+                .ok()
+                .map(|cli| cli.config.pccs_url)
+        };
+        let prepare = ["alpha", "approvals", "prepare", "batch.json"];
+        assert_eq!(flag(&prepare), Some(None));
+        let given = ["alpha", "--pccs-url", "https://pccs.example"];
+        assert_eq!(
+            flag(&[&given[..], &prepare[1..]].concat()),
+            Some(Some("https://pccs.example".into()))
+        );
+        assert_eq!(flag(&prepare[..3]), None);
+
+        let mut doc: PlatformDocument = serde_json::from_value(json!({
+            "version": 1, "issued_at": "2026-10-12T00:00:00Z",
+            "policy": { "tcb_statuses": ["UpToDate"], "tolerated_advisories": [] },
+            "reference_values": [], "kms_ca_pem": "", "kms_revisions": []
+        }))
+        .unwrap();
+        assert_eq!(pccs_url(None, &doc), super::PCCS_URL);
+        assert!(!super::PCCS_URL.contains("phala"));
+        doc.pccs_url = Some("https://pccs.site2.example/sgx/certification/v4/".into());
+        assert_eq!(
+            pccs_url(None, &doc),
+            "https://pccs.site2.example/sgx/certification/v4/"
+        );
+        assert_eq!(
+            pccs_url(Some("https://pccs.example"), &doc),
+            "https://pccs.example"
+        );
     }
 
     #[test]
