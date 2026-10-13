@@ -60,6 +60,7 @@ async fn bootstrap_once_unseal_with_two_shares_and_sealed_gate() {
         &h.release.url,
         &h.release.key,
         h.node.clock.clone(),
+        KEYED,
     )
     .await;
     assert!(node2.is_sealed());

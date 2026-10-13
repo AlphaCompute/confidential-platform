@@ -420,6 +420,7 @@ async fn bootstrap_once_never_again_then_unseal_the_second_node() {
         &h.release.url,
         &h.release.key,
         Arc::new(SystemTime::now),
+        KEYED,
     )
     .await;
     assert!(node2.is_sealed());
