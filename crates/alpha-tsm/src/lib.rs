@@ -15,7 +15,7 @@
 )]
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -86,8 +86,9 @@ impl Drop for TsmEntry {
     }
 }
 
-/// Unique across threads by the counter and across processes by pid and time: containers in
-/// one Kata pod share the guest kernel's configfs but may each have their own pid namespace.
+/// Unique across threads by the counter and, nearly always, across processes by pid and time:
+/// containers in one Kata pod share the guest kernel's configfs but may each have their own pid
+/// namespace, so `tsm_quote` retries a name that is already taken.
 fn tsm_entry_name() -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
@@ -105,8 +106,17 @@ fn tsm_quote(root: &Path, report_data: &[u8; 64]) -> Result<Vec<u8>, Error> {
         let what = what.display().to_string();
         move |e| Error::Io(what, e)
     };
-    let dir = root.join(tsm_entry_name());
-    fs::create_dir(&dir).map_err(io(&dir))?;
+    let mut attempts = 0u8;
+    let dir = loop {
+        let dir = root.join(tsm_entry_name());
+        match fs::create_dir(&dir) {
+            Ok(()) => break dir,
+            Err(e) if e.kind() == ErrorKind::AlreadyExists && attempts < 3 => {
+                attempts = attempts.saturating_add(1);
+            }
+            Err(e) => return Err(io(&dir)(e)),
+        }
+    };
     let entry = TsmEntry(dir);
     let attr = |name: &str| entry.0.join(name);
 
