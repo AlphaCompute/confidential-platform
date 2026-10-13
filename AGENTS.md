@@ -18,9 +18,10 @@ the rest.
 Run this loop on the branch, in order, and repeat it until a whole pass changes nothing:
 
 1. `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
-2. Lean review over `git diff origin/main...HEAD`, by a reviewer who did not write the code. It
-   looks only for what to remove or simplify under the Code rules below, plus dead code. Apply
-   every finding, rerun step 1, commit, and review again with a new reviewer.
+2. `/ponytail-review` over `git diff origin/main...HEAD`, in a fresh session that did not write
+   the code. The skills live in `.agents/skills/` (`.claude/skills` links there); the review looks
+   only for what to remove or simplify under the Code rules below, plus dead code. Apply every
+   finding, rerun step 1, commit, and review again in a new session.
    The loop ends when the review has no findings. It never removes the no-panic error paths, input
    validation at trust boundaries, security checks or tests; if a round proposes only those cuts,
    or undoes the previous round, stop and say so in the pull request.
