@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alpha_attest::{
     AppraisalError, Collateral, InitDataMismatch, KataAppraised, PlatformDocument, VerifiedQuote,
-    appraise_kata, check_init_data, verify_quote,
+    appraise_kata, init_data_digest, verify_quote,
 };
 use alpha_core::{ComposeHash, InitData};
 use serde_json::Value;
@@ -58,20 +58,9 @@ fn t1_digest() -> ComposeHash {
     InitData::parse(t1()).unwrap().digest()
 }
 
-fn appraise(
-    quote: &str,
-    init_data: &ComposeHash,
-    doc: &PlatformDocument,
-) -> Result<KataAppraised, AppraisalError> {
+fn appraise(quote: &str, doc: &PlatformDocument) -> Result<KataAppraised, AppraisalError> {
     let report_data = verify(quote).report_data;
-    appraise_kata(
-        &read(quote),
-        &report_data,
-        init_data,
-        doc,
-        &collateral(),
-        now(),
-    )
+    appraise_kata(&read(quote), &report_data, doc, &collateral(), now())
 }
 
 fn refused(result: Result<KataAppraised, AppraisalError>, code: &str, fragment: &str) {
@@ -81,27 +70,11 @@ fn refused(result: Result<KataAppraised, AppraisalError>, code: &str, fragment: 
 }
 
 #[test]
-fn quote_binds_the_init_data_it_booted_with() {
-    check_init_data(&verify("p1-sha256.quote.bin"), &t1_digest()).unwrap();
-}
-
-#[test]
-fn quote_refuses_init_data_one_byte_off() {
-    let toml = t1().replace("probe A", "probe B");
-    assert_eq!(toml.len(), t1().len());
-    let digest = InitData::parse(toml).unwrap().digest();
-    assert!(matches!(
-        check_init_data(&verify("p1-sha256.quote.bin"), &digest),
-        Err(InitDataMismatch::Different)
-    ));
-}
-
-#[test]
 fn quote_of_a_pod_without_init_data_is_refused() {
     let quote = verify("p0-none.quote.bin");
     assert_eq!(quote.mr_config_id, [0; 48]);
     assert!(matches!(
-        check_init_data(&quote, &t1_digest()),
+        init_data_digest(&quote),
         Err(InitDataMismatch::Absent)
     ));
 }
@@ -111,22 +84,24 @@ fn zero_tail_of_mr_config_id_is_enforced() {
     let mut quote = verify("p1-sha256.quote.bin");
     quote.mr_config_id[47] ^= 1;
     assert!(matches!(
-        check_init_data(&quote, &t1_digest()),
-        Err(InitDataMismatch::Different)
+        init_data_digest(&quote),
+        Err(InitDataMismatch::NotSha256)
     ));
 }
 
 #[test]
 fn cpu_pod_is_appraised_as_the_cpu_class() {
-    let appraised = appraise("p1-sha256.quote.bin", &t1_digest(), &doc()).unwrap();
+    let appraised = appraise("p1-sha256.quote.bin", &doc()).unwrap();
     assert_eq!(appraised.runtime_class, "kata-qemu-tdx");
+    assert!(!appraised.gpu);
+    assert_eq!(appraised.init_data, t1_digest());
     assert_eq!(appraised.quote.tcb_status, "UpToDate");
 }
 
 #[test]
 fn debug_console_on_the_kernel_cmdline_is_refused() {
     refused(
-        appraise("r10-debug-console.quote.bin", &t1_digest(), &doc()),
+        appraise("r10-debug-console.quote.bin", &doc()),
         "attestation_unknown",
         "no kata runtime class",
     );
@@ -135,7 +110,7 @@ fn debug_console_on_the_kernel_cmdline_is_refused() {
 #[test]
 fn pod_shape_not_offered_is_refused() {
     refused(
-        appraise("r14-2c-4096.quote.bin", &t1_digest(), &doc()),
+        appraise("r14-2c-4096.quote.bin", &doc()),
         "attestation_unknown",
         "no kata runtime class",
     );
@@ -149,7 +124,7 @@ fn class_with_another_mrtd_is_refused() {
     }
     let doc: PlatformDocument = serde_json::from_value(json).unwrap();
     refused(
-        appraise("p1-sha256.quote.bin", &t1_digest(), &doc),
+        appraise("p1-sha256.quote.bin", &doc),
         "attestation_unknown",
         "no kata runtime class",
     );
@@ -165,7 +140,7 @@ fn zero_mr_config_id_is_refused_even_when_its_shape_is_listed() {
         .push(rtmr0.to_string().into());
     let doc: PlatformDocument = serde_json::from_value(json).unwrap();
     refused(
-        appraise("p0-none.quote.bin", &t1_digest(), &doc),
+        appraise("p0-none.quote.bin", &doc),
         "attestation_failed",
         "MRCONFIGID is zero",
     );
@@ -180,16 +155,16 @@ fn gpu_pod_against_cpu_only_reference_values_is_refused() {
         .retain(|class| class["runtime_class"] == "kata-qemu-tdx");
     let cpu_only: PlatformDocument = serde_json::from_value(json).unwrap();
     refused(
-        appraise("g1b-gpu.quote.bin", &t1_digest(), &cpu_only),
+        appraise("g1b-gpu.quote.bin", &cpu_only),
         "attestation_unknown",
         "no kata runtime class",
     );
     // With the GPU class listed the quote gets past class matching and stops only at its own
-    // init-data, which is not this Revision's.
+    // init-data, a sha384 one.
     refused(
-        appraise("g1b-gpu.quote.bin", &t1_digest(), &doc()),
+        appraise("g1b-gpu.quote.bin", &doc()),
         "attestation_failed",
-        "not the digest of this init-data",
+        "not a SHA-256 init-data digest",
     );
 }
 
@@ -202,7 +177,6 @@ fn a_quote_over_other_report_data_is_refused() {
         appraise_kata(
             &read("p1-sha256.quote.bin"),
             &other,
-            &t1_digest(),
             &doc,
             &collateral(),
             now(),
@@ -213,13 +187,29 @@ fn a_quote_over_other_report_data_is_refused() {
 }
 
 #[test]
+fn a_pod_quoting_over_a_runtime_key_and_nonce_is_bound_to_them() {
+    let nonce: [u8; 32] = read("nonce.bin").try_into().unwrap();
+    let expected = alpha_attest::report_data(&read("runtime_spki.der"), &nonce, None);
+    let appraised = appraise_kata(
+        &read("k2-app.quote.bin"),
+        &expected,
+        &doc(),
+        &collateral(),
+        now(),
+    )
+    .unwrap();
+    let k2 = String::from_utf8(read("k2-app.toml")).unwrap();
+    assert_eq!(appraised.init_data, InitData::parse(k2).unwrap().digest());
+}
+
+#[test]
 fn two_classes_matching_one_td_are_refused() {
     let mut doc = doc();
     let mut twin = doc.kata_reference_values[0].clone();
     twin.runtime_class = "kata-qemu-tdx-twin".into();
     doc.kata_reference_values.push(twin);
     refused(
-        appraise("p1-sha256.quote.bin", &t1_digest(), &doc),
+        appraise("p1-sha256.quote.bin", &doc),
         "attestation_unknown",
         "more than one",
     );
@@ -232,7 +222,7 @@ fn a_class_without_a_name_matches_nothing() {
         class.runtime_class.clear();
     }
     refused(
-        appraise("p1-sha256.quote.bin", &t1_digest(), &doc),
+        appraise("p1-sha256.quote.bin", &doc),
         "attestation_unknown",
         "no kata runtime class",
     );

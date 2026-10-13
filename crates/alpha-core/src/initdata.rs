@@ -4,7 +4,7 @@
 
 use serde::Deserialize;
 
-use crate::{ComposeHash, compose_hash};
+use crate::{AppId, ComposeHash, compose_hash};
 
 #[derive(Debug)]
 pub struct InitData(String);
@@ -42,6 +42,25 @@ impl InitData {
     pub fn digest(&self) -> ComposeHash {
         compose_hash(&self.0)
     }
+
+    /// The App the init-data names in `[data] app_id`, as a compose names it in `name`: the
+    /// digest then belongs to one App, and no other can register the same bytes first.
+    pub fn app_id(&self) -> Option<AppId> {
+        #[derive(Deserialize)]
+        struct Named {
+            data: Data,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            app_id: String,
+        }
+        toml::from_str::<Named>(&self.0)
+            .ok()?
+            .data
+            .app_id
+            .parse()
+            .ok()
+    }
 }
 
 #[cfg(test)]
@@ -59,6 +78,18 @@ mod tests {
         );
         let same_meaning = InitData::parse(T1.replace("\"note\"", "note")).unwrap();
         assert_ne!(same_meaning.digest(), init_data.digest());
+    }
+
+    #[test]
+    fn app_id_is_read_from_data() {
+        let k2 = include_str!("../../../testdata/attest/b300-kata-4.0.0/k2-app.toml");
+        assert_eq!(
+            InitData::parse(k2.into()).unwrap().app_id(),
+            Some("0199e000-0000-7000-8000-00000000a11d".parse().unwrap())
+        );
+        assert_eq!(InitData::parse(T1.into()).unwrap().app_id(), None);
+        let not_uuid = k2.replace("0199e000", "app");
+        assert_eq!(InitData::parse(not_uuid).unwrap().app_id(), None);
     }
 
     #[test]
