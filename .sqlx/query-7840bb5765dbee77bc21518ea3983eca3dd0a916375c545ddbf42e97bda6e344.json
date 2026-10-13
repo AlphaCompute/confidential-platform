@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select compose, init_data from revisions where compose_hash = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "compose",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "revisions",
+            "name": "compose"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "init_data",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "revisions",
+            "name": "init_data"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "7840bb5765dbee77bc21518ea3983eca3dd0a916375c545ddbf42e97bda6e344"
+}
