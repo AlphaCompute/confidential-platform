@@ -211,10 +211,10 @@ fn extract_shape(rendered: &str) -> Result<(String, u32), String> {
     Ok((runtime_class, gpus))
 }
 
-/// Every container and its image in the pod templates of a rendered manifest, which may hold
-/// several YAML documents (a Deployment, its Service, ...).
-fn manifest_containers(rendered: &str) -> Result<BTreeSet<policy::PolicyContainer>, String> {
-    fn walk(value: &serde_yaml_ng::Value, out: &mut BTreeSet<policy::PolicyContainer>) {
+/// Every container (and init container) in the pod templates of a rendered manifest, which may
+/// hold several YAML documents (a Deployment, its Service, ...).
+fn manifest_containers(rendered: &str) -> Result<Vec<serde_yaml_ng::Value>, String> {
+    fn walk(value: &serde_yaml_ng::Value, out: &mut Vec<serde_yaml_ng::Value>) {
         let serde_yaml_ng::Value::Mapping(map) = value else {
             if let serde_yaml_ng::Value::Sequence(items) = value {
                 items.iter().for_each(|v| walk(v, out));
@@ -225,28 +225,97 @@ fn manifest_containers(rendered: &str) -> Result<BTreeSet<policy::PolicyContaine
             if matches!(k.as_str(), Some("containers" | "initContainers"))
                 && let Some(items) = v.as_sequence()
             {
-                for c in items {
-                    if let (Some(name), Some(image)) = (
-                        c.get("name").and_then(serde_yaml_ng::Value::as_str),
-                        c.get("image").and_then(serde_yaml_ng::Value::as_str),
-                    ) {
-                        out.insert(policy::PolicyContainer {
-                            name: name.to_owned(),
-                            image: image.to_owned(),
-                        });
-                    }
-                }
+                out.extend(items.iter().cloned());
             }
             walk(v, out);
         }
     }
-    let mut out = BTreeSet::new();
+    let mut out = Vec::new();
     for document in serde_yaml_ng::Deserializer::from_str(rendered) {
         let value = serde_yaml_ng::Value::deserialize(document)
             .map_err(|e| format!("spec: not YAML: {e}"))?;
         walk(&value, &mut out);
     }
     Ok(out)
+}
+
+/// The name and image of each container, as a policy for them admits them.
+pub(crate) fn admitted(containers: &[serde_yaml_ng::Value]) -> BTreeSet<policy::PolicyContainer> {
+    containers
+        .iter()
+        .filter_map(|c| {
+            Some(policy::PolicyContainer {
+                name: c.get("name")?.as_str()?.to_owned(),
+                image: c.get("image")?.as_str()?.to_owned(),
+            })
+        })
+        .collect()
+}
+
+/// PRD-06 I1 on a Kata pod: a customer DSM is declared only as a literal `ALPHACOMPUTE_DSM` on
+/// the `alpha-runtime` container, so genpolicy pins it, and the policy pins exactly the values
+/// the spec declares (none, when it declares none). A declaration through `valueFrom`, through
+/// `envFrom` on the runtime, or on another container would be the host's to set, and is refused.
+pub(crate) fn check_dsm(
+    containers: &[serde_yaml_ng::Value],
+    verified: &policy::Verified,
+) -> Result<(), String> {
+    use serde_yaml_ng::Value as Yaml;
+    let env = policy::DSM_ENV;
+    let runtime = crate::deploy::RUNTIME_SERVICE;
+    let mut declared = BTreeSet::new();
+    for c in containers {
+        let name = c.get("name").and_then(Yaml::as_str).unwrap_or_default();
+        if name == runtime && c.get("envFrom").is_some() {
+            return Err(format!(
+                "{runtime}: envFrom could set {env} without the policy pinning it; list its variables in env"
+            ));
+        }
+        let entries = c
+            .get("env")
+            .and_then(Yaml::as_sequence)
+            .into_iter()
+            .flatten();
+        for entry in entries.filter(|e| e.get("name").and_then(Yaml::as_str) == Some(env)) {
+            if name != runtime {
+                return Err(format!(
+                    "{name}: {env} is read only by {runtime}; declare the DSM there"
+                ));
+            }
+            let value = entry
+                .get("value")
+                .and_then(Yaml::as_str)
+                .filter(|_| entry.get("valueFrom").is_none())
+                .ok_or_else(|| {
+                    format!("{runtime}: {env} must be a literal value, which the agent policy pins")
+                })?;
+            check_dsm_value(value)?;
+            declared.insert(value);
+        }
+    }
+    let pinned = verified.listed(env);
+    if pinned != declared {
+        return Err(format!(
+            "agent policy: pins {} {env} value(s), the spec declares {}; generate the policy from this spec",
+            pinned.len(),
+            declared.len()
+        ));
+    }
+    Ok(())
+}
+
+/// The shape #72's `alpha_dsm::DsmConfig` requires before anything else: a JSON object naming
+/// its `binding`, `revision` or `app` (there is no CA-only binding). The runtime parses the rest.
+fn check_dsm_value(value: &str) -> Result<(), String> {
+    let config = alpha_core::parse(value.as_bytes())
+        .map_err(|e| format!("{}: not JSON: {e}", policy::DSM_ENV))?;
+    match config.get("binding").and_then(serde_json::Value::as_str) {
+        Some("revision" | "app") => Ok(()),
+        _ => Err(format!(
+            "{}: binding must be \"revision\" or \"app\"",
+            policy::DSM_ENV
+        )),
+    }
 }
 
 /// Builds the `alpha.json` init-data entry in JCS (JSON Canonicalization Scheme) form.
@@ -327,13 +396,15 @@ pub fn render(
     let (runtime_class, gpu_count) = extract_shape(&for_shape)?;
     let policy_text = &policy::pin_hostname(policy_text);
     let verified = policy::verify(policy_text)?;
-    let running = manifest_containers(&for_shape)?;
+    let containers = manifest_containers(&for_shape)?;
+    let running = admitted(&containers);
     if verified.containers != running {
         return Err(format!(
             "agent policy: admits {:?}, but the spec runs {:?}; run genpolicy on this spec's --for-genpolicy rendering",
             verified.containers, running
         ));
     }
+    check_dsm(&containers, &verified)?;
 
     let app_id_str = env
         .get("APP_ID")
@@ -556,6 +627,46 @@ spec:
         );
         let error = render(MINIMAL_SPEC, &loose, &env).unwrap_err();
         assert!(error.contains("ReadStreamRequest"), "{error}");
+    }
+
+    #[test]
+    fn render_takes_a_dsm_only_as_a_literal_on_the_runtime_that_the_policy_pins() {
+        let dsm = r#"{"binding":"revision","endpoint":"https://dsm.example"}"#;
+        let entry = format!("{}={dsm}", policy::DSM_ENV);
+        let mut env = base_env();
+        env.insert("DSM".into(), "unused".into());
+        let spec = |container: &str, declaration: &str| {
+            MINIMAL_SPEC.replace(
+                "    - name: app\n",
+                &format!("    - name: {container}\n      env:\n{declaration}"),
+            )
+        };
+        let literal = format!(
+            "        - name: {}\n          value: '{dsm}'\n",
+            policy::DSM_ENV
+        );
+        let pinned = policy::test_policy_env(&[("alpha-runtime", RUNTIME, &[entry.as_str()])]);
+        let unpinned = policy::test_policy(&[("alpha-runtime", RUNTIME)]);
+
+        render(&spec("alpha-runtime", &literal), &pinned, &env).unwrap();
+        // Declared but not pinned, pinned but not declared.
+        let error = render(&spec("alpha-runtime", &literal), &unpinned, &env).unwrap_err();
+        assert!(error.contains("pins 0"), "{error}");
+        let none = spec("alpha-runtime", "        - { name: X, value: y }\n");
+        assert!(render(&none, &pinned, &env).unwrap_err().contains("pins 1"));
+        // Through valueFrom, on another container, or without a binding.
+        let from = format!(
+            "        - name: {}\n          valueFrom: {{ configMapKeyRef: {{ name: x, key: y }} }}\n",
+            policy::DSM_ENV
+        );
+        let error = render(&spec("alpha-runtime", &from), &pinned, &env).unwrap_err();
+        assert!(error.contains("literal value"), "{error}");
+        let other = policy::test_policy_env(&[("app", RUNTIME, &[entry.as_str()])]);
+        let error = render(&spec("app", &literal), &other, &env).unwrap_err();
+        assert!(error.contains("read only by alpha-runtime"), "{error}");
+        let unbound = literal.replace("revision", "ca");
+        let error = render(&spec("alpha-runtime", &unbound), &pinned, &env).unwrap_err();
+        assert!(error.contains("binding"), "{error}");
     }
 
     fn vector(name: &str) -> std::path::PathBuf {

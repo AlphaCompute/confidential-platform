@@ -37,6 +37,7 @@ pub const TLS_PORT: u16 = alpha_client::runtime::TLS_PORT;
 // adapter or PRD-01's blueprint does, the runtime container does not start (fails closed).
 pub const KMS_CONFIG_MAP: &str = "alpha-kms";
 pub const KMS_CONFIG_MAP_KEY: &str = "endpoints";
+const KMS_ENDPOINTS_ENV: &str = "ALPHACOMPUTE_KMS_ENDPOINTS";
 /// At most this many Secret names reach the approval request (shroud-go's limit).
 pub const MAX_SECRETS: usize = 16;
 /// The runtime's startup probe waits this long for attestation and the first Secret delivery,
@@ -210,6 +211,15 @@ pub async fn wrap(
             verified.containers, expected
         )));
     }
+    let containers: Vec<Yaml> = ["initContainers", "containers"]
+        .iter()
+        .filter_map(|k| spec.get(k).and_then(Value::as_array))
+        .flatten()
+        .map(serde_yaml_ng::to_value)
+        .collect::<Result<_, _>>()
+        .map_err(|e| failed(e.to_string()))?;
+    // wrap has no DSM input: a compose cannot declare one (PRD-06 I1), so the policy pins none.
+    super::check_dsm(&containers, &verified).map_err(failed)?;
 
     let gpu = shape.gpu.clone();
     let alpha = super::alpha_json(app_id, &shape.runtime_class, gpu.clone()).map_err(failed)?;
@@ -320,7 +330,7 @@ fn pod_spec(
                 .collect::<Vec<_>>()
                 .join(","),
         ),
-        json!({ "name": "ALPHACOMPUTE_KMS_ENDPOINTS", "valueFrom": { "configMapKeyRef": {
+        json!({ "name": KMS_ENDPOINTS_ENV, "valueFrom": { "configMapKeyRef": {
             "name": KMS_CONFIG_MAP, "key": KMS_CONFIG_MAP_KEY,
         }}}),
         env_var("ALPHACOMPUTE_QUOTE_SOURCE", "coco-aa"),
@@ -563,6 +573,11 @@ fn environment(value: &Yaml, place: &str) -> Result<Vec<Value>, String> {
     pairs
         .into_iter()
         .map(|(k, v)| {
+            if k == policy::DSM_ENV {
+                return Err(format!(
+                    "{place}: {k} cannot be set by a compose; a customer DSM is not available for this App yet"
+                ));
+            }
             if k.is_empty() || k.contains('=') || !seen.insert(k.clone()) {
                 return Err(format!("{place}: {k} is not a name, or is set twice"));
             }
@@ -696,7 +711,7 @@ pub fn genpolicy_input(app_id: AppId, spec: &Value) -> Result<String, String> {
     }
     for container in containers_mut(fields) {
         if let Some(env) = container.get_mut("env").and_then(Value::as_array_mut) {
-            env.retain(|e| e.get("valueFrom").is_none());
+            env.retain(|e| e.get("name").and_then(Value::as_str) != Some(KMS_ENDPOINTS_ENV));
         }
     }
     let name = workload_name(app_id);
@@ -780,16 +795,24 @@ mod tests {
                     defaults: None,
                     ..policy::Genpolicy::pinned()
                 });
-            let runs = match &live {
-                Some(_) => Vec::new(),
-                None => serde_json::from_str(
-                    &fs::read_to_string(dir.join("genpolicy-runs.json")).unwrap_or_default(),
-                )
-                .unwrap_or_default(),
-            };
+            match live {
+                Some(live) => Self {
+                    dir,
+                    live: Some(live),
+                    runs: RefCell::new(Vec::new()),
+                },
+                None => Self::replay(dir),
+            }
+        }
+
+        fn replay(dir: PathBuf) -> Self {
+            let runs = serde_json::from_str(
+                &fs::read_to_string(dir.join("genpolicy-runs.json")).unwrap_or_default(),
+            )
+            .unwrap_or_default();
             Self {
                 dir,
-                live,
+                live: None,
                 runs: RefCell::new(runs),
             }
         }
@@ -1082,6 +1105,16 @@ mod tests {
         }
     }
 
+    /// 01-gpu's recorded genpolicy runs, answering the last with `policy` instead.
+    struct Replay(PathBuf, String);
+
+    impl PolicySource for Replay {
+        async fn generate(&self, yaml: &str) -> Result<String, GenpolicyError> {
+            let recorded = Recorded::replay(self.0.clone());
+            recorded.generate(yaml).await.map(|_| self.1.clone())
+        }
+    }
+
     #[derive(Deserialize)]
     struct Case {
         compose: String,
@@ -1101,7 +1134,7 @@ mod tests {
     async fn wrap_refuses_every_vector() {
         let text = fs::read_to_string(dir("coco/wrap-refusals").join("cases.yaml")).unwrap();
         let cases: BTreeMap<String, Case> = serde_yaml_ng::from_str(&text).unwrap();
-        assert_eq!(cases.len(), 9);
+        assert_eq!(cases.len(), 10);
         let shape = Shape::parse(&fs::read(dir("coco/wrap/01-gpu/shape.json")).unwrap()).unwrap();
         let source = Fixed(String::new());
         for (name, case) in cases {
@@ -1145,6 +1178,17 @@ mod tests {
                 Err(self.0.clone())
             }
         }
+        // A policy that pins a DSM the pod does not declare (PRD-06 I1).
+        let dsm = fs::read_to_string(out.join("policy.rego"))
+            .unwrap()
+            .replacen(
+                "\"ALPHACOMPUTE_QUOTE_SOURCE=coco-aa\"",
+                "\"ALPHACOMPUTE_QUOTE_SOURCE=coco-aa\", \"ALPHACOMPUTE_DSM={}\"",
+                1,
+            );
+        let compose01 = fs::read(out.join("compose.yaml")).unwrap();
+        let error = failed(wrap_with(&compose01, &shape, &Replay(out.clone(), dsm)).await);
+        assert!(error.contains("pins 1 ALPHACOMPUTE_DSM"), "{error}");
         // A missing or wrong genpolicy is ours.
         let missing = Answer(GenpolicyError::Failed(
             "genpolicy at /opt/kata/bin: gone".into(),

@@ -14,6 +14,16 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+pub use alpha_core::coco::policy::{
+    ALLOWED_ENV_REGEX, COPY_FILE_PATHS, DSM_ENV, KMS_ENDPOINTS_ENV_REGEX, PolicyContainer,
+    REFUSED_REQUESTS, RULES, Verified, dsm_pinned, verify,
+};
+#[cfg(test)]
+use alpha_core::coco::policy::{
+    DATA_PREFIX, HOSTNAME_ENV_REGEX, IMAGE_ANNOTATION, NAME_ANNOTATION, TOKEN_MOUNTS,
+    TYPE_ANNOTATION,
+};
+#[cfg(test)]
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -25,16 +35,6 @@ pub const GENPOLICY_PATH: &str = "/opt/kata/bin/genpolicy";
 pub const GENPOLICY_SHA256: &str =
     "c32ad5371d0c348100edf76758ce56682b2868fb250b883d2c7f0a68c342aa59";
 /// genpolicy 4.1.0's `rules.rego` (from the same tarball), as released.
-#[cfg(test)]
-const UPSTREAM_RULES: &str = include_str!("genpolicy/rules.rego");
-/// The Alpha rules patch (`alpha-rules.patch`, byte for byte as in #82's
-/// `testdata/agent-policy/`, which holds its regression tests): the guest pulls exactly the image
-/// the policy names (`allow_guest_pull_image`), and every variable the policy lists is set
-/// (`allow_env_complete`).
-pub const RULES_PATCH: &str = include_str!("genpolicy/alpha-rules.patch");
-/// genpolicy 4.1.0's `rules.rego` with [`RULES_PATCH`] applied, which every accepted policy
-/// starts with.
-pub const RULES: &str = include_str!("genpolicy/alpha-rules.rego");
 /// genpolicy 4.1.0's default `genpolicy-settings.json`, as released.
 const UPSTREAM_SETTINGS: &str = include_str!("genpolicy/genpolicy-settings.json");
 /// The settings drop-ins genpolicy applies to its defaults (RFC 6902 patches, in name order):
@@ -54,66 +54,6 @@ pub const SETTINGS_DROP_INS: [(&str, &str); 3] = [
         include_str!("genpolicy/genpolicy-settings.d/50-alpha-hostname.json"),
     ),
 ];
-/// What genpolicy prints between the rules and the data.
-const DATA_PREFIX: &str = "\npolicy_data := ";
-/// `ALPHACOMPUTE_KMS_ENDPOINTS` comes from the namespace's `alpha-kms` ConfigMap, not the policy:
-/// the endpoints are only where to connect, since the runtime pins the KMS CA and Revisions. The
-/// policy admits the variable only as a list of `https://host[:port]` (the `40-` drop-in).
-pub const KMS_ENDPOINTS_ENV_REGEX: &str = "^ALPHACOMPUTE_KMS_ENDPOINTS=https://[a-z0-9.-]{1,253}(:[1-9][0-9]{0,3}|:[1-5][0-9]{4}|:6[0-4][0-9]{3}|:65[0-4][0-9]{2}|:655[0-2][0-9]|:6553[0-5])?(,https://[a-z0-9.-]{1,253}(:[1-9][0-9]{0,3}|:[1-5][0-9]{4}|:6[0-4][0-9]{3}|:65[0-4][0-9]{2}|:655[0-2][0-9]|:6553[0-5])?){0,7}$";
-/// `HOSTNAME` as the host may set it: the pod's name, one lowercase DNS label (the `50-` settings
-/// drop-in). genpolicy's `$(dns_label)` also admits `.` and `_`, so a host could set
-/// `HOSTNAME=sealed.<JWS>` copied from the policy and have the agent unseal one of the App's
-/// Secrets into a container that was never given it (Option B, sealed secrets).
-pub const HOSTNAME_ENV_REGEX: &str = "^HOSTNAME=[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$";
-/// Placeholders genpolicy's rules (`allow_var`, "always_allowed") let the host fill with any
-/// value at all. genpolicy writes `HOSTNAME=$(host-name)` into every container; a host could
-/// then set `HOSTNAME=sealed.<JWS>` copied from the policy and have the agent unseal one of the
-/// App's Secrets into a container never given it. The generators take that entry out instead
-/// ([`pin_hostname`]).
-pub const ANY_VALUE_PLACEHOLDERS: [&str; 3] = ["$(host-name)", "$(node-name)", "$(pod-uid)"];
-/// genpolicy 4.1.0's own `HOSTNAME` pattern, which the `50-` drop-in replaces.
-const GENPOLICY_HOSTNAME_ENV_REGEX: &str = "^HOSTNAME=$(dns_label)$";
-/// The only environment variables the host may add to a container beyond those the policy
-/// lists: the pod's hostname, the API server's `KUBERNETES_*` (the baseline drop-in), and the KMS
-/// endpoints. Service links and the cloud identity variables genpolicy admits by default are not
-/// among them, and none admits a value that starts `sealed.`. A policy may admit fewer.
-pub const ALLOWED_ENV_REGEX: [&str; 10] = [
-    HOSTNAME_ENV_REGEX,
-    "^KUBERNETES_PORT_$(ip_p)_TCP=tcp://$(ipv4_a):$(ip_p)$",
-    "^KUBERNETES_PORT_$(ip_p)_TCP_PROTO=tcp$",
-    "^KUBERNETES_PORT_$(ip_p)_TCP_PORT=$(ip_p)$",
-    "^KUBERNETES_PORT_$(ip_p)_TCP_ADDR=$(ipv4_a)$",
-    "^KUBERNETES_SERVICE_HOST=$(ipv4_a)$",
-    "^KUBERNETES_SERVICE_PORT=$(ip_p)$",
-    "^KUBERNETES_SERVICE_PORT_HTTPS=$(ip_p)$",
-    "^KUBERNETES_PORT=tcp://$(ipv4_a):$(ip_p)$",
-    KMS_ENDPOINTS_ENV_REGEX,
-];
-/// Mounts genpolicy admits by default for a host-provided identity token; a confidential pod
-/// takes none.
-const TOKEN_MOUNTS: [&str; 2] = [
-    "/var/run/secrets/kubernetes.io/serviceaccount",
-    "/var/run/secrets/azure/tokens",
-];
-/// Requests the baseline refuses outright (logs, stdin, diagnostics, remounts).
-const REFUSED_REQUESTS: [&str; 5] = [
-    "ReadStreamRequest",
-    "WriteStreamRequest",
-    "CloseStdinRequest",
-    "GetDiagnosticDataRequest",
-    "UpdateEphemeralMountsRequest",
-];
-/// The one place the host may copy files into the guest: the per-container shared files
-/// (resolv.conf, hosts, the downward-API init-data), each bound to one container's bundle.
-const COPY_FILE_PATHS: [&str; 1] = ["$(sfprefix)"];
-/// Rules the patch adds; a policy without them is genpolicy's unpatched rules.
-const PATCH_RULES: [&str; 2] = [
-    "\nallow_guest_pull_image(p_oci, i_oci, i_storages) if {\n",
-    "\nallow_env_complete(p_process, i_process) if {\n",
-];
-const IMAGE_ANNOTATION: &str = "io.kubernetes.cri.image-name";
-const NAME_ANNOTATION: &str = "io.kubernetes.cri.container-name";
-const TYPE_ANNOTATION: &str = "io.kubernetes.cri.container-type";
 /// genpolicy reads the binary at most this large.
 const MAX_GENPOLICY_BYTES: u64 = 64 << 20;
 /// genpolicy's own output stays under the init-data limit.
@@ -131,25 +71,10 @@ pub fn settings_files() -> Vec<(String, &'static str)> {
     files
 }
 
-/// One container the policy lets the host create, as the policy pins it.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PolicyContainer {
-    pub name: String,
-    pub image: String,
-}
-
-/// A policy that holds the baseline, and the containers it admits (the sandbox's pause
-/// container left out).
-#[derive(Debug)]
-pub struct Verified {
-    pub containers: BTreeSet<PolicyContainer>,
-    /// `policy_data`, parsed, for checks that belong to one caller.
-    pub data: Value,
-}
-
 /// genpolicy's `HOSTNAME=$(host-name)`, which its rules let the host set to anything (a sealed
 /// value copied from the policy included), taken out of every container's environment. The
-/// host-set `HOSTNAME` is then admitted only by the `50-` drop-in's pattern ([`HOSTNAME_ENV_REGEX`]):
+/// host-set `HOSTNAME` is then admitted only by the `50-` drop-in's pattern
+/// ([`alpha_core::coco::policy::HOSTNAME_ENV_REGEX`]):
 /// one lowercase DNS label, which Kubernetes' (the pod's name) is. `HOSTNAME=$(sandbox-name)`
 /// would not do: the rules match `$(sandbox-name)` as an unanchored pattern, so any value that
 /// contains the pod's name passes, a sealed secret with the name appended included.
@@ -158,6 +83,7 @@ pub struct Verified {
 /// Only genpolicy's own layout is edited (one entry per line); anything else is returned as it
 /// is, for `verify` to refuse.
 pub fn pin_hostname(policy: &str) -> String {
+    use alpha_core::coco::policy::{DATA_PREFIX, RULES};
     const ANY: &str = "\"HOSTNAME=$(host-name)\"";
     let Some(data) = policy
         .strip_prefix(RULES)
@@ -183,144 +109,6 @@ pub fn pin_hostname(policy: &str) -> String {
         kept.push(line.to_owned());
     }
     format!("{RULES}{DATA_PREFIX}{}", kept.concat())
-}
-
-/// Accepts `policy` only as genpolicy 4.1.0's rules followed by `policy_data` that holds the
-/// baseline; a single trailing newline, which an editor adds, is allowed.
-pub fn verify(policy: &str) -> Result<Verified, String> {
-    let bad = |m: &str| format!("agent policy: {m}");
-    let data = policy
-        .strip_prefix(RULES)
-        .and_then(|rest| rest.strip_prefix(DATA_PREFIX))
-        .ok_or_else(|| {
-            if PATCH_RULES.iter().any(|r| !policy.contains(r)) {
-                bad("its rules lack the Alpha rules patch (allow_guest_pull_image, allow_env_complete); regenerate it with the rules `alpha coco genpolicy-settings` writes")
-            } else {
-                bad("not genpolicy 4.1.0's rules.rego with the Alpha patch, followed by policy_data; regenerate it with `alpha coco genpolicy-settings` and genpolicy 4.1.0 rather than editing the rules")
-            }
-        })?;
-    let data = data.strip_suffix('\n').unwrap_or(data);
-    let data = alpha_core::parse(data.as_bytes()).map_err(|e| bad(&format!("policy_data: {e}")))?;
-    let at = |pointer: &str| data.pointer(pointer).unwrap_or(&Value::Null);
-
-    if *at("/request_defaults/ExecProcessRequest") != json!({ "allowed_commands": [], "regex": [] })
-    {
-        return Err(bad(
-            "ExecProcessRequest allows commands; exec must be refused",
-        ));
-    }
-    for request in REFUSED_REQUESTS {
-        if *at(&format!("/request_defaults/{request}")) != json!(false) {
-            return Err(bad(&format!("{request} is not refused")));
-        }
-    }
-    if *at("/request_defaults/CopyFileRequest") != json!(COPY_FILE_PATHS) {
-        return Err(bad(
-            "CopyFileRequest allows paths outside the shared-files prefix",
-        ));
-    }
-    let admitted_env = at("/request_defaults/CreateContainerRequest/allow_env_regex");
-    if admitted_env
-        .as_array()
-        .is_some_and(|list| list.contains(&json!(GENPOLICY_HOSTNAME_ENV_REGEX)))
-    {
-        return Err(bad(
-            "allow_env_regex admits genpolicy's HOSTNAME pattern, under which the host may set HOSTNAME to a sealed secret; regenerate it with the 50-alpha-hostname.json drop-in `alpha coco genpolicy-settings` writes",
-        ));
-    }
-    if !admitted_env.as_array().is_some_and(|list| {
-        list.iter()
-            .all(|r| r.as_str().is_some_and(|r| ALLOWED_ENV_REGEX.contains(&r)))
-    }) {
-        return Err(bad(
-            "allow_env_regex admits host-provided environment variables beyond HOSTNAME, KUBERNETES_* and the KMS endpoints",
-        ));
-    }
-    if *at("/cluster_config/guest_pull") != json!(true) {
-        return Err(bad(
-            "images are not pulled in the guest, so their digests would not bind the root filesystems",
-        ));
-    }
-    let containers = at("/containers")
-        .as_array()
-        .ok_or_else(|| bad("policy_data has no containers"))?;
-    let mut admitted = BTreeSet::new();
-    for container in containers {
-        let commands = container.get("exec_commands").unwrap_or(&Value::Null);
-        if !commands.as_array().is_some_and(Vec::is_empty) {
-            return Err(bad(
-                "a container allows exec commands (an exec probe or hook)",
-            ));
-        }
-        let token = container
-            .pointer("/OCI/Mounts")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|m| m.get("destination").and_then(Value::as_str))
-            .find(|d| TOKEN_MOUNTS.contains(d));
-        if let Some(token) = token {
-            return Err(bad(&format!("a container may mount the token at {token}")));
-        }
-        let annotation = |key: &str| {
-            container
-                .pointer(&format!("/OCI/Annotations/{}", key.replace('/', "~1")))
-                .and_then(Value::as_str)
-        };
-        let listed = || {
-            container
-                .pointer("/OCI/Process/Env")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-        };
-        if let Some(var) = listed().find(|e| ANY_VALUE_PLACEHOLDERS.iter().any(|p| e.contains(p))) {
-            return Err(bad(&format!(
-                "{var} lets the host set any value; regenerate it with alpha coco render or wrap"
-            )));
-        }
-        // `$(sandbox-name)` and the like: the rules match the value as an unanchored pattern.
-        if let Some(var) = listed().find(|e| e.starts_with("HOSTNAME=") && e.contains("$(")) {
-            return Err(bad(&format!(
-                "{var} lets the host set HOSTNAME to more than one DNS label; regenerate it with alpha coco render or wrap"
-            )));
-        }
-        if annotation(TYPE_ANNOTATION) == Some("sandbox") {
-            continue;
-        }
-        let name =
-            annotation(NAME_ANNOTATION).ok_or_else(|| bad("a container has no name annotation"))?;
-        let image = annotation(IMAGE_ANNOTATION)
-            .ok_or_else(|| bad(&format!("container {name} has no image annotation")))?;
-        if !pinned(image) {
-            return Err(bad(&format!(
-                "container {name}'s image {image} is not pinned by digest"
-            )));
-        }
-        if !admitted.insert(PolicyContainer {
-            name: name.to_owned(),
-            image: image.to_owned(),
-        }) {
-            return Err(bad(&format!("container {name} is listed twice")));
-        }
-    }
-    if admitted.is_empty() {
-        return Err(bad("admits no container"));
-    }
-    Ok(Verified {
-        containers: admitted,
-        data,
-    })
-}
-
-fn pinned(image: &str) -> bool {
-    image.split_once('@').is_some_and(|(name, digest)| {
-        !name.is_empty()
-            && digest
-                .strip_prefix("sha256:")
-                .is_some_and(|hex| alpha_core::hex_bytes::<32>(hex).is_some())
-    })
 }
 
 /// Why genpolicy did not produce a policy.
@@ -546,12 +334,20 @@ impl Drop for TempDir {
 /// genpolicy prints, for tests that need one without running genpolicy.
 #[cfg(test)]
 pub(crate) fn test_policy(containers: &[(&str, &str)]) -> String {
+    let with_env: Vec<_> = containers.iter().map(|(n, i)| (*n, *i, &[][..])).collect();
+    test_policy_env(&with_env)
+}
+
+/// As [`test_policy`], each container also listing an environment.
+#[cfg(test)]
+pub(crate) fn test_policy_env(containers: &[(&str, &str, &[&str])]) -> String {
     let mut data = tests::data();
     let mut list = vec![data["containers"][0].clone()];
-    for (name, image) in containers {
+    for (name, image, env) in containers {
         let mut c = data["containers"][1].clone();
         c["OCI"]["Annotations"][NAME_ANNOTATION] = json!(name);
         c["OCI"]["Annotations"][IMAGE_ANNOTATION] = json!(image);
+        c["OCI"]["Process"] = json!({ "Env": env });
         list.push(c);
     }
     data["containers"] = json!(list);
@@ -561,6 +357,9 @@ pub(crate) fn test_policy(containers: &[(&str, &str)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// genpolicy 4.1.0's released `rules.rego`, vendored in alpha-core beside the patched rules.
+    const UPSTREAM_RULES: &str = include_str!("../../../alpha-core/src/coco/genpolicy/rules.rego");
 
     /// A policy as genpolicy prints it, from `policy_data`.
     pub(crate) fn policy(data: &Value) -> String {
@@ -598,32 +397,6 @@ mod tests {
         s
     }
 
-    /// `patch` for a unified diff that only adds lines, as `alpha-rules.patch` does.
-    fn apply(original: &str, patch: &str) -> String {
-        let lines: Vec<&str> = original.split_inclusive('\n').collect();
-        let (mut out, mut at, mut in_hunk) = (String::new(), 0, false);
-        for line in patch.split_inclusive('\n') {
-            if let Some(header) = line.strip_prefix("@@ -") {
-                let start: usize = header.split([',', ' ']).next().unwrap().parse().unwrap();
-                while at + 1 < start {
-                    out.push_str(lines[at]);
-                    at += 1;
-                }
-                in_hunk = true;
-            } else if !in_hunk {
-                continue;
-            } else if let Some(added) = line.strip_prefix('+') {
-                out.push_str(added);
-            } else {
-                assert_eq!(lines[at], &line[1..], "context");
-                out.push_str(lines[at]);
-                at += 1;
-            }
-        }
-        lines[at..].iter().for_each(|l| out.push_str(l));
-        out
-    }
-
     pub(crate) fn data() -> Value {
         let settings = effective_settings();
         let container = |kind: &str, name: &str, image: &str| {
@@ -648,15 +421,8 @@ mod tests {
     fn vendored_files_are_genpolicy_4_1_0s() {
         // The tarball's files, so a vendored edit is a deliberate change to these digests.
         let sha = |s: &str| hex::encode(Sha256::digest(s.as_bytes()));
-        assert_eq!(
-            sha(UPSTREAM_RULES),
-            "a1ad4280a7d1db83649de18640fb30f08cc160fadd7f4360d1dde09977b090b7"
-        );
-        // #82's files, byte for byte (its testdata/SHA256SUMS), and the patch applied.
-        assert_eq!(
-            sha(RULES_PATCH),
-            "970cf8d718ccb660c76c08cdcdafbffdc0a71e4638d1cd819bce9f28808a1e59"
-        );
+        // #82's drop-in, byte for byte (its testdata/SHA256SUMS); the rules and #82's rules patch
+        // are checked in alpha_core::coco::policy.
         assert_eq!(
             sha(SETTINGS_DROP_INS[0].1),
             "da88e7dec050a4f30407bf60c81c5ba37e93beff0f3350909cbc56a877bd4247"
@@ -665,10 +431,6 @@ mod tests {
             sha(SETTINGS_DROP_INS[2].1),
             "795746447fd4a2ddb29d2b95899066467c2618ef4225be8ca1010e64c9cbb1eb"
         );
-        assert_eq!(apply(UPSTREAM_RULES, RULES_PATCH), RULES);
-        for rule in PATCH_RULES {
-            assert!(RULES.contains(rule) && !UPSTREAM_RULES.contains(rule));
-        }
         assert_eq!(
             sha(UPSTREAM_SETTINGS),
             "46bf9ac5460393f626ff2ed6fa2501ec5a82893da57c06e5c53a8f8e50e9dfa0"
@@ -791,13 +553,6 @@ mod tests {
             1,
         );
         assert!(verify(&edited).unwrap_err().contains("rules.rego"));
-        // genpolicy's own rules, without the Alpha patch.
-        let unpatched = good.replacen(RULES, UPSTREAM_RULES, 1);
-        assert!(
-            verify(&unpatched)
-                .unwrap_err()
-                .contains("Alpha rules patch")
-        );
         assert!(verify(&format!("{good}\nExecProcessRequest := true\n")).is_err());
         let duplicate = good.replacen(
             "\"containers\": [",

@@ -77,3 +77,12 @@ working-dir:
         image: nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
         ports: ["443:80"]
         working_dir: /srv
+dsm-in-compose:
+  refusal: "ALPHACOMPUTE_DSM cannot be set by a compose"
+  compose: |
+    services:
+      app:
+        image: nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+        ports: ["443:80"]
+        environment:
+          ALPHACOMPUTE_DSM: '{"binding":"app"}'

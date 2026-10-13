@@ -25,6 +25,7 @@ versions; successful wrap output alone establishes none of these deployment
 prerequisites. See `kata-attestation.md` for the verified B300 startup fix and
 remaining hardware checks.
 
+
 ## `alpha coco wrap`
 
 ```
@@ -74,7 +75,7 @@ All services share the pod's network namespace. They reach each other at `127.0.
 wrap runs genpolicy 4.1.0 on exactly the pod spec it prints, wrapped in the Deployment the adapter creates (`app-<App id>` in namespace `app-<App id>`; genpolicy pins the sandbox's name and namespace to it). Some things are left out of genpolicy's input. `automountServiceAccountToken`, `enableServiceLinks` and a claim's `readOnly` are fields genpolicy 4.1.0 refuses. The emitted pod spec still sets `automountServiceAccountToken: false`, and the settings admit no token mount. The KMS endpoints variable is also left out, because the policy admits it by pattern.
 
 - **Binary.** genpolicy is `/opt/kata/bin/genpolicy` from kata-containers 4.1.0's `kata-tools-static-4.1.0-amd64.tar.zst` (sha256 `58fd1660…8f30`). Its own sha256 (`c32ad537…aa59`, `coco::policy::GENPOLICY_SHA256`) is checked before every run, and any other file there is refused. The release's `rules.rego` and `genpolicy-settings.json`, which the adapter image ships under `/opt/kata/share/defaults/kata-containers` with the same pins as its Dockerfile, are checked against `coco::policy::RELEASE_FILES` too. genpolicy itself runs with the copies embedded in `alpha`, with the Alpha baseline applied, which are made from exactly those bytes. The image therefore needs no baseline files of its own. It runs in a fresh directory with an empty environment and a 100-second limit. It needs the network: it downloads every image layer to read `/etc/passwd` and `/etc/group`, and it reads the pause image's configuration from `mcr.microsoft.com`. A large image therefore takes a large share of the two minutes.
-- **Rules and settings: the Alpha baseline of #82.** The files live in `crates/alpha-cli/src/coco/genpolicy/`. #82's `testdata/agent-policy/` holds the regression tests that evaluate them with regorus against a hostile host.
+- **Rules and settings: the Alpha baseline of #82.** The rules live in `crates/alpha-core/src/coco/genpolicy/` and the settings in `crates/alpha-cli/src/coco/genpolicy/`. #82's `testdata/agent-policy/` holds the regression tests that evaluate them with regorus against a hostile host.
   - **Rules.** genpolicy 4.1.0's `rules.rego` with `alpha-rules.patch` applied (`alpha-rules.rego`). The patch is vendored byte for byte from #82, and a test applies it again and compares. It adds `allow_guest_pull_image`: the guest pulls exactly the image the policy names, and the pause container comes from the guest image. It also adds `allow_env_complete`: every variable the policy lists is set. Stock genpolicy 4.1.0 checks neither, so a host could otherwise run another image under the same policy or unset a variable.
   - **Settings.** genpolicy's default `genpolicy-settings.json` plus drop-ins that genpolicy applies itself. `30-alpha-baseline.json` is #82's, byte for byte. `40-alpha-kms-endpoints.json` is ours and adds only the KMS endpoints pattern. `50-alpha-hostname.json` narrows the host-set `HOSTNAME` to one lowercase DNS label; it is #82's too, byte for byte.
   - **`HOSTNAME`.** genpolicy lists `HOSTNAME=$(host-name)` in every container, and its rules let the host set a variable that holds `$(host-name)` to anything. Its own `HOSTNAME` pattern, `$(dns_label)`, also admits `.` and `_`. Either way a host could set `HOSTNAME` to a sealed secret copied from a policy and have the agent unseal it into a container that was never given it. render and wrap therefore take genpolicy's entry out of every container's environment (`coco::policy::pin_hostname`), and the `50-` drop-in leaves one lowercase DNS label, which the pod's name is, as the only `HOSTNAME` the host may set. `HOSTNAME=$(sandbox-name)` would not do: the rules match `$(sandbox-name)` as an unanchored pattern, so any value containing the pod's name passes, a sealed secret with the name appended included. #82's suite shows each of these in genpolicy's own output.
@@ -100,6 +101,17 @@ wrap also requires that the policy admits exactly the pod's containers and image
 Known limits, for the security review:
 
 - `kata_config.oci_version` stays genpolicy's 1.1.0, as in #82's fixtures (*ponytail*, G0: confirm on containerd 2.3.x). A wrong value refuses every container, so it fails closed.
+
+### Customer DSM declarations (PRD-06 I1)
+
+A Kata Instance declares a customer's Fortanix DSM the same way as the compose path: through `ALPHACOMPUTE_DSM` on `alpha-runtime` (#72, `alpha_dsm::DsmConfig`). On Kata the host writes the pod's environment, so the declaration counts only as the agent policy pins it. Three places enforce this:
+
+- **The policy.** Under the baseline, `allow_env_regex` admits nothing but `HOSTNAME`, the API server's `KUBERNETES_*` and the KMS endpoints, so a host can neither add `ALPHACOMPUTE_DSM` to a container nor change it. With #82's `allow_env_complete`, it cannot drop a declared one either.
+- **The generators.** `render` takes a DSM only as a literal `value` of `ALPHACOMPUTE_DSM` on the `alpha-runtime` container, with a `binding` of `revision` or `app`. It refuses `valueFrom`, `envFrom` on the runtime, and the variable on any other container. The policy must pin exactly the values the spec declares, and none when it declares none. `wrap` has no DSM input yet, so it refuses a compose that sets the variable, and it requires a policy that pins none.
+- **The runtime.** In a pod, `alpha-runtime` refuses to start when `ALPHACOMPUTE_DSM` is set unless the init-data it attests with holds a baseline policy that lists exactly that value, with no genpolicy placeholder (`alpha_core::coco::policy::dsm_pinned`). A host that hands it other init-data gets no leaf, because the KMS checks the init-data against `MRCONFIGID`, and without a leaf the DSM opens no session. So the check holds even for a Revision whose policy was not made by these tools.
+
+No KMS-side check is needed. The KMS never sees the DSM declaration, and the DSM authenticates the leaf, whose Revision already binds the measured policy.
+
 
 ## `alpha coco render`
 
