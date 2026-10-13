@@ -79,7 +79,9 @@ fn capture_evidence() -> EvidenceSource {
         if report_data.as_slice() != quoted.as_slice() {
             return Err("report_data is not what the capture's CVM quoted over".into());
         }
-        Ok(evidence(KEYED, "instance").into())
+        Ok(alpha_client::InstanceEvidence::Dstack(evidence(
+            KEYED, "instance",
+        )))
     })
 }
 
@@ -133,7 +135,7 @@ fn start_runtime_with_compose(
         Arc::new(move || *shared.lock().unwrap()),
         capture_evidence(),
         pinned_time(h.now()),
-        app_compose,
+        Some(app_compose),
     )
     .unwrap();
     (runtime, clock)
@@ -647,7 +649,10 @@ async fn a_tenant_serves_its_endpoint_with_the_runtime_identity() {
     let identity = client.identity().await.unwrap();
     assert_eq!(identity.app_id, app);
     assert_eq!(identity.compose_hash, hash);
-    assert_eq!(identity.app_compose, text(KEYED, "app-compose.json"));
+    assert_eq!(
+        identity.app_compose.as_deref(),
+        Some(text(KEYED, "app-compose.json").as_str())
+    );
 
     let secret = client.secret(&format!("{app}.model-key")).await.unwrap();
     assert_eq!(secret.as_slice(), b"v1");
