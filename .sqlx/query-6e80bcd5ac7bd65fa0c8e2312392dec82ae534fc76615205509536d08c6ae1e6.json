@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select compose as \"compose!\" from revisions where app_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "compose!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "revisions",
+            "name": "sealed"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "6e80bcd5ac7bd65fa0c8e2312392dec82ae534fc76615205509536d08c6ae1e6"
+}

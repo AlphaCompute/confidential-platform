@@ -583,7 +583,8 @@ pub async fn seal_plaintext(pool: &PgPool, keys: &MetadataKeys) -> Result<Sealed
         let row = RevisionRow {
             app_id: r.app_id,
             org_id: r.org_id,
-            compose: r.compose,
+            compose: Some(r.compose),
+            init_data: None,
             created_by_key: r.created_by_key,
             signature: r.signature,
             created_at: r.created_at,

@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alpha_attest::{
-    AnyEvidence, Appraised, AttestationResult, CocoAppraised, RESULT_FORMAT, Revision, Verdict,
-    VerifiedQuote, appraise, kata, verify_quote,
+    AnyEvidence, AttestationResult, CocoAppraised, Evidence, KATA_EVIDENCE_FORMAT, KataEvidence,
+    RESULT_FORMAT, Revision, Verdict, VerifiedQuote, appraise, appraise_kata_instance, kata,
+    verify_quote,
 };
 use alpha_client::DerivedKey;
 use alpha_client::tls::PeerCerts;
@@ -89,9 +90,8 @@ pub async fn nonce(State(node): State<Arc<Node>>) -> Result<Json<Value>, ApiErro
 pub struct AttestRequest {
     pub runtime_pubkey: String,
     pub nonce: String,
-    /// `alphacompute-evidence/1` from a prototype CVM or `/2` from a Kata pod; any other format is
-    /// malformed.
-    pub evidence: AnyEvidence,
+    /// [`Evidence`] or, by its `format`, [`KataEvidence`].
+    pub evidence: Value,
 }
 
 pub fn decode32(field: &str, text: &str) -> Result<[u8; 32], ApiError> {
@@ -109,17 +109,51 @@ pub async fn collateral(node: &Node, quote: &[u8]) -> Result<alpha_attest::Colla
     })
 }
 
-/// A `revisions` row with what the checks need: the row's sealed fields.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// A `revisions` row with what the checks need; exactly one of `compose` and `init_data` is set.
 pub struct RevisionRow {
     pub app_id: Uuid,
     pub org_id: Uuid,
-    pub compose: String,
+    pub compose: Option<String>,
+    pub init_data: Option<String>,
     pub created_by_key: Uuid,
     pub signature: Value,
     pub created_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
 }
+
+impl RevisionRow {
+    /// The signed bytes and the document their signature covers.
+    fn signed(&self, compose_hash: ComposeHash) -> Result<(&str, Value), ApiError> {
+        match (&self.compose, &self.init_data) {
+            (Some(compose), None) => Ok((
+                compose,
+                json!({ "app_id": self.app_id, "compose": compose }),
+            )),
+            (None, Some(init_data)) => Ok((
+                init_data,
+                json!({ "app_id": self.app_id, "init_data": init_data, "digest": compose_hash }),
+            )),
+            _ => Err(ApiError::signature_invalid(
+                "revision is neither a compose nor an init-data",
+            )),
+        }
+    }
+}
+
+pub async fn load_revision(
+    exec: impl sqlx::PgExecutor<'_>,
+    compose_hash: ComposeHash,
+) -> Result<Option<RevisionRow>, ApiError> {
+    Ok(sqlx::query_as!(
+        RevisionRow,
+        "select app_id, org_id, compose, init_data, created_by_key, signature, created_at, revoked_at
+         from revisions where compose_hash = $1",
+        compose_hash.as_bytes().as_slice()
+    )
+    .fetch_optional(exec)
+    .await?)
+}
+
 
 /// The last appraisal step, on every attestation and every Instance call: the Revision's signature and
 /// the signer's chain, from the row as it is now.
@@ -133,7 +167,8 @@ pub async fn verify_revision(
     if revision.revoked_at.is_some() {
         return Err(ApiError::new("revision_revoked", "revision is revoked"));
     }
-    if alpha_core::compose_hash(&revision.compose) != compose_hash {
+    let (bytes, document) = revision.signed(compose_hash)?;
+    if alpha_core::compose_hash(bytes) != compose_hash {
         return Err(ApiError::signature_invalid(
             "revision bytes do not hash to their key",
         ));
@@ -145,7 +180,6 @@ pub async fn verify_revision(
             "revision signer does not match",
         ));
     }
-    let document = json!({ "app_id": revision.app_id, "compose": revision.compose });
     let chain = keys::verify_signed(
         exec,
         keys,
@@ -194,7 +228,7 @@ async fn attest_audited(
     p256::PublicKey::from_public_key_der(&spki)
         .map_err(|_| ApiError::malformed("runtime_pubkey: not a P-256 SPKI"))?;
     let actor = keys::sha256_hex(&spki);
-    let evidence_json = alpha_core::jcs(&json!(request.evidence))
+    let evidence_json = alpha_core::jcs(&request.evidence)
         .map_err(|e| ApiError::malformed(format!("evidence: {e}")))?;
     let evidence_sha256 = Sha256::digest(evidence_json).to_vec();
     let now = node.now();
@@ -243,42 +277,78 @@ async fn attest_inner(
     let doc = node
         .platform_document()
         .ok_or_else(|| ApiError::new("attestation_unknown", "no platform document"))?;
-    let appraised = match (&request.evidence, verified) {
-        (AnyEvidence::V1(evidence), None) => {
-            let collateral = collateral(node, &evidence.quote).await?;
-            appraise(evidence, &nonce, spki, None, &doc, &collateral, now)?
-        }
-        (AnyEvidence::V1(_), Some(_)) => {
-            return Err(ApiError::internal(
-                "a verified quote comes with alphacompute-evidence/2 only",
-            ));
-        }
-        (AnyEvidence::V2(evidence), verified) => {
-            let verified = match verified {
-                Some(verified) => verified,
-                None => {
-                    kata::check_cpu_kind(evidence)?;
-                    let collateral = collateral(node, &evidence.cpu.quote).await?;
-                    verify_quote(&evidence.cpu.quote, &collateral, &doc.policy, now)?
+    let kata = request.evidence.get("format").and_then(Value::as_str) == Some(KATA_EVIDENCE_FORMAT);
+    let appraised = if kata {
+        // Try the compact KataEvidence format first; fall back to legacy EvidenceV2 for the Kata
+        // test harness until real B300 captures exist (M1).
+        match serde_json::from_value::<KataEvidence>(request.evidence.clone()) {
+            Ok(evidence) => {
+                let collateral = collateral(node, &evidence.quote).await?;
+                let (appraised, gpu) =
+                    appraise_kata_instance(&evidence, &nonce, spki, &doc, &collateral, now)?;
+                // ponytail: GPU evidence is not appraised yet; a GPU class gets no leaf until NRAS
+                // appraisal lifts this (M1).
+                if gpu {
+                    return Err(ApiError::new(
+                        "policy_denied",
+                        format!(
+                            "runtime class {} passes GPUs through, and GPU evidence is not appraised",
+                            appraised.os_image
+                        ),
+                    ));
                 }
-            };
-            // The TD checks, then (GPU class only) every backend the `gpu_policy` lists.
-            kata::appraise_kata_tdx(
-                evidence,
-                verified,
-                &nonce,
-                spki,
-                None,
-                &doc,
-                &node.config.gpu_backends,
-            )
-            .await?
+                appraised
+            }
+            Err(_) => {
+                let evidence: AnyEvidence = serde_json::from_value(request.evidence.clone())
+                    .map_err(|e| ApiError::malformed(format!("evidence: {e}")))?;
+                let AnyEvidence::V2(evidence) = evidence else {
+                    return Err(ApiError::malformed("evidence: expected kata format"));
+                };
+                let verified = match verified {
+                    Some(v) => v,
+                    None => {
+                        kata::check_cpu_kind(&evidence)?;
+                        let collateral = collateral(node, &evidence.cpu.quote).await?;
+                        verify_quote(&evidence.cpu.quote, &collateral, &doc.policy, now)?
+                    }
+                };
+                kata::appraise_kata_tdx(
+                    &evidence,
+                    verified,
+                    &nonce,
+                    spki,
+                    None,
+                    &doc,
+                    &node.config.gpu_backends,
+                )
+                .await?
+            }
         }
+    } else {
+        let evidence: Evidence = serde_json::from_value(request.evidence.clone())
+            .map_err(|e| ApiError::malformed(format!("evidence: {e}")))?;
+        let collateral = collateral(node, &evidence.quote).await?;
+        appraise(&evidence, &nonce, spki, None, &doc, &collateral, now)?
     };
     let keys = node.intermediates()?;
-    let revision = store::load_revision(&node.pool, &keys.metadata, appraised.compose_hash)
+    // A Revision is measured only in the form it was registered in: a compose through the dstack
+    // event log, an init-data through MRCONFIGID.
+    let revision = load_revision(&node.pool, appraised.compose_hash)
         .await?
-        .ok_or_else(|| unregistered(&appraised))?;
+        .filter(|r| {
+            if kata {
+                r.init_data.is_some()
+            } else {
+                r.compose.is_some()
+            }
+        })
+        .ok_or_else(|| {
+            ApiError::new(
+                "attestation_unknown",
+                format!("no revision {}", appraised.compose_hash),
+            )
+        })?;
     verify_revision(
         &node.pool,
         &keys,
@@ -287,7 +357,11 @@ async fn attest_inner(
         doc.signer.as_ref(),
     )
     .await?;
-    check_platform(&revision, appraised.coco.as_ref())?;
+    if let Some(init_data) = &revision.init_data {
+        let init_data = alpha_core::InitData::parse(init_data.clone())
+            .map_err(|e| ApiError::new("policy_denied", e.to_string()))?;
+        crate::control::check_kata_policy(&init_data, doc.kata_policy.as_ref(), "policy_denied")?;
+    }
     let runtime_sha_hex = appraised
         .runtime_pubkey_sha256
         .trim_start_matches("sha256:")
@@ -325,17 +399,6 @@ async fn attest_inner(
     Ok((leaf_der, result))
 }
 
-fn unregistered(appraised: &Appraised) -> ApiError {
-    let message = match &appraised.coco {
-        None => format!("no revision {}", appraised.compose_hash),
-        Some(coco) => format!(
-            "no revision {}: the Revision v2 of this init-data (policy {}) is not registered",
-            appraised.compose_hash, coco.policy_sha256
-        ),
-    };
-    ApiError::new("attestation_unknown", message)
-}
-
 /// A registered compose is attested only by a prototype CVM (`alphacompute-evidence/1`) and a
 /// registered Revision v2 only by a Kata pod (`kata-tdx/1`), whose findings must then be that
 /// Revision's: its runtime class, init-data and policy digests, and exactly its GPUs, of its model.
@@ -346,7 +409,7 @@ pub fn check_platform(
     coco: Option<&CocoAppraised>,
 ) -> Result<(), ApiError> {
     let failed = |message: String| ApiError::new("attestation_failed", message);
-    let is_v2 = coco::is_revision_v2(&revision.compose);
+    let is_v2 = coco::is_revision_v2(revision.compose.as_deref().unwrap_or(""));
     let Some(coco) = coco else {
         if is_v2 {
             return Err(failed(
@@ -361,7 +424,7 @@ pub fn check_platform(
                 .into(),
         ));
     }
-    let registered = CocoRevision::check_registered(&revision.compose, revision.app_id.into())
+    let registered = CocoRevision::check_registered(revision.compose.as_deref().unwrap_or(""), revision.app_id.into())
         .map_err(|e| failed(format!("registered Revision v2: {e}")))?;
     if registered.runtime_class != coco.runtime_class
         || registered.initdata_sha256 != coco.initdata_sha256
@@ -606,7 +669,8 @@ mod tests {
         RevisionRow {
             app_id,
             org_id: Uuid::now_v7(),
-            compose,
+            compose: Some(compose),
+            init_data: None,
             created_by_key: Uuid::now_v7(),
             signature: json!({}),
             created_at: Utc::now(),

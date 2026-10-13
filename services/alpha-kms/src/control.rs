@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use alpha_core::{AppId, ComposeHash, KeyId, OrgId, PrincipalId, SecretId, context};
+use alpha_core::{AppId, ComposeHash, KataPolicy, KeyId, OrgId, PrincipalId, SecretId, context};
 use axum::Json;
 use axum::extract::{Path, State};
 use base64::Engine;
@@ -176,14 +176,74 @@ struct RevisionPayload {
     compose: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InitDataRevisionPayload {
+    app_id: AppId,
+    init_data: String,
+    digest: ComposeHash,
+}
+
+/// A compose Revision or a Kata init-data Revision, as the `revisions` row holds it: digest, App,
+/// compose, init-data.
+fn revision_payload(
+    value: &Value,
+    kata_policy: Option<&KataPolicy>,
+) -> Result<(ComposeHash, AppId, Option<String>, Option<String>), ApiError> {
+    if value.get("init_data").is_none() {
+        let p: RevisionPayload = payload(value)?;
+        let hash = alpha_core::check_registration(&p.compose, p.app_id)?;
+        return Ok((hash, p.app_id, Some(p.compose), None));
+    }
+    let p: InitDataRevisionPayload = payload(value)?;
+    let init_data = alpha_core::InitData::parse(p.init_data.clone())
+        .map_err(|e| ApiError::malformed(e.to_string()))?;
+    if init_data.app_id() != Some(p.app_id) {
+        return Err(ApiError::malformed(format!(
+            "init-data [data] app_id is not the app_id {}",
+            p.app_id
+        )));
+    }
+    let digest = init_data.digest();
+    if digest != p.digest {
+        return Err(ApiError::malformed(format!(
+            "digest is not the init-data's {digest}"
+        )));
+    }
+    check_kata_policy(&init_data, kata_policy, "malformed")?;
+    Ok((digest, p.app_id, None, Some(p.init_data)))
+}
+
+/// An init-data passes only under the agent policy the current platform document pins, at
+/// registration and again on every attestation, so a Revision stored under an earlier pin, or
+/// before any, gets no leaf once the pin moves. `miss` is the code for a policy off the pin; no
+/// pin at all is always `policy_denied`.
+pub(crate) fn check_kata_policy(
+    init_data: &alpha_core::InitData,
+    kata_policy: Option<&KataPolicy>,
+    miss: &'static str,
+) -> Result<(), ApiError> {
+    let pinned = kata_policy.ok_or_else(|| {
+        ApiError::new(
+            "policy_denied",
+            "the platform document pins no Kata agent policy",
+        )
+    })?;
+    init_data
+        .check_policy(pinned)
+        .map_err(|e| ApiError::new(miss, e.to_string()))
+}
+
 pub async fn register_revision(
     State(node): State<Arc<Node>>,
     Body(body, request): Body<Signed>,
 ) -> Result<Json<Value>, ApiError> {
     audited_route!(node, body, request, "revision.register", async {
         let keys = node.intermediates()?;
-        let p: RevisionPayload = payload(&body.payload)?;
-        let compose_hash = alpha_core::check_registration(&p.compose, p.app_id)?;
+        let doc = node.platform_document();
+        let kata_policy = doc.as_deref().and_then(|d| d.kata_policy.as_ref());
+        let (compose_hash, app_id, compose, init_data) =
+            revision_payload(&body.payload, kata_policy)?;
         let chain = authorize(&node, &keys, context::REVISION, &body, node.now_utc()).await?;
         let org_id = chain.key.org_id;
         let mut tx = node.pool.begin().await?;
@@ -201,7 +261,7 @@ pub async fn register_revision(
         }
         sqlx::query!(
             "select pg_advisory_xact_lock(hashtext($1))",
-            p.app_id.to_string()
+            app_id.to_string()
         )
         .execute(&mut *tx)
         .await?;
@@ -218,20 +278,19 @@ pub async fn register_revision(
             created_at,
             revoked_at: None,
         };
-        store::insert_revision(&mut *tx, &keys.metadata, compose_hash, &row).await?;
-        audited(
+        store::insert_revision(&mut *tx, &keys.metadata, compose_hash, &row).await?;        audited(
             &mut tx,
             &keys,
             &chain,
             "revision.register",
             format!("revision:{compose_hash}"),
-            json!({ "app_id": p.app_id }),
+            json!({ "app_id": app_id }),
         )
         .await?;
         tx.commit().await?;
         Ok(revision_json(
             compose_hash,
-            p.app_id.into(),
+            app_id.into(),
             org_id,
             created_at,
         ))

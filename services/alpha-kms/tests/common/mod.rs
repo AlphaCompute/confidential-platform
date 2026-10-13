@@ -33,6 +33,7 @@ use uuid::Uuid;
 
 pub const KEYED: &str = "phala-0.5.9-1c-2g-keyed";
 pub const DEV_KEYED: &str = "phala-dev-0.5.9-keyed";
+pub const KATA: &str = "b300-kata-4.0.0";
 
 pub fn testdata() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata")
@@ -214,16 +215,17 @@ pub fn client_with(identity_pem: &str) -> reqwest::Client {
         .unwrap()
 }
 
-/// A node acting as the keyed capture's CVM: its event log, nonce key and collateral, and `clock`
-/// (the capture's time when a test attests with its quote, the wall clock when a pinned TLS
-/// client must accept the node's one-hour leaf).
+/// A node acting as the keyed capture's CVM: its event log and nonce key, the collateral captured
+/// beside `collateral_of`, and `clock` (the capture's time when a test attests with its quote, the
+/// wall clock when a pinned TLS client must accept the node's one-hour leaf).
 pub async fn start_node(
     pool: PgPool,
     release_url: &str,
     release_key: &SigningKey,
     clock: Clock,
+    collateral_of: &str,
 ) -> (Arc<Node>, String, tokio::sync::oneshot::Sender<()>) {
-    start_node_with(pool, release_url, release_key, clock, Vec::new()).await
+    start_node_with(pool, release_url, release_key, clock, Vec::new(), collateral_of).await
 }
 
 /// [`start_node`] with these GPU verifier backends.
@@ -233,10 +235,11 @@ pub async fn start_node_with(
     release_key: &SigningKey,
     clock: Clock,
     gpu_backends: Vec<Arc<dyn GpuVerifier>>,
+    collateral_of: &str,
 ) -> (Arc<Node>, String, tokio::sync::oneshot::Sender<()>) {
     let event_log: Vec<EventLogEntry> =
         serde_json::from_slice(&read(KEYED, "event_log.json")).unwrap();
-    let collateral = serde_json::from_slice(&read(KEYED, "collateral.json")).unwrap();
+    let collateral = serde_json::from_slice(&read(collateral_of, "collateral.json")).unwrap();
     let config = Config {
         kms_endpoints: vec![],
         platform_document_url: release_url.to_owned(),
@@ -297,8 +300,44 @@ pub async fn harness_with(
         &release.key,
         clock,
         gpu_backends,
+        KEYED,
     )
     .await;
+    harness_inner(node, pool, base, shutdown, release).await
+}
+
+/// A node at the Kata capture's time, with its collateral, and the Kata reference values and agent
+/// policy added to the keyed capture's platform document.
+pub async fn kata_harness() -> Option<Harness> {
+    let mut document = platform_document(KEYED);
+    let kata = platform_document(KATA);
+    document["kata_reference_values"] = kata["kata_reference_values"].clone();
+    document["kata_policy"] = kata["kata_policy"].clone();
+    let now = captured_at(KATA);
+    harness_on(Arc::new(move || now), KATA, document).await
+}
+
+pub async fn harness_on(clock: Clock, collateral_of: &str, document: Value) -> Option<Harness> {
+    let pool = fresh_database().await?;
+    let release = ReleaseServer::start(document).await;
+    let (node, base, shutdown) = start_node(
+        pool.clone(),
+        &release.url,
+        &release.key,
+        clock,
+        collateral_of,
+    )
+    .await;
+    harness_inner(node, pool, base, shutdown, release).await
+}
+
+async fn harness_inner(
+    node: Arc<Node>,
+    pool: PgPool,
+    base: String,
+    shutdown: tokio::sync::oneshot::Sender<()>,
+    release: ReleaseServer,
+) -> Option<Harness> {
     let custodians: Vec<PrivateKey> = (0..3).map(|_| PrivateKey::generate().unwrap()).collect();
     let dir = std::env::temp_dir().join(format!("alpha-harness-{}", Uuid::now_v7()));
     fs::create_dir_all(&dir).unwrap();
@@ -435,7 +474,8 @@ impl Harness {
         let row = RevisionRow {
             app_id: app_id.into(),
             org_id: org.into(),
-            compose,
+            compose: Some(compose),
+            init_data: None,
             created_by_key: key.into(),
             signature,
             created_at: self.now().into(),

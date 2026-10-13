@@ -231,14 +231,13 @@ impl Pod {
         Self::quote_of(&self.initdata, &self.runtime_class, self.report_data(nonce))
     }
 
-    /// The request as `alpha-runtime` sends it (`alpha_client::AttestRequest`), as the KMS parses it.
+    /// The request as `alpha-runtime` sends it (evidence serialised as a JSON `Value`).
     pub fn request(&self, nonce: &[u8; 32], evidence: EvidenceV2) -> AttestRequest {
-        let wire = alpha_client::AttestRequest {
+        AttestRequest {
             runtime_pubkey: b64(&self.spki()),
             nonce: b64(nonce),
-            evidence: evidence.into(),
-        };
-        serde_json::from_value(serde_json::to_value(&wire).unwrap()).unwrap()
+            evidence: serde_json::to_value(&evidence).unwrap(),
+        }
     }
 
     /// Attests with a fresh nonce, this pod's evidence and the quote its TD produces.

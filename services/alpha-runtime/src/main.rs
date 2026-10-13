@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use alpha_runtime::{
-    Config, EXIT_REFUSED, Error, Exit, Runtime, SECRETS_DIR, SOCKET_PATH, TLS_PORT, proxy,
+    Config, EXIT_REFUSED, Error, Exit, Runtime, SECRETS_DIR, SOCKET_PATH, Substrate, TLS_PORT,
+    proxy,
 };
 use p256::ecdsa::SigningKey;
 use tokio::net::UnixListener;
@@ -48,38 +49,27 @@ async fn run() -> Result<Exit, Error> {
     let mut seed = [0u8; 32];
     getrandom::fill(&mut seed).map_err(|e| Error::Key(format!("rng: {e}")))?;
     let key = SigningKey::from_bytes(&seed.into()).map_err(|e| Error::Key(e.to_string()))?;
-    let guest = alpha_runtime::parse_guest(
-        std::env::var(alpha_runtime::QUOTE_SOURCE_ENV)
-            .ok()
-            .as_deref(),
-    )?;
-    let (app_compose, evidence, initdata) = match guest {
-        alpha_runtime::Guest::Prototype => (
+    let substrate = Substrate::detect(Path::new(alpha_tsm::DSTACK_SOCKET));
+    let app_compose = match substrate {
+        Substrate::Dstack => Some(
             alpha_tsm::app_compose().map_err(|e| Error::Evidence(format!("app_compose: {e}")))?,
-            alpha_runtime::tsm_evidence(),
-            None,
         ),
-        alpha_runtime::Guest::Coco(source) => {
-            let initdata = alpha_tsm::coco::initdata(Path::new(alpha_tsm::coco::INITDATA_PATH))
-                .map_err(|e| Error::Evidence(format!("init-data: {e}")))?;
-            let coco = alpha_runtime::coco_identity(source, initdata)?;
-            (coco.revision, coco.evidence, Some(coco.initdata))
-        }
+        // In a Kata pod the KMS pins above come from the pod spec the host writes; the agent
+        // policy in the init-data, which the KMS requires, refuses this container unless every
+        // variable has its rendered value.
+        Substrate::Kata => None,
     };
     let runtime = Runtime::new(
         config,
         &key,
         Arc::new(SystemTime::now),
-        evidence,
+        alpha_runtime::tsm_evidence(substrate),
         alpha_client::system_time_provider(),
         app_compose,
     )?;
-    if let Some(initdata) = initdata {
-        runtime.set_initdata(initdata);
-    }
     let attested = runtime.attest().await?;
     eprintln!(
-        "alpha-runtime: attested as app {} revision {} until {}",
+        "alpha-runtime: attested on {substrate:?} as app {} revision {} until {}",
         attested.identity.app_id,
         attested.identity.compose_hash,
         alpha_runtime::socket::rfc3339(attested.not_after)

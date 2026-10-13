@@ -17,13 +17,16 @@
 pub mod coco;
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use alpha_attest::EventLogEntry;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
+use dcap_qvl::quote::Quote;
 use serde::Deserialize;
 
 /// The dstack guest agent, which quotes the TD for us: Phala's guest image carries no
@@ -36,8 +39,11 @@ pub const DSTACK_SOCKET: &str = "/var/run/dstack.sock";
 /// to start with the table missing.
 pub const CCEL_PATH: &str = "/ccel";
 pub const RUNTIME_EVENTS_PATH: &str = "/run/log/dstack/runtime_events.log";
+/// The guest kernel's quote interface in a Kata TDX pod, which has no dstack guest agent.
+pub const TSM_REPORT_DIR: &str = "/sys/kernel/config/tsm/report";
 
 const DSTACK_RUNTIME_EVENT_TYPE: u32 = 0x0800_0001;
+const TEE_TYPE_TDX: u32 = 0x81;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -49,6 +55,10 @@ pub enum Error {
     Ccel(&'static str),
     #[error("runtime event log: {0}")]
     RuntimeEvents(String),
+    #[error("configfs-tsm: {0}")]
+    Tsm(String),
+    #[error("quote: {0}")]
+    Quote(String),
 }
 
 #[derive(Deserialize)]
@@ -56,9 +66,88 @@ struct QuoteReply {
     quote: String,
 }
 
-/// One quote over `report_data`, from the guest agent's `GetQuote`.
+/// One quote over `report_data`: from the guest agent's `GetQuote` when its socket exists,
+/// otherwise from configfs-tsm when the report directory exists, otherwise the agent's
+/// connect error.
 pub fn quote(report_data: &[u8; 64]) -> Result<Vec<u8>, Error> {
-    quote_from(Path::new(DSTACK_SOCKET), report_data)
+    let socket = Path::new(DSTACK_SOCKET);
+    let tsm = Path::new(TSM_REPORT_DIR);
+    if !socket.exists() && tsm.is_dir() {
+        tsm_quote(tsm, report_data)
+    } else {
+        quote_from(socket, report_data)
+    }
+}
+
+/// A configfs-tsm report entry, removed however the request ends.
+struct TsmEntry(PathBuf);
+
+impl Drop for TsmEntry {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.0);
+    }
+}
+
+/// Unique across threads by the counter and, nearly always, across processes by pid and time:
+/// containers in one Kata pod share the guest kernel's configfs but may each have their own pid
+/// namespace, so `tsm_quote` retries a name that is already taken.
+fn tsm_entry_name() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("alpha-{}-{nanos}-{n}", std::process::id())
+}
+
+/// One quote over `report_data` from a fresh entry under the configfs-tsm `root`, checked to be
+/// a TDX quote over exactly that `report_data`.
+fn tsm_quote(root: &Path, report_data: &[u8; 64]) -> Result<Vec<u8>, Error> {
+    let io = |what: &Path| {
+        let what = what.display().to_string();
+        move |e| Error::Io(what, e)
+    };
+    let mut attempts = 0u8;
+    let dir = loop {
+        let dir = root.join(tsm_entry_name());
+        match fs::create_dir(&dir) {
+            Ok(()) => break dir,
+            Err(e) if e.kind() == ErrorKind::AlreadyExists && attempts < 3 => {
+                attempts = attempts.saturating_add(1);
+            }
+            Err(e) => return Err(io(&dir)(e)),
+        }
+    };
+    let entry = TsmEntry(dir);
+    let attr = |name: &str| entry.0.join(name);
+
+    let provider = fs::read_to_string(attr("provider")).map_err(io(&attr("provider")))?;
+    if provider.trim() != "tdx_guest" {
+        return Err(Error::Tsm(format!("provider is {:?}", provider.trim())));
+    }
+    fs::write(attr("inblob"), report_data).map_err(io(&attr("inblob")))?;
+    // Another writer on our entry is caught by `check_quote`: the quote then carries its
+    // report_data, not ours.
+    let quote = fs::read(attr("outblob")).map_err(io(&attr("outblob")))?;
+    drop(entry);
+    check_quote(&quote, report_data)?;
+    Ok(quote)
+}
+
+/// The quote is a v4 or v5 TDX quote whose TD report carries `report_data`.
+fn check_quote(quote: &[u8], report_data: &[u8; 64]) -> Result<(), Error> {
+    let parsed = Quote::parse(quote).map_err(|e| Error::Quote(format!("{e:#}")))?;
+    // dcap-qvl takes a v5 TD report from the body type alone, without the header's TEE type.
+    let report = parsed
+        .report
+        .as_td10()
+        .filter(|_| parsed.header.tee_type == TEE_TYPE_TDX)
+        .ok_or_else(|| Error::Quote("not a TDX quote".into()))?;
+    if &report.report_data != report_data {
+        return Err(Error::Quote("report_data is not ours".into()));
+    }
+    Ok(())
 }
 
 fn quote_from(socket: &Path, report_data: &[u8; 64]) -> Result<Vec<u8>, Error> {
@@ -353,6 +442,77 @@ mod tests {
         assert_eq!(events[0].event_payload, [1, 2, 3]);
         assert!(events[0].digest.is_empty());
         assert!(runtime_events("{\"event\":1}").is_err());
+    }
+
+    /// A configfs-tsm outblob read by an unprivileged container in a Kata TDX pod on a B300
+    /// host, over `KATA_REPORT_DATA`.
+    const KATA_QUOTE: &[u8] = include_bytes!("../testdata/kata-tdx-quote.bin");
+    const KATA_REPORT_DATA: &str = "a1ff0080c0fe414c5048412d54534d2d554e505249560b30557a9fc4e90e33587da2c7ec11365b80a5caef14395e83a8cdf2173c6186abd0f51a3f6489aed3f8";
+
+    #[test]
+    fn accepts_a_kata_quote_only_over_our_report_data() {
+        let ours: [u8; 64] = unhex(KATA_REPORT_DATA).unwrap().try_into().unwrap();
+        check_quote(KATA_QUOTE, &ours).unwrap();
+        let mut other = ours;
+        other[63] ^= 1;
+        let error = check_quote(KATA_QUOTE, &other).unwrap_err().to_string();
+        assert!(error.contains("not ours"), "{error}");
+    }
+
+    #[test]
+    fn refuses_what_is_not_a_tdx_quote() {
+        let ours: [u8; 64] = unhex(KATA_REPORT_DATA).unwrap().try_into().unwrap();
+        assert!(check_quote(&KATA_QUOTE[..600], &ours).is_err());
+        assert!(check_quote(&[], &ours).is_err());
+        let mut garbled = KATA_QUOTE.to_vec();
+        garbled[0] = 9;
+        assert!(check_quote(&garbled, &ours).is_err());
+        let mut sgx = KATA_QUOTE.to_vec();
+        sgx[4..8].copy_from_slice(&0u32.to_le_bytes());
+        assert!(check_quote(&sgx, &ours).is_err());
+    }
+
+    #[test]
+    fn refuses_a_v5_td_body_under_a_non_tdx_header() {
+        let ours: [u8; 64] = unhex(KATA_REPORT_DATA).unwrap().try_into().unwrap();
+        let v5 = |tee_type: u32| {
+            let (header, rest) = KATA_QUOTE.split_at(48);
+            let (report, auth) = rest.split_at(584);
+            let mut quote = header.to_vec();
+            quote[0..2].copy_from_slice(&5u16.to_le_bytes());
+            quote[4..8].copy_from_slice(&tee_type.to_le_bytes());
+            quote.extend_from_slice(&2u16.to_le_bytes());
+            quote.extend_from_slice(&584u32.to_le_bytes());
+            quote.extend_from_slice(report);
+            quote.extend_from_slice(auth);
+            quote
+        };
+        check_quote(&v5(TEE_TYPE_TDX), &ours).unwrap();
+        let error = check_quote(&v5(0), &ours).unwrap_err().to_string();
+        assert!(error.contains("not a TDX quote"), "{error}");
+    }
+
+    #[test]
+    fn tsm_entries_are_unique_and_removed_on_error() {
+        let root = std::env::temp_dir().join(format!("alpha-tsm-{}", tsm_entry_name()));
+        fs::create_dir(&root).unwrap();
+        let names: std::collections::HashSet<String> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    s.spawn(|| {
+                        assert!(matches!(tsm_quote(&root, &[0; 64]), Err(Error::Io(..))));
+                        (0..100).map(|_| tsm_entry_name()).collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+        assert_eq!(names.len(), 800);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir(&root).unwrap();
     }
 }
 
