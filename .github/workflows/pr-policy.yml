@@ -1,0 +1,80 @@
+name: pr-policy
+
+# pull_request_target takes this file from main, so a pull request into any other base is
+# checked too, and fails. The job runs only git over the pull request's commits, never its code.
+on:
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  pr-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - shell: bash
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          TITLE: ${{ github.event.pull_request.title }}
+          BODY: ${{ github.event.pull_request.body }}
+          EXTRA_PATHS: ${{ github.event.pull_request.head.repo.full_name == github.repository && secrets.PR_POLICY_FORBIDDEN_PATHS || '' }}
+          EXTRA_TERMS: ${{ github.event.pull_request.head.repo.full_name == github.repository && secrets.PR_POLICY_FORBIDDEN_TERMS || '' }}
+        run: |
+          fail=0
+          # Fork and Dependabot runs get no repository secrets; fail rather than skip the checks.
+          for re in "$EXTRA_PATHS" "$EXTRA_TERMS"; do
+            rc=0; grep -E "$re" </dev/null || rc=$?
+            if [ -z "$re" ] || [ "$rc" -gt 1 ]; then
+              echo "::error::A PR_POLICY_FORBIDDEN_* secret is missing or not a valid regex; push the branch to this repository."
+              fail=1
+            fi
+          done
+          if [ "$BASE_REF" != main ]; then
+            echo "::error::Open the pull request against main, not $BASE_REF."
+            fail=1
+          fi
+
+          added=$(git diff --numstat "$BASE_SHA...$HEAD_SHA" -- ':!Cargo.lock' ':(exclude,glob)**/.sqlx/**' ':(exclude,glob)**/testdata/**' \
+            | awk '$1 != "-" { n += $1 } END { print n + 0 }')
+          if [ "$added" -gt 1000 ]; then
+            echo "::error::$added added lines; split the change into pull requests of at most 1000."
+            fail=1
+          fi
+
+          if [ -n "$EXTRA_PATHS" ] && git log -m --name-only --format= "$BASE_SHA..$HEAD_SHA" | grep -E "$EXTRA_PATHS" >/dev/null; then
+            echo "::error::The diff contains files that must stay local."
+            fail=1
+          fi
+
+          for c in $(git rev-list "$BASE_SHA..$HEAD_SHA" -- CLAUDE.md); do
+            mode=$(git ls-tree "$c" CLAUDE.md | cut -d' ' -f1)
+            if [ "$mode" != 120000 ] || [ "$(git cat-file -p "$c:CLAUDE.md")" != AGENTS.md ]; then
+              echo "::error::CLAUDE.md must stay a symlink to AGENTS.md (commit $c)."
+              fail=1
+            fi
+          done
+
+          cc='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9-]+\))?!?: [^ ]'
+          bad=$( (printf '%s\n' "$TITLE"; git log --format=%s "$BASE_SHA..$HEAD_SHA") | grep -vE "$cc" || true)
+          if [ -n "$bad" ]; then
+            echo "::error::Not a Conventional Commits subject (type(scope): description):"
+            printf '%s\n' "$bad"
+            fail=1
+          fi
+
+          hits=$([ -n "$EXTRA_TERMS" ] && (printf '%s\n%s\n' "$TITLE" "$BODY"; git log --format=%B "$BASE_SHA..$HEAD_SHA") | grep -iE "$EXTRA_TERMS" || true)
+          if [ -n "$hits" ]; then
+            echo "::error::Forbidden terms in the title, body or commit messages:"
+            printf '%s\n' "$hits"
+            fail=1
+          fi
+
+          exit "$fail"
