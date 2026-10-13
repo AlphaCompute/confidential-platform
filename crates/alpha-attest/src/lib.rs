@@ -32,6 +32,7 @@ use sha2::{Digest, Sha256};
 pub use event_log::{EventLogEntry, compose_hash as event_log_compose_hash};
 
 pub const EVIDENCE_FORMAT: &str = "alphacompute-evidence/1";
+pub const KATA_EVIDENCE_FORMAT: &str = "alphacompute-evidence/kata/1";
 pub const RESULT_FORMAT: &str = "alphacompute-attestation-result/1";
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -41,6 +42,16 @@ pub struct Evidence {
     #[serde(with = "base64url")]
     pub quote: Vec<u8>,
     pub event_log: Vec<EventLogEntry>,
+}
+
+/// A Kata pod's evidence is its quote alone: the container cannot read its init-data, and the
+/// quote's `MRCONFIGID` names the Revision.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KataEvidence {
+    pub format: String,
+    #[serde(with = "base64url")]
+    pub quote: Vec<u8>,
 }
 
 mod base64url {
@@ -164,6 +175,9 @@ pub struct KataReference {
     pub rtmr0: Vec<Measurement>,
     pub rtmr1: Measurement,
     pub rtmr2: Measurement,
+    /// Whether the class passes GPUs through, whose evidence the TD quote does not cover.
+    /// Required, so that an entry which forgets it cannot pass for a CPU class.
+    pub gpu: bool,
 }
 
 impl KataReference {
@@ -425,23 +439,14 @@ pub fn appraise(
         return Err(Unknown(format!("kms revision {compose_hash}")));
     }
 
-    let evidence_json = serde_json::to_value(evidence).map_err(|e| Failed(e.to_string()))?;
     Ok(Appraised {
         measured,
         tcb_status,
         advisories,
         os_image,
         compose_hash,
-        runtime_pubkey_sha256: format!(
-            "sha256:{}",
-            hex::encode(Sha256::digest(runtime_pubkey_spki))
-        ),
-        evidence_sha256: format!(
-            "sha256:{}",
-            hex::encode(Sha256::digest(
-                alpha_core::jcs(&evidence_json).map_err(|e| Failed(e.to_string()))?
-            ))
-        ),
+        runtime_pubkey_sha256: sha256_text(runtime_pubkey_spki),
+        evidence_sha256: evidence_sha256(evidence)?,
         policy_version: doc.version,
     })
 }
@@ -452,27 +457,20 @@ pub enum InitDataMismatch {
     // default agent policy, which allows exec.
     #[error("MRCONFIGID is zero: the pod was booted without init-data")]
     Absent,
-    #[error("MRCONFIGID is not the digest of this init-data")]
-    Different,
+    #[error("MRCONFIGID is not a SHA-256 init-data digest followed by zeros")]
+    NotSha256,
 }
 
-/// Kata's QEMU copies the init-data's SHA-256 into a zeroed 48-byte `MRCONFIGID`. `digest` is
-/// [`InitData::digest`](alpha_core::InitData::digest) of the Revision's init-data.
-pub fn check_init_data(
-    quote: &VerifiedQuote,
-    digest: &ComposeHash,
-) -> Result<(), InitDataMismatch> {
+/// The [`InitData::digest`](alpha_core::InitData::digest) a Kata TD booted with: Kata's QEMU
+/// copies the init-data's SHA-256 into a zeroed 48-byte `MRCONFIGID`.
+pub fn init_data_digest(quote: &VerifiedQuote) -> Result<ComposeHash, InitDataMismatch> {
     if quote.mr_config_id == [0; 48] {
         return Err(InitDataMismatch::Absent);
     }
-    if !quote
-        .mr_config_id
-        .iter()
-        .eq(digest.as_bytes().iter().chain(&[0; 16]))
-    {
-        return Err(InitDataMismatch::Different);
+    match quote.mr_config_id.split_first_chunk::<32>() {
+        Some((digest, tail)) if tail.iter().all(|b| *b == 0) => Ok(ComposeHash::from(*digest)),
+        _ => Err(InitDataMismatch::NotSha256),
     }
-    Ok(())
 }
 
 /// SEPT_VE_DISABLE alone. Compared whole, not as a mask, so DEBUG, MIGRATABLE, PKS, KL or
@@ -487,17 +485,21 @@ const KATA_XFAM: u64 = 0x61ae7;
 pub struct KataAppraised {
     /// The class whose reference values the measurements matched, never a host's claim.
     pub runtime_class: String,
+    /// The matched class's [`KataReference::gpu`].
+    pub gpu: bool,
+    /// What the TD booted with, from `MRCONFIGID`: the digest of its Revision.
+    pub init_data: ComposeHash,
     pub quote: VerifiedQuote,
 }
 
 /// Appraisal of a Kata TD's quote, bound to this request by `expected_report_data` (see
-/// [`report_data`]), against `doc.kata_reference_values` and the init-data digest of the
-/// Revision it claims to run. No event log is replayed: the events that vary between TDs carry
-/// only digests, so the final registers say as much.
+/// [`report_data`]), against `doc.kata_reference_values`. No event log is replayed: the events
+/// that vary between TDs carry only digests, so the final registers say as much. The caller
+/// looks the Revision up by [`KataAppraised::init_data`], and appraises GPU evidence when
+/// [`KataAppraised::gpu`] says so.
 pub fn appraise_kata(
     quote: &[u8],
     expected_report_data: &[u8; 64],
-    init_data: &ComposeHash,
     doc: &PlatformDocument,
     collateral: &Collateral,
     now: SystemTime,
@@ -508,18 +510,62 @@ pub fn appraise_kata(
             "report_data is not bound to this request".into(),
         ));
     }
-    let runtime_class = kata_runtime_class(&quote, &doc.kata_reference_values)?.to_owned();
-    check_init_data(&quote, init_data).map_err(|e| AppraisalError::Failed(e.to_string()))?;
+    let reference = kata_reference(&quote, &doc.kata_reference_values)?;
+    let init_data = init_data_digest(&quote).map_err(|e| AppraisalError::Failed(e.to_string()))?;
     Ok(KataAppraised {
-        runtime_class,
+        runtime_class: reference.runtime_class.clone(),
+        gpu: reference.gpu,
+        init_data,
         quote,
     })
 }
 
-fn kata_runtime_class<'a>(
+/// [`appraise_kata`] of an Instance's evidence over its runtime key and nonce, in the shape
+/// [`appraise`] gives: the init-data digest is `compose_hash` and the class is `os_image`. The
+/// flag is the class's [`KataReference::gpu`].
+pub fn appraise_kata_instance(
+    evidence: &KataEvidence,
+    nonce: &[u8; 32],
+    runtime_pubkey_spki: &[u8],
+    doc: &PlatformDocument,
+    collateral: &Collateral,
+    now: SystemTime,
+) -> Result<(Appraised, bool), AppraisalError> {
+    if evidence.format != KATA_EVIDENCE_FORMAT {
+        return Err(AppraisalError::Unknown(format!(
+            "evidence format {:?}",
+            evidence.format
+        )));
+    }
+    let expected = report_data(runtime_pubkey_spki, nonce, None);
+    let kata = appraise_kata(&evidence.quote, &expected, doc, collateral, now)?;
+    let appraised = Appraised {
+        measured: kata.quote.measured,
+        tcb_status: kata.quote.tcb_status,
+        advisories: kata.quote.advisories,
+        os_image: kata.runtime_class,
+        compose_hash: kata.init_data,
+        runtime_pubkey_sha256: sha256_text(runtime_pubkey_spki),
+        evidence_sha256: evidence_sha256(evidence)?,
+        policy_version: doc.version,
+    };
+    Ok((appraised, kata.gpu))
+}
+
+fn sha256_text(bytes: &[u8]) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+}
+
+fn evidence_sha256(evidence: &impl Serialize) -> Result<String, AppraisalError> {
+    let json = serde_json::to_value(evidence).map_err(|e| AppraisalError::Failed(e.to_string()))?;
+    let jcs = alpha_core::jcs(&json).map_err(|e| AppraisalError::Failed(e.to_string()))?;
+    Ok(sha256_text(&jcs))
+}
+
+fn kata_reference<'a>(
     quote: &VerifiedQuote,
     references: &'a [KataReference],
-) -> Result<&'a str, AppraisalError> {
+) -> Result<&'a KataReference, AppraisalError> {
     use AppraisalError::*;
 
     let td_attributes = u64::from_le_bytes(quote.td_attributes);
@@ -546,7 +592,7 @@ fn kata_runtime_class<'a>(
         .iter()
         .filter(|r| !r.runtime_class.is_empty() && r.matches(&quote.measured));
     match (matching.next(), matching.next()) {
-        (Some(r), None) => Ok(r.runtime_class.as_str()),
+        (Some(r), None) => Ok(r),
         (None, _) => Err(Unknown(format!(
             "no kata runtime class for mrtd {} rtmr0 {}",
             quote.measured.mrtd, quote.measured.rtmr0
@@ -703,7 +749,10 @@ mod tests {
     fn kata_td_fields_outside_the_reference_are_refused() {
         let (quote, doc) = kata_cpu_quote();
         let refs = &doc.kata_reference_values;
-        assert_eq!(kata_runtime_class(&quote, refs).unwrap(), "kata-qemu-tdx");
+        assert_eq!(
+            kata_reference(&quote, refs).unwrap().runtime_class,
+            "kata-qemu-tdx"
+        );
 
         let cases: [(QuoteChange, &str, &str); 8] = [
             (
@@ -734,7 +783,7 @@ mod tests {
         for (change, code, fragment) in cases {
             let mut q = quote.clone();
             change(&mut q);
-            let err = kata_runtime_class(&q, refs).unwrap_err();
+            let err = kata_reference(&q, refs).unwrap_err();
             assert_eq!(err.code(), code, "{err}");
             assert!(err.to_string().contains(fragment), "{err}");
         }
@@ -751,6 +800,13 @@ mod tests {
         };
         let empty = parse(&|d| d["kata_reference_values"][0]["runtime_class"] = "".into());
         assert!(empty.is_some_and(|e| e.contains("runtime_class is empty")));
+        let unsaid = parse(&|d| {
+            d["kata_reference_values"][1]
+                .as_object_mut()
+                .unwrap()
+                .remove("gpu");
+        });
+        assert!(unsaid.is_some_and(|e| e.contains("missing field `gpu`")));
         let gpu_rtmr0 = kata_doc_json()["kata_reference_values"][1]["rtmr0"][0].clone();
         let overlap = parse(&|d| {
             let cpu = d["kata_reference_values"][0].clone();
