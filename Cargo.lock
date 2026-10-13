@@ -347,6 +347,7 @@ dependencies = [
  "alpha-attest",
  "alpha-core",
  "base64 0.23.1",
+ "dcap-qvl",
  "serde",
  "serde_json",
  "thiserror",
