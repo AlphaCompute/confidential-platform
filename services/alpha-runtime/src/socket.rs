@@ -63,7 +63,7 @@ impl IntoResponse for Error {
 
 pub fn identity_json(runtime: &Runtime) -> Result<Value, Error> {
     let attested = runtime.attested().ok_or(Error::NotAttested)?;
-    let mut identity = json!({
+    Ok(json!({
         "app_id": attested.identity.app_id,
         "org_id": attested.identity.org_id,
         "compose_hash": attested.identity.compose_hash,
@@ -71,14 +71,7 @@ pub fn identity_json(runtime: &Runtime) -> Result<Value, Error> {
         "tls_private_key": BASE64_URL_SAFE_NO_PAD.encode(runtime.tls_private_key()),
         "attestation_result": attested.result,
         "app_compose": runtime.app_compose,
-    });
-    if let (Some(initdata), Some(fields)) = (runtime.initdata(), identity.as_object_mut()) {
-        fields.insert(
-            "initdata".into(),
-            json!(BASE64_URL_SAFE_NO_PAD.encode(initdata)),
-        );
-    }
-    Ok(identity)
+    }))
 }
 
 async fn identity(State(runtime): State<Arc<Runtime>>) -> Result<Json<Value>, Error> {

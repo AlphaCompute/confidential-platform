@@ -9,7 +9,7 @@ use alpha_cli::call::Route;
 use alpha_cli::deploy::{Shroud, wrap};
 use alpha_cli::keyfile::{self, Algorithm};
 use alpha_cli::request::Call;
-use alpha_cli::{instances, node, sign};
+use alpha_cli::{coco, instances, node, sign};
 use alpha_client::platform::SignedDocument;
 use alpha_client::{Client, Pin};
 use alpha_core::{AppId, KeyId, OrgId, PrincipalId};
@@ -160,6 +160,11 @@ enum Command {
         #[command(subcommand)]
         command: ComposeCommand,
     },
+    /// A tenant's Kata pod spec as a Revision.
+    Coco {
+        #[command(subcommand)]
+        command: CocoCommand,
+    },
     /// Catalog entries signed with the catalog key.
     Catalog {
         #[command(subcommand)]
@@ -264,6 +269,24 @@ enum ApprovalsCommand {
         /// A pending App this many days or fewer before the deadline is `due-soon`.
         #[arg(long, default_value_t = alpha_cli::approvals::DEFAULT_DUE_WITHIN_DAYS)]
         due_within_days: u32,
+    },
+}
+
+#[derive(Subcommand)]
+enum CocoCommand {
+    /// Writes the pod spec with its init-data annotation to `--out` and prints
+    /// `{revision, init_data, annotation, rules_sha256, policy_data_sha256}`.
+    Render {
+        #[arg(long)]
+        app_id: AppId,
+        /// `opt/kata` of the extracted kata-tools-static-4.0.0-amd64.tar.zst: genpolicy, its
+        /// rules and settings, each checked against its release digest.
+        #[arg(long)]
+        kata: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        /// A Pod whose images are all pinned `@sha256:` and whose supplementalGroups are explicit.
+        pod: PathBuf,
     },
 }
 
@@ -546,6 +569,24 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 wrap::resolve_all(&http, &plain).await?
             };
             Ok(json!(wrap::wrap(plain, &digests, app_id, &runtime)?))
+        }
+        Command::Coco {
+            command:
+                CocoCommand::Render {
+                    app_id,
+                    kata,
+                    out,
+                    pod,
+                },
+        } => {
+            let bytes =
+                fs::read(&pod).map_err(|e| Exit::Usage(format!("{}: {e}", pod.display())))?;
+            let pod = coco::parse(&bytes)?;
+            let policy = coco::Kata::read(&kata)?.genpolicy(&pod)?;
+            let rendered = coco::render(pod, app_id, &policy)?;
+            fs::write(&out, &rendered.pod)
+                .map_err(|e| Exit::Refused(format!("{}: {e}", out.display())))?;
+            Ok(json!(rendered))
         }
         Command::Catalog {
             command:
