@@ -78,8 +78,8 @@ impl<'de> Deserialize<'de> for ComposeHash {
     }
 }
 
-pub fn compose_hash(compose: &str) -> ComposeHash {
-    ComposeHash(Sha256::digest(compose).into())
+pub fn compose_hash(compose: impl AsRef<[u8]>) -> ComposeHash {
+    ComposeHash(Sha256::digest(compose.as_ref()).into())
 }
 
 /// All variants are the `malformed` error of the registration route.

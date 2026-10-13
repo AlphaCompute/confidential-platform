@@ -3,7 +3,6 @@
 //! host, so the host may re-encode the annotation without changing the Revision.
 
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 use crate::{AppId, ComposeHash, KataPolicy, compose_hash};
 
@@ -109,7 +108,7 @@ impl InitData {
             .and_then(|d| d.remove("containers"))
             .ok_or(InitDataError::NoContainers)?;
         let jcs = crate::jcs(&data).map_err(InitDataError::PolicyDataJson)?;
-        let data = ComposeHash::from(<[u8; 32]>::from(Sha256::digest(jcs)));
+        let data = compose_hash(jcs);
         if data != pinned.data_sha256 {
             return Err(InitDataError::PolicyData(data));
         }
