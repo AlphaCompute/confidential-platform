@@ -19,6 +19,8 @@ pub enum InitDataError {
     Version(String),
     #[error("init-data [data] has no \"policy.rego\" string")]
     NoPolicy,
+    #[error("init-data [data] key {0:?} is neither \"app_id\" nor \"policy.rego\"")]
+    UnknownKey(String),
     #[error("policy.rego has no \"\\npolicy_data := \"")]
     NoPolicyData,
     #[error("policy.rego rules are {0}, not the pinned rules")]
@@ -82,20 +84,27 @@ impl InitData {
     /// `containers`, the only part that describes the pod; everything else, `ReadStreamRequest`
     /// included, decides what the agent allows. No rego is evaluated: any rego after the JSON
     /// would join the pinned rules, so nothing but whitespace may follow it.
+    ///
+    /// `[data]` holds nothing else: `aa.toml` or `cdh.toml` could point the guest at another key
+    /// broker, and only alpha-kms releases keys.
     pub fn check_policy(&self, pinned: &KataPolicy) -> Result<(), InitDataError> {
         #[derive(Deserialize)]
-        struct WithPolicy {
-            data: Data,
+        struct WithData {
+            data: toml::Table,
         }
-        #[derive(Deserialize)]
-        struct Data {
-            #[serde(rename = "policy.rego")]
-            policy: String,
-        }
-        let policy = toml::from_str::<WithPolicy>(&self.0)
+        let data = toml::from_str::<WithData>(&self.0)
             .map_err(|_| InitDataError::NoPolicy)?
-            .data
-            .policy;
+            .data;
+        if let Some(key) = data
+            .keys()
+            .find(|k| !matches!(k.as_str(), "app_id" | "policy.rego"))
+        {
+            return Err(InitDataError::UnknownKey(key.clone()));
+        }
+        let policy = data
+            .get("policy.rego")
+            .and_then(toml::Value::as_str)
+            .ok_or(InitDataError::NoPolicy)?;
         let (rules, data) = policy
             .split_once(POLICY_DATA)
             .ok_or(InitDataError::NoPolicyData)?;
@@ -183,6 +192,10 @@ mod tests {
             (
                 K3.replace("\"policy.rego\"", "\"policy.txt\""),
                 "\"policy.rego\"",
+            ),
+            (
+                K3.replace("[data]\n", "[data]\n\"cdh.toml\" = \"\"\n"),
+                "\"cdh.toml\" is neither",
             ),
             (
                 K3.replace(POLICY_DATA, "\npolicy_data = "),

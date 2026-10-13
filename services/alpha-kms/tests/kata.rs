@@ -147,7 +147,7 @@ async fn an_init_data_revision_is_registered_as_signed() {
         );
     }
 
-    let tampered = k3().replace("[data]\n", "[data]\n\"note\" = \"tampered\"\n");
+    let tampered = k3().replace("version = ", "version  = ");
     let mut unsigned = h.signed(
         context::REVISION,
         registration(app, &k3(), k3_digest()),
