@@ -1,6 +1,10 @@
 name: pr-policy
 
+# pull_request_target takes this file from main, so a pull request into any other base is
+# checked too, and fails. The job runs only git over the pull request's commits, never its code.
 on:
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize]
   pull_request:
     types: [opened, edited, reopened, synchronize]
 
@@ -13,7 +17,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
+          persist-credentials: false
       - shell: bash
         env:
           BASE_REF: ${{ github.base_ref }}
@@ -21,8 +27,8 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           TITLE: ${{ github.event.pull_request.title }}
           BODY: ${{ github.event.pull_request.body }}
-          EXTRA_PATHS: ${{ secrets.PR_POLICY_FORBIDDEN_PATHS }}
-          EXTRA_TERMS: ${{ secrets.PR_POLICY_FORBIDDEN_TERMS }}
+          EXTRA_PATHS: ${{ github.event.pull_request.head.repo.full_name == github.repository && secrets.PR_POLICY_FORBIDDEN_PATHS || '' }}
+          EXTRA_TERMS: ${{ github.event.pull_request.head.repo.full_name == github.repository && secrets.PR_POLICY_FORBIDDEN_TERMS || '' }}
         run: |
           fail=0
           # Fork and Dependabot runs get no repository secrets; fail rather than skip the checks.
