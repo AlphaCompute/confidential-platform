@@ -12,7 +12,7 @@ Flags or environment, nothing else:
 |---|---|---|
 | `--endpoints a,b` | `ALPHACOMPUTE_KMS_ENDPOINTS` | `call`, `deploy` — tried in turn on a connection failure or a 5xx, never on a 4xx |
 | `--platform-document-url` | `ALPHACOMPUTE_PLATFORM_DOCUMENT_URL` | `call`, `deploy`, `instances add --wait`, `unseal`, `bootstrap` — fetched and verified under the compiled-in release key set on every run |
-| `--pccs-url` | `ALPHACOMPUTE_PCCS_URL` | `unseal`, `bootstrap`; default `https://pccs.phala.network` |
+| `--pccs-url` | `ALPHACOMPUTE_PCCS_URL` | `unseal`, `bootstrap`; default Intel's PCS, `https://api.trustedservices.intel.com` |
 | `--shroud-url`, `--shroud-api-key` | `ALPHACOMPUTE_SHROUD_URL`, `ALPHACOMPUTE_SHROUD_API_KEY` | `deploy` without `--register-only`, `instances`, `request`; the key goes to shroud-go only, never to the KMS |
 
 The passphrase of a key file is prompted on the terminal, or read as one line from stdin when stdin is a pipe.
