@@ -137,7 +137,7 @@ impl Server {
             .timeout(PROBE_TIMEOUT)
             .send()
             .await
-            .map_err(|e| transport(&e))?;
+            .map_err(transport)?;
         let revision = served_revision(&response)?;
         let listed = async {
             response
@@ -166,7 +166,7 @@ impl Server {
             .body(body)
             .send()
             .await
-            .map_err(|e| transport(&e))
+            .map_err(transport)
             .and_then(|response| served_revision(&response).map(|revision| (response, revision)));
         let ms = started.elapsed().as_millis();
         match &answered {
@@ -198,8 +198,8 @@ fn served_revision(response: &reqwest::Response) -> Result<ComposeHash, String> 
 
 /// reqwest's own message names only the URL; the cause (timeout, refused, handshake) is in
 /// its sources.
-fn transport(e: &reqwest::Error) -> String {
-    std::iter::successors(Some(e as &dyn std::error::Error), |e| e.source())
+fn transport(e: reqwest::Error) -> String {
+    std::iter::successors(Some(&e as &dyn std::error::Error), |e| e.source())
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(": ")
