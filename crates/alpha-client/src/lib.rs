@@ -615,13 +615,27 @@ pub enum Probe {
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Handshake with `url`, pinning the chain to the KMS CA and reading the Revision out of the
-/// leaf. Any HTTP answer means the handshake completed, so the status is not looked at.
+/// leaf.
 pub async fn probe_instance(
     url: &str,
     kms_ca_pem: &str,
     expected: &ComposeHash,
     time: TimeProvider,
 ) -> Result<Probe, Error> {
+    Ok(match instance_leaf(url, kms_ca_pem, time).await? {
+        Err(why) => Probe::Silent(why),
+        Ok(sans) if sans.compose_hash == *expected => Probe::Attested(sans),
+        Ok(sans) => Probe::OtherRevision(sans),
+    })
+}
+
+/// The SANs of the Instance leaf `url` presents under the KMS CA pin, or why no handshake
+/// completed. Any HTTP answer means the handshake completed, so the status is not looked at.
+pub async fn instance_leaf(
+    url: &str,
+    kms_ca_pem: &str,
+    time: TimeProvider,
+) -> Result<Result<tls::InstanceSans, String>, Error> {
     let ca = tls::cert_from_pem(kms_ca_pem)?;
     let http = pinned_http(tls::client_config(Some(Pin::Ca(ca)), None, time)?)
         .tls_info(true)
@@ -630,19 +644,14 @@ pub async fn probe_instance(
         .map_err(|e| Error::Invalid(format!("http client: {e}")))?;
     let response = match http.get(url).send().await {
         Ok(response) => response,
-        Err(e) => return Ok(Probe::Silent(format!("{url}: {e}"))),
+        Err(e) => return Ok(Err(format!("{url}: {e}"))),
     };
     let leaf = response
         .extensions()
         .get::<reqwest::tls::TlsInfo>()
         .and_then(|info| info.peer_certificate().map(<[u8]>::to_vec))
         .ok_or_else(|| Error::Invalid("no server certificate on the connection".into()))?;
-    let sans = tls::parse_instance_sans(&tls::uri_sans(&leaf)?)?;
-    Ok(if sans.compose_hash == *expected {
-        Probe::Attested(sans)
-    } else {
-        Probe::OtherRevision(sans)
-    })
+    Ok(Ok(tls::parse_instance_sans(&tls::uri_sans(&leaf)?)?))
 }
 
 /// A sealed node's evidence over an unpinned connection, together with the SPKI the server

@@ -21,6 +21,7 @@ pub mod keyfile;
 pub mod node;
 pub mod request;
 pub mod sign;
+pub mod verify;
 
 use std::time::SystemTime;
 
