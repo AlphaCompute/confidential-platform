@@ -38,12 +38,31 @@ pub struct PlatformView {
     pub kata_policy: Option<KataPolicy>,
 }
 
-/// The release key's public half, the same file `alpha-kms` compiles in; replaced at the
-/// ceremony, never in CI.
+// A build holds one set only, so a production verifier cannot accept a dev-signed document.
+#[cfg(feature = "dev")]
+const RELEASE_KEYS: &str = include_str!("../release-keys/dev.pub");
+#[cfg(not(feature = "dev"))]
+const RELEASE_KEYS: &str = include_str!("../release-keys/prod.pub");
+
+/// The release key's public half compiled into this build, which `alpha-kms`, `alpha` and the
+/// page share; replaced at the ceremony, never in CI.
 pub fn release_key() -> Result<VerifyingKey, Error> {
-    alpha_core::hex_bytes::<32>(include_str!("../../../services/alpha-kms/release-key.pub").trim())
-        .and_then(|b| VerifyingKey::from_bytes(&b).ok())
-        .ok_or_else(|| Error::Malformed("release-key.pub is not an Ed25519 public key".into()))
+    parse_release_key(RELEASE_KEYS)
+}
+
+fn parse_release_key(text: &str) -> Result<VerifyingKey, Error> {
+    let mut keys = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'));
+    match (keys.next(), keys.next()) {
+        (Some(hex), None) => alpha_core::hex_bytes::<32>(hex)
+            .and_then(|b| VerifyingKey::from_bytes(&b).ok())
+            .ok_or_else(|| Error::Malformed("the release key is not an Ed25519 public key".into())),
+        _ => Err(Error::Malformed(
+            "this build holds no single release key".into(),
+        )),
+    }
 }
 
 pub fn sign(document: Value, key: &SigningKey) -> Result<SignedDocument, Error> {

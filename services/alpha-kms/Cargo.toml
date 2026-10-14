@@ -8,12 +8,12 @@ publish.workspace = true
 workspace = true
 
 [features]
-dev-root = []
+dev-root = ["alpha-channel/dev"]
 
 [dependencies]
 aes-gcm = "0.11"
 alpha-attest = { path = "../../crates/alpha-attest" }
-alpha-channel = { path = "../../crates/alpha-channel" }
+alpha-channel = { path = "../../crates/alpha-channel", features = ["require-release-keys"] }
 alpha-client = { path = "../../crates/alpha-client" }
 alpha-core = { path = "../../crates/alpha-core" }
 alpha-crypto = { path = "../../crates/alpha-crypto" }
@@ -45,6 +45,7 @@ vsss-rs = "6"
 zeroize = "1"
 
 [dev-dependencies]
+alpha-channel = { path = "../../crates/alpha-channel", features = ["dev"] }
 alpha-cli = { path = "../../crates/alpha-cli" }
 alpha-cpu-app = { path = "../alpha-cpu-app" }
 alpha-runtime = { path = "../alpha-runtime" }

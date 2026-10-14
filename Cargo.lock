@@ -101,6 +101,7 @@ name = "alpha-channel"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "alpha-channel",
  "alpha-core",
  "alpha-crypto",
  "base64 0.23.1",

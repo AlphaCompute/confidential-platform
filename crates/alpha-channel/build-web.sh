@@ -3,6 +3,7 @@
 # prints the .wasm's SHA-256 and the revision it was built from, so anyone can rebuild it from a
 # public commit and compare. The optional [target] is the wasm-bindgen target, `web` by default;
 # the signer page uses `no-modules`, whose glue is a classic script that SRI can cover.
+# FEATURES=dev builds the dev stand's page; without it the production release key is compiled in.
 set -eu
 
 out=${1:?usage: build-web.sh <out-dir> [target]}
@@ -22,7 +23,8 @@ fi
 
 # Absolute paths end up in the binary; mapping them keeps the hash independent of the checkout.
 RUSTFLAGS="--remap-path-prefix=$root=/src --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo" \
-  cargo build -p alpha-channel --release --target wasm32-unknown-unknown
+  cargo build -p alpha-channel --release --target wasm32-unknown-unknown \
+  --features "require-release-keys${FEATURES:+,$FEATURES}"
 wasm-bindgen --target "$target" --out-dir "$out" \
   "${CARGO_TARGET_DIR:-target}/wasm32-unknown-unknown/release/alpha_channel.wasm"
 wasm="$out/alpha_channel_bg.wasm"
