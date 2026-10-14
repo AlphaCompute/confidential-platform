@@ -1,0 +1,69 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pol-c1-base
+  namespace: alpha-andreypfau-policy
+spec:
+  runtimeClassName: kata-qemu-tdx
+  terminationGracePeriodSeconds: 5
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  containers:
+  - name: alpha-runtime
+    image: public.ecr.aws/docker/library/alpine@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8
+    command:
+    - sh
+    - -c
+    - env | sort; grep PRETTY /etc/os-release; echo HOST=`hostname`; ls /var/run/secrets/kubernetes.io/serviceaccount
+      2>&1; d=/sys/kernel/config/tsm/report/q$RANDOM; mkdir $d && head -c 64 /dev/zero
+      > $d/inblob && echo QUOTE_BYTES=`wc -c < $d/outblob`; rmdir $d; exec sleep 2147483647
+    env:
+    - name: ALPHACOMPUTE_KMS_CA_SPKI_SHA256
+      value: sha256:bfc9899f64e6be9c56c895d2f364b8a34bf4a7079287339e00a15012b900ab65
+    - name: ALPHACOMPUTE_KMS_REVISIONS
+      value: sha256:ee097e09c4824eb6424202fe20ed882d19a33a563f3b3dd5988f3ff8ee1b8335
+    - name: ALPHACOMPUTE_KMS_ENDPOINTS
+      value: https://kms.alpha-andreypfau-e2e.svc.cluster.local:8443
+    securityContext:
+      runAsUser: 0
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop:
+        - ALL
+      readOnlyRootFilesystem: true
+    volumeMounts:
+    - name: tsm
+      mountPath: /sys/kernel/config
+    - name: alpha
+      mountPath: /run/alpha
+  - name: app
+    image: public.ecr.aws/docker/library/alpine@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8
+    command:
+    - sh
+    - -c
+    - while true; do echo app-alive mode=$APP_MODE; sleep 20; done
+    env:
+    - name: APP_MODE
+      value: baseline
+    volumeMounts:
+    - name: alpha
+      mountPath: /run/alpha
+  volumes:
+  - name: tsm
+    hostPath:
+      path: /sys/kernel/config
+      type: Directory
+  - name: alpha
+    emptyDir: {}
+  securityContext:
+    supplementalGroups:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 6
+    - 10
+    - 11
+    - 20
+    - 26
+    - 27

@@ -33,6 +33,8 @@ pub enum InitDataError {
     NoContainers,
     #[error("policy_data outside containers is {0}, not the pinned data")]
     PolicyData(ComposeHash),
+    #[error("policy_data lets the host exec {0} in a container; remove exec probes and exec hooks")]
+    ExecCommands(serde_json::Value),
 }
 
 const POLICY_DATA: &str = "\npolicy_data := ";
@@ -95,8 +97,11 @@ impl InitData {
     ///
     /// `[data]` holds nothing else: `aa.toml` or `cdh.toml` could point the guest at another key
     /// broker, and only alpha-kms releases keys.
+    ///
+    /// No container may list `exec_commands`, the argv of its exec probes and hooks: the agent
+    /// runs them whenever the host asks.
     pub fn check_policy(&self, pinned: &KataPolicy) -> Result<(), InitDataError> {
-        let (rules, data, _) = self.policy()?;
+        let (rules, data, containers) = self.policy()?;
         if rules != pinned.rules_sha256 {
             return Err(InitDataError::Rules(rules));
         }
@@ -104,6 +109,13 @@ impl InitData {
         let data = compose_hash(jcs);
         if data != pinned.data_sha256 {
             return Err(InitDataError::PolicyData(data));
+        }
+        for container in containers.as_array().ok_or(InitDataError::NoContainers)? {
+            match container.get("exec_commands") {
+                None | Some(serde_json::Value::Null) => {}
+                Some(serde_json::Value::Array(commands)) if commands.is_empty() => {}
+                Some(commands) => return Err(InitDataError::ExecCommands(commands.clone())),
+            }
         }
         Ok(())
     }
@@ -246,6 +258,10 @@ mod tests {
             (
                 K3.replace("\"containers\": [", "\"kontainers\": ["),
                 "object with containers",
+            ),
+            (
+                K3.replacen("\"exec_commands\": []", "\"exec_commands\": [[\"sh\"]]", 1),
+                "exec [[\"sh\"]]",
             ),
         ];
         for (toml, fragment) in cases {
