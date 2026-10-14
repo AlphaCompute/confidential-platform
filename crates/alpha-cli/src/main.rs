@@ -401,7 +401,11 @@ async fn platform_document(config: &Config, now: SystemTime) -> Result<PlatformD
         config.platform_document_url.as_deref(),
         "platform-document-url",
     )?;
-    Ok(alpha_client::platform::fetch(url, &alpha_cli::release_keys()?, now).await?)
+    let signed = alpha_client::platform::fetch_signed(url).await?;
+    let doc = alpha_client::platform::verify(&signed, &alpha_cli::release_keys()?, now)?;
+    let state = alpha_cli::platform::state_file()?;
+    alpha_cli::platform::remember(&state, url, &signed.document, doc.version)?;
+    Ok(doc)
 }
 
 /// The admin's pin: `kms_ca_pem` of the platform document fetched and verified now.
