@@ -1139,6 +1139,8 @@ allow_mount(p_oci, i_mount, i_storages, bundle_id, sandbox_id):= p_index if {
     print("allow_mount 2: i_storage =", i_storage)
 
     i_storage.mount_point == i_mount.source
+    p_mount.source == ""
+    startswith(i_mount.source, concat("", [policy_data.common.spath, "/"]))
 
     print("allow_mount 2: true, p_index =", p_index)
 }
@@ -1211,7 +1213,7 @@ mount_source_allows(p_mount, i_mount, bundle_id, sandbox_id) if {
 
     regex4 := replace(regex3, "$(bundle-id)", bundle_id)
     print("mount_source_allows 1: regex4 =", regex4)
-    regex.match(regex4, i_mount.source)
+    regex.match(concat("", ["^(?:", regex4, ")$"]), i_mount.source)
 
     print("mount_source_allows 1: true")
 }
@@ -1227,7 +1229,7 @@ mount_source_allows(p_mount, i_mount, bundle_id, sandbox_id) if {
 
     regex4 := replace(regex3, "$(sandbox-id)", sandbox_id)
     print("mount_source_allows 2: regex4 =", regex4)
-    regex.match(regex4, i_mount.source)
+    regex.match(concat("", ["^(?:", regex4, ")$"]), i_mount.source)
 
     print("mount_source_allows 2: true")
 }
