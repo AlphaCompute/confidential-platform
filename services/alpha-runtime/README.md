@@ -38,8 +38,9 @@ rendered value, the guest agent refuses to create a container whose environment 
 KMS registers no init-data without that pinned policy. A pod spec not produced by `render` gets no
 Revision.
 
-Configuration is three environment variables, a fourth when a service declared a Secret and a
-fifth for a wrapped compose.
+Configuration is three environment variables, a fourth when a service declared a Secret, a
+fifth for a wrapped compose or a Kata pod with an Endpoint, and two optional ones for that
+Endpoint.
 `ALPHACOMPUTE_KMS_CA_SPKI_SHA256` (`sha256:<hex>` of the KMS CA's SubjectPublicKeyInfo) and
 `ALPHACOMPUTE_KMS_REVISIONS` (comma-separated `sha256:<hex>`) are in the measured compose on dstack, and in the policy-pinned environment on Kata, and are
 all the runtime trusts: before the first request it refuses a KMS whose chain does not end at a
@@ -52,7 +53,11 @@ purpose (`[a-z0-9][a-z0-9._-]{0,63}`); a repeated key or any other shape is refu
 `ALPHACOMPUTE_TLS_UPSTREAM`, measured too, is `<service>:<port>`, the published service of a
 wrapped compose and its plain container port; the service must be a lowercase key purpose and
 the port 1 to 65535, or the runtime exits 1 at start naming the variable. Without it the runtime
-opens no TCP port at all.
+opens no TCP port at all. Two more need it and are refused without it:
+`ALPHACOMPUTE_TLS_CALLER_APPS`, comma-separated App ids whose Instances alone may open the
+Endpoint (unset or empty admits any client), and `ALPHACOMPUTE_TLS_UPSTREAM_READY`, the
+upstream's own readiness path such as vLLM's `/health` (a leading `/`, printable ASCII without
+spaces, at most 256 bytes).
 
 The socket is `/run/alpha/runtime.sock`, HTTP/1.1 JSON, no authentication (access is the right
 to the socket), and comes up only after the first attestation succeeded:
@@ -121,6 +126,19 @@ HTTP, and behind the provider's TLS passthrough the CVM sees the gateway's addre
 SIGTERM the listener closes at once and open connections get at most 10 s to finish; on
 `revision_revoked` every proxied connection is closed at once and the process exits 78.
 
+With `ALPHACOMPUTE_TLS_CALLER_APPS` the handshake requires a client certificate chained to the
+KMS CA of the first attestation, and a connection is proxied only when its leaf carries an
+Instance's SANs naming a listed App; anything else is closed before a byte reaches the upstream.
+A KMS node's leaf chains to the same CA but carries no Instance SANs, so it is refused too. The
+caller is pinned by App rather than Revision, so a caller that pins this Endpoint's Revision can
+still be registered.
+
+With `ALPHACOMPUTE_TLS_UPSTREAM_READY` the runtime also listens on 8444 in plain HTTP and serves
+only `GET /ready`, for a kubelet probe: a Kata agent policy refuses exec probes, and the kubelet
+has no Instance leaf for a caller-pinned Endpoint. It answers 200 with an empty body only while
+the leaf is current and the upstream answers `GET <path>` with a 2xx status within 2 s, else
+503; nothing of the upstream's reply is relayed.
+
 ## Tests
 
 `cargo test -p alpha-runtime` covers the configuration parser (the secrets and upstream variables'
@@ -138,7 +156,8 @@ unlisted Revision (and the walk to the next endpoint), the cache expiring with t
 `revision_revoked` ending the runtime with 78, and the secret files: written only into the
 directories of declaring services, waiting for a Secret put later, following a renewal, written
 by the running runtime, and never written for a revoked Revision. The same file proves the TLS listener: the leaf it serves,
-the hybrid group it requires, pass-through, renewal, expiry, revocation and the drain on SIGTERM.
+the hybrid group it requires, pass-through, renewal, expiry, revocation, the drain on SIGTERM,
+and with a caller pin: the listed App's leaf served, no client certificate refused, and `/ready`.
 
 What only a live CVM proves: the real quote and `Info` from the guest agent's socket, the real
 event log from the CCEL table and `/run/log/dstack`, that the registered `compose_hash` equals

@@ -1,13 +1,22 @@
 //! TLS for a wrapped compose: the current Instance leaf on the Endpoint, then the bytes copied
-//! both ways to the published service's plain port.
+//! both ways to the published service's plain port. With caller Apps configured, only a client
+//! presenting an Instance leaf of one of them under the KMS CA gets past the handshake.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rustls::ServerConfig;
-use rustls::server::{ClientHello, NoServerSessionStorage, ResolvesServerCert};
+use alpha_client::tls;
+use alpha_core::AppId;
+use axum::extract::State;
+use axum::http::StatusCode;
+use rustls::pki_types::CertificateDer;
+use rustls::server::{
+    ClientHello, NoServerSessionStorage, ResolvesServerCert, WebPkiClientVerifier,
+};
 use rustls::sign::CertifiedKey;
+use rustls::{RootCertStore, ServerConfig};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
@@ -19,6 +28,8 @@ const HANDSHAKE: Duration = Duration::from_secs(10);
 const CONNECT: Duration = Duration::from_secs(10);
 /// Docker kills the container this long after SIGTERM anyway.
 const DRAIN: Duration = Duration::from_secs(10);
+/// The whole readiness exchange with the upstream, connect included.
+const READY_CHECK: Duration = Duration::from_secs(2);
 
 struct CurrentLeaf(Arc<Runtime>);
 
@@ -35,10 +46,28 @@ impl ResolvesServerCert for CurrentLeaf {
 }
 
 fn server_config(runtime: Arc<Runtime>) -> Result<Arc<ServerConfig>, Error> {
-    let mut config = ServerConfig::builder_with_provider(alpha_client::tls::provider())
+    let tls_error = |e: &dyn std::fmt::Display| Error::Socket(format!("tls: {e}"));
+    let builder = ServerConfig::builder_with_details(tls::provider(), runtime.time.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|e| Error::Socket(format!("tls: {e}")))?
-        .with_no_client_auth()
+        .map_err(|e| tls_error(&e))?;
+    let builder = if runtime.config().tls_callers.is_empty() {
+        builder.with_no_client_auth()
+    } else {
+        // The CA of the first attestation, whose SPKI the runtime checked against the measured
+        // hash; a CA under another key fails the runtime's next renewal anyway.
+        let ca = runtime
+            .last()
+            .and_then(|a| a.certified.cert.last().cloned())
+            .ok_or(Error::NotAttested)?;
+        let mut roots = RootCertStore::empty();
+        roots.add(ca).map_err(|e| tls_error(&e))?;
+        builder.with_client_cert_verifier(
+            WebPkiClientVerifier::builder_with_provider(Arc::new(roots), tls::provider())
+                .build()
+                .map_err(|e| tls_error(&e))?,
+        )
+    };
+    let mut config = builder
         // ponytail: no ALPN, so a browser speaks HTTP/1.1 and HTTP/2 by prior knowledge still
         // passes, but a client that insists on `h2` (gRPC) is not served; the upgrade is a
         // measured opt-in that advertises `h2` for an `h2c` backend.
@@ -50,27 +79,48 @@ fn server_config(runtime: Arc<Runtime>) -> Result<Arc<ServerConfig>, Error> {
 }
 
 /// The Endpoint's listener with its TLS configuration, bound only for a compose that names an
-/// upstream.
+/// upstream, and its readiness listener when a readiness path is named.
 pub struct Endpoint {
     listener: TcpListener,
     acceptor: TlsAcceptor,
     upstream: String,
+    callers: Arc<[AppId]>,
+    ready: Option<(TcpListener, axum::Router)>,
+}
+
+async fn bind_tcp(addr: SocketAddr) -> Result<TcpListener, Error> {
+    TcpListener::bind(addr)
+        .await
+        .map_err(|e| Error::Socket(format!("{addr}: {e}")))
 }
 
 impl Endpoint {
-    /// `None` when the configuration names no upstream.
-    pub async fn bind(runtime: Arc<Runtime>, addr: SocketAddr) -> Result<Option<Self>, Error> {
-        let Some(upstream) = runtime.config().tls_upstream.clone() else {
+    /// `None` when the configuration names no upstream. With caller Apps, call it after the
+    /// first attestation: the KMS CA comes from its chain.
+    pub async fn bind(
+        runtime: Arc<Runtime>,
+        addr: SocketAddr,
+        ready_addr: SocketAddr,
+    ) -> Result<Option<Self>, Error> {
+        let config = runtime.config();
+        let Some(upstream) = config.tls_upstream.clone() else {
             return Ok(None);
         };
+        let callers = config.tls_callers.clone().into();
+        let ready = match config.tls_ready.clone() {
+            Some(path) => Some((
+                bind_tcp(ready_addr).await?,
+                ready_router(runtime.clone(), upstream.clone(), path),
+            )),
+            None => None,
+        };
         let acceptor = TlsAcceptor::from(server_config(runtime)?);
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(|e| Error::Socket(format!("{addr}: {e}")))?;
         Ok(Some(Self {
-            listener,
+            listener: bind_tcp(addr).await?,
             acceptor,
             upstream,
+            callers,
+            ready,
         }))
     }
 
@@ -78,10 +128,21 @@ impl Endpoint {
         self.listener.local_addr()
     }
 
+    pub fn ready_addr(&self) -> Option<SocketAddr> {
+        self.ready.as_ref()?.0.local_addr().ok()
+    }
+
     /// Accepts until `stop` resolves; no idle timeout, so WebSockets and long polls stay open.
     /// Open connections get at most [`DRAIN`] on a shutdown and are cut on revocation.
     pub async fn serve(self, stop: impl Future<Output = Exit>) {
         let mut stop = std::pin::pin!(stop);
+        let ready = self.ready.map(|(listener, router)| {
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(listener, router).await {
+                    eprintln!("alpha-runtime: readiness listener: {e}");
+                }
+            })
+        });
         let mut open = JoinSet::new();
         let how = loop {
             while open.try_join_next().is_some() {}
@@ -96,9 +157,17 @@ impl Endpoint {
                 },
                 how = &mut stop => break how,
             };
-            open.spawn(proxy(self.acceptor.clone(), tcp, self.upstream.clone()));
+            open.spawn(proxy(
+                self.acceptor.clone(),
+                tcp,
+                self.upstream.clone(),
+                self.callers.clone(),
+            ));
         };
         drop(self.listener);
+        if let Some(ready) = ready {
+            ready.abort();
+        }
         if how == Exit::Drained {
             let _ = timeout(DRAIN, async { while open.join_next().await.is_some() {} }).await;
         }
@@ -107,11 +176,26 @@ impl Endpoint {
     }
 }
 
-async fn proxy(acceptor: TlsAcceptor, tcp: TcpStream, upstream: String) {
+/// Whether the client's leaf, already chained to the KMS CA in the handshake, is an Instance
+/// of a listed App; a KMS node's leaf chains there too but carries no Instance SANs.
+fn admitted(peer: Option<&[CertificateDer<'_>]>, callers: &[AppId]) -> bool {
+    callers.is_empty()
+        || peer
+            .and_then(<[_]>::first)
+            .and_then(|leaf| tls::uri_sans(leaf).ok())
+            .and_then(|sans| tls::parse_instance_sans(&sans).ok())
+            .is_some_and(|instance| callers.contains(&instance.app_id))
+}
+
+async fn proxy(acceptor: TlsAcceptor, tcp: TcpStream, upstream: String, callers: Arc<[AppId]>) {
     let _ = tcp.set_nodelay(true);
     let Ok(Ok(mut tls)) = timeout(HANDSHAKE, acceptor.accept(tcp)).await else {
         return;
     };
+    if !admitted(tls.get_ref().1.peer_certificates(), &callers) {
+        let _ = tls.shutdown().await;
+        return;
+    }
     let connected = timeout(CONNECT, TcpStream::connect(upstream.as_str()))
         .await
         .map_err(|_| format!("no answer within {CONNECT:?}"))
@@ -120,10 +204,102 @@ async fn proxy(acceptor: TlsAcceptor, tcp: TcpStream, upstream: String) {
         Ok(backend) => backend,
         Err(reason) => {
             eprintln!("alpha-runtime: upstream {upstream}: {reason}");
-            let _ = tokio::io::AsyncWriteExt::shutdown(&mut tls).await;
+            let _ = tls.shutdown().await;
             return;
         }
     };
     let _ = backend.set_nodelay(true);
     let _ = tokio::io::copy_bidirectional(&mut tls, &mut backend).await;
+}
+
+type Ready = (Arc<Runtime>, String, String);
+
+fn ready_router(runtime: Arc<Runtime>, upstream: String, path: String) -> axum::Router {
+    axum::Router::new()
+        .route("/ready", axum::routing::get(ready))
+        .with_state(Arc::new((runtime, upstream, path)))
+}
+
+/// 200 only while the leaf is current and the upstream answers its own path with a 2xx now.
+async fn ready(State(state): State<Arc<Ready>>) -> StatusCode {
+    let (runtime, upstream, path) = state.as_ref();
+    if runtime.attested().is_some() && upstream_answers(upstream, path).await {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+}
+
+async fn upstream_answers(upstream: &str, path: &str) -> bool {
+    let check = async {
+        let mut tcp = TcpStream::connect(upstream).await.ok()?;
+        let request =
+            format!("GET {path} HTTP/1.1\r\nHost: {upstream}\r\nConnection: close\r\n\r\n");
+        tcp.write_all(request.as_bytes()).await.ok()?;
+        let mut status = [0u8; 10];
+        tcp.read_exact(&mut status).await.ok()?;
+        Some(status.starts_with(b"HTTP/1.") && status.ends_with(b" 2"))
+    };
+    matches!(timeout(READY_CHECK, check).await, Ok(Some(true)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn upstream(reply: &'static [u8]) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((mut tcp, _)) = listener.accept().await {
+                let mut request = [0u8; 1024];
+                let _ = tcp.read(&mut request).await;
+                let _ = tcp.write_all(reply).await;
+            }
+        });
+        addr
+    }
+
+    fn leaf(sans: &[String]) -> CertificateDer<'static> {
+        let mut params = rcgen::CertificateParams::default();
+        params.subject_alt_names = sans
+            .iter()
+            .map(|s| rcgen::SanType::URI(s.as_str().try_into().unwrap()))
+            .collect();
+        let key = rcgen::KeyPair::generate().unwrap();
+        params.self_signed(&key).unwrap().der().clone()
+    }
+
+    #[test]
+    fn only_an_instance_leaf_of_a_listed_app_is_admitted() {
+        let (org, listed, other) = (alpha_core::OrgId::mint(), AppId::mint(), AppId::mint());
+        let revision = format!("urn:alphacompute:revision:sha256:{}", "ab".repeat(32));
+        let instance = |app: AppId| {
+            leaf(&[
+                format!("alphacompute://{org}/{app}/{}", "cd".repeat(32)),
+                revision.clone(),
+            ])
+        };
+        let callers = [listed];
+        assert!(admitted(Some(&[instance(listed)]), &callers));
+        assert!(!admitted(Some(&[instance(other)]), &callers));
+        let node = leaf(&[tls::KMS_SAN.to_owned(), revision.clone()]);
+        assert!(!admitted(Some(&[node]), &callers));
+        assert!(!admitted(None, &callers));
+        assert!(admitted(None, &[]));
+    }
+
+    #[tokio::test]
+    async fn the_upstream_answers_only_with_a_2xx_status_line() {
+        let ok = upstream(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+        assert!(upstream_answers(&ok, "/health").await);
+        let loading = upstream(b"HTTP/1.1 503 Service Unavailable\r\n\r\n").await;
+        assert!(!upstream_answers(&loading, "/health").await);
+        let garbage = upstream(b"SSH-2.0-OpenSSH_9.6\r\n").await;
+        assert!(!upstream_answers(&garbage, "/health").await);
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = closed.local_addr().unwrap().to_string();
+        drop(closed);
+        assert!(!upstream_answers(&addr, "/health").await);
+    }
 }
