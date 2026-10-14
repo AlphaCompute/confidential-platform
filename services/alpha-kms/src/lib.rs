@@ -177,7 +177,6 @@ impl Node {
         }))
     }
 
-    /// This node's evidence for `report_data`, quoted now.
     pub fn evidence(&self, report_data: &[u8; 64]) -> Result<InstanceEvidence, ApiError> {
         alpha_tsm::evidence(self.config.substrate, report_data)
             .map_err(|e| ApiError::internal(format!("evidence: {e}")))
