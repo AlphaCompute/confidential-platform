@@ -1,4 +1,4 @@
-# The KMS nodes on Kata: fresh genesis on owned hardware
+# The KMS nodes and platform services on Kata
 
 Every KMS node is a Kata TDX pod (`kata-qemu-tdx`) of one rendered StatefulSet, `kms`, so all
 nodes share one Revision: the SHA-256 of its pod template's init-data. The trust-zone Postgres is an
@@ -185,3 +185,100 @@ two intermediates (`tenant-kek-root`, the CA key), the derived database password
 The operator does hold the Postgres owner password, the server key and the volume: ciphertext,
 metadata and the audit log, which the owner can rewrite or roll back. The genesis password is
 dead at the genesis commit.
+
+## Platform services
+
+`inference.yaml`, `guard.yaml` and `broker.yaml` are Deployments of `kata-qemu-tdx` pods with no
+resources, the KMS nodes' shape (1 vCPU, 2048 MiB), whose reference values the document already
+lists. `model-server.yaml` is one vLLM model on one GPU of `kata-qemu-nvidia-gpu-tdx`. Every pod
+runs `alpha-runtime` beside its service. The three services read their leaf and Secrets from its
+socket and terminate their own TLS on 8443. Each template is its App's Revision once rendered: a new value of any input below is a new Revision.
+
+### Inputs
+
+Each, and each service's App id, is the operator's, chosen per environment; none has a default.
+
+| Input | Templates | What |
+|---|---|---|
+| `RUNTIME_IMAGE` | all | the `alpha-runtime` release image by digest |
+| `KMS_CA_SPKI_SHA256`, `KMS_REVISIONS` | all | what `alpha sign --check` prints for the served document |
+| `KMS_ENDPOINTS` | all | `KMS_KATA_ENDPOINTS` |
+| `INFERENCE_IMAGE`, `GUARD_IMAGE`, `BROKER_IMAGE` | one each | the service's release image by digest |
+| `MODELS`, `MODEL_SERVERS` | inference | `services/alpha-inference/README.md`; `MODEL_SERVERS` is `{}` when RedPill serves every model, and a model server's `url` is `https://<MODEL_NAME>.alpha-models.svc:8443` |
+| `UPSTREAM_URL`, `PCCS_URL`, `UPSTREAM_POLICY` | inference | RedPill's settings; with every model on our own servers, delete their three lines before rendering |
+| `INFERENCE_REVISIONS`, `GUARD_CALLER_APPS` | guard | the front's registered Revisions; the App ids that may ask for a verdict (`CALLER_APPS`) |
+| the six `<PROVIDER>_CLIENT_ID`, `OAUTH_REDIRECT_BASE` | broker | `services/alpha-broker/README.md` |
+| `MODEL_NAME` | model-server | the Deployment's name, one DNS label |
+| `MODEL_ID` | model-server | the name vLLM serves the model under |
+| `MODEL_IMAGE` | model-server | vLLM with the weights, by digest (below) |
+| `MODEL_CALLER_APPS` | model-server | the App ids of the front and the guard, comma-separated |
+| `MODEL_CPUS`, `MODEL_MEMORY` | model-server | the pod VM's shape; the memory holds the image the guest pulls, vLLM's host side and the KV cache |
+
+### The model image
+
+The weights are not sealed: they are layers of an image whose digest the policy pins, and the
+guest's pull checks every layer against it, so a pod runs exactly the weights the digest names.
+
+```dockerfile
+FROM vllm/vllm-openai@sha256:<the pinned vLLM release>
+COPY <the model's directory> /weights
+```
+
+Push it and set `MODEL_IMAGE` to `<registry>/<repository>@sha256:<digest>`.
+
+### Render, register, set Secrets
+
+Render in this order, since each pins the Revisions of the next one down: model servers, the front, the guard. On Linux x86_64, for each template:
+
+```sh
+template=inference.yaml app=<the App id>
+envsubst "$(grep -o '\${[A-Z0-9_]*}' "$template" | sort -u | tr -d '\n')" < "$template" > in.yaml
+alpha coco render --app-id "$app" --kata <opt/kata> --out "rendered-$template" in.yaml > rendered.json
+jq --arg app "$app" '{app_id: $app, init_data, digest: .revision}' rendered.json > revision.json
+alpha call register-revision --key admin.key --key-id <id> revision.json
+```
+
+`rendered.json`'s `rules_sha256` and `policy_data_sha256` are the document's `kata_policy`, or the
+KMS refuses the Revision. The GPU class
+needs `kata_reference_values` with `gpu: true` at `MODEL_CPUS` and `MODEL_MEMORY`: RTMR0 is
+captured per shape.
+
+Each Secret goes in with `alpha call put-secret --value <file>` and the payload
+`{"name": "<name>", "app_ids": ["<the App id>"]}`:
+
+- inference: `redpill-api-key`, `caller-bearer`;
+- guard: `inference-bearer`, the front's `caller-bearer`;
+- broker: `google-client-secret`, `dropbox-client-secret`, `slack-client-secret`,
+  `figma-client-secret`, `hubspot-client-secret`, `connect-bearer`, `database-url`.
+
+The model server has none.
+
+### The broker's database
+
+The broker's login role and database on the trust-db, with a password sent on stdin:
+
+```sh
+openssl rand -hex 32 > broker-db-password
+printf "create role alpha_broker login password '%s';\n" "$(cat broker-db-password)" \
+  | kubectl -n alpha-trust-db exec -i postgres-0 -- psql -X -v ON_ERROR_STOP=1 -U postgres -d alpha
+echo 'create database alpha_broker owner alpha_broker;' \
+  | kubectl -n alpha-trust-db exec -i postgres-0 -- psql -X -v ON_ERROR_STOP=1 -U postgres -d alpha
+```
+
+The Secret `database-url` is
+`postgres://alpha_broker:<broker-db-password>@postgres.alpha-trust-db.svc:5432/alpha_broker?sslmode=require&channel_binding=require&require_auth=scram-sha-256`;
+then delete `broker-db-password`. The broker applies its migrations when it starts.
+
+### Apply
+
+```sh
+kubectl apply -f platform.yaml
+kubectl apply -f rendered-inference.yaml -f rendered-guard.yaml -f rendered-broker.yaml
+kubectl apply -f rendered-model-server.yaml
+kubectl -n alpha-models expose deployment <MODEL_NAME> --port 8443
+```
+
+A pod turns ready once its runtime has attested and its service answers: the front once its
+default model passes the gateway check or its model server lists it, the guard and the broker once they reach the front and the
+database, a model server once vLLM's `/health` answers. Exposing the broker or the front outside
+the cluster is the operator's choice of ingress, in TLS passthrough: each terminates its own TLS.

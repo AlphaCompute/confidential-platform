@@ -1,0 +1,80 @@
+# alpha-broker, the connector broker. Its database URL is a Secret from the KMS, never env: the
+# host reads the init-data.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: broker
+  namespace: alpha-broker
+spec:
+  # ponytail: one pod, replaced in place, since a member's channel lives in the process that
+  # opened it and a second pod would answer channel_unknown; more replicas need the channel
+  # state shared or routing pinned per channel.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: alpha-broker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: alpha-broker
+    spec:
+      runtimeClassName: kata-qemu-tdx
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        supplementalGroups: [1, 2, 3, 4, 6, 10, 11, 20, 26, 27]
+      containers:
+      - name: alpha-runtime
+        image: ${RUNTIME_IMAGE}
+        env:
+        - {name: ALPHACOMPUTE_KMS_CA_SPKI_SHA256, value: "${KMS_CA_SPKI_SHA256}"}
+        - {name: ALPHACOMPUTE_KMS_REVISIONS, value: "${KMS_REVISIONS}"}
+        - {name: ALPHACOMPUTE_KMS_ENDPOINTS, value: "${KMS_ENDPOINTS}"}
+        securityContext:
+          runAsUser: 0
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - {name: tsm, mountPath: /sys/kernel/config}
+        - {name: alpha, mountPath: /run/alpha}
+        # The broker shows its init-data to the member's page in the channel handshake.
+        - {name: init-data, mountPath: /run/alpha-init-data, readOnly: true}
+      - name: alpha-broker
+        image: ${BROKER_IMAGE}
+        ports:
+        - {name: https, containerPort: 8443}
+        readinessProbe:
+          httpGet: {path: /ready, port: https, scheme: HTTPS}
+        env:
+        - {name: GOOGLE_CLIENT_ID, value: "${GOOGLE_CLIENT_ID}"}
+        - {name: DROPBOX_CLIENT_ID, value: "${DROPBOX_CLIENT_ID}"}
+        - {name: SLACK_CLIENT_ID, value: "${SLACK_CLIENT_ID}"}
+        - {name: FIGMA_CLIENT_ID, value: "${FIGMA_CLIENT_ID}"}
+        - {name: HUBSPOT_CLIENT_ID, value: "${HUBSPOT_CLIENT_ID}"}
+        - {name: NOTION_CLIENT_ID, value: "${NOTION_CLIENT_ID}"}
+        - {name: OAUTH_REDIRECT_BASE, value: "${OAUTH_REDIRECT_BASE}"}
+        securityContext:
+          runAsUser: 65534
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - {name: alpha, mountPath: /run/alpha}
+      volumes:
+      - name: tsm
+        hostPath:
+          path: /sys/kernel/config
+          type: Directory
+      - name: alpha
+        emptyDir: {medium: Memory}
+      - name: init-data
+        downwardAPI:
+          items:
+          - path: cc_init_data
+            fieldRef:
+              fieldPath: metadata.annotations['io.katacontainers.config.hypervisor.cc_init_data']
