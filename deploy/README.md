@@ -175,9 +175,13 @@ password from three places:
   `node.join.request`: the database address is part of its measured init-data.
 
 Nobody holds the derived password. A node logs in with it before it can set it again, so the
-role must keep it: if the database owner resets it, or if both nodes are lost after Kata nodes
-joined a Phala node (they then hold the Phala password), let the role in once with a `trust`
-line, unseal (the node sets the derived password again), and remove the line.
+role must keep it. A `trust` line does not help: the node refuses a login that skips
+authentication. After genesis, the database owner saves the role's verifier,
+`select rolpassword from pg_authid where rolname = 'alpha_kms_node'`; it is not the password. If
+the role's password is reset, the owner restores it with
+`alter role alpha_kms_node password '<saved SCRAM-SHA-256$... verifier>'`, and the nodes log in
+again. Kata nodes that joined a Phala node hold the Phala password instead, and nothing restores
+access for them if both nodes are lost: retire the last Phala node only after a Kata genesis.
 
 ## The broker's database
 
