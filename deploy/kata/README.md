@@ -191,10 +191,9 @@ dead at the genesis commit.
 `inference.yaml`, `guard.yaml` and `broker.yaml` are Deployments of `kata-qemu-tdx` pods with no
 resources, the KMS nodes' shape (1 vCPU, 2048 MiB), whose reference values the document already
 lists. `model-server.yaml` is one vLLM model on one GPU of `kata-qemu-nvidia-gpu-tdx`. Every pod
-runs `alpha-runtime` beside its service; the socket directory `/run/alpha` is an `emptyDir` in
-the pod VM's memory. The three services read their leaf and Secrets from that socket and
-terminate their own TLS on 8443; the kubelet probes their HTTPS `/ready`. How the model server
-is reached is in the header of `model-server.yaml`. Each template is its App's Revision once rendered: a new value of any input below is a new Revision.
+runs `alpha-runtime` beside its service. The three services read their leaf and Secrets from its
+socket and terminate their own TLS on 8443. How the model server is reached is in the header of
+`model-server.yaml`. Each template is its App's Revision once rendered: a new value of any input below is a new Revision.
 
 ### Inputs
 

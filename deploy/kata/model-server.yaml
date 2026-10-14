@@ -8,7 +8,6 @@ metadata:
   name: ${MODEL_NAME}
   namespace: alpha-models
 spec:
-  replicas: 1
   # One GPU per pod and no spare one assumed: replace in place.
   strategy:
     type: Recreate
@@ -28,9 +27,6 @@ spec:
       containers:
       - name: alpha-runtime
         image: ${RUNTIME_IMAGE}
-        ports:
-        - {name: https, containerPort: 8443}
-        - {name: ready, containerPort: 8444}
         env:
         - {name: ALPHACOMPUTE_KMS_CA_SPKI_SHA256, value: "${KMS_CA_SPKI_SHA256}"}
         - {name: ALPHACOMPUTE_KMS_REVISIONS, value: "${KMS_REVISIONS}"}
