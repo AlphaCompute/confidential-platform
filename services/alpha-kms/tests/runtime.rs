@@ -898,23 +898,35 @@ async fn a_caller_pinned_endpoint_serves_only_listed_apps_and_answers_ready_in_p
     };
     let (app, _, _) = app_with_secret(&h, b"v1").await;
     let (port, _) = start_plain_service().await;
-    let config = Config {
-        tls_callers: vec![app],
-        tls_ready: Some("/".into()),
-        ..config_with_upstream(&h, port)
-    };
-    let (runtime, _) = start_runtime(&h, config);
-    let attested = runtime.attest().await.unwrap();
     let local = "127.0.0.1:0".parse().unwrap();
-    let endpoint = proxy::Endpoint::bind(runtime.clone(), local, local)
-        .await
-        .unwrap()
-        .unwrap();
-    let (addr, ready) = (
-        endpoint.local_addr().unwrap(),
-        endpoint.ready_addr().unwrap(),
-    );
-    let socket = Socket::serve(runtime.clone(), Some(endpoint));
+    // A runtime of the App, its Endpoint pinned to `callers`.
+    let pinned = |callers: Vec<AppId>| {
+        let h = &h;
+        async move {
+            let config = Config {
+                tls_callers: callers,
+                tls_ready: Some("/".into()),
+                ..config_with_upstream(h, port)
+            };
+            let (runtime, _) = start_runtime(h, config);
+            runtime.attest().await.unwrap();
+            let endpoint = proxy::Endpoint::bind(runtime.clone(), local, local)
+                .await
+                .unwrap()
+                .unwrap();
+            let addrs = (
+                endpoint.local_addr().unwrap(),
+                endpoint.ready_addr().unwrap(),
+            );
+            (
+                runtime.clone(),
+                Socket::serve(runtime, Some(endpoint)),
+                addrs,
+            )
+        }
+    };
+    let (runtime, socket, (addr, ready)) = pinned(vec![app]).await;
+    let (_, other_socket, (other_addr, _)) = pinned(vec![AppId::mint()]).await;
 
     let ca = tls::cert_from_pem(&h.ca_pem).unwrap();
     let as_instance = |identity| {
@@ -922,19 +934,24 @@ async fn a_caller_pinned_endpoint_serves_only_listed_apps_and_answers_ready_in_p
             tls::client_config(Some(Pin::Ca(ca.clone())), identity, pinned_time(h.now())).unwrap(),
         )
     };
-    let leaf = tls::Identity {
-        chain: attested
+    // The App's real Instance leaf under the KMS CA: listed by one Endpoint, not by the other.
+    let leaf = || tls::Identity {
+        chain: runtime
+            .attested()
+            .unwrap()
             .chain_pem
             .iter()
             .map(|pem| tls::cert_from_pem(pem).unwrap().to_vec())
             .collect(),
         pkcs8: runtime.tls_private_key().to_vec(),
     };
-    assert!(served(addr, &as_instance(Some(leaf))).await);
+    assert!(served(addr, &as_instance(Some(leaf()))).await);
+    assert!(!served(other_addr, &as_instance(Some(leaf()))).await);
     assert!(!served(addr, &as_instance(None)).await);
     assert_eq!(ready_status(ready).await, 200);
 
     assert_eq!(socket.stop().await, Exit::Drained);
+    assert_eq!(other_socket.stop().await, Exit::Drained);
 }
 
 #[tokio::test]
