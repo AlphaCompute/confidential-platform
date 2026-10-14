@@ -49,6 +49,7 @@ spec:
         env:
         - {name: UPSTREAM_URL, value: "${UPSTREAM_URL}"}
         - {name: MODELS, value: "${MODELS}"}
+        - {name: MODEL_SERVERS, value: '${MODEL_SERVERS}'}
         - {name: PCCS_URL, value: "${PCCS_URL}"}
         - {name: UPSTREAM_POLICY, value: '${UPSTREAM_POLICY}'}
         securityContext:

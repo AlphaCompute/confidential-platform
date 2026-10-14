@@ -206,7 +206,8 @@ Each is the operator's, chosen per environment; none has a default.
 | `KMS_CA_SPKI_SHA256`, `KMS_REVISIONS` | all | what `alpha sign --check` prints for the served document |
 | `KMS_ENDPOINTS` | all | `KMS_KATA_ENDPOINTS` |
 | `INFERENCE_IMAGE`, `GUARD_IMAGE`, `BROKER_IMAGE` | one each | the service's release image by digest |
-| `UPSTREAM_URL`, `MODELS`, `PCCS_URL`, `UPSTREAM_POLICY` | inference | `services/alpha-inference/README.md` |
+| `MODELS`, `MODEL_SERVERS` | inference | `services/alpha-inference/README.md`; `MODEL_SERVERS` is `{}` when RedPill serves every model, and a model server's `url` is `https://<MODEL_NAME>.alpha-models.svc:8443` |
+| `UPSTREAM_URL`, `PCCS_URL`, `UPSTREAM_POLICY` | inference | RedPill's settings; with every model on our own servers, delete their three lines before rendering |
 | `INFERENCE_REVISIONS`, `GUARD_CALLER_APPS` | guard | the front's registered Revisions; the App ids that may ask for a verdict (`CALLER_APPS`) |
 | the six `<PROVIDER>_CLIENT_ID`, `OAUTH_REDIRECT_BASE` | broker | `services/alpha-broker/README.md` |
 | `MODEL_NAME` | model-server | the Deployment's name, one DNS label |
@@ -231,7 +232,7 @@ Push it and set `MODEL_IMAGE` to `<registry>/<repository>@sha256:<digest>`.
 
 ### Render, register, set Secrets
 
-Render the front first: the guard pins its Revisions. On Linux x86_64, for each template:
+Render in this order, since each pins the Revisions of the next one down: model servers, the front, the guard. On Linux x86_64, for each template:
 
 ```sh
 template=inference.yaml app=<the App id>
