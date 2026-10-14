@@ -6,6 +6,7 @@
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -25,6 +26,13 @@ pub fn seal(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, Err
         )
         .map_err(|_| Error::internal("aead: encryption failed"))?;
     Ok([nonce.as_slice(), &ct].concat())
+}
+
+/// Associated data naming what a sealed value is for: its row, the member key that row answers to
+/// and the provider. The database is untrusted storage, so a writer who moves the ciphertext to
+/// another row or rewrites the row's member key or provider leaves it unopenable.
+pub fn aad(row: &[u8], member: &[u8], provider: &str) -> Vec<u8> {
+    [row, Sha256::digest(member).as_slice(), provider.as_bytes()].concat()
 }
 
 pub fn open(key: &[u8; 32], aad: &[u8], blob: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
@@ -134,7 +142,11 @@ pub async fn save_connection(
     .fetch_optional(&mut *tx)
     .await?;
     let (id, new) = existing.map_or((Uuid::now_v7(), true), |id| (id, false));
-    let sealed = seal(key, id.as_bytes(), refresh_token.as_bytes())?;
+    let sealed = seal(
+        key,
+        &aad(id.as_bytes(), member, provider),
+        refresh_token.as_bytes(),
+    )?;
     let statement = if new {
         "insert into connections
            (id, member_key, provider, subject, account, enc_refresh_token, scopes)

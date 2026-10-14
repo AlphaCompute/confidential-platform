@@ -48,10 +48,12 @@ async fn a_member_connects_google_over_the_sealed_channel() {
     let token = consent.refresh_token.as_bytes();
     assert!(!blob.windows(token.len()).any(|w| w == token));
     assert_eq!(
-        store::open(&KEY, id.as_bytes(), &blob).unwrap().as_slice(),
+        store::open(&KEY, &aad(id, "google"), &blob)
+            .unwrap()
+            .as_slice(),
         token
     );
-    assert!(store::open(&KEY, uuid::Uuid::now_v7().as_bytes(), &blob).is_none());
+    assert!(store::open(&KEY, &aad(uuid::Uuid::now_v7(), "google"), &blob).is_none());
 
     assert_eq!(count(&h, "pending_connects").await, 0);
 }
@@ -400,7 +402,9 @@ async fn reconnecting_a_dead_account_keeps_its_id_and_seals_the_new_token() {
     assert_eq!(listed.body["connections"].as_array().unwrap().len(), 1);
     let blob = h.stored_token(id).await.unwrap();
     assert_eq!(
-        store::open(&KEY, id.as_bytes(), &blob).unwrap().as_slice(),
+        store::open(&KEY, &aad(id, "google"), &blob)
+            .unwrap()
+            .as_slice(),
         consent.refresh_token.as_bytes()
     );
 }

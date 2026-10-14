@@ -106,7 +106,8 @@ pub async fn start(
         let connect_state = BASE64_URL_SAFE_NO_PAD.encode(crate::random::<32>()?);
         let (verifier, challenge) = oauth::pkce()?;
         let key = state.secrets.read().connectors_key.clone();
-        let enc = store::seal(&key, connect_state.as_bytes(), verifier.as_bytes())?;
+        let aad = store::aad(connect_state.as_bytes(), &member, provider.name);
+        let enc = store::seal(&key, &aad, verifier.as_bytes())?;
         store::insert_pending(&state.pool, &connect_state, &member, provider.name, &enc).await?;
 
         let url = oauth::authorization_url(
@@ -148,7 +149,8 @@ pub async fn finish(
 
         let key = state.secrets.read().connectors_key.clone();
         let (client_id, client_secret) = state.client(provider)?;
-        let verifier = store::open(&key, connect_state.as_bytes(), &pending.enc_pkce_verifier)
+        let aad = store::aad(connect_state.as_bytes(), &member, provider.name);
+        let verifier = store::open(&key, &aad, &pending.enc_pkce_verifier)
             .ok_or_else(|| Error::internal("a pending verifier does not open"))?;
         let verifier = std::str::from_utf8(&verifier)
             .map_err(|_| Error::internal("a pending verifier is not utf8"))?;
@@ -226,7 +228,7 @@ pub async fn disconnect(
             return Ok(json!({}));
         }
         let key = state.secrets.read().connectors_key.clone();
-        let token = store::open(&key, id.as_bytes(), &enc);
+        let token = store::open(&key, &store::aad(id.as_bytes(), &member, &provider), &enc);
         let token = token.as_deref().and_then(|t| std::str::from_utf8(t).ok());
         if let (Some(provider), Some(token)) = (oauth::provider(&provider), token)
             && let Ok((client_id, client_secret)) = state.client(provider)

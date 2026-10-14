@@ -127,6 +127,11 @@ pub fn member() -> Member {
     Member::from_seed(1)
 }
 
+/// The associated data a connection of `member()` to `provider` seals its refresh token under.
+pub fn aad(id: Uuid, provider: &str) -> Vec<u8> {
+    alpha_broker::store::aad(id.as_bytes(), &member().spki, provider)
+}
+
 pub fn other_member() -> Member {
     Member::from_seed(2)
 }
