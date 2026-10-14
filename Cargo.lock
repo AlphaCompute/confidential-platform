@@ -329,12 +329,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "alpha-nvml"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "libloading",
+ "serde",
+]
+
+[[package]]
 name = "alpha-runtime"
 version = "0.1.0"
 dependencies = [
  "alpha-attest",
  "alpha-client",
  "alpha-core",
+ "alpha-nvml",
  "alpha-tsm",
  "axum",
  "base64 0.23.1",
@@ -344,7 +354,9 @@ dependencies = [
  "p256 0.14.0",
  "parking_lot",
  "rustls",
+ "serde",
  "serde_json",
+ "sha2 0.11.0",
  "thiserror",
  "tokio",
  "tokio-rustls",
@@ -2450,6 +2462,16 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+
+[[package]]
+name = "libloading"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "754ca22de805bb5744484a5b151a9e1a8e837d5dc232c2d7d8c2e3492edc8b60"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
 
 [[package]]
 name = "libm"
