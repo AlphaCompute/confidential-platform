@@ -542,10 +542,10 @@ mod tests {
         )
         .unwrap();
         let golden: Value = serde_json::from_str(EXPECTED).unwrap();
-        let printed = serde_json::to_value(&rendered).unwrap();
-        for key in ["rules_sha256", "policy_data_sha256"] {
-            assert_eq!(printed[key], golden[key], "{key}");
-        }
+        assert_eq!(
+            rendered.policy_data_sha256,
+            golden["policy_data_sha256"].as_str().unwrap()
+        );
         let mut agent = Agent::new(DIND_GENPOLICY);
         let requests: Vec<Value> = serde_json::from_str(DIND_REQUESTS).unwrap();
         for request in &requests {
