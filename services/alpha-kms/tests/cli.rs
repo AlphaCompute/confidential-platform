@@ -207,7 +207,7 @@ async fn call_signs_all_five_control_routes() {
         fs::read_to_string(testdata().join("manifest/01-canonical/app-compose.json")).unwrap()
     );
 
-    // Route 3: content_sha256 and issued_at filled in from the value and the clock.
+    // Route 3: content_sha256 and issued_at filled in from a salt, the value and the clock.
     let reply = run(
         Route::PutSecret,
         &admin,
@@ -216,7 +216,7 @@ async fn call_signs_all_five_control_routes() {
     )
     .await
     .unwrap();
-    assert_eq!(
+    assert_ne!(
         reply["content_sha256"],
         json!(format!("sha256:{}", hex::encode(Sha256::digest(b"s3cret"))))
     );

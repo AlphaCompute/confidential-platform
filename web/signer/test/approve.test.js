@@ -513,24 +513,25 @@ test("every secret is put and confirmed before the registration", async () => {
     const sent = api.puts[i];
     assert.equal(sent.declared, name);
     const value = SECRET_VALUES[name];
+    const seal = page.seals[i];
+    assert.equal(seal.value.length, 32 + Buffer.byteLength(value));
+    assert.equal(seal.value.subarray(32).toString(), value);
     const payload = {
       name: `${WRAP_APP}.${name}`,
       app_ids: [WRAP_APP],
-      content_sha256: `sha256:${hex(value)}`,
+      content_sha256: `sha256:${hex(seal.value)}`,
       issued_at: sent.body.payload.issued_at,
     };
     const document = wasm.canonicalJson(JSON.stringify(payload));
     assert.deepEqual(
       Buffer.from(gets[i].options.challenge),
-      contextDigest("alphacompute/secret/v1", document),
+      contextDigest("alphacompute/secret/v2", document),
     );
-    const seal = page.seals[i];
     assert.equal(api.channels[i], seal.hello);
     assert.equal(seal.serverHello, wasm.canonicalJson(JSON.stringify({ server_hello: i + 1 })));
     assert.equal(seal.platform, testView().viewText);
     assert.equal(seal.payload, document);
     assert.equal(seal.orgId, api.org_id);
-    assert.equal(seal.value.toString(), value);
     const assertion = gets[i].result;
     assert.equal(
       sent.text,

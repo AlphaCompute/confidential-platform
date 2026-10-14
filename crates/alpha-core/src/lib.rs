@@ -48,6 +48,11 @@ pub fn is_secret_name(name: &str) -> bool {
     is_segment(name, 101)
 }
 
+/// A put carries a Secret's value after this many random bytes and commits to both in
+/// `content_sha256`, so the signed document stored beside the ciphertext does not let a reader
+/// of the database test guesses of a weak value against it.
+pub const SECRET_SALT_LEN: usize = 32;
+
 fn is_segment(name: &str, max: usize) -> bool {
     let bytes = name.as_bytes();
     matches!(bytes.first(), Some(b) if b.is_ascii_lowercase() || b.is_ascii_digit())

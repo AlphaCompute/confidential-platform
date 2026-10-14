@@ -433,6 +433,11 @@ pub async fn put_secret(
             .strip_prefix("sha256:")
             .and_then(alpha_core::hex_bytes)
             .ok_or_else(|| ApiError::malformed("content_sha256: expected sha256:<hex>"))?;
+        if value.len() < alpha_core::SECRET_SALT_LEN {
+            return Err(ApiError::malformed(
+                "value: expected the salt before the value",
+            ));
+        }
         if Sha256::digest(&value).as_slice() != content_sha256 {
             return Err(ApiError::malformed("content_sha256 does not match value"));
         }
@@ -484,7 +489,7 @@ pub async fn put_secret(
             None => SecretId::mint().into(),
         };
         let org_key = keys::org_key(&keys.tenant_kek_root, org_id.into(), &chain.anchor_spki)?;
-        let ciphertext = keys::aead_seal(&org_key, id.as_bytes(), &value)?;
+        let ciphertext = keys::aead_seal(&org_key, &keys::secret_aad(id, &body.payload)?, &value)?;
         sqlx::query!(
             "insert into secrets (id, org_id, name, app_ids, ciphertext, content_sha256, document, signed_by_key, signature, issued_at)
              values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
