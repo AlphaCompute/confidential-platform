@@ -125,25 +125,25 @@ pub fn parse(bytes: &[u8]) -> Result<Pod, String> {
                     "{list}: HOSTNAME is set by the pod's name; remove it from env"
                 ));
             }
-            // genpolicy is given no ConfigMap or Secret to resolve these from, and Kata 4.0.0's
-            // genpolicy panics on a reference it cannot resolve.
+            // genpolicy panics on a ConfigMap or Secret reference it is given nothing to resolve
+            // from, and writes the rest (fieldRef, resourceFieldRef) as placeholders such as
+            // `$(pod-ip)` that our rules never find among the variables the node sends.
             let refers = container.get("envFrom").is_some()
                 || container
                     .get("env")
                     .and_then(Yaml::as_sequence)
                     .into_iter()
                     .flatten()
-                    .filter_map(|e| e.get("valueFrom"))
-                    .any(|v| v.get("configMapKeyRef").is_some() || v.get("secretKeyRef").is_some());
+                    .any(|e| e.get("valueFrom").is_some());
             if refers {
                 return Err(format!(
-                    "{list}: envFrom and ConfigMap or Secret env references are unsupported; write the values into env"
+                    "{list}: envFrom and env valueFrom are unsupported; write the values into env"
                 ));
             }
             let image = container.get("image").and_then(Yaml::as_str).unwrap_or("");
-            if !has_sha256_digest(image) {
+            if !fully_qualified(image) {
                 return Err(format!(
-                    "{list}: image {image:?} has no digest; write <image>@sha256:<64 lowercase hex>, the policy pins it"
+                    "{list}: image {image:?} is not <registry>/<repository>@sha256:<64 lowercase hex>; the policy compares the reference the node pulls byte for byte"
                 ));
             }
         }
@@ -186,6 +186,39 @@ fn template_mut(spec: &mut Mapping) -> Result<&mut Mapping, String> {
         },
         _ => Err("pod spec: kind is not Pod or StatefulSet".into()),
     }
+}
+
+/// A short name, `docker.io/<name>`, `index.docker.io`, a tag beside the digest, or a registry or
+/// repository off the lowercase grammar may reach the node rewritten, and the rules compare the
+/// pulled reference with the policy's byte for byte.
+fn fully_qualified(image: &str) -> bool {
+    let Some((name, _)) = image.rsplit_once("@sha256:") else {
+        return false;
+    };
+    let Some((registry, repository)) = name.split_once('/') else {
+        return false;
+    };
+    let (host, port) = registry.split_once(':').unwrap_or((registry, "0"));
+    has_sha256_digest(image)
+        && (host.contains('.') || registry.contains(':') || host == "localhost")
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
+        && !port.is_empty()
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && registry != "index.docker.io"
+        && repository.split('/').all(|component| {
+            !component.is_empty()
+                && component
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
+        })
+        && (registry != "docker.io" || repository.contains('/'))
 }
 
 impl Kata {
@@ -445,8 +478,26 @@ mod tests {
     fn refuses_what_the_policy_cannot_pin() {
         let digest =
             "alpine@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8";
-        let tag = POD.replace(digest, "alpine:3.22");
-        assert!(parse(tag.as_bytes()).err().unwrap().contains("no digest"));
+        let full = format!("public.ecr.aws/docker/library/{digest}");
+        let (name, hex) = digest.split_once('@').unwrap();
+        for image in [
+            "public.ecr.aws/docker/library/alpine:3.22".to_owned(),
+            digest.to_owned(),
+            format!("library/{digest}"),
+            format!("docker.io/{digest}"),
+            format!("index.docker.io/library/{digest}"),
+            format!("public.ecr.aws/docker//library/{digest}"),
+            format!("public.ecr.aws/docker/Library/{digest}"),
+            format!("Public.ECR.aws/docker/library/{digest}"),
+            format!("a b.example/library/{digest}"),
+            format!("registry.example:/library/{digest}"),
+            format!("public.ecr.aws/docker/library/{name}:3.22@{hex}"),
+        ] {
+            let pod = POD.replace(&full, &image);
+            let err = parse(pod.as_bytes()).err().unwrap();
+            assert!(err.contains("<registry>/<repository>@sha256"), "{image}");
+        }
+        assert!(fully_qualified(&format!("localhost:5000/{digest}")));
         let groups = POD.replace("supplementalGroups", "runAsGroup: 0\n    other");
         assert!(
             parse(groups.as_bytes())
@@ -475,6 +526,16 @@ mod tests {
                 .unwrap()
                 .contains("envFrom")
         );
+        let field_ref = POD.replace(
+            "value: golden",
+            "valueFrom: {fieldRef: {fieldPath: status.podIP}}",
+        );
+        assert!(
+            parse(field_ref.as_bytes())
+                .err()
+                .unwrap()
+                .contains("valueFrom")
+        );
         let not_list = POD.replace("  containers:", "  initContainers: {}\n  containers:");
         assert!(
             parse(not_list.as_bytes())
@@ -491,16 +552,9 @@ mod tests {
     #[test]
     fn patch_turns_the_upstream_rules_into_the_pinned_ones() {
         let (patched, _) = GENPOLICY.split_once(POLICY_DATA).unwrap();
-        let mut upstream = patched
-            .strip_suffix(RULE_ADDITIONS)
-            .and_then(|r| r.strip_suffix('\n'))
-            .unwrap()
-            .to_owned();
-        for (old, new) in RULE_EDITS {
-            upstream = upstream.replacen(new, old, 1);
-        }
-        assert_eq!(sha256_hex(&upstream), RULES_SHA256);
-        assert_eq!(patch_rules(upstream.into_bytes()).unwrap(), patched);
+        let upstream = upstream_policy(GENPOLICY);
+        let (upstream, _) = upstream.split_once(POLICY_DATA).unwrap();
+        assert_eq!(patch_rules(upstream.into()).unwrap(), patched);
         let err = patch_rules(b"package agent_policy\n".to_vec()).unwrap_err();
         assert!(err.contains("the patch did not apply"));
     }
@@ -619,12 +673,8 @@ mod tests {
         in_pod.sort();
         in_policy.sort();
         assert_eq!(in_pod, in_policy);
-        let mut agent = Agent::new(DIND_GENPOLICY);
         let requests: Vec<Value> = serde_json::from_str(DIND_REQUESTS).unwrap();
-        for request in &requests {
-            let name = &request["OCI"]["Annotations"]["io.kubernetes.cri.container-name"];
-            assert!(agent.creates(request), "{name}");
-        }
+        let mut agent = launched(DIND_GENPOLICY, &requests);
         // With shared_fs=none the shim copies the downward API volume into the guest file by
         // file, in WalkDir order, under the mount source it gives the runtime container.
         let runtime = &requests[1]["OCI"]["Mounts"];
@@ -648,10 +698,7 @@ mod tests {
                 Some("..data/cc_init_data"),
             ),
         ] {
-            let request = serde_json::json!({
-                "path": path, "file_type": file_type, "symlink_target": target,
-                "file_size": 0, "file_mode": 0o644, "dir_mode": 0o755, "uid": 0, "gid": 0, "offset": 0,
-            });
+            let request = copy(file_type, &path, target);
             assert!(agent.allows("CopyFileRequest", &request), "{path}");
         }
     }
@@ -686,11 +733,296 @@ mod tests {
             (dockerd, device),
             (launch, escalated),
         ] {
-            let mut agent = Agent::new(DIND_GENPOLICY);
-            for request in &requests[..index] {
-                assert!(agent.creates(request));
-            }
+            let mut agent = launched(DIND_GENPOLICY, &requests[..index]);
             assert!(!agent.creates(&tampered));
+        }
+    }
+
+    const B300_POD: &str = include_str!("../../../testdata/coco/b300/pod.yaml");
+    /// genpolicy 4.0.0 for `B300_POD`, pinned rules and settings.
+    const B300_GENPOLICY: &str = include_str!("../../../testdata/coco/b300/genpolicy.rego");
+    /// The sandbox, `alpha-runtime` and `app` `CreateContainerRequest`s a B300 node sent for
+    /// `B300_POD`, taken from its policy denials with each tampering undone.
+    const B300_REQUESTS: &str = include_str!("../../../testdata/coco/b300/requests.json");
+    const SANDBOX: usize = 0;
+    const APP: usize = 2;
+
+    fn b300_requests() -> Vec<Value> {
+        serde_json::from_str(B300_REQUESTS).unwrap()
+    }
+
+    fn copy(file_type: &str, path: &str, target: Option<&str>) -> Value {
+        serde_json::json!({
+            "path": path, "file_type": file_type, "symlink_target": target,
+            "file_size": 0, "file_mode": 0o644, "dir_mode": 0o755, "uid": 0, "gid": 0, "offset": 0,
+        })
+    }
+
+    fn launched(policy: &str, requests: &[Value]) -> Agent {
+        let mut agent = Agent::new(policy);
+        for request in requests {
+            let name = &request["OCI"]["Annotations"]["io.kubernetes.cri.container-name"];
+            assert!(agent.creates(request), "{name}");
+        }
+        agent
+    }
+
+    /// What genpolicy 4.0.0's own rules make of the same policy data.
+    fn upstream_policy(policy: &str) -> String {
+        let (patched, data) = policy.split_once(POLICY_DATA).unwrap();
+        let mut rules = patched
+            .strip_suffix(RULE_ADDITIONS)
+            .and_then(|r| r.strip_suffix('\n'))
+            .unwrap()
+            .to_owned();
+        for (old, new) in RULE_EDITS {
+            rules = rules.replacen(new, old, 1);
+        }
+        assert_eq!(sha256_hex(&rules), RULES_SHA256);
+        format!("{rules}{POLICY_DATA}{data}")
+    }
+
+    /// One request of the launch, changed the way a malicious host would change it.
+    fn tampered(
+        requests: &[Value],
+        index: usize,
+        change: impl FnOnce(&mut Value),
+    ) -> (usize, Value) {
+        let mut request = requests[index].clone();
+        change(&mut request);
+        (index, request)
+    }
+
+    fn env(request: &mut Value) -> &mut Vec<Value> {
+        request["OCI"]["Process"]["Env"].as_array_mut().unwrap()
+    }
+
+    fn mounts(request: &mut Value) -> &mut Vec<Value> {
+        request["OCI"]["Mounts"].as_array_mut().unwrap()
+    }
+
+    fn host_tampering(requests: &[Value]) -> Vec<(&'static str, (usize, Value))> {
+        let other = "public.ecr.aws/docker/library/alpine@sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let share = "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000-0000000000000000-x";
+        vec![
+            (
+                "image swap",
+                tampered(requests, APP, |r| {
+                    r["OCI"]["Annotations"]["io.kubernetes.cri.image-name"] = other.into();
+                    r["storages"][0]["source"] = other.into();
+                }),
+            ),
+            (
+                "image swap under the pinned name",
+                tampered(requests, APP, |r| r["storages"][0]["source"] = other.into()),
+            ),
+            (
+                "env added",
+                tampered(requests, APP, |r| {
+                    env(r).push("LD_PRELOAD=/tmp/x.so".into())
+                }),
+            ),
+            (
+                "env removed",
+                tampered(requests, APP, |r| {
+                    env(r).retain(|v| v != "APP_MODE=baseline")
+                }),
+            ),
+            (
+                "env changed",
+                tampered(requests, APP, |r| {
+                    for v in env(r).iter_mut().filter(|v| *v == "APP_MODE=baseline") {
+                        *v = "APP_MODE=tampered".into();
+                    }
+                }),
+            ),
+            (
+                "pause image pulled from a registry",
+                tampered(requests, SANDBOX, |r| {
+                    let pull = &mut r["storages"][0];
+                    pull["source"] = "docker.io/attacker/pause:latest".into();
+                    let options = pull["driver_options"][0].as_str().unwrap().replace(
+                        r#""io.kubernetes.cri.container-type":"sandbox""#,
+                        r#""io.kubernetes.cri.container-type":"container""#,
+                    );
+                    pull["driver_options"][0] = options.into();
+                }),
+            ),
+            (
+                "volume moved",
+                tampered(requests, APP, |r| {
+                    for m in mounts(r)
+                        .iter_mut()
+                        .filter(|m| m["destination"] == "/run/alpha")
+                    {
+                        m["destination"] = "/etc".into();
+                    }
+                }),
+            ),
+            (
+                "extra bind mount",
+                tampered(requests, APP, |r| {
+                    mounts(r).push(serde_json::json!({
+                        "destination": "/etc/ld.so.preload", "source": share,
+                        "type_": "bind", "options": ["rbind", "rprivate", "ro"],
+                    }))
+                }),
+            ),
+            (
+                "extra storage",
+                tampered(requests, APP, |r| {
+                    let mut extra = r["storages"][1].clone();
+                    extra["mount_point"] = "/run/kata-containers/sandbox/storage/extra".into();
+                    r["storages"].as_array_mut().unwrap().push(extra);
+                }),
+            ),
+            (
+                "host device",
+                tampered(requests, APP, |r| {
+                    r["OCI"]["Linux"]["Devices"] = serde_json::json!([{
+                        "Path": "/dev/kvm", "Type": "c", "Major": 10, "Minor": 232,
+                        "FileMode": 0o660, "UID": 0, "GID": 0,
+                    }]);
+                }),
+            ),
+            (
+                "prestart hook",
+                tampered(requests, APP, |r| {
+                    r["OCI"]["Hooks"] =
+                        serde_json::json!({ "Prestart": [{ "Path": "/bin/sh", "Args": ["sh"] }] });
+                }),
+            ),
+            (
+                "seccomp profile",
+                tampered(requests, APP, |r| {
+                    r["OCI"]["Linux"]["Seccomp"] =
+                        serde_json::json!({ "DefaultAction": "SCMP_ACT_ALLOW" });
+                }),
+            ),
+            (
+                "sysctl",
+                tampered(requests, APP, |r| {
+                    r["OCI"]["Linux"]["Sysctl"] =
+                        serde_json::json!({ "kernel.core_pattern": "|/bin/sh" });
+                }),
+            ),
+            (
+                "/proc/kcore unmasked",
+                tampered(requests, APP, |r| {
+                    let masked = r["OCI"]["Linux"]["MaskedPaths"].as_array_mut().unwrap();
+                    masked.retain(|p| p != "/proc/kcore");
+                }),
+            ),
+            (
+                "/proc/sys writable",
+                tampered(requests, APP, |r| {
+                    let readonly = r["OCI"]["Linux"]["ReadonlyPaths"].as_array_mut().unwrap();
+                    readonly.retain(|p| p != "/proc/sys");
+                }),
+            ),
+            (
+                "shared pid namespace",
+                tampered(requests, APP, |r| r["sandbox_pidns"] = true.into()),
+            ),
+        ]
+    }
+
+    #[test]
+    fn b300_pod_renders_and_launches_under_the_pinned_policy() {
+        let rendered = render(
+            parse(B300_POD.as_bytes()).unwrap(),
+            APP_ID.parse().unwrap(),
+            B300_GENPOLICY,
+        )
+        .unwrap();
+        let golden: Value = serde_json::from_str(EXPECTED).unwrap();
+        assert_eq!(
+            rendered.policy_data_sha256,
+            golden["policy_data_sha256"].as_str().unwrap()
+        );
+        launched(B300_GENPOLICY, &b300_requests());
+    }
+
+    #[test]
+    fn pinned_policy_denies_a_malicious_host() {
+        let requests = b300_requests();
+        for (scenario, (index, request)) in host_tampering(&requests) {
+            let mut agent = launched(B300_GENPOLICY, &requests[..index]);
+            assert!(!agent.creates(&request), "{scenario}");
+        }
+
+        let mut agent = launched(B300_GENPOLICY, &requests);
+        let app = &requests[APP];
+        let id = &app["container_id"];
+        let mut shell = app["OCI"]["Process"].clone();
+        shell["Args"] = serde_json::json!(["sh"]);
+        let exec = |process: &Value| serde_json::json!({ "container_id": id, "exec_id": "x", "string_user": null, "process": process });
+        let read = serde_json::json!({ "container_id": id, "exec_id": "", "len": 4096 });
+        let write = serde_json::json!({ "container_id": id, "exec_id": "", "data": "aWQK" });
+        let close = serde_json::json!({ "container_id": id, "exec_id": "" });
+        for (scenario, endpoint, request) in [
+            ("exec of a shell", "ExecProcessRequest", exec(&shell)),
+            (
+                "exec of the container's own command",
+                "ExecProcessRequest",
+                exec(&app["OCI"]["Process"]),
+            ),
+            ("logs", "ReadStreamRequest", read),
+            ("attach", "WriteStreamRequest", write),
+            ("stdin close", "CloseStdinRequest", close),
+        ] {
+            assert!(!agent.allows(endpoint, &request), "{scenario}");
+        }
+
+        let shared = "/run/kata-containers/shared/containers/0000000000000000000000000000000000000000000000000000000000000000-0000000000000000-hostname";
+        assert!(agent.allows("CopyFileRequest", &copy("Regular", shared, None)));
+        for (scenario, request) in [
+            (
+                "into the app's guest-pulled rootfs",
+                copy(
+                    "Regular",
+                    "/run/kata-containers/app/rootfs/etc/ld.so.preload",
+                    None,
+                ),
+            ),
+            (
+                "into an in-guest volume",
+                copy(
+                    "Regular",
+                    "/run/kata-containers/sandbox/storage/MDow/x",
+                    None,
+                ),
+            ),
+            (
+                "out of the shared directory",
+                copy("Regular", &format!("{shared}/../../../sandbox/x"), None),
+            ),
+            ("relative path", copy("Regular", &shared[1..], None)),
+            (
+                "symlink out of the guest",
+                copy("Symlink", &format!("{shared}/x"), Some("/etc/passwd")),
+            ),
+        ] {
+            assert!(!agent.allows("CopyFileRequest", &request), "{scenario}");
+        }
+    }
+
+    /// Our rules exist because genpolicy 4.0.0's own do not refuse these; when they start to,
+    /// the edits may be redundant.
+    #[test]
+    fn upstream_rules_still_let_the_host_swap_the_image_drop_env_and_pull_a_pause_image() {
+        let requests = b300_requests();
+        let upstream = upstream_policy(B300_GENPOLICY);
+        launched(&upstream, &requests);
+        let tampering = host_tampering(&requests);
+        for wanted in [
+            "image swap under the pinned name",
+            "env removed",
+            "pause image pulled from a registry",
+        ] {
+            let (_, (index, request)) = tampering.iter().find(|(s, _)| *s == wanted).unwrap();
+            let mut agent = launched(&upstream, &requests[..*index]);
+            assert!(agent.creates(request), "{wanted}");
         }
     }
 }
