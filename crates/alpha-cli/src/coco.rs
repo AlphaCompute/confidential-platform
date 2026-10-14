@@ -501,22 +501,14 @@ mod tests {
 
         fn creates(&mut self, request: &Value) -> bool {
             self.engine.clear_data();
-            let data = serde_json::json!({ "pstate": self.state }).to_string();
-            self.engine
-                .add_data(regorus::Value::from_json_str(&data).unwrap())
-                .unwrap();
+            let data = serde_json::from_value(serde_json::json!({ "pstate": self.state })).unwrap();
+            self.engine.add_data(data).unwrap();
             self.engine.set_input_json(&request.to_string()).unwrap();
             let results = self
                 .engine
                 .eval_query("data.agent_policy.CreateContainerRequest".into(), false)
                 .unwrap();
-            let value: Value = serde_json::from_str(
-                &results.result[0].expressions[0]
-                    .value
-                    .to_json_str()
-                    .unwrap(),
-            )
-            .unwrap();
+            let value = serde_json::to_value(&results.result[0].expressions[0].value).unwrap();
             if value == Value::Bool(false) {
                 return false;
             }
