@@ -43,7 +43,9 @@ from the Instance or from the relay.
 8. `enc` decapsulates under the page's X-Wing key.
 
 Because of check 6, the page can read the services, images and environment of the App out of the
-compose it just hashed, rather than trusting its own bundle for them (`composeServices`).
+compose it just hashed, rather than trusting its own bundle for them (`composeServices`). An
+Instance in a Kata pod sends its init-data TOML as `compose`, the bytes its Revision hashes;
+checks 1 to 8 hold, but `composeServices` does not read it.
 
 ## Handshake
 

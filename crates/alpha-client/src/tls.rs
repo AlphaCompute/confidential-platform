@@ -471,6 +471,7 @@ mod tests {
             tls_private_key: Zeroizing::new(leaf_key.serialize_der()),
             attestation_result: dummy_attestation(),
             app_compose: Some("test".into()),
+            init_data: None,
         }
     }
 

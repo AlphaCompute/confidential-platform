@@ -132,7 +132,7 @@ fn start_runtime_with_compose(
         Arc::new(move || *shared.lock().unwrap()),
         capture_evidence(),
         pinned_time(h.now()),
-        Some(app_compose),
+        Some(alpha_runtime::RevisionText::Compose(app_compose)),
     )
     .unwrap();
     (runtime, clock)

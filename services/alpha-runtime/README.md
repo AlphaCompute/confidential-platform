@@ -11,8 +11,26 @@ with 1 and name the check; a drain on SIGTERM exits with 0.
 In a Kata TDX pod there is no guest agent socket: the runtime quotes through configfs-tsm
 (`/sys/kernel/config/tsm/report`, which the container needs mounted and must run as uid 0 to
 write) and sends the quote alone. The KMS reads the Revision, the digest of the pod's init-data,
-from the quote's `MRCONFIGID`. The container cannot read that init-data, so on Kata there is no
-compose to check against the leaf and `/v1/identity` answers `app_compose: null`.
+from the quote's `MRCONFIGID`. The guest does not show a container its init-data, so a pod that
+wants `/v1/identity` to serve it mounts its own annotation into the runtime container with the
+downward API, at `/run/alpha-init-data/cc_init_data`:
+
+```yaml
+volumes:
+  - name: init-data
+    downwardAPI:
+      items:
+        - path: cc_init_data
+          fieldRef:
+            fieldPath: metadata.annotations['io.katacontainers.config.hypervisor.cc_init_data']
+# in the alpha-runtime container
+volumeMounts:
+  - { name: init-data, mountPath: /run/alpha-init-data, readOnly: true }
+```
+
+The host writes that file, so the runtime decodes it (`base64(gzip(toml))`, under 1 MiB
+inflated) and refuses to attest unless its SHA-256 is the leaf's Revision. Without the file
+`/v1/identity` answers `init_data: null`.
 
 On Kata the host writes the environment variables below, and the init-data's agent policy is
 what makes them trustworthy: `alpha coco render` pins every variable of every container to its
@@ -41,7 +59,7 @@ to the socket), and comes up only after the first attestation succeeded:
 
 | Route | Reply |
 |---|---|
-| `GET /v1/identity` | `{app_id, org_id, compose_hash, certificate_chain, tls_private_key, attestation_result, app_compose}` — the ids and the hash are read from the leaf's SANs; `tls_private_key` is the PKCS#8 DER, base64url; `app_compose` is the Instance's `app-compose.json`, read once at start from the guest agent's `Info` and refused unless its SHA-256 is the leaf's Revision digest, so a service can show a client which compose it runs; `null` on Kata, where the Revision is init-data the container cannot read |
+| `GET /v1/identity` | `{app_id, org_id, compose_hash, certificate_chain, tls_private_key, attestation_result, app_compose, init_data}` — the ids and the hash are read from the leaf's SANs, on dstack and on Kata alike; `tls_private_key` is the PKCS#8 DER, base64url; `app_compose` is the Instance's `app-compose.json`, read once at start from the guest agent's `Info` and refused unless its SHA-256 is the leaf's Revision digest, so a service can show a client which compose it runs; `null` on Kata; `init_data` is the Kata pod's init-data TOML under the same rule, `null` on dstack and when the pod does not mount it |
 | `GET /v1/secrets/{name}` | the KMS reply for the Secret of that KMS name (a declared Secret's is `<app_id>.<name>`), fetched over mTLS with the leaf and cached until the leaf expires; a KMS error passes through in its envelope with its status |
 | `GET /v1/keys/{purpose}` | the KMS reply to `POST /v1/keys/derive` for that purpose, `{key}`, 32 bytes base64url: the App's own key, the same for every Revision of the App; fetched and cached like a secret, up to 64 purposes per leaf, beyond which a key is derived again on every read |
 | `GET /healthz` | `{attested, cert_not_after}` |

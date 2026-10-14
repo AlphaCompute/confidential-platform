@@ -14,7 +14,7 @@ use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
 
-use crate::{Error, Runtime};
+use crate::{Error, RevisionText, Runtime};
 
 pub fn router(runtime: Arc<Runtime>) -> Router {
     Router::new()
@@ -63,6 +63,11 @@ impl IntoResponse for Error {
 
 pub fn identity_json(runtime: &Runtime) -> Result<Value, Error> {
     let attested = runtime.attested().ok_or(Error::NotAttested)?;
+    let (app_compose, init_data) = match &runtime.revision {
+        Some(RevisionText::Compose(compose)) => (Some(compose), None),
+        Some(RevisionText::InitData(init_data)) => (None, Some(init_data)),
+        None => (None, None),
+    };
     Ok(json!({
         "app_id": attested.identity.app_id,
         "org_id": attested.identity.org_id,
@@ -70,7 +75,8 @@ pub fn identity_json(runtime: &Runtime) -> Result<Value, Error> {
         "certificate_chain": attested.chain_pem,
         "tls_private_key": BASE64_URL_SAFE_NO_PAD.encode(runtime.tls_private_key()),
         "attestation_result": attested.result,
-        "app_compose": runtime.app_compose,
+        "app_compose": app_compose,
+        "init_data": init_data,
     }))
 }
 

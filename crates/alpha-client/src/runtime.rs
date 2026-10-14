@@ -90,6 +90,7 @@ impl RuntimeSocket {
             tls_private_key: String,
             attestation_result: AttestationResult,
             app_compose: Option<String>,
+            init_data: Option<String>,
         }
 
         let (status, body) = self.get("/v1/identity").await?;
@@ -106,6 +107,7 @@ impl RuntimeSocket {
             tls_private_key: Zeroizing::new(decode("tls_private_key", &wire.tls_private_key)?),
             attestation_result: wire.attestation_result,
             app_compose: wire.app_compose,
+            init_data: wire.init_data,
         })
     }
 
@@ -181,9 +183,11 @@ pub struct RuntimeIdentity {
     pub tls_private_key: Zeroizing<Vec<u8>>,
     pub attestation_result: AttestationResult,
     /// The Instance's measured `app-compose.json`, exact bytes; its SHA-256 is `compose_hash`.
-    /// None in a Kata pod, whose container cannot read the init-data its Revision is the
-    /// digest of.
+    /// None in a Kata pod.
     pub app_compose: Option<String>,
+    /// A Kata pod's init-data TOML, exact bytes; its SHA-256 is `compose_hash`. None on dstack,
+    /// and in a pod that does not mount its init-data annotation into the runtime.
+    pub init_data: Option<String>,
 }
 
 impl std::fmt::Debug for RuntimeIdentity {
@@ -196,6 +200,7 @@ impl std::fmt::Debug for RuntimeIdentity {
             .field("tls_private_key", &"<redacted>")
             .field("attestation_result", &self.attestation_result)
             .field("app_compose", &self.app_compose)
+            .field("init_data", &self.init_data)
             .finish()
     }
 }
