@@ -902,6 +902,14 @@ mod tests {
                 }),
             ),
             (
+                "disk emptyDir's block device mounted out of the storage path",
+                tampered(requests, APP, |r| {
+                    let outside = "/run/kata-containers/sandbox/storage/../../shared/containers";
+                    r["storages"][1]["mount_point"] = outside.into();
+                    mount_source(r, "/run/alpha", outside)
+                }),
+            ),
+            (
                 "configfs-tsm swapped for a host share",
                 tampered(requests, RUNTIME, |r| {
                     mount_source(
