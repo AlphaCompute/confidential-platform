@@ -56,15 +56,14 @@ const RULE_EDITS: [(&str, &str); 7] = [
         "    i_storage.mount_point == i_mount.source\n",
         "    i_storage.mount_point == i_mount.source\n    i_storage.driver in [\"blk\", \"scsi\"]\n    p_mount.source == \"\"\n    startswith(i_mount.source, concat(\"\", [policy_data.common.spath, \"/\"]))\n",
     ),
-    (
-        "regex4 =\", regex4)\n    regex.match(regex4, i_mount.source)\n\n    print(\"mount_source_allows 1",
-        "regex4 =\", regex4)\n    regex.match(concat(\"\", [\"^(?:\", regex4, \")$\"]), i_mount.source)\n\n    print(\"mount_source_allows 1",
-    ),
-    (
-        "regex4 =\", regex4)\n    regex.match(regex4, i_mount.source)\n\n    print(\"mount_source_allows 2",
-        "regex4 =\", regex4)\n    regex.match(concat(\"\", [\"^(?:\", regex4, \")$\"]), i_mount.source)\n\n    print(\"mount_source_allows 2",
-    ),
+    ANCHORED_SOURCE,
+    ANCHORED_SOURCE,
 ];
+/// Both variants of `mount_source_allows`, in turn.
+const ANCHORED_SOURCE: (&str, &str) = (
+    "    regex.match(regex4, i_mount.source)\n",
+    "    regex.match(concat(\"\", [\"^(?:\", regex4, \")$\"]), i_mount.source)\n",
+);
 const RULE_ADDITIONS: &str = include_str!("coco/rules-additions.rego");
 const SETTINGS_DROP_INS: [(&str, &str); 2] = [
     ("20-node.json", include_str!("coco/20-node.json")),
