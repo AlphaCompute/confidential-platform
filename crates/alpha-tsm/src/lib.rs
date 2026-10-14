@@ -21,7 +21,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alpha_attest::EventLogEntry;
+use alpha_attest::{
+    EVIDENCE_FORMAT, EventLogEntry, Evidence, InstanceEvidence, KATA_EVIDENCE_FORMAT, KataEvidence,
+};
 use alpha_core::ComposeHash;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
@@ -76,6 +78,47 @@ pub fn quote(report_data: &[u8; 64]) -> Result<Vec<u8>, Error> {
     } else {
         quote_from(socket, report_data)
     }
+}
+
+/// What a TD runs on, and so what it proves itself with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Substrate {
+    /// A dstack CVM: the guest agent quotes, and the event log names the measured compose.
+    Dstack,
+    /// A Kata TDX pod: configfs-tsm quotes, and `MRCONFIGID` names the init-data.
+    Kata,
+}
+
+impl Substrate {
+    /// Dstack exactly when its guest agent's socket exists; anywhere else the quote has to come
+    /// from configfs-tsm, which [`quote`] then uses.
+    pub fn detect(dstack_socket: &Path) -> Self {
+        if dstack_socket.exists() {
+            Substrate::Dstack
+        } else {
+            Substrate::Kata
+        }
+    }
+}
+
+pub fn kata_evidence(quote: Vec<u8>) -> InstanceEvidence {
+    InstanceEvidence::Kata(KataEvidence {
+        format: KATA_EVIDENCE_FORMAT.into(),
+        quote,
+    })
+}
+
+/// A quote over `report_data`, with the event log as it stands now on dstack, alone in Kata.
+pub fn evidence(substrate: Substrate, report_data: &[u8; 64]) -> Result<InstanceEvidence, Error> {
+    let quote = quote(report_data)?;
+    Ok(match substrate {
+        Substrate::Dstack => InstanceEvidence::Dstack(Evidence {
+            format: EVIDENCE_FORMAT.into(),
+            quote,
+            event_log: event_log()?,
+        }),
+        Substrate::Kata => kata_evidence(quote),
+    })
 }
 
 /// The init-data digest this Kata TD booted with, from the `MRCONFIGID` of a quote it takes of
@@ -469,6 +512,16 @@ mod tests {
         other[63] ^= 1;
         let error = check_quote(KATA_QUOTE, &other).unwrap_err().to_string();
         assert!(error.contains("not ours"), "{error}");
+    }
+
+    #[test]
+    fn dstack_is_chosen_by_its_guest_agent_socket_alone() {
+        let socket =
+            std::env::temp_dir().join(format!("alpha-tsm-{}-dstack.sock", tsm_entry_name()));
+        assert_eq!(Substrate::detect(&socket), Substrate::Kata);
+        fs::write(&socket, b"").unwrap();
+        assert_eq!(Substrate::detect(&socket), Substrate::Dstack);
+        fs::remove_file(&socket).unwrap();
     }
 
     #[test]
