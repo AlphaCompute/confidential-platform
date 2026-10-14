@@ -10,6 +10,12 @@ workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Compiles in release-keys/dev.pub instead of release-keys/prod.pub.
+dev = []
+# Set by every build that verifies platform documents: build.rs fails it on the placeholder set.
+require-release-keys = []
+
 [dependencies]
 aes-gcm = "0.11"
 alpha-core = { path = "../alpha-core" }
@@ -39,6 +45,7 @@ wasm-bindgen = "=0.2.128"
 js-sys = "0.3"
 
 [dev-dependencies]
+alpha-channel = { path = ".", features = ["dev"] }
 serde_json = { version = "1", features = ["raw_value"] }
 wasm-bindgen-test = "=0.3.78"
 

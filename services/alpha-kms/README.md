@@ -20,7 +20,7 @@ Control bodies are signed `ed25519` or `webauthn-es256`, a passkey's WebAuthn as
 
 `alpha-kms migrate` applies `migrations/` (expand-only) and returns; run it as the schema owner. The service then learns its own Revision: in a dstack CVM (the guest agent's socket exists) from its event log, read from the CCEL table and `/run/log/dstack`; in a Kata TDX pod from the init-data digest in the `MRCONFIGID` of a quote it takes of itself through configfs-tsm, which the pod must mount at `/sys/kernel/config`. Its node evidence is the same shape as an Instance's, dstack or Kata (`format`). It then generates its P-256 runtime key and X-Wing key, and comes up sealed: it joins the first ready endpoint or waits for two `unseal` shares (or, on an empty database, a `bootstrap`).
 
-The release key's public half is `release-key.pub`; replacing it means rebuilding the image.
+The release key's public half is compiled in from `crates/alpha-channel/release-keys/`: `prod.pub`, or `dev.pub` with `dev-root` (`deploy/README.md`, Release keys).
 
 The image is `images/kms/Dockerfile` (`alpha-kms`, or `alpha-kms-dev` with `--build-arg FEATURES=dev-root`), built and reproducibility-checked by `.github/workflows/release.yml`; the two nodes' compose and the operator's steps are `deploy/README.md`.
 

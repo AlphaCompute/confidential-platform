@@ -8,9 +8,6 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use tokio::net::TcpListener;
 use zeroize::Zeroizing;
 
-/// The release key's public half; the private half is held by a person, never by CI.
-const RELEASE_KEY_HEX: &str = include_str!("../release-key.pub");
-
 const LISTEN: &str = "0.0.0.0:8443";
 
 // ponytail: eprintln and no metrics; the external log/metrics receiver with
@@ -37,9 +34,7 @@ async fn run() -> Result<(), String> {
             .map_err(|e| format!("migrate: {e}"))?;
         return Ok(());
     }
-    let release_key = alpha_core::hex_bytes::<32>(RELEASE_KEY_HEX.trim())
-        .and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok())
-        .ok_or("release-key.pub is not an Ed25519 public key")?;
+    let release_key = alpha_channel::platform::release_key().map_err(|e| e.to_string())?;
     let mut config = Config::from_env()?;
     config.database_password = url_password(&url)?;
     let pool_options = PgPoolOptions::new().max_connections(8);

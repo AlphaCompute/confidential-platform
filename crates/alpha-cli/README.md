@@ -2,6 +2,8 @@
 
 The command line of the trust plane: keys, signed Control calls, the platform document, deploys, and the custodians' `bootstrap` and `unseal`. Every command prints one JSON document on success; exit code 1 means a check refused (the message names it), 2 means usage.
 
+The default build compiles in the production release key and fails until the key ceremony has committed it; `--features dev` builds the `alpha` of the dev stand (`deploy/README.md`, Release keys).
+
 ## Configuration
 
 Flags or environment, nothing else:

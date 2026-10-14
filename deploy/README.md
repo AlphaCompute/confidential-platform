@@ -35,6 +35,18 @@ dev `01a09f07-8d09-7aff-b257-83dbd9e6e641`); `testdata/manifest/06-kms-node` pin
 the root KEK from `ALPHACOMPUTE_KMS_DEV_ROOT_KEK` instead of the custodians' shares. It is a
 different image with a different `compose_hash`; a production platform document never lists it.
 
+## Release keys
+
+Every build that verifies a platform document (`alpha-kms`, `alpha`, the signer page's wasm)
+compiles in one release key set from `crates/alpha-channel/release-keys/`: `prod.pub` by default,
+`dev.pub` with the dev feature (`dev-root` for `alpha-kms`, `dev` for `alpha`, `FEATURES=dev`
+for the page). A production build holds no dev key and a dev build no production key, so neither
+accepts the other's documents. Until the offline key ceremony commits the production key,
+`prod.pub` is a placeholder and every production build of those three fails at compile time,
+the `alpha-kms` job of a release included; the dev images, the dev `alpha`
+(`cargo install --path crates/alpha-cli --features dev`) and the tests build with `dev.pub`.
+Replacing either file means rebuilding every image and page that compiles it in.
+
 ## Pulling from ghcr
 
 The images are public, so a CVM pulls them anonymously and no credential is delivered to one.
@@ -201,8 +213,7 @@ answers 200 only once it reaches that database.
 ## The dev App
 
 The same steps with `alpha-kms-dev`, its own App id, its own Postgres, its own platform
-document at its own URL (signed by the same release key: both images compile in the one
-`release-key.pub`; it lists the dev Revision and never a production one), and
+document at its own URL (signed by the dev release key, which only dev builds compile in), and
 `ALPHACOMPUTE_KMS_DEV_ROOT_KEK` (64 hex digits) in the encrypted env. `alpha bootstrap` still runs once on the empty database (with three throwaway custodian
 keys: the root is the env value, so the shares it writes protect nothing and can be deleted);
 after that every restart serves without `unseal` or `join`. Production shares and the

@@ -35,6 +35,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    # The tests load the dev stand's platform document; the production key set is the ceremony's.
+    env:
+      FEATURES: dev
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2

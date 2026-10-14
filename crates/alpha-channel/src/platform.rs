@@ -38,12 +38,18 @@ pub struct PlatformView {
     pub kata_policy: Option<KataPolicy>,
 }
 
-/// The release key's public half, the same file `alpha-kms` compiles in; replaced at the
-/// ceremony, never in CI.
+// A build holds one set only, so a production verifier cannot accept a dev-signed document.
+#[cfg(feature = "dev")]
+const RELEASE_KEY: &str = include_str!("../release-keys/dev.pub");
+#[cfg(not(feature = "dev"))]
+const RELEASE_KEY: &str = include_str!("../release-keys/prod.pub");
+
+/// The release key's public half compiled into this build, which `alpha-kms`, `alpha` and the
+/// page share; replaced at the ceremony, never in CI.
 pub fn release_key() -> Result<VerifyingKey, Error> {
-    alpha_core::hex_bytes::<32>(include_str!("../../../services/alpha-kms/release-key.pub").trim())
+    alpha_core::hex_bytes::<32>(RELEASE_KEY.trim())
         .and_then(|b| VerifyingKey::from_bytes(&b).ok())
-        .ok_or_else(|| Error::Malformed("release-key.pub is not an Ed25519 public key".into()))
+        .ok_or_else(|| Error::Malformed("the compiled-in release key is not Ed25519".into()))
 }
 
 pub fn sign(document: Value, key: &SigningKey) -> Result<SignedDocument, Error> {

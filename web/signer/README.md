@@ -23,6 +23,10 @@ says "Approved" only after the receipt of every put and of the registration veri
 web/signer/build.sh web/signer/dist
 ```
 
+That page carries the production release key and does not build until the key ceremony has
+replaced `crates/alpha-channel/release-keys/prod.pub`; `FEATURES=dev web/signer/build.sh …` builds
+the dev stand's page with `release-keys/dev.pub`.
+
 It needs the toolchain in `rust-toolchain.toml`, `openssl`, and the `wasm-bindgen` CLI at the
 version `crates/alpha-channel` pins (`cargo install wasm-bindgen-cli --version 0.2.128 --locked`).
 The output directory must be empty or absent, and receives eight files:

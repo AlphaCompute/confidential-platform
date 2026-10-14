@@ -7,6 +7,10 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# The dev stand's release key instead of the production one.
+dev = ["alpha-channel/dev"]
+
 [[bin]]
 name = "alpha"
 path = "src/main.rs"
@@ -14,7 +18,7 @@ path = "src/main.rs"
 [dependencies]
 aes-gcm = "0.11"
 alpha-attest = { path = "../alpha-attest" }
-alpha-channel = { path = "../alpha-channel" }
+alpha-channel = { path = "../alpha-channel", features = ["require-release-keys"] }
 alpha-client = { path = "../alpha-client" }
 alpha-core = { path = "../alpha-core" }
 alpha-crypto = { path = "../alpha-crypto" }
@@ -37,6 +41,7 @@ uuid = "1"
 zeroize = "1"
 
 [dev-dependencies]
+alpha-channel = { path = "../alpha-channel", features = ["dev"] }
 axum = { version = "0.8", default-features = false }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
