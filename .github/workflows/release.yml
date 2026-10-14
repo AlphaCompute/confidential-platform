@@ -117,10 +117,9 @@ jobs:
           cargo run -q -p alpha-cli --bin alpha -- coco render --app-id "$APP_ID" --kata "$kata/opt/kata" \
             --out "$OUT/pod.yaml" "$RUNNER_TEMP/kms-node.yaml" > "$RUNNER_TEMP/rendered.json"
           jq -j .init_data "$RUNNER_TEMP/rendered.json" > "$OUT/init-data.toml"
-          (cd "$OUT" && sha256sum init-data.toml > init-data.toml.sha256)
           jq --arg image "$KMS_IMAGE" '{image: $image, compose_hash: .revision, rules_sha256, policy_data_sha256}' \
             "$RUNNER_TEMP/rendered.json" > "$OUT/manifest.json"
-          if [ "$(jq -r .compose_hash "$OUT/manifest.json")" != "sha256:$(cut -d' ' -f1 "$OUT/init-data.toml.sha256")" ]; then
+          if [ "$(jq -r .compose_hash "$OUT/manifest.json")" != "sha256:$(sha256sum < "$OUT/init-data.toml" | cut -d' ' -f1)" ]; then
             echo "the rendered Revision is not the SHA-256 of init-data.toml" >&2
             exit 1
           fi

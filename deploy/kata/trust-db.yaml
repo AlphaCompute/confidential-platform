@@ -1,12 +1,7 @@
 # The trust-zone Postgres: an ordinary runc pod on its own node pool, treated as untrusted storage.
 # Everything secret in it is ciphertext under keys it never sees. Apply with
 #   envsubst '$TRUST_DB_STORAGE_CLASS $TRUST_DB_STORAGE_SIZE' < trust-db.yaml | kubectl apply -f -
-# after creating the Secrets `postgres` (key `password`) and `postgres-tls` (kubernetes.io/tls).
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: alpha-trust-db
----
+# after creating the namespace and the Secrets `postgres` (key `password`) and `postgres-tls`.
 apiVersion: v1
 kind: ConfigMap
 metadata:

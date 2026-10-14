@@ -11,7 +11,7 @@ How a node gets its database password, and why the init-data carries none, is in
 | File | What it is |
 |---|---|
 | `kms-node.yaml` | the node's pod template; the release renders it |
-| `trust-db.yaml` | namespace `alpha-trust-db`, Postgres with TLS and SCRAM only |
+| `trust-db.yaml` | Postgres with TLS and SCRAM only |
 | `migrate.yaml` | `alpha-kms migrate` as the database owner |
 | `kms.yaml` | namespace `alpha-kms` and the node pods' disruption budget |
 | `kms-service.yaml` | one Service per node, `kms-<n>` |
@@ -41,7 +41,6 @@ adds `kata/` to the `alpha-kms-release-manifest` artifact:
 - `pod.yaml`: the pod spec with the init-data in its `io.katacontainers.config.hypervisor.cc_init_data`
   annotation; the file every node pod is created from;
 - `init-data.toml`: the init-data bytes, `[data] app_id` and the agent policy;
-- `init-data.toml.sha256`: their SHA-256 (`sha256sum -c` format);
 - `manifest.json`: `image`, `compose_hash` (`sha256:` of `init-data.toml`, the Revision),
   `rules_sha256` and `policy_data_sha256` (the values of the document's `kata_policy`).
 
@@ -53,8 +52,8 @@ and `init_data`.
 
 ## Signing the Revision
 
-Each release-key holder downloads the artifact, runs `sha256sum -c init-data.toml.sha256`, and
-reads `init-data.toml`: the image is the release's digest, the four `ALPHACOMPUTE_*` values are the
+Each release-key holder downloads the artifact, checks that `sha256sum init-data.toml`
+is `compose_hash` in `manifest.json`, and reads `init-data.toml`: the image is the release's digest, the four `ALPHACOMPUTE_*` values are the
 intended ones and the database URL has no password. The document gets
 `{ "compose_hash": "<manifest.json>", "build": "kms <tag>", "source_url": "<the release>" }` in
 `kms_revisions[]`, `kata_policy` with the two digests from `manifest.json`, and
