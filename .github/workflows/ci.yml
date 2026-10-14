@@ -43,7 +43,8 @@ jobs:
             | tar --zstd -x -C "$kata"
           # shellcheck disable=SC2016
           envsubst '$KMS_IMAGE $KMS_ENDPOINTS $PLATFORM_DOCUMENT_URL $PCCS_URL' < deploy/kata/kms-node.yaml > "$RUNNER_TEMP/kms-node.yaml"
-          target/debug/alpha coco render --app-id 01a09f07-8d09-7640-94c1-bbdb74200a1e --kata "$kata/opt/kata" \
+          # `dev`: the production build refuses the placeholder release key set, which a render never reads.
+          cargo run -q -p alpha-cli --features dev --bin alpha -- coco render --app-id 01a09f07-8d09-7640-94c1-bbdb74200a1e --kata "$kata/opt/kata" \
             --out "$RUNNER_TEMP/out.yaml" "$RUNNER_TEMP/kms-node.yaml" > "$RUNNER_TEMP/rendered.json"
           jq -e --slurpfile pinned testdata/coco/expected.json \
             '.policy_data_sha256 == $pinned[0].policy_data_sha256' "$RUNNER_TEMP/rendered.json"

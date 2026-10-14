@@ -19,7 +19,7 @@ spec:
   - {name: https, port: 8443}
 ---
 # Ready means serving, so a drain never takes the last serving node: that would be an unseal
-# ceremony.
+# ceremony. A sealed node serves nothing, so it may always be evicted.
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
@@ -27,6 +27,7 @@ metadata:
   namespace: alpha-kms
 spec:
   minAvailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow
   selector:
     matchLabels:
       app.kubernetes.io/name: alpha-kms
