@@ -474,7 +474,8 @@ impl Client {
         })
     }
 
-    /// Walks the endpoints: a connection failure or a 5xx moves to the next one, a 4xx is final.
+    /// Walks the endpoints: a connection failure, an unreadable reply or a 5xx moves to the next
+    /// one, a 4xx is final.
     async fn request<T: DeserializeOwned>(
         &self,
         method: Method,
@@ -497,9 +498,13 @@ impl Client {
                 }
             };
             let status = response.status();
-            let bytes = read_capped(response, REPLY_CAP)
-                .await
-                .map_err(|e| Error::Connect(format!("{endpoint}: {e}")))?;
+            let bytes = match read_capped(response, REPLY_CAP).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    last = Error::Connect(format!("{endpoint}: {e}"));
+                    continue;
+                }
+            };
             if status.is_success() {
                 return serde_json::from_slice(&bytes)
                     .map_err(|e| Error::Invalid(format!("{method} {path}: reply: {e}")));
