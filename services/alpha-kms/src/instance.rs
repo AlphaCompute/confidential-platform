@@ -250,7 +250,7 @@ async fn attest_inner(
     let doc = node
         .platform_document()
         .ok_or_else(|| ApiError::new("attestation_unknown", "no platform document"))?;
-    let evidence: InstanceEvidence = serde_json::from_value(request.evidence.clone())
+    let evidence = InstanceEvidence::deserialize(&request.evidence)
         .map_err(|e| ApiError::malformed(format!("evidence: {e}")))?;
     let kata = matches!(evidence, InstanceEvidence::Kata(_));
     let collateral = collateral(node, evidence.quote()).await?;

@@ -36,7 +36,8 @@ async fn run() -> Result<(), String> {
     let release_key = alpha_core::hex_bytes::<32>(RELEASE_KEY_HEX.trim())
         .and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok())
         .ok_or("release-key.pub is not an Ed25519 public key")?;
-    let revision = match Substrate::detect(std::path::Path::new(alpha_tsm::DSTACK_SOCKET)) {
+    let config = Config::from_env()?;
+    let revision = match config.substrate {
         Substrate::Dstack => {
             let event_log = alpha_tsm::event_log().map_err(|e| format!("event log: {e}"))?;
             alpha_attest::event_log_compose_hash(&event_log)
@@ -46,7 +47,7 @@ async fn run() -> Result<(), String> {
     };
     let node = Node::new(
         pool,
-        Config::from_env()?,
+        config,
         Arc::new(SystemTime::now),
         CollateralSource::Pccs(alpha_kms::env("ALPHACOMPUTE_PCCS_URL")?),
         alpha_kms::random().map_err(|e| e.message)?,

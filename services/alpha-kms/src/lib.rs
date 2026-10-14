@@ -44,6 +44,8 @@ use crate::error::ApiError;
 
 /// What the node keeps of its environment; the database and PCCS URLs are consumed on start.
 pub struct Config {
+    /// Read once at start: the substrate the node took its Revision from is the one it quotes on.
+    pub substrate: alpha_tsm::Substrate,
     pub kms_endpoints: Vec<String>,
     pub platform_document_url: String,
     #[cfg(feature = "dev-root")]
@@ -57,6 +59,7 @@ pub fn env(name: &str) -> Result<String, String> {
 impl Config {
     pub fn from_env() -> Result<Self, String> {
         Ok(Self {
+            substrate: alpha_tsm::Substrate::detect(std::path::Path::new(alpha_tsm::DSTACK_SOCKET)),
             kms_endpoints: env("ALPHACOMPUTE_KMS_ENDPOINTS")?
                 .split(',')
                 .map(|s| s.trim().trim_end_matches('/').to_owned())
@@ -176,9 +179,7 @@ impl Node {
 
     /// This node's evidence for `report_data`, quoted now.
     pub fn evidence(&self, report_data: &[u8; 64]) -> Result<InstanceEvidence, ApiError> {
-        let substrate =
-            alpha_tsm::Substrate::detect(std::path::Path::new(alpha_tsm::DSTACK_SOCKET));
-        alpha_tsm::evidence(substrate, report_data)
+        alpha_tsm::evidence(self.config.substrate, report_data)
             .map_err(|e| ApiError::internal(format!("evidence: {e}")))
     }
 

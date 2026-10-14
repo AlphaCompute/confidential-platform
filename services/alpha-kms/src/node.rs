@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use alpha_attest::{InstanceEvidence, report_data};
+use alpha_attest::report_data;
 use alpha_client::tls::PeerCerts;
 use alpha_client::{Client, Identity, JoinRequest, NodeEvidence, Pin, UnsealRequest};
 use alpha_core::{context, signing_digest};
@@ -42,14 +42,8 @@ pub async fn evidence(
     let nonce = decode32("nonce", &query.nonce)?;
     let xwing = node.xwing_key.public();
     let rd = report_data(&node.runtime_spki, &nonce, Some(xwing.as_bytes()));
-    let (format, quote, event_log) = match node.evidence(&rd)? {
-        InstanceEvidence::Dstack(e) => (e.format, e.quote, e.event_log),
-        InstanceEvidence::Kata(e) => (e.format, e.quote, Vec::new()),
-    };
     Ok(Json(NodeEvidence {
-        format,
-        quote: BASE64_URL_SAFE_NO_PAD.encode(quote),
-        event_log,
+        evidence: node.evidence(&rd)?,
         runtime_pubkey: BASE64_URL_SAFE_NO_PAD.encode(&node.runtime_spki),
         xwing_pubkey: xwing,
         compose_hash: node.compose_hash,

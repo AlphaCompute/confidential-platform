@@ -56,8 +56,7 @@ pub fn verify_node(
     }
     let runtime_spki = evidence.runtime_spki().map_err(|e| e.to_string())?;
     evidence
-        .evidence()
-        .map_err(|e| e.to_string())?
+        .evidence
         .appraise(
             nonce,
             &runtime_spki,
@@ -88,8 +87,7 @@ pub async fn attested_node(
     let (evidence, server_spki) = fetch_node_evidence(endpoint, &nonce)
         .await
         .map_err(|e| e.to_string())?;
-    let quote = alpha_client::decode("quote", &evidence.quote).map_err(|e| e.to_string())?;
-    let collateral = alpha_attest::fetch_collateral(pccs_url, &quote)
+    let collateral = alpha_attest::fetch_collateral(pccs_url, evidence.evidence.quote())
         .await
         .map_err(|e| e.to_string())?;
     let identity = verify_node(

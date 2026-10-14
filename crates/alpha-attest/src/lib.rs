@@ -35,18 +35,24 @@ pub const EVIDENCE_FORMAT: &str = "alphacompute-evidence/1";
 pub const KATA_EVIDENCE_FORMAT: &str = "alphacompute-evidence/kata/1";
 pub const RESULT_FORMAT: &str = "alphacompute-attestation-result/1";
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Evidence {
+    /// Absent in the node evidence of a KMS built before Kata nodes.
+    #[serde(default = "dstack_format")]
     pub format: String,
     #[serde(with = "base64url")]
     pub quote: Vec<u8>,
     pub event_log: Vec<EventLogEntry>,
 }
 
+fn dstack_format() -> String {
+    EVIDENCE_FORMAT.into()
+}
+
 /// A Kata pod's evidence is its quote alone: the container cannot read its init-data, and the
 /// quote's `MRCONFIGID` names the Revision.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KataEvidence {
     pub format: String,
@@ -57,7 +63,7 @@ pub struct KataEvidence {
 /// A TD's evidence: a dstack CVM's quote with the event log that replays it, or a Kata pod's
 /// quote alone. `format` decides which, so a Kata quote sent with an event log is malformed
 /// rather than read as dstack evidence.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(untagged)]
 pub enum InstanceEvidence {
     Dstack(Evidence),

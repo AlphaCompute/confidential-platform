@@ -225,6 +225,7 @@ pub async fn start_node(
         serde_json::from_slice(&read(KEYED, "event_log.json")).unwrap();
     let collateral = serde_json::from_slice(&read(collateral_of, "collateral.json")).unwrap();
     let config = Config {
+        substrate: alpha_tsm::Substrate::Dstack,
         kms_endpoints: vec![],
         platform_document_url: release_url.to_owned(),
         #[cfg(feature = "dev-root")]
