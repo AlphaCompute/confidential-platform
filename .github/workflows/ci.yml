@@ -27,10 +27,12 @@ jobs:
       - run: cargo test --workspace
       # genpolicy accepts the KMS StatefulSet, writes the policy for its pods' names, and the
       # policy's data is the one the platform document pins. The image only shapes the container
-      # entries, which the pin leaves out, so any public one renders.
+      # entries, which the pin leaves out, so any public one renders; ghcr.io, as public.ecr.aws
+      # rate-limits anonymous pulls from runners.
       - name: Render the KMS StatefulSet with the release genpolicy
         shell: bash
         env:
+          KMS_IMAGE: ghcr.io/alphacompute/alpha-runtime@sha256:bb7dca63cfd0c44b50e87cc844a3c9eec001c8ded52f404fd476af97ec22dbe7
           KMS_ENDPOINTS: https://kms-0.kms.alpha-kms.svc:8443,https://kms-1.kms.alpha-kms.svc:8443
           PLATFORM_DOCUMENT_URL: https://platform.invalid/document.json
           PCCS_URL: https://pccs.invalid
@@ -39,8 +41,6 @@ jobs:
           mkdir -p "$kata"
           curl -fsSL https://github.com/kata-containers/kata-containers/releases/download/4.0.0/kata-tools-static-4.0.0-amd64.tar.zst \
             | tar --zstd -x -C "$kata"
-          KMS_IMAGE=$(grep -o 'public.ecr.aws/[^ ]*' testdata/coco/pod.yaml)
-          export KMS_IMAGE
           # shellcheck disable=SC2016
           envsubst '$KMS_IMAGE $KMS_ENDPOINTS $PLATFORM_DOCUMENT_URL $PCCS_URL' < deploy/kata/kms-node.yaml > "$RUNNER_TEMP/kms-node.yaml"
           target/debug/alpha coco render --app-id 01a09f07-8d09-7640-94c1-bbdb74200a1e --kata "$kata/opt/kata" \
