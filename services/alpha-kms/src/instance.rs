@@ -85,7 +85,7 @@ pub async fn nonce(State(node): State<Arc<Node>>) -> Result<Json<Value>, ApiErro
 pub struct AttestRequest {
     pub runtime_pubkey: String,
     pub nonce: String,
-    /// [`Evidence`] or, by its `format`, [`KataEvidence`].
+    /// Kept as received, because `evidence_sha256` hashes these bytes; parsed as [`InstanceEvidence`].
     pub evidence: Value,
 }
 
