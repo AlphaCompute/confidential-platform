@@ -11,8 +11,9 @@ bytes can be served from any origin the platform document lists under `signer.or
 A launch whose compose declares Secrets gets one password field per Secret. Each value is read
 once, sealed with `KmsSecretSealer` to a KMS node that proves itself against the platform
 document, and put in its own step, signed by the same passkey that made the first signature; the
-relay sees the value only as the sealed frame, but it does see the signed document with the
-value's unsalted SHA-256, so a short or guessable value can be found by trying candidates. At the KMS the Secret is named `<app_id>.<name>`, so two Apps
+relay sees the value only as the sealed frame. The signed document it also sees commits to 32
+random bytes the page draws for the put and the value, and those bytes travel only inside the
+frame, so the document is no test for a guess. At the KMS the Secret is named `<app_id>.<name>`, so two Apps
 of one organization that declare the same name keep separate values. Every put comes before the
 Revision's registration, because shroud-go refuses puts once a request is approved, and the page
 says "Approved" only after the receipt of every put and of the registration verified.
