@@ -24,7 +24,7 @@ use serde::{Serialize, Serializer};
 const NONCE_OFFSET: usize = 4;
 const NVML: &str = "libnvidia-ml.so.1";
 
-#[derive(Debug, PartialEq, Eq, Serialize)]
+#[derive(Debug, Serialize)]
 pub struct GpuEvidence {
     /// The SPDM `GET_MEASUREMENTS` request and the GPU's signed response.
     #[serde(serialize_with = "base64url")]
@@ -147,11 +147,10 @@ fn check(call: &str, status: c_int) -> Result<(), String> {
 impl Nvml {
     /// NVML for a container given `gpus` GPUs.
     pub fn open(gpus: usize) -> Result<Self, String> {
+        let symbol = |e: libloading::Error| format!("{NVML}: {e}");
         // SAFETY: loading runs the library's initializers; libnvidia-ml is NVIDIA's own library,
         // injected by the container toolkit, and its initializers have no preconditions on us.
-        let library =
-            unsafe { libloading::Library::new(NVML) }.map_err(|e| format!("{NVML}: {e}"))?;
-        let symbol = |e: libloading::Error| format!("{NVML}: {e}");
+        let library = unsafe { libloading::Library::new(NVML) }.map_err(symbol)?;
         // SAFETY: each type is the prototype `nvml.h` declares for the symbol named, and every
         // pointer is copied out only into `Nvml`, which keeps `library` loaded as long as it lives.
         let (init, nvml) = unsafe {

@@ -307,15 +307,6 @@ pub struct AttestEvidence {
     pub gpu: Vec<alpha_nvml::GpuEvidence>,
 }
 
-impl From<InstanceEvidence> for AttestEvidence {
-    fn from(td: InstanceEvidence) -> Self {
-        AttestEvidence {
-            td,
-            gpu: Vec::new(),
-        }
-    }
-}
-
 /// The bytes whose SHA-256 is the Instance's Revision, served on `/v1/identity` once a leaf
 /// names that hash.
 pub enum RevisionText {

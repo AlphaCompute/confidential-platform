@@ -85,7 +85,11 @@ mod tests {
             })
         );
         assert_eq!(
-            serde_json::to_value(AttestEvidence::from(td())).unwrap(),
+            serde_json::to_value(AttestEvidence {
+                td: td(),
+                gpu: Vec::new()
+            })
+            .unwrap(),
             serde_json::to_value(td()).unwrap()
         );
     }
