@@ -27,7 +27,7 @@ const GENPOLICY_SHA256: &str = "4fa1cabd8d6e757c271caa991b889e1c2ccdbbdce58872b8
 const RULES_SHA256: &str = "c3e17ef9f1e8c1accde820774033459580c0fa431056fca2a51283beb9aad1d6";
 const SETTINGS_SHA256: &str = "c7d95bc2e45be20643304cb4915a7ab1a3f070c6b270f685b0f0970faf23d5b1";
 const PATCHED_RULES_SHA256: &str =
-    "c9c220c0730e4577ab2a8fa736aeaaa946c69fa2945ae042248a40c490eebfd9";
+    "bd577f47615b580ec481dc1f5574c55d84f088231851d413897602a36cfc1e50";
 
 /// The upstream rules check neither the image a container pulls, nor that every pinned variable
 /// is set, nor HOSTNAME and the sandbox hostname: the host could swap the image, drop or add
@@ -54,7 +54,7 @@ const RULE_EDITS: [(&str, &str); 7] = [
     ),
     (
         "    i_storage.mount_point == i_mount.source\n",
-        "    i_storage.mount_point == i_mount.source\n    p_mount.source == \"\"\n    startswith(i_mount.source, concat(\"\", [policy_data.common.spath, \"/\"]))\n",
+        "    i_storage.mount_point == i_mount.source\n    i_storage.driver in [\"blk\", \"scsi\"]\n    p_mount.source == \"\"\n    startswith(i_mount.source, concat(\"\", [policy_data.common.spath, \"/\"]))\n",
     ),
     (
         "regex4 =\", regex4)\n    regex.match(regex4, i_mount.source)\n\n    print(\"mount_source_allows 1",
@@ -892,6 +892,14 @@ mod tests {
                 "disk emptyDir bound to the image rootfs",
                 tampered(requests, APP, |r| {
                     mount_source(r, "/run/alpha", "/run/kata-containers/app/rootfs")
+                }),
+            ),
+            (
+                "disk emptyDir bound to an image pulled under the storage path",
+                tampered(requests, APP, |r| {
+                    let image = "/run/kata-containers/sandbox/storage/image";
+                    r["storages"][0]["mount_point"] = image.into();
+                    mount_source(r, "/run/alpha", image)
                 }),
             ),
             (

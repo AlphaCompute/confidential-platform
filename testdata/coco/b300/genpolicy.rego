@@ -1139,6 +1139,7 @@ allow_mount(p_oci, i_mount, i_storages, bundle_id, sandbox_id):= p_index if {
     print("allow_mount 2: i_storage =", i_storage)
 
     i_storage.mount_point == i_mount.source
+    i_storage.driver in ["blk", "scsi"]
     p_mount.source == ""
     startswith(i_mount.source, concat("", [policy_data.common.spath, "/"]))
 
