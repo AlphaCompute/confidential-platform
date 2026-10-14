@@ -16,7 +16,7 @@ pub mod platform;
 pub mod runtime;
 pub mod tls;
 
-use alpha_attest::{AttestationResult, EVIDENCE_FORMAT, EventLogEntry, Evidence, KataEvidence};
+use alpha_attest::{AttestationResult, InstanceEvidence};
 use alpha_core::{
     AppId, ComposeHash, KeyId, OrgId, PrincipalId, SecretId, context, signing_digest,
 };
@@ -168,14 +168,6 @@ pub struct AttestRequest {
     pub evidence: InstanceEvidence,
 }
 
-/// A dstack CVM's quote with the event log that replays it, or a Kata pod's quote alone.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum InstanceEvidence {
-    Dstack(Evidence),
-    Kata(KataEvidence),
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AttestReply {
     pub certificate_chain: Vec<String>,
@@ -256,25 +248,46 @@ pub struct KeyRevoked {
     pub receipt: Option<Value>,
 }
 
-/// `GET /v1/node/evidence`: the quote is base64url, `runtime_pubkey` the P-256 SPKI DER.
+/// `GET /v1/node/evidence`: the node's evidence in the shape an Instance sends, beside
+/// `runtime_pubkey` (the P-256 SPKI DER) and its X-Wing key.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(try_from = "WireNodeEvidence")]
 pub struct NodeEvidence {
-    pub quote: String,
-    pub event_log: Vec<EventLogEntry>,
+    #[serde(flatten)]
+    pub evidence: InstanceEvidence,
     pub runtime_pubkey: String,
     pub xwing_pubkey: PublicKey,
     pub compose_hash: ComposeHash,
 }
 
-impl NodeEvidence {
-    pub fn evidence(&self) -> Result<Evidence, Error> {
-        Ok(Evidence {
-            format: EVIDENCE_FORMAT.into(),
-            quote: decode("quote", &self.quote)?,
-            event_log: self.event_log.clone(),
+/// A node built before Kata nodes names no `format`; its evidence is dstack. Only this reply
+/// gets the default: `/v1/attest` and `join` bodies must name their format.
+#[derive(Deserialize)]
+struct WireNodeEvidence {
+    #[serde(flatten)]
+    evidence: serde_json::Map<String, Value>,
+    runtime_pubkey: String,
+    xwing_pubkey: PublicKey,
+    compose_hash: ComposeHash,
+}
+
+impl TryFrom<WireNodeEvidence> for NodeEvidence {
+    type Error = serde_json::Error;
+
+    fn try_from(mut wire: WireNodeEvidence) -> Result<Self, Self::Error> {
+        wire.evidence
+            .entry("format")
+            .or_insert_with(|| alpha_attest::EVIDENCE_FORMAT.into());
+        Ok(Self {
+            evidence: serde_json::from_value(Value::Object(wire.evidence))?,
+            runtime_pubkey: wire.runtime_pubkey,
+            xwing_pubkey: wire.xwing_pubkey,
+            compose_hash: wire.compose_hash,
         })
     }
+}
 
+impl NodeEvidence {
     pub fn runtime_spki(&self) -> Result<Vec<u8>, Error> {
         decode("runtime_pubkey", &self.runtime_pubkey)
     }
@@ -369,7 +382,7 @@ pub struct UnsealReply {
 #[serde(deny_unknown_fields)]
 pub struct JoinRequest {
     pub nonce: String,
-    pub evidence: Evidence,
+    pub evidence: InstanceEvidence,
     pub xwing_pubkey: PublicKey,
 }
 

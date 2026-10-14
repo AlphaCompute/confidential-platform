@@ -27,7 +27,7 @@ pub mod webauthn;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
-use alpha_attest::{Collateral, EventLogEntry, PlatformDocument};
+use alpha_attest::{Collateral, InstanceEvidence, PlatformDocument};
 use alpha_core::ComposeHash;
 use axum::Router;
 use axum::extract::{Request, State};
@@ -44,6 +44,8 @@ use crate::error::ApiError;
 
 /// What the node keeps of its environment; the database and PCCS URLs are consumed on start.
 pub struct Config {
+    /// Read once at start: the substrate the node took its Revision from is the one it quotes on.
+    pub substrate: alpha_tsm::Substrate,
     pub kms_endpoints: Vec<String>,
     pub platform_document_url: String,
     #[cfg(feature = "dev-root")]
@@ -57,6 +59,7 @@ pub fn env(name: &str) -> Result<String, String> {
 impl Config {
     pub fn from_env() -> Result<Self, String> {
         Ok(Self {
+            substrate: alpha_tsm::Substrate::detect(std::path::Path::new(alpha_tsm::DSTACK_SOCKET)),
             kms_endpoints: env("ALPHACOMPUTE_KMS_ENDPOINTS")?
                 .split(',')
                 .map(|s| s.trim().trim_end_matches('/').to_owned())
@@ -120,7 +123,7 @@ pub struct Node {
     pub runtime_pkcs8: Zeroizing<Vec<u8>>,
     pub runtime_spki: Vec<u8>,
     pub xwing_key: alpha_crypto::PrivateKey,
-    pub event_log: Vec<EventLogEntry>,
+    /// This node's Revision: its compose's in a dstack CVM, its init-data's in a Kata pod.
     pub compose_hash: ComposeHash,
     pub release_key: ed25519_dalek::VerifyingKey,
     pub platform: RwLock<Option<Arc<PlatformDocument>>>,
@@ -136,11 +139,9 @@ impl Node {
         clock: Clock,
         collateral: CollateralSource,
         nonce_key: [u8; 32],
-        event_log: Vec<EventLogEntry>,
+        compose_hash: ComposeHash,
         release_key: ed25519_dalek::VerifyingKey,
     ) -> Result<Arc<Self>, String> {
-        let compose_hash = alpha_attest::event_log_compose_hash(&event_log)
-            .ok_or("the event log carries no compose-hash event")?;
         let runtime_key = SigningKey::from_bytes((&random::<32>().map_err(|e| e.message)?).into())
             .map_err(|e| format!("runtime key: {e}"))?;
         let runtime_spki = runtime_key
@@ -167,7 +168,6 @@ impl Node {
             runtime_pkcs8,
             runtime_spki,
             xwing_key: alpha_crypto::PrivateKey::generate().map_err(|e| e.to_string())?,
-            event_log,
             compose_hash,
             release_key,
             platform: RwLock::new(None),
@@ -175,6 +175,11 @@ impl Node {
             server_cert,
             bucket: Mutex::new((BUCKET_CAPACITY, Instant::now())),
         }))
+    }
+
+    pub fn evidence(&self, report_data: &[u8; 64]) -> Result<InstanceEvidence, ApiError> {
+        alpha_tsm::evidence(self.config.substrate, report_data)
+            .map_err(|e| ApiError::internal(format!("evidence: {e}")))
     }
 
     pub fn now(&self) -> SystemTime {

@@ -21,7 +21,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use alpha_attest::EventLogEntry;
+use alpha_attest::{
+    EVIDENCE_FORMAT, EventLogEntry, Evidence, InstanceEvidence, KATA_EVIDENCE_FORMAT, KataEvidence,
+};
+use alpha_core::ComposeHash;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use dcap_qvl::quote::Quote;
@@ -75,6 +78,60 @@ pub fn quote(report_data: &[u8; 64]) -> Result<Vec<u8>, Error> {
     } else {
         quote_from(socket, report_data)
     }
+}
+
+/// What a TD runs on, and so what it proves itself with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Substrate {
+    /// A dstack CVM: the guest agent quotes, and the event log names the measured compose.
+    Dstack,
+    /// A Kata TDX pod: configfs-tsm quotes, and `MRCONFIGID` names the init-data.
+    Kata,
+}
+
+impl Substrate {
+    /// Dstack exactly when its guest agent's socket exists; anywhere else the quote has to come
+    /// from configfs-tsm, which [`quote`] then uses.
+    pub fn detect(dstack_socket: &Path) -> Self {
+        if dstack_socket.exists() {
+            Substrate::Dstack
+        } else {
+            Substrate::Kata
+        }
+    }
+}
+
+fn kata_evidence(quote: Vec<u8>) -> InstanceEvidence {
+    InstanceEvidence::Kata(KataEvidence {
+        format: KATA_EVIDENCE_FORMAT.into(),
+        quote,
+    })
+}
+
+/// A quote over `report_data`, with the event log as it stands now on dstack, alone in Kata.
+pub fn evidence(substrate: Substrate, report_data: &[u8; 64]) -> Result<InstanceEvidence, Error> {
+    let quote = quote(report_data)?;
+    Ok(match substrate {
+        Substrate::Dstack => InstanceEvidence::Dstack(Evidence {
+            format: EVIDENCE_FORMAT.into(),
+            quote,
+            event_log: event_log()?,
+        }),
+        Substrate::Kata => kata_evidence(quote),
+    })
+}
+
+/// The init-data digest this Kata TD booted with, from the `MRCONFIGID` of a quote it takes of
+/// itself. Read from the hardware rather than configured, so the node's leaf names the Revision a
+/// verifier of its evidence would find.
+pub fn init_data() -> Result<ComposeHash, Error> {
+    let quote = quote(&[0; 64])?;
+    let parsed = Quote::parse(&quote).map_err(|e| Error::Quote(format!("{e:#}")))?;
+    let report = parsed
+        .report
+        .as_td10()
+        .ok_or_else(|| Error::Quote("not a TDX quote".into()))?;
+    alpha_attest::init_data_digest(&report.mr_config_id).map_err(|e| Error::Quote(e.to_string()))
 }
 
 /// A configfs-tsm report entry, removed however the request ends.
@@ -455,6 +512,61 @@ mod tests {
         other[63] ^= 1;
         let error = check_quote(KATA_QUOTE, &other).unwrap_err().to_string();
         assert!(error.contains("not ours"), "{error}");
+    }
+
+    fn kata_testdata(name: &str) -> Vec<u8> {
+        fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../testdata/attest/b300-kata-4.0.0")
+                .join(name),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn kata_evidence_is_the_quote_alone_and_the_kms_appraises_it() {
+        let quote = kata_testdata("k3-app.quote.bin");
+        let body = serde_json::to_value(kata_evidence(quote.clone())).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "format": "alphacompute-evidence/kata/1",
+                "quote": base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(&quote),
+            })
+        );
+
+        let evidence: alpha_attest::KataEvidence = serde_json::from_value(body).unwrap();
+        let doc: alpha_attest::PlatformDocument =
+            serde_json::from_slice(&kata_testdata("platform-document.json")).unwrap();
+        let collateral: alpha_attest::Collateral =
+            serde_json::from_slice(&kata_testdata("collateral.json")).unwrap();
+        let captured_at = String::from_utf8(kata_testdata("captured_at.txt")).unwrap();
+        let now: std::time::SystemTime = chrono::DateTime::parse_from_rfc3339(captured_at.trim())
+            .unwrap()
+            .into();
+        let nonce: [u8; 32] = kata_testdata("nonce.bin").try_into().unwrap();
+        let appraised = alpha_attest::appraise_kata_evidence(
+            &evidence,
+            &nonce,
+            &kata_testdata("runtime_spki.der"),
+            None,
+            &doc,
+            &collateral,
+            now,
+        )
+        .unwrap();
+        let init_data = String::from_utf8(kata_testdata("k3-app.toml")).unwrap();
+        assert_eq!(appraised.compose_hash, alpha_core::compose_hash(&init_data));
+    }
+
+    #[test]
+    fn dstack_is_chosen_by_its_guest_agent_socket_alone() {
+        let socket =
+            std::env::temp_dir().join(format!("alpha-tsm-{}-dstack.sock", tsm_entry_name()));
+        assert_eq!(Substrate::detect(&socket), Substrate::Kata);
+        fs::write(&socket, b"").unwrap();
+        assert_eq!(Substrate::detect(&socket), Substrate::Dstack);
+        fs::remove_file(&socket).unwrap();
     }
 
     #[test]

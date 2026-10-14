@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use alpha_attest::{Collateral, PlatformDocument, appraise};
+use alpha_attest::{Collateral, PlatformDocument};
 use alpha_client::{
     BootstrapBody, BootstrapRequest, Client, NodeEvidence, Pin, UnsealReply, UnsealRequest,
     fetch_node_evidence,
@@ -55,16 +55,17 @@ pub fn verify_node(
         ));
     }
     let runtime_spki = evidence.runtime_spki().map_err(|e| e.to_string())?;
-    appraise(
-        &evidence.evidence().map_err(|e| e.to_string())?,
-        nonce,
-        &runtime_spki,
-        Some(evidence.xwing_pubkey.as_bytes()),
-        doc,
-        collateral,
-        now,
-    )
-    .map_err(|e| format!("{}: {e}", e.code()))?;
+    evidence
+        .evidence
+        .appraise(
+            nonce,
+            &runtime_spki,
+            Some(evidence.xwing_pubkey.as_bytes()),
+            doc,
+            collateral,
+            now,
+        )
+        .map_err(|e| format!("{}: {e}", e.code()))?;
     if server_spki != runtime_spki {
         return Err("server TLS key is not the attested runtime_pubkey".into());
     }
@@ -86,8 +87,7 @@ pub async fn attested_node(
     let (evidence, server_spki) = fetch_node_evidence(endpoint, &nonce)
         .await
         .map_err(|e| e.to_string())?;
-    let quote = evidence.evidence().map_err(|e| e.to_string())?.quote;
-    let collateral = alpha_attest::fetch_collateral(pccs_url, &quote)
+    let collateral = alpha_attest::fetch_collateral(pccs_url, evidence.evidence.quote())
         .await
         .map_err(|e| e.to_string())?;
     let identity = verify_node(
@@ -248,13 +248,16 @@ mod tests {
 
     fn capture() -> Capture {
         let quote = hex::decode(String::from_utf8(read("quote.node.hex")).unwrap().trim()).unwrap();
-        let evidence = NodeEvidence {
-            quote: BASE64_URL_SAFE_NO_PAD.encode(quote),
-            event_log: serde_json::from_slice(&read("event_log.json")).unwrap(),
-            runtime_pubkey: BASE64_URL_SAFE_NO_PAD.encode(read("runtime_spki.der")),
-            xwing_pubkey: PublicKey::try_from(read("node_xwing_pubkey.bin").as_slice()).unwrap(),
-            compose_hash: alpha_core::compose_hash("ignored: the measured one is used"),
-        };
+        // As a node from before Kata answers: no `format`.
+        let xwing = PublicKey::try_from(read("node_xwing_pubkey.bin").as_slice()).unwrap();
+        let evidence: NodeEvidence = serde_json::from_value(json!({
+            "quote": BASE64_URL_SAFE_NO_PAD.encode(quote),
+            "event_log": serde_json::from_slice::<Value>(&read("event_log.json")).unwrap(),
+            "runtime_pubkey": BASE64_URL_SAFE_NO_PAD.encode(read("runtime_spki.der")),
+            "xwing_pubkey": xwing,
+            "compose_hash": alpha_core::compose_hash("ignored: the measured one is used"),
+        }))
+        .unwrap();
         let captured_at = String::from_utf8(read("captured_at.txt")).unwrap();
         let t = chrono::DateTime::parse_from_rfc3339(captured_at.trim()).unwrap();
         Capture {
@@ -308,6 +311,41 @@ mod tests {
         c.doc.kms_revisions.clear();
         let err = verify(&c, &c.evidence, &spki, None).unwrap_err();
         assert!(err.starts_with("attestation_unknown"), "{err}");
+    }
+
+    /// A real Kata quote is appraised as Kata evidence, and one bound to an Instance key
+    /// (no X-Wing half in `report_data`) cannot pass for a node.
+    #[test]
+    fn kata_instance_quote_is_no_node_evidence() {
+        let dir =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/attest/b300-kata-4.0.0");
+        let kata = |name: &str| fs::read(dir.join(name)).unwrap();
+        let spki = kata("runtime_spki.der");
+        let evidence: NodeEvidence = serde_json::from_value(json!({
+            "format": alpha_attest::KATA_EVIDENCE_FORMAT,
+            "quote": BASE64_URL_SAFE_NO_PAD.encode(kata("k3-app.quote.bin")),
+            "runtime_pubkey": BASE64_URL_SAFE_NO_PAD.encode(&spki),
+            "xwing_pubkey": alpha_crypto::PrivateKey::generate().unwrap().public(),
+            "compose_hash": alpha_core::compose_hash("k3"),
+        }))
+        .unwrap();
+        let captured_at = String::from_utf8(kata("captured_at.txt")).unwrap();
+        let err = verify_node(
+            &evidence,
+            &kata("nonce.bin").try_into().unwrap(),
+            &spki,
+            &serde_json::from_slice(&kata("platform-document.json")).unwrap(),
+            None,
+            &serde_json::from_slice(&kata("collateral.json")).unwrap(),
+            chrono::DateTime::parse_from_rfc3339(captured_at.trim())
+                .unwrap()
+                .into(),
+        )
+        .unwrap_err();
+        assert!(
+            err.starts_with("attestation_failed") && err.contains("report_data"),
+            "{err}"
+        );
     }
 
     #[test]

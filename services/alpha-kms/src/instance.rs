@@ -4,10 +4,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use alpha_attest::{
-    AttestationResult, Evidence, KATA_EVIDENCE_FORMAT, KataEvidence, RESULT_FORMAT, Revision,
-    Verdict, appraise, appraise_kata_instance,
-};
+use alpha_attest::{AttestationResult, InstanceEvidence, RESULT_FORMAT, Revision, Verdict};
 use alpha_client::DerivedKey;
 use alpha_client::tls::PeerCerts;
 use alpha_core::{ComposeHash, Signer, context};
@@ -88,7 +85,7 @@ pub async fn nonce(State(node): State<Arc<Node>>) -> Result<Json<Value>, ApiErro
 pub struct AttestRequest {
     pub runtime_pubkey: String,
     pub nonce: String,
-    /// [`Evidence`] or, by its `format`, [`KataEvidence`].
+    /// Kept as received, because `evidence_sha256` hashes these bytes; parsed as [`InstanceEvidence`].
     pub evidence: Value,
 }
 
@@ -253,31 +250,11 @@ async fn attest_inner(
     let doc = node
         .platform_document()
         .ok_or_else(|| ApiError::new("attestation_unknown", "no platform document"))?;
-    let kata = request.evidence.get("format").and_then(Value::as_str) == Some(KATA_EVIDENCE_FORMAT);
-    let appraised = if kata {
-        let evidence: KataEvidence = serde_json::from_value(request.evidence.clone())
-            .map_err(|e| ApiError::malformed(format!("evidence: {e}")))?;
-        let collateral = collateral(node, &evidence.quote).await?;
-        let (appraised, gpu) =
-            appraise_kata_instance(&evidence, &nonce, spki, &doc, &collateral, now)?;
-        // ponytail: no GPU evidence is appraised yet, so a GPU class gets no leaf at all; NRAS
-        // appraisal of the passed-through GPUs lifts this.
-        if gpu {
-            return Err(ApiError::new(
-                "policy_denied",
-                format!(
-                    "runtime class {} passes GPUs through, and GPU evidence is not appraised",
-                    appraised.os_image
-                ),
-            ));
-        }
-        appraised
-    } else {
-        let evidence: Evidence = serde_json::from_value(request.evidence.clone())
-            .map_err(|e| ApiError::malformed(format!("evidence: {e}")))?;
-        let collateral = collateral(node, &evidence.quote).await?;
-        appraise(&evidence, &nonce, spki, None, &doc, &collateral, now)?
-    };
+    let evidence = InstanceEvidence::deserialize(&request.evidence)
+        .map_err(|e| ApiError::malformed(format!("evidence: {e}")))?;
+    let kata = matches!(evidence, InstanceEvidence::Kata(_));
+    let collateral = collateral(node, evidence.quote()).await?;
+    let appraised = evidence.appraise(&nonce, spki, None, &doc, &collateral, now)?;
     let keys = node.intermediates()?;
     // A Revision is measured only in the form it was registered in: a compose through the dstack
     // event log, an init-data through MRCONFIGID.

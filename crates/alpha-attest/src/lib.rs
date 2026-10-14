@@ -35,7 +35,7 @@ pub const EVIDENCE_FORMAT: &str = "alphacompute-evidence/1";
 pub const KATA_EVIDENCE_FORMAT: &str = "alphacompute-evidence/kata/1";
 pub const RESULT_FORMAT: &str = "alphacompute-attestation-result/1";
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Evidence {
     pub format: String,
@@ -46,12 +46,76 @@ pub struct Evidence {
 
 /// A Kata pod's evidence is its quote alone: the container cannot read its init-data, and the
 /// quote's `MRCONFIGID` names the Revision.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KataEvidence {
     pub format: String,
     #[serde(with = "base64url")]
     pub quote: Vec<u8>,
+}
+
+/// A TD's evidence: a dstack CVM's quote with the event log that replays it, or a Kata pod's
+/// quote alone. `format` decides which, so a Kata quote sent with an event log is malformed
+/// rather than read as dstack evidence.
+#[derive(Clone, Debug, Serialize)]
+#[serde(untagged)]
+pub enum InstanceEvidence {
+    Dstack(Evidence),
+    Kata(KataEvidence),
+}
+
+impl<'de> Deserialize<'de> for InstanceEvidence {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let kata = value.get("format").and_then(|f| f.as_str()) == Some(KATA_EVIDENCE_FORMAT);
+        if kata {
+            serde_json::from_value(value).map(Self::Kata)
+        } else {
+            serde_json::from_value(value).map(Self::Dstack)
+        }
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+impl InstanceEvidence {
+    pub fn quote(&self) -> &[u8] {
+        match self {
+            Self::Dstack(e) => &e.quote,
+            Self::Kata(e) => &e.quote,
+        }
+    }
+
+    /// [`appraise`] or [`appraise_kata_evidence`], whichever the evidence's shape calls for.
+    pub fn appraise(
+        &self,
+        nonce: &[u8; 32],
+        runtime_pubkey_spki: &[u8],
+        node_xwing_spki: Option<&[u8]>,
+        doc: &PlatformDocument,
+        collateral: &Collateral,
+        now: SystemTime,
+    ) -> Result<Appraised, AppraisalError> {
+        match self {
+            Self::Dstack(e) => appraise(
+                e,
+                nonce,
+                runtime_pubkey_spki,
+                node_xwing_spki,
+                doc,
+                collateral,
+                now,
+            ),
+            Self::Kata(e) => appraise_kata_evidence(
+                e,
+                nonce,
+                runtime_pubkey_spki,
+                node_xwing_spki,
+                doc,
+                collateral,
+                now,
+            ),
+        }
+    }
 }
 
 mod base64url {
@@ -433,13 +497,8 @@ pub fn appraise(
 
     let compose_hash = event_log::compose_hash(&evidence.event_log)
         .ok_or_else(|| Failed("event log has no compose-hash event".into()))?;
-    if node_xwing_spki.is_some()
-        && !doc
-            .kms_revisions
-            .iter()
-            .any(|r| r.compose_hash == compose_hash)
-    {
-        return Err(Unknown(format!("kms revision {compose_hash}")));
+    if node_xwing_spki.is_some() {
+        kms_revision_listed(doc, compose_hash)?;
     }
 
     Ok(Appraised {
@@ -454,6 +513,17 @@ pub fn appraise(
     })
 }
 
+fn kms_revision_listed(
+    doc: &PlatformDocument,
+    revision: ComposeHash,
+) -> Result<(), AppraisalError> {
+    if doc.kms_revisions.iter().any(|r| r.compose_hash == revision) {
+        Ok(())
+    } else {
+        Err(AppraisalError::Unknown(format!("kms revision {revision}")))
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum InitDataMismatch {
     // A host can drop the init-data annotation and the pod still boots, under the guest image's
@@ -466,11 +536,11 @@ pub enum InitDataMismatch {
 
 /// The [`InitData::digest`](alpha_core::InitData::digest) a Kata TD booted with: Kata's QEMU
 /// copies the init-data's SHA-256 into a zeroed 48-byte `MRCONFIGID`.
-pub fn init_data_digest(quote: &VerifiedQuote) -> Result<ComposeHash, InitDataMismatch> {
-    if quote.mr_config_id == [0; 48] {
+pub fn init_data_digest(mr_config_id: &[u8; 48]) -> Result<ComposeHash, InitDataMismatch> {
+    if mr_config_id == &[0; 48] {
         return Err(InitDataMismatch::Absent);
     }
-    match quote.mr_config_id.split_first_chunk::<32>() {
+    match mr_config_id.split_first_chunk::<32>() {
         Some((digest, tail)) if tail.iter().all(|b| *b == 0) => Ok(ComposeHash::from(*digest)),
         _ => Err(InitDataMismatch::NotSha256),
     }
@@ -514,7 +584,8 @@ pub fn appraise_kata(
         ));
     }
     let reference = kata_reference(&quote, &doc.kata_reference_values)?;
-    let init_data = init_data_digest(&quote).map_err(|e| AppraisalError::Failed(e.to_string()))?;
+    let init_data =
+        init_data_digest(&quote.mr_config_id).map_err(|e| AppraisalError::Failed(e.to_string()))?;
     Ok(KataAppraised {
         runtime_class: reference.runtime_class.clone(),
         gpu: reference.gpu,
@@ -523,26 +594,38 @@ pub fn appraise_kata(
     })
 }
 
-/// [`appraise_kata`] of an Instance's evidence over its runtime key and nonce, in the shape
-/// [`appraise`] gives: the init-data digest is `compose_hash` and the class is `os_image`. The
-/// flag is the class's [`KataReference::gpu`].
-pub fn appraise_kata_instance(
+/// [`appraise_kata`] of a Kata pod's evidence over its runtime key and nonce, in the shape
+/// [`appraise`] gives: the init-data digest is `compose_hash` and the class is `os_image`.
+/// `node_xwing_spki` is `Some` for a KMS node, whose digest must then be in `doc.kms_revisions`.
+pub fn appraise_kata_evidence(
     evidence: &KataEvidence,
     nonce: &[u8; 32],
     runtime_pubkey_spki: &[u8],
+    node_xwing_spki: Option<&[u8]>,
     doc: &PlatformDocument,
     collateral: &Collateral,
     now: SystemTime,
-) -> Result<(Appraised, bool), AppraisalError> {
+) -> Result<Appraised, AppraisalError> {
     if evidence.format != KATA_EVIDENCE_FORMAT {
         return Err(AppraisalError::Unknown(format!(
             "evidence format {:?}",
             evidence.format
         )));
     }
-    let expected = report_data(runtime_pubkey_spki, nonce, None);
+    let expected = report_data(runtime_pubkey_spki, nonce, node_xwing_spki);
     let kata = appraise_kata(&evidence.quote, &expected, doc, collateral, now)?;
-    let appraised = Appraised {
+    // ponytail: no GPU evidence is appraised yet, so a GPU class is refused outright; NRAS
+    // appraisal of the passed-through GPUs lifts this.
+    if kata.gpu {
+        return Err(AppraisalError::PolicyDenied(format!(
+            "runtime class {} passes GPUs through, and GPU evidence is not appraised",
+            kata.runtime_class
+        )));
+    }
+    if node_xwing_spki.is_some() {
+        kms_revision_listed(doc, kata.init_data)?;
+    }
+    Ok(Appraised {
         measured: kata.quote.measured,
         tcb_status: kata.quote.tcb_status,
         advisories: kata.quote.advisories,
@@ -551,8 +634,7 @@ pub fn appraise_kata_instance(
         runtime_pubkey_sha256: sha256_text(runtime_pubkey_spki),
         evidence_sha256: evidence_sha256(evidence)?,
         policy_version: doc.version,
-    };
-    Ok((appraised, kata.gpu))
+    })
 }
 
 fn sha256_text(bytes: &[u8]) -> String {
@@ -680,6 +762,20 @@ mod tests {
             .contains("INTEL-SA-00999")
         );
         assert!(denied("UpToDate", &[], DEBUG).unwrap().contains("debug"));
+    }
+
+    #[test]
+    fn evidence_must_name_its_format() {
+        let parse = |v: serde_json::Value| serde_json::from_value::<InstanceEvidence>(v);
+        assert!(parse(serde_json::json!({ "quote": "AA", "event_log": [] })).is_err());
+        assert!(
+            parse(serde_json::json!({ "format": KATA_EVIDENCE_FORMAT, "quote": "AA", "event_log": [] }))
+                .is_err()
+        );
+        assert!(matches!(
+            parse(serde_json::json!({ "format": KATA_EVIDENCE_FORMAT, "quote": "AA" })),
+            Ok(InstanceEvidence::Kata(_))
+        ));
     }
 
     #[test]

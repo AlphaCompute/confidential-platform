@@ -3,9 +3,9 @@
 
 use std::sync::Arc;
 
-use alpha_attest::{Evidence, appraise, report_data};
+use alpha_attest::report_data;
 use alpha_client::tls::PeerCerts;
-use alpha_client::{Client, Identity, JoinRequest, Pin, UnsealRequest};
+use alpha_client::{Client, Identity, JoinRequest, NodeEvidence, Pin, UnsealRequest};
 use alpha_core::{context, signing_digest};
 use alpha_crypto::{INFO_NODE_BOOTSTRAP, INFO_UNSEAL_SHARE, Sealed};
 use axum::Json;
@@ -38,18 +38,16 @@ pub struct NonceQuery {
 pub async fn evidence(
     State(node): State<Arc<Node>>,
     Query(query): Query<NonceQuery>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Json<NodeEvidence>, ApiError> {
     let nonce = decode32("nonce", &query.nonce)?;
     let xwing = node.xwing_key.public();
     let rd = report_data(&node.runtime_spki, &nonce, Some(xwing.as_bytes()));
-    let quote = alpha_tsm::quote(&rd).map_err(|e| ApiError::internal(format!("quote: {e}")))?;
-    Ok(Json(json!({
-        "quote": BASE64_URL_SAFE_NO_PAD.encode(quote),
-        "event_log": node.event_log,
-        "runtime_pubkey": BASE64_URL_SAFE_NO_PAD.encode(&node.runtime_spki),
-        "xwing_pubkey": xwing,
-        "compose_hash": node.compose_hash,
-    })))
+    Ok(Json(NodeEvidence {
+        evidence: node.evidence(&rd)?,
+        runtime_pubkey: BASE64_URL_SAFE_NO_PAD.encode(&node.runtime_spki),
+        xwing_pubkey: xwing,
+        compose_hash: node.compose_hash,
+    }))
 }
 
 pub use alpha_client::{BootstrapBody, BootstrapRequest};
@@ -262,9 +260,8 @@ async fn join_inner(
     let doc = node
         .platform_document()
         .ok_or_else(|| ApiError::new("attestation_unknown", "no platform document"))?;
-    let collateral = collateral(node, &request.evidence.quote).await?;
-    let appraised = appraise(
-        &request.evidence,
+    let collateral = collateral(node, request.evidence.quote()).await?;
+    let appraised = request.evidence.appraise(
         &nonce,
         spki,
         Some(request.xwing_pubkey.as_bytes()),
@@ -323,16 +320,10 @@ async fn join_via(node: &Node, client: &Client, endpoint: &str) -> Result<(), Ap
     .await?;
     let xwing = node.xwing_key.public();
     let rd = report_data(&node.runtime_spki, &nonce, Some(xwing.as_bytes()));
-    let quote = alpha_tsm::quote(&rd).map_err(|e| ApiError::internal(format!("quote: {e}")))?;
-    let evidence = Evidence {
-        format: alpha_attest::EVIDENCE_FORMAT.into(),
-        quote,
-        event_log: node.event_log.clone(),
-    };
     let reply = client
         .join(&JoinRequest {
             nonce: nonce_text,
-            evidence,
+            evidence: node.evidence(&rd)?,
             xwing_pubkey: xwing,
         })
         .await

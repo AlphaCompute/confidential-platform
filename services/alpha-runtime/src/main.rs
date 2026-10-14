@@ -4,8 +4,9 @@ use std::time::SystemTime;
 
 use alpha_runtime::{
     Config, EXIT_REFUSED, Error, Exit, INIT_DATA_PATH, RevisionText, Runtime, SECRETS_DIR,
-    SOCKET_PATH, Substrate, TLS_PORT, proxy,
+    SOCKET_PATH, TLS_PORT, proxy,
 };
+use alpha_tsm::Substrate;
 use p256::ecdsa::SigningKey;
 use tokio::net::UnixListener;
 
@@ -65,7 +66,9 @@ async fn run() -> Result<Exit, Error> {
         config,
         &key,
         Arc::new(SystemTime::now),
-        alpha_runtime::tsm_evidence(substrate),
+        Arc::new(move |report_data| {
+            alpha_tsm::evidence(substrate, report_data).map_err(|e| e.to_string())
+        }),
         alpha_client::system_time_provider(),
         revision,
     )?;
