@@ -14,7 +14,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
-use crate::{Config, Error};
+use crate::{COMPLETION_TIMEOUT, Config, Error};
 
 /// A verification is trusted for one minute; older than that, the check runs again.
 const VERIFIED_TTL: Duration = Duration::from_secs(60);
@@ -119,6 +119,7 @@ fn pinned_client(spki: &[u8]) -> Result<reqwest::Client, Error> {
         .tls_backend_preconfigured(tls)
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
+        .timeout(COMPLETION_TIMEOUT)
         .build()
         .map_err(|e| Error::internal(format!("forwarding client: {e}")))
 }
@@ -181,26 +182,37 @@ fn check_report(
 }
 
 impl Upstream {
-    pub fn new(config: &Config) -> Result<Self, Error> {
+    /// `None` when every allowlisted model is served by our own model servers.
+    pub fn new(config: &Config) -> Result<Option<Self>, Error> {
         Self::build(config, Arc::new(SystemTime::now), REPORT_TIMEOUT)
     }
 
     /// `now` and `report_timeout` are injected so tests never wait out a real clock or a real
     /// network timeout.
-    pub fn build(config: &Config, now: Clock, report_timeout: Duration) -> Result<Self, Error> {
+    pub fn build(
+        config: &Config,
+        now: Clock,
+        report_timeout: Duration,
+    ) -> Result<Option<Self>, Error> {
+        let Some(external) = &config.external else {
+            return Ok(None);
+        };
         let slots = config
-            .models
-            .iter()
+            .external_models()
             .map(|model| (model.clone(), Mutex::new(None)))
             .collect();
-        Ok(Self {
-            upstream_url: config.upstream_url.clone(),
-            pccs_url: config.pccs_url.clone(),
-            policy: config.upstream_policy.clone(),
+        Ok(Some(Self {
+            upstream_url: external.upstream_url.clone(),
+            pccs_url: external.pccs_url.clone(),
+            policy: external.upstream_policy.clone(),
             slots,
             report_client: unpinned_client(report_timeout)?,
             now,
-        })
+        }))
+    }
+
+    pub fn url(&self) -> &str {
+        &self.upstream_url
     }
 
     /// A client pinned to `model`'s attested key, checked within the last minute — running
@@ -437,7 +449,9 @@ mod tests {
         now: SystemTime,
     ) -> Upstream {
         let clock: Clock = Arc::new(move || now);
-        Upstream::build(&test_config(upstream_url, models), clock, report_timeout).unwrap()
+        Upstream::build(&test_config(upstream_url, models), clock, report_timeout)
+            .unwrap()
+            .unwrap()
     }
 
     #[tokio::test]
@@ -528,8 +542,9 @@ mod tests {
             let cell = clock_cell.clone();
             Arc::new(move || *cell.lock())
         };
-        let upstream =
-            Upstream::build(&test_config(&base, &["m1"]), clock, Duration::from_secs(5)).unwrap();
+        let upstream = Upstream::build(&test_config(&base, &["m1"]), clock, Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
         *upstream.slots.get("m1").unwrap().lock().await = Some(Checked {
             at: start,
             outcome: Ok(pinned_client(&[7u8; 32]).unwrap()),
@@ -719,7 +734,15 @@ mod tests {
             b"the-callers-bearer",
             "the-provider-key",
         );
-        *state.upstream.slots.get("m1").unwrap().lock().await = Some(Checked {
+        *state
+            .upstream
+            .as_ref()
+            .unwrap()
+            .slots
+            .get("m1")
+            .unwrap()
+            .lock()
+            .await = Some(Checked {
             at: SystemTime::now(),
             outcome: Ok(pinned_client(&spki).unwrap()),
         });
