@@ -348,7 +348,14 @@ async fn sign_and_check_feed_the_node_and_the_admin_pin() {
     document["kms_ca_pem"] = json!(h.ca_pem);
     let compose = String::from_utf8(read(KEYED, "app-compose.json")).unwrap();
     let keys = h.release.key.verifying_key().into();
-    let artifact = sign::sign(document.clone(), &h.release.key, &keys, &[compose], &[]).unwrap();
+    let artifact = sign::sign(
+        sign::artifact(document.clone()).unwrap(),
+        &h.release.key,
+        &keys,
+        &[compose],
+        &[],
+    )
+    .unwrap();
     let summary = sign::check(&artifact, &keys, h.now()).unwrap();
     let ca_der = h.node.intermediates().unwrap().ca_cert_der.clone();
     assert_eq!(

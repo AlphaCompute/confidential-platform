@@ -11,20 +11,18 @@ use ed25519_dalek::SigningKey;
 use serde::Serialize;
 use serde_json::Value;
 
-/// A bare document starts a new artifact; an artifact gets one more signature, and every
-/// signature already on it must be by a distinct key of the set. Signing garbage is refused: the
-/// document must already be a platform document. Every `kms_revisions` entry must be one of the
-/// supplied node Revisions, a dstack compose or a Kata init-data; the KMS sees only a Kata node's
-/// digest, so its init-data must pass the document's own `kata_policy` here, as a tenant's does at
-/// registration.
+/// One more signature on the artifact; every signature already on it must be by a distinct key of
+/// the set. Signing garbage is refused: the document must already be a platform document. Every
+/// `kms_revisions` entry must be one of the supplied node Revisions, a dstack compose or a Kata
+/// init-data; the KMS sees only a Kata node's digest, so its init-data must pass the document's
+/// own `kata_policy` here, as a tenant's does at registration.
 pub fn sign(
-    input: Value,
+    mut artifact: SignedDocument,
     key: &SigningKey,
     keys: &ReleaseKeys,
     composes: &[String],
     init_data: &[String],
 ) -> Result<SignedDocument, String> {
-    let mut artifact = artifact(input)?;
     let doc = serde_json::from_value::<PlatformDocument>(artifact.document.clone())
         .map_err(|e| format!("document: {e}"))?;
     let mut supplied = Vec::new();
@@ -191,7 +189,7 @@ mod tests {
         let compose = ["{}".to_owned()];
         assert!(
             sign(
-                json!({"version": 1}),
+                artifact(json!({"version": 1})).unwrap(),
                 &key,
                 &key.verifying_key().into(),
                 &compose,
@@ -199,7 +197,14 @@ mod tests {
             )
             .is_err()
         );
-        let artifact = sign(document, &key, &key.verifying_key().into(), &compose, &[]).unwrap();
+        let artifact = sign(
+            artifact(document).unwrap(),
+            &key,
+            &key.verifying_key().into(),
+            &compose,
+            &[],
+        )
+        .unwrap();
         let summary = check(&artifact, &key.verifying_key().into(), SystemTime::now()).unwrap();
         assert_eq!(
             summary,
@@ -234,7 +239,7 @@ mod tests {
         let compose = ["{}".to_owned()];
         assert!(
             sign(
-                document.clone(),
+                artifact(document.clone()).unwrap(),
                 &key,
                 &key.verifying_key().into(),
                 &compose,
@@ -243,7 +248,16 @@ mod tests {
             .is_ok()
         );
         document["signer"]["origins"][0] = json!("https://sign.example/path");
-        assert!(sign(document, &key, &key.verifying_key().into(), &compose, &[]).is_err());
+        assert!(
+            sign(
+                artifact(document).unwrap(),
+                &key,
+                &key.verifying_key().into(),
+                &compose,
+                &[]
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -260,7 +274,7 @@ mod tests {
         let init_data = [k3.to_owned()];
         assert!(
             sign(
-                document.clone(),
+                artifact(document.clone()).unwrap(),
                 &key,
                 &key.verifying_key().into(),
                 &[],
@@ -270,7 +284,7 @@ mod tests {
         );
 
         let err = sign(
-            document.clone(),
+            artifact(document.clone()).unwrap(),
             &key,
             &key.verifying_key().into(),
             &[],
@@ -279,7 +293,7 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("no compose or init-data"), "{err}");
         let err = sign(
-            document.clone(),
+            artifact(document.clone()).unwrap(),
             &key,
             &key.verifying_key().into(),
             &init_data,
@@ -289,7 +303,14 @@ mod tests {
         assert!(err.starts_with("compose:"), "{err}");
 
         document["kata_policy"]["rules_sha256"] = json!(format!("sha256:{}", "0".repeat(64)));
-        let err = sign(document, &key, &key.verifying_key().into(), &[], &init_data).unwrap_err();
+        let err = sign(
+            artifact(document).unwrap(),
+            &key,
+            &key.verifying_key().into(),
+            &[],
+            &init_data,
+        )
+        .unwrap_err();
         assert!(err.contains("not the pinned rules"), "{err}");
     }
 
@@ -309,9 +330,8 @@ mod tests {
             "reference_values": [], "kms_ca_pem": "",
             "kms_revisions": [{ "compose_hash": hash, "build": "b", "source_url": "u" }]
         });
-        let half = sign(v1.clone(), &a, &keys, &compose, &[]).unwrap();
+        let half = sign(artifact(v1.clone()).unwrap(), &a, &keys, &compose, &[]).unwrap();
         assert!(check(&half, &keys, SystemTime::now()).is_err());
-        let half = serde_json::to_value(&half).unwrap();
         assert!(sign(half.clone(), &a, &keys, &compose, &[]).is_err());
         let stranger = SigningKey::from_bytes(&[4u8; 32]);
         assert!(sign(half.clone(), &stranger, &keys, &compose, &[]).is_err());

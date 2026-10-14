@@ -1331,7 +1331,7 @@ mod tests {
         let pem = ca.cert.pem();
         let compose = ["{}".to_owned()];
         let artifact = crate::sign::sign(
-            document(&pem),
+            crate::sign::artifact(document(&pem)).unwrap(),
             &key,
             &key.verifying_key().into(),
             &compose,
@@ -1352,7 +1352,7 @@ mod tests {
         assert!(runtime(&artifact, &other.verifying_key().into(), now, &image).is_err());
 
         let day0 = crate::sign::sign(
-            document(""),
+            crate::sign::artifact(document("")).unwrap(),
             &key,
             &key.verifying_key().into(),
             &compose,

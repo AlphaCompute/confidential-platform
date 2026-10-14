@@ -6,9 +6,7 @@ use std::time::SystemTime;
 
 use alpha_attest::PlatformDocument;
 
-pub use alpha_channel::platform::{
-    ReleaseKeys, SignedDocument, count_signatures, release_keys, sign,
-};
+pub use alpha_channel::platform::{ReleaseKeys, SignedDocument, count_signatures, sign};
 
 use crate::Error;
 

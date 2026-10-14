@@ -482,16 +482,12 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 None => None,
             };
             let keys = alpha_cli::release_keys()?;
-            let changes = sign::diff(
-                previous.as_ref(),
-                &sign::artifact(document.clone())?.document,
-                &keys,
-                now,
-            )?;
+            let artifact = sign::artifact(document)?;
+            let changes = sign::diff(previous.as_ref(), &artifact.document, &keys, now)?;
             eprintln!("changes against the previous version:\n{changes}");
             let key = read_ed25519(&need(release_key, "release-key")?)?;
             Ok(json!(sign::sign(
-                document, &key, &keys, &compose, &init_data
+                artifact, &key, &keys, &compose, &init_data
             )?))
         }
         Command::Deploy {
