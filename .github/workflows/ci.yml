@@ -77,7 +77,9 @@ jobs:
               --out "$RUNNER_TEMP/out-$template" "$RUNNER_TEMP/$template" > "$RUNNER_TEMP/$template.json" < /dev/null
             jq -e --slurpfile pinned testdata/coco/expected.json \
               '.policy_data_sha256 == $pinned[0].policy_data_sha256' "$RUNNER_TEMP/$template.json"
-            jq -r .init_data "$RUNNER_TEMP/$template.json" | grep -qF "\"io.kubernetes.cri.sandbox-name\": \"$pods\""
+            # No `| grep -q`: grep exits at the first match and pipefail fails on jq's broken pipe.
+            jq -e --arg pods "\"io.kubernetes.cri.sandbox-name\": \"$pods\"" '.init_data | contains($pods)' \
+              "$RUNNER_TEMP/$template.json"
           done <<EOF
           kms-node.yaml ^kms-[0-9]+$
           inference.yaml ^inference-$generated-$generated$
