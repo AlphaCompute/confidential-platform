@@ -191,10 +191,7 @@ mod tests {
             (T1.replace("algorithm = \"sha256\"\n", ""), "TOML"),
             (format!("algorithm = \"sha256\"\n{T1}"), "TOML"),
             ("not toml".into(), "TOML"),
-            (
-                format!("{T1}#{}\n", " ".repeat(MAX_INIT_DATA)),
-                "bytes or more",
-            ),
+            (" ".repeat(MAX_INIT_DATA), "bytes or more"),
         ];
         for (toml, fragment) in cases {
             let err = InitData::parse(toml.clone()).unwrap_err().to_string();
