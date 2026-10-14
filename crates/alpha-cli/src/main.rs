@@ -411,19 +411,15 @@ async fn platform_document(config: &Config, now: SystemTime) -> Result<PlatformD
         "platform-document-url",
     )?;
     let doc = alpha_client::platform::fetch(url, &alpha_cli::release_keys()?, now).await?;
-    remember_platform(config, &doc, now)?;
-    Ok(doc)
-}
-
-fn remember_platform(config: &Config, doc: &PlatformDocument, now: SystemTime) -> Result<(), Exit> {
     alpha_cli::freshness::remember(
         need(config.platform_state.as_deref(), "platform-state")?,
-        doc,
+        &doc,
         need(config.platform_min_version, "platform-min-version")?,
         config.platform_max_age_seconds,
         now,
     )
-    .map_err(Exit::Refused)
+    .map_err(Exit::Refused)?;
+    Ok(doc)
 }
 
 /// The admin's pin: `kms_ca_pem` of the platform document fetched and verified now.
@@ -518,9 +514,6 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 let artifact: SignedDocument = serde_json::from_value(document)
                     .map_err(|e| Exit::Refused(format!("artifact: {e}")))?;
                 let summary = sign::check(&artifact, &alpha_cli::release_keys()?, now)?;
-                let verified =
-                    alpha_client::platform::verify(&artifact, &alpha_cli::release_keys()?, now)?;
-                remember_platform(config, &verified, now)?;
                 return Ok(json!(summary));
             }
             let read = |paths: Vec<PathBuf>| {
