@@ -36,12 +36,12 @@ fn to_json(value: &impl serde::Serialize) -> Result<String, JsError> {
 
 /// `{version, issued_at, kms_ca_pem, kms_revisions}`, plus `signer`, `catalog_key` and
 /// `kata_policy` when the document has them, of a platform document that verifies under the
-/// release key compiled into this package.
+/// release key set compiled into this package.
 #[wasm_bindgen(js_name = verifyPlatform)]
 pub fn verify_platform(signed_json: &str, now_ms: f64) -> Result<String, JsError> {
     let signed: platform::SignedDocument = parse("platform document", signed_json)?;
-    let key = platform::release_key().map_err(js)?;
-    to_json(&platform::verify(&signed, &key, at(now_ms)?).map_err(js)?)
+    let keys = platform::release_keys().map_err(js)?;
+    to_json(&platform::verify(&signed, &keys, at(now_ms)?).map_err(js)?)
 }
 
 /// The response the KMS signed, which callers use instead of the reply's top-level fields.

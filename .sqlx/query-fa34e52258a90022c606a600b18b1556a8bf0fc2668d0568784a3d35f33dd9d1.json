@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select document, signature from platform_document",
+  "query": "select document, signatures from platform_document",
   "describe": {
     "columns": [
       {
@@ -16,12 +16,12 @@
       },
       {
         "ordinal": 1,
-        "name": "signature",
-        "type_info": "Bytea",
+        "name": "signatures",
+        "type_info": "Jsonb",
         "origin": {
           "Table": {
             "table": "platform_document",
-            "name": "signature"
+            "name": "signatures"
           }
         }
       }
@@ -31,8 +31,8 @@
     },
     "nullable": [
       false,
-      false
+      true
     ]
   },
-  "hash": "0b283506407886ea60517d302d217bbf9629854dee65978de25ba9c878743bce"
+  "hash": "fa34e52258a90022c606a600b18b1556a8bf0fc2668d0568784a3d35f33dd9d1"
 }

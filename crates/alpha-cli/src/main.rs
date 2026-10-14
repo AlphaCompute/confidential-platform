@@ -114,13 +114,17 @@ enum Command {
         #[arg(long, default_value = "root key")]
         label: String,
     },
-    /// Sign a platform document with the release key, or check a signed artifact.
+    /// Add one release signature to a platform document or its artifact, or check an artifact.
     Sign {
         #[arg(long, conflicts_with = "check", required_unless_present = "check")]
         release_key: Option<PathBuf>,
-        /// Verify with the compiled-in key and print version, CA SPKI hash and Revisions.
+        /// Verify with the compiled-in key set and print version, CA SPKI hash and Revisions.
         #[arg(long)]
         check: bool,
+        /// The published artifact this version replaces; the changes against it are shown on
+        /// stderr before the passphrase is asked.
+        #[arg(long, conflicts_with = "check")]
+        previous: Option<PathBuf>,
         /// A dstack node's `app-compose.json`; one per such `kms_revisions` entry.
         #[arg(long, conflicts_with = "check")]
         compose: Vec<PathBuf>,
@@ -228,7 +232,7 @@ enum ComposeCommand {
         #[arg(long)]
         app_id: AppId,
         /// The signed platform document, as `alpha sign --check` reads it; the KMS pins come from
-        /// it once it verifies under the compiled-in release key.
+        /// it once it verifies under the compiled-in release key set.
         #[arg(long)]
         platform: PathBuf,
         /// The `alpha-runtime` image, pinned as `<image>@sha256:<digest>`.
@@ -366,7 +370,7 @@ async fn platform_document(config: &Config, now: SystemTime) -> Result<PlatformD
         config.platform_document_url.as_deref(),
         "platform-document-url",
     )?;
-    Ok(alpha_client::platform::fetch(url, &alpha_cli::release_key()?, now).await?)
+    Ok(alpha_client::platform::fetch(url, &alpha_cli::release_keys()?, now).await?)
 }
 
 /// The admin's pin: `kms_ca_pem` of the platform document fetched and verified now.
@@ -451,6 +455,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
         Command::Sign {
             release_key,
             check,
+            previous,
             compose,
             init_data,
             document,
@@ -459,7 +464,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             if check {
                 let artifact: SignedDocument = serde_json::from_value(document)
                     .map_err(|e| Exit::Refused(format!("artifact: {e}")))?;
-                let summary = sign::check(&artifact, &alpha_cli::release_key()?, now)?;
+                let summary = sign::check(&artifact, &alpha_cli::release_keys()?, now)?;
                 return Ok(json!(summary));
             }
             let read = |paths: Vec<PathBuf>| {
@@ -472,8 +477,18 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                     .collect::<Result<Vec<_>, _>>()
             };
             let (compose, init_data) = (read(compose)?, read(init_data)?);
+            let previous = match previous {
+                Some(path) => Some(sign::artifact(read_json(&path)?)?),
+                None => None,
+            };
+            let keys = alpha_cli::release_keys()?;
+            let artifact = sign::artifact(document)?;
+            let changes = sign::diff(previous.as_ref(), &artifact.document, &keys, now)?;
+            eprintln!("changes against the previous version:\n{changes}");
             let key = read_ed25519(&need(release_key, "release-key")?)?;
-            Ok(json!(sign::sign(document, &key, &compose, &init_data)?))
+            Ok(json!(sign::sign(
+                artifact, &key, &keys, &compose, &init_data
+            )?))
         }
         Command::Deploy {
             register_only,
@@ -540,7 +555,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let artifact: SignedDocument = serde_json::from_value(read_json(&platform)?)
                 .map_err(|e| Exit::Refused(format!("artifact: {e}")))?;
             let runtime =
-                wrap::runtime(&artifact, &alpha_cli::release_key()?, now, &runtime_image)?;
+                wrap::runtime(&artifact, &alpha_cli::release_keys()?, now, &runtime_image)?;
             let digests = if no_resolve {
                 BTreeMap::new()
             } else {

@@ -261,7 +261,7 @@ pub async fn start_node_on(
         CollateralSource::Fixed(Box::new(collateral)),
         nonce_key(),
         alpha_attest::event_log_compose_hash(&event_log).unwrap(),
-        release_key.verifying_key(),
+        release_key.verifying_key().into(),
     )
     .unwrap();
     platform::start(&node).await;

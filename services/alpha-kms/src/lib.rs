@@ -128,7 +128,7 @@ pub struct Node {
     pub xwing_key: alpha_crypto::PrivateKey,
     /// This node's Revision: its compose's in a dstack CVM, its init-data's in a Kata pod.
     pub compose_hash: ComposeHash,
-    pub release_key: ed25519_dalek::VerifyingKey,
+    pub release_keys: alpha_client::platform::ReleaseKeys,
     pub platform: RwLock<Option<Arc<PlatformDocument>>>,
     pub phase: RwLock<Phase>,
     pub server_cert: Arc<tls::ServerCert>,
@@ -145,7 +145,7 @@ impl Node {
         collateral: CollateralSource,
         nonce_key: [u8; 32],
         compose_hash: ComposeHash,
-        release_key: ed25519_dalek::VerifyingKey,
+        release_keys: alpha_client::platform::ReleaseKeys,
     ) -> Result<Arc<Self>, String> {
         let database_password = config.database_password.take();
         let runtime_key = SigningKey::from_bytes((&random::<32>().map_err(|e| e.message)?).into())
@@ -175,7 +175,7 @@ impl Node {
             runtime_spki,
             xwing_key: alpha_crypto::PrivateKey::generate().map_err(|e| e.to_string())?,
             compose_hash,
-            release_key,
+            release_keys,
             platform: RwLock::new(None),
             phase: RwLock::new(Phase::Sealed { shares: Vec::new() }),
             server_cert,
