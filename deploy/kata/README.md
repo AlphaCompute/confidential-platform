@@ -77,6 +77,7 @@ custodians have run `alpha keygen --custodian` and handed over their public keys
    verify it, but bind their SCRAM login to the TLS connection, so a relay in between fails.
 
    ```sh
+   umask 077   # the password files and tls.key; keep this shell for step 4
    kubectl create namespace alpha-trust-db
    openssl rand -hex 32 > owner-password
    kubectl -n alpha-trust-db create secret generic postgres --from-file=password=owner-password
@@ -164,8 +165,9 @@ through the nodes' API and the database.
 - The genesis password is dead; this login is refused:
 
   ```sh
-  kubectl -n alpha-trust-db exec postgres-0 -- env PGPASSWORD="$(cat genesis-db-password)" \
-    psql -X "host=localhost dbname=alpha user=alpha_kms_node sslmode=require" -c 'select 1'
+  kubectl -n alpha-trust-db exec -i postgres-0 -- sh -c 'IFS= read -r PGPASSWORD; export PGPASSWORD
+    exec psql -X "host=localhost dbname=alpha user=alpha_kms_node sslmode=require" -c "select 1"' \
+    < genesis-db-password
   ```
 - The audit log has the genesis and one join per other node:
   `select ts, action, outcome from audit_log where actor_kind = 'node' order by seq;` as `postgres`
