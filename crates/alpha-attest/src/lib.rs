@@ -14,6 +14,7 @@
 )]
 
 mod event_log;
+mod gpu;
 
 use std::fmt;
 use std::str::FromStr;
@@ -30,6 +31,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 pub use event_log::{EventLogEntry, compose_hash as event_log_compose_hash};
+pub use gpu::{GpuEvidence, GpuReference, appraise_gpus};
 
 pub const EVIDENCE_FORMAT: &str = "alphacompute-evidence/1";
 pub const KATA_EVIDENCE_FORMAT: &str = "alphacompute-evidence/kata/1";
@@ -44,14 +46,16 @@ pub struct Evidence {
     pub event_log: Vec<EventLogEntry>,
 }
 
-/// A Kata pod's evidence is its quote alone: the container cannot read its init-data, and the
-/// quote's `MRCONFIGID` names the Revision.
+/// A Kata pod's evidence is its quote, plus one evidence per GPU it passes through: the
+/// container cannot read its init-data, and the quote's `MRCONFIGID` names the Revision.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KataEvidence {
     pub format: String,
     #[serde(with = "base64url")]
     pub quote: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gpu: Vec<GpuEvidence>,
 }
 
 /// A TD's evidence: a dstack CVM's quote with the event log that replays it, or a Kata pod's
@@ -619,6 +623,12 @@ pub fn appraise_kata_evidence(
     if kata.gpu {
         return Err(AppraisalError::PolicyDenied(format!(
             "runtime class {} passes GPUs through, and GPU evidence is not appraised",
+            kata.runtime_class
+        )));
+    }
+    if !evidence.gpu.is_empty() {
+        return Err(AppraisalError::Failed(format!(
+            "runtime class {} passes no GPU through, and the evidence carries GPU evidence",
             kata.runtime_class
         )));
     }

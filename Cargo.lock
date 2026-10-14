@@ -58,11 +58,13 @@ dependencies = [
  "chrono",
  "dcap-qvl",
  "hex",
+ "p384 0.14.0",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "thiserror",
  "tokio",
+ "x509-parser",
 ]
 
 [[package]]
@@ -1208,7 +1210,7 @@ dependencies = [
  "ecdsa 0.16.9",
  "ed25519-dalek 2.2.0",
  "p256 0.13.2",
- "p384",
+ "p384 0.13.1",
  "ring",
  "rsa",
  "rustls-pki-types",
@@ -2793,6 +2795,20 @@ dependencies = [
  "elliptic-curve 0.13.8",
  "primeorder 0.13.6",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "p384"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d17b851e6b3e378ab4ecb07fa2ed23f4d15f075735f8fec9fa1e7bdce5f8301f"
+dependencies = [
+ "ecdsa 0.17.0",
+ "elliptic-curve 0.14.1",
+ "fiat-crypto 0.3.0",
+ "primefield",
+ "primeorder 0.14.0",
+ "sha2 0.11.0",
 ]
 
 [[package]]
