@@ -44,5 +44,7 @@ zeroize = "1"
 alpha-channel = { path = "../alpha-channel", features = ["dev"] }
 axum = { version = "0.8", default-features = false }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
+# The engine and features the Kata 4.0.0 agent evaluates its policy with (src/agent/policy).
+regorus = { git = "https://github.com/microsoft/regorus", rev = "898643129e3652efd43e596f978d99f85e770235", default-features = false, features = ["arc", "base64", "base64url", "regex", "std"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
