@@ -232,15 +232,18 @@ The put then goes to `PUT /v1/secrets/<name>` as:
 ```
 
 The frame is one request frame on `PUT /v1/secrets/<name>` with `seq` 0. Its plaintext is the
-32-byte digest `SHA-256("alphacompute/secret/v1" ‖ 0x00 ‖ JCS(payload))`, the same digest the put's
-signature covers, then the 16 bytes of the organization id, then the value. The node refuses the
+32-byte digest `SHA-256("alphacompute/secret/v2" ‖ 0x00 ‖ JCS(payload))`, the same digest the put's
+signature covers, then the 16 bytes of the organization id, then the salted value: 32 random bytes
+the page draws for this put, then the value. The node refuses the
 put as `malformed` when the digest is not its own digest of the received payload, or when the
 organization is not the one the signing key belongs to. The digest keeps the value from travelling
 in a put with any other payload. The payload names no organization, so a relay holding a key of its
 own could sign the very same payload; the organization id is what keeps it from storing the value
 in its own organization, whether or not the granted Apps have a Revision yet. The path in the
-frame's associated data binds the value to its name. `content_sha256` stays the SHA-256 of the
-value alone. The reply is plain JSON with a receipt, whose `response` includes `org_id`.
+frame's associated data binds the value to its name. `content_sha256` is the SHA-256 of the
+salted value, so the signed document the KMS stores is no test for a guess at a weak value; an
+Instance receives the value without the salt. The reply is plain JSON with a receipt, whose
+`response` includes `org_id`.
 
 The node keeps no record of the frame. A replayed put is stopped by the put's own `issued_at` rule:
 a put no newer than the stored Secret is refused as `already_exists`.

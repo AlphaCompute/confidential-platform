@@ -475,7 +475,7 @@ impl Harness {
     ) -> (StatusCode, Value) {
         let payload = put_payload(name, app_ids, value, issued_at);
         let mut body = self.signed(context::SECRET, payload, signer);
-        body["value"] = json!(b64(value));
+        body["value"] = json!(b64(&salted(value)));
         self.call(reqwest::Method::PUT, &format!("/v1/secrets/{name}"), body)
             .await
     }
@@ -492,7 +492,7 @@ impl Harness {
         signer: &(KeyId, SigningKey),
     ) -> Value {
         let payload = put_payload(name, app_ids, value, issued_at);
-        let sealed = self.sealed(&payload, self.org, value).await;
+        let sealed = self.sealed(&payload, self.org, &salted(value)).await;
         let mut body = self.signed(context::SECRET, payload, signer);
         body["sealed"] = sealed;
         body
@@ -583,9 +583,14 @@ pub fn webauthn_vector() -> Value {
         .unwrap()
 }
 
+/// What a put carries for `value`: a salt, fixed here, then the value.
+pub fn salted(value: &[u8]) -> Vec<u8> {
+    [[0x5a; alpha_core::SECRET_SALT_LEN].as_slice(), value].concat()
+}
+
 pub fn put_payload(name: &str, app_ids: &[AppId], value: &[u8], issued_at: SystemTime) -> Value {
     json!({ "name": name, "app_ids": app_ids,
-            "content_sha256": format!("sha256:{}", hex::encode(Sha256::digest(value))),
+            "content_sha256": format!("sha256:{}", hex::encode(Sha256::digest(salted(value)))),
             "issued_at": rfc3339(issued_at) })
 }
 

@@ -86,7 +86,7 @@ fn put_body(
         put_payload(name, app_ids, value, issued_at),
         Some(signer.0),
     );
-    body["value"] = json!(b64(value));
+    body["value"] = json!(b64(&salted(value)));
     body
 }
 
@@ -277,7 +277,7 @@ async fn a_second_passkey_signs_every_control_route() {
     );
 
     let payload = put_payload("passkey-sealed", &[app], b"sealed", h.now());
-    let sealed = h.sealed(&payload, org, b"sealed").await;
+    let sealed = h.sealed(&payload, org, &salted(b"sealed")).await;
     let mut body = by_admin(context::SECRET, payload);
     body["sealed"] = sealed;
     let (status, reply) = put(&h, "passkey-sealed", body.clone()).await;
@@ -524,7 +524,7 @@ async fn another_organizations_passkey_or_a_grafted_link_does_not_sign() {
         put_payload("across", &[app], b"refused", h.now()),
         Some(y.root.0),
     );
-    body["value"] = json!(b64(b"refused"));
+    body["value"] = json!(b64(&salted(b"refused")));
     refused(put(&h, "across", body).await, "signature_invalid");
 
     // Would pass if the chain walk stopped verifying each link's registration under its parent.

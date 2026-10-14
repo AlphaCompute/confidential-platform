@@ -144,6 +144,15 @@ function random(n) {
   return crypto.getRandomValues(new Uint8Array(n));
 }
 
+// A put commits to 32 random bytes and the value, so the stored document is no test for a guess.
+function salted(value) {
+  const out = new Uint8Array(32 + value.length);
+  out.set(random(32));
+  out.set(value, 32);
+  value.fill(0);
+  return out;
+}
+
 function equalBytes(a, b) {
   return a.length === b.length && a.every((x, i) => x === b[i]);
 }
@@ -898,7 +907,7 @@ function secretFields(services, before) {
 function takeValues(a) {
   const sent = a.fields.filter((f) => f.keep?.value !== "keep");
   if (sent.some((f) => !f.input.value)) return { note: MESSAGES.secret_missing };
-  const values = sent.map((f) => ({ name: f.name, value: utf8(f.input.value), done: false }));
+  const values = sent.map((f) => ({ name: f.name, value: salted(utf8(f.input.value)), done: false }));
   for (const f of a.fields) f.input.value = "";
   a.secretsBox.replaceChildren(
     ...a.fields.map((f) =>

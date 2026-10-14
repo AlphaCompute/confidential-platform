@@ -249,7 +249,7 @@ async fn two_organizations_live_side_by_side() {
         alpha_kms::keys::aead_open(&key_a, &aad, &stored.ciphertext)
             .unwrap()
             .as_slice(),
-        b"a's value"
+        salted(b"a's value")
     );
 }
 
@@ -604,7 +604,7 @@ async fn control_routes_register_revoke_and_put() {
         (StatusCode::BAD_REQUEST, "signature_invalid")
     );
     let mut bad_hash = h.signed(context::SECRET, json!({ "name": "x", "app_ids": [app], "content_sha256": format!("sha256:{}", "0".repeat(64)), "issued_at": rfc3339(h.now()) }), &admin);
-    bad_hash["value"] = json!(b64(b"v"));
+    bad_hash["value"] = json!(b64(&salted(b"v")));
     let (status, reply) = h
         .call(reqwest::Method::PUT, "/v1/secrets/x", bad_hash)
         .await;
@@ -755,11 +755,9 @@ async fn every_control_success_carries_a_receipt_and_no_error_does() {
     );
 
     let value = b"receipted";
-    let payload = json!({ "name": "receipted", "app_ids": [AppId::mint()],
-                          "content_sha256": format!("sha256:{}", hex::encode(Sha256::digest(value))),
-                          "issued_at": rfc3339(h.now()) });
+    let payload = put_payload("receipted", &[AppId::mint()], value, h.now());
     let mut body = h.signed(context::SECRET, payload, &admin);
-    body["value"] = json!(b64(value));
+    body["value"] = json!(b64(&salted(value)));
     let (status, reply) = h
         .call(reqwest::Method::PUT, "/v1/secrets/receipted", body.clone())
         .await;
@@ -1003,7 +1001,7 @@ async fn attest_release_revoke_and_tamper() {
         secret["content_sha256"],
         json!(format!(
             "sha256:{}",
-            hex::encode(Sha256::digest(b"the value"))
+            hex::encode(Sha256::digest(salted(b"the value")))
         ))
     );
     let (status, reply) = send(instance.get(format!("{}/v1/secrets/other", h.url))).await;

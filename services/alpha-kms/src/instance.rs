@@ -426,8 +426,11 @@ async fn get_secret_inner(
             "secret value differs from its signed document",
         ));
     }
+    let (_salt, value) = value
+        .split_first_chunk::<{ alpha_core::SECRET_SALT_LEN }>()
+        .ok_or_else(|| ApiError::internal("secret is shorter than its salt"))?;
     Ok(json!({
-        "value": BASE64_URL_SAFE_NO_PAD.encode(&*value),
+        "value": BASE64_URL_SAFE_NO_PAD.encode(value),
         "content_sha256": content_sha256,
         "issued_at": rfc3339(document.issued_at),
     }))

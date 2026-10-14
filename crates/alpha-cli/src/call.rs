@@ -3,16 +3,17 @@
 use std::time::SystemTime;
 
 use alpha_client::{Client, PutSecretBody, sign, sign_self};
-use alpha_core::{ComposeHash, KeyId, OrgId, PrincipalId, context};
+use alpha_core::{ComposeHash, KeyId, OrgId, PrincipalId, SECRET_SALT_LEN, context};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use ed25519_dalek::SigningKey;
 use ed25519_dalek::pkcs8::EncodePublicKey;
 use serde_json::{Value, json};
+use zeroize::Zeroizing;
 
 use alpha_channel::sha256_label;
 
-use crate::rfc3339;
+use crate::{random, rfc3339};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum Route {
@@ -40,7 +41,8 @@ fn field<'a>(payload: &'a Value, name: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("payload has no {name}"))
 }
 
-/// Fills `issued_at` (and, for a secret, `content_sha256`) when the payload lacks them, signs
+/// Fills `issued_at` when the payload lacks it (and, for a secret, `content_sha256` over a fresh
+/// salt and the value), signs
 /// under the route's context (or `ctx`) and sends. The reply is printed as received.
 pub async fn run(
     client: &Client,
@@ -57,12 +59,19 @@ pub async fn run(
     if route != Route::RegisterRevision && !object.contains_key("issued_at") {
         object.insert("issued_at".into(), json!(rfc3339(now)));
     }
-    if route == Route::PutSecret && !object.contains_key("content_sha256") {
-        let value = value.ok_or("put-secret needs --value")?;
-        object.insert("content_sha256".into(), json!(sha256_label(value)));
-    }
-    if route != Route::PutSecret && value.is_some() {
-        return Err("--value is only for put-secret".into());
+    let salted = match (route, value) {
+        (Route::PutSecret, Some(value)) => Some(Zeroizing::new(
+            [random::<SECRET_SALT_LEN>()?.as_slice(), value].concat(),
+        )),
+        (Route::PutSecret, None) => return Err("put-secret needs --value".into()),
+        (_, Some(_)) => return Err("--value is only for put-secret".into()),
+        (_, None) => None,
+    };
+    if let Some(salted) = &salted {
+        if object.contains_key("content_sha256") {
+            return Err("content_sha256 is computed from --value".into());
+        }
+        object.insert("content_sha256".into(), json!(sha256_label(salted)));
     }
     let api = |e: alpha_client::Error| e.to_string();
     let signed = sign(ctx.unwrap_or(route.context()), payload, signer.0, signer.1).map_err(api)?;
@@ -79,7 +88,8 @@ pub async fn run(
             let body = PutSecretBody {
                 payload: signed.payload,
                 signature: signed.signature,
-                value: BASE64_URL_SAFE_NO_PAD.encode(value.ok_or("put-secret needs --value")?),
+                value: BASE64_URL_SAFE_NO_PAD
+                    .encode(salted.as_deref().ok_or("put-secret needs --value")?),
             };
             json!(client.put_secret(&name, &body).await.map_err(api)?)
         }

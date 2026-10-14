@@ -433,6 +433,11 @@ pub async fn put_secret(
             .strip_prefix("sha256:")
             .and_then(alpha_core::hex_bytes)
             .ok_or_else(|| ApiError::malformed("content_sha256: expected sha256:<hex>"))?;
+        if value.len() < alpha_core::SECRET_SALT_LEN {
+            return Err(ApiError::malformed(
+                "value: expected the salt before the value",
+            ));
+        }
         if Sha256::digest(&value).as_slice() != content_sha256 {
             return Err(ApiError::malformed("content_sha256 does not match value"));
         }
