@@ -464,4 +464,131 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
         assert!(err.contains("genpolicy: not the Kata 4.0.0 release file"));
     }
+
+    const DIND_POD: &str = include_str!("../../../testdata/coco/docker-in-kata/pod.yaml");
+    /// genpolicy 4.0.0 (built from the tag) for `DIND_POD`, pinned rules and settings.
+    const DIND_GENPOLICY: &str =
+        include_str!("../../../testdata/coco/docker-in-kata/genpolicy.rego");
+    /// The `CreateContainerRequest`s the shim sends for `DIND_POD`, in order: B300 captures of
+    /// containerd 2.3.6 and Kata 4.0.0, changed only as containerd and the shim change them for
+    /// this spec (a privileged container, Memory emptyDirs, a downward API volume).
+    const DIND_REQUESTS: &str = include_str!("../../../testdata/coco/docker-in-kata/requests.json");
+
+    /// Evaluates requests the way the Kata 4.0.0 agent does (`src/agent/policy/src/policy.rs`):
+    /// a rule's `ops` patch the policy state only when it allows.
+    struct Agent {
+        engine: regorus::Engine,
+        state: serde_json::Map<String, Value>,
+    }
+
+    impl Agent {
+        fn new(policy: &str) -> Self {
+            let mut engine = regorus::Engine::new();
+            engine.set_strict_builtin_errors(false);
+            engine.set_policy_length_config(regorus::PolicyLengthConfig {
+                max_col: (64 * 1024).try_into().unwrap(),
+                max_file_bytes: (16 * 1024 * 1024).try_into().unwrap(),
+                max_lines: 200_000.try_into().unwrap(),
+            });
+            engine
+                .add_policy("agent_policy".into(), policy.into())
+                .unwrap();
+            Self {
+                engine,
+                state: Default::default(),
+            }
+        }
+
+        fn allows(&mut self, endpoint: &str, request: &Value) -> bool {
+            self.engine.clear_data();
+            let data = serde_json::json!({ "pstate": self.state }).to_string();
+            self.engine
+                .add_data(regorus::Value::from_json_str(&data).unwrap())
+                .unwrap();
+            self.engine.set_input_json(&request.to_string()).unwrap();
+            let results = self
+                .engine
+                .eval_query(format!("data.agent_policy.{endpoint}"), false)
+                .unwrap();
+            let value: Value = serde_json::from_str(
+                &results.result[0].expressions[0]
+                    .value
+                    .to_json_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            if value == Value::Bool(false) {
+                return false;
+            }
+            for op in value["ops"].as_array().unwrap() {
+                assert_eq!(op["op"], "add", "{op}");
+                let key = op["path"]
+                    .as_str()
+                    .unwrap()
+                    .strip_prefix("/pstate/")
+                    .unwrap();
+                self.state.insert(key.into(), op["value"].clone());
+            }
+            value["allowed"] == Value::Bool(true)
+        }
+    }
+
+    fn dind_requests() -> Vec<(String, Value)> {
+        let requests: Vec<Value> = serde_json::from_str(DIND_REQUESTS).unwrap();
+        requests
+            .into_iter()
+            .map(|r| {
+                (
+                    r["endpoint"].as_str().unwrap().to_owned(),
+                    r["request"].clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn docker_in_kata_pod_runs_under_the_pinned_policy() {
+        let rendered = render(
+            parse(DIND_POD.as_bytes()).unwrap(),
+            APP_ID.parse().unwrap(),
+            DIND_GENPOLICY,
+        )
+        .unwrap();
+        let golden: Value = serde_json::from_str(EXPECTED).unwrap();
+        let printed = serde_json::to_value(&rendered).unwrap();
+        for key in ["rules_sha256", "policy_data_sha256"] {
+            assert_eq!(printed[key], golden[key], "{key}");
+        }
+        let mut agent = Agent::new(DIND_GENPOLICY);
+        for (endpoint, request) in dind_requests() {
+            let name = &request["OCI"]["Annotations"]["io.kubernetes.cri.container-name"];
+            assert!(agent.allows(&endpoint, &request), "{endpoint} {name}");
+        }
+    }
+
+    #[test]
+    fn docker_in_kata_policy_pins_the_privileged_container() {
+        let requests = dind_requests();
+        let dockerd = 2;
+        let launch = 3;
+        let mut tcp = requests[dockerd].1.clone();
+        tcp["OCI"]["Process"]["Args"]
+            .as_array_mut()
+            .unwrap()
+            .push("--host=tcp://0.0.0.0:2375".into());
+        let mut image = requests[dockerd].1.clone();
+        let other = "docker.io/library/docker@sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        image["OCI"]["Annotations"]["io.kubernetes.cri.image-name"] = other.into();
+        image["storages"][0]["source"] = other.into();
+        let mut escalated = requests[launch].1.clone();
+        escalated["OCI"]["Process"]["Capabilities"] =
+            requests[dockerd].1["OCI"]["Process"]["Capabilities"].clone();
+        for (index, tampered) in [(dockerd, tcp), (dockerd, image), (launch, escalated)] {
+            let mut agent = Agent::new(DIND_GENPOLICY);
+            for (endpoint, request) in &requests[..index] {
+                assert!(agent.allows(endpoint, request));
+            }
+            assert!(!agent.allows("CreateContainerRequest", &tampered));
+        }
+    }
 }

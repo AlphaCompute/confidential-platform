@@ -1,0 +1,117 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: corpus-supervisor
+spec:
+  runtimeClassName: kata-qemu-tdx
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  terminationGracePeriodSeconds: 60
+  securityContext:
+    supplementalGroups: [1, 2, 3, 4, 6, 10, 11, 20, 26, 27]
+  initContainers:
+  - name: alpha-runtime
+    image: ghcr.io/alphacompute/alpha-runtime@sha256:bb7dca63cfd0c44b50e87cc844a3c9eec001c8ded52f404fd476af97ec22dbe7
+    restartPolicy: Always
+    env:
+    - {name: ALPHACOMPUTE_KMS_ENDPOINTS, value: "https://kms-1.alphacompute.ai:8443,https://kms-2.alphacompute.ai:8443"}
+    - {name: ALPHACOMPUTE_KMS_CA_SPKI_SHA256, value: "sha256:c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1"}
+    - {name: ALPHACOMPUTE_KMS_REVISIONS, value: "sha256:e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1"}
+    securityContext:
+      runAsUser: 0
+      allowPrivilegeEscalation: false
+      capabilities: {drop: [ALL]}
+      readOnlyRootFilesystem: true
+    resources:
+      limits: {cpu: 500m, memory: 256Mi}
+    volumeMounts:
+    - {name: tsm, mountPath: /sys/kernel/config}
+    - {name: runtime-socket, mountPath: /run/alpha}
+    - {name: init-data, mountPath: /run/alpha-init-data, readOnly: true}
+  - name: dockerd
+    image: docker.io/library/docker@sha256:aa3df78ecf320f5fafdce71c659f1629e96e9de0968305fe1de670e0ca9176ce
+    restartPolicy: Always
+    securityContext:
+      privileged: true
+    args: [dockerd, --host=unix:///var/run/docker/docker.sock, --tls=false]
+    resources:
+      limits: {cpu: 3250m, memory: 5760Mi}
+    volumeMounts:
+    - {name: docker-socket, mountPath: /var/run/docker}
+    - {name: docker-state, mountPath: /var/lib/docker}
+    - {name: runtime-socket, mountPath: /run/alpha}
+  containers:
+  - name: launch
+    image: docker.io/library/docker@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+    command: [/bin/sh, -c]
+    args:
+    - |
+      set -eu
+      started=
+      stop() {
+        if [ -z "$started" ]; then exit 0; fi
+        docker stop -t 45 corpus-supervisor >/dev/null 2>&1 || true
+      }
+      trap stop TERM INT
+      set --
+      until docker info >/dev/null 2>&1; do
+        set -- "$@" x
+        if [ "$#" -ge 180 ]; then echo "launch: no Docker daemon after 180 s" >&2; exit 1; fi
+        sleep 1
+      done
+      docker rm -f corpus-supervisor >/dev/null 2>&1 || true
+      docker pull "$SUPERVISOR_IMAGE" &
+      wait "$!"
+      started=1
+      docker run -d --name corpus-supervisor --restart no \
+        -p 8443:8443 \
+        -v /var/run/docker/docker.sock:/var/run/docker.sock \
+        -v /run/alpha:/run/alpha \
+        -e SESSION_CAP -e CHAT_IMAGE -e CORPUS_MODELS \
+        -e INFERENCE_URL -e INFERENCE_REVISIONS \
+        -e BROKER_URL -e BROKER_REVISIONS \
+        -e GUARD_URL -e GUARD_REVISIONS \
+        -e MODERATION_POLICY \
+        "$SUPERVISOR_IMAGE" >/dev/null
+      docker wait corpus-supervisor >/tmp/code &
+      waiter=$!
+      wait "$waiter" || true
+      wait "$waiter" || true
+      code=
+      read -r code </tmp/code || true
+      case "$code" in ''|*[!0-9]*) code=1 ;; esac
+      exit "$code"
+    env:
+    - {name: DOCKER_HOST, value: "unix:///var/run/docker/docker.sock"}
+    - {name: SUPERVISOR_IMAGE, value: "ghcr.io/alphacompute/corpus-supervisor@sha256:99748db9018a1d9b93ccc4bf7205ec6233b8f22d85b7200e70dd24a2f5ac3965"}
+    - {name: SESSION_CAP, value: "4"}
+    - {name: CHAT_IMAGE, value: "ghcr.io/alphacompute/corpus-chat@sha256:7d7b7d01897cf33cb57546d4978003d7704c14dea875c23ab2b69fbcbb9b6f13"}
+    - {name: CORPUS_MODELS, value: "nvidia/nemotron-3.5-lightning"}
+    - {name: INFERENCE_URL, value: "https://alpha-inference:8443/v1"}
+    - {name: INFERENCE_REVISIONS, value: "sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"}
+    - {name: BROKER_URL, value: "https://alpha-broker:8443"}
+    - {name: BROKER_REVISIONS, value: "sha256:b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1"}
+    - {name: GUARD_URL, value: "https://alpha-guard:8443"}
+    - {name: GUARD_REVISIONS, value: "sha256:d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1"}
+    - {name: MODERATION_POLICY, value: '{"model":"nvidia/llama-3.1-nemotron-safety-guard-8b-v3","categories":["Violence","Hate and identity attacks"]}'}
+    resources:
+      limits: {cpu: 250m, memory: 128Mi}
+    ports:
+    - {name: https, containerPort: 8443}
+    readinessProbe:
+      tcpSocket: {port: 8443}
+      periodSeconds: 5
+    volumeMounts:
+    - {name: docker-socket, mountPath: /var/run/docker}
+  volumes:
+  - name: tsm
+    hostPath: {path: /sys/kernel/config, type: Directory}
+  - {name: runtime-socket, emptyDir: {medium: Memory}}
+  - {name: docker-socket, emptyDir: {medium: Memory}}
+  - {name: docker-state, emptyDir: {medium: Memory}}
+  - name: init-data
+    downwardAPI:
+      items:
+      - path: cc_init_data
+        fieldRef:
+          fieldPath: metadata.annotations['io.katacontainers.config.hypervisor.cc_init_data']
