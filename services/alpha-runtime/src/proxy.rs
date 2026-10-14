@@ -136,9 +136,13 @@ impl Endpoint {
     /// Open connections get at most [`DRAIN`] on a shutdown and are cut on revocation.
     pub async fn serve(self, stop: impl Future<Output = Exit>) {
         let mut stop = std::pin::pin!(stop);
-        let ready = self
-            .ready
-            .map(|(listener, router)| tokio::spawn(axum::serve(listener, router).into_future()));
+        let ready = self.ready.map(|(listener, router)| {
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(listener, router).await {
+                    eprintln!("alpha-runtime: readiness listener: {e}");
+                }
+            })
+        });
         let mut open = JoinSet::new();
         let how = loop {
             while open.try_join_next().is_some() {}

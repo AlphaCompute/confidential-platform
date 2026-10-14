@@ -888,7 +888,7 @@ async fn ready_status(addr: SocketAddr) -> u16 {
         .unwrap();
     let mut reply = String::new();
     tcp.read_to_string(&mut reply).await.unwrap();
-    reply[9..12].parse().unwrap()
+    reply.split(' ').nth(1).unwrap().parse().unwrap()
 }
 
 #[tokio::test]
