@@ -13,10 +13,19 @@ build.
 A tag `v*` runs `.github/workflows/release.yml`: every image (`alpha-runtime`, `alpha-kms`,
 `alpha-kms-dev`, `alpha-inference`, `alpha-broker`, `alpha-guard`, `alpha-cpu-app`) is built
 with `--no-cache` on two fresh runners, and an image is pushed as `ghcr.io/<owner>/<name>:<tag>`
-only when both give one image id and one layer set. Each pushed digest carries a signed GitHub
-build-provenance attestation, stored beside the image in ghcr and checked with
-`gh attestation verify oci://<image@sha256:…> --repo <owner>/confidential-platform`. For the two KMS images the workflow then renders the node's
-`app-compose.json` from the pushed digest (`cargo run -p alpha-cli --example kms_compose`,
+only when the CI checks pass on the tagged commit and both runners give one image id and one
+layer set. Each pushed digest carries a signed GitHub build-provenance attestation, stored beside the
+image in ghcr. Check it against this workflow at the tag, since `--repo` alone also accepts an
+attestation from a dispatch of an edited workflow on any branch:
+
+```sh
+gh attestation verify oci://<image@sha256:…> --repo AlphaCompute/confidential-platform \
+  --signer-workflow AlphaCompute/confidential-platform/.github/workflows/release.yml \
+  --source-ref refs/tags/<tag> --deny-self-hosted-runners
+```
+
+For the two KMS images a job holding no credential then renders the node's `app-compose.json`
+from the pushed digest (`cargo run -p alpha-cli --example kms_compose`,
 which is `alpha_cli::deploy::kms_compose` over `alpha_core::phala::canonicalize`, the same
 serializer Phala's API applies) and publishes the unsigned release manifest as the artifact
 `<name>-release-manifest` and in the job summary:

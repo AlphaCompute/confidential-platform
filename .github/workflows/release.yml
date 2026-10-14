@@ -8,16 +8,24 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
   build:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         runner: [a, b]
-        image:
+        image: &images
           - {name: alpha-runtime, dockerfile: images/manager/Dockerfile}
           - {name: alpha-kms, dockerfile: images/kms/Dockerfile}
+          # The dev KMS App with the root KEK from env; a distinct image, never a switch.
           - {name: alpha-kms-dev, dockerfile: images/kms/Dockerfile, features: dev-root}
           - {name: alpha-inference, dockerfile: images/inference/Dockerfile}
           - {name: alpha-broker, dockerfile: images/broker/Dockerfile}
@@ -53,10 +61,12 @@ jobs:
           retention-days: 7
 
   # Per image and after every build, so one image's failed build (a production KMS before the
-  # release keys exist) holds back only that image; its missing build fails the comparison.
+  # release keys exist) holds back only that image; its missing build fails the comparison. The
+  # job holds the ghcr and signing credentials, so it runs no code from the repository's
+  # dependencies: no cargo, no downloaded tools.
   image:
-    needs: build
-    if: ${{ !cancelled() }}
+    needs: [ci, build]
+    if: ${{ !cancelled() && needs.ci.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -67,30 +77,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: alpha-runtime
-          # The KMS App: two CVMs, one Revision; the compose rendered below is that Revision.
-          - name: alpha-kms
-            app_id: 01a09f07-8d09-7640-94c1-bbdb74200a1e
-          # The dev KMS App with the root KEK from env; a distinct image, never a switch.
-          - name: alpha-kms-dev
-            features: dev-root
-            app_id: 01a09f07-8d09-7aff-b257-83dbd9e6e641
-          # No app_id: the release workflow renders a compose only for the KMS.
-          - name: alpha-inference
-          - name: alpha-broker
-          - name: alpha-guard
-          - name: alpha-cpu-app
+        image: *images
     env:
-      NAME: ${{ matrix.name }}
-      FEATURES: ${{ matrix.features }}
+      NAME: ${{ matrix.image.name }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: ${{ matrix.name }}-[ab]
+          pattern: ${{ matrix.image.name }}-[ab]
           path: builds
       - name: Require one image from both runners
         run: |
@@ -105,38 +98,76 @@ jobs:
           fi
       - name: Push
         id: push
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          repository="ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/$NAME"
+          docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin <<< "$TOKEN"
+          repository="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/$NAME"
           docker tag "$NAME:candidate" "$repository:$GITHUB_REF_NAME"
           docker push "$repository:$GITHUB_REF_NAME"
           digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$repository:$GITHUB_REF_NAME")
           echo "pushed $digest" >> "$GITHUB_STEP_SUMMARY"
+          mkdir pushed
+          echo "$digest" > pushed/digest
           {
-            echo "digest=$digest"
             echo "repository=$repository"
             echo "sha256=${digest#*@}"
           } >> "$GITHUB_OUTPUT"
       - name: Attest the pushed image's build provenance
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-name: ${{ steps.push.outputs.repository }}
           subject-digest: ${{ steps.push.outputs.sha256 }}
           push-to-registry: true
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: ${{ matrix.image.name }}-digest
+          path: pushed
+          if-no-files-found: error
+
+  # The renders run the CLI and its dependencies' build scripts, and the Kata tools, so they get
+  # the pushed digest from an artifact and no credential.
+  render:
+    needs: image
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The KMS App: one Revision for every node; the compose rendered below is that Revision.
+          - name: alpha-kms
+            app_id: 01a09f07-8d09-7640-94c1-bbdb74200a1e
+          - name: alpha-kms-dev
+            features: dev-root
+            app_id: 01a09f07-8d09-7aff-b257-83dbd9e6e641
+    env:
+      NAME: ${{ matrix.name }}
+      FEATURES: ${{ matrix.features }}
+      APP_ID: ${{ matrix.app_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ matrix.name }}-digest
+          path: pushed
+      - run: echo "KMS_IMAGE=$(cat pushed/digest)" >> "$GITHUB_ENV"
       # The unsigned release manifest: the compose of the KMS node with this image, in the bytes
       # Phala measures, and its compose_hash for the release-key holder to sign into kms_revisions.
       - name: Render the KMS compose from the pushed digest
-        if: matrix.app_id && startsWith(github.ref, 'refs/tags/')
         run: |
           {
             echo '```json'
             cargo run -q -p alpha-cli --example kms_compose -- ${FEATURES:+--dev-root} \
-              "${{ matrix.app_id }}" "${{ steps.push.outputs.digest }}" "release/${{ matrix.name }}"
+              "$APP_ID" "$KMS_IMAGE" "release/$NAME"
             echo '```'
             echo '```json'
-            cat "release/${{ matrix.name }}/app-compose.json"
+            cat "release/$NAME/app-compose.json"
             echo
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
@@ -145,10 +176,8 @@ jobs:
       # three URLs are measured, so they are repository variables, not secrets; no render until
       # they are set.
       - name: Render the KMS node's Kata pod from the pushed digest
-        if: matrix.name == 'alpha-kms' && vars.KMS_KATA_ENDPOINTS && startsWith(github.ref, 'refs/tags/')
+        if: matrix.name == 'alpha-kms' && vars.KMS_KATA_ENDPOINTS
         env:
-          APP_ID: ${{ matrix.app_id }}
-          KMS_IMAGE: ${{ steps.push.outputs.digest }}
           KMS_ENDPOINTS: ${{ vars.KMS_KATA_ENDPOINTS }}
           PLATFORM_DOCUMENT_URL: ${{ vars.KMS_KATA_PLATFORM_DOCUMENT_URL }}
           PCCS_URL: ${{ vars.KMS_KATA_PCCS_URL }}
@@ -181,7 +210,6 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: matrix.app_id && startsWith(github.ref, 'refs/tags/')
         with:
           name: ${{ matrix.name }}-release-manifest
           path: release/${{ matrix.name }}
