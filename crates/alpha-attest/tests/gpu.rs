@@ -10,6 +10,15 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use p384::ecdsa::SigningKey;
+use p384::ecdsa::signature::Signer;
+use p384::pkcs8::DecodePrivateKey;
+use rcgen::{
+    BasicConstraints, CertificateParams, CertifiedIssuer, CustomExtension, IsCa, KeyPair,
+    KeyUsagePurpose, PKCS_ECDSA_P384_SHA384,
+};
+use sha2::{Digest, Sha256};
+
 use alpha_attest::{
     GpuEvidence, GpuReference, KataGpus, KataReference, PlatformDocument, appraise_gpus,
     appraise_kata_gpus, bind_gpus, verify_quote,
@@ -74,7 +83,7 @@ fn captured_gpus_are_accepted_with_their_leaf_serials() {
 #[test]
 fn altered_gpu_evidence_is_refused() {
     type Change = fn(&mut Vec<GpuEvidence>, &mut [u8; 32], &mut GpuReference, &mut usize);
-    let cases: [(&str, Change, &str, &str); 11] = [
+    let cases: [(&str, Change, &str, &str); 13] = [
         (
             "measurement byte flipped",
             |g, _, _, _| g[0].evidence[120] ^= 1,
@@ -134,6 +143,18 @@ fn altered_gpu_evidence_is_refused() {
             "block 2",
         ),
         (
+            "firmware not pinned",
+            |_, _, r, _| r.fwid.0[0] ^= 1,
+            "attestation_unknown",
+            "is not the pinned",
+        ),
+        (
+            "protected PCIe mode",
+            |_, _, r, _| r.feature_flag = 2,
+            "attestation_unknown",
+            "feature flag 1 is not the pinned 2",
+        ),
+        (
             "nonzero block not referenced",
             |_, _, r, _| {
                 r.measurements.remove(&2);
@@ -181,14 +202,28 @@ fn gpu_pod() -> ([u8; 64], KataReference) {
         .into_iter()
         .find(|c| c.gpu)
         .unwrap();
-    (quote.report_data, class)
+    // The capture predates the length prefixes, so its second half is the bare SHA-256.
+    assert_eq!(
+        quote.report_data[32..],
+        Sha256::digest(gpu("g1b").evidence)[..]
+    );
+    (bind_gpus(&quote.report_data, &[gpu("g1b")]), class)
 }
 
 #[test]
-fn a_gpu_pod_quote_commits_to_its_evidence() {
-    let (report_data, _) = gpu_pod();
-    assert_eq!(bind_gpus(&report_data, &[gpu("g1b")]), report_data);
-    assert_ne!(bind_gpus(&report_data, &[gpu("g2b")]), report_data);
+fn the_gpu_binding_marks_where_each_evidence_ends() {
+    let split = |at: usize| {
+        let evidence = gpu("g1b").evidence;
+        [&evidence[..at], &evidence[at..]].map(|part| GpuEvidence {
+            evidence: part.to_vec(),
+            certificate_chain: Vec::new(),
+        })
+    };
+    let report_data = [7; 64];
+    assert_ne!(
+        bind_gpus(&report_data, &split(100)),
+        bind_gpus(&report_data, &split(200))
+    );
 }
 
 #[test]
@@ -253,6 +288,108 @@ fn kata_classes_take_gpu_evidence_only_as_pinned() {
     for (case, class, report_data, code, fragment) in cases {
         let err = appraise_kata_gpus(&class, &report_data, &[gpu("g1b")], now()).unwrap_err();
         assert_eq!(err.code(), code, "{case}: {err}");
+        assert!(err.to_string().contains(fragment), "{case}: {err}");
+    }
+    let err = appraise_kata_gpus(&pinned(1), &report_data, &[], now()).unwrap_err();
+    assert_eq!(err.code(), "attestation_failed", "{err}");
+    assert!(err.to_string().contains("requires GPU evidence"), "{err}");
+}
+
+/// `g1b`'s evidence re-signed by a leaf under a root of our own, whose TcbInfo is the real
+/// leaf's with `flags` as its operational flags, and which also carries `extra`.
+fn resigned(flags: [u8; 4], extra: Vec<CustomExtension>) -> (GpuEvidence, GpuReference) {
+    let mut root = CertificateParams::new(vec![]).unwrap();
+    root.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    root.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+    let root = CertifiedIssuer::self_signed(
+        root,
+        KeyPair::generate_for(&PKCS_ECDSA_P384_SHA384).unwrap(),
+    )
+    .unwrap();
+
+    let real = gpu("g1b").certificate_chain;
+    let real = x509_parser::pem::Pem::iter_from_buffer(&real)
+        .next()
+        .unwrap()
+        .unwrap();
+    let (_, real) = x509_parser::parse_x509_certificate(&real.contents).unwrap();
+    let mut tcb_info = real
+        .extensions()
+        .iter()
+        .find(|e| e.oid.to_id_string() == "2.23.133.5.4.1.1")
+        .unwrap()
+        .value
+        .to_vec();
+    let at = tcb_info
+        .windows(4)
+        .position(|w| w == [0x87, 0x05, 0x00, 0x80])
+        .unwrap();
+    tcb_info[at + 3..at + 7].copy_from_slice(&flags);
+
+    let mut leaf = CertificateParams::new(vec![]).unwrap();
+    leaf.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+    leaf.custom_extensions = vec![CustomExtension::from_oid_content(
+        &[2, 23, 133, 5, 4, 1, 1],
+        tcb_info,
+    )];
+    leaf.custom_extensions.extend(extra);
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P384_SHA384).unwrap();
+    let signer: SigningKey = p384::SecretKey::from_pkcs8_der(&key.serialize_der())
+        .unwrap()
+        .into();
+    let leaf = leaf.signed_by(&key, &root).unwrap();
+
+    let mut evidence = gpu("g1b").evidence;
+    let signed = evidence.len() - 96;
+    let signature: p384::ecdsa::Signature = signer.sign(&evidence[..signed]);
+    evidence[signed..].copy_from_slice(&signature.to_bytes());
+    let reference = GpuReference {
+        root_sha256: alpha_core::ComposeHash::from(<[u8; 32]>::from(Sha256::digest(root.der()))),
+        ..reference()
+    };
+    let gpu = GpuEvidence {
+        evidence,
+        certificate_chain: format!("{}{}", leaf.pem(), root.pem()).into_bytes(),
+    };
+    (gpu, reference)
+}
+
+#[test]
+fn insecure_tcb_flags_and_unknown_critical_extensions_are_refused() {
+    let appraise = |(gpu, reference): (GpuEvidence, GpuReference)| {
+        appraise_gpus(&[gpu], &nonce("g1b"), 1, &[reference], now())
+    };
+    // notConfigured and fixedWidth, as the B300 leaf reports.
+    let b300 = [0x80, 0, 0, 0x01];
+    appraise(resigned(b300, Vec::new())).unwrap();
+
+    let mut critical = CustomExtension::from_oid_content(&[1, 2, 3, 4], vec![0x05, 0x00]);
+    critical.set_criticality(true);
+    let cases = [
+        (
+            "notSecure",
+            resigned([0xc0, 0, 0, 0x01], Vec::new()),
+            "notSecure",
+        ),
+        (
+            "recovery",
+            resigned([0xa0, 0, 0, 0x01], Vec::new()),
+            "notSecure",
+        ),
+        (
+            "debug",
+            resigned([0x90, 0, 0, 0x01], Vec::new()),
+            "notSecure",
+        ),
+        (
+            "unknown critical extension",
+            resigned(b300, vec![critical]),
+            "unknown critical extension 1.2.3.4",
+        ),
+    ];
+    for (case, evidence, fragment) in cases {
+        let err = appraise(evidence).unwrap_err();
+        assert_eq!(err.code(), "attestation_failed", "{case}: {err}");
         assert!(err.to_string().contains(fragment), "{case}: {err}");
     }
 }

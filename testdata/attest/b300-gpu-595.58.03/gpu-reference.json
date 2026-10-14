@@ -6,6 +6,8 @@
   "chip_sku": "887",
   "vbios_version": "97.10.52.00.17",
   "driver_version": "595.58.03",
+  "fwid": "sha384:c4c76fa6583bc2c684fb0444a31a111f6187e03f27131c29b9d836fdc58404560f9901e254e8d6178f8c9c0202e3deec",
+  "feature_flag": 1,
   "measurements": {
     "2": [
       "sha384:013c2f7d0ef8bd7a77f992dd0a694dcb05dea3d2d30ea0cdda6114b78039ed4b52be11f92313f152f8d6fe7d5dd14e39"

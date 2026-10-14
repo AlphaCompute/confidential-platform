@@ -13,7 +13,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use x509_parser::asn1_rs::{Any, Class, FromDer, Oid, Tag};
 use x509_parser::certificate::X509Certificate;
-use x509_parser::oid_registry::{OID_NIST_HASH_SHA384, OID_SIG_ECDSA_WITH_SHA384};
+use x509_parser::oid_registry::{
+    OID_NIST_HASH_SHA384, OID_SIG_ECDSA_WITH_SHA384, OID_X509_EXT_BASIC_CONSTRAINTS,
+    OID_X509_EXT_KEY_USAGE,
+};
 use x509_parser::pem::Pem;
 use x509_parser::time::ASN1Time;
 
@@ -43,12 +46,20 @@ pub struct GpuReference {
     pub chip_sku: String,
     pub vbios_version: String,
     pub driver_version: String,
+    /// The FWID the leaf certificate must carry: the hash of the firmware the boot ROM certified
+    /// the leaf key for. Without it, an older NVIDIA-signed firmware could sign copied
+    /// measurements.
+    pub fwid: Measurement,
+    /// The `FEATURE_FLAG` opaque value the GPU must report: 1 for a single GPU passed through,
+    /// other values for the multi-GPU and protected-PCIe modes.
+    pub feature_flag: u16,
     pub measurements: BTreeMap<u8, Vec<Measurement>>,
 }
 
 /// The GPUs of a Kata runtime class. `count` belongs to the class rather than to a Revision
-/// because the class's RTMR0 values measure it: each passed-through GPU gets a PCIe root port,
-/// which reaches the TD as the `etc/extra-pci-roots` firmware config and the ACPI tables.
+/// because the TD's shape follows it: each passed-through GPU gets a PCIe root port. RTMR0 is
+/// captured for one GPU only, so a larger count also rests on the runtime counting every GPU
+/// NVML sees.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KataGpus {
@@ -68,12 +79,16 @@ pub fn gpu_nonce(report_data: &[u8; 64]) -> [u8; 32] {
         .into()
 }
 
-/// `report_data` with its second half set to the SHA-256 of the GPU evidences concatenated in
-/// the order they are sent, so the TD commits to exactly the evidence it presents.
+/// `report_data` with its second half set to the SHA-256 of the GPU evidences in the order
+/// they are sent, each preceded by its length as a big-endian u64, so the TD commits to
+/// exactly the evidences it presents and to where each one ends.
 pub fn bind_gpus(report_data: &[u8; 64], gpus: &[GpuEvidence]) -> [u8; 64] {
     let digest = gpus
         .iter()
-        .fold(Sha256::new(), |h, gpu| h.chain_update(&gpu.evidence))
+        .fold(Sha256::new(), |h, gpu| {
+            h.chain_update((gpu.evidence.len() as u64).to_be_bytes())
+                .chain_update(&gpu.evidence)
+        })
         .finalize();
     let mut out = *report_data;
     out.iter_mut()
@@ -107,6 +122,9 @@ pub fn appraise_kata_gpus(
             "runtime class {name} passes GPUs through, and the document pins none"
         )));
     };
+    if gpus.is_empty() {
+        return Err(failed(format!("GPU class {name} requires GPU evidence")));
+    }
     if &bind_gpus(report_data, gpus) != report_data {
         return Err(failed("report_data does not commit to the GPU evidence"));
     }
@@ -138,6 +156,7 @@ mod tlv {
     pub const FWID: u16 = 20;
     pub const OPAQUE_DATA_VERSION: u16 = 34;
     pub const CHIP_INFO: u16 = 35;
+    pub const FEATURE_FLAG: u16 = 36;
 }
 
 fn failed(what: impl Into<String>) -> AppraisalError {
@@ -206,6 +225,19 @@ fn appraise_gpu(
                 opaque.driver_version
             ))
         })?;
+    if leaf.fwid != reference.fwid.0 {
+        return Err(AppraisalError::Unknown(format!(
+            "gpu firmware {} is not the pinned {}",
+            Measurement(leaf.fwid),
+            reference.fwid
+        )));
+    }
+    if opaque.feature_flag != reference.feature_flag {
+        return Err(AppraisalError::Unknown(format!(
+            "gpu feature flag {} is not the pinned {}",
+            opaque.feature_flag, reference.feature_flag
+        )));
+    }
     for (index, value) in (1..=BLOCKS).zip(&spdm.blocks) {
         let allowed = reference.measurements.get(&index);
         let ok = match allowed {
@@ -317,6 +349,7 @@ struct Opaque {
     vbios_version: String,
     driver_version: String,
     fwid: [u8; 48],
+    feature_flag: u16,
 }
 
 impl Opaque {
@@ -371,6 +404,10 @@ impl Opaque {
             fwid: field(tlv::FWID)?
                 .try_into()
                 .map_err(|_| failed("FWID is not a SHA-384"))?,
+            feature_flag: field(tlv::FEATURE_FLAG)?
+                .try_into()
+                .map(u16::from_le_bytes)
+                .map_err(|_| failed("feature flag is not a u16"))?,
         })
     }
 
@@ -461,6 +498,31 @@ fn verify_chain(
     if !certs.iter().all(|c| c.validity().is_valid_at(now)) {
         return Err(failed("certificate outside its validity"));
     }
+    let mut leaf_fwid = None;
+    for (depth, cert) in certs.iter().enumerate() {
+        for ext in cert.extensions() {
+            if ext.oid.to_id_string() == TCB_INFO_OID {
+                let tcb_info = tcb_info(ext.value)
+                    .ok_or_else(|| failed(format!("certificate {depth} TcbInfo")))?;
+                if tcb_info.insecure {
+                    return Err(failed(format!(
+                        "certificate {depth} reports a notSecure, recovery or debug TCB"
+                    )));
+                }
+                if depth == 0 {
+                    leaf_fwid = tcb_info.fwid;
+                }
+            } else if ext.critical
+                && ext.oid != OID_X509_EXT_BASIC_CONSTRAINTS
+                && ext.oid != OID_X509_EXT_KEY_USAGE
+            {
+                return Err(failed(format!(
+                    "certificate {depth} has unknown critical extension {}",
+                    ext.oid
+                )));
+            }
+        }
+    }
     let leaf_is_ca = leaf
         .basic_constraints()
         .map_or(true, |bc| bc.is_some_and(|bc| bc.value.ca));
@@ -476,12 +538,7 @@ fn verify_chain(
     Ok(Leaf {
         key: p384_key(leaf)?,
         serial: hex::encode(leaf.raw_serial()),
-        fwid: leaf
-            .extensions()
-            .iter()
-            .find(|e| e.oid.to_id_string() == TCB_INFO_OID)
-            .and_then(|e| tcb_info_fwid(e.value))
-            .ok_or_else(|| failed("leaf has no SHA-384 TcbInfo FWID"))?,
+        fwid: leaf_fwid.ok_or_else(|| failed("leaf has no SHA-384 TcbInfo FWID"))?,
         root: root_sha256,
     })
 }
@@ -491,28 +548,46 @@ fn p384_key(cert: &X509Certificate<'_>) -> Result<VerifyingKey, AppraisalError> 
         .map_err(|_| failed("certificate key is not P-384"))
 }
 
-/// The first FWID of a TCG DICE TcbInfo: `SEQUENCE { …, fwids [6] IMPLICIT SEQUENCE OF
-/// SEQUENCE { hashAlg OID, digest OCTET STRING }, … }`.
-fn tcb_info_fwid(value: &[u8]) -> Option<[u8; 48]> {
+struct TcbInfo {
+    fwid: Option<[u8; 48]>,
+    insecure: bool,
+}
+
+/// The first FWID, when it is a SHA-384, and the operational flags of a TCG DICE TcbInfo:
+/// `SEQUENCE { …, fwids [6] IMPLICIT SEQUENCE OF SEQUENCE { hashAlg OID, digest OCTET STRING },
+/// flags [7] IMPLICIT BIT STRING, … }`. `None` when it does not parse.
+fn tcb_info(value: &[u8]) -> Option<TcbInfo> {
     let ([], tcb_info) = Any::from_der(value).ok()? else {
         return None;
+    };
+    let mut info = TcbInfo {
+        fwid: None,
+        insecure: false,
     };
     let mut fields = tcb_info.data;
     while !fields.is_empty() {
         let (rest, field) = Any::from_der(fields).ok()?;
         fields = rest;
-        if field.class() == Class::ContextSpecific && field.tag() == Tag(6) {
+        if field.class() != Class::ContextSpecific {
+            continue;
+        }
+        if field.tag() == Tag(6) {
             let (_, fwid) = Any::from_der(field.data).ok()?;
             let (digest, hash_alg) = Oid::from_der(fwid.data).ok()?;
             let ([], digest) = Any::from_der(digest).ok()? else {
                 return None;
             };
-            return (hash_alg == OID_NIST_HASH_SHA384 && digest.tag() == Tag::OctetString)
+            info.fwid = (hash_alg == OID_NIST_HASH_SHA384 && digest.tag() == Tag::OctetString)
                 .then(|| digest.data.try_into().ok())
                 .flatten();
+        } else if field.tag() == Tag(7) {
+            // OperationalFlags bits notSecure (1), recovery (2) and debug (3): the first content
+            // byte after the unused-bits count, most significant bit first. A B300 leaf sets
+            // notConfigured (0) and fixedWidth (31), which say nothing against the firmware.
+            info.insecure = field.data.get(1).is_some_and(|b| b & 0x70 != 0);
         }
     }
-    None
+    Some(info)
 }
 
 #[cfg(test)]
