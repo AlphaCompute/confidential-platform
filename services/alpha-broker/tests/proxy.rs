@@ -165,7 +165,8 @@ async fn a_rewritten_member_key_or_a_moved_refresh_token_is_refused() {
             .bind(key)
             .execute(&h.pool)
     };
-    let before = h.fake.with(|f| f.data.len());
+    let reached = || h.fake.with(|f| (f.data.len(), f.requests.len()));
+    let before = reached();
 
     set_key(victim, other_member().spki).await.unwrap();
     let mut body = read(victim, FILES);
@@ -191,7 +192,7 @@ async fn a_rewritten_member_key_or_a_moved_refresh_token_is_refused() {
         (reply.status, reply.code()),
         (StatusCode::INTERNAL_SERVER_ERROR, "internal".into())
     );
-    assert_eq!(h.fake.with(|f| f.data.len()), before);
+    assert_eq!(reached(), before);
 }
 
 #[tokio::test]
