@@ -121,6 +121,12 @@ enum Command {
         /// Verify with the compiled-in key and print version, CA SPKI hash and Revisions.
         #[arg(long)]
         check: bool,
+        /// A dstack node's `app-compose.json`; one per such `kms_revisions` entry.
+        #[arg(long, conflicts_with = "check")]
+        compose: Vec<PathBuf>,
+        /// A Kata node's init-data TOML; one per such `kms_revisions` entry.
+        #[arg(long, conflicts_with = "check")]
+        init_data: Vec<PathBuf>,
         document: PathBuf,
     },
     /// Tenant YAML, or the output of `alpha compose wrap` → Revision → shroud-go deploy.
@@ -441,6 +447,8 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
         Command::Sign {
             release_key,
             check,
+            compose,
+            init_data,
             document,
         } => {
             let document = read_json(&document)?;
@@ -450,8 +458,18 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 let summary = sign::check(&artifact, &alpha_cli::release_key()?, now)?;
                 return Ok(json!(summary));
             }
+            let read = |paths: Vec<PathBuf>| {
+                paths
+                    .iter()
+                    .map(|p| {
+                        fs::read_to_string(p)
+                            .map_err(|e| Exit::Usage(format!("{}: {e}", p.display())))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            };
+            let (compose, init_data) = (read(compose)?, read(init_data)?);
             let key = read_ed25519(&need(release_key, "release-key")?)?;
-            Ok(json!(sign::sign(document, &key)?))
+            Ok(json!(sign::sign(document, &key, &compose, &init_data)?))
         }
         Command::Deploy {
             register_only,

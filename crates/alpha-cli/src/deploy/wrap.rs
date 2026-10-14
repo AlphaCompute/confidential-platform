@@ -1330,7 +1330,8 @@ mod tests {
         );
         let now = SystemTime::now();
         let pem = ca.cert.pem();
-        let artifact = crate::sign::sign(document(&pem), &key).unwrap();
+        let compose = ["{}".to_owned()];
+        let artifact = crate::sign::sign(document(&pem), &key, &compose, &[]).unwrap();
 
         let pins = runtime(&artifact, &key.verifying_key(), now, &image).unwrap();
         assert_eq!(
@@ -1344,7 +1345,7 @@ mod tests {
         let other = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
         assert!(runtime(&artifact, &other.verifying_key(), now, &image).is_err());
 
-        let day0 = crate::sign::sign(document(""), &key).unwrap();
+        let day0 = crate::sign::sign(document(""), &key, &compose, &[]).unwrap();
         let err = runtime(&day0, &key.verifying_key(), now, &image).unwrap_err();
         assert!(err.contains("names no KMS CA"), "{err}");
     }
