@@ -102,14 +102,14 @@ pub fn diff(
 }
 
 /// `None` is an absent value, so adding or removing a `null` still shows. Keys are written as JSON
-/// pointer segments with control characters escaped: a key comes from whoever wrote the document,
-/// and must not draw or hide lines on the next signer's terminal.
+/// pointer segments; keys and values come from whoever wrote the document, so both go through
+/// `printable` before they reach the next signer's terminal.
 fn changes(path: &str, old: Option<&Value>, new: Option<&Value>, out: &mut Vec<String>) {
     match (old, new) {
         (Some(Value::Object(a)), Some(Value::Object(b))) => {
             for k in a.keys().chain(b.keys().filter(|k| !a.contains_key(*k))) {
                 let segment = k.replace('~', "~0").replace('/', "~1");
-                let path = format!("{path}/{}", segment.escape_debug());
+                let path = format!("{path}/{}", printable(&segment));
                 changes(&path, a.get(k), b.get(k), out);
             }
         }
@@ -121,13 +121,27 @@ fn changes(path: &str, old: Option<&Value>, new: Option<&Value>, out: &mut Vec<S
         _ if old == new => {}
         _ => {
             if let Some(old) = old {
-                out.push(format!("- {path}: {old}"));
+                out.push(format!("- {path}: {}", printable(&old.to_string())));
             }
             if let Some(new) = new {
-                out.push(format!("+ {path}: {new}"));
+                out.push(format!("+ {path}: {}", printable(&new.to_string())));
             }
         }
     }
+}
+
+/// Control characters (C0, DEL, C1) and bidirectional formatting characters as `\u{…}`: JSON
+/// leaves C1 and the bidi controls as they are, and a terminal acts on them.
+fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            c if c.is_control() => c.escape_unicode().to_string(),
+            '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => {
+                c.escape_unicode().to_string()
+            }
+            c => c.to_string(),
+        })
+        .collect()
 }
 
 /// `ALPHACOMPUTE_KMS_CA_SPKI_SHA256` and `ALPHACOMPUTE_KMS_REVISIONS`, from a verified artifact.
@@ -343,8 +357,13 @@ mod tests {
         let mut v3 = v1;
         v3["version"] = json!(3);
         v3["hidden\n+ /x"] = json!(null);
+        v3["policy"]["note"] = json!("\u{9b}2J\u{202e}");
         let shown = diff(Some(&published), &v3, &keys, SystemTime::now()).unwrap();
-        assert!(shown.ends_with("+ /hidden\\n+ ~1x: null"), "{shown}");
+        assert!(shown.contains("+ /hidden\\u{a}+ ~1x: null"), "{shown}");
+        assert!(
+            shown.contains("+ /policy/note: \"\\u{9b}2J\\u{202e}\""),
+            "{shown}"
+        );
 
         let mut fields = v2.clone();
         fields["signatures"] = json!([]);
