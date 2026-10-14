@@ -4,7 +4,7 @@
 
 use std::time::SystemTime;
 
-use alpha_core::{CatalogKey, KmsRevision, Signer, context, signing_digest};
+use alpha_core::{CatalogKey, KataPolicy, KmsRevision, Signer, context, signing_digest};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use chrono::DateTime;
@@ -34,6 +34,8 @@ pub struct PlatformView {
     pub signer: Option<Signer>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_key: Option<CatalogKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kata_policy: Option<KataPolicy>,
 }
 
 /// The release key's public half, the same file `alpha-kms` compiles in; replaced at the

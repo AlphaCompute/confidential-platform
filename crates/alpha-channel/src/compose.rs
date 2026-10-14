@@ -6,9 +6,9 @@
 
 use std::collections::BTreeMap;
 
-use alpha_core::{InitData, MAX_INIT_DATA};
+use alpha_core::{AppId, InitData, KataPolicy, MAX_INIT_DATA};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use yaml_rust2::{Yaml, YamlLoader};
 
 use crate::Error;
@@ -33,11 +33,42 @@ fn get<'a>(map: &'a yaml_rust2::yaml::Hash, key: &str) -> Option<&'a Yaml> {
     map.get(&Yaml::String(key.into()))
 }
 
-pub fn services(revision: &str) -> Result<BTreeMap<String, Service>, Error> {
+/// Whether `revision` is a compose rather than an init-data: a TOML document cannot start with
+/// `{`, a compose always does.
+fn is_compose(revision: &str) -> Result<bool, Error> {
     if revision.len() >= MAX_INIT_DATA {
         return Err(malformed(&format!("{MAX_INIT_DATA} bytes or more")));
     }
-    let mut services = if revision.trim_start().starts_with('{') {
+    Ok(revision.trim_start().starts_with('{'))
+}
+
+/// The payload `POST /v1/revisions` takes for `revision`, refused here when the KMS would refuse
+/// it, so that a page stores no Secret for a launch that cannot register: `{app_id, compose}`
+/// for a compose, `{app_id, init_data, digest}` for an init-data, which must name `app_id` and
+/// carry the agent policy the platform document pins.
+pub fn revision_payload(
+    app_id: AppId,
+    revision: &str,
+    kata_policy: Option<&KataPolicy>,
+) -> Result<Value, Error> {
+    if is_compose(revision)? {
+        alpha_core::check_registration(revision, app_id).map_err(|e| malformed(&e.to_string()))?;
+        return Ok(json!({ "app_id": app_id, "compose": revision }));
+    }
+    let init_data = InitData::parse(revision.to_owned()).map_err(|e| malformed(&e.to_string()))?;
+    if init_data.app_id() != Some(app_id) {
+        return Err(malformed(&format!("init-data does not name app {app_id}")));
+    }
+    let pinned =
+        kata_policy.ok_or_else(|| malformed("the platform document pins no Kata agent policy"))?;
+    init_data
+        .check_policy(pinned)
+        .map_err(|e| malformed(&e.to_string()))?;
+    Ok(json!({ "app_id": app_id, "init_data": revision, "digest": init_data.digest() }))
+}
+
+pub fn services(revision: &str) -> Result<BTreeMap<String, Service>, Error> {
+    let mut services = if is_compose(revision)? {
         compose_services(revision)?
     } else {
         pod_services(revision)?
@@ -424,6 +455,32 @@ mod tests {
         .unwrap();
         assert_eq!(s["app"].secrets, ["db_password"]);
         assert_eq!(s["app"].environment["MODE"], "a=b");
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+    fn an_init_data_registers_as_init_data_under_the_pinned_policy() {
+        let doc: Value = serde_json::from_str(include_str!(
+            "../../../testdata/attest/b300-kata-4.0.0/platform-document.json"
+        ))
+        .unwrap();
+        let pinned: KataPolicy = serde_json::from_value(doc["kata_policy"].clone()).unwrap();
+        let app: AppId = "0199e000-0000-7000-8000-00000000a11d".parse().unwrap();
+
+        let payload = revision_payload(app, K3, Some(&pinned)).unwrap();
+        assert_eq!(
+            payload,
+            json!({
+                "app_id": app,
+                "init_data": K3,
+                "digest": alpha_core::compose_hash(K3),
+            })
+        );
+
+        let other: AppId = "0199e000-0000-7000-8000-00000000b22e".parse().unwrap();
+        assert!(revision_payload(other, K3, Some(&pinned)).is_err());
+        assert!(revision_payload(app, K3, None).is_err());
+        let off_pin = K3.replacen("(c) 2023", "(c) 2024", 1);
+        assert!(revision_payload(app, &off_pin, Some(&pinned)).is_err());
     }
 
     #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
