@@ -188,7 +188,6 @@ impl Server {
     }
 }
 
-/// The Revision in the leaf this connection was pinned to.
 fn served_revision(response: &reqwest::Response) -> Result<ComposeHash, String> {
     let leaf = response
         .extensions()
