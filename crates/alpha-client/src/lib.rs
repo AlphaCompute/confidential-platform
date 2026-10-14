@@ -31,6 +31,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
+use std::time::Duration;
 
 pub use tls::{Identity, Pin};
 
@@ -399,6 +400,43 @@ pub struct JoinReply {
     pub database_password: Option<String>,
 }
 
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Covers the slowest route: appraising evidence fetches PCS collateral through a PCCS whose
+/// cache may be cold, and a sealed node generates a quote to answer the evidence route.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// A KMS reply: the largest are a Kata node's evidence, which carries init-data of up to
+/// 1 MiB in base64, and a Secret, whose value came in under the KMS's 2 MiB request limit.
+const REPLY_CAP: usize = 4 << 20;
+
+/// Every HTTP client this crate builds: no connection or reply may hold a caller forever.
+fn http() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+}
+
+/// A redirect would leave the pinned peer.
+fn pinned_http(config: rustls::ClientConfig) -> reqwest::ClientBuilder {
+    http()
+        .tls_backend_preconfigured(config)
+        .redirect(reqwest::redirect::Policy::none())
+}
+
+async fn read_capped(mut response: reqwest::Response, cap: usize) -> Result<Vec<u8>, String> {
+    let too_large = || format!("reply over {cap} bytes");
+    if response.content_length().is_some_and(|n| n > cap as u64) {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        if chunk.len() > cap.saturating_sub(body.len()) {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 pub struct Client {
     endpoints: Vec<String>,
     http: reqwest::Client,
@@ -428,8 +466,7 @@ impl Client {
         if endpoints.is_empty() {
             return Err(Error::Invalid("no endpoints".into()));
         }
-        let http = reqwest::Client::builder()
-            .tls_backend_preconfigured(tls::client_config(Some(pin), identity, time)?)
+        let http = pinned_http(tls::client_config(Some(pin), identity, time)?)
             .build()
             .map_err(|e| Error::Invalid(format!("http client: {e}")))?;
         Ok(Self {
@@ -464,8 +501,7 @@ impl Client {
                 }
             };
             let status = response.status();
-            let bytes = response
-                .bytes()
+            let bytes = read_capped(response, REPLY_CAP)
                 .await
                 .map_err(|e| Error::Connect(format!("{endpoint}: {e}")))?;
             if status.is_success() {
@@ -575,7 +611,7 @@ pub enum Probe {
 }
 
 /// One attempt, with its own short timeout; the deadline over many attempts is the caller's.
-const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Handshake with `url`, pinning the chain to the KMS CA and reading the Revision out of the
 /// leaf. Any HTTP answer means the handshake completed, so the status is not looked at.
@@ -586,8 +622,7 @@ pub async fn probe_instance(
     time: TimeProvider,
 ) -> Result<Probe, Error> {
     let ca = tls::cert_from_pem(kms_ca_pem)?;
-    let http = reqwest::Client::builder()
-        .tls_backend_preconfigured(tls::client_config(Some(Pin::Ca(ca)), None, time)?)
+    let http = pinned_http(tls::client_config(Some(Pin::Ca(ca)), None, time)?)
         .tls_info(true)
         .timeout(PROBE_TIMEOUT)
         .build()
@@ -617,8 +652,7 @@ pub async fn fetch_node_evidence(
     nonce: &[u8; 32],
 ) -> Result<(NodeEvidence, Vec<u8>), Error> {
     let endpoint = endpoint.trim_end_matches('/');
-    let http = reqwest::Client::builder()
-        .tls_backend_preconfigured(tls::client_config(None, None, system_time_provider())?)
+    let http = pinned_http(tls::client_config(None, None, system_time_provider())?)
         .tls_info(true)
         .build()
         .map_err(|e| Error::Invalid(format!("http client: {e}")))?;
@@ -637,8 +671,7 @@ pub async fn fetch_node_evidence(
         .ok_or_else(|| Error::Invalid("no server certificate on the connection".into()))?;
     let spki = tls::spki_of(&leaf)?;
     let status = response.status();
-    let bytes = response
-        .bytes()
+    let bytes = read_capped(response, REPLY_CAP)
         .await
         .map_err(|e| Error::Connect(format!("{endpoint}: {e}")))?;
     if !status.is_success() {

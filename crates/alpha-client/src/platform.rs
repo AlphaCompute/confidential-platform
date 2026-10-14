@@ -22,20 +22,36 @@ pub fn verify(
         .map_err(|e| Error::Invalid(format!("platform document: document: {e}")))
 }
 
+/// The document is a few kilobytes and grows by one entry per machine shape.
+const DOCUMENT_CAP: usize = 1 << 20;
+
 /// The URL is untrusted; the signature is what makes the document the reference.
 pub async fn fetch(
     url: &str,
     keys: &ReleaseKeys,
     now: SystemTime,
 ) -> Result<PlatformDocument, Error> {
-    let signed: SignedDocument = reqwest::get(url)
+    verify(&fetch_signed(url).await?, keys, now)
+}
+
+/// Unverified: the caller verifies. Redirects are followed, as a release artifact host may
+/// redirect; the signature, not the host, is what is trusted.
+pub async fn fetch_signed(url: &str) -> Result<SignedDocument, Error> {
+    let fetch_failed = |e: String| Error::Connect(format!("platform document fetch: {e}"));
+    let http = crate::http()
+        .build()
+        .map_err(|e| Error::Invalid(format!("http client: {e}")))?;
+    let response = http
+        .get(url)
+        .send()
         .await
         .and_then(|r| r.error_for_status())
-        .map_err(|e| Error::Connect(format!("platform document fetch: {e}")))?
-        .json()
+        .map_err(|e| fetch_failed(e.to_string()))?;
+    let body = crate::read_capped(response, DOCUMENT_CAP)
         .await
-        .map_err(|e| Error::Invalid(format!("platform document body: {e}")))?;
-    verify(&signed, keys, now)
+        .map_err(fetch_failed)?;
+    serde_json::from_slice(&body)
+        .map_err(|e| Error::Invalid(format!("platform document body: {e}")))
 }
 
 #[cfg(test)]
@@ -112,5 +128,23 @@ mod tests {
                 .to_string()
                 .contains("signer.origins \"http://sign.example\"")
         );
+    }
+
+    #[tokio::test]
+    async fn a_document_over_the_cap_is_refused_without_a_declared_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/platform.json", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _ = socket.read(&mut [0u8; 1024]).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = socket.write_all(&vec![b' '; DOCUMENT_CAP + 1]).await;
+        });
+        let error = fetch_signed(&url).await.unwrap_err().to_string();
+        assert!(error.contains("reply over"), "{error}");
     }
 }

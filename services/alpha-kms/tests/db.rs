@@ -1517,8 +1517,12 @@ async fn platform_document_is_monotone_and_audited_on_change() {
     platform::reload(&h.node).await.unwrap();
     assert_eq!(h.node.platform_document().unwrap().version, 5);
     let rows = h.audit("platform.reload").await;
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[1].2, json!({ "version": 5, "previous": 1 }));
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        (rows[1].1.as_str(), &rows[1].2),
+        ("denied", &json!({ "version": 0, "stored": 1 }))
+    );
+    assert_eq!(rows[2].2, json!({ "version": 5, "previous": 1 }));
     let stored: i32 = sqlx::query_scalar!("select version from platform_document")
         .fetch_one(&h.pool)
         .await
