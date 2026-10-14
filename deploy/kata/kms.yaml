@@ -1,0 +1,16 @@
+# A drain that evicts every node at once is an unseal ceremony.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: alpha-kms
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: alpha-kms
+  namespace: alpha-kms
+spec:
+  maxUnavailable: ${KMS_MAX_UNAVAILABLE}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: alpha-kms

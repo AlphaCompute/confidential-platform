@@ -86,6 +86,46 @@ jobs:
             echo
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+      # The Kata node's Revision: the committed pod template with this image, rendered into the
+      # pod spec and init-data the release-key holders review and sign into kms_revisions. The
+      # three URLs are measured, so they are repository variables, not secrets; no render until
+      # they are set.
+      - name: Render the KMS node's Kata pod from the pushed digest
+        if: matrix.name == 'alpha-kms' && vars.KMS_KATA_ENDPOINTS && startsWith(github.ref, 'refs/tags/')
+        env:
+          APP_ID: ${{ matrix.app_id }}
+          KMS_IMAGE: ${{ steps.push.outputs.digest }}
+          KMS_ENDPOINTS: ${{ vars.KMS_KATA_ENDPOINTS }}
+          PLATFORM_DOCUMENT_URL: ${{ vars.KMS_KATA_PLATFORM_DOCUMENT_URL }}
+          PCCS_URL: ${{ vars.KMS_KATA_PCCS_URL }}
+          OUT: release/${{ matrix.name }}/kata
+        run: |
+          url='https://[^][:space:],"'\''\\$`]+'
+          [[ $KMS_ENDPOINTS =~ ^$url(,$url)*$ ]] || { echo "KMS_KATA_ENDPOINTS: not a comma-separated list of https URLs" >&2; exit 1; }
+          for v in PLATFORM_DOCUMENT_URL PCCS_URL; do
+            [[ ${!v} =~ ^$url$ ]] || { echo "KMS_KATA_$v: not one https URL" >&2; exit 1; }
+          done
+          kata="$RUNNER_TEMP/kata-tools"
+          mkdir -p "$kata" "$OUT"
+          # coco render checks genpolicy, its rules and settings against their release digests.
+          curl -fsSL https://github.com/kata-containers/kata-containers/releases/download/4.0.0/kata-tools-static-4.0.0-amd64.tar.zst \
+            | tar --zstd -x -C "$kata"
+          # shellcheck disable=SC2016
+          envsubst '$KMS_IMAGE $KMS_ENDPOINTS $PLATFORM_DOCUMENT_URL $PCCS_URL' < deploy/kata/kms-node.yaml > "$RUNNER_TEMP/kms-node.yaml"
+          cargo run -q -p alpha-cli --bin alpha -- coco render --app-id "$APP_ID" --kata "$kata/opt/kata" \
+            --out "$OUT/pod.yaml" "$RUNNER_TEMP/kms-node.yaml" > "$RUNNER_TEMP/rendered.json"
+          jq -j .init_data "$RUNNER_TEMP/rendered.json" > "$OUT/init-data.toml"
+          jq --arg image "$KMS_IMAGE" '{image: $image, compose_hash: .revision, rules_sha256, policy_data_sha256}' \
+            "$RUNNER_TEMP/rendered.json" > "$OUT/manifest.json"
+          if [ "$(jq -r .compose_hash "$OUT/manifest.json")" != "sha256:$(sha256sum < "$OUT/init-data.toml" | cut -d' ' -f1)" ]; then
+            echo "the rendered Revision is not the SHA-256 of init-data.toml" >&2
+            exit 1
+          fi
+          {
+            echo '```json'
+            cat "$OUT/manifest.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         if: matrix.app_id && startsWith(github.ref, 'refs/tags/')
         with:

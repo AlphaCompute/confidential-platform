@@ -1,0 +1,91 @@
+# The trust-zone Postgres: an ordinary runc pod on its own node pool, treated as untrusted storage.
+# Everything secret in it is ciphertext under keys it never sees.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-hba
+  namespace: alpha-trust-db
+data:
+  # Over the network only TLS with SCRAM; the socket is reachable only through `kubectl exec`.
+  pg_hba.conf: |
+    local all postgres trust
+    hostssl all all all scram-sha-256
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: alpha-trust-db
+spec:
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+  - {name: postgres, port: 5432}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: alpha-trust-db
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        alphacompute.io/pool: trust-db
+      tolerations:
+      - {key: alphacompute.io/pool, operator: Equal, value: trust-db, effect: NoSchedule}
+      securityContext:
+        # The image's postgres group: Postgres accepts a root-owned key only as 0640 with its group.
+        fsGroup: 999
+      containers:
+      - name: postgres
+        image: postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+        args:
+        - -c
+        - ssl=on
+        - -c
+        - ssl_cert_file=/tls/tls.crt
+        - -c
+        - ssl_key_file=/tls/tls.key
+        - -c
+        - hba_file=/hba/pg_hba.conf
+        env:
+        - {name: POSTGRES_DB, value: alpha}
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef: {name: postgres, key: password}
+        ports:
+        - {name: postgres, containerPort: 5432}
+        # Over TCP: the image's first-start server listens only on the socket, so the probe and
+        # the migration wait until the database is created.
+        readinessProbe:
+          exec:
+            command: [pg_isready, -h, 127.0.0.1, -U, postgres, -d, alpha]
+        volumeMounts:
+        - {name: data, mountPath: /var/lib/postgresql}
+        - {name: tls, mountPath: /tls, readOnly: true}
+        - {name: hba, mountPath: /hba, readOnly: true}
+      volumes:
+      - name: tls
+        secret: {secretName: postgres-tls, defaultMode: 0640}
+      - name: hba
+        configMap: {name: postgres-hba}
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: ${TRUST_DB_STORAGE_CLASS}
+      resources:
+        requests:
+          storage: ${TRUST_DB_STORAGE_SIZE}

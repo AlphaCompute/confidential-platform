@@ -1,0 +1,13 @@
+# One stable address per node pod, selected by a label set after the pod is created: labels are
+# not in the policy.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kms-${KMS_NODE}
+  namespace: alpha-kms
+spec:
+  selector:
+    app.kubernetes.io/name: alpha-kms
+    alphacompute.io/kms-node: "${KMS_NODE}"
+  ports:
+  - {name: https, port: 8443}
