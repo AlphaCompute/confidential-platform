@@ -21,11 +21,10 @@ pub async fn instance(
     init_data: Option<&InitData>,
     doc: &PlatformDocument,
 ) -> Result<Value, String> {
-    let sans = alpha_client::instance_leaf(url, &doc.kms_ca_pem, system_time_provider())
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|why| format!("no Instance leaf from the KMS CA: {why}"))?;
-    check_instance(&sans, app, init_data, doc)?;
+    let sans = app_leaf(url, app, &doc.kms_ca_pem).await?;
+    if let Some(init_data) = init_data {
+        check_init_data(&sans, init_data, doc)?;
+    }
     Ok(json!({
         "platform_document_version": doc.version,
         "org_id": sans.org_id,
@@ -37,21 +36,26 @@ pub async fn instance(
     }))
 }
 
-fn check_instance(
-    sans: &InstanceSans,
-    app: AppId,
-    init_data: Option<&InitData>,
-    doc: &PlatformDocument,
-) -> Result<(), String> {
+/// The SANs of the Instance leaf `url` presents under the KMS CA, refused unless they name `app`.
+pub async fn app_leaf(url: &str, app: AppId, kms_ca_pem: &str) -> Result<InstanceSans, String> {
+    let sans = alpha_client::instance_leaf(url, kms_ca_pem, system_time_provider())
+        .await
+        .map_err(|e| format!("probe: {e}"))?
+        .map_err(|why| format!("no Instance leaf from the KMS CA: {why}"))?;
     if sans.app_id != app {
         return Err(format!(
             "the Endpoint presents App {}, not {app}",
             sans.app_id
         ));
     }
-    let Some(init_data) = init_data else {
-        return Ok(());
-    };
+    Ok(sans)
+}
+
+fn check_init_data(
+    sans: &InstanceSans,
+    init_data: &InitData,
+    doc: &PlatformDocument,
+) -> Result<(), String> {
     if init_data.digest() != sans.compose_hash {
         return Err(format!(
             "the init-data is Revision {}, the leaf names {}",
@@ -117,26 +121,21 @@ mod tests {
     }
 
     #[test]
-    fn the_leaf_must_be_the_app_and_the_init_data_its_revision_within_the_policy() {
+    fn the_init_data_must_be_the_leafs_revision_within_the_policy() {
         let init_data = InitData::parse(K3.into()).unwrap();
         let sans = leaf(&init_data);
-        let app = sans.app_id;
-        check_instance(&sans, app, Some(&init_data), &doc()).unwrap();
-
-        let other_app = "0199e000-0000-7000-8000-00000000b0b0".parse().unwrap();
-        let err = check_instance(&sans, other_app, None, &doc()).unwrap_err();
-        assert!(err.contains("presents App"), "{err}");
+        check_init_data(&sans, &init_data, &doc()).unwrap();
 
         let other = InitData::parse(K3.replacen("(c) 2023", "(c) 2024", 1)).unwrap();
-        let err = check_instance(&sans, app, Some(&other), &doc()).unwrap_err();
+        let err = check_init_data(&sans, &other, &doc()).unwrap_err();
         assert!(err.contains("the leaf names"), "{err}");
 
-        let err = check_instance(&leaf(&other), app, Some(&other), &doc()).unwrap_err();
+        let err = check_init_data(&leaf(&other), &other, &doc()).unwrap_err();
         assert!(err.contains("pinned rules"), "{err}");
 
         let mut unpinned = doc();
         unpinned.kata_policy = None;
-        let err = check_instance(&sans, app, Some(&init_data), &unpinned).unwrap_err();
+        let err = check_init_data(&sans, &init_data, &unpinned).unwrap_err();
         assert!(err.contains("no kata_policy"), "{err}");
     }
 }

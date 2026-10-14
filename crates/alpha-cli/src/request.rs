@@ -4,14 +4,14 @@
 
 use std::time::Duration;
 
-use alpha_client::{Pin, Probe, probe_instance, system_time_provider, tls};
-use alpha_core::{AppId, ComposeHash};
+use alpha_client::{Pin, system_time_provider, tls};
+use alpha_core::AppId;
 use reqwest::Method;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::deploy::Shroud;
-use crate::instances;
+use crate::{instances, verify};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -27,25 +27,11 @@ pub struct Call<'a> {
 /// second connection cannot land on another App's Instance.
 pub async fn send_to(
     url: &str,
-    listed: ComposeHash,
     app: AppId,
     kms_ca_pem: &str,
     call: &Call<'_>,
 ) -> Result<Value, String> {
-    // A copy mid-deploy may still serve the previous Revision; it is the App's own all the same.
-    let sans = match probe_instance(url, kms_ca_pem, &listed, system_time_provider())
-        .await
-        .map_err(|e| format!("probe: {e}"))?
-    {
-        Probe::Attested(sans) | Probe::OtherRevision(sans) => sans,
-        Probe::Silent(why) => return Err(format!("no Instance leaf from the KMS CA: {why}")),
-    };
-    if sans.app_id != app {
-        return Err(format!(
-            "the Endpoint presents App {}, not {app}",
-            sans.app_id
-        ));
-    }
+    let sans = verify::app_leaf(url, app, kms_ca_pem).await?;
     let ca = tls::cert_from_pem(kms_ca_pem).map_err(|e| e.to_string())?;
     let pin = Pin::CaAndInstanceRevisions(ca, vec![sans.compose_hash]);
     let http = reqwest::Client::builder()
@@ -104,18 +90,10 @@ pub async fn run(
     let (mut responses, mut failed) = (Vec::new(), false);
     for copy in targets {
         let instance = copy.get("id").cloned().unwrap_or(Value::Null);
-        let reply = async {
-            let field = |name: &str| {
-                copy.get(name)
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| format!("no {name} in {copy}"))
-            };
-            let hash: ComposeHash = field("compose_hash")?
-                .parse()
-                .map_err(|e| format!("compose_hash: {e}"))?;
-            send_to(field("url")?, hash, app, kms_ca_pem, call).await
-        }
-        .await;
+        let reply = match copy.get("url").and_then(Value::as_str) {
+            Some(url) => send_to(url, app, kms_ca_pem, call).await,
+            None => Err(format!("no url in {copy}")),
+        };
         responses.push(match reply {
             Ok(mut reply) => {
                 if let Some(fields) = reply.as_object_mut() {

@@ -83,9 +83,7 @@ async fn the_bearer_reaches_a_leaf_of_the_named_app() {
     let (url, seen) = copy(&ca, app, hash).await;
     let body = json!({ "k": 3 });
 
-    let reply = send_to(&url, hash, app, &ca.pem(), &call(&body))
-        .await
-        .unwrap();
+    let reply = send_to(&url, app, &ca.pem(), &call(&body)).await.unwrap();
 
     assert_eq!(
         reply,
@@ -101,7 +99,7 @@ async fn a_leaf_of_another_app_never_sees_the_bearer() {
     let hash = compose_hash("{\"name\":\"worker\"}");
     let (url, seen) = copy(&ca, other, hash).await;
 
-    let message = send_to(&url, hash, app, &ca.pem(), &call(&json!({})))
+    let message = send_to(&url, app, &ca.pem(), &call(&json!({})))
         .await
         .unwrap_err();
 
@@ -116,7 +114,7 @@ async fn a_leaf_from_another_ca_never_sees_the_bearer() {
     let hash = compose_hash("{\"name\":\"worker\"}");
     let (url, seen) = copy(&Ca::new(), app, hash).await;
 
-    let message = send_to(&url, hash, app, &Ca::new().pem(), &call(&json!({})))
+    let message = send_to(&url, app, &Ca::new().pem(), &call(&json!({})))
         .await
         .unwrap_err();
 
