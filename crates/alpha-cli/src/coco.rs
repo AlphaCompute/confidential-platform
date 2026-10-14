@@ -499,7 +499,7 @@ mod tests {
             }
         }
 
-        fn allows(&mut self, endpoint: &str, request: &Value) -> bool {
+        fn creates(&mut self, request: &Value) -> bool {
             self.engine.clear_data();
             let data = serde_json::json!({ "pstate": self.state }).to_string();
             self.engine
@@ -508,7 +508,7 @@ mod tests {
             self.engine.set_input_json(&request.to_string()).unwrap();
             let results = self
                 .engine
-                .eval_query(format!("data.agent_policy.{endpoint}"), false)
+                .eval_query("data.agent_policy.CreateContainerRequest".into(), false)
                 .unwrap();
             let value: Value = serde_json::from_str(
                 &results.result[0].expressions[0]
@@ -533,19 +533,6 @@ mod tests {
         }
     }
 
-    fn dind_requests() -> Vec<(String, Value)> {
-        let requests: Vec<Value> = serde_json::from_str(DIND_REQUESTS).unwrap();
-        requests
-            .into_iter()
-            .map(|r| {
-                (
-                    r["endpoint"].as_str().unwrap().to_owned(),
-                    r["request"].clone(),
-                )
-            })
-            .collect()
-    }
-
     #[test]
     fn docker_in_kata_pod_runs_under_the_pinned_policy() {
         let rendered = render(
@@ -560,35 +547,36 @@ mod tests {
             assert_eq!(printed[key], golden[key], "{key}");
         }
         let mut agent = Agent::new(DIND_GENPOLICY);
-        for (endpoint, request) in dind_requests() {
+        let requests: Vec<Value> = serde_json::from_str(DIND_REQUESTS).unwrap();
+        for request in &requests {
             let name = &request["OCI"]["Annotations"]["io.kubernetes.cri.container-name"];
-            assert!(agent.allows(&endpoint, &request), "{endpoint} {name}");
+            assert!(agent.creates(request), "{name}");
         }
     }
 
     #[test]
     fn docker_in_kata_policy_pins_the_privileged_container() {
-        let requests = dind_requests();
+        let requests: Vec<Value> = serde_json::from_str(DIND_REQUESTS).unwrap();
         let dockerd = 2;
         let launch = 3;
-        let mut tcp = requests[dockerd].1.clone();
+        let mut tcp = requests[dockerd].clone();
         tcp["OCI"]["Process"]["Args"]
             .as_array_mut()
             .unwrap()
             .push("--host=tcp://0.0.0.0:2375".into());
-        let mut image = requests[dockerd].1.clone();
+        let mut image = requests[dockerd].clone();
         let other = "docker.io/library/docker@sha256:0000000000000000000000000000000000000000000000000000000000000000";
         image["OCI"]["Annotations"]["io.kubernetes.cri.image-name"] = other.into();
         image["storages"][0]["source"] = other.into();
-        let mut escalated = requests[launch].1.clone();
+        let mut escalated = requests[launch].clone();
         escalated["OCI"]["Process"]["Capabilities"] =
-            requests[dockerd].1["OCI"]["Process"]["Capabilities"].clone();
+            requests[dockerd]["OCI"]["Process"]["Capabilities"].clone();
         for (index, tampered) in [(dockerd, tcp), (dockerd, image), (launch, escalated)] {
             let mut agent = Agent::new(DIND_GENPOLICY);
-            for (endpoint, request) in &requests[..index] {
-                assert!(agent.allows(endpoint, request));
+            for request in &requests[..index] {
+                assert!(agent.creates(request));
             }
-            assert!(!agent.allows("CreateContainerRequest", &tampered));
+            assert!(!agent.creates(&tampered));
         }
     }
 }
