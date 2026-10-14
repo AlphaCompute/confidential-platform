@@ -87,6 +87,7 @@ impl From<VerifyingKey> for ReleaseKeys {
 }
 
 // A build holds one set only, so a production verifier cannot accept a dev-signed document.
+// build.rs holds the production threshold too, to refuse a set that could never meet it.
 #[cfg(feature = "dev")]
 const RELEASE_KEYS: (&str, usize) = (include_str!("../release-keys/dev.pub"), 1);
 #[cfg(not(feature = "dev"))]

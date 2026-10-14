@@ -57,15 +57,18 @@ pub fn sign(
     Ok(artifact)
 }
 
-/// `{document, signatures}` as it is, anything else as a document nobody has signed yet.
+/// A platform document as a new artifact nobody has signed yet, anything else as
+/// `{document, signatures}`. The document is tried first: it allows unknown fields, so a field
+/// named `signatures` does not make it an artifact.
 pub fn artifact(input: Value) -> Result<SignedDocument, String> {
-    if input.get("signatures").is_some() {
-        return serde_json::from_value(input).map_err(|e| format!("artifact: {e}"));
+    match serde_json::from_value::<PlatformDocument>(input.clone()) {
+        Ok(_) => Ok(SignedDocument {
+            document: input,
+            signatures: Vec::new(),
+        }),
+        Err(e) if input.get("document").is_none() => Err(format!("document: {e}")),
+        Err(_) => serde_json::from_value(input).map_err(|e| format!("artifact: {e}")),
     }
-    Ok(SignedDocument {
-        document: input,
-        signatures: Vec::new(),
-    })
 }
 
 /// What a signature would change, one line per changed value: `- /path: old` and `+ /path: new`
@@ -94,41 +97,33 @@ pub fn diff(
         None => &empty,
     };
     let mut lines = Vec::new();
-    changes("", old, document, &mut lines);
+    changes("", Some(old), Some(document), &mut lines);
     Ok(lines.join("\n"))
 }
 
-fn changes(path: &str, old: &Value, new: &Value, out: &mut Vec<String>) {
-    let null = &Value::Null;
+/// `None` is an absent value, so adding or removing a `null` still shows. Keys are written as JSON
+/// pointer segments with control characters escaped: a key comes from whoever wrote the document,
+/// and must not draw or hide lines on the next signer's terminal.
+fn changes(path: &str, old: Option<&Value>, new: Option<&Value>, out: &mut Vec<String>) {
     match (old, new) {
-        (Value::Object(a), Value::Object(b)) => {
+        (Some(Value::Object(a)), Some(Value::Object(b))) => {
             for k in a.keys().chain(b.keys().filter(|k| !a.contains_key(*k))) {
-                let path = format!("{path}/{k}");
-                changes(
-                    &path,
-                    a.get(k).unwrap_or(null),
-                    b.get(k).unwrap_or(null),
-                    out,
-                );
+                let segment = k.replace('~', "~0").replace('/', "~1");
+                let path = format!("{path}/{}", segment.escape_debug());
+                changes(&path, a.get(k), b.get(k), out);
             }
         }
-        (Value::Array(a), Value::Array(b)) => {
+        (Some(Value::Array(a)), Some(Value::Array(b))) => {
             for i in 0..a.len().max(b.len()) {
-                let path = format!("{path}/{i}");
-                changes(
-                    &path,
-                    a.get(i).unwrap_or(null),
-                    b.get(i).unwrap_or(null),
-                    out,
-                );
+                changes(&format!("{path}/{i}"), a.get(i), b.get(i), out);
             }
         }
         _ if old == new => {}
         _ => {
-            if !old.is_null() {
+            if let Some(old) = old {
                 out.push(format!("- {path}: {old}"));
             }
-            if !new.is_null() {
+            if let Some(new) = new {
                 out.push(format!("+ {path}: {new}"));
             }
         }
@@ -187,16 +182,12 @@ mod tests {
             "kms_revisions": [{ "compose_hash": hash, "build": "b", "source_url": "u" }]
         });
         let compose = ["{}".to_owned()];
-        assert!(
-            sign(
-                artifact(json!({"version": 1})).unwrap(),
-                &key,
-                &key.verifying_key().into(),
-                &compose,
-                &[]
-            )
-            .is_err()
-        );
+        assert!(artifact(json!({"version": 1})).is_err());
+        let garbage = SignedDocument {
+            document: json!({"version": 1}),
+            signatures: Vec::new(),
+        };
+        assert!(sign(garbage, &key, &key.verifying_key().into(), &compose, &[]).is_err());
         let artifact = sign(
             artifact(document).unwrap(),
             &key,
@@ -248,16 +239,8 @@ mod tests {
             .is_ok()
         );
         document["signer"]["origins"][0] = json!("https://sign.example/path");
-        assert!(
-            sign(
-                artifact(document).unwrap(),
-                &key,
-                &key.verifying_key().into(),
-                &compose,
-                &[]
-            )
-            .is_err()
-        );
+        let err = artifact(document).unwrap_err();
+        assert!(err.starts_with("document:"), "{err}");
     }
 
     #[test]
@@ -356,5 +339,15 @@ mod tests {
                 .unwrap()
                 .contains("+ /version: 1")
         );
+
+        let mut v3 = v1;
+        v3["version"] = json!(3);
+        v3["hidden\n+ /x"] = json!(null);
+        let shown = diff(Some(&published), &v3, &keys, SystemTime::now()).unwrap();
+        assert!(shown.ends_with("+ /hidden\\n+ ~1x: null"), "{shown}");
+
+        let mut fields = v2.clone();
+        fields["signatures"] = json!([]);
+        assert_eq!(artifact(fields.clone()).unwrap().document, fields);
     }
 }
