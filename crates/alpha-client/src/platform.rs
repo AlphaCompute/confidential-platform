@@ -1,13 +1,14 @@
 //! The release-signed platform document as its artifact URL serves it, and its verification:
-//! the signature under the compiled-in release key and `issued_at` not in the future. Version
+//! the threshold of release signatures and `issued_at` not in the future. Version
 //! monotonicity is the caller's, against whatever it remembers.
 
 use std::time::SystemTime;
 
 use alpha_attest::PlatformDocument;
-pub use alpha_channel::NamedSignature;
-pub use alpha_channel::platform::{SignedDocument, sign};
-use ed25519_dalek::VerifyingKey;
+
+pub use alpha_channel::platform::{
+    ReleaseKeys, SignedDocument, count_signatures, release_keys, sign,
+};
 
 use crate::Error;
 
@@ -15,10 +16,10 @@ use crate::Error;
 /// that the KMS and the CLI read.
 pub fn verify(
     signed: &SignedDocument,
-    release_key: &VerifyingKey,
+    keys: &ReleaseKeys,
     now: SystemTime,
 ) -> Result<PlatformDocument, Error> {
-    alpha_channel::platform::verify(signed, release_key, now)?;
+    alpha_channel::platform::verify(signed, keys, now)?;
     serde_json::from_value(signed.document.clone())
         .map_err(|e| Error::Invalid(format!("platform document: document: {e}")))
 }
@@ -26,7 +27,7 @@ pub fn verify(
 /// The URL is untrusted; the signature is what makes the document the reference.
 pub async fn fetch(
     url: &str,
-    release_key: &VerifyingKey,
+    keys: &ReleaseKeys,
     now: SystemTime,
 ) -> Result<PlatformDocument, Error> {
     let signed: SignedDocument = reqwest::get(url)
@@ -36,7 +37,7 @@ pub async fn fetch(
         .json()
         .await
         .map_err(|e| Error::Invalid(format!("platform document body: {e}")))?;
-    verify(&signed, release_key, now)
+    verify(&signed, keys, now)
 }
 
 #[cfg(test)]
@@ -61,20 +62,22 @@ mod tests {
         });
         let signed = sign(document.clone(), &key).unwrap();
         assert_eq!(
-            verify(&signed, &key.verifying_key(), now).unwrap().version,
+            verify(&signed, &key.verifying_key().into(), now)
+                .unwrap()
+                .version,
             3
         );
         let mut partial = document;
         partial.as_object_mut().unwrap().remove("policy");
         let signed = sign(partial, &key).unwrap();
         assert!(
-            verify(&signed, &key.verifying_key(), now)
+            verify(&signed, &key.verifying_key().into(), now)
                 .unwrap_err()
                 .to_string()
                 .contains("policy")
         );
         let other = SigningKey::from_bytes(&[6u8; 32]);
-        assert!(verify(&signed, &other.verifying_key(), now).is_err());
+        assert!(verify(&signed, &other.verifying_key().into(), now).is_err());
     }
 
     #[test]
@@ -99,14 +102,14 @@ mod tests {
             }
         });
         let signed = sign(document.clone(), &key).unwrap();
-        let full = verify(&signed, &key.verifying_key(), now).unwrap();
+        let full = verify(&signed, &key.verifying_key().into(), now).unwrap();
         assert_eq!(full.signer.unwrap().rp_id, "sign.example");
         assert!(full.catalog_key.is_some());
 
         document["signer"]["origins"][0] = json!("http://sign.example");
         let signed = sign(document, &key).unwrap();
         assert!(
-            verify(&signed, &key.verifying_key(), now)
+            verify(&signed, &key.verifying_key().into(), now)
                 .unwrap_err()
                 .to_string()
                 .contains("signer.origins \"http://sign.example\"")

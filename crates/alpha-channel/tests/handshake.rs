@@ -11,7 +11,7 @@ use std::time::SystemTime;
 use alpha_channel::Error;
 use alpha_channel::cert::{pem_to_der, spki_sha256};
 use alpha_channel::handshake::{Expected, Initiator, Responder, ServerHello, Verified};
-use alpha_channel::platform::{SignedDocument, release_key, verify};
+use alpha_channel::platform::{SignedDocument, release_keys, verify};
 use alpha_core::{AppId, OrgId};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
@@ -262,7 +262,12 @@ fn a_chain_of_three_certificates_is_foreign() {
 #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
 fn the_stands_platform_document_verifies_under_the_compiled_in_release_key() {
     let signed: SignedDocument = serde_json::from_str(PLATFORM_DOCUMENT).unwrap();
-    let view = verify(&signed, &release_key().unwrap(), at("2026-09-24T00:00:00Z")).unwrap();
+    let view = verify(
+        &signed,
+        &release_keys().unwrap(),
+        at("2026-09-24T00:00:00Z"),
+    )
+    .unwrap();
     assert!(view.version >= 1);
     assert!(view.kms_ca_pem.contains("BEGIN CERTIFICATE"));
     pem_to_der(&view.kms_ca_pem).unwrap();
@@ -277,7 +282,12 @@ fn a_platform_document_with_a_changed_ca_is_refused_platform_signature() {
     let original = tampered.remove(at_char);
     tampered.insert(at_char, if original == 'A' { 'B' } else { 'A' });
     signed.document["kms_ca_pem"] = json!(tampered);
-    let err = verify(&signed, &release_key().unwrap(), at("2026-09-24T00:00:00Z")).unwrap_err();
+    let err = verify(
+        &signed,
+        &release_keys().unwrap(),
+        at("2026-09-24T00:00:00Z"),
+    )
+    .unwrap_err();
     assert_eq!(err.code(), "platform_signature");
 }
 
@@ -286,6 +296,6 @@ fn a_platform_document_is_refused_before_it_was_issued() {
     let signed: SignedDocument = serde_json::from_str(PLATFORM_DOCUMENT).unwrap();
     let issued_at = signed.document["issued_at"].as_str().unwrap();
     let before = at(issued_at) - std::time::Duration::from_secs(1);
-    let err = verify(&signed, &release_key().unwrap(), before).unwrap_err();
+    let err = verify(&signed, &release_keys().unwrap(), before).unwrap_err();
     assert_eq!(err.code(), "platform_signature");
 }

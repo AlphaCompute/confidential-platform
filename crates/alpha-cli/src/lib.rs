@@ -24,10 +24,10 @@ pub mod sign;
 
 use std::time::SystemTime;
 
-use ed25519_dalek::VerifyingKey;
+use alpha_client::platform::ReleaseKeys;
 
-pub fn release_key() -> Result<VerifyingKey, String> {
-    alpha_channel::platform::release_key().map_err(|e| e.to_string())
+pub fn release_keys() -> Result<ReleaseKeys, String> {
+    alpha_channel::platform::release_keys().map_err(|e| e.to_string())
 }
 
 pub fn rfc3339(t: SystemTime) -> String {
@@ -38,12 +38,4 @@ pub fn random<const N: usize>() -> Result<[u8; N], String> {
     let mut out = [0u8; N];
     getrandom::fill(&mut out).map_err(|e| format!("rng: {e}"))?;
     Ok(out)
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn compiled_in_release_key_parses() {
-        super::release_key().unwrap();
-    }
 }

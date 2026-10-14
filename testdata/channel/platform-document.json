@@ -34,8 +34,11 @@
       }
     ]
   },
-  "signature": {
-    "algorithm": "ed25519",
-    "signature": "nUgN2RqKphstNjXTOvhbcl-kGzWH634H-UsQL6iVRnkuKDAevYC5kuRfW0NlwaChd5gdwjqVkt5y4MetJup2AQ"
-  }
+  "signatures": [
+    {
+      "key": "oFMMIcTYWFl7017wPFlQuD04G_Z0z4vU9N94xdlNzXg",
+      "algorithm": "ed25519",
+      "signature": "nUgN2RqKphstNjXTOvhbcl-kGzWH634H-UsQL6iVRnkuKDAevYC5kuRfW0NlwaChd5gdwjqVkt5y4MetJup2AQ"
+    }
+  ]
 }

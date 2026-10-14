@@ -347,8 +347,9 @@ async fn sign_and_check_feed_the_node_and_the_admin_pin() {
     document["version"] = json!(2);
     document["kms_ca_pem"] = json!(h.ca_pem);
     let compose = String::from_utf8(read(KEYED, "app-compose.json")).unwrap();
-    let artifact = sign::sign(document.clone(), &h.release.key, &[compose], &[]).unwrap();
-    let summary = sign::check(&artifact, &h.release.key.verifying_key(), h.now()).unwrap();
+    let keys = h.release.key.verifying_key().into();
+    let artifact = sign::sign(document.clone(), &h.release.key, &keys, &[compose], &[]).unwrap();
+    let summary = sign::check(&artifact, &keys, h.now()).unwrap();
     let ca_der = h.node.intermediates().unwrap().ca_cert_der.clone();
     assert_eq!(
         summary.kms_ca_spki_sha256.as_deref(),
@@ -362,17 +363,16 @@ async fn sign_and_check_feed_the_node_and_the_admin_pin() {
     );
     assert_eq!(summary.kms_revisions, vec![h.node.compose_hash]);
     assert!(
-        sign::check(&artifact, &alpha_cli::release_key().unwrap(), h.now()).is_err(),
+        sign::check(&artifact, &alpha_cli::release_keys().unwrap(), h.now()).is_err(),
         "not the pilot key"
     );
 
     h.release.set(document);
     platform::reload(&h.node).await.unwrap();
     assert_eq!(h.node.platform_document().unwrap().version, 2);
-    let served =
-        alpha_client::platform::fetch(&h.release.url, &h.release.key.verifying_key(), h.now())
-            .await
-            .unwrap();
+    let served = alpha_client::platform::fetch(&h.release.url, &keys, h.now())
+        .await
+        .unwrap();
     let client = pinned(&h, Pin::Ca(tls::cert_from_pem(&served.kms_ca_pem).unwrap()));
     assert!(client.ready().await.is_ok());
 }

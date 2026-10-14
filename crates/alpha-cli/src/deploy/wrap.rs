@@ -7,9 +7,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
-use alpha_client::platform::SignedDocument;
+use alpha_client::platform::{ReleaseKeys, SignedDocument};
 use alpha_core::{AppId, ComposeHash, compose_hash, hex_bytes, is_key_purpose};
-use ed25519_dalek::VerifyingKey;
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::{Mapping, Value as Yaml};
 
@@ -485,14 +484,14 @@ fn list<'a>(value: &'a Yaml, place: &str) -> Result<&'a Vec<Yaml>, String> {
         .ok_or_else(|| format!("{place}: not a list"))
 }
 
-/// The runtime service's pins, only from a platform document verified under `release_key`.
+/// The runtime service's pins, only from a platform document verified under the release key set.
 pub fn runtime(
     artifact: &SignedDocument,
-    release_key: &VerifyingKey,
+    keys: &ReleaseKeys,
     now: SystemTime,
     image: &str,
 ) -> Result<Runtime, String> {
-    let summary = crate::sign::check(artifact, release_key, now)?;
+    let summary = crate::sign::check(artifact, keys, now)?;
     let kms_ca_spki_sha256 = summary.kms_ca_spki_sha256.ok_or(
         "the platform document names no KMS CA yet; wrap against a document that pins one",
     )?;
@@ -1331,9 +1330,16 @@ mod tests {
         let now = SystemTime::now();
         let pem = ca.cert.pem();
         let compose = ["{}".to_owned()];
-        let artifact = crate::sign::sign(document(&pem), &key, &compose, &[]).unwrap();
+        let artifact = crate::sign::sign(
+            document(&pem),
+            &key,
+            &key.verifying_key().into(),
+            &compose,
+            &[],
+        )
+        .unwrap();
 
-        let pins = runtime(&artifact, &key.verifying_key(), now, &image).unwrap();
+        let pins = runtime(&artifact, &key.verifying_key().into(), now, &image).unwrap();
         assert_eq!(
             Some(pins.kms_ca_spki_sha256.clone()),
             crate::sign::ca_spki_sha256(&pem).unwrap()
@@ -1343,10 +1349,17 @@ mod tests {
         assert_eq!(pins.image, image);
 
         let other = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
-        assert!(runtime(&artifact, &other.verifying_key(), now, &image).is_err());
+        assert!(runtime(&artifact, &other.verifying_key().into(), now, &image).is_err());
 
-        let day0 = crate::sign::sign(document(""), &key, &compose, &[]).unwrap();
-        let err = runtime(&day0, &key.verifying_key(), now, &image).unwrap_err();
+        let day0 = crate::sign::sign(
+            document(""),
+            &key,
+            &key.verifying_key().into(),
+            &compose,
+            &[],
+        )
+        .unwrap();
+        let err = runtime(&day0, &key.verifying_key().into(), now, &image).unwrap_err();
         assert!(err.contains("names no KMS CA"), "{err}");
     }
 }

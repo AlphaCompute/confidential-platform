@@ -5,58 +5,48 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use alpha_attest::PlatformDocument;
-use base64::Engine;
-use base64::prelude::BASE64_URL_SAFE_NO_PAD;
-use ed25519_dalek::VerifyingKey;
-use serde_json::{Value, json};
+use alpha_client::platform::ReleaseKeys;
+use serde_json::json;
 
 use crate::error::ApiError;
 use crate::{Node, audit};
 
 pub const RELOAD_EVERY: Duration = Duration::from_secs(300);
 
-pub use alpha_client::platform::{NamedSignature, SignedDocument};
+pub use alpha_client::platform::SignedDocument;
 
 #[derive(Debug)]
 pub struct Verified {
     pub document: PlatformDocument,
-    pub raw: Value,
-    pub signature: Vec<u8>,
+    pub signed: SignedDocument,
 }
 
-/// Signature, `issued_at` not in the future, and a well-formed document.
+/// Signatures, `issued_at` not in the future, and a well-formed document.
 pub fn verify(
-    signed: &SignedDocument,
-    release_key: &VerifyingKey,
+    signed: SignedDocument,
+    keys: &ReleaseKeys,
     now: SystemTime,
 ) -> Result<Verified, String> {
-    let document =
-        alpha_client::platform::verify(signed, release_key, now).map_err(|e| e.to_string())?;
-    Ok(Verified {
-        document,
-        raw: signed.document.clone(),
-        signature: BASE64_URL_SAFE_NO_PAD
-            .decode(&signed.signature.signature)
-            .map_err(|e| e.to_string())?,
-    })
+    let document = alpha_client::platform::verify(&signed, keys, now).map_err(|e| e.to_string())?;
+    Ok(Verified { document, signed })
 }
 
-/// The stored row, re-verified: a swapped row must not become the reference values.
+/// The stored row, re-verified: a swapped row must not become the reference values. A row stored
+/// before signatures were a list has none; the URL then supplies the document, and `apply` still
+/// holds it to the stored version.
 pub async fn load_stored(node: &Node) -> Result<Option<Verified>, ApiError> {
-    let row = sqlx::query!("select document, signature from platform_document")
+    let row = sqlx::query!("select document, signatures from platform_document")
         .fetch_optional(&node.pool)
         .await?;
-    let Some(row) = row else {
+    let Some((document, Some(signatures))) = row.map(|r| (r.document, r.signatures)) else {
         return Ok(None);
     };
     let signed = SignedDocument {
-        document: row.document,
-        signature: NamedSignature {
-            algorithm: "ed25519".into(),
-            signature: BASE64_URL_SAFE_NO_PAD.encode(row.signature),
-        },
+        document,
+        signatures: serde_json::from_value(signatures)
+            .map_err(|e| ApiError::internal(format!("stored platform document: {e}")))?,
     };
-    verify(&signed, &node.release_key, node.now())
+    verify(signed, &node.release_keys, node.now())
         .map(Some)
         .map_err(|e| ApiError::internal(format!("stored platform document: {e}")))
 }
@@ -78,12 +68,15 @@ pub async fn apply(node: &Node, verified: Verified) -> Result<(), ApiError> {
         }
         Some(stored) if stored == version => {}
         _ => {
+            let signatures = serde_json::to_value(&verified.signed.signatures)
+                .map_err(|e| ApiError::internal(format!("platform document signatures: {e}")))?;
             sqlx::query!(
-                "insert into platform_document (one, version, document, signature) values (1, $1, $2, $3)
-                 on conflict (one) do update set version = $1, document = $2, signature = $3, verified_at = now()",
+                "insert into platform_document (one, version, document, signatures) values (1, $1, $2, $3)
+                 on conflict (one) do update
+                 set version = $1, document = $2, signatures = $3, signature = null, verified_at = now()",
                 version,
-                verified.raw,
-                verified.signature,
+                verified.signed.document,
+                signatures,
             )
             .execute(&mut *tx)
             .await?;
@@ -119,7 +112,7 @@ pub async fn reload(node: &Node) -> Result<(), ApiError> {
         .json()
         .await
         .map_err(|e| ApiError::internal(format!("platform document body: {e}")))?;
-    let verified = verify(&signed, &node.release_key, node.now())
+    let verified = verify(signed, &node.release_keys, node.now())
         .map_err(|e| ApiError::internal(format!("platform document: {e}")))?;
     if !node.has_database() {
         remember(node, verified.document);

@@ -34,7 +34,7 @@ async fn run() -> Result<(), String> {
             .map_err(|e| format!("migrate: {e}"))?;
         return Ok(());
     }
-    let release_key = alpha_channel::platform::release_key().map_err(|e| e.to_string())?;
+    let release_keys = alpha_channel::platform::release_keys().map_err(|e| e.to_string())?;
     let mut config = Config::from_env()?;
     config.database_password = url_password(&url)?;
     let pool_options = PgPoolOptions::new().max_connections(8);
@@ -70,7 +70,7 @@ async fn run() -> Result<(), String> {
         CollateralSource::Pccs(alpha_kms::env("ALPHACOMPUTE_PCCS_URL")?),
         alpha_kms::random().map_err(|e| e.message)?,
         revision,
-        release_key,
+        release_keys,
     )?;
     platform::start(&node).await;
     tokio::spawn(platform::run(node.clone()));

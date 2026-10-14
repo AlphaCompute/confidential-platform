@@ -1524,6 +1524,22 @@ async fn platform_document_is_monotone_and_audited_on_change() {
         .await
         .unwrap();
     assert_eq!(stored, 5);
+
+    sqlx::query("update platform_document set signatures = null, signature = '\\x00'")
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    assert!(
+        platform::load_stored(&h.node).await.unwrap().is_none(),
+        "a row from before the signature list is not reused"
+    );
+    let mut doc = platform_document(KEYED);
+    doc["version"] = json!(4);
+    h.release.set(doc);
+    assert!(
+        platform::reload(&h.node).await.is_err(),
+        "its version still bounds the next document"
+    );
 }
 
 #[tokio::test]

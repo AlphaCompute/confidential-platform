@@ -40,8 +40,10 @@ different image with a different `compose_hash`; a production platform document 
 Every build that verifies a platform document (`alpha-kms`, `alpha`, the signer page's wasm)
 compiles in one release key set from `crates/alpha-channel/release-keys/`: `prod.pub` by default,
 `dev.pub` with the dev feature (`dev-root` for `alpha-kms`, `dev` for `alpha`, `FEATURES=dev`
-for the page). A production build holds no dev key and a dev build no production key, so neither
-accepts the other's documents. Until the offline key ceremony commits the production key,
+for the page). Each file holds one hex public key per line, and the threshold of signatures a
+document needs is compiled in beside it: 2 for production (three signers, one outside the
+company), 1 for dev. A production build holds no dev key and a dev build no production key, so
+neither accepts the other's documents. Until the offline key ceremony commits the production keys,
 `prod.pub` is a placeholder and every production build of those three fails at compile time,
 the `alpha-kms` job of a release included; the dev images, the dev `alpha`
 (`cargo install --path crates/alpha-cli --features dev`) and the tests build with `dev.pub`.
@@ -75,10 +77,16 @@ again, since an env update does not restore the order.
 
 ## Signing the Revision
 
-The release-key holder adds `{ "compose_hash": "<from manifest.json>", "build": "kms <tag>",
-"source_url": "<the release>" }` to `kms_revisions[]` of the platform document, raises
-`version`, signs with `alpha sign --release-key`, and publishes the artifact at the URL the
-nodes read as `ALPHACOMPUTE_PLATFORM_DOCUMENT_URL`. The document must also carry a
+One release signer adds `{ "compose_hash": "<from manifest.json>", "build": "kms <tag>",
+"source_url": "<the release>" }` to `kms_revisions[]` of the platform document and raises
+`version`. Each signer in turn runs `alpha sign --release-key own.key --previous
+published.json …` on the document (the first) or on the artifact the last signer produced:
+it prints on stderr every value that changes against the published artifact, refuses a version
+that is not above it, and only then asks for the passphrase and appends one signature to
+`signatures[]`. The artifact `{document, signatures: [{key, algorithm, signature}]}` is
+published at the URL the nodes read as `ALPHACOMPUTE_PLATFORM_DOCUMENT_URL` once
+`alpha sign --check` accepts it, that is once the threshold of keys of the set has signed; a
+signature by a key outside the set, a broken one or two by one key refuse the whole artifact. The document must also carry a
 `reference_values` entry for the dstack guest image and CVM shape the nodes will run on. On
 day 0 `kms_ca_pem` is still empty; it is filled in after bootstrap (below).
 
@@ -229,3 +237,13 @@ document at its own URL (signed by the dev release key, which only dev builds co
 keys: the root is the env value, so the shares it writes protect nothing and can be deleted);
 after that every restart serves without `unseal` or `join`. Production shares and the
 production release key never touch it.
+
+The dev artifact moves from one `signature` to the `signatures` list without signing again: the
+digest is the same, so `{document, signature: {algorithm, signature}}` becomes
+`{document, signatures: [{key, algorithm, signature}]}` with `key` the dev key in base64url
+(`oFMMIcTYWFl7017wPFlQuD04G_Z0z4vU9N94xdlNzXg`) and the same signature; check it with the dev
+`alpha sign --check`. Publish it at the dev URL when the `alpha-kms-dev` image that reads it is
+deployed. Until then a node of the old image refuses the new body on its timer and keeps the
+document it holds; the new image's migration adds the `signatures` column, the node ignores the
+stored row's single signature, takes the document from the URL and still refuses any version
+below the stored one. Rebuild the dev `alpha` and the stand's page at the same time.

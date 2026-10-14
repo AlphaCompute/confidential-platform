@@ -1,2 +1,2 @@
-# Placeholder. The production release key is generated at the offline key ceremony, and its
-# public half (64 hex digits) replaces this comment before the first production build.
+# Placeholder. The production release keys are generated at the offline key ceremony; their public
+# halves (64 hex digits each, one per line) replace this comment before the first production build.
