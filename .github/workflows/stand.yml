@@ -41,6 +41,7 @@ jobs:
 
   # Each owned KMS node and App Endpoint, verified as a relying party on the internet would.
   #   STAND_PLATFORM_DOCUMENT_URL  the stand's platform document; unset skips this job
+  #   STAND_PLATFORM_MIN_VERSION   the lowest document version the stand accepts
   #   STAND_KMS_ENDPOINTS          the KMS nodes, whitespace-separated https URLs
   #   STAND_APP_ENDPOINTS          one `<app id> <url>` per line
   owned:
@@ -62,10 +63,16 @@ jobs:
       - run: cargo build --locked --release -p alpha-cli --features dev
       - env:
           ALPHACOMPUTE_PLATFORM_DOCUMENT_URL: ${{ vars.STAND_PLATFORM_DOCUMENT_URL }}
+          ALPHACOMPUTE_PLATFORM_MIN_VERSION: ${{ vars.STAND_PLATFORM_MIN_VERSION }}
           KMS: ${{ vars.STAND_KMS_ENDPOINTS }}
           APPS: ${{ vars.STAND_APP_ENDPOINTS }}
         run: |
           alpha=target/release/alpha
+          # ponytail: a fresh journal each run, so the stand refuses only documents below the
+          # minimum version or outside the age window, not a rollback between runs. A journal
+          # kept across runs (an artifact or the cache) would catch that too.
+          export ALPHACOMPUTE_PLATFORM_STATE="$RUNNER_TEMP/platform-state"
+          : > "$ALPHACOMPUTE_PLATFORM_STATE"
           # $1 prefixes each finding: only the last attempt's are errors.
           check() {
             down=0
