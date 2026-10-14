@@ -423,14 +423,10 @@ fn pinned_http(config: rustls::ClientConfig) -> reqwest::ClientBuilder {
 }
 
 async fn read_capped(mut response: reqwest::Response, cap: usize) -> Result<Vec<u8>, String> {
-    let too_large = || format!("reply over {cap} bytes");
-    if response.content_length().is_some_and(|n| n > cap as u64) {
-        return Err(too_large());
-    }
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
         if chunk.len() > cap.saturating_sub(body.len()) {
-            return Err(too_large());
+            return Err(format!("reply over {cap} bytes"));
         }
         body.extend_from_slice(&chunk);
     }
