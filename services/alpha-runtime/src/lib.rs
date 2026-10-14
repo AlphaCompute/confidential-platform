@@ -31,7 +31,6 @@ use alpha_client::{
     AttestReply, AttestRequest, Client, DerivedKey, Identity, Pin, Secret, TimeProvider,
 };
 use alpha_core::ComposeHash;
-use alpha_tsm::Substrate;
 use base64::Engine;
 use base64::prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
 use p256::ecdsa::SigningKey;
@@ -339,12 +338,6 @@ fn read_under_limit(reader: impl Read) -> Result<String, String> {
         return Err(format!("{MAX_INIT_DATA} bytes or more"));
     }
     Ok(text)
-}
-
-pub fn tsm_evidence(substrate: Substrate) -> EvidenceSource {
-    Arc::new(move |report_data| {
-        alpha_tsm::evidence(substrate, report_data).map_err(|e| e.to_string())
-    })
 }
 
 /// How long to wait before renewing: ten minutes before `not_after`, or at once if that has passed.

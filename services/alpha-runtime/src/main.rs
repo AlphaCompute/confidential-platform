@@ -66,7 +66,9 @@ async fn run() -> Result<Exit, Error> {
         config,
         &key,
         Arc::new(SystemTime::now),
-        alpha_runtime::tsm_evidence(substrate),
+        Arc::new(move |report_data| {
+            alpha_tsm::evidence(substrate, report_data).map_err(|e| e.to_string())
+        }),
         alpha_client::system_time_provider(),
         revision,
     )?;
