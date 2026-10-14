@@ -47,10 +47,12 @@ pub fn mrtd(firmware: &[u8]) -> Result<Measurement, String> {
         .collect::<Result<Vec<_>, String>>()?;
     let mut h = Sha384::new();
     for s in sections {
-        let contents: Box<dyn Iterator<Item = &[u8]>> = match s.source {
-            Some(source) => Box::new(source.chunks_exact(PAGE as usize)),
-            None => Box::new(std::iter::repeat(ZERO_PAGE.as_slice())),
-        };
+        // A source holds exactly size / PAGE pages, so only a sourceless section reaches the zeros.
+        let contents = s
+            .source
+            .unwrap_or_default()
+            .chunks_exact(PAGE as usize)
+            .chain(std::iter::repeat(ZERO_PAGE.as_slice()));
         // address + size fits in u64, so neither range below steps past it.
         let pages = (s.address..)
             .step_by(PAGE as usize)
@@ -221,7 +223,7 @@ fn authenticode(pe: &[u8]) -> Result<[u8; 48], String> {
     let table = add(optional, u16_at(pe, coff, 16)?.into())?;
     let mut sections = (0..usize::from(u16_at(pe, coff, 2)?))
         .map(|i| {
-            let header = add(table, mul(i, 40)?)?;
+            let header = add(table, i.checked_mul(40).ok_or("image offset overflows")?)?;
             Ok((
                 u32_at(pe, header, 20)? as usize,
                 u32_at(pe, header, 16)? as usize,
@@ -247,11 +249,6 @@ fn authenticode(pe: &[u8]) -> Result<[u8; 48], String> {
 
 fn add(a: usize, b: usize) -> Result<usize, String> {
     a.checked_add(b)
-        .ok_or_else(|| "image offset overflows".into())
-}
-
-fn mul(a: usize, b: usize) -> Result<usize, String> {
-    a.checked_mul(b)
         .ok_or_else(|| "image offset overflows".into())
 }
 
