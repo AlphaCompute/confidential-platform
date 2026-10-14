@@ -28,7 +28,7 @@ volumeMounts:
   - { name: init-data, mountPath: /run/alpha-init-data, readOnly: true }
 ```
 
-The host writes that file, so the runtime decodes it (`base64(gzip(toml))`, at most 1 MiB
+The host writes that file, so the runtime decodes it (`base64(gzip(toml))`, under 1 MiB
 inflated) and refuses to attest unless its SHA-256 is the leaf's Revision. Without the file
 `/v1/identity` answers `init_data: null`.
 
