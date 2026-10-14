@@ -369,17 +369,17 @@ fn insecure_tcb_flags_and_unknown_critical_extensions_are_refused() {
         (
             "notSecure",
             resigned([0xc0, 0, 0, 0x01], Vec::new()),
-            "notSecure",
+            "notSecure, recovery or debug TCB",
         ),
         (
             "recovery",
             resigned([0xa0, 0, 0, 0x01], Vec::new()),
-            "notSecure",
+            "notSecure, recovery or debug TCB",
         ),
         (
             "debug",
             resigned([0x90, 0, 0, 0x01], Vec::new()),
-            "notSecure",
+            "notSecure, recovery or debug TCB",
         ),
         (
             "unknown critical extension",
