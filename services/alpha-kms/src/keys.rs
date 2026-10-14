@@ -90,15 +90,8 @@ pub fn scram_verifier(password: &str, salt: &[u8]) -> Result<String, ApiError> {
         mac.update(data);
         Ok(mac.finalize().into_bytes().into())
     };
-    let mut u = Zeroizing::new(mac(
-        password.as_bytes(),
-        &[salt, &1u32.to_be_bytes()].concat(),
-    )?);
-    let mut salted = u.clone();
-    for _ in 1..SCRAM_ITERATIONS {
-        *u = mac(password.as_bytes(), u.as_slice())?;
-        salted.iter_mut().zip(u.iter()).for_each(|(s, b)| *s ^= b);
-    }
+    let mut salted = Zeroizing::new([0u8; 32]);
+    pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), salt, SCRAM_ITERATIONS, salted.as_mut());
     let stored_key = Sha256::digest(mac(salted.as_slice(), b"Client Key")?);
     let server_key = mac(salted.as_slice(), b"Server Key")?;
     Ok(format!(
