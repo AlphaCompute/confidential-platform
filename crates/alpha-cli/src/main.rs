@@ -247,7 +247,7 @@ enum ComposeCommand {
 
 #[derive(Subcommand)]
 enum CocoCommand {
-    /// Writes the pod spec with its init-data annotation to `--out` and prints
+    /// Writes the spec with its pod's init-data annotation to `--out` and prints
     /// `{revision, init_data, annotation, rules_sha256, policy_data_sha256}`.
     Render {
         #[arg(long)]
@@ -258,7 +258,8 @@ enum CocoCommand {
         kata: PathBuf,
         #[arg(long)]
         out: PathBuf,
-        /// A Pod whose images are all pinned `@sha256:` and whose supplementalGroups are explicit.
+        /// A Pod, or a StatefulSet rendered for its pod template, whose images are all pinned
+        /// `@sha256:` and whose supplementalGroups are explicit.
         pod: PathBuf,
     },
     /// Prints `{mrtd, rtmr1, rtmr2}` of a Kata TD booting these artifacts, for the platform

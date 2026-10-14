@@ -25,6 +25,29 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p alpha-channel --target wasm32-unknown-unknown --all-targets -- -D warnings
       - run: cargo test --workspace
+      # genpolicy accepts the KMS StatefulSet, writes the policy for its pods' names, and the
+      # policy's data is the one the platform document pins. The image only shapes the container
+      # entries, which the pin leaves out, so any public one renders.
+      - name: Render the KMS StatefulSet with the release genpolicy
+        shell: bash
+        env:
+          KMS_ENDPOINTS: https://kms-0.kms.alpha-kms.svc:8443,https://kms-1.kms.alpha-kms.svc:8443
+          PLATFORM_DOCUMENT_URL: https://platform.invalid/document.json
+          PCCS_URL: https://pccs.invalid
+        run: |
+          kata="$RUNNER_TEMP/kata-tools"
+          mkdir -p "$kata"
+          curl -fsSL https://github.com/kata-containers/kata-containers/releases/download/4.0.0/kata-tools-static-4.0.0-amd64.tar.zst \
+            | tar --zstd -x -C "$kata"
+          KMS_IMAGE=$(grep -o 'public.ecr.aws/[^ ]*' testdata/coco/pod.yaml)
+          export KMS_IMAGE
+          # shellcheck disable=SC2016
+          envsubst '$KMS_IMAGE $KMS_ENDPOINTS $PLATFORM_DOCUMENT_URL $PCCS_URL' < deploy/kata/kms-node.yaml > "$RUNNER_TEMP/kms-node.yaml"
+          target/debug/alpha coco render --app-id 01a09f07-8d09-7640-94c1-bbdb74200a1e --kata "$kata/opt/kata" \
+            --out "$RUNNER_TEMP/out.yaml" "$RUNNER_TEMP/kms-node.yaml" > "$RUNNER_TEMP/rendered.json"
+          jq -e --slurpfile pinned testdata/coco/expected.json \
+            '.policy_data_sha256 == $pinned[0].policy_data_sha256' "$RUNNER_TEMP/rendered.json"
+          jq -r .init_data "$RUNNER_TEMP/rendered.json" | grep -qF '"io.kubernetes.cri.sandbox-name": "^kms-[0-9]+$"'
       # The same CLI version build-web.sh requires, so the tests run the glue a page loads.
       - run: cargo install wasm-bindgen-cli --version 0.2.128 --locked
       - run: cargo test -p alpha-channel --target wasm32-unknown-unknown

@@ -89,10 +89,8 @@ pub fn parse(bytes: &[u8]) -> Result<Pod, String> {
     else {
         return Err("pod spec: not a mapping; write one Pod".into());
     };
-    if spec.get("kind").and_then(Yaml::as_str) != Some("Pod") {
-        return Err("pod spec: kind is not Pod; render one Pod".into());
-    }
-    if spec
+    let template = template_mut(&mut spec)?;
+    if template
         .get("metadata")
         .and_then(|m| m.get("annotations"))
         .and_then(|a| a.get(ANNOTATION))
@@ -102,7 +100,7 @@ pub fn parse(bytes: &[u8]) -> Result<Pod, String> {
             "pod spec: already carries {ANNOTATION}; render the tenant's own spec"
         ));
     }
-    let Some(Yaml::Mapping(pod)) = spec.get_mut("spec") else {
+    let Some(Yaml::Mapping(pod)) = template.get_mut("spec") else {
         return Err("pod spec: no spec mapping".into());
     };
     // The rules accept HOSTNAME only as the sandbox name, which the host chooses.
@@ -167,7 +165,7 @@ pub fn parse(bytes: &[u8]) -> Result<Pod, String> {
         }
     }
     let genpolicy_input = serde_yaml_ng::to_string(&spec).map_err(|e| format!("pod spec: {e}"))?;
-    if let Some(Yaml::Mapping(pod)) = spec.get_mut("spec") {
+    if let Some(Yaml::Mapping(pod)) = template_mut(&mut spec)?.get_mut("spec") {
         pod.insert("automountServiceAccountToken".into(), false.into());
         pod.insert("enableServiceLinks".into(), false.into());
     }
@@ -175,6 +173,19 @@ pub fn parse(bytes: &[u8]) -> Result<Pod, String> {
         spec,
         genpolicy_input,
     })
+}
+
+/// The mapping holding the pod's `metadata` and `spec`: a Pod itself, or a workload's template,
+/// which genpolicy renders the policy for and every pod of the workload is created from.
+fn template_mut(spec: &mut Mapping) -> Result<&mut Mapping, String> {
+    match spec.get("kind").and_then(Yaml::as_str) {
+        Some("Pod") => Ok(spec),
+        Some("StatefulSet") => match spec.get_mut("spec").and_then(|s| s.get_mut("template")) {
+            Some(Yaml::Mapping(template)) => Ok(template),
+            _ => Err("spec.template: missing or not a mapping".into()),
+        },
+        _ => Err("pod spec: kind is not Pod or StatefulSet".into()),
+    }
 }
 
 impl Kata {
@@ -303,8 +314,7 @@ pub fn render(mut pod: Pod, app_id: AppId, policy: &str) -> Result<Rendered, Str
     gzip.write_all(toml.as_bytes())
         .map_err(|e| format!("gzip: {e}"))?;
     let annotation = BASE64_STANDARD.encode(gzip.finish().map_err(|e| format!("gzip: {e}"))?);
-    let metadata = pod
-        .spec
+    let metadata = template_mut(&mut pod.spec)?
         .entry("metadata".into())
         .or_insert_with(|| Mapping::new().into());
     let Yaml::Mapping(metadata) = metadata else {
@@ -388,6 +398,47 @@ mod tests {
         let input = parse(POD.as_bytes()).unwrap().genpolicy_input;
         assert!(!input.contains("automountServiceAccountToken"));
         assert!(!input.contains("enableServiceLinks"));
+    }
+
+    #[test]
+    fn stateful_set_carries_the_init_data_in_its_pod_template() {
+        let pod: Yaml = serde_yaml_ng::from_str(POD).unwrap();
+        let set = serde_yaml_ng::to_string(&serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": {"name": "render"},
+            "spec": {
+                "serviceName": "render",
+                "selector": {"matchLabels": {"app": "render"}},
+                "template": {"metadata": {"labels": {"app": "render"}}, "spec": pod["spec"]},
+            },
+        }))
+        .unwrap();
+        let parsed = parse(set.as_bytes()).unwrap();
+        let input: Yaml = serde_yaml_ng::from_str(&parsed.genpolicy_input).unwrap();
+        assert_eq!(input["kind"].as_str(), Some("StatefulSet"));
+        assert!(
+            input["spec"]["template"]["spec"]
+                .get("automountServiceAccountToken")
+                .is_none()
+        );
+        let rendered = render(parsed, APP_ID.parse().unwrap(), GENPOLICY).unwrap();
+        assert_eq!(rendered.revision, render_golden().revision);
+        let out: Yaml = serde_yaml_ng::from_str(&rendered.pod).unwrap();
+        assert!(out["metadata"].get("annotations").is_none());
+        let template = &out["spec"]["template"];
+        assert_eq!(
+            template["metadata"]["annotations"][ANNOTATION].as_str(),
+            Some(rendered.annotation.as_str())
+        );
+        assert_eq!(template["spec"]["enableServiceLinks"], Yaml::Bool(false));
+        let hostname = set.replace("    spec:\n", "    spec:\n      hostname: evil\n");
+        assert!(
+            parse(hostname.as_bytes())
+                .err()
+                .unwrap()
+                .contains("hostname")
+        );
     }
 
     #[test]

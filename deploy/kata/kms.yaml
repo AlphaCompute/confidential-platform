@@ -1,16 +1,32 @@
-# A drain that evicts every node at once is an unseal ceremony.
 apiVersion: v1
 kind: Namespace
 metadata:
   name: alpha-kms
 ---
+# One name per node, kms-<ordinal>.kms.alpha-kms.svc, as KMS_KATA_ENDPOINTS lists them. A sealed
+# node keeps its name: a joining node asks each /ready itself.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kms
+  namespace: alpha-kms
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: alpha-kms
+  ports:
+  - {name: https, port: 8443}
+---
+# Ready means serving, so a drain never takes the last serving node: that would be an unseal
+# ceremony.
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: alpha-kms
   namespace: alpha-kms
 spec:
-  maxUnavailable: ${KMS_MAX_UNAVAILABLE}
+  minAvailable: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: alpha-kms
