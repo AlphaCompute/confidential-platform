@@ -19,7 +19,7 @@ pub mod proxy;
 pub mod socket;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,7 +35,7 @@ use alpha_client::{
 };
 use alpha_core::ComposeHash;
 use base64::Engine;
-use base64::prelude::BASE64_URL_SAFE_NO_PAD;
+use base64::prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
 use p256::ecdsa::SigningKey;
 use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
 use parking_lot::{Mutex, RwLock};
@@ -319,6 +319,52 @@ impl Substrate {
     }
 }
 
+/// The bytes whose SHA-256 is the Instance's Revision, served on `/v1/identity` once a leaf
+/// names that hash.
+#[derive(Clone, Debug)]
+pub enum RevisionText {
+    /// dstack: the guest agent's `app-compose.json`.
+    Compose(String),
+    /// Kata: the init-data TOML the pod's annotation carries.
+    InitData(String),
+}
+
+impl RevisionText {
+    fn text(&self) -> &str {
+        match self {
+            RevisionText::Compose(text) | RevisionText::InitData(text) => text,
+        }
+    }
+}
+
+/// Where a Kata pod mounts its init-data annotation through the downward API.
+pub const INIT_DATA_PATH: &str = "/run/alpha-init-data/cc_init_data";
+/// The host writes the annotation, so a gzip bomb there must not exhaust the pod.
+const MAX_INIT_DATA: usize = 1 << 20;
+
+/// The init-data out of the annotation's text, `base64(gzip(toml))`; None when the pod mounts
+/// none. The host can write anything there, so the leaf's Revision is what makes it the pod's.
+pub fn read_init_data(path: &Path) -> Result<Option<String>, Error> {
+    let refused = |m: String| Error::Evidence(format!("init-data {}: {m}", path.display()));
+    let annotation = match std::fs::read_to_string(path) {
+        Ok(annotation) => annotation,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(refused(e.to_string())),
+    };
+    let gzip = BASE64_STANDARD
+        .decode(annotation.trim())
+        .map_err(|e| refused(format!("not base64: {e}")))?;
+    let mut text = String::new();
+    flate2::read::GzDecoder::new(gzip.as_slice())
+        .take(MAX_INIT_DATA as u64)
+        .read_to_string(&mut text)
+        .map_err(|e| refused(format!("not gzip of UTF-8: {e}")))?;
+    if text.len() >= MAX_INIT_DATA {
+        return Err(refused(format!("{MAX_INIT_DATA} bytes or more")));
+    }
+    Ok(Some(text))
+}
+
 pub fn kata_evidence(quote: Vec<u8>) -> InstanceEvidence {
     InstanceEvidence::Kata(KataEvidence {
         format: KATA_EVIDENCE_FORMAT.into(),
@@ -368,9 +414,9 @@ pub struct Runtime {
     clock: Clock,
     time: TimeProvider,
     evidence: EvidenceSource,
-    /// The guest agent's; served to the tenant's services only once a leaf names its hash.
-    /// None in a Kata pod, where the KMS names the Revision from the verified `MRCONFIGID`.
-    app_compose: Option<String>,
+    /// None in a Kata pod that mounts no init-data; the KMS names the Revision from the
+    /// verified `MRCONFIGID` either way.
+    revision: Option<RevisionText>,
     kms: Client,
     attested: RwLock<Option<Arc<Attested>>>,
     revoked: watch::Sender<bool>,
@@ -383,7 +429,7 @@ impl Runtime {
         clock: Clock,
         evidence: EvidenceSource,
         time: TimeProvider,
-        app_compose: Option<String>,
+        revision: Option<RevisionText>,
     ) -> Result<Arc<Self>, Error> {
         let key_error = |e: p256::pkcs8::Error| Error::Key(e.to_string());
         let spki = key
@@ -405,7 +451,7 @@ impl Runtime {
             clock,
             time,
             evidence,
-            app_compose,
+            revision,
             kms,
             attested: RwLock::new(None),
             revoked: watch::Sender::new(false),
@@ -498,14 +544,16 @@ impl Runtime {
         let identity = tls::uri_sans(leaf)
             .and_then(|sans| tls::parse_instance_sans(&sans))
             .map_err(alpha_client::Error::from)?;
-        if self
-            .app_compose
-            .as_ref()
-            .is_some_and(|compose| alpha_core::compose_hash(compose) != identity.compose_hash)
+        if let Some(revision) = &self.revision
+            && alpha_core::compose_hash(revision.text()) != identity.compose_hash
         {
-            return Err(Error::Certificate(
-                "the guest agent's app_compose is not the leaf's Revision".into(),
-            ));
+            let what = match revision {
+                RevisionText::Compose(_) => "the guest agent's app_compose",
+                RevisionText::InitData(_) => "the pod's init-data",
+            };
+            return Err(Error::Certificate(format!(
+                "{what} is not the leaf's Revision"
+            )));
         }
         let certified =
             tls::certified(chain.iter().cloned().map(Into::into).collect(), &self.pkcs8)?;
@@ -966,6 +1014,29 @@ mod tests {
         assert!(!gpu);
         let init_data = String::from_utf8(kata_testdata("k3-app.toml")).unwrap();
         assert_eq!(appraised.compose_hash, alpha_core::compose_hash(&init_data));
+    }
+
+    #[test]
+    fn init_data_is_read_from_the_annotation_and_a_bomb_is_refused() {
+        let annotation = |bytes: &[u8]| {
+            let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+            gzip.write_all(bytes).unwrap();
+            BASE64_STANDARD.encode(gzip.finish().unwrap())
+        };
+        let dir = temp_dir();
+        let path = dir.join("cc_init_data");
+        assert_eq!(read_init_data(&path).unwrap(), None);
+
+        let init_data = kata_testdata("k3-app.toml");
+        std::fs::write(&path, annotation(&init_data)).unwrap();
+        let read = read_init_data(&path).unwrap().unwrap();
+        assert_eq!(read.as_bytes(), init_data);
+
+        std::fs::write(&path, annotation(&vec![b' '; MAX_INIT_DATA])).unwrap();
+        assert!(read_init_data(&path).is_err());
+        std::fs::write(&path, "not base64").unwrap();
+        assert!(read_init_data(&path).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

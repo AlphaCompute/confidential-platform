@@ -15,6 +15,7 @@ alpha-tsm = { path = "../../crates/alpha-tsm" }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+flate2 = "1"
 getrandom = "0.4"
 p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
 parking_lot = "0.12"

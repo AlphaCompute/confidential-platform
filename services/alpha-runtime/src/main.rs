@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use alpha_runtime::{
-    Config, EXIT_REFUSED, Error, Exit, Runtime, SECRETS_DIR, SOCKET_PATH, Substrate, TLS_PORT,
-    proxy,
+    Config, EXIT_REFUSED, Error, Exit, INIT_DATA_PATH, RevisionText, Runtime, SECRETS_DIR,
+    SOCKET_PATH, Substrate, TLS_PORT, proxy,
 };
 use p256::ecdsa::SigningKey;
 use tokio::net::UnixListener;
@@ -50,14 +50,16 @@ async fn run() -> Result<Exit, Error> {
     getrandom::fill(&mut seed).map_err(|e| Error::Key(format!("rng: {e}")))?;
     let key = SigningKey::from_bytes(&seed.into()).map_err(|e| Error::Key(e.to_string()))?;
     let substrate = Substrate::detect(Path::new(alpha_tsm::DSTACK_SOCKET));
-    let app_compose = match substrate {
-        Substrate::Dstack => Some(
+    let revision = match substrate {
+        Substrate::Dstack => Some(RevisionText::Compose(
             alpha_tsm::app_compose().map_err(|e| Error::Evidence(format!("app_compose: {e}")))?,
-        ),
+        )),
         // In a Kata pod the KMS pins above come from the pod spec the host writes; the agent
         // policy in the init-data, which the KMS requires, refuses this container unless every
         // variable has its rendered value.
-        Substrate::Kata => None,
+        Substrate::Kata => {
+            alpha_runtime::read_init_data(Path::new(INIT_DATA_PATH))?.map(RevisionText::InitData)
+        }
     };
     let runtime = Runtime::new(
         config,
@@ -65,7 +67,7 @@ async fn run() -> Result<Exit, Error> {
         Arc::new(SystemTime::now),
         alpha_runtime::tsm_evidence(substrate),
         alpha_client::system_time_provider(),
-        app_compose,
+        revision,
     )?;
     let attested = runtime.attest().await?;
     eprintln!(

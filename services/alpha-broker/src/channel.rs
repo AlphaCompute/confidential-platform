@@ -63,11 +63,15 @@ impl Channels {
 }
 
 /// The runtime hands the chain over as one PEM text; the responder sends it as leaf and CA.
+/// On Kata the handshake's `compose` is the init-data, the bytes that Revision hashes.
 pub fn responder(identity: &RuntimeIdentity) -> Result<Responder, Error> {
     let compose = identity
         .app_compose
         .clone()
-        .ok_or_else(|| Error::internal("channel responder: the Instance runs no compose"))?;
+        .or_else(|| identity.init_data.clone())
+        .ok_or_else(|| {
+            Error::internal("channel responder: the runtime serves neither compose nor init-data")
+        })?;
     Responder::new(
         pem_blocks(&identity.certificate_chain),
         &identity.tls_private_key,
