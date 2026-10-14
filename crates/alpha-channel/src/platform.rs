@@ -51,7 +51,7 @@ pub struct PlatformView {
 
 /// Distinct keys and how many of them must sign. The threshold is compiled in beside the keys,
 /// never read from a document: a document cannot lower the bar that admits it.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ReleaseKeys {
     keys: Vec<VerifyingKey>,
     threshold: usize,
