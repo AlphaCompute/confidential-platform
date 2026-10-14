@@ -140,6 +140,26 @@ the platform-document URL are served; the signed document lists the Revision.
 Both nodes now serve; a restart of either is a `join` from the other; losing both means
 `alpha unseal` with two of the three shares.
 
+## A node in a Kata pod
+
+A Kata pod has no encrypted env: its env is pinned in the init-data, and the host reads it. A Kata
+node therefore refuses to start if `ALPHACOMPUTE_DATABASE_URL` carries a password. Give it
+`postgres://alpha_kms_node@<pg>/alpha?sslmode=require` (the login role, no password), with a
+`scram-sha-256` line in `pg_hba.conf` for that role. The node gets its password from three places:
+
+- **Bootstrap.** The operator gives the role a one-time password and passes it once, through
+  `alpha bootstrap --database-password-file <file>`. The body is sealed to the attested node. In
+  the genesis transaction the node sets the role's password to one derived from the root KEK,
+  sent as a SCRAM verifier. Delete the file afterwards. Its password is already dead.
+- **Unseal.** The two shares give the root, and the root gives the password.
+- **Join.** The serving node passes its password in the join reply. A Kata joiner writes no
+  `node.join.request`: the database address is part of its measured init-data.
+
+Nobody holds the derived password. The database owner can still reset it, and the next unseal
+sets it back. Kata nodes that joined a Phala node use the Phala node's password. If both nodes
+are lost after the last Phala node is gone, let the role in once with a `trust` line, unseal,
+and remove the line.
+
 ## The broker's database
 
 `alpha-broker` keeps its connections in its own database on the same trust-zone Postgres, and no

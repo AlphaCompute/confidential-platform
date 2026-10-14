@@ -97,14 +97,18 @@ pub async fn apply(node: &Node, verified: Verified) -> Result<(), ApiError> {
         }
     }
     tx.commit().await?;
+    remember(node, verified.document);
+    Ok(())
+}
+
+fn remember(node: &Node, document: PlatformDocument) {
     let mut platform = node.platform.write();
     if platform
         .as_ref()
-        .is_none_or(|d| d.version < verified.document.version)
+        .is_none_or(|d| d.version < document.version)
     {
-        *platform = Some(Arc::new(verified.document));
+        *platform = Some(Arc::new(document));
     }
-    Ok(())
 }
 
 pub async fn reload(node: &Node) -> Result<(), ApiError> {
@@ -117,15 +121,22 @@ pub async fn reload(node: &Node) -> Result<(), ApiError> {
         .map_err(|e| ApiError::internal(format!("platform document body: {e}")))?;
     let verified = verify(&signed, &node.release_key, node.now())
         .map_err(|e| ApiError::internal(format!("platform document: {e}")))?;
+    if !node.has_database() {
+        remember(node, verified.document);
+        return Ok(());
+    }
     apply(node, verified).await
 }
 
-/// Start: the stored row, then the URL; afterwards one tick every five minutes.
+/// Start: the stored row, then the URL; afterwards one tick every five minutes. A Kata node runs
+/// it again once it has the database, so the stored version bounds what it fetched while sealed.
 pub async fn start(node: &Node) {
-    match load_stored(node).await {
-        Ok(Some(stored)) => *node.platform.write() = Some(Arc::new(stored.document)),
-        Ok(None) => {}
-        Err(e) => eprintln!("{}", e.message),
+    if node.has_database() {
+        match load_stored(node).await {
+            Ok(Some(stored)) => remember(node, stored.document),
+            Ok(None) => {}
+            Err(e) => eprintln!("{}", e.message),
+        }
     }
     if let Err(e) = reload(node).await {
         eprintln!("platform document: {}", e.message);

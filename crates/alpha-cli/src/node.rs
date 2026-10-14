@@ -151,10 +151,14 @@ pub async fn bootstrap(
     client: &Client,
     node: &NodeIdentity,
     custodians: [PublicKey; 3],
+    database_password: Option<String>,
     doc_version: u64,
     out_dir: &Path,
 ) -> Result<Value, String> {
-    let body = BootstrapBody { custodians };
+    let body = BootstrapBody {
+        custodians,
+        database_password,
+    };
     let body_hpke = alpha_crypto::seal(
         &node.xwing,
         INFO_NODE_BOOTSTRAP,

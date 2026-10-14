@@ -1843,3 +1843,123 @@ async fn a_put_carries_exactly_one_of_value_and_sealed() {
         assert_eq!(message, "exactly one of value and sealed");
     }
 }
+
+/// The salt of the role's stored SCRAM secret, and whether `password` reproduces that secret.
+async fn role_password_is(admin: &sqlx::PgPool, role: &str, password: &str) -> bool {
+    let stored: String = sqlx::query_scalar("select rolpassword from pg_authid where rolname = $1")
+        .bind(role)
+        .fetch_one(admin)
+        .await
+        .unwrap();
+    let salt = stored.split(['$', ':']).nth(2).unwrap();
+    let salt = base64::prelude::BASE64_STANDARD.decode(salt).unwrap();
+    alpha_kms::keys::scram_verifier(password, &salt).unwrap() == stored
+}
+
+#[tokio::test]
+async fn a_kata_node_takes_the_database_only_from_genesis_and_its_root() {
+    let Some(pool) = fresh_database().await else {
+        return;
+    };
+    let admin = sqlx::PgPool::connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    let role = format!("alpha_kms_node_{}", Uuid::now_v7().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "create role {role} login password 'genesis' in role alpha_kms"
+    )))
+    .execute(&admin)
+    .await
+    .unwrap();
+    assert!(
+        role_password_is(&admin, &role, "genesis").await,
+        "our verifier is not the one Postgres computes"
+    );
+    let options = (*pool.connect_options()).clone().username(&role);
+    let lazy = || sqlx::postgres::PgPoolOptions::new().connect_lazy_with(options.clone());
+
+    let now = captured_at(KEYED);
+    let release = ReleaseServer::start(platform_document(KEYED)).await;
+    let kata = |pool| {
+        start_node_on(
+            alpha_tsm::Substrate::Kata,
+            None,
+            pool,
+            &release.url,
+            &release.key,
+            std::sync::Arc::new(move || now),
+            KEYED,
+        )
+    };
+    let (node, url, _shutdown) = kata(lazy()).await;
+    assert!(
+        node.platform_document().is_some(),
+        "fetched without the database"
+    );
+    let custodians: Vec<_> = (0..3)
+        .map(|_| alpha_crypto::PrivateKey::generate().unwrap())
+        .collect();
+    let dir = std::env::temp_dir().join(format!("alpha-kata-{}", Uuid::now_v7()));
+    fs::create_dir_all(&dir).unwrap();
+    let identity = node_identity(&node);
+    let cli = spki_client(&url, &node);
+    let bootstrap = |password: Option<&str>| {
+        alpha_cli::node::bootstrap(
+            &cli,
+            &identity,
+            custodian_pubs(&custodians),
+            password.map(str::to_owned),
+            1,
+            &dir,
+        )
+    };
+    let refused = bootstrap(None).await.unwrap_err();
+    assert!(refused.contains("database_password"), "{refused}");
+    bootstrap(Some("genesis")).await.unwrap();
+
+    let shares: Vec<Vec<u8>> = (1..=3)
+        .zip(&custodians)
+        .map(|(i, custodian)| {
+            let file =
+                alpha_cli::node::ShareFile::read(&dir.join(format!("share-{i}.json"))).unwrap();
+            alpha_crypto::open(
+                custodian,
+                INFO_UNSEAL_SHARE,
+                &identity.aad(),
+                &file.share_hpke,
+            )
+            .unwrap()
+            .to_vec()
+        })
+        .collect();
+    fs::remove_dir_all(&dir).unwrap();
+    let root: [u8; 32] = vsss_rs::Gf256::combine_bytes(&shares[..2])
+        .unwrap()
+        .as_slice()
+        .try_into()
+        .unwrap();
+    let derived = alpha_kms::keys::database_password(&root).unwrap();
+    assert!(!role_password_is(&admin, &role, "genesis").await);
+    assert!(
+        role_password_is(&admin, &role, &derived).await,
+        "genesis leaves the role on the password derived from the root"
+    );
+
+    let (node2, url2, _shutdown2) = kata(lazy()).await;
+    assert!(node2.database_password().is_none());
+    let aad: [u8; 32] = Sha256::digest(&node2.runtime_spki).into();
+    for share in &shares[1..] {
+        let sealed =
+            alpha_crypto::seal(&node2.xwing_key.public(), INFO_UNSEAL_SHARE, &aad, share).unwrap();
+        let (status, reply) = send(
+            client()
+                .post(format!("{url2}/v1/node/unseal"))
+                .json(&json!({ "share_hpke": sealed })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{reply}");
+    }
+    assert!(!node2.is_sealed());
+    assert_eq!(node2.database_password().as_deref(), Some(&*derived));
+    assert!(role_password_is(&admin, &role, &derived).await);
+}

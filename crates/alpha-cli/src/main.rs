@@ -211,6 +211,10 @@ enum Command {
         /// Three files, each holding a custodian's public key as `keygen --custodian` printed it.
         #[arg(long, value_delimiter = ',', num_args = 3)]
         custodians: Vec<PathBuf>,
+        /// A file holding the node login role's one-time genesis password. A Kata node needs it
+        /// (sealed to the node like the rest of the body) and replaces it with one only nodes know.
+        #[arg(long)]
+        database_password_file: Option<PathBuf>,
         #[arg(long)]
         endpoint: String,
     },
@@ -676,8 +680,16 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
         }
         Command::Bootstrap {
             custodians,
+            database_password_file,
             endpoint,
         } => {
+            let database_password = database_password_file
+                .map(|path| {
+                    fs::read_to_string(&path)
+                        .map(|text| text.trim().to_owned())
+                        .map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))
+                })
+                .transpose()?;
             let mut keys = Vec::new();
             for path in &custodians {
                 let text = fs::read_to_string(path)
@@ -696,10 +708,15 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let doc = platform_document(config, now).await?;
             let (identity, client) =
                 node::attested_node(&endpoint, &config.pccs_url, &doc, None, now).await?;
-            Ok(
-                node::bootstrap(&client, &identity, custodians, doc.version, Path::new("."))
-                    .await?,
+            Ok(node::bootstrap(
+                &client,
+                &identity,
+                custodians,
+                database_password,
+                doc.version,
+                Path::new("."),
             )
+            .await?)
         }
     }
 }
