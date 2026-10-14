@@ -42,6 +42,7 @@ async fn run() -> Result<(), String> {
         .ok_or("release-key.pub is not an Ed25519 public key")?;
     let mut config = Config::from_env()?;
     config.database_password = url_password(&url)?;
+    let pool_options = PgPoolOptions::new().max_connections(8);
     let pool = match (config.substrate, &config.database_password) {
         (Substrate::Kata, Some(_)) => {
             return Err(
@@ -50,11 +51,8 @@ async fn run() -> Result<(), String> {
                     .into(),
             );
         }
-        (Substrate::Kata, None) => PgPoolOptions::new()
-            .max_connections(8)
-            .connect_lazy_with(options),
-        (Substrate::Dstack, _) => PgPoolOptions::new()
-            .max_connections(8)
+        (Substrate::Kata, None) => pool_options.connect_lazy_with(options),
+        (Substrate::Dstack, _) => pool_options
             .connect_with(options)
             .await
             .map_err(|e| format!("database: {e}"))?,

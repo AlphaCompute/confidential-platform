@@ -140,14 +140,13 @@ pub struct Node {
 impl Node {
     pub fn new(
         pool: PgPool,
-        config: Config,
+        mut config: Config,
         clock: Clock,
         collateral: CollateralSource,
         nonce_key: [u8; 32],
         compose_hash: ComposeHash,
         release_key: ed25519_dalek::VerifyingKey,
     ) -> Result<Arc<Self>, String> {
-        let mut config = config;
         let database_password = config.database_password.take();
         let runtime_key = SigningKey::from_bytes((&random::<32>().map_err(|e| e.message)?).into())
             .map_err(|e| format!("runtime key: {e}"))?;
