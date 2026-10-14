@@ -27,12 +27,15 @@ const GENPOLICY_SHA256: &str = "4fa1cabd8d6e757c271caa991b889e1c2ccdbbdce58872b8
 const RULES_SHA256: &str = "c3e17ef9f1e8c1accde820774033459580c0fa431056fca2a51283beb9aad1d6";
 const SETTINGS_SHA256: &str = "c7d95bc2e45be20643304cb4915a7ab1a3f070c6b270f685b0f0970faf23d5b1";
 const PATCHED_RULES_SHA256: &str =
-    "dff8e4b6c1e86828fdf11b49200b1f84c7c0e3a33f9e793f7bc4a6978729551a";
+    "bd577f47615b580ec481dc1f5574c55d84f088231851d413897602a36cfc1e50";
 
 /// The upstream rules check neither the image a container pulls, nor that every pinned variable
 /// is set, nor HOSTNAME and the sandbox hostname: the host could swap the image, drop or add
-/// env, and rename the pod without changing the measurement.
-const RULE_EDITS: [(&str, &str); 4] = [
+/// env, and rename the pod without changing the measurement. They also match a mount's source
+/// against an unanchored pattern, and genpolicy writes a disk emptyDir's as `""`, so the host
+/// could put a directory it filled at any such destination; anchored, an emptyDir mount must
+/// come from a block storage under the sandbox's storage path.
+const RULE_EDITS: [(&str, &str); 7] = [
     (
         "    allow_anno(p_container, i_oci)\n",
         "    allow_anno(p_container, i_oci)\n    allow_image(p_oci, i_oci, i_storages)\n",
@@ -49,7 +52,18 @@ const RULE_EDITS: [(&str, &str); 4] = [
         "    i_kata_type == \"pod_sandbox\"\n\n    allow_sandbox_container_name(p_oci, i_oci)\n",
         "    i_kata_type == \"pod_sandbox\"\n\n    print(\"allow_by_container_type 1: Hostname =\", i_oci.Hostname, \"s_name =\", s_name)\n    i_oci.Hostname == s_name\n\n    allow_sandbox_container_name(p_oci, i_oci)\n",
     ),
+    (
+        "    i_storage.mount_point == i_mount.source\n",
+        "    i_storage.mount_point == i_mount.source\n    i_storage.driver in [\"blk\", \"scsi\"]\n    p_mount.source == \"\"\n    startswith(i_mount.source, concat(\"\", [policy_data.common.spath, \"/\"]))\n",
+    ),
+    ANCHORED_SOURCE,
+    ANCHORED_SOURCE,
 ];
+/// Both variants of `mount_source_allows`, in turn.
+const ANCHORED_SOURCE: (&str, &str) = (
+    "    regex.match(regex4, i_mount.source)\n",
+    "    regex.match(concat(\"\", [\"^(?:\", regex4, \")$\"]), i_mount.source)\n",
+);
 const RULE_ADDITIONS: &str = include_str!("coco/rules-additions.rego");
 const SETTINGS_DROP_INS: [(&str, &str); 2] = [
     ("20-node.json", include_str!("coco/20-node.json")),
@@ -745,6 +759,7 @@ mod tests {
     /// `B300_POD`, taken from its policy denials with each tampering undone.
     const B300_REQUESTS: &str = include_str!("../../../testdata/coco/b300/requests.json");
     const SANDBOX: usize = 0;
+    const RUNTIME: usize = 1;
     const APP: usize = 2;
 
     fn b300_requests() -> Vec<Value> {
@@ -799,6 +814,15 @@ mod tests {
 
     fn mounts(request: &mut Value) -> &mut Vec<Value> {
         request["OCI"]["Mounts"].as_array_mut().unwrap()
+    }
+
+    fn mount_source(request: &mut Value, destination: &str, source: &str) {
+        for m in mounts(request)
+            .iter_mut()
+            .filter(|m| m["destination"] == destination)
+        {
+            m["source"] = source.into();
+        }
     }
 
     fn host_tampering(requests: &[Value]) -> Vec<(&'static str, (usize, Value))> {
@@ -857,6 +881,49 @@ mod tests {
                     {
                         m["destination"] = "/etc".into();
                     }
+                }),
+            ),
+            (
+                "disk emptyDir swapped for a host share",
+                tampered(requests, APP, |r| mount_source(r, "/run/alpha", share)),
+            ),
+            (
+                "disk emptyDir bound to the image rootfs",
+                tampered(requests, APP, |r| {
+                    mount_source(r, "/run/alpha", "/run/kata-containers/app/rootfs")
+                }),
+            ),
+            (
+                "disk emptyDir bound to an image pulled under the storage path",
+                tampered(requests, APP, |r| {
+                    let image = "/run/kata-containers/sandbox/storage/image";
+                    r["storages"][0]["mount_point"] = image.into();
+                    mount_source(r, "/run/alpha", image)
+                }),
+            ),
+            (
+                "disk emptyDir's block device mounted out of the storage path",
+                tampered(requests, APP, |r| {
+                    let outside = "/run/kata-containers/sandbox/storage/../../shared/containers";
+                    r["storages"][1]["mount_point"] = outside.into();
+                    mount_source(r, "/run/alpha", outside)
+                }),
+            ),
+            (
+                "configfs-tsm swapped for a host share",
+                tampered(requests, RUNTIME, |r| {
+                    mount_source(
+                        r,
+                        "/sys/kernel/config",
+                        &format!("{share}/sys/kernel/config"),
+                    )
+                }),
+            ),
+            (
+                "/dev/shm swapped for a host share",
+                tampered(requests, APP, |r| {
+                    let shm = format!("{share}/run/kata-containers/sandbox/shm");
+                    mount_source(r, "/dev/shm", &shm)
                 }),
             ),
             (
@@ -1010,7 +1077,7 @@ mod tests {
     /// Our rules exist because genpolicy 4.0.0's own do not refuse these; when they start to,
     /// the edits may be redundant.
     #[test]
-    fn upstream_rules_still_let_the_host_swap_the_image_drop_env_and_pull_a_pause_image() {
+    fn upstream_rules_still_allow_what_our_edits_refuse() {
         let requests = b300_requests();
         let upstream = upstream_policy(B300_GENPOLICY);
         launched(&upstream, &requests);
@@ -1019,6 +1086,9 @@ mod tests {
             "image swap under the pinned name",
             "env removed",
             "pause image pulled from a registry",
+            "disk emptyDir swapped for a host share",
+            "configfs-tsm swapped for a host share",
+            "/dev/shm swapped for a host share",
         ] {
             let (_, (index, request)) = tampering.iter().find(|(s, _)| *s == wanted).unwrap();
             let mut agent = launched(&upstream, &requests[..*index]);
