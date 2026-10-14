@@ -685,9 +685,12 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
         } => {
             let database_password = database_password_file
                 .map(|path| {
-                    fs::read_to_string(&path)
-                        .map(|text| text.trim().to_owned())
-                        .map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))
+                    let text = fs::read_to_string(&path)
+                        .map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))?;
+                    match text.trim() {
+                        "" => Err(Exit::Usage(format!("{}: empty", path.display()))),
+                        password => Ok(password.to_owned()),
+                    }
                 })
                 .transpose()?;
             let mut keys = Vec::new();

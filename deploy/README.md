@@ -155,10 +155,10 @@ node therefore refuses to start if `ALPHACOMPUTE_DATABASE_URL` carries a passwor
 - **Join.** The serving node passes its password in the join reply. A Kata joiner writes no
   `node.join.request`: the database address is part of its measured init-data.
 
-Nobody holds the derived password. The database owner can still reset it, and the next unseal
-sets it back. Kata nodes that joined a Phala node use the Phala node's password. If both nodes
-are lost after the last Phala node is gone, let the role in once with a `trust` line, unseal,
-and remove the line.
+Nobody holds the derived password. A node logs in with it before it can set it again, so the
+role must keep it: if the database owner resets it, or if both nodes are lost after Kata nodes
+joined a Phala node (they then hold the Phala password), let the role in once with a `trust`
+line, unseal (the node sets the derived password again), and remove the line.
 
 ## The broker's database
 

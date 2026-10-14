@@ -258,9 +258,13 @@ pub async fn unseal(
         if let Phase::Sealed { shares } = &mut *node.phase.write() {
             shares.clear();
         }
-        audit::node("node.unseal", "denied", e.details())
+        // On Kata a wrong root is also a wrong database password: keep the refusal, not that.
+        if let Err(audit) = audit::node("node.unseal", "denied", e.details())
             .insert(&node.pool)
-            .await?;
+            .await
+        {
+            eprintln!("node.unseal denied: {audit}");
+        }
         return Err(e);
     }
     audit::node("node.unseal", "ok", json!({}))
@@ -357,7 +361,7 @@ pub async fn try_join(node: &Node) -> Result<(), ApiError> {
         if !client.ready().await.is_ok_and(|r| !r.sealed) {
             continue;
         }
-        match join_via(node, &client, endpoint).await {
+        match join_via(node, &client, endpoint, doc.version).await {
             Ok(()) => return Ok(()),
             Err(e) => eprintln!("join {endpoint}: {}", e.message),
         }
@@ -365,7 +369,12 @@ pub async fn try_join(node: &Node) -> Result<(), ApiError> {
     Err(ApiError::internal("no ready node to join"))
 }
 
-async fn join_via(node: &Node, client: &Client, endpoint: &str) -> Result<(), ApiError> {
+async fn join_via(
+    node: &Node,
+    client: &Client,
+    endpoint: &str,
+    pinned_version: u64,
+) -> Result<(), ApiError> {
     let http = |e: alpha_client::Error| ApiError::internal(format!("join: {e}"));
     let nonce_text = client.attest_nonce().await.map_err(http)?.nonce;
     let nonce = decode32("nonce", &nonce_text)?;
@@ -400,6 +409,14 @@ async fn join_via(node: &Node, client: &Client, endpoint: &str) -> Result<(), Ap
             .database_password
             .ok_or_else(|| ApiError::internal("join reply: no database_password"))?;
         node.use_database_password(Zeroizing::new(password));
+        // The peer was pinned by a document fetched without the database; one older than the
+        // stored row may be a replay naming a retired Revision, so nothing from it is used.
+        let stored = crate::platform::load_stored(node).await?;
+        if stored.is_some_and(|s| s.document.version > pinned_version) {
+            return Err(ApiError::internal(
+                "the other node was pinned by a platform document older than the stored one",
+            ));
+        }
     }
     node.start_serving(Intermediates {
         tenant_kek_root,
