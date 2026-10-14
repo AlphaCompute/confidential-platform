@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use alpha_runtime::{
-    Config, EXIT_REFUSED, Error, Exit, INIT_DATA_PATH, RevisionText, Runtime, SECRETS_DIR,
-    SOCKET_PATH, TLS_PORT, gpu, proxy,
+    Config, EXIT_REFUSED, Error, Exit, INIT_DATA_PATH, READY_PORT, RevisionText, Runtime,
+    SECRETS_DIR, SOCKET_PATH, TLS_PORT, gpu, proxy,
 };
 use alpha_tsm::Substrate;
 use p256::ecdsa::SigningKey;
@@ -101,7 +101,12 @@ async fn run() -> Result<Exit, Error> {
         std::os::unix::fs::PermissionsExt::from_mode(0o666),
     )
     .map_err(socket)?;
-    let tls = proxy::Endpoint::bind(runtime.clone(), ([0, 0, 0, 0], TLS_PORT).into()).await?;
+    let tls = proxy::Endpoint::bind(
+        runtime.clone(),
+        ([0, 0, 0, 0], TLS_PORT).into(),
+        ([0, 0, 0, 0], READY_PORT).into(),
+    )
+    .await?;
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| Error::Socket(format!("SIGTERM handler: {e}")))?;
     let shutdown = async move {

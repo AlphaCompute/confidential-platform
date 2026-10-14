@@ -32,7 +32,7 @@ use alpha_client::tls::{self, InstanceSans};
 use alpha_client::{
     AttestReply, AttestRequest, Client, DerivedKey, Identity, Pin, Secret, TimeProvider,
 };
-use alpha_core::{ComposeHash, MAX_INIT_DATA};
+use alpha_core::{AppId, ComposeHash, MAX_INIT_DATA};
 use base64::Engine;
 use base64::prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
 use p256::ecdsa::SigningKey;
@@ -44,6 +44,10 @@ use tokio::sync::watch;
 use zeroize::Zeroizing;
 
 pub use alpha_client::runtime::{SOCKET_PATH, TLS_PORT};
+
+/// Plain HTTP, `GET /ready` only, for a kubelet probe: a Kata agent policy refuses exec, and
+/// the kubelet cannot present an Instance leaf to a caller-pinned Endpoint.
+pub const READY_PORT: u16 = 8444;
 
 pub const RENEW_BEFORE: Duration = Duration::from_secs(600);
 const RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -165,8 +169,44 @@ pub fn parse_upstream(text: Option<&str>) -> Result<Option<String>, Error> {
     Ok(Some(text.to_owned()))
 }
 
+/// `ALPHACOMPUTE_TLS_CALLER_APPS`: comma-separated App ids whose Instance leaves alone may open
+/// the Endpoint; unset or empty admits any client.
+pub fn parse_callers(text: Option<&str>, upstream: Option<&str>) -> Result<Vec<AppId>, Error> {
+    let refused = |m: String| Error::Config(format!("ALPHACOMPUTE_TLS_CALLER_APPS: {m}"));
+    let callers = list(text.unwrap_or_default())
+        .map(|s| {
+            s.parse()
+                .map_err(|_| refused(format!("{s:?} is not an App id")))
+        })
+        .collect::<Result<Vec<AppId>, _>>()?;
+    if !callers.is_empty() && upstream.is_none() {
+        return Err(refused("set without ALPHACOMPUTE_TLS_UPSTREAM".into()));
+    }
+    Ok(callers)
+}
+
+/// `ALPHACOMPUTE_TLS_UPSTREAM_READY`: the upstream's own readiness path, such as vLLM's
+/// `/health`; set, [`READY_PORT`] serves plain-HTTP `GET /ready`.
+pub fn parse_ready(text: Option<&str>, upstream: Option<&str>) -> Result<Option<String>, Error> {
+    let Some(text) = text else {
+        return Ok(None);
+    };
+    let refused = |m: &str| Error::Config(format!("ALPHACOMPUTE_TLS_UPSTREAM_READY: {m}"));
+    if upstream.is_none() {
+        return Err(refused("set without ALPHACOMPUTE_TLS_UPSTREAM"));
+    }
+    // It goes into a request line verbatim.
+    if !text.starts_with('/') || text.len() > 256 || !text.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(refused(
+            "is not a path: a leading /, printable ASCII without spaces, at most 256 bytes",
+        ));
+    }
+    Ok(Some(text.to_owned()))
+}
+
 /// The three environment variables and, when a service declared a Secret,
-/// `ALPHACOMPUTE_SECRETS`; for a wrapped compose, `ALPHACOMPUTE_TLS_UPSTREAM`.
+/// `ALPHACOMPUTE_SECRETS`; for a wrapped compose or a Kata pod with an Endpoint,
+/// `ALPHACOMPUTE_TLS_UPSTREAM` and optionally its caller pin and readiness path.
 #[derive(Clone, Debug)]
 pub struct Config {
     pub kms_ca_spki_sha256: [u8; 32],
@@ -174,6 +214,8 @@ pub struct Config {
     pub kms_endpoints: Vec<String>,
     pub secrets: Secrets,
     pub tls_upstream: Option<String>,
+    pub tls_callers: Vec<AppId>,
+    pub tls_ready: Option<String>,
 }
 
 impl Config {
@@ -187,6 +229,12 @@ impl Config {
             &var("ALPHACOMPUTE_KMS_ENDPOINTS")?,
             std::env::var("ALPHACOMPUTE_SECRETS").ok().as_deref(),
             std::env::var("ALPHACOMPUTE_TLS_UPSTREAM").ok().as_deref(),
+            std::env::var("ALPHACOMPUTE_TLS_CALLER_APPS")
+                .ok()
+                .as_deref(),
+            std::env::var("ALPHACOMPUTE_TLS_UPSTREAM_READY")
+                .ok()
+                .as_deref(),
         )
     }
 
@@ -196,6 +244,8 @@ impl Config {
         endpoints: &str,
         secrets: Option<&str>,
         tls_upstream: Option<&str>,
+        tls_callers: Option<&str>,
+        tls_ready: Option<&str>,
     ) -> Result<Self, Error> {
         let kms_ca_spki_sha256 = ca_spki_sha256
             .trim()
@@ -224,12 +274,16 @@ impl Config {
         }
         let secrets = parse_secrets(secrets)?;
         let tls_upstream = parse_upstream(tls_upstream)?;
+        let tls_callers = parse_callers(tls_callers, tls_upstream.as_deref())?;
+        let tls_ready = parse_ready(tls_ready, tls_upstream.as_deref())?;
         Ok(Self {
             kms_ca_spki_sha256,
             kms_revisions,
             kms_endpoints,
             secrets,
             tls_upstream,
+            tls_callers,
+            tls_ready,
         })
     }
 
@@ -736,6 +790,8 @@ mod tests {
             "https://a:8443/,, https://b:8443",
             None,
             None,
+            None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -749,7 +805,7 @@ mod tests {
         );
 
         let refused = |a: &str, b: &str, c: &str| {
-            let Err(Error::Config(m)) = Config::parse(a, b, c, None, None) else {
+            let Err(Error::Config(m)) = Config::parse(a, b, c, None, None, None, None) else {
                 panic!("{a} {b} {c} was accepted");
             };
             m
@@ -766,7 +822,7 @@ mod tests {
     #[test]
     fn secrets_parse_the_wraps_variable() {
         let wrap = r#"{"db":["db_password"],"web":["db_password","session_key"]}"#;
-        let c = Config::parse(HASH, HASH, "https://a", Some(wrap), None).unwrap();
+        let c = Config::parse(HASH, HASH, "https://a", Some(wrap), None, None, None).unwrap();
         let set = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<BTreeSet<_>>();
         assert_eq!(
             c.secrets,
@@ -796,7 +852,8 @@ mod tests {
                 panic!("{bad} was accepted");
             };
             assert!(m.starts_with("ALPHACOMPUTE_SECRETS:"), "{bad}: {m}");
-            let Err(Error::Config(m)) = Config::parse(HASH, HASH, "https://a", Some(bad), None)
+            let Err(Error::Config(m)) =
+                Config::parse(HASH, HASH, "https://a", Some(bad), None, None, None)
             else {
                 panic!("{bad} was accepted by Config::parse");
             };
@@ -807,7 +864,7 @@ mod tests {
     #[test]
     fn the_tls_upstream_is_a_lowercase_service_and_a_port() {
         assert_eq!(parse_upstream(None).unwrap(), None);
-        let c = Config::parse(HASH, HASH, "https://a", None, Some("web:80")).unwrap();
+        let c = Config::parse(HASH, HASH, "https://a", None, Some("web:80"), None, None).unwrap();
         assert_eq!(c.tls_upstream.as_deref(), Some("web:80"));
         assert_eq!(
             parse_upstream(Some("localhost:65535")).unwrap().as_deref(),
@@ -827,11 +884,59 @@ mod tests {
             " web:80x",
             "a..b:80",
         ] {
-            let Err(Error::Config(m)) = Config::parse(HASH, HASH, "https://a", None, Some(bad))
+            let Err(Error::Config(m)) =
+                Config::parse(HASH, HASH, "https://a", None, Some(bad), None, None)
             else {
                 panic!("{bad} was accepted");
             };
             assert!(m.starts_with("ALPHACOMPUTE_TLS_UPSTREAM:"), "{bad}: {m}");
+        }
+    }
+
+    #[test]
+    fn caller_apps_and_the_ready_path_need_an_upstream_and_their_shape() {
+        let app = "0199e4a0-0000-7000-8000-000000000001";
+        let parse = |callers, ready| {
+            Config::parse(
+                HASH,
+                HASH,
+                "https://a",
+                None,
+                Some("web:80"),
+                callers,
+                ready,
+            )
+        };
+        let callers = format!(" {app},, {app} ");
+        let c = parse(Some(&callers), Some("/health")).unwrap();
+        assert_eq!(c.tls_callers, [app.parse::<AppId>().unwrap(); 2]);
+        assert_eq!(c.tls_ready.as_deref(), Some("/health"));
+        assert!(parse(Some(""), None).unwrap().tls_callers.is_empty());
+
+        let refused = |r: Result<Config, Error>, var: &str| {
+            let Err(Error::Config(m)) = r else {
+                panic!("accepted");
+            };
+            assert!(m.starts_with(var), "{m}");
+        };
+        let unwrapped =
+            |callers, ready| Config::parse(HASH, HASH, "https://a", None, None, callers, ready);
+        refused(unwrapped(Some(app), None), "ALPHACOMPUTE_TLS_CALLER_APPS:");
+        refused(
+            unwrapped(None, Some("/health")),
+            "ALPHACOMPUTE_TLS_UPSTREAM_READY:",
+        );
+        refused(
+            parse(Some("not-a-uuid"), None),
+            "ALPHACOMPUTE_TLS_CALLER_APPS:",
+        );
+        for bad in [
+            "health",
+            "/a b",
+            "/a\r\nX: y",
+            &format!("/{}", "a".repeat(256)),
+        ] {
+            refused(parse(None, Some(bad)), "ALPHACOMPUTE_TLS_UPSTREAM_READY:");
         }
     }
 

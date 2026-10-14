@@ -90,6 +90,8 @@ fn config(h: &Harness, endpoints: Vec<String>) -> Config {
         kms_endpoints: endpoints,
         secrets: Secrets::new(),
         tls_upstream: None,
+        tls_callers: Vec::new(),
+        tls_ready: None,
     }
 }
 
@@ -168,7 +170,8 @@ impl Socket {
 
     /// As [`Socket::start`], with the Endpoint listening on a free local port.
     async fn with_endpoint(runtime: Arc<Runtime>) -> (Self, SocketAddr) {
-        let endpoint = proxy::Endpoint::bind(runtime.clone(), "127.0.0.1:0".parse().unwrap())
+        let local = "127.0.0.1:0".parse().unwrap();
+        let endpoint = proxy::Endpoint::bind(runtime.clone(), local, local)
             .await
             .unwrap()
             .expect("the config names an upstream");
@@ -859,6 +862,81 @@ async fn a_wrapped_endpoint_is_served_with_the_instance_leaf() {
     assert_eq!(socket.stop().await, Exit::Drained);
 }
 
+/// Whether `config` gets the service's body through the Endpoint; a refusal may come as a failed
+/// handshake or as a closed connection after it.
+async fn served(addr: SocketAddr, config: &Arc<ClientConfig>) -> bool {
+    let Ok(mut tls) = connect(addr, config).await else {
+        return false;
+    };
+    if tls
+        .write_all(b"GET / HTTP/1.1\r\nHost: app\r\nConnection: close\r\n\r\n")
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    let mut reply = Vec::new();
+    let _ = tls.read_to_end(&mut reply).await;
+    reply.ends_with(BODY.as_bytes())
+}
+
+/// A plain-HTTP `GET /ready` on `addr`: the status.
+async fn ready_status(addr: SocketAddr) -> u16 {
+    let mut tcp = TcpStream::connect(addr).await.unwrap();
+    tcp.write_all(b"GET /ready HTTP/1.1\r\nHost: kubelet\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut reply = String::new();
+    tcp.read_to_string(&mut reply).await.unwrap();
+    reply[9..12].parse().unwrap()
+}
+
+#[tokio::test]
+async fn a_caller_pinned_endpoint_serves_only_listed_apps_and_answers_ready_in_plain_http() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    let (app, _, _) = app_with_secret(&h, b"v1").await;
+    let (port, _) = start_plain_service().await;
+    let config = Config {
+        tls_callers: vec![app],
+        tls_ready: Some("/".into()),
+        ..config_with_upstream(&h, port)
+    };
+    let (runtime, _) = start_runtime(&h, config);
+    let attested = runtime.attest().await.unwrap();
+    let local = "127.0.0.1:0".parse().unwrap();
+    let endpoint = proxy::Endpoint::bind(runtime.clone(), local, local)
+        .await
+        .unwrap()
+        .unwrap();
+    let (addr, ready) = (
+        endpoint.local_addr().unwrap(),
+        endpoint.ready_addr().unwrap(),
+    );
+    let socket = Socket::serve(runtime.clone(), Some(endpoint));
+
+    let ca = tls::cert_from_pem(&h.ca_pem).unwrap();
+    let as_instance = |identity| {
+        Arc::new(
+            tls::client_config(Some(Pin::Ca(ca.clone())), identity, pinned_time(h.now())).unwrap(),
+        )
+    };
+    let leaf = tls::Identity {
+        chain: attested
+            .chain_pem
+            .iter()
+            .map(|pem| tls::cert_from_pem(pem).unwrap().to_vec())
+            .collect(),
+        pkcs8: runtime.tls_private_key().to_vec(),
+    };
+    assert!(served(addr, &as_instance(Some(leaf))).await);
+    assert!(!served(addr, &as_instance(None)).await);
+    assert_eq!(ready_status(ready).await, 200);
+
+    assert_eq!(socket.stop().await, Exit::Drained);
+}
+
 #[tokio::test]
 async fn a_client_without_the_hybrid_group_is_refused() {
     let Some(h) = nonce_clock_harness().await else {
@@ -1127,6 +1205,8 @@ fn the_wrap_and_the_runtime_agree_on_the_endpoint() {
         env("ALPHACOMPUTE_KMS_ENDPOINTS").unwrap(),
         env("ALPHACOMPUTE_SECRETS"),
         env("ALPHACOMPUTE_TLS_UPSTREAM"),
+        None,
+        None,
     )
     .unwrap();
     assert_eq!(config.tls_upstream.as_deref(), Some("web:80"));
