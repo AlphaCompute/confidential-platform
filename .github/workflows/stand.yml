@@ -78,5 +78,5 @@ jobs:
             done <<< "$APPS"
             return $down
           }
-          [ -n "$KMS$APPS" ] || { echo "::error::STAND_KMS_ENDPOINTS and STAND_APP_ENDPOINTS name nothing"; exit 1; }
+          [ -n "${KMS//[[:space:]]/}${APPS//[[:space:]]/}" ] || { echo "::error::STAND_KMS_ENDPOINTS and STAND_APP_ENDPOINTS name nothing"; exit 1; }
           check "" || { sleep 120; check "::error::"; }
