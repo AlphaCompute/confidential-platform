@@ -15,11 +15,19 @@ use alpha_attest::{
     appraise_kata_gpus, bind_gpus, verify_quote,
 };
 
-fn read(name: &str) -> Vec<u8> {
+fn testdata(path: &str) -> Vec<u8> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../testdata/attest/b300-gpu-595.58.03")
-        .join(name);
+        .join("../../testdata/attest")
+        .join(path);
     fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+fn read(name: &str) -> Vec<u8> {
+    testdata(&format!("b300-gpu-595.58.03/{name}"))
+}
+
+fn kata(name: &str) -> Vec<u8> {
+    testdata(&format!("b300-kata-4.0.0/{name}"))
 }
 
 fn gpu(name: &str) -> GpuEvidence {
@@ -157,13 +165,6 @@ fn altered_gpu_evidence_is_refused() {
         assert_eq!(err.code(), code, "{case}: {err}");
         assert!(err.to_string().contains(fragment), "{case}: {err}");
     }
-}
-
-fn kata(name: &str) -> Vec<u8> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../testdata/attest/b300-kata-4.0.0")
-        .join(name);
-    fs::read(path).unwrap()
 }
 
 /// The GPU pod's real quote, whose `report_data` is the challenge and the SHA-256 of `g1b`'s
