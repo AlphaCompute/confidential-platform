@@ -28,7 +28,7 @@ jobs:
       # genpolicy accepts every Kata template in deploy/kata, writes the policy for its pods'
       # names, and the policy's data is the one the platform document pins. The images only shape
       # the container entries, which the pin leaves out, so any public one renders; ghcr.io, as
-      # public.ecr.aws rate-limits anonymous pulls from runners. The other values are placeholders.
+      # public.ecr.aws rate-limits anonymous pulls from runners.
       - name: Render the Kata templates with the release genpolicy
         shell: bash
         env:

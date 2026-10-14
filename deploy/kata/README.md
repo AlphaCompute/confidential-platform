@@ -192,12 +192,11 @@ dead at the genesis commit.
 resources, the KMS nodes' shape (1 vCPU, 2048 MiB), whose reference values the document already
 lists. `model-server.yaml` is one vLLM model on one GPU of `kata-qemu-nvidia-gpu-tdx`. Every pod
 runs `alpha-runtime` beside its service. The three services read their leaf and Secrets from its
-socket and terminate their own TLS on 8443. How the model server is reached is in the header of
-`model-server.yaml`. Each template is its App's Revision once rendered: a new value of any input below is a new Revision.
+socket and terminate their own TLS on 8443. Each template is its App's Revision once rendered: a new value of any input below is a new Revision.
 
 ### Inputs
 
-Each is the operator's, chosen per environment; none has a default.
+Each, and each service's App id, is the operator's, chosen per environment; none has a default.
 
 | Input | Templates | What |
 |---|---|---|
@@ -214,8 +213,6 @@ Each is the operator's, chosen per environment; none has a default.
 | `MODEL_IMAGE` | model-server | vLLM with the weights, by digest (below) |
 | `MODEL_CALLER_APPS` | model-server | the App ids of the front and the guard, comma-separated |
 | `MODEL_CPUS`, `MODEL_MEMORY` | model-server | the pod VM's shape; the memory holds the image the guest pulls, vLLM's host side and the KV cache |
-
-The App id of each service, given to `render`, is the operator's too.
 
 ### The model image
 
@@ -282,7 +279,6 @@ kubectl -n alpha-models expose deployment <MODEL_NAME> --port 8443
 ```
 
 A pod turns ready once its runtime has attested and its service answers: the front once its
-default model's gateway check passes, the guard and the broker once they reach the front and the
-database, a model server once vLLM's `/health` answers. A Deployment
-scales without a new Revision. Exposing the broker or the front outside
+default model passes the gateway check or its model server lists it, the guard and the broker once they reach the front and the
+database, a model server once vLLM's `/health` answers. Exposing the broker or the front outside
 the cluster is the operator's choice of ingress, in TLS passthrough: each terminates its own TLS.
