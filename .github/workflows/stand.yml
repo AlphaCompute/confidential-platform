@@ -72,9 +72,10 @@ jobs:
           check() {
             down=0
             # Appraisal needs the TDX QE identity, and unlike the TCB info it is not per platform.
-            if [ -n "$PCCS" ]; then
-              out=$(curl -sS -f -m 30 "${PCCS%/}/tdx/certification/v4/qe/identity" 2>&1) && [ -n "$out" ] ||
-                { echo "$1$PCCS: no TDX QE identity: ${out:-empty body}"; down=1; }
+            if [ -n "$PCCS" ] && { ! out=$(curl -sS -m 30 -o /dev/null -w '%{http_code} %{size_download}' \
+              "${PCCS%/}/tdx/certification/v4/qe/identity" 2>&1) || [[ $out != "200 "[1-9]* ]]; }; then
+              echo "$1$PCCS: no TDX QE identity (status, bytes): ${out//$'\n'/ }"
+              down=1
             fi
             for url in $KMS; do
               out=$($alpha verify --kms-node "$url" 2>&1) || { echo "$1$url: $out"; down=1; }
