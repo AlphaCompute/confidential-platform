@@ -261,6 +261,19 @@ enum CocoCommand {
         /// A Pod whose images are all pinned `@sha256:` and whose supplementalGroups are explicit.
         pod: PathBuf,
     },
+    /// Prints `{mrtd, rtmr1, rtmr2}` of a Kata TD booting these artifacts, for the platform
+    /// document's Kata reference values. RTMR0 depends on the VM shape and is captured instead.
+    Measure {
+        /// The TDVF image, `share/ovmf/OVMF.inteltdx.fd` of the kata-static tarball.
+        #[arg(long)]
+        firmware: PathBuf,
+        /// The runtime class's `kernel`, e.g. `share/kata-containers/vmlinuz-6.18.35-200`.
+        #[arg(long)]
+        kernel: PathBuf,
+        /// The guest command line exactly as Kata passes it to QEMU's `-append`.
+        #[arg(long)]
+        cmdline: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -583,6 +596,23 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             fs::write(&out, &rendered.pod)
                 .map_err(|e| Exit::Refused(format!("{}: {e}", out.display())))?;
             Ok(json!(rendered))
+        }
+        Command::Coco {
+            command:
+                CocoCommand::Measure {
+                    firmware,
+                    kernel,
+                    cmdline,
+                },
+        } => {
+            let read = |path: &Path| {
+                fs::read(path).map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))
+            };
+            Ok(json!({
+                "mrtd": coco::measure::mrtd(&read(&firmware)?)?,
+                "rtmr1": coco::measure::rtmr1(&read(&kernel)?)?,
+                "rtmr2": coco::measure::rtmr2(&cmdline),
+            }))
         }
         Command::Catalog {
             command:
