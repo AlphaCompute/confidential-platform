@@ -4,7 +4,7 @@ use std::time::SystemTime;
 
 use alpha_kms::{CollateralSource, Config, Node, node, platform, tls};
 use alpha_tsm::Substrate;
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::postgres::{PgAuthMethod, PgChannelBinding, PgConnectOptions, PgPoolOptions};
 use tokio::net::TcpListener;
 use zeroize::Zeroizing;
 
@@ -46,7 +46,10 @@ async fn run() -> Result<(), String> {
                     .into(),
             );
         }
-        (Substrate::Kata, None) => pool_options.connect_lazy_with(options),
+        (Substrate::Kata, None) => {
+            require_channel_binding(&options)?;
+            pool_options.connect_lazy_with(options)
+        }
         (Substrate::Dstack, _) => pool_options
             .connect_with(options)
             .await
@@ -104,6 +107,18 @@ async fn start_phase(node: &Arc<Node>) {
     }
 }
 
+/// `require_auth` keeps cleartext and MD5 refused should `channel_binding` ever stop implying it.
+fn require_channel_binding(options: &PgConnectOptions) -> Result<(), String> {
+    if options.get_channel_binding() == PgChannelBinding::Require
+        && options.get_require_auth() == Some(&[PgAuthMethod::ScramSha256][..])
+    {
+        return Ok(());
+    }
+    Err("ALPHACOMPUTE_DATABASE_URL of a Kata node must carry \
+         channel_binding=require&require_auth=scram-sha-256"
+        .into())
+}
+
 /// The URL's password, percent-decoded as sqlx reads it: a dstack node hands it to a Kata joiner.
 fn url_password(url: &str) -> Result<Option<Zeroizing<String>>, String> {
     let parsed = reqwest::Url::parse(url).map_err(|e| format!("ALPHACOMPUTE_DATABASE_URL: {e}"))?;
@@ -116,4 +131,23 @@ fn url_password(url: &str) -> Result<Option<Zeroizing<String>>, String> {
                 .map_err(|e| format!("ALPHACOMPUTE_DATABASE_URL password: {e}"))
         })
         .transpose()
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_kata_url_must_bind_scram_to_the_tls_connection() {
+        let check = |query: &str| {
+            let url = format!("postgres://alpha_kms_node@pg/alpha?sslmode=require{query}");
+            require_channel_binding(&PgConnectOptions::from_str(&url).unwrap())
+        };
+        assert!(check("&channel_binding=require&require_auth=scram-sha-256").is_ok());
+        assert!(check("").is_err());
+        assert!(check("&channel_binding=require").is_err());
+        assert!(check("&require_auth=scram-sha-256").is_err());
+        assert!(check("&channel_binding=require&require_auth=scram-sha-256,md5").is_err());
+    }
 }

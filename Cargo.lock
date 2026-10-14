@@ -3879,7 +3879,7 @@ dependencies = [
 [[package]]
 name = "sqlx"
 version = "0.9.0"
-source = "git+https://github.com/AlphaCompute/sqlx?rev=cbfd2eee5b84c5f8549dd2810ec31df441255659#cbfd2eee5b84c5f8549dd2810ec31df441255659"
+source = "git+https://github.com/AlphaCompute/sqlx?rev=1bb86958580b5676f223f168da76a135ceef900f#1bb86958580b5676f223f168da76a135ceef900f"
 dependencies = [
  "sqlx-core",
  "sqlx-macros",
@@ -3891,7 +3891,7 @@ dependencies = [
 [[package]]
 name = "sqlx-core"
 version = "0.9.0"
-source = "git+https://github.com/AlphaCompute/sqlx?rev=cbfd2eee5b84c5f8549dd2810ec31df441255659#cbfd2eee5b84c5f8549dd2810ec31df441255659"
+source = "git+https://github.com/AlphaCompute/sqlx?rev=1bb86958580b5676f223f168da76a135ceef900f#1bb86958580b5676f223f168da76a135ceef900f"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -3928,7 +3928,7 @@ dependencies = [
 [[package]]
 name = "sqlx-macros"
 version = "0.9.0"
-source = "git+https://github.com/AlphaCompute/sqlx?rev=cbfd2eee5b84c5f8549dd2810ec31df441255659#cbfd2eee5b84c5f8549dd2810ec31df441255659"
+source = "git+https://github.com/AlphaCompute/sqlx?rev=1bb86958580b5676f223f168da76a135ceef900f#1bb86958580b5676f223f168da76a135ceef900f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -3940,7 +3940,7 @@ dependencies = [
 [[package]]
 name = "sqlx-macros-core"
 version = "0.9.0"
-source = "git+https://github.com/AlphaCompute/sqlx?rev=cbfd2eee5b84c5f8549dd2810ec31df441255659#cbfd2eee5b84c5f8549dd2810ec31df441255659"
+source = "git+https://github.com/AlphaCompute/sqlx?rev=1bb86958580b5676f223f168da76a135ceef900f#1bb86958580b5676f223f168da76a135ceef900f"
 dependencies = [
  "cfg-if",
  "dotenvy",
@@ -3965,7 +3965,7 @@ dependencies = [
 [[package]]
 name = "sqlx-mysql"
 version = "0.9.0"
-source = "git+https://github.com/AlphaCompute/sqlx?rev=cbfd2eee5b84c5f8549dd2810ec31df441255659#cbfd2eee5b84c5f8549dd2810ec31df441255659"
+source = "git+https://github.com/AlphaCompute/sqlx?rev=1bb86958580b5676f223f168da76a135ceef900f#1bb86958580b5676f223f168da76a135ceef900f"
 dependencies = [
  "bitflags",
  "byteorder",
@@ -3992,7 +3992,7 @@ dependencies = [
 [[package]]
 name = "sqlx-postgres"
 version = "0.9.0"
-source = "git+https://github.com/AlphaCompute/sqlx?rev=cbfd2eee5b84c5f8549dd2810ec31df441255659#cbfd2eee5b84c5f8549dd2810ec31df441255659"
+source = "git+https://github.com/AlphaCompute/sqlx?rev=1bb86958580b5676f223f168da76a135ceef900f#1bb86958580b5676f223f168da76a135ceef900f"
 dependencies = [
  "atoi",
  "base64 0.22.1",
@@ -4028,7 +4028,7 @@ dependencies = [
 [[package]]
 name = "sqlx-sqlite"
 version = "0.9.0"
-source = "git+https://github.com/AlphaCompute/sqlx?rev=cbfd2eee5b84c5f8549dd2810ec31df441255659#cbfd2eee5b84c5f8549dd2810ec31df441255659"
+source = "git+https://github.com/AlphaCompute/sqlx?rev=1bb86958580b5676f223f168da76a135ceef900f#1bb86958580b5676f223f168da76a135ceef900f"
 dependencies = [
  "atoi",
  "chrono",
