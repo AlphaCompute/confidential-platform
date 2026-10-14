@@ -163,7 +163,7 @@ pub struct AppState {
     pub config: Config,
     pub secrets: parking_lot::RwLock<Secrets>,
     pub upstream: Option<Upstream>,
-    pub own: own::Servers,
+    pub own: BTreeMap<String, own::Server>,
 }
 
 /// Every error this service answers with, OpenAI-shaped on the wire. Messages never carry a
@@ -261,18 +261,19 @@ fn verify_error(outcome: upstream::VerifyOutcome, model: &str) -> Error {
     }
 }
 
-fn upstream(state: &AppState) -> Result<&Upstream, Error> {
-    state
+async fn verified_external<'a>(
+    state: &'a AppState,
+    model: &str,
+) -> Result<(&'a Upstream, reqwest::Client), Error> {
+    let upstream = state
         .upstream
         .as_ref()
-        .ok_or_else(|| Error::internal("no external provider is configured"))
-}
-
-async fn verified_external(state: &AppState, model: &str) -> Result<reqwest::Client, Error> {
-    upstream(state)?
+        .ok_or_else(|| Error::internal("no external provider is configured"))?;
+    let client = upstream
         .verified(model)
         .await
-        .map_err(|outcome| verify_error(outcome, model))
+        .map_err(|outcome| verify_error(outcome, model))?;
+    Ok((upstream, client))
 }
 
 async fn list_models(State(state): State<Arc<AppState>>, _: AuthedCaller) -> Json<Value> {
@@ -349,8 +350,7 @@ async fn chat_completions(
     let upstream_response = if let Some(server) = state.own.get(&model) {
         server.complete(body).await.map_err(|_| Error::Upstream)?
     } else {
-        let client = verified_external(&state, &model).await?;
-        let upstream = upstream(&state)?;
+        let (upstream, client) = verified_external(&state, &model).await?;
         let provider_key = state
             .secrets
             .read()

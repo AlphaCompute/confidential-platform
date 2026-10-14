@@ -68,47 +68,37 @@ pub struct Server {
     probe: Mutex<Option<(Instant, bool)>>,
 }
 
-#[derive(Default)]
-pub struct Servers(BTreeMap<String, Server>);
-
-impl Servers {
-    /// `leaf` is this Instance's own certificate, renewed in place.
-    pub fn new(
-        config: &BTreeMap<String, ModelServer>,
-        kms_ca: &CertificateDer<'static>,
-        leaf: Arc<dyn ResolvesClientCert>,
-        completion_timeout: Duration,
-    ) -> Result<Self, Error> {
-        config
-            .iter()
-            .map(|(model, server)| {
-                let tls = alpha_client::tls::renewing_client_config(
-                    Pin::CaAndInstanceRevisions(kms_ca.clone(), server.revisions.clone()),
-                    leaf.clone(),
-                    alpha_client::system_time_provider(),
-                )
-                .map_err(|e| Error::internal(format!("model server tls: {e}")))?;
-                let client = reqwest::Client::builder()
-                    .tls_backend_preconfigured(tls)
-                    .no_proxy()
-                    .redirect(reqwest::redirect::Policy::none())
-                    .timeout(completion_timeout)
-                    .build()
-                    .map_err(|e| Error::internal(format!("model server client: {e}")))?;
-                let server = Server {
-                    url: server.url.clone(),
-                    client,
-                    probe: Mutex::new(None),
-                };
-                Ok((model.clone(), server))
-            })
-            .collect::<Result<_, Error>>()
-            .map(Servers)
-    }
-
-    pub fn get(&self, model: &str) -> Option<&Server> {
-        self.0.get(model)
-    }
+/// `leaf` is this Instance's own certificate, renewed in place.
+pub fn servers(
+    config: &BTreeMap<String, ModelServer>,
+    kms_ca: &CertificateDer<'static>,
+    leaf: Arc<dyn ResolvesClientCert>,
+    completion_timeout: Duration,
+) -> Result<BTreeMap<String, Server>, Error> {
+    config
+        .iter()
+        .map(|(model, server)| {
+            let tls = alpha_client::tls::renewing_client_config(
+                Pin::CaAndInstanceRevisions(kms_ca.clone(), server.revisions.clone()),
+                leaf.clone(),
+                alpha_client::system_time_provider(),
+            )
+            .map_err(|e| Error::internal(format!("model server tls: {e}")))?;
+            let client = reqwest::Client::builder()
+                .tls_backend_preconfigured(tls)
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(completion_timeout)
+                .build()
+                .map_err(|e| Error::internal(format!("model server client: {e}")))?;
+            let server = Server {
+                url: server.url.clone(),
+                client,
+                probe: Mutex::new(None),
+            };
+            Ok((model.clone(), server))
+        })
+        .collect()
 }
 
 impl Server {
@@ -297,7 +287,7 @@ mod tests {
         );
         let mut state = test_state(config, b"bearer", "key");
         let front_leaf = ca.leaf(&alpha_core::compose_hash("front"));
-        let own = Servers::new(&state.config.own, &ca.der(), front_leaf, timeout).unwrap();
+        let own = servers(&state.config.own, &ca.der(), front_leaf, timeout).unwrap();
         Arc::get_mut(&mut state).unwrap().own = own;
         (crate::router(state), report_hits)
     }

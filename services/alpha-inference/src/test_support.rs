@@ -40,7 +40,7 @@ pub(crate) fn test_state(
             caller_bearer: zeroize::Zeroizing::new(caller_bearer.to_vec()),
         }),
         upstream,
-        own: crate::own::Servers::default(),
+        own: Default::default(),
     })
 }
 
