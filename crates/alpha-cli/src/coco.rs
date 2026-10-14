@@ -2,6 +2,8 @@
 //! init-data TOML whose SHA-256 the shim puts in `MRCONFIGID`, and the pod spec carrying that
 //! init-data. genpolicy, its rules and settings are pinned: they decide what the policy allows.
 
+pub mod measure;
+
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
