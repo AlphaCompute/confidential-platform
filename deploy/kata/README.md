@@ -36,7 +36,9 @@ adds `kata/` to the `alpha-kms-release-manifest` artifact:
 - `manifest.json`: `image`, `compose_hash` (`sha256:` of `init-data.toml`, the Revision),
   `rules_sha256` and `policy_data_sha256` (the values of the document's `kata_policy`).
 
-With the variables unset, the release renders no Kata pod. Anyone reproduces it on Linux x86_64
+With the variables unset, the release renders no Kata pod; neither does a release whose
+`alpha-kms` build fails because `crates/alpha-channel/release-keys/prod.pub` does not hold the
+production release key yet. Anyone reproduces it on Linux x86_64
 from the tag: `envsubst` the template with the same four values, then
 `alpha coco render --app-id 01a09f07-8d09-7640-94c1-bbdb74200a1e --kata <opt/kata of
 kata-tools-static-4.0.0-amd64.tar.zst> --out pod.yaml kms-node.yaml` prints the same `revision`
@@ -71,7 +73,8 @@ custodians have run `alpha keygen --custodian` and handed over their public keys
    ```
 
 2. **Postgres.** The owner password stays with the operator. The server certificate is
-   self-signed; the nodes connect with `sslmode=require` and do not verify it.
+   self-signed ECDSA (an Ed25519 certificate has no hash for channel binding). The nodes do not
+   verify it, but bind their SCRAM login to the TLS connection, so a relay in between fails.
 
    ```sh
    kubectl create namespace alpha-trust-db

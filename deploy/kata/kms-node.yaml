@@ -35,7 +35,7 @@ spec:
     # No password: the host reads the init-data. The node's login gets it from bootstrap, unseal
     # or the peer it joins.
     - name: ALPHACOMPUTE_DATABASE_URL
-      value: postgres://alpha_kms_node@postgres.alpha-trust-db.svc:5432/alpha?sslmode=require
+      value: postgres://alpha_kms_node@postgres.alpha-trust-db.svc:5432/alpha?sslmode=require&channel_binding=require&require_auth=scram-sha-256
     - name: ALPHACOMPUTE_KMS_ENDPOINTS
       value: "${KMS_ENDPOINTS}"
     - name: ALPHACOMPUTE_PLATFORM_DOCUMENT_URL
