@@ -16,7 +16,10 @@ pub mod platform;
 pub mod runtime;
 pub mod tls;
 
-use alpha_attest::{AttestationResult, EVIDENCE_FORMAT, EventLogEntry, Evidence, KataEvidence};
+pub use alpha_attest::InstanceEvidence;
+use alpha_attest::{
+    AttestationResult, EVIDENCE_FORMAT, EventLogEntry, Evidence, KATA_EVIDENCE_FORMAT, KataEvidence,
+};
 use alpha_core::{
     AppId, ComposeHash, KeyId, OrgId, PrincipalId, SecretId, context, signing_digest,
 };
@@ -168,14 +171,6 @@ pub struct AttestRequest {
     pub evidence: InstanceEvidence,
 }
 
-/// A dstack CVM's quote with the event log that replays it, or a Kata pod's quote alone.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum InstanceEvidence {
-    Dstack(Evidence),
-    Kata(KataEvidence),
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AttestReply {
     pub certificate_chain: Vec<String>,
@@ -256,22 +251,38 @@ pub struct KeyRevoked {
     pub receipt: Option<Value>,
 }
 
-/// `GET /v1/node/evidence`: the quote is base64url, `runtime_pubkey` the P-256 SPKI DER.
+/// `GET /v1/node/evidence`: the quote is base64url, `runtime_pubkey` the P-256 SPKI DER. A Kata
+/// node has no event log; a node that names no `format` is a dstack one.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeEvidence {
+    #[serde(default = "dstack_format")]
+    pub format: String,
     pub quote: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub event_log: Vec<EventLogEntry>,
     pub runtime_pubkey: String,
     pub xwing_pubkey: PublicKey,
     pub compose_hash: ComposeHash,
 }
 
+fn dstack_format() -> String {
+    EVIDENCE_FORMAT.into()
+}
+
 impl NodeEvidence {
-    pub fn evidence(&self) -> Result<Evidence, Error> {
-        Ok(Evidence {
-            format: EVIDENCE_FORMAT.into(),
-            quote: decode("quote", &self.quote)?,
-            event_log: self.event_log.clone(),
+    pub fn evidence(&self) -> Result<InstanceEvidence, Error> {
+        let quote = decode("quote", &self.quote)?;
+        Ok(if self.format == KATA_EVIDENCE_FORMAT {
+            InstanceEvidence::Kata(KataEvidence {
+                format: self.format.clone(),
+                quote,
+            })
+        } else {
+            InstanceEvidence::Dstack(Evidence {
+                format: self.format.clone(),
+                quote,
+                event_log: self.event_log.clone(),
+            })
         })
     }
 
@@ -369,7 +380,7 @@ pub struct UnsealReply {
 #[serde(deny_unknown_fields)]
 pub struct JoinRequest {
     pub nonce: String,
-    pub evidence: Evidence,
+    pub evidence: InstanceEvidence,
     pub xwing_pubkey: PublicKey,
 }
 

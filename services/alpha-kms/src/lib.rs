@@ -27,7 +27,9 @@ pub mod webauthn;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
-use alpha_attest::{Collateral, EventLogEntry, PlatformDocument};
+use alpha_attest::{
+    Collateral, EventLogEntry, Evidence, InstanceEvidence, KataEvidence, PlatformDocument,
+};
 use alpha_core::ComposeHash;
 use axum::Router;
 use axum::extract::{Request, State};
@@ -99,6 +101,13 @@ impl Intermediates {
     }
 }
 
+/// What names this node's Revision: a dstack CVM's event log, whose `compose-hash` event is in
+/// RTMR3, or the init-data digest a Kata pod's `MRCONFIGID` carries.
+pub enum Substrate {
+    Dstack(Vec<EventLogEntry>),
+    Kata(ComposeHash),
+}
+
 pub enum Phase {
     Sealed { shares: Vec<Vec<u8>> },
     Serving(Arc<Intermediates>),
@@ -120,7 +129,7 @@ pub struct Node {
     pub runtime_pkcs8: Zeroizing<Vec<u8>>,
     pub runtime_spki: Vec<u8>,
     pub xwing_key: alpha_crypto::PrivateKey,
-    pub event_log: Vec<EventLogEntry>,
+    pub substrate: Substrate,
     pub compose_hash: ComposeHash,
     pub release_key: ed25519_dalek::VerifyingKey,
     pub platform: RwLock<Option<Arc<PlatformDocument>>>,
@@ -136,11 +145,14 @@ impl Node {
         clock: Clock,
         collateral: CollateralSource,
         nonce_key: [u8; 32],
-        event_log: Vec<EventLogEntry>,
+        substrate: Substrate,
         release_key: ed25519_dalek::VerifyingKey,
     ) -> Result<Arc<Self>, String> {
-        let compose_hash = alpha_attest::event_log_compose_hash(&event_log)
-            .ok_or("the event log carries no compose-hash event")?;
+        let compose_hash = match &substrate {
+            Substrate::Dstack(event_log) => alpha_attest::event_log_compose_hash(event_log)
+                .ok_or("the event log carries no compose-hash event")?,
+            Substrate::Kata(init_data) => *init_data,
+        };
         let runtime_key = SigningKey::from_bytes((&random::<32>().map_err(|e| e.message)?).into())
             .map_err(|e| format!("runtime key: {e}"))?;
         let runtime_spki = runtime_key
@@ -167,7 +179,7 @@ impl Node {
             runtime_pkcs8,
             runtime_spki,
             xwing_key: alpha_crypto::PrivateKey::generate().map_err(|e| e.to_string())?,
-            event_log,
+            substrate,
             compose_hash,
             release_key,
             platform: RwLock::new(None),
@@ -175,6 +187,23 @@ impl Node {
             server_cert,
             bucket: Mutex::new((BUCKET_CAPACITY, Instant::now())),
         }))
+    }
+
+    /// This node's evidence for `report_data`, quoted now.
+    pub fn evidence(&self, report_data: &[u8; 64]) -> Result<InstanceEvidence, ApiError> {
+        let quote =
+            alpha_tsm::quote(report_data).map_err(|e| ApiError::internal(format!("quote: {e}")))?;
+        Ok(match &self.substrate {
+            Substrate::Dstack(event_log) => InstanceEvidence::Dstack(Evidence {
+                format: alpha_attest::EVIDENCE_FORMAT.into(),
+                quote,
+                event_log: event_log.clone(),
+            }),
+            Substrate::Kata(_) => InstanceEvidence::Kata(KataEvidence {
+                format: alpha_attest::KATA_EVIDENCE_FORMAT.into(),
+                quote,
+            }),
+        })
     }
 
     pub fn now(&self) -> SystemTime {

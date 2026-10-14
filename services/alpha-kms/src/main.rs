@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use alpha_kms::{CollateralSource, Config, Node, node, platform, tls};
+use alpha_kms::{CollateralSource, Config, Node, Substrate, node, platform, tls};
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 
@@ -35,14 +35,19 @@ async fn run() -> Result<(), String> {
     let release_key = alpha_core::hex_bytes::<32>(RELEASE_KEY_HEX.trim())
         .and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok())
         .ok_or("release-key.pub is not an Ed25519 public key")?;
-    let event_log = alpha_tsm::event_log().map_err(|e| format!("event log: {e}"))?;
+    // The same rule as alpha-runtime's: dstack exactly when its guest agent's socket exists.
+    let substrate = if std::path::Path::new(alpha_tsm::DSTACK_SOCKET).exists() {
+        Substrate::Dstack(alpha_tsm::event_log().map_err(|e| format!("event log: {e}"))?)
+    } else {
+        Substrate::Kata(alpha_tsm::init_data().map_err(|e| format!("init-data: {e}"))?)
+    };
     let node = Node::new(
         pool,
         Config::from_env()?,
         Arc::new(SystemTime::now),
         CollateralSource::Pccs(alpha_kms::env("ALPHACOMPUTE_PCCS_URL")?),
         alpha_kms::random().map_err(|e| e.message)?,
-        event_log,
+        substrate,
         release_key,
     )?;
     platform::start(&node).await;

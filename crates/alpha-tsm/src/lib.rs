@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alpha_attest::EventLogEntry;
+use alpha_core::ComposeHash;
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use dcap_qvl::quote::Quote;
@@ -75,6 +76,19 @@ pub fn quote(report_data: &[u8; 64]) -> Result<Vec<u8>, Error> {
     } else {
         quote_from(socket, report_data)
     }
+}
+
+/// The init-data digest this Kata TD booted with, from the `MRCONFIGID` of a quote it takes of
+/// itself. Read from the hardware rather than configured, so the node's leaf names the Revision a
+/// verifier of its evidence would find.
+pub fn init_data() -> Result<ComposeHash, Error> {
+    let quote = quote(&[0; 64])?;
+    let parsed = Quote::parse(&quote).map_err(|e| Error::Quote(format!("{e:#}")))?;
+    let report = parsed
+        .report
+        .as_td10()
+        .ok_or_else(|| Error::Quote("not a TDX quote".into()))?;
+    alpha_attest::init_data_digest(&report.mr_config_id).map_err(|e| Error::Quote(e.to_string()))
 }
 
 /// A configfs-tsm report entry, removed however the request ends.

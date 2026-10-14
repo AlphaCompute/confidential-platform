@@ -997,16 +997,16 @@ mod tests {
             .unwrap()
             .into();
         let nonce: [u8; 32] = kata_testdata("nonce.bin").try_into().unwrap();
-        let (appraised, gpu) = alpha_attest::appraise_kata_instance(
+        let appraised = alpha_attest::appraise_kata_evidence(
             &evidence,
             &nonce,
             &kata_testdata("runtime_spki.der"),
+            None,
             &doc,
             &collateral,
             now,
         )
         .unwrap();
-        assert!(!gpu);
         let init_data = String::from_utf8(kata_testdata("k3-app.toml")).unwrap();
         assert_eq!(appraised.compose_hash, alpha_core::compose_hash(&init_data));
     }

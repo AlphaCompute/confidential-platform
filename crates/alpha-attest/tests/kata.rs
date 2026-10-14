@@ -74,7 +74,7 @@ fn quote_of_a_pod_without_init_data_is_refused() {
     let quote = verify("p0-none.quote.bin");
     assert_eq!(quote.mr_config_id, [0; 48]);
     assert!(matches!(
-        init_data_digest(&quote),
+        init_data_digest(&quote.mr_config_id),
         Err(InitDataMismatch::Absent)
     ));
 }
@@ -84,7 +84,7 @@ fn zero_tail_of_mr_config_id_is_enforced() {
     let mut quote = verify("p1-sha256.quote.bin");
     quote.mr_config_id[47] ^= 1;
     assert!(matches!(
-        init_data_digest(&quote),
+        init_data_digest(&quote.mr_config_id),
         Err(InitDataMismatch::NotSha256)
     ));
 }
