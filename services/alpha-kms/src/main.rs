@@ -107,10 +107,7 @@ async fn start_phase(node: &Arc<Node>) {
     }
 }
 
-/// `sslmode=require` does not authenticate the server, and a Kata pod's network is the host's: only
-/// SCRAM bound to the TLS connection keeps the host from asking for the password or relaying the
-/// login. `require_auth` keeps cleartext and MD5 refused should `channel_binding` ever stop
-/// implying it.
+/// `require_auth` keeps cleartext and MD5 refused should `channel_binding` ever stop implying it.
 fn require_channel_binding(options: &PgConnectOptions) -> Result<(), String> {
     if options.get_channel_binding() == PgChannelBinding::Require
         && options.get_require_auth() == Some(&[PgAuthMethod::ScramSha256][..])
