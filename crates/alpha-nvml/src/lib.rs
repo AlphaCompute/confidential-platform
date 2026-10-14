@@ -16,27 +16,11 @@
 use std::ffi::{c_int, c_uint, c_void};
 use std::path::Path;
 
-use base64::Engine;
-use base64::prelude::BASE64_URL_SAFE_NO_PAD;
-use serde::{Serialize, Serializer};
+use alpha_attest::GpuEvidence;
 
 /// Where the SPDM `GET_MEASUREMENTS` request that opens the report carries the requester's nonce.
 const NONCE_OFFSET: usize = 4;
 const NVML: &str = "libnvidia-ml.so.1";
-
-#[derive(Debug, Serialize)]
-pub struct GpuEvidence {
-    /// The SPDM `GET_MEASUREMENTS` request and the GPU's signed response.
-    #[serde(serialize_with = "base64url")]
-    pub evidence: Vec<u8>,
-    /// The device certificate chain as NVML returns it, PEM text ending in NVIDIA's root.
-    #[serde(serialize_with = "base64url")]
-    pub certificate_chain: Vec<u8>,
-}
-
-fn base64url<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(&BASE64_URL_SAFE_NO_PAD.encode(bytes))
-}
 
 /// How many GPUs the pod was given: the toolkit injects `/dev/nvidia<N>` for each one.
 pub fn count_devices(dev: &Path) -> Result<usize, String> {

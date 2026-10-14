@@ -162,10 +162,10 @@ pub struct Nonce {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct AttestRequest<E = InstanceEvidence> {
+pub struct AttestRequest {
     pub runtime_pubkey: String,
     pub nonce: String,
-    pub evidence: E,
+    pub evidence: InstanceEvidence,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -498,10 +498,7 @@ impl Client {
         self.request(Method::POST, "/v1/attest/nonce", None).await
     }
 
-    pub async fn attest<E: Serialize>(
-        &self,
-        body: &AttestRequest<E>,
-    ) -> Result<AttestReply, Error> {
+    pub async fn attest(&self, body: &AttestRequest) -> Result<AttestReply, Error> {
         self.post("/v1/attest", body).await
     }
 

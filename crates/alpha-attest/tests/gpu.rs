@@ -10,13 +10,24 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use alpha_attest::{GpuEvidence, GpuReference, appraise_gpus};
+use alpha_attest::{
+    GpuEvidence, GpuReference, KataGpus, KataReference, PlatformDocument, appraise_gpus,
+    appraise_kata_gpus, bind_gpus, verify_quote,
+};
+
+fn testdata(path: &str) -> Vec<u8> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../testdata/attest")
+        .join(path);
+    fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
 
 fn read(name: &str) -> Vec<u8> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../testdata/attest/b300-gpu-595.58.03")
-        .join(name);
-    fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    testdata(&format!("b300-gpu-595.58.03/{name}"))
+}
+
+fn kata(name: &str) -> Vec<u8> {
+    testdata(&format!("b300-kata-4.0.0/{name}"))
 }
 
 fn gpu(name: &str) -> GpuEvidence {
@@ -151,6 +162,96 @@ fn altered_gpu_evidence_is_refused() {
             (vec![gpu("g1b")], nonce("g1b"), reference(), 1);
         change(&mut gpus, &mut nonce, &mut reference, &mut count);
         let err = appraise_gpus(&gpus, &nonce, count, &[reference], now()).unwrap_err();
+        assert_eq!(err.code(), code, "{case}: {err}");
+        assert!(err.to_string().contains(fragment), "{case}: {err}");
+    }
+}
+
+/// The GPU pod's real quote, whose `report_data` is the challenge and the SHA-256 of `g1b`'s
+/// evidence, and the GPU class of its platform document.
+fn gpu_pod() -> ([u8; 64], KataReference) {
+    let doc: PlatformDocument = serde_json::from_slice(&kata("platform-document.json")).unwrap();
+    let collateral = serde_json::from_slice(&kata("collateral.json")).unwrap();
+    let captured_at = String::from_utf8(kata("captured_at.txt")).unwrap();
+    let captured_at = chrono::DateTime::parse_from_rfc3339(captured_at.trim()).unwrap();
+    let at = UNIX_EPOCH + Duration::from_secs(captured_at.timestamp() as u64);
+    let quote = verify_quote(&kata("g1b-gpu.quote.bin"), &collateral, &doc.policy, at).unwrap();
+    let class = doc
+        .kata_reference_values
+        .into_iter()
+        .find(|c| c.gpu)
+        .unwrap();
+    (quote.report_data, class)
+}
+
+#[test]
+fn a_gpu_pod_quote_commits_to_its_evidence() {
+    let (report_data, _) = gpu_pod();
+    assert_eq!(bind_gpus(&report_data, &[gpu("g1b")]), report_data);
+    assert_ne!(bind_gpus(&report_data, &[gpu("g2b")]), report_data);
+}
+
+#[test]
+fn kata_classes_take_gpu_evidence_only_as_pinned() {
+    let (report_data, gpu_class) = gpu_pod();
+    let pinned = |count: u8| KataReference {
+        gpus: Some(KataGpus {
+            count: count.try_into().unwrap(),
+            reference_values: vec![reference()],
+        }),
+        ..gpu_class.clone()
+    };
+    let cpu_class = KataReference {
+        gpu: false,
+        ..gpu_class.clone()
+    };
+    let mut other_report_data = report_data;
+    other_report_data[63] ^= 1;
+
+    assert_eq!(
+        appraise_kata_gpus(&cpu_class, &report_data, &[], now()).unwrap(),
+        Vec::<String>::new()
+    );
+    let cases = [
+        (
+            "cpu class",
+            cpu_class,
+            report_data,
+            "attestation_failed",
+            "passes no GPU",
+        ),
+        (
+            "nothing pinned",
+            gpu_class.clone(),
+            report_data,
+            "policy_denied",
+            "pins none",
+        ),
+        (
+            "evidence not quoted",
+            pinned(1),
+            other_report_data,
+            "attestation_failed",
+            "does not commit",
+        ),
+        (
+            "class of two GPUs",
+            pinned(2),
+            report_data,
+            "attestation_failed",
+            "1 evidences for 2 GPUs",
+        ),
+        // The capture predates the nonce derivation: the device signed the raw challenge.
+        (
+            "raw challenge",
+            pinned(1),
+            report_data,
+            "attestation_failed",
+            "nonce",
+        ),
+    ];
+    for (case, class, report_data, code, fragment) in cases {
+        let err = appraise_kata_gpus(&class, &report_data, &[gpu("g1b")], now()).unwrap_err();
         assert_eq!(err.code(), code, "{case}: {err}");
         assert!(err.to_string().contains(fragment), "{case}: {err}");
     }

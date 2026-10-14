@@ -3,6 +3,7 @@
 //! reference values for its firmware.
 
 use std::collections::{BTreeMap, HashSet};
+use std::num::NonZeroU8;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alpha_core::ComposeHash;
@@ -16,7 +17,7 @@ use x509_parser::oid_registry::{OID_NIST_HASH_SHA384, OID_SIG_ECDSA_WITH_SHA384}
 use x509_parser::pem::Pem;
 use x509_parser::time::ASN1Time;
 
-use crate::{AppraisalError, Measurement, base64url};
+use crate::{AppraisalError, KataReference, Measurement, base64url};
 
 /// One GPU's evidence as NVML hands it out: the request and signed response of SPDM
 /// GET_MEASUREMENTS, and the device certificate chain in PEM, leaf first.
@@ -31,7 +32,7 @@ pub struct GpuEvidence {
 
 /// What one GPU model on one VBIOS and driver must report. The identity fields are read off
 /// the signed opaque data; a measurement block absent from `measurements` must be zero.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GpuReference {
     /// SHA-256 of the DER of the device identity root the chain must end in.
@@ -43,6 +44,79 @@ pub struct GpuReference {
     pub vbios_version: String,
     pub driver_version: String,
     pub measurements: BTreeMap<u8, Vec<Measurement>>,
+}
+
+/// The GPUs of a Kata runtime class. `count` belongs to the class rather than to a Revision
+/// because the class's RTMR0 values measure it: each passed-through GPU gets a PCIe root port,
+/// which reaches the TD as the `etc/extra-pci-roots` firmware config and the ACPI tables.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KataGpus {
+    pub count: NonZeroU8,
+    pub reference_values: Vec<GpuReference>,
+}
+
+const NONCE_DOMAIN: &[u8] = b"alphacompute-gpu/1";
+
+/// The nonce every GPU signs: `SHA-256("alphacompute-gpu/1" ‖ report_data[0..32])`, so its
+/// evidence is fresh for the KMS's challenge and the Instance's key.
+pub fn gpu_nonce(report_data: &[u8; 64]) -> [u8; 32] {
+    Sha256::new()
+        .chain_update(NONCE_DOMAIN)
+        .chain_update(report_data.get(..32).unwrap_or_default())
+        .finalize()
+        .into()
+}
+
+/// `report_data` with its second half set to the SHA-256 of the GPU evidences concatenated in
+/// the order they are sent, so the TD commits to exactly the evidence it presents.
+pub fn bind_gpus(report_data: &[u8; 64], gpus: &[GpuEvidence]) -> [u8; 64] {
+    let digest = gpus
+        .iter()
+        .fold(Sha256::new(), |h, gpu| h.chain_update(&gpu.evidence))
+        .finalize();
+    let mut out = *report_data;
+    out.iter_mut()
+        .skip(32)
+        .zip(digest)
+        .for_each(|(o, b)| *o = b);
+    out
+}
+
+/// The GPU half of a Kata appraisal, over the `report_data` of the TD's verified quote: a GPU
+/// class needs exactly its count of evidences, fresh for and committed to by that `report_data`;
+/// any other class none. Returns the GPUs' leaf serials.
+pub fn appraise_kata_gpus(
+    class: &KataReference,
+    report_data: &[u8; 64],
+    gpus: &[GpuEvidence],
+    now: SystemTime,
+) -> Result<Vec<String>, AppraisalError> {
+    let name = &class.runtime_class;
+    if !class.gpu {
+        return if gpus.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err(failed(format!(
+                "runtime class {name} passes no GPU through"
+            )))
+        };
+    }
+    let Some(pinned) = &class.gpus else {
+        return Err(AppraisalError::PolicyDenied(format!(
+            "runtime class {name} passes GPUs through, and the document pins none"
+        )));
+    };
+    if &bind_gpus(report_data, gpus) != report_data {
+        return Err(failed("report_data does not commit to the GPU evidence"));
+    }
+    appraise_gpus(
+        gpus,
+        &gpu_nonce(report_data),
+        pinned.count.get().into(),
+        &pinned.reference_values,
+        now,
+    )
 }
 
 /// SPDM 1.1 GET_MEASUREMENTS, signature requested, all blocks.
@@ -444,6 +518,16 @@ fn tcb_info_fwid(value: &[u8]) -> Option<[u8; 48]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_nonce_hashes_the_domain_and_the_first_half_only() {
+        let mut report_data = [7u8; 64];
+        let expected: [u8; 32] =
+            Sha256::digest([b"alphacompute-gpu/1".as_slice(), &[7; 32]].concat()).into();
+        assert_eq!(gpu_nonce(&report_data), expected);
+        report_data[63] = 0;
+        assert_eq!(gpu_nonce(&report_data), expected);
+    }
 
     #[test]
     fn opaque_types_unknown_or_repeated_are_refused() {

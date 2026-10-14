@@ -77,10 +77,9 @@ fn capture_evidence() -> EvidenceSource {
         if report_data.as_slice() != quoted.as_slice() {
             return Err("report_data is not what the capture's CVM quoted over".into());
         }
-        Ok(alpha_runtime::AttestEvidence {
-            td: alpha_attest::InstanceEvidence::Dstack(evidence(KEYED, "instance")),
-            gpu: Vec::new(),
-        })
+        Ok(alpha_attest::InstanceEvidence::Dstack(evidence(
+            KEYED, "instance",
+        )))
     })
 }
 

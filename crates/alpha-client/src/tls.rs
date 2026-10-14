@@ -435,6 +435,7 @@ mod tests {
             evidence_sha256: format!("sha256:{}", "0".repeat(64)),
             verified_at: "1970-01-01T00:00:00Z".into(),
             policy_version: 1,
+            gpu_serials: Vec::new(),
         }
     }
 

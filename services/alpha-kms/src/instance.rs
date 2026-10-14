@@ -318,6 +318,7 @@ async fn attest_inner(
         evidence_sha256: appraised.evidence_sha256,
         verified_at: rfc3339(now),
         policy_version: appraised.policy_version,
+        gpu_serials: appraised.gpu_serials,
     };
     Ok((leaf_der, result))
 }

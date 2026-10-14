@@ -31,7 +31,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 pub use event_log::{EventLogEntry, compose_hash as event_log_compose_hash};
-pub use gpu::{GpuEvidence, GpuReference, appraise_gpus};
+pub use gpu::{
+    GpuEvidence, GpuReference, KataGpus, appraise_gpus, appraise_kata_gpus, bind_gpus, gpu_nonce,
+};
 
 pub const EVIDENCE_FORMAT: &str = "alphacompute-evidence/1";
 pub const KATA_EVIDENCE_FORMAT: &str = "alphacompute-evidence/kata/1";
@@ -46,14 +48,16 @@ pub struct Evidence {
     pub event_log: Vec<EventLogEntry>,
 }
 
-/// A Kata pod's evidence is its quote alone: the container cannot read its init-data, and the
-/// quote's `MRCONFIGID` names the Revision.
+/// A Kata pod's evidence is its quote, plus one evidence per GPU it passes through: the
+/// container cannot read its init-data, and the quote's `MRCONFIGID` names the Revision.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KataEvidence {
     pub format: String,
     #[serde(with = "base64url")]
     pub quote: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gpu: Vec<GpuEvidence>,
 }
 
 /// A TD's evidence: a dstack CVM's quote with the event log that replays it, or a Kata pod's
@@ -247,6 +251,9 @@ pub struct KataReference {
     /// Whether the class passes GPUs through, whose evidence the TD quote does not cover.
     /// Required, so that an entry which forgets it cannot pass for a CPU class.
     pub gpu: bool,
+    /// Only on a `gpu` class; absent, its pods are refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpus: Option<KataGpus>,
 }
 
 impl KataReference {
@@ -280,6 +287,11 @@ fn kata_reference_values<'de, D: Deserializer<'de>>(
                 "kata_reference_values: runtime_class is empty",
             ));
         }
+        if entry.gpus.is_some() && !entry.gpu {
+            return Err(D::Error::custom(format!(
+                "kata_reference_values: {class} pins GPUs but passes none through"
+            )));
+        }
         for other in entries.iter().skip(i.saturating_add(1)) {
             if entry.overlaps(other) {
                 return Err(D::Error::custom(format!(
@@ -305,6 +317,9 @@ pub struct AttestationResult {
     pub evidence_sha256: String,
     pub verified_at: String,
     pub policy_version: u64,
+    /// The leaf certificate serial of every appraised GPU, in hex, in evidence order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gpu_serials: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -334,6 +349,8 @@ pub struct Appraised {
     pub runtime_pubkey_sha256: String,
     pub evidence_sha256: String,
     pub policy_version: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub gpu_serials: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -512,6 +529,7 @@ pub fn appraise(
         runtime_pubkey_sha256: sha256_text(runtime_pubkey_spki),
         evidence_sha256: evidence_sha256(evidence)?,
         policy_version: doc.version,
+        gpu_serials: Vec::new(),
     })
 }
 
@@ -559,9 +577,7 @@ const KATA_XFAM: u64 = 0x61ae7;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KataAppraised {
     /// The class whose reference values the measurements matched, never a host's claim.
-    pub runtime_class: String,
-    /// The matched class's [`KataReference::gpu`].
-    pub gpu: bool,
+    pub reference: KataReference,
     /// What the TD booted with, from `MRCONFIGID`: the digest of its Revision.
     pub init_data: ComposeHash,
     pub quote: VerifiedQuote,
@@ -570,8 +586,8 @@ pub struct KataAppraised {
 /// Appraisal of a Kata TD's quote, bound to this request by `expected_report_data` (see
 /// [`report_data`]), against `doc.kata_reference_values`. No event log is replayed: the events
 /// that vary between TDs carry only digests, so the final registers say as much. The caller
-/// looks the Revision up by [`KataAppraised::init_data`], and appraises GPU evidence when
-/// [`KataAppraised::gpu`] says so.
+/// looks the Revision up by [`KataAppraised::init_data`], and appraises GPU evidence with
+/// [`appraise_kata_gpus`].
 pub fn appraise_kata(
     quote: &[u8],
     expected_report_data: &[u8; 64],
@@ -589,8 +605,7 @@ pub fn appraise_kata(
     let init_data =
         init_data_digest(&quote.mr_config_id).map_err(|e| AppraisalError::Failed(e.to_string()))?;
     Ok(KataAppraised {
-        runtime_class: reference.runtime_class.clone(),
-        gpu: reference.gpu,
+        reference: reference.clone(),
         init_data,
         quote,
     })
@@ -614,28 +629,33 @@ pub fn appraise_kata_evidence(
             evidence.format
         )));
     }
-    let expected = report_data(runtime_pubkey_spki, nonce, node_xwing_spki);
-    let kata = appraise_kata(&evidence.quote, &expected, doc, collateral, now)?;
-    // ponytail: no GPU evidence is appraised yet, so a GPU class is refused outright; NRAS
-    // appraisal of the passed-through GPUs lifts this.
-    if kata.gpu {
-        return Err(AppraisalError::PolicyDenied(format!(
-            "runtime class {} passes GPUs through, and GPU evidence is not appraised",
-            kata.runtime_class
-        )));
+    let mut expected = report_data(runtime_pubkey_spki, nonce, node_xwing_spki);
+    if !evidence.gpu.is_empty() {
+        expected = bind_gpus(&expected, &evidence.gpu);
     }
+    let kata = appraise_kata(&evidence.quote, &expected, doc, collateral, now)?;
     if node_xwing_spki.is_some() {
+        // The second half of a node's report_data is its X-Wing key, so it has none for GPUs.
+        if kata.reference.gpu {
+            return Err(AppraisalError::PolicyDenied(format!(
+                "a KMS node does not run in GPU class {}",
+                kata.reference.runtime_class
+            )));
+        }
         kms_revision_listed(doc, kata.init_data)?;
     }
+    let gpu_serials =
+        appraise_kata_gpus(&kata.reference, &kata.quote.report_data, &evidence.gpu, now)?;
     Ok(Appraised {
         measured: kata.quote.measured,
         tcb_status: kata.quote.tcb_status,
         advisories: kata.quote.advisories,
-        os_image: kata.runtime_class,
+        os_image: kata.reference.runtime_class,
         compose_hash: kata.init_data,
         runtime_pubkey_sha256: sha256_text(runtime_pubkey_spki),
         evidence_sha256: evidence_sha256(evidence)?,
         policy_version: doc.version,
+        gpu_serials,
     })
 }
 
@@ -917,5 +937,13 @@ mod tests {
                 serde_json::json!([gpu_rtmr0, d["kata_reference_values"][0]["rtmr0"][4]]);
         });
         assert!(overlap.is_some_and(|e| e.contains("accept the same measurements")));
+        let gpus = serde_json::json!({ "count": 1, "reference_values": [] });
+        let on_cpu = parse(&|d| d["kata_reference_values"][0]["gpus"] = gpus.clone());
+        assert!(on_cpu.is_some_and(|e| e.contains("pins GPUs but passes none")));
+        let none = parse(&|d| {
+            d["kata_reference_values"][1]["gpus"] =
+                serde_json::json!({ "count": 0, "reference_values": [] })
+        });
+        assert!(none.is_some());
     }
 }

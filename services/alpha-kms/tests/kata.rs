@@ -288,7 +288,7 @@ async fn a_kata_pod_gets_a_leaf_naming_the_revision_in_its_mrconfigid() {
 }
 
 #[tokio::test]
-async fn a_class_passing_gpus_through_gets_no_leaf() {
+async fn a_gpu_class_without_pinned_gpus_gets_no_leaf() {
     let Some(h) = kata_harness().await else {
         return;
     };

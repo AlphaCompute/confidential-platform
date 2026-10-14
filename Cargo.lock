@@ -334,9 +334,8 @@ dependencies = [
 name = "alpha-nvml"
 version = "0.1.0"
 dependencies = [
- "base64 0.23.1",
+ "alpha-attest",
  "libloading",
- "serde",
 ]
 
 [[package]]
@@ -354,9 +353,10 @@ dependencies = [
  "flate2",
  "getrandom 0.4.3",
  "p256 0.14.0",
+ "p384 0.14.0",
  "parking_lot",
+ "rcgen",
  "rustls",
- "serde",
  "serde_json",
  "sha2 0.11.0",
  "thiserror",
