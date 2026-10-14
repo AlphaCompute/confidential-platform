@@ -48,8 +48,6 @@ pub struct Config {
     pub substrate: alpha_tsm::Substrate,
     pub kms_endpoints: Vec<String>,
     pub platform_document_url: String,
-    /// From the encrypted env on dstack; never configured on Kata.
-    pub database_password: Option<Zeroizing<String>>,
     #[cfg(feature = "dev-root")]
     pub dev_root_kek: Option<Zeroizing<[u8; 32]>>,
 }
@@ -68,7 +66,6 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .collect(),
             platform_document_url: env("ALPHACOMPUTE_PLATFORM_DOCUMENT_URL")?,
-            database_password: None,
             #[cfg(feature = "dev-root")]
             dev_root_kek: std::env::var("ALPHACOMPUTE_KMS_DEV_ROOT_KEK")
                 .ok()
@@ -140,14 +137,13 @@ pub struct Node {
 impl Node {
     pub fn new(
         pool: PgPool,
-        mut config: Config,
+        config: Config,
         clock: Clock,
         collateral: CollateralSource,
         nonce_key: [u8; 32],
         compose_hash: ComposeHash,
         release_keys: alpha_client::platform::ReleaseKeys,
     ) -> Result<Arc<Self>, String> {
-        let database_password = config.database_password.take();
         let runtime_key = SigningKey::from_bytes((&random::<32>().map_err(|e| e.message)?).into())
             .map_err(|e| format!("runtime key: {e}"))?;
         let runtime_spki = runtime_key
@@ -179,7 +175,7 @@ impl Node {
             platform: RwLock::new(None),
             phase: RwLock::new(Phase::Sealed { shares: Vec::new() }),
             server_cert,
-            database_password: RwLock::new(database_password),
+            database_password: RwLock::new(None),
             bucket: Mutex::new((BUCKET_CAPACITY, Instant::now())),
         }))
     }
