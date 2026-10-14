@@ -20,7 +20,7 @@ use crate::{AppraisalError, Measurement, base64url};
 
 /// One GPU's evidence as NVML hands it out: the request and signed response of SPDM
 /// GET_MEASUREMENTS, and the device certificate chain in PEM, leaf first.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GpuEvidence {
     #[serde(with = "base64url")]
@@ -31,7 +31,7 @@ pub struct GpuEvidence {
 
 /// What one GPU model on one VBIOS and driver must report. The identity fields are read off
 /// the signed opaque data; a measurement block absent from `measurements` must be zero.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GpuReference {
     /// SHA-256 of the DER of the device identity root the chain must end in.
@@ -385,17 +385,13 @@ fn verify_chain(
         let [cert, issuer] = pair else {
             return Err(failed("certificate chain"));
         };
+        let n = depth.saturating_add(1);
         let ca = issuer
             .basic_constraints()
             .ok()
             .flatten()
             .filter(|bc| bc.value.ca)
-            .ok_or_else(|| {
-                failed(format!(
-                    "certificate {} is not a CA",
-                    depth.saturating_add(1)
-                ))
-            })?;
+            .ok_or_else(|| failed(format!("certificate {n} is not a CA")))?;
         let within_path_len = ca
             .value
             .path_len_constraint
@@ -406,10 +402,7 @@ fn verify_chain(
             .flatten()
             .is_some_and(|ku| ku.value.key_cert_sign());
         if !within_path_len || !may_sign || cert.issuer().as_raw() != issuer.subject().as_raw() {
-            return Err(failed(format!(
-                "certificate {} may not issue",
-                depth.saturating_add(1)
-            )));
+            return Err(failed(format!("certificate {n} may not issue")));
         }
         if cert.signature_algorithm.algorithm != OID_SIG_ECDSA_WITH_SHA384 {
             return Err(failed(format!(

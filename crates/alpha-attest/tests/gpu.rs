@@ -45,14 +45,6 @@ fn now() -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(1_791_849_600)
 }
 
-fn appraise(
-    gpus: &[GpuEvidence],
-    nonce: [u8; 32],
-    reference: GpuReference,
-) -> Result<Vec<String>, alpha_attest::AppraisalError> {
-    appraise_gpus(gpus, &nonce, gpus.len(), &[reference], now())
-}
-
 #[test]
 fn captured_gpus_are_accepted_with_their_leaf_serials() {
     // g1b reports zero in block 62, g2b the driver RIM's other alternative.
@@ -61,7 +53,7 @@ fn captured_gpus_are_accepted_with_their_leaf_serials() {
         ("g2b", "415265d5ac81e8ab05191b441d65e8b6e3256466"),
     ] {
         assert_eq!(
-            appraise(&[gpu(name)], nonce(name), reference()).unwrap(),
+            appraise_gpus(&[gpu(name)], &nonce(name), 1, &[reference()], now()).unwrap(),
             [serial],
             "{name}"
         );
