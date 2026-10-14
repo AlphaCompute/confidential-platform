@@ -1,0 +1,69 @@
+# alpha-inference, the RedPill front. The operator fills the ${…} with envsubst and renders it
+# with `alpha coco render --app-id <the front's App>`: what the agent policy pins for the pod
+# template (namespace, images, commands, env, mounts, security contexts) is the front's Revision;
+# labels, replicas, scheduling and probes are not.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inference
+  namespace: alpha-inference
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: alpha-inference
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: alpha-inference
+    spec:
+      runtimeClassName: kata-qemu-tdx
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        supplementalGroups: [1, 2, 3, 4, 6, 10, 11, 20, 26, 27]
+      containers:
+      - name: alpha-runtime
+        image: ${RUNTIME_IMAGE}
+        env:
+        - {name: ALPHACOMPUTE_KMS_CA_SPKI_SHA256, value: "${KMS_CA_SPKI_SHA256}"}
+        - {name: ALPHACOMPUTE_KMS_REVISIONS, value: "${KMS_REVISIONS}"}
+        - {name: ALPHACOMPUTE_KMS_ENDPOINTS, value: "${KMS_ENDPOINTS}"}
+        securityContext:
+          # configfs-tsm report entries are root-owned.
+          runAsUser: 0
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - {name: tsm, mountPath: /sys/kernel/config}
+        - {name: alpha, mountPath: /run/alpha}
+      - name: alpha-inference
+        image: ${INFERENCE_IMAGE}
+        ports:
+        - {name: https, containerPort: 8443}
+        # The kubelet probes from the host and skips certificate checks; exec would be refused.
+        readinessProbe:
+          httpGet: {path: /ready, port: https, scheme: HTTPS}
+        env:
+        - {name: UPSTREAM_URL, value: "${UPSTREAM_URL}"}
+        - {name: MODELS, value: "${MODELS}"}
+        - {name: PCCS_URL, value: "${PCCS_URL}"}
+        - {name: UPSTREAM_POLICY, value: '${UPSTREAM_POLICY}'}
+        securityContext:
+          runAsUser: 65534
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - {name: alpha, mountPath: /run/alpha}
+      volumes:
+      - name: tsm
+        hostPath:
+          path: /sys/kernel/config
+          type: Directory
+      # The runtime's socket, in the pod VM's memory: a disk emptyDir is host storage.
+      - name: alpha
+        emptyDir: {medium: Memory}

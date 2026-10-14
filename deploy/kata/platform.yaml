@@ -1,0 +1,54 @@
+# Namespaces and addresses of the platform services; nothing here is measured. A model server's
+# Service is per model: `kubectl -n alpha-models expose deployment <MODEL_NAME> --port 8443`.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: alpha-inference
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: alpha-guard
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: alpha-broker
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: alpha-models
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inference
+  namespace: alpha-inference
+spec:
+  selector:
+    app.kubernetes.io/name: alpha-inference
+  ports:
+  - {name: https, port: 8443}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: guard
+  namespace: alpha-guard
+spec:
+  selector:
+    app.kubernetes.io/name: alpha-guard
+  ports:
+  - {name: https, port: 8443}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: broker
+  namespace: alpha-broker
+spec:
+  selector:
+    app.kubernetes.io/name: alpha-broker
+  ports:
+  - {name: https, port: 8443}

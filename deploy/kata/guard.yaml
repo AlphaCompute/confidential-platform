@@ -1,0 +1,64 @@
+# alpha-guard, the content judge, rendered like inference.yaml with `--app-id <the guard's App>`.
+# It reaches the front by its Service name; the name is only routing, the TLS pin on the front's
+# Revisions is the check.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: guard
+  namespace: alpha-guard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: alpha-guard
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: alpha-guard
+    spec:
+      runtimeClassName: kata-qemu-tdx
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        supplementalGroups: [1, 2, 3, 4, 6, 10, 11, 20, 26, 27]
+      containers:
+      - name: alpha-runtime
+        image: ${RUNTIME_IMAGE}
+        env:
+        - {name: ALPHACOMPUTE_KMS_CA_SPKI_SHA256, value: "${KMS_CA_SPKI_SHA256}"}
+        - {name: ALPHACOMPUTE_KMS_REVISIONS, value: "${KMS_REVISIONS}"}
+        - {name: ALPHACOMPUTE_KMS_ENDPOINTS, value: "${KMS_ENDPOINTS}"}
+        securityContext:
+          runAsUser: 0
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - {name: tsm, mountPath: /sys/kernel/config}
+        - {name: alpha, mountPath: /run/alpha}
+      - name: alpha-guard
+        image: ${GUARD_IMAGE}
+        ports:
+        - {name: https, containerPort: 8443}
+        readinessProbe:
+          httpGet: {path: /ready, port: https, scheme: HTTPS}
+        env:
+        - {name: INFERENCE_URL, value: "https://inference.alpha-inference.svc:8443"}
+        - {name: INFERENCE_REVISIONS, value: "${INFERENCE_REVISIONS}"}
+        - {name: CALLER_APPS, value: "${GUARD_CALLER_APPS}"}
+        securityContext:
+          runAsUser: 65534
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - {name: alpha, mountPath: /run/alpha}
+      volumes:
+      - name: tsm
+        hostPath:
+          path: /sys/kernel/config
+          type: Directory
+      - name: alpha
+        emptyDir: {medium: Memory}

@@ -194,11 +194,13 @@ pub fn parse(bytes: &[u8]) -> Result<Pod, String> {
 fn template_mut(spec: &mut Mapping) -> Result<&mut Mapping, String> {
     match spec.get("kind").and_then(Yaml::as_str) {
         Some("Pod") => Ok(spec),
-        Some("StatefulSet") => match spec.get_mut("spec").and_then(|s| s.get_mut("template")) {
-            Some(Yaml::Mapping(template)) => Ok(template),
-            _ => Err("spec.template: missing or not a mapping".into()),
-        },
-        _ => Err("pod spec: kind is not Pod or StatefulSet".into()),
+        Some("StatefulSet" | "Deployment") => {
+            match spec.get_mut("spec").and_then(|s| s.get_mut("template")) {
+                Some(Yaml::Mapping(template)) => Ok(template),
+                _ => Err("spec.template: missing or not a mapping".into()),
+            }
+        }
+        _ => Err("pod spec: kind is not Pod, StatefulSet or Deployment".into()),
     }
 }
 
@@ -448,14 +450,19 @@ mod tests {
     }
 
     #[test]
-    fn stateful_set_carries_the_init_data_in_its_pod_template() {
+    fn a_workload_carries_the_init_data_in_its_pod_template() {
+        for kind in ["StatefulSet", "Deployment"] {
+            workload_carries_the_init_data_in_its_pod_template(kind);
+        }
+    }
+
+    fn workload_carries_the_init_data_in_its_pod_template(kind: &str) {
         let pod: Yaml = serde_yaml_ng::from_str(POD).unwrap();
         let set = serde_yaml_ng::to_string(&serde_json::json!({
             "apiVersion": "apps/v1",
-            "kind": "StatefulSet",
+            "kind": kind,
             "metadata": {"name": "render"},
             "spec": {
-                "serviceName": "render",
                 "selector": {"matchLabels": {"app": "render"}},
                 "template": {"metadata": {"labels": {"app": "render"}}, "spec": pod["spec"]},
             },
@@ -463,7 +470,7 @@ mod tests {
         .unwrap();
         let parsed = parse(set.as_bytes()).unwrap();
         let input: Yaml = serde_yaml_ng::from_str(&parsed.genpolicy_input).unwrap();
-        assert_eq!(input["kind"].as_str(), Some("StatefulSet"));
+        assert_eq!(input["kind"].as_str(), Some(kind));
         assert!(
             input["spec"]["template"]["spec"]
                 .get("automountServiceAccountToken")

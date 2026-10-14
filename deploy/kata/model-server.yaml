@@ -1,0 +1,83 @@
+# One vLLM model on one passed-through GPU, rendered like inference.yaml with `--app-id <the
+# model's App>`. vLLM listens on loopback only; the runtime terminates TLS on 8443 with the
+# Instance leaf and proxies only Instances of the Apps in MODEL_CALLER_APPS, so nobody else reaches
+# any vLLM route. MODEL_IMAGE is vLLM with the weights at /weights: its digest, pinned by the
+# policy and checked by the guest's image pull, pins every byte of the weights.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${MODEL_NAME}
+  namespace: alpha-models
+spec:
+  replicas: 1
+  # One GPU per pod and no spare one assumed: replace in place.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ${MODEL_NAME}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ${MODEL_NAME}
+    spec:
+      runtimeClassName: kata-qemu-nvidia-gpu-tdx
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        supplementalGroups: [1, 2, 3, 4, 6, 10, 11, 20, 26, 27]
+      containers:
+      - name: alpha-runtime
+        image: ${RUNTIME_IMAGE}
+        ports:
+        - {name: https, containerPort: 8443}
+        - {name: ready, containerPort: 8444}
+        env:
+        - {name: ALPHACOMPUTE_KMS_CA_SPKI_SHA256, value: "${KMS_CA_SPKI_SHA256}"}
+        - {name: ALPHACOMPUTE_KMS_REVISIONS, value: "${KMS_REVISIONS}"}
+        - {name: ALPHACOMPUTE_KMS_ENDPOINTS, value: "${KMS_ENDPOINTS}"}
+        # An address, not a name: the host writes the pod's /etc/hosts.
+        - {name: ALPHACOMPUTE_TLS_UPSTREAM, value: "127.0.0.1:8000"}
+        - {name: ALPHACOMPUTE_TLS_CALLER_APPS, value: "${MODEL_CALLER_APPS}"}
+        - {name: ALPHACOMPUTE_TLS_UPSTREAM_READY, value: /health}
+        # The GPU the vllm container claims, injected here too so the runtime sends its evidence.
+        - {name: VISIBLE_CDI_DEVICES, value: nvidia.com/gpu=all}
+        securityContext:
+          runAsUser: 0
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - {name: tsm, mountPath: /sys/kernel/config}
+        - {name: alpha, mountPath: /run/alpha}
+      - name: vllm
+        image: ${MODEL_IMAGE}
+        command: [vllm, serve, /weights, --served-model-name, "${MODEL_ID}", --host, 127.0.0.1, --port, "8000"]
+        env:
+        - {name: HF_HUB_OFFLINE, value: "1"}
+        - {name: VLLM_NO_USAGE_STATS, value: "1"}
+        - {name: DO_NOT_TRACK, value: "1"}
+        # The pod VM is sized from the limits, and the guest pulls the image into its memory.
+        resources:
+          limits:
+            nvidia.com/pgpu: 1
+            cpu: "${MODEL_CPUS}"
+            memory: ${MODEL_MEMORY}
+        # Plain HTTP from the runtime: 200 while its leaf is current and vLLM's /health answers.
+        readinessProbe:
+          httpGet: {path: /ready, port: 8444}
+          periodSeconds: 10
+          failureThreshold: 60
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+      volumes:
+      - name: tsm
+        hostPath:
+          path: /sys/kernel/config
+          type: Directory
+      # Only the runtime mounts it: the container running the model never reaches the socket.
+      - name: alpha
+        emptyDir: {medium: Memory}

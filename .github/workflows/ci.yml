@@ -25,30 +25,64 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy -p alpha-channel --target wasm32-unknown-unknown --all-targets -- -D warnings
       - run: cargo test --workspace
-      # genpolicy accepts the KMS StatefulSet, writes the policy for its pods' names, and the
-      # policy's data is the one the platform document pins. The image only shapes the container
-      # entries, which the pin leaves out, so any public one renders; ghcr.io, as public.ecr.aws
-      # rate-limits anonymous pulls from runners.
-      - name: Render the KMS StatefulSet with the release genpolicy
+      # genpolicy accepts every Kata template in deploy/kata, writes the policy for its pods'
+      # names, and the policy's data is the one the platform document pins. The images only shape
+      # the container entries, which the pin leaves out, so any public one renders; ghcr.io, as
+      # public.ecr.aws rate-limits anonymous pulls from runners. The other values are placeholders.
+      - name: Render the Kata templates with the release genpolicy
         shell: bash
         env:
-          KMS_IMAGE: ghcr.io/alphacompute/alpha-runtime@sha256:bb7dca63cfd0c44b50e87cc844a3c9eec001c8ded52f404fd476af97ec22dbe7
+          IMAGE: ghcr.io/alphacompute/alpha-runtime@sha256:bb7dca63cfd0c44b50e87cc844a3c9eec001c8ded52f404fd476af97ec22dbe7
           KMS_ENDPOINTS: https://kms-0.kms.alpha-kms.svc:8443,https://kms-1.kms.alpha-kms.svc:8443
           PLATFORM_DOCUMENT_URL: https://platform.invalid/document.json
           PCCS_URL: https://pccs.invalid
+          KMS_CA_SPKI_SHA256: sha256:0000000000000000000000000000000000000000000000000000000000000000
+          KMS_REVISIONS: sha256:0000000000000000000000000000000000000000000000000000000000000000
+          UPSTREAM_URL: https://upstream.invalid/v1
+          MODELS: model
+          UPSTREAM_POLICY: '{"tcb_statuses":["UpToDate"]}'
+          INFERENCE_REVISIONS: sha256:0000000000000000000000000000000000000000000000000000000000000000
+          GUARD_CALLER_APPS: 01a09f07-8d09-7640-94c1-bbdb74200a1e
+          GOOGLE_CLIENT_ID: x
+          DROPBOX_CLIENT_ID: x
+          SLACK_CLIENT_ID: x
+          FIGMA_CLIENT_ID: x
+          HUBSPOT_CLIENT_ID: x
+          NOTION_CLIENT_ID: x
+          OAUTH_REDIRECT_BASE: https://tenant.invalid/connect
+          MODEL_NAME: model
+          MODEL_ID: model
+          MODEL_CALLER_APPS: 01a09f07-8d09-7640-94c1-bbdb74200a1e
+          MODEL_CPUS: "8"
+          MODEL_MEMORY: 64Gi
         run: |
           kata="$RUNNER_TEMP/kata-tools"
           mkdir -p "$kata"
           curl -fsSL https://github.com/kata-containers/kata-containers/releases/download/4.0.0/kata-tools-static-4.0.0-amd64.tar.zst \
             | tar --zstd -x -C "$kata"
-          # shellcheck disable=SC2016
-          envsubst '$KMS_IMAGE $KMS_ENDPOINTS $PLATFORM_DOCUMENT_URL $PCCS_URL' < deploy/kata/kms-node.yaml > "$RUNNER_TEMP/kms-node.yaml"
-          # `dev`: the production build refuses the placeholder release key set, which a render never reads.
-          cargo run -q -p alpha-cli --features dev --bin alpha -- coco render --app-id 01a09f07-8d09-7640-94c1-bbdb74200a1e --kata "$kata/opt/kata" \
-            --out "$RUNNER_TEMP/out.yaml" "$RUNNER_TEMP/kms-node.yaml" > "$RUNNER_TEMP/rendered.json"
-          jq -e --slurpfile pinned testdata/coco/expected.json \
-            '.policy_data_sha256 == $pinned[0].policy_data_sha256' "$RUNNER_TEMP/rendered.json"
-          jq -r .init_data "$RUNNER_TEMP/rendered.json" | grep -qF '"io.kubernetes.cri.sandbox-name": "^kms-[0-9]+$"'
+          export KMS_IMAGE=$IMAGE RUNTIME_IMAGE=$IMAGE INFERENCE_IMAGE=$IMAGE GUARD_IMAGE=$IMAGE BROKER_IMAGE=$IMAGE MODEL_IMAGE=$IMAGE
+          generated='[bcdfghjklmnpqrstvwxz2456789]+'
+          # A template and the sandbox-name pattern of its pods.
+          while read -r template pods; do
+            # Every ${…} of the template is set: envsubst would write an unset one as empty.
+            vars=$(grep -o '\${[A-Z0-9_]*}' "deploy/kata/$template" | sort -u | tr -d '\n')
+            for var in $(grep -o '\${[A-Z0-9_]*}' "deploy/kata/$template" | tr -d '${}' | sort -u); do
+              [ -n "${!var:-}" ] || { echo "$template: $var is not set" >&2; exit 1; }
+            done
+            envsubst "$vars" < "deploy/kata/$template" > "$RUNNER_TEMP/$template"
+            # `dev`: the production build refuses the placeholder release key set, which a render never reads.
+            cargo run -q -p alpha-cli --features dev --bin alpha -- coco render --app-id 01a09f07-8d09-7640-94c1-bbdb74200a1e --kata "$kata/opt/kata" \
+              --out "$RUNNER_TEMP/out-$template" "$RUNNER_TEMP/$template" > "$RUNNER_TEMP/$template.json" < /dev/null
+            jq -e --slurpfile pinned testdata/coco/expected.json \
+              '.policy_data_sha256 == $pinned[0].policy_data_sha256' "$RUNNER_TEMP/$template.json"
+            jq -r .init_data "$RUNNER_TEMP/$template.json" | grep -qF "\"io.kubernetes.cri.sandbox-name\": \"$pods\""
+          done <<EOF
+          kms-node.yaml ^kms-[0-9]+$
+          inference.yaml ^inference-$generated-$generated$
+          guard.yaml ^guard-$generated-$generated$
+          broker.yaml ^broker-$generated-$generated$
+          model-server.yaml ^model-$generated-$generated$
+          EOF
       # The same CLI version build-web.sh requires, so the tests run the glue a page loads.
       - run: cargo install wasm-bindgen-cli --version 0.2.128 --locked
       - run: cargo test -p alpha-channel --target wasm32-unknown-unknown

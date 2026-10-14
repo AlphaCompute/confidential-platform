@@ -258,7 +258,7 @@ enum CocoCommand {
         kata: PathBuf,
         #[arg(long)]
         out: PathBuf,
-        /// A Pod, or a StatefulSet rendered for its pod template, whose images are all pinned
+        /// A Pod, or a StatefulSet or Deployment rendered for its pod template, whose images are all pinned
         /// `@sha256:` and whose supplementalGroups are explicit.
         pod: PathBuf,
     },
