@@ -409,7 +409,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const REPLY_CAP: usize = 4 << 20;
 
 /// Every HTTP client this crate builds: no connection or reply may hold a caller forever.
-fn http() -> reqwest::ClientBuilder {
+pub fn http() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
@@ -422,7 +422,7 @@ fn pinned_http(config: rustls::ClientConfig) -> reqwest::ClientBuilder {
         .redirect(reqwest::redirect::Policy::none())
 }
 
-async fn read_capped(mut response: reqwest::Response, cap: usize) -> Result<Vec<u8>, String> {
+pub async fn read_capped(mut response: reqwest::Response, cap: usize) -> Result<Vec<u8>, String> {
     let mut body = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
         if chunk.len() > cap.saturating_sub(body.len()) {
