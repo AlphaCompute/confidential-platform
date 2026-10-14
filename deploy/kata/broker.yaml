@@ -6,6 +6,12 @@ metadata:
   name: broker
   namespace: alpha-broker
 spec:
+  # ponytail: one pod, replaced in place, since a member's channel lives in the process that
+  # opened it and a second pod would answer channel_unknown; more replicas need the channel
+  # state shared or routing pinned per channel.
+  replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: alpha-broker
