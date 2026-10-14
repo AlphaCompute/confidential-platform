@@ -63,7 +63,7 @@ fn captured_gpus_are_accepted_with_their_leaf_serials() {
 #[test]
 fn altered_gpu_evidence_is_refused() {
     type Change = fn(&mut Vec<GpuEvidence>, &mut [u8; 32], &mut GpuReference, &mut usize);
-    let cases: [(&str, Change, &str, &str); 10] = [
+    let cases: [(&str, Change, &str, &str); 11] = [
         (
             "measurement byte flipped",
             |g, _, _, _| g[0].evidence[120] ^= 1,
@@ -99,6 +99,16 @@ fn altered_gpu_evidence_is_refused() {
             },
             "attestation_failed",
             "certificate 2 may not issue",
+        ),
+        (
+            "leaf dropped",
+            |g, _, _, _| {
+                let pem = String::from_utf8(g[0].certificate_chain.clone()).unwrap();
+                let blocks: Vec<&str> = pem.split_inclusive("-----END CERTIFICATE-----").collect();
+                g[0].certificate_chain = blocks[1..].concat().into_bytes();
+            },
+            "attestation_failed",
+            "leaf may not sign",
         ),
         (
             "another device's chain",

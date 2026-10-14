@@ -387,6 +387,17 @@ fn verify_chain(
     if !certs.iter().all(|c| c.validity().is_valid_at(now)) {
         return Err(failed("certificate outside its validity"));
     }
+    let leaf_is_ca = leaf
+        .basic_constraints()
+        .map_or(true, |bc| bc.is_some_and(|bc| bc.value.ca));
+    let leaf_may_sign = leaf
+        .key_usage()
+        .ok()
+        .flatten()
+        .is_some_and(|ku| ku.value.digital_signature());
+    if leaf_is_ca || !leaf_may_sign {
+        return Err(failed("leaf may not sign evidence"));
+    }
 
     Ok(Leaf {
         key: p384_key(leaf)?,
