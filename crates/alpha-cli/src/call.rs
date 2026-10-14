@@ -42,8 +42,8 @@ fn field<'a>(payload: &'a Value, name: &str) -> Result<&'a str, String> {
 }
 
 /// Fills `issued_at` when the payload lacks it (and, for a secret, `content_sha256` over a fresh
-/// salt and the value), signs
-/// under the route's context (or `ctx`) and sends. The reply is printed as received.
+/// salt and the value), signs under the route's context (or `ctx`) and sends. The reply is
+/// printed as received.
 pub async fn run(
     client: &Client,
     route: Route,
@@ -60,19 +60,18 @@ pub async fn run(
         object.insert("issued_at".into(), json!(rfc3339(now)));
     }
     let salted = match (route, value) {
-        (Route::PutSecret, Some(value)) => Some(Zeroizing::new(
-            [random::<SECRET_SALT_LEN>()?.as_slice(), value].concat(),
-        )),
+        (Route::PutSecret, Some(value)) => {
+            if object.contains_key("content_sha256") {
+                return Err("content_sha256 is computed from --value".into());
+            }
+            let salted = Zeroizing::new([random::<SECRET_SALT_LEN>()?.as_slice(), value].concat());
+            object.insert("content_sha256".into(), json!(sha256_label(&salted)));
+            Some(salted)
+        }
         (Route::PutSecret, None) => return Err("put-secret needs --value".into()),
         (_, Some(_)) => return Err("--value is only for put-secret".into()),
         (_, None) => None,
     };
-    if let Some(salted) = &salted {
-        if object.contains_key("content_sha256") {
-            return Err("content_sha256 is computed from --value".into());
-        }
-        object.insert("content_sha256".into(), json!(sha256_label(salted)));
-    }
     let api = |e: alpha_client::Error| e.to_string();
     let signed = sign(ctx.unwrap_or(route.context()), payload, signer.0, signer.1).map_err(api)?;
     let reply = match route {
