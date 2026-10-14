@@ -328,14 +328,6 @@ pub enum RevisionText {
     InitData(String),
 }
 
-impl RevisionText {
-    fn text(&self) -> &str {
-        match self {
-            RevisionText::Compose(text) | RevisionText::InitData(text) => text,
-        }
-    }
-}
-
 /// Where a Kata pod mounts its init-data annotation through the downward API.
 pub const INIT_DATA_PATH: &str = "/run/alpha-init-data/cc_init_data";
 /// The host writes the annotation, so a gzip bomb there must not exhaust the pod.
@@ -543,16 +535,12 @@ impl Runtime {
         let identity = tls::uri_sans(leaf)
             .and_then(|sans| tls::parse_instance_sans(&sans))
             .map_err(alpha_client::Error::from)?;
-        if let Some(revision) = &self.revision
-            && alpha_core::compose_hash(revision.text()) != identity.compose_hash
+        if let Some(RevisionText::Compose(text) | RevisionText::InitData(text)) = &self.revision
+            && alpha_core::compose_hash(text) != identity.compose_hash
         {
-            let what = match revision {
-                RevisionText::Compose(_) => "the guest agent's app_compose",
-                RevisionText::InitData(_) => "the pod's init-data",
-            };
-            return Err(Error::Certificate(format!(
-                "{what} is not the leaf's Revision"
-            )));
+            return Err(Error::Certificate(
+                "the app_compose or init-data read at start is not the leaf's Revision".into(),
+            ));
         }
         let certified =
             tls::certified(chain.iter().cloned().map(Into::into).collect(), &self.pkcs8)?;
