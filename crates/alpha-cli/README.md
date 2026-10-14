@@ -12,8 +12,13 @@ Flags or environment, nothing else:
 |---|---|---|
 | `--endpoints a,b` | `ALPHACOMPUTE_KMS_ENDPOINTS` | `call`, `deploy` — tried in turn on a connection failure or a 5xx, never on a 4xx |
 | `--platform-document-url` | `ALPHACOMPUTE_PLATFORM_DOCUMENT_URL` | `call`, `deploy`, `instances add --wait`, `request`, `verify`, `unseal`, `bootstrap` — fetched and verified under the compiled-in release key set on every run |
+| `--platform-state` | `ALPHACOMPUTE_PLATFORM_STATE` | wherever the platform document is fetched: the absolute path of the customer's journal of document versions, an existing file (empty to start) |
+| `--platform-min-version` | `ALPHACOMPUTE_PLATFORM_MIN_VERSION` | the same: the lowest document version accepted, positive, obtained independently of the document URL |
+| `--platform-max-age-seconds` | | the same: how old the document's `issued_at` may be, 1 to 86400 (the default) |
 | `--pccs-url` | `ALPHACOMPUTE_PCCS_URL` | `unseal`, `bootstrap`, `verify --kms-node`; default Intel's PCS, `https://api.trustedservices.intel.com` |
 | `--shroud-url`, `--shroud-api-key` | `ALPHACOMPUTE_SHROUD_URL`, `ALPHACOMPUTE_SHROUD_API_KEY` | `deploy` without `--register-only`, `instances`, `request`; the key goes to shroud-go only, never to the KMS |
+
+Every fetched platform document is checked against the journal before any pin from it is used: under an exclusive lock, a version below the highest recorded one, a different document under a recorded version, a document outside the age window or below the minimum, and a missing, torn or non-monotonic journal are refused; a new version is appended and fsynced. The journal is the customer's: keep it outside orchestration, protect it against rollback and preserve it across hosts and reinstalls. A lost journal is recovered from a customer checkpoint and an independent minimum, never re-created empty, and the age check trusts the local clock.
 
 The passphrase of a key file is prompted on the terminal, or read as one line from stdin when stdin is a pipe.
 

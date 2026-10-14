@@ -44,6 +44,15 @@ struct Config {
     /// The release-signed platform document.
     #[arg(long, global = true, env = "ALPHACOMPUTE_PLATFORM_DOCUMENT_URL")]
     platform_document_url: Option<String>,
+    /// The customer's platform-document journal: an existing file, kept outside orchestration.
+    #[arg(long, global = true, env = "ALPHACOMPUTE_PLATFORM_STATE")]
+    platform_state: Option<PathBuf>,
+    /// The lowest platform-document version accepted, obtained independently of the URL.
+    #[arg(long, global = true, env = "ALPHACOMPUTE_PLATFORM_MIN_VERSION")]
+    platform_min_version: Option<u64>,
+    /// The oldest platform document accepted, by its `issued_at`.
+    #[arg(long, global = true, default_value_t = alpha_cli::freshness::MAX_AGE_LIMIT_SECONDS)]
+    platform_max_age_seconds: u64,
     /// PCCS for DCAP collateral.
     #[arg(
         long,
@@ -401,7 +410,20 @@ async fn platform_document(config: &Config, now: SystemTime) -> Result<PlatformD
         config.platform_document_url.as_deref(),
         "platform-document-url",
     )?;
-    Ok(alpha_client::platform::fetch(url, &alpha_cli::release_keys()?, now).await?)
+    let doc = alpha_client::platform::fetch(url, &alpha_cli::release_keys()?, now).await?;
+    remember_platform(config, &doc, now)?;
+    Ok(doc)
+}
+
+fn remember_platform(config: &Config, doc: &PlatformDocument, now: SystemTime) -> Result<(), Exit> {
+    alpha_cli::freshness::remember(
+        need(config.platform_state.as_deref(), "platform-state")?,
+        doc,
+        need(config.platform_min_version, "platform-min-version")?,
+        config.platform_max_age_seconds,
+        now,
+    )
+    .map_err(Exit::Refused)
 }
 
 /// The admin's pin: `kms_ca_pem` of the platform document fetched and verified now.
@@ -496,6 +518,9 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 let artifact: SignedDocument = serde_json::from_value(document)
                     .map_err(|e| Exit::Refused(format!("artifact: {e}")))?;
                 let summary = sign::check(&artifact, &alpha_cli::release_keys()?, now)?;
+                let verified =
+                    alpha_client::platform::verify(&artifact, &alpha_cli::release_keys()?, now)?;
+                remember_platform(config, &verified, now)?;
                 return Ok(json!(summary));
             }
             let read = |paths: Vec<PathBuf>| {
