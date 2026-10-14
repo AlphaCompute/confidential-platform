@@ -130,14 +130,14 @@ impl Server {
         live
     }
 
-    async fn lists(&self, model: &str) -> Result<(ComposeHash, bool), Error> {
+    async fn lists(&self, model: &str) -> Result<(ComposeHash, bool), String> {
         let response = self
             .client
             .get(format!("{}/v1/models", self.url))
             .timeout(PROBE_TIMEOUT)
             .send()
             .await
-            .map_err(|_| Error::Upstream)?;
+            .map_err(|e| transport(&e))?;
         let revision = served_revision(&response)?;
         let listed = async {
             response
@@ -167,9 +167,9 @@ impl Server {
                 .body(body)
                 .send()
                 .await
-                .map_err(|_| Error::Upstream)?;
+                .map_err(|e| transport(&e))?;
             let revision = served_revision(&response)?;
-            Ok((response, revision))
+            Ok::<_, String>((response, revision))
         }
         .await;
         let ms = started.elapsed().as_millis();
@@ -182,21 +182,32 @@ impl Server {
                 eprintln!("alpha-inference: completion model={model} failed: {e} duration_ms={ms}")
             }
         }
-        answered.map(|(response, _)| response)
+        answered
+            .map(|(response, _)| response)
+            .map_err(|_| Error::Upstream)
     }
 }
 
 /// The Revision in the leaf this connection was pinned to.
-fn served_revision(response: &reqwest::Response) -> Result<ComposeHash, Error> {
+fn served_revision(response: &reqwest::Response) -> Result<ComposeHash, String> {
     let leaf = response
         .extensions()
         .get::<reqwest::tls::TlsInfo>()
         .and_then(reqwest::tls::TlsInfo::peer_certificate)
-        .ok_or_else(|| Error::internal("no model server certificate on the connection"))?;
+        .ok_or("no model server certificate on the connection")?;
     alpha_client::tls::uri_sans(leaf)
         .and_then(|sans| alpha_client::tls::parse_instance_sans(&sans))
         .map(|sans| sans.compose_hash)
-        .map_err(|e| Error::internal(format!("model server leaf: {e}")))
+        .map_err(|e| format!("model server leaf: {e}"))
+}
+
+/// reqwest's own message names only the URL; the cause (timeout, refused, handshake) is in
+/// its sources.
+fn transport(e: &reqwest::Error) -> String {
+    std::iter::successors(Some(e as &dyn std::error::Error), |e| e.source())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 #[cfg(test)]
