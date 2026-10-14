@@ -203,31 +203,6 @@ fn a_pod_quoting_over_a_runtime_key_and_nonce_is_bound_to_them() {
 }
 
 #[test]
-fn gpu_evidence_from_a_cpu_class_is_refused() {
-    let evidence = alpha_attest::KataEvidence {
-        format: alpha_attest::KATA_EVIDENCE_FORMAT.into(),
-        quote: read("k3-app.quote.bin"),
-        gpu: vec![alpha_attest::GpuEvidence {
-            evidence: vec![0],
-            certificate_chain: vec![0],
-        }],
-    };
-    let nonce: [u8; 32] = read("nonce.bin").try_into().unwrap();
-    let result = alpha_attest::appraise_kata_evidence(
-        &evidence,
-        &nonce,
-        &read("runtime_spki.der"),
-        None,
-        &doc(),
-        &collateral(),
-        now(),
-    );
-    let err = result.unwrap_err();
-    assert_eq!(err.code(), "attestation_failed", "{err}");
-    assert!(err.to_string().contains("passes no GPU"), "{err}");
-}
-
-#[test]
 fn two_classes_matching_one_td_are_refused() {
     let mut doc = doc();
     let mut twin = doc.kata_reference_values[0].clone();

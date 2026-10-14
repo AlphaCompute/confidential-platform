@@ -105,7 +105,6 @@ fn kata_evidence(quote: Vec<u8>) -> InstanceEvidence {
     InstanceEvidence::Kata(KataEvidence {
         format: KATA_EVIDENCE_FORMAT.into(),
         quote,
-        gpu: Vec::new(),
     })
 }
 
