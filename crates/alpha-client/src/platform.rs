@@ -25,15 +25,6 @@ pub fn verify(
 /// The document is a few kilobytes and grows by one entry per machine shape.
 const DOCUMENT_CAP: usize = 1 << 20;
 
-/// The URL is untrusted; the signature is what makes the document the reference.
-pub async fn fetch(
-    url: &str,
-    keys: &ReleaseKeys,
-    now: SystemTime,
-) -> Result<PlatformDocument, Error> {
-    verify(&fetch_signed(url).await?, keys, now)
-}
-
 /// Unverified: the caller verifies. Redirects are followed, as a release artifact host may
 /// redirect; the signature, not the host, is what is trusted.
 pub async fn fetch_signed(url: &str) -> Result<SignedDocument, Error> {

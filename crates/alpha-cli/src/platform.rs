@@ -37,12 +37,11 @@ pub fn remember(path: &Path, url: &str, document: &Value, version: u64) -> Resul
     let digest = alpha_core::jcs(document)
         .map(|bytes| hex::encode(Sha256::digest(bytes)))
         .map_err(|e| format!("platform document: {e}"))?;
+    let failed = |p: &Path, e: &dyn std::fmt::Display| format!("{}: {e}", p.display());
     let mut state: BTreeMap<String, Accepted> = match fs::read(path) {
-        Ok(text) => {
-            serde_json::from_slice(&text).map_err(|e| format!("{}: {e}", path.display()))?
-        }
+        Ok(text) => serde_json::from_slice(&text).map_err(|e| failed(path, &e))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
-        Err(e) => return Err(format!("{}: {e}", path.display())),
+        Err(e) => return Err(failed(path, &e)),
     };
     let reset = format!("if the rollback is deliberate, delete {}", path.display());
     if let Some(seen) = state.get(url) {
@@ -72,13 +71,12 @@ pub fn remember(path: &Path, url: &str, document: &Value, version: u64) -> Resul
         },
     );
     let text = serde_json::to_vec_pretty(&state).map_err(|e| e.to_string())?;
-    let failed = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(|e| failed(dir, e))?;
+        fs::create_dir_all(dir).map_err(|e| failed(dir, &e))?;
     }
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-    fs::write(&tmp, text).map_err(|e| failed(&tmp, e))?;
-    fs::rename(&tmp, path).map_err(|e| failed(path, e))
+    fs::write(&tmp, text).map_err(|e| failed(&tmp, &e))?;
+    fs::rename(&tmp, path).map_err(|e| failed(path, &e))
 }
 
 #[cfg(test)]
