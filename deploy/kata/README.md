@@ -239,7 +239,7 @@ alpha call register-revision --key admin.key --key-id <id> revision.json
 ```
 
 `rendered.json`'s `rules_sha256` and `policy_data_sha256` are the document's `kata_policy`, or the
-KMS refuses the Revision; CI renders every template and checks the data digest. The GPU class
+KMS refuses the Revision. The GPU class
 needs `kata_reference_values` with `gpu: true` at `MODEL_CPUS` and `MODEL_MEMORY`: RTMR0 is
 captured per shape.
 
