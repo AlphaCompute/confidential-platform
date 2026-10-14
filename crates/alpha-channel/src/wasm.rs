@@ -63,8 +63,9 @@ pub fn verify_kms_receipt(
 }
 
 /// `{name: {image, environment, ports, volumes, secrets}}` for every service of an
-/// `app-compose.json`: `volumes` lists named volumes only, and `secrets` the names the runtime
-/// delivers to that service, from its measured `ALPHACOMPUTE_SECRETS`.
+/// `app-compose.json`, or every container of a Kata init-data's agent policy: `volumes` lists
+/// named volumes only, and `secrets` the names the runtime delivers to that service, from its
+/// measured `ALPHACOMPUTE_SECRETS`.
 #[wasm_bindgen(js_name = composeServices)]
 pub fn compose_services(compose: &str) -> Result<String, JsError> {
     to_json(&compose::services(compose).map_err(js)?)

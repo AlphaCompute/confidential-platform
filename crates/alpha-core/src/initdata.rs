@@ -88,6 +88,31 @@ impl InitData {
     /// `[data]` holds nothing else: `aa.toml` or `cdh.toml` could point the guest at another key
     /// broker, and only alpha-kms releases keys.
     pub fn check_policy(&self, pinned: &KataPolicy) -> Result<(), InitDataError> {
+        let (rules, mut data) = self.policy()?;
+        if rules != pinned.rules_sha256 {
+            return Err(InitDataError::Rules(rules));
+        }
+        data.as_object_mut()
+            .and_then(|d| d.remove("containers"))
+            .ok_or(InitDataError::NoContainers)?;
+        let jcs = crate::jcs(&data).map_err(InitDataError::PolicyDataJson)?;
+        let data = compose_hash(jcs);
+        if data != pinned.data_sha256 {
+            return Err(InitDataError::PolicyData(data));
+        }
+        Ok(())
+    }
+
+    /// The policy data's `containers`, genpolicy's description of each container the agent lets
+    /// the pod create. The pins are not checked: that is [`Self::check_policy`]'s job.
+    pub fn containers(&self) -> Result<serde_json::Value, InitDataError> {
+        let (_, mut data) = self.policy()?;
+        data.as_object_mut()
+            .and_then(|d| d.remove("containers"))
+            .ok_or(InitDataError::NoContainers)
+    }
+
+    fn policy(&self) -> Result<(ComposeHash, serde_json::Value), InitDataError> {
         #[derive(Deserialize)]
         struct WithData {
             data: toml::Table,
@@ -108,20 +133,8 @@ impl InitData {
         let (rules, data) = policy
             .split_once(POLICY_DATA)
             .ok_or(InitDataError::NoPolicyData)?;
-        let rules = compose_hash(rules);
-        if rules != pinned.rules_sha256 {
-            return Err(InitDataError::Rules(rules));
-        }
-        let mut data = crate::parse(data.as_bytes()).map_err(InitDataError::PolicyDataJson)?;
-        data.as_object_mut()
-            .and_then(|d| d.remove("containers"))
-            .ok_or(InitDataError::NoContainers)?;
-        let jcs = crate::jcs(&data).map_err(InitDataError::PolicyDataJson)?;
-        let data = compose_hash(jcs);
-        if data != pinned.data_sha256 {
-            return Err(InitDataError::PolicyData(data));
-        }
-        Ok(())
+        let data = crate::parse(data.as_bytes()).map_err(InitDataError::PolicyDataJson)?;
+        Ok((compose_hash(rules), data))
     }
 }
 

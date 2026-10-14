@@ -44,8 +44,8 @@ from the Instance or from the relay.
 
 Because of check 6, the page can read the services, images and environment of the App out of the
 compose it just hashed, rather than trusting its own bundle for them (`composeServices`). An
-Instance in a Kata pod sends its init-data TOML as `compose`, the bytes its Revision hashes;
-checks 1 to 8 hold, but `composeServices` does not read it.
+Instance in a Kata pod sends its init-data TOML as `compose`, the bytes its Revision hashes, and
+`composeServices` reads its services out of the agent policy in it.
 
 ## Handshake
 
@@ -304,7 +304,14 @@ frame, so no AES-GCM nonce is ever used twice.
 
 The rest are functions: `composeServices(compose)`, which returns
 `{service: {image, environment, ports, volumes, secrets}}`, with named volumes only and the
-Secrets the runtime delivers to each service from its measured `ALPHACOMPUTE_SECRETS`;
+Secrets the runtime delivers to each service from its measured `ALPHACOMPUTE_SECRETS`. Given a
+Kata init-data instead of an `app-compose.json`, each service is a container of
+`[data] "policy.rego"`'s `policy_data.containers`, the sandbox left out: its name and image are
+the `io.kubernetes.cri.container-name` and `io.kubernetes.cri.image-name` annotations, which the
+pinned rules make the agent pull, its environment is every `NAME=value` of `Process.Env`, the
+image's defaults and `HOSTNAME=$(host-name)` included, and `ports` and `volumes` are empty
+because the policy does not describe them. A Revision of 1 MiB or more, a container without a
+name or image, a repeated name or variable, or a variable without `=` is `malformed`;
 `signingDigest(context, documentJson)`, which returns `{document, digest}`, the JCS text and its
 signing digest for `revision`, `secret`, `org-root-key` or `principal-key` and refuses any other
 context; `canonicalJson(text)`, the JCS text of a body, refusing a repeated key, whose

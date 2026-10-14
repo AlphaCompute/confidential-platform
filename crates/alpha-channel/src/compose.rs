@@ -1,12 +1,13 @@
 //! Each service's image, environment, published ports, named volumes and the Secrets it
-//! receives, read from the `app-compose.json` whose SHA-256 is the Revision, so a page shows what
-//! was measured rather than what its own bundle claims. Which Secrets a service receives comes
-//! from the `alpha-runtime` service's measured `ALPHACOMPUTE_SECRETS`, the list the runtime itself
-//! delivers from.
+//! receives, read from the bytes whose SHA-256 is the Revision (dstack's `app-compose.json` or a
+//! Kata pod's init-data), so a page shows what was measured rather than what its own bundle
+//! claims. Which Secrets a service receives comes from the `alpha-runtime` service's measured
+//! `ALPHACOMPUTE_SECRETS`, the list the runtime itself delivers from.
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use alpha_core::InitData;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use yaml_rust2::{Yaml, YamlLoader};
 
@@ -23,6 +24,8 @@ pub struct Service {
 
 const RUNTIME: &str = "alpha-runtime";
 const SECRETS: &str = "ALPHACOMPUTE_SECRETS";
+/// The runtime's bound on a pod's init-data; an `app-compose.json` stays far below it too.
+const MAX_REVISION: usize = 1 << 20;
 
 fn malformed(m: &str) -> Error {
     Error::Malformed(format!("compose: {m}"))
@@ -32,7 +35,34 @@ fn get<'a>(map: &'a yaml_rust2::yaml::Hash, key: &str) -> Option<&'a Yaml> {
     map.get(&Yaml::String(key.into()))
 }
 
-pub fn services(compose: &str) -> Result<BTreeMap<String, Service>, Error> {
+pub fn services(revision: &str) -> Result<BTreeMap<String, Service>, Error> {
+    if revision.len() >= MAX_REVISION {
+        return Err(malformed(&format!("{MAX_REVISION} bytes or more")));
+    }
+    let mut services = if revision.trim_start().starts_with('{') {
+        compose_services(revision)?
+    } else {
+        pod_services(revision)?
+    };
+    let declared = match services
+        .get(RUNTIME)
+        .and_then(|runtime| runtime.environment.get(SECRETS))
+    {
+        None => BTreeMap::new(),
+        Some(text) => declared_secrets(text)?,
+    };
+    // A Secret declared for a service the compose lacks would still be awaited by the runtime,
+    // so the page could not leave it out without the Instance never becoming healthy.
+    for (name, secrets) in declared {
+        services
+            .get_mut(&name)
+            .ok_or_else(|| malformed(&format!("{SECRETS} names {name}, which is not a service")))?
+            .secrets = secrets;
+    }
+    Ok(services)
+}
+
+fn compose_services(compose: &str) -> Result<BTreeMap<String, Service>, Error> {
     let value = alpha_core::parse(compose.as_bytes()).map_err(|e| malformed(&e.to_string()))?;
     let yaml = value
         .get("docker_compose_file")
@@ -45,7 +75,7 @@ pub fn services(compose: &str) -> Result<BTreeMap<String, Service>, Error> {
     let Some(Yaml::Hash(services)) = get(root, "services") else {
         return Err(malformed("services is not a map"));
     };
-    let mut services = services
+    services
         .iter()
         .map(|(name, service)| {
             let name = name
@@ -85,22 +115,77 @@ pub fn services(compose: &str) -> Result<BTreeMap<String, Service>, Error> {
             };
             Ok((name.to_owned(), service))
         })
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
+        .collect()
+}
 
-    let declared = match services
-        .get(RUNTIME)
-        .and_then(|runtime| runtime.environment.get(SECRETS))
-    {
-        None => BTreeMap::new(),
-        Some(text) => declared_secrets(text)?,
-    };
-    // A Secret declared for a service the compose lacks would still be awaited by the runtime,
-    // so the page could not leave it out without the Instance never becoming healthy.
-    for (name, secrets) in declared {
-        services
-            .get_mut(&name)
-            .ok_or_else(|| malformed(&format!("{SECRETS} names {name}, which is not a service")))?
-            .secrets = secrets;
+#[derive(Deserialize)]
+struct Container {
+    #[serde(rename = "OCI")]
+    oci: Oci,
+}
+
+#[derive(Deserialize)]
+struct Oci {
+    #[serde(rename = "Process")]
+    process: Process,
+    #[serde(rename = "Annotations")]
+    annotations: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct Process {
+    #[serde(rename = "Env")]
+    env: Vec<String>,
+}
+
+/// One service per container of the agent policy, under its pod spec name. The image is the one
+/// the pinned rules make the agent pull, and the environment every variable they pin, image
+/// defaults included. The policy says nothing of ports and names no volume, so both stay empty.
+fn pod_services(init_data: &str) -> Result<BTreeMap<String, Service>, Error> {
+    let containers = InitData::parse(init_data.to_owned())
+        .and_then(|i| i.containers())
+        .map_err(|e| malformed(&e.to_string()))?;
+    let containers: Vec<Container> =
+        serde_json::from_value(containers).map_err(|e| malformed(&e.to_string()))?;
+    let mut services = BTreeMap::new();
+    for Container { oci } in containers {
+        let annotation = |key: &str| oci.annotations.get(key).cloned();
+        match annotation("io.kubernetes.cri.container-type").as_deref() {
+            // The pause container, which runs the guest's own bundle.
+            Some("sandbox") => continue,
+            Some("container") => {}
+            _ => {
+                return Err(malformed(
+                    "a container is neither the sandbox nor a container",
+                ));
+            }
+        }
+        let name = annotation("io.kubernetes.cri.container-name")
+            .ok_or_else(|| malformed("a container has no name"))?;
+        let image = annotation("io.kubernetes.cri.image-name")
+            .ok_or_else(|| malformed(&format!("{name} has no image")))?;
+        let mut environment = BTreeMap::new();
+        for var in oci.process.env {
+            let (key, value) = var
+                .split_once('=')
+                .ok_or_else(|| malformed(&format!("{name} has a variable without =")))?;
+            if environment
+                .insert(key.to_owned(), value.to_owned())
+                .is_some()
+            {
+                return Err(malformed(&format!("{name} sets {key} twice")));
+            }
+        }
+        let service = Service {
+            image: Some(image),
+            environment,
+            ports: Vec::new(),
+            volumes: Vec::new(),
+            secrets: Vec::new(),
+        };
+        if services.insert(name.clone(), service).is_some() {
+            return Err(malformed(&format!("two containers are named {name}")));
+        }
     }
     Ok(services)
 }
@@ -297,5 +382,73 @@ mod tests {
         let repeated =
             r#"{"docker_compose_file":"services: {}","docker_compose_file":"services: {}"}"#;
         assert_eq!(services(repeated).unwrap_err().code(), "malformed");
+    }
+
+    const K3: &str = include_str!("../../../testdata/attest/b300-kata-4.0.0/k3-app.toml");
+
+    fn init_data(containers: Value) -> String {
+        let data = serde_json::json!({ "containers": containers });
+        format!(
+            "algorithm = \"sha256\"\nversion = \"0.1.0\"\n\n[data]\n\"policy.rego\" = '''\npackage agent_policy\npolicy_data := {data}\n'''\n"
+        )
+    }
+
+    fn container(name: &str, env: &[&str]) -> Value {
+        serde_json::json!({ "OCI": {
+            "Process": { "Env": env },
+            "Annotations": {
+                "io.kubernetes.cri.container-type": "container",
+                "io.kubernetes.cri.container-name": name,
+                "io.kubernetes.cri.image-name": format!("{name}@sha256:{}", "a".repeat(64)),
+            },
+        }})
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+    fn reads_the_containers_of_a_pods_policy() {
+        let s = services(K3).unwrap();
+        assert_eq!(s.keys().collect::<Vec<_>>(), ["capture"]);
+        assert_eq!(
+            s["capture"].image.as_deref(),
+            Some(
+                "public.ecr.aws/docker/library/alpine@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8"
+            )
+        );
+        assert_eq!(s["capture"].environment["HOSTNAME"], "$(host-name)");
+
+        let s = services(&init_data(serde_json::json!([
+            container(
+                RUNTIME,
+                &[r#"ALPHACOMPUTE_SECRETS={"app":["db_password"]}"#]
+            ),
+            container("app", &["MODE=a=b"]),
+        ])))
+        .unwrap();
+        assert_eq!(s["app"].secrets, ["db_password"]);
+        assert_eq!(s["app"].environment["MODE"], "a=b");
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+    fn containers_of_another_shape_are_refused() {
+        let mut typeless = container("app", &[]);
+        typeless["OCI"]["Annotations"]
+            .as_object_mut()
+            .unwrap()
+            .remove("io.kubernetes.cri.container-type");
+        for containers in [
+            serde_json::json!([container("app", &["MODE"])]),
+            serde_json::json!([container("app", &["A=1", "A=2"])]),
+            serde_json::json!([container("app", &[]), container("app", &[])]),
+            serde_json::json!([typeless]),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(
+                services(&init_data(containers.clone())).unwrap_err().code(),
+                "malformed",
+                "{containers}"
+            );
+        }
+        let huge = format!("{K3}#{}\n", " ".repeat(MAX_REVISION));
+        assert_eq!(services(&huge).unwrap_err().code(), "malformed");
     }
 }
