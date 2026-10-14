@@ -37,5 +37,4 @@ Both outputs equal the `mrtd`, `rtmr1` and `rtmr2` of their class in the platfor
 are `OVMF.inteltdx.fd` sha256 `2af9e5e9…0fb0c0b6`, `vmlinuz-6.18.35-200` `f1041521…4977ea34` and
 `vmlinuz-6.18.35-200-nvidia-gpu` `08064a9b…7d22a4f4`, the files the B300 pods booted.
 
-RTMR0 is not computed: it measures the ACPI tables, the table loader and SMBIOS that Kata's QEMU generates for
-each VM's vCPUs, memory and devices, and the event log holds only their digests. Its values stay captured per shape.
+RTMR0 stays captured per shape; see the module doc of `measure.rs`.

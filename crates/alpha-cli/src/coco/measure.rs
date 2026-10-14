@@ -40,13 +40,10 @@ pub fn mrtd(firmware: &[u8]) -> Result<Measurement, String> {
             "firmware: TDVF metadata length {length:#x} does not hold exactly its {count} sections"
         ));
     }
-    let sections = range(firmware, add(descriptor, 16)?, add(descriptor, length)?)?
-        .chunks_exact(32)
-        .enumerate()
-        .map(|(i, entry)| section(firmware, i, entry))
-        .collect::<Result<Vec<_>, String>>()?;
+    let entries = range(firmware, add(descriptor, 16)?, add(descriptor, length)?)?;
     let mut h = Sha384::new();
-    for s in sections {
+    for (i, entry) in entries.chunks_exact(32).enumerate() {
+        let s = section(firmware, i, entry)?;
         // A source holds exactly size / PAGE pages, so only a sourceless section reaches the zeros.
         let contents = s
             .source
