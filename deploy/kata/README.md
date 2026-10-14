@@ -170,7 +170,8 @@ through the nodes' API and the database.
 - **Upgrade.** Sign a document listing the old and the new Revision; every tenant App that pins
   the KMS gets a Revision listing both. Then `kubectl apply -f` the new release's `kms-node.yaml`:
   the StatefulSet replaces `kms-1`, waits until it has joined and is ready, then replaces `kms-0`.
-  If the new pod never becomes ready, apply the old file and delete that pod.
+  If the new `kms-1` never becomes ready, apply the old file, then
+  `kubectl -n alpha-kms delete pod kms-1`: the StatefulSet does not replace a pod that is not ready.
   Drop the old Revision once no tenant pins it.
 - **All nodes lost.** Port-forward to `pod/kms-0` as in step 6, and two custodians each run
   `alpha unseal --share share-<n>.json --key custodian.key --endpoint https://localhost:8443`
