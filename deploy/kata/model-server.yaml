@@ -67,7 +67,6 @@ spec:
         # Plain HTTP from the runtime: 200 while its leaf is current and vLLM's /health answers.
         readinessProbe:
           httpGet: {path: /ready, port: 8444}
-          periodSeconds: 10
           failureThreshold: 60
         securityContext:
           allowPrivilegeEscalation: false

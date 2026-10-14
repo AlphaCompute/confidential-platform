@@ -1,5 +1,4 @@
-# Namespaces and addresses of the platform services; nothing here is measured. A model server's
-# Service is per model: `kubectl -n alpha-models expose deployment <MODEL_NAME> --port 8443`.
+# Namespaces and addresses of the platform services; nothing here is measured.
 apiVersion: v1
 kind: Namespace
 metadata:

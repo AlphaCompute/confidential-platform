@@ -65,8 +65,8 @@ jobs:
           # A template and the sandbox-name pattern of its pods.
           while read -r template pods; do
             # Every ${…} of the template is set: envsubst would write an unset one as empty.
-            vars=$(grep -o '\${[A-Z0-9_]*}' "deploy/kata/$template" | sort -u | tr -d '\n')
-            for var in $(grep -o '\${[A-Z0-9_]*}' "deploy/kata/$template" | tr -d '${}' | sort -u); do
+            vars=$(grep -o '\${[A-Z0-9_]*}' "deploy/kata/$template" | sort -u)
+            for var in $(tr -d '${}' <<< "$vars"); do
               [ -n "${!var:-}" ] || { echo "$template: $var is not set" >&2; exit 1; }
             done
             envsubst "$vars" < "deploy/kata/$template" > "$RUNNER_TEMP/$template"

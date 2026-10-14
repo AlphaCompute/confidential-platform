@@ -193,10 +193,8 @@ resources, the KMS nodes' shape (1 vCPU, 2048 MiB), whose reference values the d
 lists. `model-server.yaml` is one vLLM model on one GPU of `kata-qemu-nvidia-gpu-tdx`. Every pod
 runs `alpha-runtime` beside its service; the socket directory `/run/alpha` is an `emptyDir` in
 the pod VM's memory. The three services read their leaf and Secrets from that socket and
-terminate their own TLS on 8443; the kubelet probes their HTTPS `/ready`. The model server's
-runtime terminates TLS on 8443 for vLLM on `127.0.0.1:8000`, admits only Instances of the Apps in
-`MODEL_CALLER_APPS`, and answers the kubelet's probe on plain HTTP 8444 (`services/alpha-runtime`).
-Each template is its App's Revision once rendered: a new value of any input below is a new Revision.
+terminate their own TLS on 8443; the kubelet probes their HTTPS `/ready`. How the model server
+is reached is in the header of `model-server.yaml`. Each template is its App's Revision once rendered: a new value of any input below is a new Revision.
 
 ### Inputs
 
