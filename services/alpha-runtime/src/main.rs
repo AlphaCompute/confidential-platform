@@ -4,8 +4,9 @@ use std::time::SystemTime;
 
 use alpha_runtime::{
     Config, EXIT_REFUSED, Error, Exit, INIT_DATA_PATH, RevisionText, Runtime, SECRETS_DIR,
-    SOCKET_PATH, Substrate, TLS_PORT, proxy,
+    SOCKET_PATH, TLS_PORT, proxy,
 };
+use alpha_tsm::Substrate;
 use p256::ecdsa::SigningKey;
 use tokio::net::UnixListener;
 

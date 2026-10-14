@@ -101,7 +101,7 @@ impl Substrate {
     }
 }
 
-pub fn kata_evidence(quote: Vec<u8>) -> InstanceEvidence {
+fn kata_evidence(quote: Vec<u8>) -> InstanceEvidence {
     InstanceEvidence::Kata(KataEvidence {
         format: KATA_EVIDENCE_FORMAT.into(),
         quote,
@@ -512,6 +512,51 @@ mod tests {
         other[63] ^= 1;
         let error = check_quote(KATA_QUOTE, &other).unwrap_err().to_string();
         assert!(error.contains("not ours"), "{error}");
+    }
+
+    fn kata_testdata(name: &str) -> Vec<u8> {
+        fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../testdata/attest/b300-kata-4.0.0")
+                .join(name),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn kata_evidence_is_the_quote_alone_and_the_kms_appraises_it() {
+        let quote = kata_testdata("k3-app.quote.bin");
+        let body = serde_json::to_value(kata_evidence(quote.clone())).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "format": "alphacompute-evidence/kata/1",
+                "quote": base64::prelude::BASE64_URL_SAFE_NO_PAD.encode(&quote),
+            })
+        );
+
+        let evidence: alpha_attest::KataEvidence = serde_json::from_value(body).unwrap();
+        let doc: alpha_attest::PlatformDocument =
+            serde_json::from_slice(&kata_testdata("platform-document.json")).unwrap();
+        let collateral: alpha_attest::Collateral =
+            serde_json::from_slice(&kata_testdata("collateral.json")).unwrap();
+        let captured_at = String::from_utf8(kata_testdata("captured_at.txt")).unwrap();
+        let now: std::time::SystemTime = chrono::DateTime::parse_from_rfc3339(captured_at.trim())
+            .unwrap()
+            .into();
+        let nonce: [u8; 32] = kata_testdata("nonce.bin").try_into().unwrap();
+        let appraised = alpha_attest::appraise_kata_evidence(
+            &evidence,
+            &nonce,
+            &kata_testdata("runtime_spki.der"),
+            None,
+            &doc,
+            &collateral,
+            now,
+        )
+        .unwrap();
+        let init_data = String::from_utf8(kata_testdata("k3-app.toml")).unwrap();
+        assert_eq!(appraised.compose_hash, alpha_core::compose_hash(&init_data));
     }
 
     #[test]
