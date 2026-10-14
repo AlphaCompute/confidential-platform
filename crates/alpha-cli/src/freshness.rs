@@ -61,7 +61,7 @@ pub fn remember(
         .append(true)
         .open(path)
         .map_err(|e| format!("platform-state {}: {e}", path.display()))?;
-    file.try_lock()
+    file.lock()
         .map_err(|e| format!("platform-state lock: {e}"))?;
     let mut history = String::new();
     file.read_to_string(&mut history)
