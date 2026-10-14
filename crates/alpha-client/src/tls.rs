@@ -45,6 +45,9 @@ pub enum Pin {
     Ca(CertificateDer<'static>),
     /// The chain ends at this CA and the leaf carries one of these Revisions.
     CaAndRevisions(CertificateDer<'static>, Vec<ComposeHash>),
+    /// As `CaAndRevisions`, and the leaf's SubjectPublicKeyInfo is exactly these bytes: the
+    /// node whose evidence was appraised, not another behind the same name.
+    CaRevisionsAndSpki(CertificateDer<'static>, Vec<ComposeHash>, Vec<u8>),
     /// The chain ends at this CA and the leaf is an App Instance's carrying one of these
     /// Revisions; an empty list matches nothing.
     CaAndInstanceRevisions(CertificateDer<'static>, Vec<ComposeHash>),
@@ -78,13 +81,16 @@ struct PinnedServer {
 impl PinnedServer {
     fn new(pin: Option<Pin>) -> Result<Self, Error> {
         let anchor = match &pin {
-            Some(Pin::Ca(ca) | Pin::CaAndRevisions(ca, _) | Pin::CaAndInstanceRevisions(ca, _)) => {
-                Some(
-                    webpki::anchor_from_trusted_cert(ca)
-                        .map_err(|e| Error::Invalid(format!("pinned ca: {e}")))?
-                        .to_owned(),
-                )
-            }
+            Some(
+                Pin::Ca(ca)
+                | Pin::CaAndRevisions(ca, _)
+                | Pin::CaRevisionsAndSpki(ca, ..)
+                | Pin::CaAndInstanceRevisions(ca, _),
+            ) => Some(
+                webpki::anchor_from_trusted_cert(ca)
+                    .map_err(|e| Error::Invalid(format!("pinned ca: {e}")))?
+                    .to_owned(),
+            ),
             Some(Pin::CaSpkiAndRevisions(..) | Pin::Spki(_)) | None => None,
         };
         Ok(Self {
@@ -110,7 +116,10 @@ impl ServerCertVerifier for PinnedServer {
         };
         let presented;
         let anchor = match pin {
-            Pin::Ca(_) | Pin::CaAndRevisions(..) | Pin::CaAndInstanceRevisions(..) => Some(
+            Pin::Ca(_)
+            | Pin::CaAndRevisions(..)
+            | Pin::CaRevisionsAndSpki(..)
+            | Pin::CaAndInstanceRevisions(..) => Some(
                 self.anchor
                     .as_ref()
                     .ok_or_else(|| refuse("pinned ca is not an anchor".into()))?,
@@ -146,7 +155,9 @@ impl ServerCertVerifier for PinnedServer {
         }
         match pin {
             Pin::Ca(_) => {}
-            Pin::CaAndRevisions(_, revisions) | Pin::CaSpkiAndRevisions(_, revisions) => {
+            Pin::CaAndRevisions(_, revisions)
+            | Pin::CaRevisionsAndSpki(_, revisions, _)
+            | Pin::CaSpkiAndRevisions(_, revisions) => {
                 let sans = uri_sans(end_entity).map_err(|e| refuse(e.to_string()))?;
                 // An Instance leaf from the same CA also carries a Revision SAN and the
                 // server-auth EKU; only a node's leaf carries the KMS identity.
@@ -160,6 +171,13 @@ impl ServerCertVerifier for PinnedServer {
                 if !allowed {
                     return Err(refuse(
                         "server certificate carries no allowed KMS revision".into(),
+                    ));
+                }
+                if let Pin::CaRevisionsAndSpki(.., spki) = pin
+                    && spki_of(end_entity).map_err(|e| refuse(e.to_string()))? != *spki
+                {
+                    return Err(refuse(
+                        "server key is not the pinned SubjectPublicKeyInfo".into(),
                     ));
                 }
             }
@@ -595,6 +613,24 @@ mod tests {
         let (_, other_ca) = new_ca();
         let foreign = Pin::CaAndInstanceRevisions(other_ca.der().clone(), vec![revision]);
         assert!(!pinned_handshake(&app, foreign).await);
+    }
+
+    #[tokio::test]
+    async fn a_node_key_pin_refuses_another_node_of_the_same_ca_and_revision() {
+        let (ca_key, ca_cert) = new_ca();
+        let ca = CertificateDer::from(ca_cert.der().to_vec());
+        let revision = alpha_core::compose_hash("kms");
+        let sans = [
+            KMS_SAN.to_owned(),
+            format!("urn:alphacompute:revision:{revision}"),
+        ];
+        let appraised = leaf_with_sans(&ca_key, &ca_cert, &sans);
+        let other = leaf_with_sans(&ca_key, &ca_cert, &sans);
+        let leaf = CertificateDer::from_pem_slice(appraised.certificate_chain.as_bytes()).unwrap();
+        let pin = || Pin::CaRevisionsAndSpki(ca.clone(), vec![revision], spki_of(&leaf).unwrap());
+
+        assert!(pinned_handshake(&appraised, pin()).await);
+        assert!(!pinned_handshake(&other, pin()).await);
     }
 
     #[tokio::test]

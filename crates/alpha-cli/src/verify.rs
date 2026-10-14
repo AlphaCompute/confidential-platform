@@ -32,8 +32,8 @@ pub async fn instance(
         "app_id": sans.app_id,
         "revision": sans.compose_hash,
         "runtime_pubkey_sha256": sans.runtime_pubkey_sha256_hex,
-        "appraisal": "the KMS appraised the Instance against this platform document before issuing \
-                      its leaf, which lives an hour",
+        "appraisal": "the KMS appraised the Instance when it issued its leaf, at most an hour \
+                      ago, under the platform document the KMS held then",
     }))
 }
 
@@ -70,7 +70,8 @@ fn check_instance(
 
 /// A KMS node proves itself with fresh evidence, appraised here as a custodian would, and must
 /// be serving: `/ready` answers over a leaf from the document's KMS CA naming one of its
-/// `kms_revisions`.
+/// `kms_revisions`, held by the key the evidence attested, so a name that balances across
+/// nodes cannot pair one node's quote with another's readiness.
 pub async fn kms_node(
     url: &str,
     pccs_url: &str,
@@ -80,7 +81,8 @@ pub async fn kms_node(
     let (identity, _) = node::attested_node(url, pccs_url, doc, None, now).await?;
     let ca = tls::cert_from_pem(&doc.kms_ca_pem).map_err(|e| e.to_string())?;
     let revisions = doc.kms_revisions.iter().map(|r| r.compose_hash).collect();
-    Client::new(vec![url.to_owned()], Pin::CaAndRevisions(ca, revisions))
+    let pin = Pin::CaRevisionsAndSpki(ca, revisions, identity.runtime_spki.clone());
+    Client::new(vec![url.to_owned()], pin)
         .map_err(|e| e.to_string())?
         .ready()
         .await
