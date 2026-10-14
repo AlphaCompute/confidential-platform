@@ -12,7 +12,7 @@ use alpha_cli::request::Call;
 use alpha_cli::{coco, instances, node, sign};
 use alpha_client::platform::SignedDocument;
 use alpha_client::{Client, Pin};
-use alpha_core::{AppId, KeyId, OrgId, PrincipalId};
+use alpha_core::{AppId, InitData, KeyId, OrgId, PrincipalId};
 use alpha_crypto::PublicKey;
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
@@ -199,6 +199,23 @@ enum Command {
         body: Option<String>,
         method: reqwest::Method,
         path: String,
+    },
+    /// Check an Endpoint against the platform document: an App's Instance by its leaf from the
+    /// KMS CA, or a KMS node by fresh evidence. Exits non-zero on any failed check.
+    Verify {
+        #[arg(
+            long,
+            conflicts_with = "kms_node",
+            required_unless_present = "kms_node"
+        )]
+        app: Option<AppId>,
+        /// The Revision v2 the tenant signed: it must be the leaf's Revision and pass the
+        /// document's `kata_policy`.
+        #[arg(long, requires = "app")]
+        init_data: Option<PathBuf>,
+        #[arg(long)]
+        kms_node: bool,
+        url: String,
     },
     /// Hand one custodian's share to an attested sealed node.
     Unseal {
@@ -709,6 +726,28 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 return Err(Exit::Partial(out));
             }
             Ok(out)
+        }
+        Command::Verify {
+            app,
+            init_data,
+            kms_node: _,
+            url,
+        } => {
+            let init_data = init_data
+                .map(|path| {
+                    fs::read_to_string(&path)
+                        .map_err(|e| e.to_string())
+                        .and_then(|text| InitData::parse(text).map_err(|e| e.to_string()))
+                        .map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))
+                })
+                .transpose()?;
+            let doc = platform_document(config, now).await?;
+            Ok(match app {
+                Some(app) => {
+                    alpha_cli::verify::instance(&url, app, init_data.as_ref(), &doc).await?
+                }
+                None => alpha_cli::verify::kms_node(&url, &config.pccs_url, &doc, now).await?,
+            })
         }
         Command::Unseal {
             share,
