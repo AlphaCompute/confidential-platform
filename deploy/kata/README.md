@@ -8,6 +8,11 @@ whoever runs it. Nothing here is applied by CI: the operator applies these files
 How a node gets its database password, and why the init-data carries none, is in
 [`../README.md`](../README.md#a-node-in-a-kata-pod).
 
+Production's Day 0 comes after three ceremonies: the release signers' keys
+([`../signer-keys.md`](../signer-keys.md)), the tagged release rebuilt on a second machine
+([`../verify-release.md`](../verify-release.md)), and the dress rehearsal of genesis
+([`../rehearsal.md`](../rehearsal.md)).
+
 ## Inputs not fixed yet
 
 Each is chosen before the release whose pod spec is signed; the first three are measured, so

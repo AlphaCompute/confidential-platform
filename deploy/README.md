@@ -19,9 +19,11 @@ image in ghcr. Check it against this workflow at the tag, since `--repo` alone a
 attestation from a dispatch of an edited workflow on any branch:
 
 ```sh
-gh attestation verify oci://<image@sha256:…> --repo AlphaCompute/confidential-platform \
+IMAGE='PASTE_IMAGE_REFERENCE'   # ghcr.io/…/<name>@sha256:…
+TAG='PASTE_TAG'
+gh attestation verify "oci://$IMAGE" --repo AlphaCompute/confidential-platform \
   --signer-workflow AlphaCompute/confidential-platform/.github/workflows/release.yml \
-  --source-ref refs/tags/<tag> --deny-self-hosted-runners
+  --source-ref "refs/tags/$TAG" --deny-self-hosted-runners
 ```
 
 For the two KMS images a job holding no credential then renders the node's `app-compose.json`
