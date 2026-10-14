@@ -1,59 +1,70 @@
-# The KMS node's pod. The release workflow fills the four ${…} with envsubst and renders it with
-# `alpha coco render`: everything the agent policy pins (namespace, image, command, env, mounts,
-# security context) is part of the node's Revision. Labels, scheduling and the generated name are
-# not, so every node pod is created from the one rendered file.
-apiVersion: v1
-kind: Pod
+# The KMS nodes. The release workflow fills the four ${…} with envsubst and renders it with
+# `alpha coco render`: everything the agent policy pins for the pod template (namespace, image,
+# command, env, mounts, security context, the names kms-<ordinal>) is the nodes' one Revision;
+# labels, scheduling and probes are not.
+apiVersion: apps/v1
+kind: StatefulSet
 metadata:
-  generateName: kms-
+  name: kms
   namespace: alpha-kms
-  labels:
-    app.kubernetes.io/name: alpha-kms
 spec:
-  runtimeClassName: kata-qemu-tdx
-  automountServiceAccountToken: false
-  enableServiceLinks: false
-  nodeSelector:
-    alphacompute.io/pool: kms
-  tolerations:
-  - {key: alphacompute.io/pool, operator: Equal, value: kms, effect: NoSchedule}
-  affinity:
-    podAntiAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-      - topologyKey: kubernetes.io/hostname
-        labelSelector:
-          matchLabels:
-            app.kubernetes.io/name: alpha-kms
-  securityContext:
-    supplementalGroups: [1, 2, 3, 4, 6, 10, 11, 20, 26, 27]
-  containers:
-  - name: alpha-kms
-    image: ${KMS_IMAGE}
-    ports:
-    - {name: https, containerPort: 8443}
-    env:
-    # No password: the host reads the init-data. The node's login gets it from bootstrap, unseal
-    # or the peer it joins.
-    - name: ALPHACOMPUTE_DATABASE_URL
-      value: postgres://alpha_kms_node@postgres.alpha-trust-db.svc:5432/alpha?sslmode=require&channel_binding=require&require_auth=scram-sha-256
-    - name: ALPHACOMPUTE_KMS_ENDPOINTS
-      value: "${KMS_ENDPOINTS}"
-    - name: ALPHACOMPUTE_PLATFORM_DOCUMENT_URL
-      value: "${PLATFORM_DOCUMENT_URL}"
-    - name: ALPHACOMPUTE_PCCS_URL
-      value: "${PCCS_URL}"
-    securityContext:
-      # configfs-tsm report entries are root-owned.
-      runAsUser: 0
-      allowPrivilegeEscalation: false
-      capabilities:
-        drop: [ALL]
-      readOnlyRootFilesystem: true
-    volumeMounts:
-    - name: tsm
-      mountPath: /sys/kernel/config
-  volumes:
-  - name: tsm
-    hostPath:
-      path: /sys/kernel/config
-      type: Directory
+  serviceName: kms
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: alpha-kms
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: alpha-kms
+    spec:
+      runtimeClassName: kata-qemu-tdx
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        alphacompute.io/pool: kms
+      tolerations:
+      - {key: alphacompute.io/pool, operator: Equal, value: kms, effect: NoSchedule}
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - topologyKey: kubernetes.io/hostname
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/name: alpha-kms
+      securityContext:
+        supplementalGroups: [1, 2, 3, 4, 6, 10, 11, 20, 26, 27]
+      containers:
+      - name: alpha-kms
+        image: ${KMS_IMAGE}
+        ports:
+        - {name: https, containerPort: 8443}
+        # The kubelet probes from the host; an exec probe would be refused by the agent policy.
+        readinessProbe:
+          httpGet: {path: /ready, port: https, scheme: HTTPS}
+        env:
+        # No password: the host reads the init-data. The node's login gets it from bootstrap, unseal
+        # or the peer it joins.
+        - name: ALPHACOMPUTE_DATABASE_URL
+          value: postgres://alpha_kms_node@postgres.alpha-trust-db.svc:5432/alpha?sslmode=require&channel_binding=require&require_auth=scram-sha-256
+        - name: ALPHACOMPUTE_KMS_ENDPOINTS
+          value: "${KMS_ENDPOINTS}"
+        - name: ALPHACOMPUTE_PLATFORM_DOCUMENT_URL
+          value: "${PLATFORM_DOCUMENT_URL}"
+        - name: ALPHACOMPUTE_PCCS_URL
+          value: "${PCCS_URL}"
+        securityContext:
+          # configfs-tsm report entries are root-owned.
+          runAsUser: 0
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: [ALL]
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: tsm
+          mountPath: /sys/kernel/config
+      volumes:
+      - name: tsm
+        hostPath:
+          path: /sys/kernel/config
+          type: Directory

@@ -1,7 +1,7 @@
 # The KMS nodes on Kata: fresh genesis on owned hardware
 
-Every KMS node is a Kata TDX pod (`kata-qemu-tdx`) created from one rendered pod spec, so all
-nodes share one Revision: the SHA-256 of the pod's init-data. The trust-zone Postgres is an
+Every KMS node is a Kata TDX pod (`kata-qemu-tdx`) of one rendered StatefulSet, `kms`, so all
+nodes share one Revision: the SHA-256 of its pod template's init-data. The trust-zone Postgres is an
 ordinary pod on its own node pool and is treated as untrusted storage: what is secret in it is
 ciphertext under keys it never sees, and its rows and their freshness are not protected against
 whoever runs it. Nothing here is applied by CI: the operator applies these files with `kubectl`.
@@ -13,14 +13,12 @@ How a node gets its database password, and why the init-data carries none, is in
 Each is chosen before the release whose pod spec is signed; the first three are measured, so
 changing one is a new Revision.
 
-- `KMS_KATA_ENDPOINTS` (repository variable): every node's address,
-  `https://kms-1.alpha-kms.svc:8443,…,https://kms-<N>.alpha-kms.svc:8443`. Its length is the number
-  of nodes. A node walks this list once, at start, to find a peer to join.
+- `KMS_KATA_ENDPOINTS` (repository variable): both nodes' addresses,
+  `https://kms-0.kms.alpha-kms.svc:8443,https://kms-1.kms.alpha-kms.svc:8443`. A node walks this
+  list once, at start, to find a peer to join.
 - `KMS_KATA_PLATFORM_DOCUMENT_URL` (repository variable): where the signed platform document is
   served, without a cache in front.
 - `KMS_KATA_PCCS_URL` (repository variable): the PCCS the nodes fetch collateral from.
-- `KMS_MAX_UNAVAILABLE` (`kms.yaml`): how many node pods a voluntary disruption may take at once;
-  fewer than the number of nodes.
 - `TRUST_DB_STORAGE_CLASS`, `TRUST_DB_STORAGE_SIZE` (`trust-db.yaml`): the trust-db pool's local
   volume.
 
@@ -30,8 +28,8 @@ A tag `v*` with `KMS_KATA_ENDPOINTS` set renders `kms-node.yaml` with the pushed
 and the three variables (`envsubst`, then `alpha coco render` with the Kata 4.0.0 genpolicy) and
 adds `kata/` to the `alpha-kms-release-manifest` artifact:
 
-- `pod.yaml`: the pod spec with the init-data in its `io.katacontainers.config.hypervisor.cc_init_data`
-  annotation; the file every node pod is created from;
+- `kms-node.yaml`: the StatefulSet with the init-data in its pod template's
+  `io.katacontainers.config.hypervisor.cc_init_data` annotation;
 - `init-data.toml`: the init-data bytes, `[data] app_id` and the agent policy;
 - `manifest.json`: `image`, `compose_hash` (`sha256:` of `init-data.toml`, the Revision),
   `rules_sha256` and `policy_data_sha256` (the values of the document's `kata_policy`).
@@ -41,7 +39,7 @@ With the variables unset, the release renders no Kata pod; neither does a releas
 production release key yet. Anyone reproduces it on Linux x86_64
 from the tag: `envsubst` the template with the same four values, then
 `alpha coco render --app-id 01a09f07-8d09-7640-94c1-bbdb74200a1e --kata <opt/kata of
-kata-tools-static-4.0.0-amd64.tar.zst> --out pod.yaml kms-node.yaml` prints the same `revision`
+kata-tools-static-4.0.0-amd64.tar.zst> --out out.yaml kms-node.yaml` prints the same `revision`
 and `init_data`.
 
 ## Signing the Revision
@@ -106,21 +104,16 @@ custodians have run `alpha keygen --custodian` and handed over their public keys
      | kubectl -n alpha-trust-db exec -i postgres-0 -- psql -X -v ON_ERROR_STOP=1 -U postgres -d alpha
    ```
 
-5. **Namespace, budget, addresses**, one Service for each address in `KMS_KATA_ENDPOINTS`:
+5. **Namespace, addresses, budget**: `kubectl apply -f kms.yaml`. The headless Service `kms`
+   gives each node its name in `KMS_KATA_ENDPOINTS`; the budget keeps one ready node, and a node
+   is ready only while it serves.
+
+6. **The nodes**, from the release's `kms-node.yaml` unchanged. `kms-0` comes up sealed; the
+   StatefulSet creates `kms-1` only once `kms-0` is ready.
 
    ```sh
-   : "${KMS_MAX_UNAVAILABLE:?}" && export KMS_MAX_UNAVAILABLE &&
-     envsubst '$KMS_MAX_UNAVAILABLE' < kms.yaml | kubectl apply -f -
-   for n in $(seq <number of nodes>); do KMS_NODE=$n envsubst '$KMS_NODE' < kms-service.yaml | kubectl apply -f -; done
-   ```
-
-6. **The first node**, from the release's `pod.yaml` unchanged. A label routes `kms-1` to it.
-   It comes up sealed.
-
-   ```sh
-   pod=$(kubectl create -f pod.yaml -o name)
-   kubectl -n alpha-kms label "$pod" alphacompute.io/kms-node=1
-   kubectl -n alpha-kms port-forward service/kms-1 8443:8443 &
+   kubectl apply -f kms-node.yaml
+   kubectl -n alpha-kms port-forward pod/kms-0 8443:8443 &
    curl -sk https://localhost:8443/ready   # 503 {"sealed":true}
    ```
 
@@ -139,18 +132,14 @@ custodians have run `alpha keygen --custodian` and handed over their public keys
    once the check below shows it is dead. If the CLI gets no answer, do not retry: drop and
    recreate the database (`drop database alpha; create database alpha;` as `postgres`), give the
    role a new genesis password (`alter role alpha_kms_node password …`, as in step 4), migrate and
-   bootstrap again on a new node pod.
+   bootstrap again after `kubectl -n alpha-kms delete pod kms-0`.
 
 8. **Re-sign the document** with `kms_ca_pem`; `alpha sign --check` prints the CA's SPKI SHA-256
    and the Revisions, the two values a tenant pins.
 
-9. **The other nodes**, from the same `pod.yaml`, each labelled with its number. Each joins a
-   serving node on start; one created before the first node served is deleted and created again.
-
-   ```sh
-   pod=$(kubectl create -f pod.yaml -o name)
-   kubectl -n alpha-kms label "$pod" alphacompute.io/kms-node=2
-   ```
+9. **The other node.** `kms-1` joins `kms-0` on start, which needs the re-signed document. If it
+   started before and stays sealed, `kubectl -n alpha-kms delete pod kms-1`; the StatefulSet
+   creates it again.
 
 ## Verify
 
@@ -161,7 +150,7 @@ through the nodes' API and the database.
   `kubectl -n alpha-kms get pod <pod> -o jsonpath='{.metadata.annotations.io\.katacontainers\.config\.hypervisor\.cc_init_data}' | base64 -d | gunzip | sha256sum`
   equals `compose_hash`.
 - `kubectl -n alpha-kms exec <pod> -- /alpha-kms` is refused.
-- `GET /ready` through each `kms-<n>` answers 200 `{"sealed":false}`.
+- `kubectl -n alpha-kms get statefulset kms` shows `2/2` ready: both nodes serve.
 - The genesis password is dead; this login is refused:
 
   ```sh
@@ -176,18 +165,18 @@ through the nodes' API and the database.
 
 ## Restart, upgrade, loss
 
-- **Restart.** A node pod that is deleted or restarts comes back sealed and joins a serving node.
-  Recreate a deleted one from the same `pod.yaml` and label it again.
+- **Restart.** The StatefulSet recreates a lost node pod; it comes back sealed and joins the
+  serving node.
 - **Upgrade.** Sign a document listing the old and the new Revision; every tenant App that pins
-  the KMS gets a Revision listing both. Then, one node at a time, delete the old pod (anti-affinity
-  leaves no host for a second pod while it runs), create a pod from the new release's `pod.yaml`,
-  give it the node's label, and wait for `/ready` 200 before the next node; the others serve
-  meanwhile.
+  the KMS gets a Revision listing both. Then `kubectl apply -f` the new release's `kms-node.yaml`:
+  the StatefulSet replaces `kms-1`, waits until it has joined and is ready, then replaces `kms-0`.
+  If the new `kms-1` never becomes ready, apply the old file, then
+  `kubectl -n alpha-kms delete pod kms-1`: the StatefulSet does not replace a pod that is not ready.
   Drop the old Revision once no tenant pins it.
-- **All nodes lost.** Create one node pod, label it, port-forward, and two custodians each run
+- **All nodes lost.** Port-forward to `pod/kms-0` as in step 6, and two custodians each run
   `alpha unseal --share share-<n>.json --key custodian.key --endpoint https://localhost:8443`
-  with the same URL options. The root gives the node its database password. The other nodes then
-  join it.
+  with the same URL options. The root gives the node its database password. `kms-1` then joins
+  it; if it was already running sealed, delete its pod.
 
 ## What the operator never sees
 
