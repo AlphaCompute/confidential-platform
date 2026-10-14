@@ -169,5 +169,5 @@ Cloud with the three host mounts of `docs/manifest.md`.
 `images/manager/Dockerfile` builds the binary as a static musl executable in a stage with no
 network (dependencies are fetched in the stage before) and ships it alone in a `scratch` image;
 the base image is pinned by digest and every timestamp comes from `SOURCE_DATE_EPOCH`, so one
-commit gives one image digest. `.github/workflows/release.yml` builds it twice, the second time
-with `--no-cache`, and fails when the two differ.
+commit gives one image digest. `.github/workflows/release.yml` builds it on two fresh runners
+with `--no-cache` and pushes it only when the two are the same.

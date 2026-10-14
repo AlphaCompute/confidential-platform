@@ -7,70 +7,124 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
-  image:
+  build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [a, b]
+        image:
+          - {name: alpha-runtime, dockerfile: images/manager/Dockerfile}
+          - {name: alpha-kms, dockerfile: images/kms/Dockerfile}
+          - {name: alpha-kms-dev, dockerfile: images/kms/Dockerfile, features: dev-root}
+          - {name: alpha-inference, dockerfile: images/inference/Dockerfile}
+          - {name: alpha-broker, dockerfile: images/broker/Dockerfile}
+          - {name: alpha-guard, dockerfile: images/guard/Dockerfile}
+          - {name: alpha-cpu-app, dockerfile: images/cpu-app/Dockerfile}
+    env:
+      NAME: ${{ matrix.image.name }}
+      DOCKERFILE: ${{ matrix.image.dockerfile }}
+      FEATURES: ${{ matrix.image.features }}
+      RUNNER_LABEL: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build ${{ matrix.image.name }} from nothing
+        run: |
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
+          docker build --no-cache --platform linux/amd64 --provenance=false \
+            --build-arg SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
+            ${FEATURES:+--build-arg FEATURES=$FEATURES} \
+            -f "$DOCKERFILE" -t "$NAME:candidate" .
+          mkdir out
+          docker image inspect --format '{{.Id}} {{.RootFS.Layers}}' "$NAME:candidate" > out/fingerprint
+          # The other runner's image only has to match; this one is the image that is pushed.
+          if [ "$RUNNER_LABEL" = a ]; then docker save "$NAME:candidate" | gzip > out/image.tar.gz; fi
+          echo "$NAME on runner $RUNNER_LABEL (Docker $(docker version --format '{{.Server.Version}}'), SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH): $(cat out/fingerprint)" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.image.name }}-${{ matrix.runner }}
+          path: out
+          if-no-files-found: error
+          retention-days: 7
+
+  # Per image and after every build, so one image's failed build (a production KMS before the
+  # release keys exist) holds back only that image; its missing build fails the comparison.
+  image:
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: alpha-runtime
-            dockerfile: images/manager/Dockerfile
           # The KMS App: two CVMs, one Revision; the compose rendered below is that Revision.
           - name: alpha-kms
-            dockerfile: images/kms/Dockerfile
             app_id: 01a09f07-8d09-7640-94c1-bbdb74200a1e
           # The dev KMS App with the root KEK from env; a distinct image, never a switch.
           - name: alpha-kms-dev
-            dockerfile: images/kms/Dockerfile
             features: dev-root
             app_id: 01a09f07-8d09-7aff-b257-83dbd9e6e641
           # No app_id: the release workflow renders a compose only for the KMS.
           - name: alpha-inference
-            dockerfile: images/inference/Dockerfile
           - name: alpha-broker
-            dockerfile: images/broker/Dockerfile
           - name: alpha-guard
-            dockerfile: images/guard/Dockerfile
           - name: alpha-cpu-app
-            dockerfile: images/cpu-app/Dockerfile
     env:
+      NAME: ${{ matrix.name }}
       FEATURES: ${{ matrix.features }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Build ${{ matrix.name }} twice, the second time from nothing
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: ${{ matrix.name }}-[ab]
+          path: builds
+      - name: Require one image from both runners
         run: |
-          export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
-          build() {
-            docker build --platform linux/amd64 --provenance=false \
-              --build-arg SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
-              ${FEATURES:+--build-arg FEATURES=$FEATURES} \
-              -f "${{ matrix.dockerfile }}" -t "${{ matrix.name }}:$1" "${@:2}" .
-          }
-          build first
-          build second --no-cache
-          first=$(docker image inspect --format '{{.Id}} {{.RootFS.Layers}}' "${{ matrix.name }}:first")
-          second=$(docker image inspect --format '{{.Id}} {{.RootFS.Layers}}' "${{ matrix.name }}:second")
-          echo "first:  $first"
-          echo "second: $second"
-          if [ "$first" != "$second" ]; then
-            echo "the two builds of ${{ matrix.dockerfile }} differ; the image is not reproducible" >&2
+          if ! cmp "builds/$NAME-a/fingerprint" "builds/$NAME-b/fingerprint"; then
+            echo "the two runners' builds of $NAME differ; the image is not reproducible" >&2
             exit 1
           fi
-          echo "${{ matrix.name }} image (SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH): $first" >> "$GITHUB_STEP_SUMMARY"
+          gunzip -c "builds/$NAME-a/image.tar.gz" | docker load
+          if [ "$(docker image inspect --format '{{.Id}} {{.RootFS.Layers}}' "$NAME:candidate")" != "$(cat "builds/$NAME-a/fingerprint")" ]; then
+            echo "the archived $NAME is not the image runner a built" >&2
+            exit 1
+          fi
       - name: Push
         id: push
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          image="ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/${{ matrix.name }}:${GITHUB_REF_NAME}"
-          docker tag "${{ matrix.name }}:first" "$image"
-          docker push "$image"
-          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$image")
+          repository="ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/$NAME"
+          docker tag "$NAME:candidate" "$repository:$GITHUB_REF_NAME"
+          docker push "$repository:$GITHUB_REF_NAME"
+          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$repository:$GITHUB_REF_NAME")
           echo "pushed $digest" >> "$GITHUB_STEP_SUMMARY"
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          {
+            echo "digest=$digest"
+            echo "repository=$repository"
+            echo "sha256=${digest#*@}"
+          } >> "$GITHUB_OUTPUT"
+      - name: Attest the pushed image's build provenance
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ steps.push.outputs.repository }}
+          subject-digest: ${{ steps.push.outputs.sha256 }}
+          push-to-registry: true
       # The unsigned release manifest: the compose of the KMS node with this image, in the bytes
       # Phala measures, and its compose_hash for the release-key holder to sign into kms_revisions.
       - name: Render the KMS compose from the pushed digest
@@ -126,7 +180,7 @@ jobs:
             cat "$OUT/manifest.json"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: matrix.app_id && startsWith(github.ref, 'refs/tags/')
         with:
           name: ${{ matrix.name }}-release-manifest

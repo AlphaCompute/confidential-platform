@@ -11,9 +11,11 @@ build.
 ## What a release produces
 
 A tag `v*` runs `.github/workflows/release.yml`: every image (`alpha-runtime`, `alpha-kms`,
-`alpha-kms-dev`, `alpha-inference`, `alpha-broker`) is built twice, the second time with `--no-cache`, and the job fails unless
-both builds give one image id and one layer set; the images are pushed as
-`ghcr.io/<owner>/<name>:<tag>`. For the two KMS images the workflow then renders the node's
+`alpha-kms-dev`, `alpha-inference`, `alpha-broker`, `alpha-guard`, `alpha-cpu-app`) is built
+with `--no-cache` on two fresh runners, and an image is pushed as `ghcr.io/<owner>/<name>:<tag>`
+only when both give one image id and one layer set. Each pushed digest carries a signed GitHub
+build-provenance attestation, stored beside the image in ghcr and checked with
+`gh attestation verify oci://<image@sha256:…> --repo <owner>/confidential-platform`. For the two KMS images the workflow then renders the node's
 `app-compose.json` from the pushed digest (`cargo run -p alpha-cli --example kms_compose`,
 which is `alpha_cli::deploy::kms_compose` over `alpha_core::phala::canonicalize`, the same
 serializer Phala's API applies) and publishes the unsigned release manifest as the artifact
