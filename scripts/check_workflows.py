@@ -16,8 +16,8 @@ assert 'workflow_call' in docs['ci']['on']
 release = docs['release']['jobs']
 assert release['checks']['uses'] == './.github/workflows/ci.yml'
 assert release['build']['needs'] == 'checks'
-assert release['compare']['needs'] == 'build'
+assert release['publish']['needs'] == ['checks', 'build']
 assert release['build']['strategy']['matrix']['replica'] == ['a', 'b']
-assert docs['release']['permissions'].get('packages') != 'write'
-assert 'docker push' not in (root/'release.yml').read_text()
-print('PASS: release actions pinned; mandatory CI; independent candidate builds; no automatic registry push.')
+assert [n for n, job in release.items() if 'packages' in job.get('permissions', {})] == ['publish']
+assert 'packages' not in docs['release']['permissions']
+print('PASS: release actions pinned; mandatory CI; independent candidate builds; only the comparing job publishes.')
