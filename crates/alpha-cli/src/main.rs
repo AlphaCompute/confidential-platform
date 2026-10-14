@@ -410,9 +410,11 @@ async fn platform_document(config: &Config, now: SystemTime) -> Result<PlatformD
         config.platform_document_url.as_deref(),
         "platform-document-url",
     )?;
-    let doc = alpha_client::platform::fetch(url, &alpha_cli::release_keys()?, now).await?;
+    let signed = alpha_client::platform::fetch_signed(url).await?;
+    let doc = alpha_client::platform::verify(&signed, &alpha_cli::release_keys()?, now)?;
     alpha_cli::freshness::remember(
         need(config.platform_state.as_deref(), "platform-state")?,
+        &signed.document,
         &doc,
         need(config.platform_min_version, "platform-min-version")?,
         config.platform_max_age_seconds,

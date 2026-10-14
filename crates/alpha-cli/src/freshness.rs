@@ -7,6 +7,7 @@ use std::time::SystemTime;
 
 use alpha_attest::PlatformDocument;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub const MAX_AGE_LIMIT_SECONDS: u64 = 86400;
 
@@ -20,8 +21,10 @@ struct Checkpoint {
 /// The journal must already exist: a lost journal is recovered from the customer's checkpoint,
 /// never silently re-created, or a rollback would pass. The OS lock serializes concurrent CLI
 /// processes, and the new record is fsynced before the caller uses any pin from `doc`.
+/// `signed` is the document value the release signatures cover, and `doc` its parse.
 pub fn remember(
     path: &Path,
+    signed: &Value,
     doc: &PlatformDocument,
     minimum: u64,
     max_age_seconds: u64,
@@ -53,9 +56,9 @@ pub fn remember(
             doc.version
         ));
     }
-    let digest = alpha_channel::sha256_label(
-        &serde_json::to_vec(doc).map_err(|e| format!("platform document: {e}"))?,
-    );
+    let digest = alpha_core::signing_digest(alpha_core::context::PLATFORM, signed)
+        .map(|d| format!("sha256:{}", hex::encode(d)))
+        .map_err(|e| format!("platform document: {e}"))?;
     let mut file = OpenOptions::new()
         .read(true)
         .append(true)
@@ -119,14 +122,23 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("alpha-platform-{}", alpha_core::AppId::mint()));
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
-        let mut doc: PlatformDocument = serde_json::from_value(json!({
+        let mut doc = json!({
             "version": 4, "issued_at": crate::rfc3339(now),
             "policy": {"tcb_statuses": ["UpToDate"], "tolerated_advisories": []},
             "reference_values": [], "kms_ca_pem": "first-ca", "kms_revisions": []
-        }))
-        .unwrap();
+        });
         let day = MAX_AGE_LIMIT_SECONDS;
-        let check = |doc: &PlatformDocument, minimum, now| remember(&path, doc, minimum, day, now);
+        let at = |doc: &Value, minimum, max_age, now, path: &Path| {
+            remember(
+                path,
+                doc,
+                &serde_json::from_value(doc.clone()).unwrap(),
+                minimum,
+                max_age,
+                now,
+            )
+        };
+        let check = |doc: &Value, minimum, now| at(doc, minimum, day, now, &path);
 
         assert!(check(&doc, 4, now).unwrap_err().contains("platform-state"));
         std::fs::File::create(&path).unwrap();
@@ -134,16 +146,19 @@ mod tests {
         check(&doc, 4, now).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
 
-        doc.version = 3;
+        doc["version"] = json!(3);
         assert!(
             check(&doc, 1, now)
                 .unwrap_err()
                 .contains("below the recorded 4")
         );
-        doc.version = 4;
-        doc.kms_ca_pem = "rotated-ca".into();
+        doc["version"] = json!(4);
+        let mut extended = doc.clone();
+        extended["unknown"] = json!("signed but not parsed");
+        assert!(check(&extended, 1, now).unwrap_err().contains("differs"));
+        doc["kms_ca_pem"] = json!("rotated-ca");
         assert!(check(&doc, 1, now).unwrap_err().contains("differs"));
-        doc.version = 5;
+        doc["version"] = json!(5);
         check(&doc, 4, now).unwrap();
         let later = now + Duration::from_secs(day + 1);
         assert!(check(&doc, 4, later).unwrap_err().contains("expired"));
@@ -158,8 +173,8 @@ mod tests {
                 .unwrap_err()
                 .contains("customer minimum 6")
         );
-        assert!(remember(&path, &doc, 4, day + 1, now).is_err());
-        assert!(remember(Path::new("relative"), &doc, 4, day, now).is_err());
+        assert!(at(&doc, 4, day + 1, now, &path).is_err());
+        assert!(at(&doc, 4, day, now, Path::new("relative")).is_err());
 
         OpenOptions::new()
             .append(true)
