@@ -395,7 +395,7 @@ pub struct JoinReply {
     pub tenant_kek_root: String,
     pub ca_key: String,
     pub ca_cert: String,
-    /// The password the peer reaches the database with; absent from a node that predates it.
+    /// The password a Kata peer reaches the database with; a Phala node sends none.
     #[serde(default)]
     pub database_password: Option<String>,
 }

@@ -29,7 +29,6 @@ hmac = "0.13"
 rand_core = "0.10"
 pem = "3"
 pbkdf2 = "0.13"
-percent-encoding = "2"
 parking_lot = "0.12"
 p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }

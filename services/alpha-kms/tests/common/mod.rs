@@ -221,10 +221,8 @@ pub async fn start_node(
     clock: Clock,
     collateral_of: &str,
 ) -> (Arc<Node>, String, tokio::sync::oneshot::Sender<()>) {
-    let password = Some(zeroize::Zeroizing::new("from the encrypted env".to_owned()));
     start_node_on(
         alpha_tsm::Substrate::Dstack,
-        password,
         pool,
         release_url,
         release_key,
@@ -236,7 +234,6 @@ pub async fn start_node(
 
 pub async fn start_node_on(
     substrate: alpha_tsm::Substrate,
-    database_password: Option<zeroize::Zeroizing<String>>,
     pool: PgPool,
     release_url: &str,
     release_key: &SigningKey,
@@ -250,7 +247,6 @@ pub async fn start_node_on(
         substrate,
         kms_endpoints: vec![],
         platform_document_url: release_url.to_owned(),
-        database_password,
         #[cfg(feature = "dev-root")]
         dev_root_kek: None,
     };

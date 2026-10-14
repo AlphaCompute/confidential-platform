@@ -192,7 +192,6 @@ mod tests {
             substrate: alpha_tsm::Substrate::Kata,
             kms_endpoints: vec![],
             platform_document_url: url,
-            database_password: None,
             #[cfg(feature = "dev-root")]
             dev_root_kek: None,
         };

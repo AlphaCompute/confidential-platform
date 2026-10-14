@@ -49,7 +49,7 @@ struct Config {
         long,
         global = true,
         env = "ALPHACOMPUTE_PCCS_URL",
-        default_value = "https://pccs.phala.network"
+        default_value = "https://api.trustedservices.intel.com"
     )]
     pccs_url: String,
     #[arg(long, global = true, env = "ALPHACOMPUTE_SHROUD_URL")]

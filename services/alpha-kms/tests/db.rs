@@ -1926,7 +1926,6 @@ async fn a_kata_node_takes_the_database_only_from_genesis_and_its_root() {
     let kata = |pool| {
         start_node_on(
             alpha_tsm::Substrate::Kata,
-            None,
             pool,
             &release.url,
             &release.key,

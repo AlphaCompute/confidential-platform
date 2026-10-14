@@ -166,7 +166,8 @@ The runbook for nodes on owned hardware, and what a release renders for them, is
 [`kata/README.md`](kata/README.md).
 
 A Kata pod has no encrypted env: its env is pinned in the init-data, and the host reads it. A Kata
-node therefore refuses to start if `ALPHACOMPUTE_DATABASE_URL` carries a password. Give it
+node therefore refuses to start if it is given a database password: in `ALPHACOMPUTE_DATABASE_URL`
+(userinfo or `?password=`), in `PGPASSWORD`, or in a pgpass file. Give it
 `postgres://alpha_kms_node@<pg>/alpha?sslmode=require&channel_binding=require&require_auth=scram-sha-256`
 (the login role, no password), with a `hostssl ... scram-sha-256` line in `pg_hba.conf` for that
 role. The node refuses to start without the last two parameters. `sslmode=require` does not
@@ -182,7 +183,8 @@ password from three places:
   the genesis transaction the node sets the role's password to one derived from the root KEK,
   sent as a SCRAM verifier. Delete the file afterwards. Its password is already dead.
 - **Unseal.** The two shares give the root, and the root gives the password.
-- **Join.** The serving node passes its password in the join reply. A Kata joiner writes no
+- **Join.** The serving Kata node passes its password in the join reply; a Phala node has none
+  to pass, so a Kata node cannot join one. A Kata joiner writes no
   `node.join.request`: the database address is part of its measured init-data.
 
 Nobody holds the derived password. A node logs in with it before it can set it again, so the
@@ -191,8 +193,7 @@ authentication. After genesis, the database owner saves the role's verifier,
 `select rolpassword from pg_authid where rolname = 'alpha_kms_node'`; it is not the password. If
 the role's password is reset, the owner restores it with
 `alter role alpha_kms_node password '<saved SCRAM-SHA-256$... verifier>'`, and the nodes log in
-again. Kata nodes that joined a Phala node hold the Phala password instead, and nothing restores
-access for them if both nodes are lost: retire the last Phala node only after a Kata genesis.
+again.
 
 ## The broker's database
 
