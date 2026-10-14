@@ -54,46 +54,16 @@ const DMTF_SPEC: u8 = 0x01;
 const SIGNATURE_LEN: usize = 96;
 const TCB_INFO_OID: &str = "2.23.133.5.4.1.1";
 
-/// NVIDIA's opaque data types. Any other type is refused, so a firmware that starts
-/// reporting something new is looked at before it is accepted.
+/// The NVIDIA opaque data types read by name.
 mod tlv {
     pub const DRIVER_VERSION: u16 = 3;
-    pub const GPU_INFO: u16 = 4;
     pub const VBIOS_VERSION: u16 = 6;
-    pub const NVDEC0_STATUS: u16 = 11;
-    pub const MSRSCNT: u16 = 12;
-    pub const CPRINFO: u16 = 13;
-    pub const BOARD_ID: u16 = 14;
     pub const CHIP_SKU: u16 = 15;
-    pub const CHIP_SKU_MOD: u16 = 16;
     pub const PROJECT: u16 = 17;
     pub const PROJECT_SKU: u16 = 18;
-    pub const PROJECT_SKU_MOD: u16 = 19;
     pub const FWID: u16 = 20;
-    pub const SYS_ENABLE_STATUS: u16 = 33;
     pub const OPAQUE_DATA_VERSION: u16 = 34;
     pub const CHIP_INFO: u16 = 35;
-    pub const FEATURE_FLAG: u16 = 36;
-
-    pub const KNOWN: [u16; 17] = [
-        DRIVER_VERSION,
-        GPU_INFO,
-        VBIOS_VERSION,
-        NVDEC0_STATUS,
-        MSRSCNT,
-        CPRINFO,
-        BOARD_ID,
-        CHIP_SKU,
-        CHIP_SKU_MOD,
-        PROJECT,
-        PROJECT_SKU,
-        PROJECT_SKU_MOD,
-        FWID,
-        SYS_ENABLE_STATUS,
-        OPAQUE_DATA_VERSION,
-        CHIP_INFO,
-        FEATURE_FLAG,
-    ];
 }
 
 fn failed(what: impl Into<String>) -> AppraisalError {
@@ -283,7 +253,9 @@ impl Opaque {
             let kind = r.u16()?;
             let len = r.u16()?;
             let value = r.take(len.into())?;
-            if !tlv::KNOWN.contains(&kind) {
+            // Every type the B300 firmware reports. Any other is refused, so a firmware that
+            // starts reporting something new is looked at before it is accepted.
+            if !matches!(kind, 3 | 4 | 6 | 11..=20 | 33..=36) {
                 return Err(failed(format!("unknown opaque type {kind}")));
             }
             if fields.insert(kind, value).is_some() {
@@ -381,10 +353,7 @@ fn verify_chain(
         .and_then(|d| i64::try_from(d.as_secs()).ok())
         .and_then(|secs| ASN1Time::from_timestamp(secs).ok())
         .ok_or_else(|| failed("now"))?;
-    for (depth, pair) in certs.windows(2).enumerate() {
-        let [cert, issuer] = pair else {
-            return Err(failed("certificate chain"));
-        };
+    for (depth, (cert, issuer)) in certs.iter().zip(certs.iter().skip(1)).enumerate() {
         let n = depth.saturating_add(1);
         let ca = issuer
             .basic_constraints()
