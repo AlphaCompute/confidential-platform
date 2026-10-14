@@ -348,7 +348,7 @@ async fn chat_completions(
         return Err(Error::ModelNotFound(model));
     }
     let upstream_response = if let Some(server) = state.own.get(&model) {
-        server.complete(body).await.map_err(|_| Error::Upstream)?
+        server.complete(&model, body).await?
     } else {
         let (upstream, client) = verified_external(&state, &model).await?;
         let provider_key = state

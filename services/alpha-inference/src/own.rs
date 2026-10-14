@@ -91,6 +91,7 @@ pub fn servers(
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(completion_timeout)
+                .tls_info(true)
                 .build()
                 .map_err(|e| Error::internal(format!("model server client: {e}")))?;
             let server = Server {
@@ -113,45 +114,89 @@ impl Server {
         {
             return live;
         }
-        let live = self.lists(model).await;
-        if !live {
-            eprintln!("alpha-inference: model server for {model} failed its probe");
-        }
+        let live = match self.lists(model).await {
+            Ok((revision, listed)) => {
+                eprintln!(
+                    "alpha-inference: probe model={model} revision={revision} listed={listed}"
+                );
+                listed
+            }
+            Err(e) => {
+                eprintln!("alpha-inference: probe model={model} failed: {e}");
+                false
+            }
+        };
         *last = Some((Instant::now(), live));
         live
     }
 
-    async fn lists(&self, model: &str) -> bool {
-        let fetch = async {
-            let body: Value = self
-                .client
-                .get(format!("{}/v1/models", self.url))
-                .timeout(PROBE_TIMEOUT)
-                .send()
-                .await
-                .ok()?
+    async fn lists(&self, model: &str) -> Result<(ComposeHash, bool), Error> {
+        let response = self
+            .client
+            .get(format!("{}/v1/models", self.url))
+            .timeout(PROBE_TIMEOUT)
+            .send()
+            .await
+            .map_err(|_| Error::Upstream)?;
+        let revision = served_revision(&response)?;
+        let listed = async {
+            response
                 .error_for_status()
                 .ok()?
-                .json()
+                .json::<Value>()
                 .await
-                .ok()?;
-            body.get("data")?
+                .ok()?
+                .get("data")?
                 .as_array()?
                 .iter()
                 .any(|m| m.get("id").and_then(Value::as_str) == Some(model))
                 .then_some(())
         };
-        fetch.await.is_some()
+        Ok((revision, listed.await.is_some()))
     }
 
-    pub async fn complete(&self, body: Bytes) -> reqwest::Result<reqwest::Response> {
-        self.client
-            .post(format!("{}/v1/chat/completions", self.url))
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body)
-            .send()
-            .await
+    /// Logs the model, the Revision that answered, the status and the time to the response
+    /// head; never the request or the answer.
+    pub async fn complete(&self, model: &str, body: Bytes) -> Result<reqwest::Response, Error> {
+        let started = Instant::now();
+        let answered = async {
+            let response = self
+                .client
+                .post(format!("{}/v1/chat/completions", self.url))
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .send()
+                .await
+                .map_err(|_| Error::Upstream)?;
+            let revision = served_revision(&response)?;
+            Ok((response, revision))
+        }
+        .await;
+        let ms = started.elapsed().as_millis();
+        match &answered {
+            Ok((response, revision)) => eprintln!(
+                "alpha-inference: completion model={model} revision={revision} status={} duration_ms={ms}",
+                response.status().as_u16()
+            ),
+            Err(e) => {
+                eprintln!("alpha-inference: completion model={model} failed: {e} duration_ms={ms}")
+            }
+        }
+        answered.map(|(response, _)| response)
     }
+}
+
+/// The Revision in the leaf this connection was pinned to.
+fn served_revision(response: &reqwest::Response) -> Result<ComposeHash, Error> {
+    let leaf = response
+        .extensions()
+        .get::<reqwest::tls::TlsInfo>()
+        .and_then(reqwest::tls::TlsInfo::peer_certificate)
+        .ok_or_else(|| Error::internal("no model server certificate on the connection"))?;
+    alpha_client::tls::uri_sans(leaf)
+        .and_then(|sans| alpha_client::tls::parse_instance_sans(&sans))
+        .map(|sans| sans.compose_hash)
+        .map_err(|e| Error::internal(format!("model server leaf: {e}")))
 }
 
 #[cfg(test)]
