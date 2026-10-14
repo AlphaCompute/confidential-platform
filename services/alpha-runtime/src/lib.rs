@@ -321,7 +321,6 @@ impl Substrate {
 
 /// The bytes whose SHA-256 is the Instance's Revision, served on `/v1/identity` once a leaf
 /// names that hash.
-#[derive(Clone, Debug)]
 pub enum RevisionText {
     /// dstack: the guest agent's `app-compose.json`.
     Compose(String),
