@@ -159,19 +159,15 @@ impl Server {
     /// head; never the request or the answer.
     pub async fn complete(&self, model: &str, body: Bytes) -> Result<reqwest::Response, Error> {
         let started = Instant::now();
-        let answered = async {
-            let response = self
-                .client
-                .post(format!("{}/v1/chat/completions", self.url))
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body)
-                .send()
-                .await
-                .map_err(|e| transport(&e))?;
-            let revision = served_revision(&response)?;
-            Ok::<_, String>((response, revision))
-        }
-        .await;
+        let answered = self
+            .client
+            .post(format!("{}/v1/chat/completions", self.url))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| transport(&e))
+            .and_then(|response| served_revision(&response).map(|revision| (response, revision)));
         let ms = started.elapsed().as_millis();
         match &answered {
             Ok((response, revision)) => eprintln!(
