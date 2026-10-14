@@ -121,6 +121,28 @@ test("an uploaded compose is approved only after the registration receipt verifi
   assert.ok(page.text().includes(APPROVED), page.text());
 });
 
+test("a Kata init-data registers as init-data, and only under the pinned agent policy", async () => {
+  const initData = testdata("attest/b300-kata-4.0.0/k3-app.toml");
+  const app_id = "0199e000-0000-7000-8000-00000000a11d";
+  const unpinned = await approvalPage({ compose: initData, app_id });
+  assert.ok(unpinned.page.text().includes("The KMS would refuse to register"), unpinned.page.text());
+  assert.equal(unpinned.laptop.log.length, 0);
+
+  const view = testView();
+  view.view.kata_policy = JSON.parse(
+    testdata("attest/b300-kata-4.0.0/platform-document.json"),
+  ).kata_policy;
+  const { api, page } = await approvalPage({ compose: initData, app_id }, {}, view);
+  assert.ok(page.text().includes("Image: public.ecr.aws/docker/library/alpine"), page.text());
+  await page.click("Approve with passkey");
+  assert.deepEqual(api.revisions[0].body.payload, {
+    app_id,
+    digest: api.compose_hash,
+    init_data: initData,
+  });
+  assert.ok(page.text().includes(APPROVED), page.text());
+});
+
 // The approval page's text for the vector with each `[from, to]` replaced in its compose.
 async function shown(...replacements) {
   const compose = JSON.parse(withoutSecrets());

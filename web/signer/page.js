@@ -70,6 +70,8 @@ const MESSAGES = {
     "What the service asked you to approve does not match what it would run. Nothing was signed.",
   unreadable:
     "This page cannot read what the service asked you to approve, so it cannot show it to you. Nothing was signed.",
+  not_registrable:
+    "The KMS would refuse to register what the service asked you to approve. Nothing was signed.",
   approved: "Approved. You can close this tab.",
   declined: "Declined. You can close this tab.",
   secret_missing: "Enter a value for every secret.",
@@ -834,6 +836,13 @@ async function startApproval(view, viewText, ticket) {
       ? uploadedLaunch(read)
       : await catalogLaunch(view, read, before);
   if (launch.refusal) return stop(launch.refusal);
+  // Built before any Secret is stored: a launch the KMS would not register stops here.
+  try {
+    const policy = JSON.stringify(view.kata_policy ?? null);
+    launch.payload = JSON.parse(wasm_bindgen.revisionPayload(read.app_id, launch.compose, policy));
+  } catch (_) {
+    return stop(MESSAGES.not_registrable);
+  }
 
   const ui = screen(
     el(
@@ -986,7 +995,7 @@ async function put(a, item, inputs) {
 }
 
 function revisionInputs(a) {
-  const payload = { app_id: a.read.app_id, compose: a.launch.compose };
+  const payload = a.launch.payload;
   const signable = wasm_bindgen.signingDigest("revision", JSON.stringify(payload));
   return { payload, options: getOptions(a.view, signable.digest, allowed(a)) };
 }

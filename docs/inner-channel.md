@@ -44,8 +44,8 @@ from the Instance or from the relay.
 
 Because of check 6, the page can read the services, images and environment of the App out of the
 compose it just hashed, rather than trusting its own bundle for them (`composeServices`). An
-Instance in a Kata pod sends its init-data TOML as `compose`, the bytes its Revision hashes;
-checks 1 to 8 hold, but `composeServices` does not read it.
+Instance in a Kata pod sends its init-data TOML as `compose`, the bytes its Revision hashes, and
+`composeServices` reads its services out of the agent policy in it.
 
 ## Handshake
 
@@ -271,7 +271,7 @@ Every export returns an error rather than trapping, and the error's message star
 ## The JavaScript surface
 
 `verifyPlatform(signedJson, nowMs)` returns `{version, issued_at, kms_ca_pem, kms_revisions}` as
-JSON, with `signer` and `catalog_key` when the document has them.
+JSON, with `signer`, `catalog_key` and `kata_policy` when the document has them.
 
 `verifyKmsReceipt(receiptJson, kmsCaPem, kmsRevisionsJson, expectedJson)` checks a KMS receipt
 and returns the response it signed as JSON. `kmsRevisionsJson` lists the `compose_hash` of each
@@ -304,7 +304,19 @@ frame, so no AES-GCM nonce is ever used twice.
 
 The rest are functions: `composeServices(compose)`, which returns
 `{service: {image, environment, ports, volumes, secrets}}`, with named volumes only and the
-Secrets the runtime delivers to each service from its measured `ALPHACOMPUTE_SECRETS`;
+Secrets the runtime delivers to each service from its measured `ALPHACOMPUTE_SECRETS`. Given a
+Kata init-data instead of an `app-compose.json`, each service is a container of
+`[data] "policy.rego"`'s `policy_data.containers`, the sandbox left out: its name and image are
+the `io.kubernetes.cri.container-name` and `io.kubernetes.cri.image-name` annotations, which the
+pinned rules make the agent pull, its environment is every `NAME=value` of `Process.Env`, the
+image's defaults and `HOSTNAME=$(host-name)` included, and `ports` and `volumes` are empty
+because the policy does not describe them. A Revision of 1 MiB or more, a container without a
+name or image, a repeated name or variable, or a variable without `=` is `malformed`;
+`revisionPayload(appId, revision, kataPolicyJson)`, the payload that registers the same bytes:
+`{app_id, compose}` for a compose that passes the KMS's registration checks, and
+`{app_id, init_data, digest}` for an init-data that names the App and carries the agent policy
+of `kataPolicyJson`, the verified document's `kata_policy` or `null`; anything else is
+`malformed`, so a page can refuse a launch before it stores a Secret for it;
 `signingDigest(context, documentJson)`, which returns `{document, digest}`, the JCS text and its
 signing digest for `revision`, `secret`, `org-root-key` or `principal-key` and refuses any other
 context; `canonicalJson(text)`, the JCS text of a body, refusing a repeated key, whose

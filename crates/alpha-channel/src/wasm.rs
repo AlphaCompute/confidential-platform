@@ -34,9 +34,9 @@ fn to_json(value: &impl serde::Serialize) -> Result<String, JsError> {
     serde_json::to_string(value).map_err(|e| js(Error::Malformed(e.to_string())))
 }
 
-/// `{version, issued_at, kms_ca_pem, kms_revisions}`, plus `signer` and `catalog_key` when the
-/// document has them, of a platform document that verifies under the release key compiled into
-/// this package.
+/// `{version, issued_at, kms_ca_pem, kms_revisions}`, plus `signer`, `catalog_key` and
+/// `kata_policy` when the document has them, of a platform document that verifies under the
+/// release key compiled into this package.
 #[wasm_bindgen(js_name = verifyPlatform)]
 pub fn verify_platform(signed_json: &str, now_ms: f64) -> Result<String, JsError> {
     let signed: platform::SignedDocument = parse("platform document", signed_json)?;
@@ -63,11 +63,29 @@ pub fn verify_kms_receipt(
 }
 
 /// `{name: {image, environment, ports, volumes, secrets}}` for every service of an
-/// `app-compose.json`: `volumes` lists named volumes only, and `secrets` the names the runtime
-/// delivers to that service, from its measured `ALPHACOMPUTE_SECRETS`.
+/// `app-compose.json`, or every container of a Kata init-data's agent policy: `volumes` lists
+/// named volumes only, and `secrets` the names the runtime delivers to that service, from its
+/// measured `ALPHACOMPUTE_SECRETS`.
 #[wasm_bindgen(js_name = composeServices)]
 pub fn compose_services(compose: &str) -> Result<String, JsError> {
     to_json(&compose::services(compose).map_err(js)?)
+}
+
+/// The payload to sign under `revision` that registers `revision` for `app_id`:
+/// `{app_id, compose}` or `{app_id, init_data, digest}`, refused when the KMS would refuse it.
+/// `kata_policy_json` is the verified platform document's `kata_policy`, or `null` when it has
+/// none, which an init-data must carry.
+#[wasm_bindgen(js_name = revisionPayload)]
+pub fn revision_payload(
+    app_id: &str,
+    revision: &str,
+    kata_policy_json: &str,
+) -> Result<String, JsError> {
+    let app_id: alpha_core::AppId = app_id
+        .parse()
+        .map_err(|_| js(Error::Malformed(format!("app_id {app_id:?} is not a UUID"))))?;
+    let kata_policy: Option<alpha_core::KataPolicy> = parse("kata policy", kata_policy_json)?;
+    to_json(&compose::revision_payload(app_id, revision, kata_policy.as_ref()).map_err(js)?)
 }
 
 fn canonical(value: &serde_json::Value) -> Result<String, JsError> {

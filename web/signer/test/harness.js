@@ -718,7 +718,7 @@ function approvalApi(options = {}) {
       api.revisions.push({ text: req.body, body, puts: api.puts.length });
       if (api.reply.revision) return api.reply.revision(req.body);
       const response = {
-        compose_hash: `sha256:${sha256(body.payload.compose).toString("hex")}`,
+        compose_hash: `sha256:${sha256(body.payload.compose ?? body.payload.init_data).toString("hex")}`,
         app_id: body.payload.app_id,
         org_id: api.org_id,
         created_at: RECEIPT_TIME,
