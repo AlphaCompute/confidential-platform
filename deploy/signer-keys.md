@@ -50,7 +50,8 @@ the same machine.
    anything but an Ed25519 SubjectPublicKeyInfo.
 
    ```sh
-   python3 -c 'import base64,sys; d=base64.urlsafe_b64decode(sys.argv[1]+"=="); assert len(d)==44 and d[:12].hex()=="302a300506032b6570032100"; print(d[12:].hex())' <public_key>
+   KEY='PASTE_PUBLIC_KEY'   # the public_key value keygen printed
+   python3 -c 'import base64,sys; d=base64.urlsafe_b64decode(sys.argv[1]+"=="); assert len(d)==44 and d[:12].hex()=="302a300506032b6570032100"; print(d[12:].hex())' "$KEY"
    ```
 
    Write that line to the plain drive and in the record by hand. The signer and the witness read
@@ -72,9 +73,19 @@ watching the keyboard or a camera in the room. Only the hex public key leaves th
 
 On an online machine, one signer opens a pull request against `main` that replaces
 `crates/alpha-channel/release-keys/prod.pub` with the three lines from the plain drives, nothing
-else in the file. Each of the other two signers checks that the file in the diff holds their
-line exactly as written in the record and approves. Before it merges, the production `alpha`
-builds: the command above without `--features dev`.
+else in the file. Each of the other two signers approves only after checking the file at the
+pull request's head against all three keys of the record, typed from the record, not copied
+from the diff:
+
+```sh
+printf '%s\n' RECORDED_KEY_1 RECORDED_KEY_2 RECORDED_KEY_3 | sort |
+  diff - <(sort crates/alpha-channel/release-keys/prod.pub) && echo "the three recorded keys"
+```
+
+The build alone is not enough: it accepts any two or more distinct keys, so a file holding only
+the two approvers' keys would build and give them the whole threshold without the third signer.
+Before it merges, one approver checks that the production `alpha` builds: the `docker run`
+command in [Before the ceremony](#before-the-ceremony) without `--features dev`.
 
 After the merge, the same two signers build the production `alpha` at the merged commit the
 same way and compare the SHA-256s; that binary replaces the dev build on every signer's offline
