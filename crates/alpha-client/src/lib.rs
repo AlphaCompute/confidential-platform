@@ -251,12 +251,40 @@ pub struct KeyRevoked {
 /// `GET /v1/node/evidence`: the node's evidence in the shape an Instance sends, beside
 /// `runtime_pubkey` (the P-256 SPKI DER) and its X-Wing key.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(try_from = "WireNodeEvidence")]
 pub struct NodeEvidence {
     #[serde(flatten)]
     pub evidence: InstanceEvidence,
     pub runtime_pubkey: String,
     pub xwing_pubkey: PublicKey,
     pub compose_hash: ComposeHash,
+}
+
+/// A node built before Kata nodes names no `format`; its evidence is dstack. Only this reply
+/// gets the default: `/v1/attest` and `join` bodies must name their format.
+#[derive(Deserialize)]
+struct WireNodeEvidence {
+    #[serde(flatten)]
+    evidence: serde_json::Map<String, Value>,
+    runtime_pubkey: String,
+    xwing_pubkey: PublicKey,
+    compose_hash: ComposeHash,
+}
+
+impl TryFrom<WireNodeEvidence> for NodeEvidence {
+    type Error = serde_json::Error;
+
+    fn try_from(mut wire: WireNodeEvidence) -> Result<Self, Self::Error> {
+        wire.evidence
+            .entry("format")
+            .or_insert_with(|| alpha_attest::EVIDENCE_FORMAT.into());
+        Ok(Self {
+            evidence: serde_json::from_value(Value::Object(wire.evidence))?,
+            runtime_pubkey: wire.runtime_pubkey,
+            xwing_pubkey: wire.xwing_pubkey,
+            compose_hash: wire.compose_hash,
+        })
+    }
 }
 
 impl NodeEvidence {

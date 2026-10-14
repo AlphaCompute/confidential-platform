@@ -38,16 +38,10 @@ pub const RESULT_FORMAT: &str = "alphacompute-attestation-result/1";
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Evidence {
-    /// Absent in the node evidence of a KMS built before Kata nodes.
-    #[serde(default = "dstack_format")]
     pub format: String,
     #[serde(with = "base64url")]
     pub quote: Vec<u8>,
     pub event_log: Vec<EventLogEntry>,
-}
-
-fn dstack_format() -> String {
-    EVIDENCE_FORMAT.into()
 }
 
 /// A Kata pod's evidence is its quote alone: the container cannot read its init-data, and the
@@ -768,6 +762,20 @@ mod tests {
             .contains("INTEL-SA-00999")
         );
         assert!(denied("UpToDate", &[], DEBUG).unwrap().contains("debug"));
+    }
+
+    #[test]
+    fn evidence_must_name_its_format() {
+        let parse = |v: serde_json::Value| serde_json::from_value::<InstanceEvidence>(v);
+        assert!(parse(serde_json::json!({ "quote": "AA", "event_log": [] })).is_err());
+        assert!(
+            parse(serde_json::json!({ "format": KATA_EVIDENCE_FORMAT, "quote": "AA", "event_log": [] }))
+                .is_err()
+        );
+        assert!(matches!(
+            parse(serde_json::json!({ "format": KATA_EVIDENCE_FORMAT, "quote": "AA" })),
+            Ok(InstanceEvidence::Kata(_))
+        ));
     }
 
     #[test]
