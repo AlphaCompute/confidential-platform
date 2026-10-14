@@ -23,12 +23,16 @@ ENV SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH CARGO_PROFILE_RELEASE_STRIP=true
 RUN --network=none cargo build --release --locked --offline -p alpha-inference \
  && install -D -m 0755 target/release/alpha-inference /out/alpha-inference \
  && touch -h -d "@$SOURCE_DATE_EPOCH" /out/alpha-inference /out
+# A COPY creates missing parent directories at build time; staged here, /etc and its
+# subdirectories carry SOURCE_DATE_EPOCH too.
+RUN install -D -m 0644 /etc/ssl/certs/ca-certificates.crt /roots/etc/ssl/certs/ca-certificates.crt \
+ && find /roots -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 
 # Runs as root, no USER: scratch has no /etc/passwd to name another user.
 FROM scratch
 # RedPill's attestation report and PCCS collateral are fetched over WebPKI, and reqwest's
 # rustls verifier reads the system roots; scratch has none, so the pinned base image's bundle
 # goes where rustls-native-certs looks for it — the same reason images/kms/Dockerfile copies it.
-COPY --from=deps /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=build /roots/ /
 COPY --from=build /out/alpha-inference /alpha-inference
 ENTRYPOINT ["/alpha-inference"]
