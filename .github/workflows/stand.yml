@@ -38,3 +38,45 @@ jobs:
           [ $# -gt 0 ] || { echo "::error::STAND_APPS names no App"; exit 1; }
           # A copy does not serve for a minute while it is being redeployed.
           check "" || { sleep 120; check "::error::"; }
+
+  # Each owned KMS node and App Endpoint, verified as a relying party on the internet would.
+  #   STAND_PLATFORM_DOCUMENT_URL  the stand's platform document; unset skips this job
+  #   STAND_KMS_ENDPOINTS          the KMS nodes, whitespace-separated https URLs
+  #   STAND_APP_ENDPOINTS          one `<app id> <url>` per line
+  owned:
+    if: vars.STAND_PLATFORM_DOCUMENT_URL != ''
+    runs-on: ubuntu-latest
+    # Under the fifteen-minute schedule, so a slow round never overlaps the next.
+    timeout-minutes: 14
+    concurrency:
+      group: stand-owned
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The stand's document is signed by the dev release key; `prod.pub` stays a placeholder
+      # until the key ceremony, and a production build refuses it.
+      - run: cargo build --locked --release -p alpha-cli --features dev
+      - env:
+          ALPHACOMPUTE_PLATFORM_DOCUMENT_URL: ${{ vars.STAND_PLATFORM_DOCUMENT_URL }}
+          KMS: ${{ vars.STAND_KMS_ENDPOINTS }}
+          APPS: ${{ vars.STAND_APP_ENDPOINTS }}
+        run: |
+          alpha=target/release/alpha
+          # $1 prefixes each finding: only the last attempt's are errors.
+          check() {
+            down=0
+            for url in $KMS; do
+              out=$($alpha verify --kms-node "$url" 2>&1) || { echo "$1$url: $out"; down=1; }
+            done
+            while read -r app url; do
+              [ -n "$app" ] || continue
+              out=$($alpha verify --app "$app" "$url" 2>&1) || { echo "$1$app $url: $out"; down=1; }
+            done <<< "$APPS"
+            return $down
+          }
+          [ -n "${KMS//[[:space:]]/}${APPS//[[:space:]]/}" ] || { echo "::error::STAND_KMS_ENDPOINTS and STAND_APP_ENDPOINTS name nothing"; exit 1; }
+          check "" || { sleep 120; check "::error::"; }
