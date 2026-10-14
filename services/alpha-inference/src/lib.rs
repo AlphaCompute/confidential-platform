@@ -507,6 +507,7 @@ mod tests {
             format!(r#"{{"m3":{{"url":"https://ms.example","revisions":["{rev}"]}}}}"#),
             format!(r#"{{"m1":{{"url":"http://ms.example","revisions":["{rev}"]}}}}"#),
             format!(r#"{{"m1":{{"url":"https://ms.example/v1","revisions":["{rev}"]}}}}"#),
+            format!(r#"{{"m1":{{"url":"https://ms.example#f","revisions":["{rev}"]}}}}"#),
             r#"{"m1":{"url":"https://ms.example","revisions":[]}}"#.to_owned(),
         ] {
             let err = Config::build(|n| {
