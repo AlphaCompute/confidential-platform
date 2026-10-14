@@ -138,9 +138,10 @@ the platform-document URL are served; the signed document lists the Revision.
    object in `app-compose.json` (the API serializes it itself; the `compose_hash` in the provision
    reply must equal `manifest.json`'s — if it does not, stop: the bytes Phala would measure are
    not the signed Revision), the dstack image and instance type the document has reference values
-   for, and a region. Install `integrations/dstack-tee` and provision `PHALA_KMS_SIGNER`
-   independently. Verify the fresh app-bound v1 signed key matches `app_env_encrypt_pubkey`
-   before encrypting or committing. Unsigned keys and legacy-only signatures are refused:
+   for, and a region. Install the adapter with `integrations/dstack-tee/install.sh` and
+   provision `PHALA_KMS_SIGNER` independently. Verify the fresh app-bound v1 signed key matches
+   `app_env_encrypt_pubkey` before encrypting or committing. Unsigned keys and legacy-only
+   signatures are refused:
    `ALPHACOMPUTE_DATABASE_URL` (as the service user), `ALPHACOMPUTE_KMS_ENDPOINTS` (both nodes'
    URLs, `https://<app id>-8443s.<gateway base>`, so provision the second CVM first to learn its
    app id: the values are not measured, but a later env update rewrites the stored

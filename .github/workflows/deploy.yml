@@ -38,6 +38,10 @@ jobs:
             cargo run -q -p alpha-cli --example kms_compose -- --dev-root "$APP_ID" "$IMAGE@$digest" out
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Install the environment-key adapter from its locks
+        run: |
+          integrations/dstack-tee/install.sh "$RUNNER_TEMP/venv"
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
       - name: Create or update the CVM
         env:
           PHALA_API_KEY: ${{ secrets.PHALA_API_KEY }}
@@ -49,7 +53,6 @@ jobs:
           ALPHACOMPUTE_PCCS_URL: ${{ vars.ALPHACOMPUTE_PCCS_URL }}
           ALPHACOMPUTE_PLATFORM_DOCUMENT_URL: ${{ vars.ALPHACOMPUTE_PLATFORM_DOCUMENT_URL }}
         run: |
-          pip install --quiet ./integrations/dstack-tee
           if [ -n "$CVM_ID" ]; then
             python3 deploy/phala.py update "$CVM_ID" out/app-compose.json > cvm.json
           else
