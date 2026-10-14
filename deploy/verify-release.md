@@ -9,8 +9,7 @@ covers what both runners share: GitHub's runner image, network and account.
 
 Linux on x86_64, not a GitHub runner, with Docker Engine using its classic image store, where an
 image's id is the digest of its configuration: `docker info -f '{{.Driver}}'` prints `overlay2`
-(the containerd store prints `overlayfs` and reports other ids). `git`, `gh`, `jq` and the Rust
-toolchain in `rust-toolchain.toml`.
+(the containerd store prints `overlayfs` and reports other ids). `git`, `gh` and `jq`.
 
 ## Inputs
 
@@ -65,7 +64,8 @@ gh attestation verify oci://<pushed reference> --repo AlphaCompute/confidential-
 ## 4. The KMS nodes' init-data
 
 Render it again as in [What a release produces](kata/README.md#what-a-release-produces), with
-the production `alpha` built at the tag (`cargo build --release --locked -p alpha-cli`), the
+the production `alpha` built at the tag in the pinned image (the command in
+[`signer-keys.md`](signer-keys.md) without `--features dev`), the
 pushed `alpha-kms` digest and the three URLs the tag's `render` job used, which its log prints
 in that step's environment (`gh run view <run id> -R AlphaCompute/confidential-platform --log`);
 the repository variables may have changed since. Write the JSON `alpha coco render` prints to
@@ -79,6 +79,6 @@ jq -j .init_data rendered.json | cmp - release/kata/init-data.toml
 ## 5. The record
 
 The tag, the commit, every image's id line and pushed reference, and the `compose_hash`.
-Each custodian and signer builds `alpha` at the tag on their own machine and records the
-SHA-256 of that build; it embeds the build paths, so it differs from machine to machine and is
-not compared. A difference at any step stops the ceremony until it is explained.
+Each custodian and signer runs an `alpha` built at the tag in the pinned image, as in
+[`signer-keys.md`](signer-keys.md), with its SHA-256 equal to a second person's build of the same
+tag; the record keeps it. A difference at any step stops the ceremony until it is explained.

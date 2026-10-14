@@ -6,14 +6,15 @@ separate cluster.
 
 ## Test keys and a rehearsal build
 
-- **Test release keys.** Three keys made as in [`signer-keys.md`](signer-keys.md), on any
-  machine, with `TEST` in the file names. A branch off `main` replaces `prod.pub` with their
-  three lines and is never merged. A tag `v<next version>-rehearsal.<n>` on it runs the release:
-  its images and its KMS init-data accept only documents signed by the test keys, and no
-  production document lists their Revision.
+- **Test release keys.** Each signer makes one as in [`signer-keys.md`](signer-keys.md), with
+  `TEST` in the file name. A branch off `main` replaces `prod.pub` with their three lines and is
+  never merged. A tag `v<next version>-rehearsal.<n>` on it runs the release: its images and its
+  KMS init-data accept only documents signed by the test keys, and no production document lists
+  their Revision.
 - **Test custodian keys.** Each custodian runs `alpha keygen --custodian --out TEST-custodian.key`
-  with the `alpha` they built at the rehearsal tag and sends the public key. These are not the
-  keys they bring to genesis.
+  with the production `alpha` built at the rehearsal tag in the pinned image and compared, as in
+  [`signer-keys.md`](signer-keys.md), and sends the public key. These are not the keys they
+  bring to genesis.
 - **A rehearsal document URL**, served like the production one but never the production URL. It
   is one of the repository variables the release measures, so it is set before the rehearsal tag
   and set back to the production URL as soon as that tag's `render` job has finished.
