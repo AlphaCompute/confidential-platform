@@ -15,55 +15,97 @@ const TDX_METADATA: [u8; 16] = [
     0x35, 0x65, 0x7a, 0xe4, 0x4a, 0x98, 0x98, 0x47, 0x86, 0x5e, 0x46, 0x85, 0xa7, 0xbf, 0x8e, 0xc2,
 ];
 const MR_EXTEND: u32 = 1;
-const PAGE_AUG: u32 = 2;
+const ZERO_PAGE: [u8; PAGE as usize] = [0; PAGE as usize];
+
+struct Section<'a> {
+    address: u64,
+    size: u64,
+    extend: bool,
+    /// `None` for the zeroed TD HOB and temporary memory.
+    source: Option<&'a [u8]>,
+}
 
 /// Each TDVF section in metadata order: every page `MEM.PAGE.ADD`ed, then, for an `MR.EXTEND`
-/// section, its 256-byte chunks.
+/// section, its 256-byte chunks. Refuses whatever QEMU's `tdvf_parse_metadata` refuses, so no
+/// value comes out for firmware Kata could not boot.
 pub fn mrtd(firmware: &[u8]) -> Result<Measurement, String> {
     let descriptor = metadata_offset(firmware)?;
     if bytes::<4>(firmware, descriptor, 0)? != *b"TDVF" || u32_at(firmware, descriptor, 8)? != 1 {
         return Err("firmware: no TDVF metadata version 1".into());
     }
+    let length = u32_at(firmware, descriptor, 4)? as usize;
+    let count = u32_at(firmware, descriptor, 12)? as usize;
+    if count < 2 || Some(length) != count.checked_mul(32).and_then(|n| n.checked_add(16)) {
+        return Err(format!(
+            "firmware: TDVF metadata length {length:#x} does not hold exactly its {count} sections"
+        ));
+    }
+    let sections = range(firmware, add(descriptor, 16)?, add(descriptor, length)?)?
+        .chunks_exact(32)
+        .enumerate()
+        .map(|(i, entry)| section(firmware, i, entry))
+        .collect::<Result<Vec<_>, String>>()?;
     let mut h = Sha384::new();
-    for i in 0..u32_at(firmware, descriptor, 12)? {
-        let at = add(descriptor, add(16, mul(i as usize, 32)?)?)?;
-        let data_offset = u32_at(firmware, at, 0)? as usize;
-        let raw_size = u32_at(firmware, at, 4)? as usize;
-        let address = u64::from_le_bytes(bytes(firmware, at, 8)?);
-        let size = u64::from_le_bytes(bytes(firmware, at, 16)?);
-        let attributes = u32_at(firmware, at, 28)?;
-        if attributes & PAGE_AUG != 0 {
-            continue;
-        }
-        if size % PAGE != 0 || address % PAGE != 0 || address.checked_add(size).is_none() {
-            return Err(format!("firmware: section {i} is not a page range"));
-        }
-        let mut chunks = if attributes & MR_EXTEND == 0 {
-            None
-        } else if u64::try_from(raw_size).ok() == Some(size) {
-            Some(range(firmware, data_offset, add(data_offset, raw_size)?)?.chunks_exact(CHUNK))
-        } else {
-            return Err(format!(
-                "firmware: section {i} measures fewer bytes than it maps"
-            ));
+    for s in sections {
+        let contents: Box<dyn Iterator<Item = &[u8]>> = match s.source {
+            Some(source) => Box::new(source.chunks_exact(PAGE as usize)),
+            None => Box::new(std::iter::repeat(ZERO_PAGE.as_slice())),
         };
         // address + size fits in u64, so neither range below steps past it.
-        for page in (address..)
+        let pages = (s.address..)
             .step_by(PAGE as usize)
-            .take((size / PAGE) as usize)
-        {
+            .take((s.size / PAGE) as usize);
+        for (page, content) in pages.zip(contents) {
             tdx_op(&mut h, b"MEM.PAGE.ADD", page);
-            let Some(chunks) = chunks.as_mut() else {
+            if !s.extend {
                 continue;
-            };
-            let per_page = chunks.by_ref().take(PAGE as usize / CHUNK);
-            for (gpa, chunk) in (page..).step_by(CHUNK).zip(per_page) {
+            }
+            for (gpa, chunk) in (page..).step_by(CHUNK).zip(content.chunks_exact(CHUNK)) {
                 tdx_op(&mut h, b"MR.EXTEND", gpa);
                 h.update(chunk);
             }
         }
     }
     Ok(Measurement(h.finalize().into()))
+}
+
+/// QEMU copies a firmware volume's whole `MemoryDataSize` from the image at `DataOffset`, and
+/// maps zeroed memory for the TD HOB and temporary memory; it ignores the PAGE.AUG attribute.
+fn section<'a>(firmware: &'a [u8], i: usize, entry: &[u8]) -> Result<Section<'a>, String> {
+    let data_offset = u32_at(entry, 0, 0)? as usize;
+    let raw_size = u32_at(entry, 0, 4)?;
+    let address = u64::from_le_bytes(bytes(entry, 0, 8)?);
+    let size = u64::from_le_bytes(bytes(entry, 0, 16)?);
+    let kind = u32_at(entry, 0, 24)?;
+    if u64::from(raw_size) > size
+        || address % PAGE != 0
+        || size % PAGE != 0
+        || address.checked_add(size).is_none()
+    {
+        return Err(format!(
+            "firmware: section {i} is not a page range holding its data"
+        ));
+    }
+    let source = match (kind, raw_size) {
+        // Boot and configuration firmware volumes, with data.
+        (0 | 1, 1..) => {
+            let size = usize::try_from(size).map_err(|_| "firmware: section too large")?;
+            Some(range(firmware, data_offset, add(data_offset, size)?)?)
+        }
+        // TD HOB and temporary memory, without.
+        (2 | 3, 0) => None,
+        _ => {
+            return Err(format!(
+                "firmware: section {i} of type {kind} with {raw_size:#x} data bytes is not one QEMU loads"
+            ));
+        }
+    };
+    Ok(Section {
+        address,
+        size,
+        extend: u32_at(entry, 0, 28)? & MR_EXTEND != 0,
+        source,
+    })
 }
 
 /// RTMR1 when TDVF boots the kernel straight from QEMU's `-kernel`: the kernel's Authenticode
@@ -279,13 +321,16 @@ mod tests {
         );
     }
 
-    /// A TDVF image with an extended, an added and an accepted-later section, and a PE32+ image
-    /// with sections out of file order, trailing data and a certificate table; expected values
-    /// from an independent implementation.
+    const TDVF: &[u8] = include_bytes!("../../../../testdata/coco/measure/tdvf.bin");
+    /// The TDVF descriptor's offset in `tdvf.bin`.
+    const DESCRIPTOR: usize = 0x1000;
+
+    /// A TDVF image with an extended boot volume, an added-only configuration volume and
+    /// temporary memory, and a PE32+ image with sections out of file order, trailing data and a
+    /// certificate table; expected values from an independent implementation.
     #[test]
     fn small_images_match_an_independent_implementation() {
         let pe = include_bytes!("../../../../testdata/coco/measure/pe.bin");
-        let tdvf = include_bytes!("../../../../testdata/coco/measure/tdvf.bin");
         assert_eq!(
             rtmr1(pe).unwrap(),
             sha384(
@@ -293,12 +338,36 @@ mod tests {
             )
         );
         assert_eq!(
-            mrtd(tdvf).unwrap(),
+            mrtd(TDVF).unwrap(),
             sha384(
-                "dc6a713c35f8b7fa7843edfb7f2ac61e9f562402dd8b9d6419cb938673db11c15a8cba117ed701c7e7bd5e756eb8d7ad"
+                "d2cecc79e35187c698ef051f1c45e872a195742154da73cf2b950b395a2022adfcf376fd30491d589f5ba88d7657701c"
             )
         );
-        assert!(mrtd(&tdvf[..tdvf.len() - 1]).is_err());
+        assert!(mrtd(&TDVF[..TDVF.len() - 1]).is_err());
         assert!(rtmr1(&pe[..0x300]).is_err());
+    }
+
+    fn patched(at: usize, value: u32) -> Vec<u8> {
+        let mut image = TDVF.to_vec();
+        image[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        image
+    }
+
+    #[test]
+    fn firmware_qemu_would_not_load_is_refused() {
+        let section = |i: usize, field: usize| DESCRIPTOR + 16 + 32 * i + field;
+        for (what, image) in [
+            (
+                "length beyond the sections",
+                patched(DESCRIPTOR + 4, 16 + 32 * 4),
+            ),
+            ("one section", patched(DESCRIPTOR + 12, 1)),
+            ("unsupported type", patched(section(1, 24), 4)),
+            ("temporary memory with data", patched(section(1, 4), 0x1000)),
+            ("firmware volume without data", patched(section(2, 4), 0)),
+            ("unaligned address", patched(section(0, 8), 0xFFFF_F800)),
+        ] {
+            assert!(mrtd(&image).is_err(), "{what}");
+        }
     }
 }
