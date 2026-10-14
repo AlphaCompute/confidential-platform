@@ -1,0 +1,25 @@
+[package]
+name = "alpha-nvml"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+
+# The workspace's lints, except that FFI needs `unsafe`; every unsafe block must say why it holds.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+
+[dependencies]
+base64 = "0.23"
+libloading = "0.9"
+serde = { version = "1", features = ["derive"] }

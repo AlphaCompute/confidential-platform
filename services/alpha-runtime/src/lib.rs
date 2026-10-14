@@ -2,7 +2,8 @@
 //! one-hour leaf renewed ten minutes before it expires, handed to the tenant's containers over
 //! a unix socket with four routes. Trust comes from the measured compose (the KMS CA's SPKI
 //! hash and the allowed KMS Revisions); the KMS endpoints are only where to look. In a Kata pod
-//! the same variables come from the pod spec, and the evidence is the quote alone.
+//! the same variables come from the pod spec, and the evidence is the quote, with every GPU's
+//! evidence when the pod has GPUs.
 
 #![cfg_attr(
     test,
@@ -15,6 +16,7 @@
     )
 )]
 
+pub mod gpu;
 pub mod proxy;
 pub mod socket;
 
@@ -293,7 +295,17 @@ pub type Clock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 
 /// A quote over `report_data`, with the event log behind it on dstack; the TD in `main`, a
 /// capture in tests.
-pub type EvidenceSource = Arc<dyn Fn(&[u8; 64]) -> Result<InstanceEvidence, String> + Send + Sync>;
+pub type EvidenceSource = Arc<dyn Fn(&[u8; 64]) -> Result<AttestEvidence, String> + Send + Sync>;
+
+/// The evidence `/v1/attest` receives: the TD's and, in a GPU pod, the GPU evidence its quote's
+/// `report_data` commits to.
+#[derive(Debug, serde::Serialize)]
+pub struct AttestEvidence {
+    #[serde(flatten)]
+    pub td: InstanceEvidence,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub gpu: Vec<alpha_nvml::GpuEvidence>,
+}
 
 /// The bytes whose SHA-256 is the Instance's Revision, served on `/v1/identity` once a leaf
 /// names that hash.
