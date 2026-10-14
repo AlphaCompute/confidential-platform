@@ -66,6 +66,11 @@ spec:
             secretKeyRef: {name: postgres, key: password}
         ports:
         - {name: postgres, containerPort: 5432}
+        # Over TCP: the image's first-start server listens only on the socket, so the probe and
+        # the migration wait until the database is created.
+        readinessProbe:
+          exec:
+            command: [pg_isready, -h, 127.0.0.1, -U, postgres, -d, alpha]
         volumeMounts:
         - {name: data, mountPath: /var/lib/postgresql}
         - {name: tls, mountPath: /tls, readOnly: true}

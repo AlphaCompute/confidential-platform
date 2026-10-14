@@ -80,6 +80,7 @@ custodians have run `alpha keygen --custodian` and handed over their public keys
    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
      -subj /CN=postgres.alpha-trust-db.svc -keyout tls.key -out tls.crt
    kubectl -n alpha-trust-db create secret tls postgres-tls --cert tls.crt --key tls.key
+   : "${TRUST_DB_STORAGE_CLASS:?}" "${TRUST_DB_STORAGE_SIZE:?}"
    envsubst '$TRUST_DB_STORAGE_CLASS $TRUST_DB_STORAGE_SIZE' < trust-db.yaml | kubectl apply -f -
    kubectl -n alpha-trust-db rollout status statefulset/postgres
    ```
@@ -103,6 +104,7 @@ custodians have run `alpha keygen --custodian` and handed over their public keys
 5. **Namespace, budget, addresses**, one Service for each address in `KMS_KATA_ENDPOINTS`:
 
    ```sh
+   : "${KMS_MAX_UNAVAILABLE:?}"
    envsubst '$KMS_MAX_UNAVAILABLE' < kms.yaml | kubectl apply -f -
    for n in $(seq <number of nodes>); do KMS_NODE=$n envsubst '$KMS_NODE' < kms-service.yaml | kubectl apply -f -; done
    ```
@@ -171,8 +173,10 @@ through the nodes' API and the database.
 - **Restart.** A node pod that is deleted or restarts comes back sealed and joins a serving node.
   Recreate a deleted one from the same `pod.yaml` and label it again.
 - **Upgrade.** Sign a document listing the old and the new Revision; every tenant App that pins
-  the KMS gets a Revision listing both. Then, one node at a time, create a pod from the new
-  release's `pod.yaml`, move the node's label to it, wait for `/ready` 200, delete the old pod.
+  the KMS gets a Revision listing both. Then, one node at a time, delete the old pod (anti-affinity
+  leaves no host for a second pod while it runs), create a pod from the new release's `pod.yaml`,
+  give it the node's label, and wait for `/ready` 200 before the next node; the others serve
+  meanwhile.
   Drop the old Revision once no tenant pins it.
 - **All nodes lost.** Create one node pod, label it, port-forward, and two custodians each run
   `alpha unseal --share share-<n>.json --key custodian.key --endpoint https://localhost:8443`
