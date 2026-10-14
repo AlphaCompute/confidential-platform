@@ -1,8 +1,7 @@
 # One vLLM model on one passed-through GPU, rendered like inference.yaml with `--app-id <the
 # model's App>`. vLLM listens on loopback only; the runtime terminates TLS on 8443 with the
 # Instance leaf and proxies only Instances of the Apps in MODEL_CALLER_APPS, so nobody else reaches
-# any vLLM route. MODEL_IMAGE is vLLM with the weights at /weights: its digest, pinned by the
-# policy and checked by the guest's image pull, pins every byte of the weights.
+# any vLLM route. MODEL_IMAGE is vLLM with the weights at /weights.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

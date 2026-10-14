@@ -283,6 +283,6 @@ kubectl -n alpha-models expose deployment <MODEL_NAME> --port 8443
 
 A pod turns ready once its runtime has attested and its service answers: the front once its
 default model's gateway check passes, the guard and the broker once they reach the front and the
-database, a model server once vLLM's `/health` answers. Replicas, labels and scheduling are not
-measured; scale a Deployment without a new Revision. Exposing the broker or the front outside
+database, a model server once vLLM's `/health` answers. A Deployment
+scales without a new Revision. Exposing the broker or the front outside
 the cluster is the operator's choice of ingress, in TLS passthrough: each terminates its own TLS.

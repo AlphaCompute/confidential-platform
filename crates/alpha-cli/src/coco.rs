@@ -452,47 +452,43 @@ mod tests {
     #[test]
     fn a_workload_carries_the_init_data_in_its_pod_template() {
         for kind in ["StatefulSet", "Deployment"] {
-            workload_carries_the_init_data_in_its_pod_template(kind);
+            let pod: Yaml = serde_yaml_ng::from_str(POD).unwrap();
+            let set = serde_yaml_ng::to_string(&serde_json::json!({
+                "apiVersion": "apps/v1",
+                "kind": kind,
+                "metadata": {"name": "render"},
+                "spec": {
+                    "selector": {"matchLabels": {"app": "render"}},
+                    "template": {"metadata": {"labels": {"app": "render"}}, "spec": pod["spec"]},
+                },
+            }))
+            .unwrap();
+            let parsed = parse(set.as_bytes()).unwrap();
+            let input: Yaml = serde_yaml_ng::from_str(&parsed.genpolicy_input).unwrap();
+            assert_eq!(input["kind"].as_str(), Some(kind));
+            assert!(
+                input["spec"]["template"]["spec"]
+                    .get("automountServiceAccountToken")
+                    .is_none()
+            );
+            let rendered = render(parsed, APP_ID.parse().unwrap(), GENPOLICY).unwrap();
+            assert_eq!(rendered.revision, render_golden().revision);
+            let out: Yaml = serde_yaml_ng::from_str(&rendered.pod).unwrap();
+            assert!(out["metadata"].get("annotations").is_none());
+            let template = &out["spec"]["template"];
+            assert_eq!(
+                template["metadata"]["annotations"][ANNOTATION].as_str(),
+                Some(rendered.annotation.as_str())
+            );
+            assert_eq!(template["spec"]["enableServiceLinks"], Yaml::Bool(false));
+            let hostname = set.replace("    spec:\n", "    spec:\n      hostname: evil\n");
+            assert!(
+                parse(hostname.as_bytes())
+                    .err()
+                    .unwrap()
+                    .contains("hostname")
+            );
         }
-    }
-
-    fn workload_carries_the_init_data_in_its_pod_template(kind: &str) {
-        let pod: Yaml = serde_yaml_ng::from_str(POD).unwrap();
-        let set = serde_yaml_ng::to_string(&serde_json::json!({
-            "apiVersion": "apps/v1",
-            "kind": kind,
-            "metadata": {"name": "render"},
-            "spec": {
-                "selector": {"matchLabels": {"app": "render"}},
-                "template": {"metadata": {"labels": {"app": "render"}}, "spec": pod["spec"]},
-            },
-        }))
-        .unwrap();
-        let parsed = parse(set.as_bytes()).unwrap();
-        let input: Yaml = serde_yaml_ng::from_str(&parsed.genpolicy_input).unwrap();
-        assert_eq!(input["kind"].as_str(), Some(kind));
-        assert!(
-            input["spec"]["template"]["spec"]
-                .get("automountServiceAccountToken")
-                .is_none()
-        );
-        let rendered = render(parsed, APP_ID.parse().unwrap(), GENPOLICY).unwrap();
-        assert_eq!(rendered.revision, render_golden().revision);
-        let out: Yaml = serde_yaml_ng::from_str(&rendered.pod).unwrap();
-        assert!(out["metadata"].get("annotations").is_none());
-        let template = &out["spec"]["template"];
-        assert_eq!(
-            template["metadata"]["annotations"][ANNOTATION].as_str(),
-            Some(rendered.annotation.as_str())
-        );
-        assert_eq!(template["spec"]["enableServiceLinks"], Yaml::Bool(false));
-        let hostname = set.replace("    spec:\n", "    spec:\n      hostname: evil\n");
-        assert!(
-            parse(hostname.as_bytes())
-                .err()
-                .unwrap()
-                .contains("hostname")
-        );
     }
 
     #[test]
