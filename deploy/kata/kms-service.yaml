@@ -1,0 +1,14 @@
+# One stable address per node pod, `https://kms-<n>.alpha-kms.svc:8443`, selected by a label set
+# after the pod is created (labels are not in the policy). One per node:
+#   KMS_NODE=1 envsubst '$KMS_NODE' < kms-service.yaml | kubectl apply -f -
+apiVersion: v1
+kind: Service
+metadata:
+  name: kms-${KMS_NODE}
+  namespace: alpha-kms
+spec:
+  selector:
+    app.kubernetes.io/name: alpha-kms
+    alphacompute.io/kms-node: "${KMS_NODE}"
+  ports:
+  - {name: https, port: 8443}

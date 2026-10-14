@@ -162,6 +162,9 @@ Both nodes now serve; a restart of either is a `join` from the other; losing bot
 
 ## A node in a Kata pod
 
+The runbook for nodes on owned hardware, and what a release renders for them, is
+[`kata/README.md`](kata/README.md).
+
 A Kata pod has no encrypted env: its env is pinned in the init-data, and the host reads it. A Kata
 node therefore refuses to start if `ALPHACOMPUTE_DATABASE_URL` carries a password. Give it
 `postgres://alpha_kms_node@<pg>/alpha?sslmode=require&channel_binding=require&require_auth=scram-sha-256`

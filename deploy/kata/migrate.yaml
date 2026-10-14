@@ -1,0 +1,28 @@
+# `alpha-kms migrate` as the database owner, in a runc pod next to Postgres:
+#   KMS_IMAGE=<the release's alpha-kms@sha256:…> envsubst '$KMS_IMAGE' < migrate.yaml | kubectl create -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: alpha-kms-migrate-
+  namespace: alpha-trust-db
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        alphacompute.io/pool: trust-db
+      tolerations:
+      - {key: alphacompute.io/pool, operator: Equal, value: trust-db, effect: NoSchedule}
+      containers:
+      - name: migrate
+        image: ${KMS_IMAGE}
+        args: [migrate]
+        env:
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef: {name: postgres, key: password}
+        - name: ALPHACOMPUTE_DATABASE_URL
+          value: postgres://postgres:$(POSTGRES_PASSWORD)@postgres:5432/alpha?sslmode=require
