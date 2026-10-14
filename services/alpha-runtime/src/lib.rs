@@ -929,7 +929,11 @@ mod tests {
         let path = dir.join("cc_init_data");
         assert_eq!(read_init_data(&path).unwrap(), None);
 
-        let init_data = kata_testdata("k3-app.toml");
+        let init_data = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../testdata/attest/b300-kata-4.0.0/k3-app.toml"),
+        )
+        .unwrap();
         std::fs::write(&path, annotation(&init_data)).unwrap();
         let read = read_init_data(&path).unwrap().unwrap();
         assert_eq!(read.as_bytes(), init_data);
