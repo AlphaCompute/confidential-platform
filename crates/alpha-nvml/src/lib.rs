@@ -120,14 +120,15 @@ struct GpuAttestationReport {
 }
 
 type Device = *mut c_void;
-type Init = unsafe extern "C" fn() -> c_int;
+type Lifecycle = unsafe extern "C" fn() -> c_int;
 type GetCount = unsafe extern "C" fn(*mut c_uint) -> c_int;
 type GetHandle = unsafe extern "C" fn(c_uint, *mut Device) -> c_int;
 type GetCertificate = unsafe extern "C" fn(Device, *mut GpuCertificate) -> c_int;
 type GetReport = unsafe extern "C" fn(Device, *mut GpuAttestationReport) -> c_int;
 
-/// NVML, loaded and initialized once for the life of the process.
+/// NVML, loaded and initialized until dropped.
 pub struct Nvml {
+    shutdown: Lifecycle,
     get_count: GetCount,
     get_handle: GetHandle,
     get_certificate: GetCertificate,
@@ -154,8 +155,9 @@ impl Nvml {
         // SAFETY: each type is the prototype `nvml.h` declares for the symbol named, and every
         // pointer is copied out only into `Nvml`, which keeps `library` loaded as long as it lives.
         let (init, nvml) = unsafe {
-            let init = *library.get::<Init>(b"nvmlInit_v2\0").map_err(symbol)?;
+            let init = *library.get::<Lifecycle>(b"nvmlInit_v2\0").map_err(symbol)?;
             let nvml = Nvml {
+                shutdown: *library.get(b"nvmlShutdown\0").map_err(symbol)?,
                 get_count: *library.get(b"nvmlDeviceGetCount_v2\0").map_err(symbol)?,
                 get_handle: *library
                     .get(b"nvmlDeviceGetHandleByIndex_v2\0")
@@ -227,6 +229,15 @@ impl Nvml {
             certificate.attestation_cert_chain_size,
         )
         .map_err(|e| format!("GPU {index}: {e}"))
+    }
+}
+
+// NVML's threads must stop before the library is unloaded, or they run unmapped code.
+impl Drop for Nvml {
+    fn drop(&mut self) {
+        // SAFETY: `nvmlShutdown` takes no arguments, is harmless after a failed init (`nvml.h`:
+        // no error when called more times than `nvmlInit`), and `_library` outlives the call.
+        let _ = unsafe { (self.shutdown)() };
     }
 }
 
