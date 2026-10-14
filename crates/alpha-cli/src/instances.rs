@@ -9,6 +9,9 @@ use uuid::Uuid;
 
 use crate::deploy::{Shroud, wait_for_attestation};
 
+/// An App's Instance list is the largest reply.
+const SHROUD_REPLY_CAP: usize = 1 << 20;
+
 /// One shroud-go route; a reply outside 2xx is an error carrying shroud-go's body.
 pub async fn shroud_call(
     shroud: &Shroud,
@@ -16,7 +19,10 @@ pub async fn shroud_call(
     path: &str,
     body: Option<Value>,
 ) -> Result<Value, String> {
-    let mut request = reqwest::Client::new()
+    let http = alpha_client::http()
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+    let mut request = http
         .request(
             method,
             format!("{}{path}", shroud.url.trim_end_matches('/')),
@@ -30,8 +36,11 @@ pub async fn shroud_call(
         .await
         .map_err(|e| format!("shroud-go: {e}"))?;
     let status = response.status();
-    let text = response.text().await.unwrap_or_default();
-    let body = serde_json::from_str(&text).unwrap_or(Value::String(text));
+    let bytes = alpha_client::read_capped(response, SHROUD_REPLY_CAP)
+        .await
+        .map_err(|e| format!("shroud-go {path}: {e}"))?;
+    let body = serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()));
     if !status.is_success() {
         return Err(format!("shroud-go {path}: {status}: {body}"));
     }
