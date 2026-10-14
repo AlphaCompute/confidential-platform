@@ -1,5 +1,6 @@
 //! P-256 certificates: the node's self-signed sealed-phase certificate, the `ca` root, the
-//! one-hour leaves with exactly two URI SANs, and the checks the extractors run on them.
+//! one-hour leaves with exactly two URI SANs (an Instance's also with two DNS names derived from
+//! them), and the checks the extractors run on them.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -75,7 +76,12 @@ pub fn new_ca(now: SystemTime) -> Result<(Vec<u8>, Vec<u8>), ApiError> {
     Ok((key.serialize_der(), cert.der().to_vec()))
 }
 
-/// A one-hour leaf from `ca` over a foreign SPKI with the two URI SANs and both EKUs.
+/// A one-hour leaf from `ca` over a foreign SPKI with the two URI SANs and both EKUs. When the
+/// SANs are an Instance's, the leaf also carries [`alpha_client::tls::app_dns_name`] and
+/// [`alpha_client::tls::revision_dns_name`] of the same ids, so a peer that matches client
+/// certificates only by DNS name (a customer's Fortanix DSM, PRD-06 I1) can bind to the App or
+/// the Revision rather than to the shared KMS CA. They are derived here, from the URI SANs being
+/// signed, so the two forms can never disagree.
 pub fn issue_leaf(
     ca_key: &KeyPair,
     ca_cert_der: &[u8],
@@ -89,9 +95,21 @@ pub fn issue_leaf(
         .map_err(|e| ApiError::internal(format!("ca certificate: {e}")))?;
     let mut params = CertificateParams::default();
     params.distinguished_name = DistinguishedName::new();
+    let dns_names = match parse_instance_sans(&sans) {
+        Ok(id) => vec![
+            alpha_client::tls::app_dns_name(id.org_id, id.app_id),
+            alpha_client::tls::revision_dns_name(id.org_id, id.app_id, id.compose_hash),
+        ],
+        Err(_) => Vec::new(),
+    };
     params.subject_alt_names = sans
         .into_iter()
         .map(|s| Ia5String::try_from(s).map(SanType::URI))
+        .chain(
+            dns_names
+                .into_iter()
+                .map(|s| Ia5String::try_from(s).map(SanType::DnsName)),
+        )
         .collect::<Result<_, _>>()
         .map_err(|e| ApiError::internal(format!("san: {e}")))?;
     params.is_ca = IsCa::ExplicitNoCa;
@@ -208,6 +226,14 @@ mod tests {
         assert_eq!(got, sans);
         let id = parse_instance_sans(&got).unwrap();
         assert_eq!((id.org_id, id.app_id, id.compose_hash), (org, app, hash));
+        // The DNS names a customer's DSM can bind to (PRD-06 I1), derived from the same ids.
+        assert_eq!(
+            alpha_client::tls::dns_sans(&leaf).unwrap(),
+            [
+                alpha_client::tls::app_dns_name(org, app),
+                alpha_client::tls::revision_dns_name(org, app, hash),
+            ]
+        );
         assert!(
             verify_to_ca(
                 verifier.as_ref(),
@@ -234,5 +260,17 @@ mod tests {
         );
         assert!(parse_instance_sans(&node_sans(hash)).is_err());
         assert!(parse_instance_sans(&[sans[0].clone()]).is_err());
+
+        // A KMS node's leaf names no App, so it carries no DNS name a DSM could bind to.
+        let node_leaf = issue_leaf(
+            &ca_key,
+            &ca_cert,
+            &runtime.subject_public_key_info(),
+            node_sans(hash),
+            now,
+        )
+        .unwrap();
+        assert!(alpha_client::tls::dns_sans(&node_leaf).unwrap().is_empty());
+        assert_eq!(uri_sans(&node_leaf).unwrap(), node_sans(hash));
     }
 }

@@ -38,8 +38,9 @@ rendered value, the guest agent refuses to create a container whose environment 
 KMS registers no init-data without that pinned policy. A pod spec not produced by `render` gets no
 Revision.
 
-Configuration is three environment variables, a fourth when a service declared a Secret and a
-fifth for a wrapped compose.
+Configuration is three environment variables, plus `ALPHACOMPUTE_SECRETS` when a service declared
+a Secret, `ALPHACOMPUTE_TLS_UPSTREAM` for a wrapped compose and `ALPHACOMPUTE_DSM` when the App
+takes keys from the customer's Fortanix DSM.
 `ALPHACOMPUTE_KMS_CA_SPKI_SHA256` (`sha256:<hex>` of the KMS CA's SubjectPublicKeyInfo) and
 `ALPHACOMPUTE_KMS_REVISIONS` (comma-separated `sha256:<hex>`) are in the measured compose on dstack, and in the policy-pinned environment on Kata, and are
 all the runtime trusts: before the first request it refuses a KMS whose chain does not end at a
@@ -54,6 +55,11 @@ wrapped compose and its plain container port; the service must be a lowercase ke
 the port 1 to 65535, or the runtime exits 1 at start naming the variable. Without it the runtime
 opens no TCP port at all.
 
+`ALPHACOMPUTE_DSM`, measured too, is a JSON object naming the customer's Fortanix DSM endpoint,
+the DSM App, the CA its server certificate chains to, the keys this Revision may fetch and the
+leaf name the DSM App is bound to (`binding`: `revision` or `app`); a malformed value, or one
+without a binding, exits 1 at start. No tool writes it yet; see `docs/fortanix-dsm-keys.md`.
+
 The socket is `/run/alpha/runtime.sock`, HTTP/1.1 JSON, no authentication (access is the right
 to the socket), and comes up only after the first attestation succeeded:
 
@@ -62,9 +68,10 @@ to the socket), and comes up only after the first attestation succeeded:
 | `GET /v1/identity` | `{app_id, org_id, compose_hash, certificate_chain, tls_private_key, attestation_result, app_compose, init_data}` — the ids and the hash are read from the leaf's SANs, on dstack and on Kata alike; `tls_private_key` is the PKCS#8 DER, base64url; `app_compose` is the Instance's `app-compose.json`, read once at start from the guest agent's `Info` and refused unless its SHA-256 is the leaf's Revision digest, so a service can show a client which compose it runs; `null` on Kata; `init_data` is the Kata pod's init-data TOML under the same rule, `null` on dstack and when the pod does not mount it |
 | `GET /v1/secrets/{name}` | the KMS reply for the Secret of that KMS name (a declared Secret's is `<app_id>.<name>`), fetched over mTLS with the leaf and cached until the leaf expires; a KMS error passes through in its envelope with its status |
 | `GET /v1/keys/{purpose}` | the KMS reply to `POST /v1/keys/derive` for that purpose, `{key}`, 32 bytes base64url: the App's own key, the same for every Revision of the App; fetched and cached like a secret, up to 64 purposes per leaf, beyond which a key is derived again on every read |
+| `GET /v1/customer-keys/{name}` | `{name, kid, obj_type, value}`, `value` base64url: a key the Revision declared in `ALPHACOMPUTE_DSM`, released by the customer's DSM to the current leaf over mTLS and cached until the leaf expires; 404 `not_found` when undeclared, 403 `dsm_refused` when the DSM's policy says no, 403 `dsm_unbound` when the leaf does not carry the bound name (nothing is sent), 502 `dsm_unavailable` otherwise (`docs/fortanix-dsm-keys.md`) |
 | `GET /healthz` | `{attested, cert_not_after}` |
 
-With no valid leaf (the last renewal failed and the hour is over) the first three answer
+With no valid leaf (the last renewal failed and the hour is over) the first four answer
 `503 not_attested`. A cached secret or key is served until the leaf expires even after its Revision is
 revoked; the next call that reaches the KMS is the one that ends the process.
 
@@ -92,8 +99,8 @@ written stay until the volume's last container stops.
 `/run/alpha-secrets`, and 1 otherwise or when `ALPHACOMPUTE_SECRETS` does not parse. It reads that
 one variable and nothing else, before configuration, the key, the guest agent or the socket,
 because Docker runs it as a second process in the live container. A declaring service's
-`depends_on: alpha-runtime: {condition: service_healthy}` waits on it. The socket's four routes
-are unchanged.
+`depends_on: alpha-runtime: {condition: service_healthy}` waits on it. The socket's routes are
+unchanged.
 
 ## TLS for a wrapped compose
 
@@ -125,20 +132,23 @@ SIGTERM the listener closes at once and open connections get at most 10 s to fin
 
 `cargo test -p alpha-runtime` covers the configuration parser (the secrets and upstream variables'
 accepted and refused shapes included), the renewal schedule, the exit-code decision, the atomic 0444 replace of
-a secret file and the healthcheck's file check; `tests/healthcheck.rs` runs the built binary's
+a secret file, the healthcheck's file check and the status of each DSM error; `tests/healthcheck.rs` runs the built binary's
 `healthcheck` with a cleared environment and checks it exits 0 without reaching configuration and
 1 for a missing file or an unparsable variable. The end-to-end tests are `services/alpha-kms/tests/runtime.rs` (they need
 `DATABASE_URL`): a runtime holding the key of the `phala-0.5.9-1c-2g-keyed` capture, with a
 quote source that hands out the captured quote for exactly the `report_data` that CVM quoted
 over, attests against the in-process node clocked to the instant the capture's nonce was
 minted — so `POST /v1/attest/nonce` returns that nonce and the appraisal is the real one. They
-prove the four routes, the refusal of a compose that is not the leaf's Revision, a tenant backend pinning the KMS CA and reading the Revision from the
+prove the socket routes, the refusal of a compose that is not the leaf's Revision, a tenant backend pinning the KMS CA and reading the Revision from the
 SAN URI with rustls and webpki alone, the refusal of a listener under another CA or with an
 unlisted Revision (and the walk to the next endpoint), the cache expiring with the leaf,
 `revision_revoked` ending the runtime with 78, and the secret files: written only into the
 directories of declaring services, waiting for a Secret put later, following a renewal, written
 by the running runtime, and never written for a revoked Revision. The same file proves the TLS listener: the leaf it serves,
-the hybrid group it requires, pass-through, renewal, expiry, revocation and the drain on SIGTERM.
+the hybrid group it requires, pass-through, renewal, expiry, revocation and the drain on SIGTERM,
+and the customer-key route against a stand-in DSM bound to the leaf's Revision DNS name: one
+release per leaf, a new one after renewal, and nothing for a DSM App bound to another Revision.
+The DSM client itself is tested in `crates/alpha-dsm`.
 
 What only a live CVM proves: the real quote and `Info` from the guest agent's socket, the real
 event log from the CCEL table and `/run/log/dstack`, that the registered `compose_hash` equals

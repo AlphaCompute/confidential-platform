@@ -242,7 +242,8 @@ pub fn client_config(
 }
 
 pub use alpha_channel::cert::{
-    InstanceSans, KMS_SAN, parse_instance_sans, spki_of, spki_sha256, uri_sans,
+    INSTANCE_DNS_SUFFIX, InstanceSans, KMS_SAN, app_dns_name, dns_sans, parse_instance_sans,
+    revision_dns_name, spki_of, spki_sha256, uri_sans,
 };
 
 /// A server's chain and its PKCS#8 key as rustls serves them.
