@@ -30,7 +30,7 @@ use alpha_client::tls::{self, InstanceSans};
 use alpha_client::{
     AttestReply, AttestRequest, Client, DerivedKey, Identity, Pin, Secret, TimeProvider,
 };
-use alpha_core::ComposeHash;
+use alpha_core::{ComposeHash, MAX_INIT_DATA};
 use base64::Engine;
 use base64::prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
 use p256::ecdsa::SigningKey;
@@ -306,8 +306,6 @@ pub enum RevisionText {
 
 /// Where a Kata pod mounts its init-data annotation through the downward API.
 pub const INIT_DATA_PATH: &str = "/run/alpha-init-data/cc_init_data";
-/// The host writes the annotation, so a gzip bomb there must not exhaust the pod.
-const MAX_INIT_DATA: usize = 1 << 20;
 
 /// The init-data out of the annotation's text, `base64(gzip(toml))`; None when the pod mounts
 /// none. The host can write anything there, so the leaf's Revision is what makes it the pod's.

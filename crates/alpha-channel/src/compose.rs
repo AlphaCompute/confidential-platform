@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use alpha_core::InitData;
+use alpha_core::{InitData, MAX_INIT_DATA};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use yaml_rust2::{Yaml, YamlLoader};
@@ -24,8 +24,6 @@ pub struct Service {
 
 const RUNTIME: &str = "alpha-runtime";
 const SECRETS: &str = "ALPHACOMPUTE_SECRETS";
-/// The runtime's bound on a pod's init-data; an `app-compose.json` stays far below it too.
-const MAX_REVISION: usize = 1 << 20;
 
 fn malformed(m: &str) -> Error {
     Error::Malformed(format!("compose: {m}"))
@@ -36,8 +34,8 @@ fn get<'a>(map: &'a yaml_rust2::yaml::Hash, key: &str) -> Option<&'a Yaml> {
 }
 
 pub fn services(revision: &str) -> Result<BTreeMap<String, Service>, Error> {
-    if revision.len() >= MAX_REVISION {
-        return Err(malformed(&format!("{MAX_REVISION} bytes or more")));
+    if revision.len() >= MAX_INIT_DATA {
+        return Err(malformed(&format!("{MAX_INIT_DATA} bytes or more")));
     }
     let mut services = if revision.trim_start().starts_with('{') {
         compose_services(revision)?
@@ -448,7 +446,7 @@ mod tests {
                 "{containers}"
             );
         }
-        let huge = format!("{K3}#{}\n", " ".repeat(MAX_REVISION));
+        let huge = format!("{K3}#{}\n", " ".repeat(MAX_INIT_DATA));
         assert_eq!(services(&huge).unwrap_err().code(), "malformed");
     }
 }
