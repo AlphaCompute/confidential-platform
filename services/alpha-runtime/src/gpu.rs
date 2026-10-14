@@ -132,7 +132,9 @@ mod tests {
     fn gpu_class(root_sha256: [u8; 32]) -> KataReference {
         let mut reference: serde_json::Value =
             serde_json::from_slice(&testdata("gpu-reference.json")).unwrap();
-        reference["root_sha256"] = format!("sha256:{}", hex::encode(root_sha256)).into();
+        reference["root_sha256"] = alpha_core::ComposeHash::from(root_sha256)
+            .to_string()
+            .into();
         let zero = format!("sha384:{}", "00".repeat(48));
         serde_json::from_value(serde_json::json!({
             "runtime_class": "kata-qemu-nvidia-gpu-tdx",

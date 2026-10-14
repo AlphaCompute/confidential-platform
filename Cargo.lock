@@ -352,7 +352,6 @@ dependencies = [
  "chrono",
  "flate2",
  "getrandom 0.4.3",
- "hex",
  "p256 0.14.0",
  "p384 0.14.0",
  "parking_lot",
