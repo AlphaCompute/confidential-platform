@@ -14,6 +14,7 @@
 )]
 
 mod event_log;
+mod gpu;
 
 use std::fmt;
 use std::str::FromStr;
@@ -30,6 +31,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 
 pub use event_log::{EventLogEntry, compose_hash as event_log_compose_hash};
+pub use gpu::{GpuEvidence, GpuReference, appraise_gpus};
 
 pub const EVIDENCE_FORMAT: &str = "alphacompute-evidence/1";
 pub const KATA_EVIDENCE_FORMAT: &str = "alphacompute-evidence/kata/1";
