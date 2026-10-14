@@ -321,6 +321,9 @@ pub struct BootstrapRequest {
 #[serde(deny_unknown_fields)]
 pub struct BootstrapBody {
     pub custodians: [PublicKey; 3],
+    /// The node login role's one-time genesis password; a Kata node takes it only from here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_password: Option<String>,
 }
 
 /// The reply as received; `payload` is typed only after its signature has been checked.
@@ -391,6 +394,9 @@ pub struct JoinReply {
     pub tenant_kek_root: String,
     pub ca_key: String,
     pub ca_cert: String,
+    /// The password the peer reaches the database with; absent from a node that predates it.
+    #[serde(default)]
+    pub database_password: Option<String>,
 }
 
 pub struct Client {

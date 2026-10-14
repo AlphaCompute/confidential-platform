@@ -48,6 +48,8 @@ pub struct Config {
     pub substrate: alpha_tsm::Substrate,
     pub kms_endpoints: Vec<String>,
     pub platform_document_url: String,
+    /// From the encrypted env on dstack; never configured on Kata.
+    pub database_password: Option<Zeroizing<String>>,
     #[cfg(feature = "dev-root")]
     pub dev_root_kek: Option<Zeroizing<[u8; 32]>>,
 }
@@ -66,6 +68,7 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .collect(),
             platform_document_url: env("ALPHACOMPUTE_PLATFORM_DOCUMENT_URL")?,
+            database_password: None,
             #[cfg(feature = "dev-root")]
             dev_root_kek: std::env::var("ALPHACOMPUTE_KMS_DEV_ROOT_KEK")
                 .ok()
@@ -129,19 +132,22 @@ pub struct Node {
     pub platform: RwLock<Option<Arc<PlatformDocument>>>,
     pub phase: RwLock<Phase>,
     pub server_cert: Arc<tls::ServerCert>,
+    /// On Kata only from bootstrap, unseal or the peer.
+    database_password: RwLock<Option<Zeroizing<String>>>,
     bucket: Mutex<(f64, Instant)>,
 }
 
 impl Node {
     pub fn new(
         pool: PgPool,
-        config: Config,
+        mut config: Config,
         clock: Clock,
         collateral: CollateralSource,
         nonce_key: [u8; 32],
         compose_hash: ComposeHash,
         release_key: ed25519_dalek::VerifyingKey,
     ) -> Result<Arc<Self>, String> {
+        let database_password = config.database_password.take();
         let runtime_key = SigningKey::from_bytes((&random::<32>().map_err(|e| e.message)?).into())
             .map_err(|e| format!("runtime key: {e}"))?;
         let runtime_spki = runtime_key
@@ -173,8 +179,28 @@ impl Node {
             platform: RwLock::new(None),
             phase: RwLock::new(Phase::Sealed { shares: Vec::new() }),
             server_cert,
+            database_password: RwLock::new(database_password),
             bucket: Mutex::new((BUCKET_CAPACITY, Instant::now())),
         }))
+    }
+
+    pub fn is_kata(&self) -> bool {
+        self.config.substrate == alpha_tsm::Substrate::Kata
+    }
+
+    /// A sealed Kata node has no database credential yet.
+    pub fn has_database(&self) -> bool {
+        !self.is_kata() || !self.is_sealed()
+    }
+
+    pub fn database_password(&self) -> Option<Zeroizing<String>> {
+        self.database_password.read().clone()
+    }
+
+    pub fn use_database_password(&self, password: Zeroizing<String>) {
+        let options = (*self.pool.connect_options()).clone().password(&password);
+        self.pool.set_connect_options(options);
+        *self.database_password.write() = Some(password);
     }
 
     pub fn evidence(&self, report_data: &[u8; 64]) -> Result<InstanceEvidence, ApiError> {
@@ -279,16 +305,17 @@ pub fn router(node: Arc<Node>) -> Router {
 }
 
 async fn ready(State(node): State<Arc<Node>>) -> Response {
+    if node.is_sealed() {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "sealed": true })),
+        )
+            .into_response();
+    }
     if let Err(e) = sqlx::query("select 1").execute(&node.pool).await {
         return ApiError::internal(format!("database: {e}")).into_response();
     }
-    let sealed = node.is_sealed();
-    let status = if sealed {
-        axum::http::StatusCode::SERVICE_UNAVAILABLE
-    } else {
-        axum::http::StatusCode::OK
-    };
-    (status, axum::Json(serde_json::json!({ "sealed": sealed }))).into_response()
+    axum::Json(serde_json::json!({ "sealed": false })).into_response()
 }
 
 pub fn random<const N: usize>() -> Result<[u8; N], ApiError> {

@@ -5,11 +5,12 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use alpha_core::{AppId, OrgId, Signer, signing_digest};
 use base64::Engine;
-use base64::prelude::BASE64_URL_SAFE_NO_PAD;
+use base64::prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::pkcs8::DecodePublicKey;
 use ed25519_dalek::{Signature, VerifyingKey};
 use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::PgExecutor;
@@ -66,6 +67,39 @@ pub fn app_key(org_key: &[u8; 32], app: AppId, purpose: &str) -> Result<Key32, A
         .expand(&info, out.as_mut())
         .map_err(|e| ApiError::internal(format!("hkdf: {e}")))?;
     Ok(out)
+}
+
+/// A Kata node's database password: a node computes it from the root KEK, so no person and no
+/// configuration ever holds it.
+pub fn database_password(root: &[u8; 32]) -> Result<Zeroizing<String>, ApiError> {
+    let mut out = Zeroizing::new([0u8; 32]);
+    Hkdf::<Sha256>::new(Some(b"alphacompute-kms/database/v1"), root)
+        .expand(&[], out.as_mut())
+        .map_err(|e| ApiError::internal(format!("hkdf: {e}")))?;
+    Ok(Zeroizing::new(hex::encode(out.as_slice())))
+}
+
+const SCRAM_ITERATIONS: u32 = 4096;
+
+/// Postgres's SCRAM-SHA-256 secret of `password` (RFC 5802, 7677), what `ALTER ROLE … PASSWORD`
+/// stores as given: the plaintext never reaches the server or its statement log.
+pub fn scram_verifier(password: &str, salt: &[u8]) -> Result<String, ApiError> {
+    let mac = |key: &[u8], data: &[u8]| -> Result<[u8; 32], ApiError> {
+        let mut mac = <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(key)
+            .map_err(|e| ApiError::internal(format!("hmac: {e}")))?;
+        mac.update(data);
+        Ok(mac.finalize().into_bytes().into())
+    };
+    let mut salted = Zeroizing::new([0u8; 32]);
+    pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), salt, SCRAM_ITERATIONS, salted.as_mut());
+    let stored_key = Sha256::digest(mac(salted.as_slice(), b"Client Key")?);
+    let server_key = mac(salted.as_slice(), b"Server Key")?;
+    Ok(format!(
+        "SCRAM-SHA-256${SCRAM_ITERATIONS}:{}${}:{}",
+        BASE64_STANDARD.encode(salt),
+        BASE64_STANDARD.encode(stored_key),
+        BASE64_STANDARD.encode(server_key),
+    ))
 }
 
 /// `nonce(12) ‖ AES-256-GCM(key, plaintext, aad)`.

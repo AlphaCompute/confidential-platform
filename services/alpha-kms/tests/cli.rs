@@ -410,7 +410,7 @@ async fn bootstrap_once_never_again_then_unseal_the_second_node() {
     // Never again: the serving node refuses, and so does a fresh sealed node over the same database.
     let pubs = custodian_pubs(&h.custodians);
     let client = spki_client(&h.url, &h.node);
-    let err = cli_node::bootstrap(&client, &identity, pubs.clone(), 1, &h.dir)
+    let err = cli_node::bootstrap(&client, &identity, pubs.clone(), None, 1, &h.dir)
         .await
         .unwrap_err();
     assert!(err.starts_with("already_exists"), "{err}");
@@ -425,7 +425,7 @@ async fn bootstrap_once_never_again_then_unseal_the_second_node() {
     assert!(node2.is_sealed());
     let identity2 = node_identity(&node2);
     let client2 = spki_client(&url2, &node2);
-    let err = cli_node::bootstrap(&client2, &identity2, pubs, 1, &h.dir)
+    let err = cli_node::bootstrap(&client2, &identity2, pubs, None, 1, &h.dir)
         .await
         .unwrap_err();
     assert!(err.starts_with("already_exists"), "{err}");

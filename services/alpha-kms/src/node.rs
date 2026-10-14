@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use alpha_attest::report_data;
+use alpha_attest::{InstanceEvidence, report_data};
 use alpha_client::tls::PeerCerts;
 use alpha_client::{Client, Identity, JoinRequest, NodeEvidence, Pin, UnsealRequest};
 use alpha_core::{context, signing_digest};
@@ -70,6 +70,12 @@ pub async fn bootstrap(
     let body: BootstrapBody =
         serde_json::from_slice(&body).map_err(|e| ApiError::malformed(format!("body: {e}")))?;
     let now = node.now();
+    if node.is_kata() {
+        let password = body.database_password.ok_or_else(|| {
+            ApiError::malformed("database_password: a Kata node takes its genesis password here")
+        })?;
+        node.use_database_password(Zeroizing::new(password));
+    }
 
     let root = root_kek(&node)?;
     let tenant_kek_root = Zeroizing::new(random()?);
@@ -92,7 +98,15 @@ pub async fn bootstrap(
     audit::node("node.bootstrap", "ok", json!({}))
         .insert(&mut *tx)
         .await?;
+    let password = if node.is_kata() {
+        Some(set_role_password(&mut *tx, &root).await?)
+    } else {
+        None
+    };
     tx.commit().await?;
+    if let Some(password) = password {
+        node.use_database_password(password);
+    }
 
     let shares = Gf256::split_bytes(
         2,
@@ -120,6 +134,7 @@ pub async fn bootstrap(
     let digest = signing_digest(context::NODE_BOOTSTRAP, &payload)
         .map_err(|e| ApiError::internal(format!("payload: {e}")))?;
     node.start_serving(keys)?;
+    on_database(&node).await;
     let signature: p256::ecdsa::Signature = node.runtime_key.sign(&digest);
     Ok(Json(json!({
         "payload": payload,
@@ -136,6 +151,44 @@ fn root_kek(_node: &Node) -> Result<Zeroizing<[u8; 32]>, ApiError> {
         return Ok(root.clone());
     }
     Ok(Zeroizing::new(random()?))
+}
+
+/// The login role's password becomes the one derived from `root`, sent as a SCRAM verifier.
+async fn set_role_password(
+    conn: impl sqlx::PgExecutor<'_>,
+    root: &[u8; 32],
+) -> Result<Zeroizing<String>, ApiError> {
+    let password = keys::database_password(root)?;
+    let verifier = keys::scram_verifier(&password, &random::<16>()?)?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "alter role current_user password '{verifier}'"
+    )))
+    .execute(conn)
+    .await?;
+    Ok(password)
+}
+
+/// Unseal and the dev root: on Kata the root is also the database credential, and the role is
+/// set to it again once the unwrap has proved the root.
+pub async fn serve_from_root(node: &Node, root: &[u8; 32]) -> Result<(), ApiError> {
+    if node.is_kata() {
+        node.use_database_password(keys::database_password(root)?);
+    }
+    let keys = unwrap_intermediates(node, root).await?;
+    if node.is_kata() {
+        set_role_password(&node.pool, root).await?;
+    }
+    node.start_serving(keys)?;
+    on_database(node).await;
+    Ok(())
+}
+
+/// A Kata node fetched the platform document without the database while sealed; now the stored
+/// row bounds it.
+async fn on_database(node: &Node) {
+    if node.is_kata() {
+        crate::platform::start(node).await;
+    }
 }
 
 /// Unwraps both rows under `root`.
@@ -198,17 +251,20 @@ pub async fn unseal(
             .and_then(|r| <[u8; 32]>::try_from(r.as_slice()).ok())
             .map(Zeroizing::new)
             .ok_or_else(|| ApiError::malformed("shares do not combine"))?;
-        let keys = unwrap_intermediates(&node, &root).await?;
-        node.start_serving(keys)
+        serve_from_root(&node, &root).await
     }
     .await;
     if let Err(e) = outcome {
         if let Phase::Sealed { shares } = &mut *node.phase.write() {
             shares.clear();
         }
-        audit::node("node.unseal", "denied", e.details())
+        // On Kata a wrong root is also a wrong database password: keep the refusal, not that.
+        if let Err(audit) = audit::node("node.unseal", "denied", e.details())
             .insert(&node.pool)
-            .await?;
+            .await
+        {
+            eprintln!("node.unseal denied: {audit}");
+        }
         return Err(e);
     }
     audit::node("node.unseal", "ok", json!({}))
@@ -245,6 +301,7 @@ pub async fn join(
         "tenant_kek_root": BASE64_URL_SAFE_NO_PAD.encode(keys.tenant_kek_root.as_slice()),
         "ca_key": BASE64_URL_SAFE_NO_PAD.encode(keys.ca_key_der.as_slice()),
         "ca_cert": BASE64_URL_SAFE_NO_PAD.encode(&keys.ca_cert_der),
+        "database_password": node.database_password().as_deref(),
     })))
 }
 
@@ -269,6 +326,11 @@ async fn join_inner(
         &collateral,
         now,
     )?;
+    // A Kata joiner's database address is a pinned literal of its init-data, so the Revision
+    // already names the database; it has no credential to write the row with before this reply.
+    if matches!(request.evidence, InstanceEvidence::Kata(_)) {
+        return Ok(appraised.compose_hash);
+    }
     let requested = sqlx::query_scalar!(
         "select exists(select 1 from audit_log
            where action = 'node.join.request' and outcome = 'ok'
@@ -299,7 +361,7 @@ pub async fn try_join(node: &Node) -> Result<(), ApiError> {
         if !client.ready().await.is_ok_and(|r| !r.sealed) {
             continue;
         }
-        match join_via(node, &client, endpoint).await {
+        match join_via(node, &client, endpoint, doc.version).await {
             Ok(()) => return Ok(()),
             Err(e) => eprintln!("join {endpoint}: {}", e.message),
         }
@@ -307,17 +369,24 @@ pub async fn try_join(node: &Node) -> Result<(), ApiError> {
     Err(ApiError::internal("no ready node to join"))
 }
 
-async fn join_via(node: &Node, client: &Client, endpoint: &str) -> Result<(), ApiError> {
+async fn join_via(
+    node: &Node,
+    client: &Client,
+    endpoint: &str,
+    pinned_version: u64,
+) -> Result<(), ApiError> {
     let http = |e: alpha_client::Error| ApiError::internal(format!("join: {e}"));
     let nonce_text = client.attest_nonce().await.map_err(http)?.nonce;
     let nonce = decode32("nonce", &nonce_text)?;
-    audit::node(
-        "node.join.request",
-        "ok",
-        json!({ "runtime_pubkey_sha256": keys::sha256_hex(&node.runtime_spki), "endpoint": endpoint }),
-    )
-    .insert(&node.pool)
-    .await?;
+    if !node.is_kata() {
+        audit::node(
+            "node.join.request",
+            "ok",
+            json!({ "runtime_pubkey_sha256": keys::sha256_hex(&node.runtime_spki), "endpoint": endpoint }),
+        )
+        .insert(&node.pool)
+        .await?;
+    }
     let xwing = node.xwing_key.public();
     let rd = report_data(&node.runtime_spki, &nonce, Some(xwing.as_bytes()));
     let reply = client
@@ -335,11 +404,27 @@ async fn join_via(node: &Node, client: &Client, endpoint: &str) -> Result<(), Ap
         <[u8; 32]>::try_from(field("tenant_kek_root", &reply.tenant_kek_root)?.as_slice())
             .map_err(|_| ApiError::internal("join reply: tenant_kek_root"))?,
     );
+    if node.is_kata() {
+        let password = reply
+            .database_password
+            .ok_or_else(|| ApiError::internal("join reply: no database_password"))?;
+        node.use_database_password(Zeroizing::new(password));
+        // The peer was pinned by a document fetched without the database; one older than the
+        // stored row may be a replay naming a retired Revision, so nothing from it is used.
+        let stored = crate::platform::load_stored(node).await?;
+        if stored.is_some_and(|s| s.document.version > pinned_version) {
+            return Err(ApiError::internal(
+                "the other node was pinned by a platform document older than the stored one",
+            ));
+        }
+    }
     node.start_serving(Intermediates {
         tenant_kek_root,
         ca_key_der: Zeroizing::new(field("ca_key", &reply.ca_key)?),
         ca_cert_der: field("ca_cert", &reply.ca_cert)?,
-    })
+    })?;
+    on_database(node).await;
+    Ok(())
 }
 
 /// An HTTPS client for the other node: our self-signed runtime certificate as identity, the

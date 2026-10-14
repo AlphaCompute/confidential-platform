@@ -221,13 +221,36 @@ pub async fn start_node(
     clock: Clock,
     collateral_of: &str,
 ) -> (Arc<Node>, String, tokio::sync::oneshot::Sender<()>) {
+    let password = Some(zeroize::Zeroizing::new("from the encrypted env".to_owned()));
+    start_node_on(
+        alpha_tsm::Substrate::Dstack,
+        password,
+        pool,
+        release_url,
+        release_key,
+        clock,
+        collateral_of,
+    )
+    .await
+}
+
+pub async fn start_node_on(
+    substrate: alpha_tsm::Substrate,
+    database_password: Option<zeroize::Zeroizing<String>>,
+    pool: PgPool,
+    release_url: &str,
+    release_key: &SigningKey,
+    clock: Clock,
+    collateral_of: &str,
+) -> (Arc<Node>, String, tokio::sync::oneshot::Sender<()>) {
     let event_log: Vec<EventLogEntry> =
         serde_json::from_slice(&read(KEYED, "event_log.json")).unwrap();
     let collateral = serde_json::from_slice(&read(collateral_of, "collateral.json")).unwrap();
     let config = Config {
-        substrate: alpha_tsm::Substrate::Dstack,
+        substrate,
         kms_endpoints: vec![],
         platform_document_url: release_url.to_owned(),
+        database_password,
         #[cfg(feature = "dev-root")]
         dev_root_kek: None,
     };
@@ -301,6 +324,7 @@ pub async fn harness_on(clock: Clock, collateral_of: &str, document: Value) -> O
         &spki_client(&base, &node),
         &identity,
         custodian_pubs(&custodians),
+        None,
         1,
         &dir,
     )
