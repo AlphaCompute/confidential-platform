@@ -216,28 +216,17 @@ fn appraise_gpu(
         .find(|r| r.root_sha256 == leaf.root && opaque.is(r))
         .ok_or_else(|| {
             AppraisalError::Unknown(format!(
-                "no gpu reference for {} {} {} {} vbios {} driver {}",
+                "no gpu reference for {} {} {} {} vbios {} driver {} firmware {} feature flag {}",
                 opaque.chip,
                 opaque.project,
                 opaque.project_sku,
                 opaque.chip_sku,
                 opaque.vbios_version,
-                opaque.driver_version
+                opaque.driver_version,
+                Measurement(opaque.fwid),
+                opaque.feature_flag
             ))
         })?;
-    if leaf.fwid != reference.fwid.0 {
-        return Err(AppraisalError::Unknown(format!(
-            "gpu firmware {} is not the pinned {}",
-            Measurement(leaf.fwid),
-            reference.fwid
-        )));
-    }
-    if opaque.feature_flag != reference.feature_flag {
-        return Err(AppraisalError::Unknown(format!(
-            "gpu feature flag {} is not the pinned {}",
-            opaque.feature_flag, reference.feature_flag
-        )));
-    }
     for (index, value) in (1..=BLOCKS).zip(&spdm.blocks) {
         let allowed = reference.measurements.get(&index);
         let ok = match allowed {
@@ -418,6 +407,8 @@ impl Opaque {
             && self.chip_sku == r.chip_sku
             && self.vbios_version == r.vbios_version
             && self.driver_version == r.driver_version
+            && self.fwid == r.fwid.0
+            && self.feature_flag == r.feature_flag
     }
 }
 
@@ -565,12 +556,15 @@ fn tcb_info(value: &[u8]) -> Option<TcbInfo> {
         insecure: false,
     };
     let mut fields = tcb_info.data;
+    let mut last_tag = None;
     while !fields.is_empty() {
         let (rest, field) = Any::from_der(fields).ok()?;
         fields = rest;
-        if field.class() != Class::ContextSpecific {
-            continue;
+        // DER orders the fields by tag, so a repeated flags field cannot hide the first one.
+        if field.class() != Class::ContextSpecific || last_tag >= Some(field.tag().0) {
+            return None;
         }
+        last_tag = Some(field.tag().0);
         if field.tag() == Tag(6) {
             let (_, fwid) = Any::from_der(field.data).ok()?;
             let (digest, hash_alg) = Oid::from_der(fwid.data).ok()?;
@@ -602,6 +596,18 @@ mod tests {
         assert_eq!(gpu_nonce(&report_data), expected);
         report_data[63] = 0;
         assert_eq!(gpu_nonce(&report_data), expected);
+    }
+
+    #[test]
+    fn tcb_info_flags_appear_once() {
+        let debug = [0x87, 0x05, 0x00, 0x90, 0x00, 0x00, 0x01];
+        let b300 = [0x87, 0x05, 0x00, 0x80, 0x00, 0x00, 0x01];
+        assert!(
+            tcb_info(&[[0x30, 0x07].as_slice(), &debug].concat())
+                .unwrap()
+                .insecure
+        );
+        assert!(tcb_info(&[[0x30, 0x0e].as_slice(), &debug, &b300].concat()).is_none());
     }
 
     #[test]

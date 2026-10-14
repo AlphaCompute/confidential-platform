@@ -146,13 +146,13 @@ fn altered_gpu_evidence_is_refused() {
             "firmware not pinned",
             |_, _, r, _| r.fwid.0[0] ^= 1,
             "attestation_unknown",
-            "is not the pinned",
+            "no gpu reference",
         ),
         (
             "protected PCIe mode",
             |_, _, r, _| r.feature_flag = 2,
             "attestation_unknown",
-            "feature flag 1 is not the pinned 2",
+            "no gpu reference",
         ),
         (
             "nonzero block not referenced",
