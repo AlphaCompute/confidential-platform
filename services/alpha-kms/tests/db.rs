@@ -224,7 +224,7 @@ async fn two_organizations_live_side_by_side() {
     // Each organization's secrets are sealed under its own root key.
     let intermediates = h.node.intermediates().unwrap();
     let stored = sqlx::query!(
-        "select id, ciphertext from secrets where org_id = $1 and name = 'a-secret'",
+        "select id, ciphertext, document from secrets where org_id = $1 and name = 'a-secret'",
         Uuid::from(h.org)
     )
     .fetch_one(&h.pool)
@@ -238,14 +238,15 @@ async fn two_organizations_live_side_by_side() {
         )
         .unwrap()
     };
+    let aad = alpha_kms::keys::secret_aad(stored.id, &stored.document).unwrap();
     let key_b = org_key(org_b, &root_b.1);
     assert!(
-        alpha_kms::keys::aead_open(&key_b, stored.id.as_bytes(), &stored.ciphertext).is_none(),
+        alpha_kms::keys::aead_open(&key_b, &aad, &stored.ciphertext).is_none(),
         "the neighbour's key opens the secret"
     );
     let key_a = org_key(h.org, &h.root.1);
     assert_eq!(
-        alpha_kms::keys::aead_open(&key_a, stored.id.as_bytes(), &stored.ciphertext)
+        alpha_kms::keys::aead_open(&key_a, &aad, &stored.ciphertext)
             .unwrap()
             .as_slice(),
         b"a's value"
@@ -1173,6 +1174,30 @@ async fn attest_release_revoke_and_tamper() {
     .unwrap();
     let (status, reply) = send(instance.get(format!("{}/v1/secrets/foreign", h.url))).await;
     assert_eq!((status, code(&reply)), (StatusCode::NOT_FOUND, "not_found"));
+
+    // Another secret's id and ciphertext moved under this secret's signed document stay sealed.
+    let (foreign_id, foreign_ciphertext): (Uuid, Vec<u8>) =
+        sqlx::query_as("select id, ciphertext from secrets where name = 'foreign'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    sqlx::query("update secrets set id = $1 where name = 'foreign'")
+        .bind(Uuid::now_v7())
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    sqlx::query("update secrets set id = $1, ciphertext = $2 where name = 'model-key'")
+        .bind(foreign_id)
+        .bind(foreign_ciphertext)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let (status, reply) = send(instance.get(&secret_url)).await;
+    assert_eq!(
+        (status, code(&reply)),
+        (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+        "{reply}"
+    );
 
     // A swapped anchor SPKI leaves the organization's secrets undecryptable.
     sqlx::query!(

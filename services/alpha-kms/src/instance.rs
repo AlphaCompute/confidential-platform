@@ -393,7 +393,7 @@ async fn get_secret_inner(
     // document, not from the columns beside it.
     let document: SecretPayload = serde_json::from_value(secret.document.clone())
         .map_err(|_| ApiError::signature_invalid("secret document"))?;
-    let content_sha256 = format!("sha256:{}", hex::encode(secret.content_sha256));
+    let content_sha256 = format!("sha256:{}", hex::encode(&secret.content_sha256));
     if document.name != name || document.content_sha256 != content_sha256 {
         return Err(ApiError::signature_invalid(
             "secret row differs from its signed document",
@@ -418,8 +418,14 @@ async fn get_secret_inner(
         ));
     }
     let org_key = keys::org_key(tenant_kek_root, identity.org_id, &chain.anchor_spki)?;
-    let value = keys::aead_open(&org_key, secret.id.as_bytes(), &secret.ciphertext)
+    let aad = keys::secret_aad(secret.id, &secret.document)?;
+    let value = keys::aead_open(&org_key, &aad, &secret.ciphertext)
         .ok_or_else(|| ApiError::internal("secret does not decrypt under org_key"))?;
+    if Sha256::digest(&*value).as_slice() != secret.content_sha256 {
+        return Err(ApiError::signature_invalid(
+            "secret value differs from its signed document",
+        ));
+    }
     Ok(json!({
         "value": BASE64_URL_SAFE_NO_PAD.encode(&*value),
         "content_sha256": content_sha256,

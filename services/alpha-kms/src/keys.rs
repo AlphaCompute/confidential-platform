@@ -125,6 +125,15 @@ pub fn aead_open(key: &[u8; 32], aad: &[u8], blob: &[u8]) -> Option<Zeroizing<Ve
         .map(Zeroizing::new)
 }
 
+/// The database is untrusted storage: a Secret's ciphertext opens only beside the document its
+/// signature covers, so a writer cannot move it under another Secret's document. `org_key`
+/// already binds the organization.
+pub fn secret_aad(id: Uuid, document: &Value) -> Result<Vec<u8>, ApiError> {
+    let digest = signing_digest(alpha_core::context::SECRET, document)
+        .map_err(|e| ApiError::malformed(format!("payload: {e}")))?;
+    Ok([id.as_bytes().as_slice(), &digest].concat())
+}
+
 pub use alpha_client::SignatureObject;
 
 pub fn verify_ed25519(spki_der: &[u8], digest: &[u8; 32], signature_b64: &str) -> bool {

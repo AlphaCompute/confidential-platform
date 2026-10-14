@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select id, ciphertext from secrets where org_id = $1 and name = 'a-secret'",
+  "query": "select id, ciphertext, document from secrets where org_id = $1 and name = 'a-secret'",
   "describe": {
     "columns": [
       {
@@ -24,6 +24,17 @@
             "name": "ciphertext"
           }
         }
+      },
+      {
+        "ordinal": 2,
+        "name": "document",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "secrets",
+            "name": "document"
+          }
+        }
       }
     ],
     "parameters": {
@@ -33,8 +44,9 @@
     },
     "nullable": [
       false,
+      false,
       false
     ]
   },
-  "hash": "6433c58278ef050f5934c1652eb163b34753676d6cf83a1feb3f4cf1ab450020"
+  "hash": "88f3527d5957219c51d29b2843161ab58a48d3ea5a0061c2524c7d4c39d2b272"
 }
