@@ -13,7 +13,6 @@ spec:
   runtimeClassName: kata-qemu-tdx
   automountServiceAccountToken: false
   enableServiceLinks: false
-  restartPolicy: Always
   nodeSelector:
     alphacompute.io/pool: kms
   tolerations:

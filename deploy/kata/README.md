@@ -8,14 +8,6 @@ whoever runs it. Nothing here is applied by CI: the operator applies these files
 How a node gets its database password, and why the init-data carries none, is in
 [`../README.md`](../README.md#a-node-in-a-kata-pod).
 
-| File | What it is |
-|---|---|
-| `kms-node.yaml` | the node's pod template; the release renders it |
-| `trust-db.yaml` | Postgres with TLS and SCRAM only |
-| `migrate.yaml` | `alpha-kms migrate` as the database owner |
-| `kms.yaml` | namespace `alpha-kms` and the node pods' disruption budget |
-| `kms-service.yaml` | one Service per node, `kms-<n>` |
-
 ## Inputs not fixed yet
 
 Each is chosen before the release whose pod spec is signed; the first three are measured, so
@@ -112,7 +104,7 @@ custodians have run `alpha keygen --custodian` and handed over their public keys
 
    ```sh
    envsubst '$KMS_MAX_UNAVAILABLE' < kms.yaml | kubectl apply -f -
-   for n in 1 2; do KMS_NODE=$n envsubst '$KMS_NODE' < kms-service.yaml | kubectl apply -f -; done
+   for n in $(seq <number of nodes>); do KMS_NODE=$n envsubst '$KMS_NODE' < kms-service.yaml | kubectl apply -f -; done
    ```
 
 6. **The first node**, from the release's `pod.yaml` unchanged. A label routes `kms-1` to it.

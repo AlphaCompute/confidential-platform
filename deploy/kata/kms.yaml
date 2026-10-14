@@ -1,5 +1,3 @@
-# The KMS namespace and its disruption budget. Apply with
-#   envsubst '$KMS_MAX_UNAVAILABLE' < kms.yaml | kubectl apply -f -
 # A drain that evicts every node at once is an unseal ceremony.
 apiVersion: v1
 kind: Namespace

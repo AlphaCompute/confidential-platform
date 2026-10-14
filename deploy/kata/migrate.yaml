@@ -1,5 +1,3 @@
-# `alpha-kms migrate` as the database owner, in a runc pod next to Postgres:
-#   KMS_IMAGE=<the release's alpha-kms@sha256:…> envsubst '$KMS_IMAGE' < migrate.yaml | kubectl create -f -
 apiVersion: batch/v1
 kind: Job
 metadata:

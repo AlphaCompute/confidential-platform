@@ -1,6 +1,5 @@
-# One stable address per node pod, `https://kms-<n>.alpha-kms.svc:8443`, selected by a label set
-# after the pod is created (labels are not in the policy). One per node:
-#   KMS_NODE=1 envsubst '$KMS_NODE' < kms-service.yaml | kubectl apply -f -
+# One stable address per node pod, selected by a label set after the pod is created: labels are
+# not in the policy.
 apiVersion: v1
 kind: Service
 metadata:
