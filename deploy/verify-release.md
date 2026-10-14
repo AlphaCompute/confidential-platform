@@ -9,7 +9,7 @@ covers what both runners share: GitHub's runner image, network and account.
 
 Linux on x86_64, not a GitHub runner, with Docker Engine using its classic image store, where an
 image's id is the digest of its configuration: `docker info -f '{{.Driver}}'` prints `overlay2`
-(the containerd store prints `overlayfs` and reports other ids). `git`, `gh` and `jq`.
+(the containerd store prints `overlayfs` and reports other ids). `bash`, `git`, `gh` and `jq`.
 
 ## Inputs
 
@@ -27,7 +27,7 @@ gh run view "$RUN" -R AlphaCompute/confidential-platform --json jobs --jq '.jobs
 
 ## 1. The source
 
-```sh
+```bash
 git clone https://github.com/AlphaCompute/confidential-platform && cd confidential-platform
 git checkout "$TAG"
 gh run download "$RUN" -n alpha-kms-release-manifest -D release
@@ -86,4 +86,5 @@ jq -j .init_data rendered.json | cmp - release/kata/init-data.toml
 The tag, the commit, every image's id line and pushed reference, and the `compose_hash`.
 Each custodian and signer runs an `alpha` built at the tag in the pinned image, as in
 [`signer-keys.md`](signer-keys.md), with its SHA-256 equal to a second person's build of the same
-tag; the record keeps it. A difference at any step stops the ceremony until it is explained.
+tag; the image fixes the toolchain and the build paths, so equal source gives an equal binary.
+The record keeps it. A difference at any step stops the ceremony until it is explained.

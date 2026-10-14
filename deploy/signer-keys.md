@@ -77,7 +77,7 @@ else in the file. Each of the other two signers approves only after checking the
 pull request's head against all three keys of the record, typed from the record, not copied
 from the diff:
 
-```sh
+```bash
 printf '%s\n' RECORDED_KEY_1 RECORDED_KEY_2 RECORDED_KEY_3 | sort |
   diff - <(sort crates/alpha-channel/release-keys/prod.pub) && echo "the three recorded keys"
 ```

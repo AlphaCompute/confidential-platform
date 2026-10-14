@@ -36,7 +36,7 @@ Time every step and write down what went wrong.
    kubectl -n alpha-kms wait --for=create pod/kms-0 --timeout=10m
    kubectl -n alpha-kms wait --for=jsonpath='{.status.phase}'=Running pod/kms-0 --timeout=10m
    kubectl -n alpha-kms port-forward pod/kms-0 8443:8443 &
-   sleep 2; curl -sk -w ' %{http_code}\n' https://localhost:8443/ready   # {"sealed":true} 503
+   timeout 120 bash -c 'until curl -sk https://localhost:8443/ready | grep -qF "{\"sealed\":true}"; do sleep 2; done'
    ```
 5. **Unseal with two shares**, one custodian inside the company at the port-forward and one
    outside it, remotely, as in [All nodes lost](kata/README.md#restart-upgrade-loss). The
