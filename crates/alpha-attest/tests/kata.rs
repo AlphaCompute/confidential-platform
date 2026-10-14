@@ -92,8 +92,8 @@ fn zero_tail_of_mr_config_id_is_enforced() {
 #[test]
 fn cpu_pod_is_appraised_as_the_cpu_class() {
     let appraised = appraise("p1-sha256.quote.bin", &doc()).unwrap();
-    assert_eq!(appraised.runtime_class, "kata-qemu-tdx");
-    assert!(!appraised.gpu);
+    assert_eq!(appraised.reference.runtime_class, "kata-qemu-tdx");
+    assert!(!appraised.reference.gpu);
     assert_eq!(appraised.init_data, t1_digest());
     assert_eq!(appraised.quote.tcb_status, "UpToDate");
 }

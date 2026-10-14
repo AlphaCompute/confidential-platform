@@ -295,17 +295,7 @@ pub type Clock = Arc<dyn Fn() -> SystemTime + Send + Sync>;
 
 /// A quote over `report_data`, with the event log behind it on dstack; the TD in `main`, a
 /// capture in tests.
-pub type EvidenceSource = Arc<dyn Fn(&[u8; 64]) -> Result<AttestEvidence, String> + Send + Sync>;
-
-/// The evidence `/v1/attest` receives: the TD's and, in a GPU pod, the GPU evidence its quote's
-/// `report_data` commits to.
-#[derive(Debug, serde::Serialize)]
-pub struct AttestEvidence {
-    #[serde(flatten)]
-    pub td: InstanceEvidence,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub gpu: Vec<alpha_nvml::GpuEvidence>,
-}
+pub type EvidenceSource = Arc<dyn Fn(&[u8; 64]) -> Result<InstanceEvidence, String> + Send + Sync>;
 
 /// The bytes whose SHA-256 is the Instance's Revision, served on `/v1/identity` once a leaf
 /// names that hash.
