@@ -36,10 +36,11 @@ pub(crate) fn test_state(
     Arc::new(crate::AppState {
         config,
         secrets: parking_lot::RwLock::new(crate::Secrets {
-            provider_key: zeroize::Zeroizing::new(provider_key.to_string()),
+            provider_key: Some(zeroize::Zeroizing::new(provider_key.to_string())),
             caller_bearer: zeroize::Zeroizing::new(caller_bearer.to_vec()),
         }),
         upstream,
+        own: Default::default(),
     })
 }
 
@@ -47,13 +48,16 @@ pub(crate) fn test_state(
 /// modules need for a config that never has to pass the `https://` check `Config::build` runs.
 pub(crate) fn test_config(upstream_url: &str, models: &[&str]) -> crate::Config {
     crate::Config {
-        upstream_url: upstream_url.to_string(),
         models: models.iter().map(|s| (*s).to_string()).collect(),
-        pccs_url: "https://pccs.example".to_string(),
-        upstream_policy: alpha_attest::Policy {
-            tcb_statuses: vec!["UpToDate".into()],
-            tolerated_advisories: vec![],
-        },
+        own: Default::default(),
+        external: Some(crate::External {
+            upstream_url: upstream_url.to_string(),
+            pccs_url: "https://pccs.example".to_string(),
+            upstream_policy: alpha_attest::Policy {
+                tcb_statuses: vec!["UpToDate".into()],
+                tolerated_advisories: vec![],
+            },
+        }),
     }
 }
 

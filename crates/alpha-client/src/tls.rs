@@ -12,6 +12,7 @@ use hyper_util::server::conn::auto::Builder;
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
 use parking_lot::RwLock;
+use rustls::client::ResolvesClientCert;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::CryptoProvider;
 use rustls::crypto::aws_lc_rs::{self, kx_group};
@@ -221,11 +222,7 @@ pub fn client_config(
     identity: Option<Identity>,
     time: Arc<dyn TimeProvider>,
 ) -> Result<ClientConfig, Error> {
-    let builder = ClientConfig::builder_with_details(provider(), time)
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|e| Error::Invalid(format!("tls: {e}")))?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(PinnedServer::new(pin)?));
+    let builder = pinned_builder(pin, time)?;
     Ok(match identity {
         None => builder.with_no_client_auth(),
         Some(identity) => builder
@@ -239,6 +236,27 @@ pub fn client_config(
             )
             .map_err(|e| Error::Invalid(format!("client identity: {e}")))?,
     })
+}
+
+/// As [`client_config`], presenting whatever `cert` resolves at each handshake, so a renewed
+/// Instance leaf reaches a client built before the renewal.
+pub fn renewing_client_config(
+    pin: Pin,
+    cert: Arc<dyn ResolvesClientCert>,
+    time: Arc<dyn TimeProvider>,
+) -> Result<ClientConfig, Error> {
+    Ok(pinned_builder(Some(pin), time)?.with_client_cert_resolver(cert))
+}
+
+fn pinned_builder(
+    pin: Option<Pin>,
+    time: Arc<dyn TimeProvider>,
+) -> Result<rustls::ConfigBuilder<ClientConfig, rustls::client::WantsClientCert>, Error> {
+    Ok(ClientConfig::builder_with_details(provider(), time)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| Error::Invalid(format!("tls: {e}")))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedServer::new(pin)?)))
 }
 
 pub use alpha_channel::cert::{
@@ -289,6 +307,16 @@ impl InstanceCert {
 impl ResolvesServerCert for InstanceCert {
     fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         Some(self.0.read().clone())
+    }
+}
+
+impl ResolvesClientCert for InstanceCert {
+    fn resolve(&self, _: &[&[u8]], _: &[SignatureScheme]) -> Option<Arc<CertifiedKey>> {
+        Some(self.0.read().clone())
+    }
+
+    fn has_certs(&self) -> bool {
+        true
     }
 }
 

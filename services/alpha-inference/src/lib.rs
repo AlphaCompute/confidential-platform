@@ -1,8 +1,8 @@
-//! The platform's inference front: an App of its own, whose provider is RedPill. Every
-//! `/v1` route forwards to RedPill only after `upstream::Upstream::verified` has proven, in
-//! this process's own measured code, that the connection it will forward over terminates
-//! inside RedPill's attested gateway — never on a stale check, an error, or a caller without
-//! its bearer.
+//! The platform's inference front: an App of its own. A model in `MODEL_SERVERS` goes to our own
+//! attested model server (`own`); every other allowlisted model goes to RedPill, and only after
+//! `upstream::Upstream::verified` has proven, in this process's own measured code, that the
+//! connection it will forward over terminates inside RedPill's attested gateway — never on a
+//! stale check, an error, or a caller without its bearer.
 
 #![cfg_attr(
     test,
@@ -15,12 +15,15 @@
     )
 )]
 
+pub mod own;
 pub mod upstream;
 
 #[cfg(test)]
 mod test_support;
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, State};
@@ -36,13 +39,26 @@ pub use upstream::Upstream;
 
 const COMPLETIONS_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
-/// The four measured environment variables, read once at startup and never mutated.
+/// A completion's whole exchange, the streamed answer included, ends after this. Far above any
+/// caller's own deadline, so the front never cuts an answer a caller still waits for, yet it
+/// bounds a connection held by a server that stopped sending.
+pub const COMPLETION_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The measured environment, read once at startup and never mutated.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// RedPill's OpenAI-compatible base, `/v1` included, trailing slash trimmed.
-    pub upstream_url: String,
     /// The allowlist, in order; the first is the default model.
     pub models: Vec<String>,
+    /// The allowlisted models our own model servers serve.
+    pub own: BTreeMap<String, own::ModelServer>,
+    /// The provider of every other allowlisted model; `None` when there is none.
+    pub external: Option<External>,
+}
+
+#[derive(Clone, Debug)]
+pub struct External {
+    /// RedPill's OpenAI-compatible base, `/v1` included, trailing slash trimmed.
+    pub upstream_url: String,
     pub pccs_url: String,
     pub upstream_policy: alpha_attest::Policy,
 }
@@ -55,11 +71,6 @@ impl Config {
     /// Built from a lookup function rather than the process environment, so validation is
     /// testable without touching global state.
     pub fn build(get: impl Fn(&str) -> Option<String>) -> Result<Self, Error> {
-        let upstream_url =
-            get("UPSTREAM_URL").ok_or_else(|| Error::internal("UPSTREAM_URL is required"))?;
-        if !upstream_url.starts_with("https://") {
-            return Err(Error::internal("UPSTREAM_URL must be https"));
-        }
         let models: Vec<String> = get("MODELS")
             .unwrap_or_default()
             .split(',')
@@ -69,6 +80,47 @@ impl Config {
             .collect();
         if models.is_empty() {
             return Err(Error::internal("MODELS names no model"));
+        }
+        let own = get("MODEL_SERVERS")
+            .map(|raw| own::parse(&raw))
+            .transpose()?
+            .unwrap_or_default();
+        if let Some(stray) = own.keys().find(|m| !models.contains(m)) {
+            return Err(Error::internal(format!(
+                "MODEL_SERVERS names {stray}, which is not in MODELS"
+            )));
+        }
+        let external = if models.iter().all(|m| own.contains_key(m)) {
+            None
+        } else {
+            Some(External::build(&get)?)
+        };
+        Ok(Config {
+            models,
+            own,
+            external,
+        })
+    }
+
+    pub fn default_model(&self) -> &str {
+        self.models.first().map_or("", String::as_str)
+    }
+
+    pub fn allows(&self, model: &str) -> bool {
+        self.models.iter().any(|m| m == model)
+    }
+
+    pub fn external_models(&self) -> impl Iterator<Item = &String> {
+        self.models.iter().filter(|m| !self.own.contains_key(*m))
+    }
+}
+
+impl External {
+    fn build(get: &impl Fn(&str) -> Option<String>) -> Result<Self, Error> {
+        let upstream_url =
+            get("UPSTREAM_URL").ok_or_else(|| Error::internal("UPSTREAM_URL is required"))?;
+        if !upstream_url.starts_with("https://") {
+            return Err(Error::internal("UPSTREAM_URL must be https"));
         }
         let pccs_url = get("PCCS_URL").ok_or_else(|| Error::internal("PCCS_URL is required"))?;
         if !pccs_url.starts_with("https://") {
@@ -81,26 +133,18 @@ impl Config {
         if upstream_policy.tcb_statuses.is_empty() {
             return Err(Error::internal("UPSTREAM_POLICY names no tcb_status"));
         }
-        Ok(Config {
+        Ok(External {
             upstream_url: upstream_url.trim_end_matches('/').to_owned(),
-            models,
             pccs_url: pccs_url.trim_end_matches('/').to_owned(),
             upstream_policy,
         })
-    }
-
-    pub fn default_model(&self) -> &str {
-        self.models.first().map_or("", String::as_str)
-    }
-
-    pub fn allows(&self, model: &str) -> bool {
-        self.models.iter().any(|m| m == model)
     }
 }
 
 /// Held only in zeroizing buffers; `Debug` never shows the bytes.
 pub struct Secrets {
-    pub provider_key: Zeroizing<String>,
+    /// Read only when some model goes to the external provider.
+    pub provider_key: Option<Zeroizing<String>>,
     pub caller_bearer: Zeroizing<Vec<u8>>,
 }
 
@@ -118,7 +162,8 @@ impl std::fmt::Debug for Secrets {
 pub struct AppState {
     pub config: Config,
     pub secrets: parking_lot::RwLock<Secrets>,
-    pub upstream: Upstream,
+    pub upstream: Option<Upstream>,
+    pub own: BTreeMap<String, own::Server>,
 }
 
 /// Every error this service answers with, OpenAI-shaped on the wire. Messages never carry a
@@ -216,31 +261,54 @@ fn verify_error(outcome: upstream::VerifyOutcome, model: &str) -> Error {
     }
 }
 
+async fn verified_external<'a>(
+    state: &'a AppState,
+    model: &str,
+) -> Result<(&'a Upstream, reqwest::Client), Error> {
+    let upstream = state
+        .upstream
+        .as_ref()
+        .ok_or_else(|| Error::internal("no external provider is configured"))?;
+    let client = upstream
+        .verified(model)
+        .await
+        .map_err(|outcome| verify_error(outcome, model))?;
+    Ok((upstream, client))
+}
+
 async fn list_models(State(state): State<Arc<AppState>>, _: AuthedCaller) -> Json<Value> {
-    let listed = state.upstream.list_models().await;
-    let entries = listed
-        .get("data")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let allowed: Vec<Value> = entries
-        .into_iter()
-        .filter(|m| {
-            m.get("id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| state.config.allows(id))
-        })
+    let mut data: Vec<Value> = state
+        .config
+        .own
+        .keys()
+        .map(|id| json!({ "id": id, "object": "model", "owned_by": "alphacompute" }))
         .collect();
-    let data = if allowed.is_empty() {
-        state
-            .config
-            .models
-            .iter()
-            .map(|id| json!({ "id": id, "object": "model" }))
-            .collect()
-    } else {
-        allowed
-    };
+    if let Some(upstream) = &state.upstream {
+        let listed = upstream.list_models().await;
+        let entries = listed
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let allowed: Vec<Value> = entries
+            .into_iter()
+            .filter(|m| {
+                m.get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| state.config.external_models().any(|e| e == id))
+            })
+            .collect();
+        if allowed.is_empty() {
+            data.extend(
+                state
+                    .config
+                    .external_models()
+                    .map(|id| json!({ "id": id, "object": "model" })),
+            );
+        } else {
+            data.extend(allowed);
+        }
+    }
     Json(json!({ "object": "list", "data": data }))
 }
 
@@ -252,13 +320,16 @@ async fn get_model(
     if !state.config.allows(&model) {
         return Err(Error::ModelNotFound(model));
     }
-    state
-        .upstream
-        .verified(&model)
-        .await
-        .map_err(|outcome| verify_error(outcome, &model))?;
+    let owned_by = match state.own.get(&model) {
+        Some(server) if server.live(&model).await => "alphacompute",
+        Some(_) => return Err(Error::Upstream),
+        None => {
+            verified_external(&state, &model).await?;
+            "redpill"
+        }
+    };
     Ok(Json(
-        json!({ "id": model, "object": "model", "owned_by": "redpill" }),
+        json!({ "id": model, "object": "model", "owned_by": owned_by }),
     ))
 }
 
@@ -276,25 +347,29 @@ async fn chat_completions(
     if !state.config.allows(&model) {
         return Err(Error::ModelNotFound(model));
     }
-    let client = state
-        .upstream
-        .verified(&model)
-        .await
-        .map_err(|outcome| verify_error(outcome, &model))?;
-
-    let provider_key = state.secrets.read().provider_key.clone();
-    let sent = client
-        .post(format!("{}/chat/completions", state.config.upstream_url))
-        .bearer_auth(provider_key.as_str())
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(body)
-        .send()
-        .await;
-    let upstream_response = match sent {
-        Ok(response) => response,
-        Err(_) => {
-            state.upstream.forget(&model).await;
-            return Err(Error::Upstream);
+    let upstream_response = if let Some(server) = state.own.get(&model) {
+        server.complete(body).await.map_err(|_| Error::Upstream)?
+    } else {
+        let (upstream, client) = verified_external(&state, &model).await?;
+        let provider_key = state
+            .secrets
+            .read()
+            .provider_key
+            .clone()
+            .ok_or_else(|| Error::internal("no provider key was read"))?;
+        let sent = client
+            .post(format!("{}/chat/completions", upstream.url()))
+            .bearer_auth(provider_key.as_str())
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await;
+        match sent {
+            Ok(response) => response,
+            Err(_) => {
+                upstream.forget(&model).await;
+                return Err(Error::Upstream);
+            }
         }
     };
     let status = StatusCode::from_u16(upstream_response.status().as_u16())
@@ -317,9 +392,15 @@ async fn healthz() -> StatusCode {
 }
 
 async fn ready(State(state): State<Arc<AppState>>) -> StatusCode {
-    match state.upstream.verified(state.config.default_model()).await {
-        Ok(_) => StatusCode::OK,
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    let model = state.config.default_model();
+    let ready = match state.own.get(model) {
+        Some(server) => server.live(model).await,
+        None => verified_external(&state, model).await.is_ok(),
+    };
+    if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
     }
 }
 
@@ -400,6 +481,45 @@ mod tests {
         ))
         .unwrap_err();
         assert!(err.to_string().contains("UPSTREAM_POLICY"), "{err}");
+    }
+
+    const OWN_M1: &str = r#"{"m1":{"url":"https://ms.example:8443","revisions":["sha256:1111111111111111111111111111111111111111111111111111111111111111"]}}"#;
+
+    #[test]
+    fn config_build_needs_no_provider_when_every_model_is_served_by_our_own() {
+        let config = Config::build(|n| match n {
+            "MODELS" => Some("m1".into()),
+            "MODEL_SERVERS" => Some(OWN_M1.into()),
+            _ => None,
+        })
+        .unwrap();
+        assert!(config.external.is_none());
+        assert_eq!(config.own["m1"].url, "https://ms.example:8443");
+        let mixed = Config::build(with_override("MODEL_SERVERS", OWN_M1)).unwrap();
+        assert!(mixed.external.is_some());
+        assert_eq!(mixed.external_models().collect::<Vec<_>>(), ["m2"]);
+    }
+
+    #[test]
+    fn config_build_refuses_a_bad_model_server_naming_it() {
+        let rev = format!("sha256:{}", "1".repeat(64));
+        for bad in [
+            format!(r#"{{"m3":{{"url":"https://ms.example","revisions":["{rev}"]}}}}"#),
+            format!(r#"{{"m1":{{"url":"http://ms.example","revisions":["{rev}"]}}}}"#),
+            format!(r#"{{"m1":{{"url":"https://ms.example/v1","revisions":["{rev}"]}}}}"#),
+            format!(r#"{{"m1":{{"url":"https://ms.example#f","revisions":["{rev}"]}}}}"#),
+            r#"{"m1":{"url":"https://ms.example","revisions":[]}}"#.to_owned(),
+        ] {
+            let err = Config::build(|n| {
+                if n == "MODEL_SERVERS" {
+                    Some(bad.clone())
+                } else {
+                    valid_env(n)
+                }
+            })
+            .unwrap_err();
+            assert!(err.to_string().contains("MODEL_SERVERS"), "{bad}: {err}");
+        }
     }
 
     #[tokio::test]

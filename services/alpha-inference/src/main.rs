@@ -1,6 +1,6 @@
-//! Thin entrypoint: attest, read this Instance's identity and both Secrets, then serve the
-//! `/v1` routes over TLS on `:8443` until SIGTERM, refreshing the leaf and both Secrets every
-//! five minutes. A failed read of the Secrets is retried; a lost identity ends the process: the
+//! Thin entrypoint: attest, read this Instance's identity and its Secrets (the provider key only
+//! when some model goes to the external provider), then serve the `/v1` routes over TLS on
+//! `:8443` until SIGTERM, refreshing the leaf and the Secrets every five minutes. A failed read of the Secrets is retried; a lost identity ends the process: the
 //! runtime is gone when the Revision is revoked, and the front must not go on serving with what
 //! it read before. All logic lives in `run`, which maps every error to a non-zero exit and never
 //! panics.
@@ -8,8 +8,10 @@
 use std::sync::Arc;
 
 use alpha_client::runtime::{RuntimeSocket, refresh_forever};
-use alpha_client::tls::{InstanceCert, serve, server_config};
-use alpha_inference::{AppState, Config, Error, Secrets, Upstream, router};
+use alpha_client::tls::{InstanceCert, kms_ca, serve, server_config};
+use alpha_inference::{
+    AppState, COMPLETION_TIMEOUT, Config, Error, Secrets, Upstream, own, router,
+};
 use tokio::net::TcpListener;
 use zeroize::Zeroizing;
 
@@ -27,20 +29,24 @@ async fn main() {
     std::process::exit(code);
 }
 
-async fn read_secrets(runtime: &RuntimeSocket) -> Result<Secrets, Error> {
-    let provider_key = runtime
-        .secret("redpill-api-key")
-        .await
-        .map_err(|e| Error::internal(format!("secret redpill-api-key: {e}")))?;
+async fn read_secrets(runtime: &RuntimeSocket, external: bool) -> Result<Secrets, Error> {
+    let provider_key = if external {
+        let key = runtime
+            .secret("redpill-api-key")
+            .await
+            .map_err(|e| Error::internal(format!("secret redpill-api-key: {e}")))?;
+        Some(Zeroizing::new(String::from_utf8(key.to_vec()).map_err(
+            |_| Error::internal("redpill-api-key is not utf8"),
+        )?))
+    } else {
+        None
+    };
     let caller_bearer = runtime
         .secret("caller-bearer")
         .await
         .map_err(|e| Error::internal(format!("secret caller-bearer: {e}")))?;
     Ok(Secrets {
-        provider_key: Zeroizing::new(
-            String::from_utf8(provider_key.to_vec())
-                .map_err(|_| Error::internal("redpill-api-key is not utf8"))?,
-        ),
+        provider_key,
         caller_bearer: Zeroizing::new(caller_bearer.to_vec()),
     })
 }
@@ -63,12 +69,15 @@ async fn run() -> Result<(), Error> {
     let tls_config =
         server_config(cert.clone()).map_err(|e| Error::internal(format!("tls: {e}")))?;
 
-    let secrets = read_secrets(&runtime).await?;
+    let secrets = read_secrets(&runtime, config.external.is_some()).await?;
     let upstream = Upstream::new(&config)?;
+    let kms_ca = kms_ca(&identity).map_err(|e| Error::internal(format!("kms ca: {e}")))?;
+    let own = own::servers(&config.own, &kms_ca, cert.clone(), COMPLETION_TIMEOUT)?;
     let state = Arc::new(AppState {
         config,
         secrets: parking_lot::RwLock::new(secrets),
         upstream,
+        own,
     });
     let app = router(state.clone());
 
@@ -93,6 +102,6 @@ async fn run() -> Result<(), Error> {
 }
 
 async fn refresh(runtime: &RuntimeSocket, state: &AppState) -> Result<(), Error> {
-    *state.secrets.write() = read_secrets(runtime).await?;
+    *state.secrets.write() = read_secrets(runtime, state.config.external.is_some()).await?;
     Ok(())
 }
