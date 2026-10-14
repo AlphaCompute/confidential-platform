@@ -1,6 +1,5 @@
-# alpha-guard, the content judge, rendered like inference.yaml with `--app-id <the guard's App>`.
-# It reaches the front by its Service name; the name is only routing, the TLS pin on the front's
-# Revisions is the check.
+# alpha-guard, the content judge. It reaches the front by its Service name; the name is only
+# routing, the TLS pin on the front's Revisions is the check.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

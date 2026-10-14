@@ -1,7 +1,6 @@
-# One vLLM model on one passed-through GPU, rendered like inference.yaml with `--app-id <the
-# model's App>`. vLLM listens on loopback only; the runtime terminates TLS on 8443 with the
-# Instance leaf and proxies only Instances of the Apps in MODEL_CALLER_APPS, so nobody else reaches
-# any vLLM route. MODEL_IMAGE is vLLM with the weights at /weights.
+# One vLLM model on one passed-through GPU. vLLM listens on loopback only; the runtime terminates
+# TLS on 8443 with the Instance leaf and proxies only Instances of the Apps in MODEL_CALLER_APPS,
+# so nobody else reaches any vLLM route.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -51,7 +50,6 @@ spec:
         command: [vllm, serve, /weights, --served-model-name, "${MODEL_ID}", --host, 127.0.0.1, --port, "8000"]
         env:
         - {name: HF_HUB_OFFLINE, value: "1"}
-        - {name: VLLM_NO_USAGE_STATS, value: "1"}
         - {name: DO_NOT_TRACK, value: "1"}
         # The pod VM is sized from the limits, and the guest pulls the image into its memory.
         resources:

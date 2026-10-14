@@ -1,5 +1,5 @@
-# alpha-broker, the connector broker, rendered like inference.yaml with `--app-id <the broker's
-# App>`. Its database URL is a Secret from the KMS, never env: the host reads the init-data.
+# alpha-broker, the connector broker. Its database URL is a Secret from the KMS, never env: the
+# host reads the init-data.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

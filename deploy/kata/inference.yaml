@@ -1,7 +1,6 @@
-# alpha-inference, the RedPill front. The operator fills the ${…} with envsubst and renders it
-# with `alpha coco render --app-id <the front's App>`: what the agent policy pins for the pod
-# template (namespace, images, commands, env, mounts, security contexts) is the front's Revision;
-# labels, replicas, scheduling and probes are not.
+# alpha-inference, the front. What the agent policy pins for the pod template (namespace, images,
+# commands, env, mounts, security contexts) is its Revision; labels, replicas, scheduling and
+# probes are not. The same holds for every template here.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
