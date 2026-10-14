@@ -127,7 +127,7 @@ async fn every_slack_refresh_stores_the_rotated_refresh_token() {
         h.state.tokens.lock().clear();
         assert_eq!(h.proxy(&read(id, HISTORY)).await.status, StatusCode::OK);
         let sealed = h.stored_token(id).await.unwrap();
-        let stored = alpha_broker::store::open(&KEY, id.as_bytes(), &sealed).unwrap();
+        let stored = alpha_broker::store::open(&KEY, &aad(id, "slack"), &sealed).unwrap();
         let newest = h.fake.with(|f| f.refresh.last().cloned().unwrap());
         assert_eq!(stored.as_slice(), newest.as_bytes(), "round {round}");
         assert_ne!(newest, consent.refresh_token);

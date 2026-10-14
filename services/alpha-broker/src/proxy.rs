@@ -54,8 +54,9 @@ const DEFAULT_LIFETIME: Duration = Duration::from_secs(3600);
 const SEND_TIMEOUT: Duration = Duration::from_secs(100);
 
 /// Access tokens by connection id, kept only in this process; expired ones are dropped whenever
-/// a new one is stored.
-pub type TokenCache = parking_lot::Mutex<HashMap<Uuid, (Zeroizing<String>, Instant)>>;
+/// a new one is stored. Each carries the associated data its refresh token opened under, so a row
+/// rewritten after the token was cached does not reach it.
+pub type TokenCache = parking_lot::Mutex<HashMap<Uuid, (Zeroizing<String>, Instant, Vec<u8>)>>;
 
 fn is_id(segment: &str) -> bool {
     (1..=256).contains(&segment.len())
@@ -252,7 +253,7 @@ pub async fn proxy(
         .transpose()
         .map_err(|e| Error::internal(format!("body: {e}")))?
         .map(|v| (HeaderValue::from_static("application/json"), Bytes::from(v)));
-    forward(&state, id, provider, entry, url, headers, payload).await
+    forward(&state, id, &member, provider, entry, url, headers, payload).await
 }
 
 /// The member's export as the page seals it: the signed document and the bytes it hashes.
@@ -308,7 +309,7 @@ pub async fn write(
         )
         .await?;
         let payload = Some((content_type, Bytes::from(bytes)));
-        let relayed = forward(&state, id, provider, entry, url, headers, payload).await?;
+        let relayed = forward(&state, id, &member, provider, entry, url, headers, payload).await?;
         Ok(json!({
             "status": relayed.status.as_u16(),
             "content_type": relayed.content_type.as_ref().and_then(|v| v.to_str().ok()),
@@ -321,9 +322,11 @@ pub async fn write(
 
 /// Sends the entry's method to `url` with the member's access token; a 401 on a cached token
 /// drops it, refreshes once and retries once.
+#[allow(clippy::too_many_arguments)]
 async fn forward(
     state: &AppState,
     id: Uuid,
+    member: &[u8],
     provider: &Provider,
     entry: &Entry,
     url: Url,
@@ -332,7 +335,7 @@ async fn forward(
 ) -> Result<Relayed, Error> {
     let mut retried = false;
     loop {
-        let token = access_token(state, id, provider).await?;
+        let token = access_token(state, id, member, provider).await?;
         let outgoing = state
             .http
             .request(entry.method.clone(), url.clone())
@@ -348,7 +351,7 @@ async fn forward(
         let response = outgoing.send().await.map_err(|_| Error::Upstream)?;
         if response.status() == StatusCode::UNAUTHORIZED && !retried {
             let mut cache = state.tokens.lock();
-            if cache.get(&id).is_some_and(|(t, _)| *t == token) {
+            if cache.get(&id).is_some_and(|(t, _, _)| *t == token) {
                 cache.remove(&id);
             }
             retried = true;
@@ -395,34 +398,36 @@ async fn relay(mut response: reqwest::Response) -> Result<Relayed, Error> {
     })
 }
 
-fn cached(state: &AppState, id: Uuid) -> Option<Zeroizing<String>> {
+fn cached(state: &AppState, id: Uuid, aad: &[u8]) -> Option<Zeroizing<String>> {
     state
         .tokens
         .lock()
         .get(&id)
-        .filter(|(_, until)| *until > Instant::now())
-        .map(|(token, _)| token.clone())
+        .filter(|(_, until, opened)| *until > Instant::now() && opened == aad)
+        .map(|(token, _, _)| token.clone())
 }
 
 /// The cached access token, or a new one from the sealed refresh token.
 async fn access_token(
     state: &AppState,
     id: Uuid,
+    member: &[u8],
     provider: &Provider,
 ) -> Result<Zeroizing<String>, Error> {
-    if let Some(token) = cached(state, id) {
+    let aad = store::aad(id.as_bytes(), member, provider.name);
+    if let Some(token) = cached(state, id, &aad) {
         return Ok(token);
     }
     let mut tx = state.pool.begin().await?;
     let sealed = store::lock_token(&mut tx, id)
         .await?
         .ok_or(Error::NotFound)?;
-    if let Some(token) = cached(state, id) {
+    if let Some(token) = cached(state, id, &aad) {
         return Ok(token);
     }
     let key = state.secrets.read().connectors_key.clone();
     let (client_id, client_secret) = state.client(provider)?;
-    let refresh_token = store::open(&key, id.as_bytes(), &sealed)
+    let refresh_token = store::open(&key, &aad, &sealed)
         .ok_or_else(|| Error::internal("a stored refresh token does not open"))?;
     let refresh_token = std::str::from_utf8(&refresh_token)
         .map_err(|_| Error::internal("a stored refresh token is not utf8"))?;
@@ -449,7 +454,7 @@ async fn access_token(
         }
     };
     if let Some(rotated) = &refreshed.refresh_token {
-        let sealed = store::seal(&key, id.as_bytes(), rotated.as_bytes())?;
+        let sealed = store::seal(&key, &aad, rotated.as_bytes())?;
         store::replace_refresh_token(&mut tx, id, &sealed).await?;
     }
     let until = refreshed
@@ -461,9 +466,9 @@ async fn access_token(
     {
         let mut cache = state.tokens.lock();
         let now = Instant::now();
-        cache.retain(|_, (_, until)| *until > now);
+        cache.retain(|_, (_, until, _)| *until > now);
         if let Some(until) = until {
-            cache.insert(id, (refreshed.access_token.clone(), until));
+            cache.insert(id, (refreshed.access_token.clone(), until, aad));
         }
     }
     if let Err(e) = tx.commit().await {

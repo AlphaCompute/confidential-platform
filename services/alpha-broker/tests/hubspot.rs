@@ -202,7 +202,7 @@ async fn a_hubspot_refresh_stores_whatever_refresh_token_comes_back() {
             StatusCode::OK
         );
         let sealed = h.stored_token(id).await.unwrap();
-        let stored = alpha_broker::store::open(&KEY, id.as_bytes(), &sealed).unwrap();
+        let stored = alpha_broker::store::open(&KEY, &aad(id, "hubspot"), &sealed).unwrap();
         let newest = h.fake.with(|f| f.refresh.last().cloned().unwrap());
         assert_eq!(stored.as_slice(), newest.as_bytes(), "round {round}");
         assert_ne!(newest, consent.refresh_token);

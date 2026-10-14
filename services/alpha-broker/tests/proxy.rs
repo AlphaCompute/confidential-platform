@@ -153,6 +153,49 @@ async fn an_unknown_or_revoked_connection_is_not_found_and_a_foreign_one_is_not_
 }
 
 #[tokio::test]
+async fn a_rewritten_member_key_or_a_moved_refresh_token_is_refused() {
+    let Some(h) = harness().await else { return };
+    let (victim, _) = h.connected().await;
+    assert_eq!(h.proxy(&read(victim, FILES)).await.status, StatusCode::OK);
+    let (theirs, _) = h.connect(&other_member(), "other@example.com").await;
+    let theirs = id_of(&theirs);
+    let set_key = |id, key: Vec<u8>| {
+        sqlx::query("update connections set member_key = $2 where id = $1")
+            .bind(id)
+            .bind(key)
+            .execute(&h.pool)
+    };
+    let reached = || h.fake.with(|f| (f.data.len(), f.requests.len()));
+    let before = reached();
+
+    set_key(victim, other_member().spki).await.unwrap();
+    let mut body = read(victim, FILES);
+    body["grant"] = serde_json::json!(grant(&other_member(), &h.aud, &[victim]));
+    let reply = h.proxy(&body).await;
+    assert_eq!(
+        (reply.status, reply.code()),
+        (StatusCode::INTERNAL_SERVER_ERROR, "internal".into())
+    );
+    set_key(victim, member().spki).await.unwrap();
+
+    let token = h.stored_token(victim).await.unwrap();
+    sqlx::query("update connections set enc_refresh_token = $2 where id = $1")
+        .bind(theirs)
+        .bind(token)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let mut body = read(theirs, FILES);
+    body["grant"] = serde_json::json!(grant(&other_member(), &h.aud, &[theirs]));
+    let reply = h.proxy(&body).await;
+    assert_eq!(
+        (reply.status, reply.code()),
+        (StatusCode::INTERNAL_SERVER_ERROR, "internal".into())
+    );
+    assert_eq!(reached(), before);
+}
+
+#[tokio::test]
 async fn a_request_outside_the_allowlist_is_refused_before_google() {
     let Some(h) = harness().await else { return };
     let (id, _) = h.connected().await;
@@ -249,7 +292,7 @@ async fn a_rotated_refresh_token_is_sealed_and_stored() {
     let live = h.fake.with(|f| f.refresh.clone());
     assert!(!live.contains(&consent.refresh_token));
     let blob = h.stored_token(id).await.unwrap();
-    let stored = alpha_broker::store::open(&KEY, id.as_bytes(), &blob).unwrap();
+    let stored = alpha_broker::store::open(&KEY, &aad(id, "google"), &blob).unwrap();
     assert_eq!(live, [String::from_utf8(stored.to_vec()).unwrap()]);
 }
 
@@ -319,7 +362,7 @@ async fn two_calls_on_an_expired_token_share_one_refresh() {
 
     let live = h.fake.with(|f| f.refresh.clone());
     let blob = h.stored_token(id).await.unwrap();
-    let stored = alpha_broker::store::open(&KEY, id.as_bytes(), &blob).unwrap();
+    let stored = alpha_broker::store::open(&KEY, &aad(id, "google"), &blob).unwrap();
     assert_eq!(live, [String::from_utf8(stored.to_vec()).unwrap()]);
 }
 
@@ -391,7 +434,11 @@ async fn a_disconnect_drops_the_cached_token_and_a_refresh_drops_expired_ones() 
     let idle = uuid::Uuid::now_v7();
     h.state.tokens.lock().insert(
         idle,
-        ("ya29.expired".to_string().into(), std::time::Instant::now()),
+        (
+            "ya29.expired".to_string().into(),
+            std::time::Instant::now(),
+            Vec::new(),
+        ),
     );
     assert_eq!(h.proxy(&read(id, FILES)).await.status, StatusCode::OK);
     assert_eq!(
