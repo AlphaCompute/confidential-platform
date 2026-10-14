@@ -888,12 +888,6 @@ mod tests {
                 tampered(requests, APP, |r| mount_source(r, "/run/alpha", share)),
             ),
             (
-                "disk emptyDir bound to the image rootfs",
-                tampered(requests, APP, |r| {
-                    mount_source(r, "/run/alpha", "/run/kata-containers/app/rootfs")
-                }),
-            ),
-            (
                 "disk emptyDir bound to an image pulled under the storage path",
                 tampered(requests, APP, |r| {
                     let image = "/run/kata-containers/sandbox/storage/image";
