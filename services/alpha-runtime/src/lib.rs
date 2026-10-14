@@ -337,23 +337,31 @@ const MAX_INIT_DATA: usize = 1 << 20;
 /// none. The host can write anything there, so the leaf's Revision is what makes it the pod's.
 pub fn read_init_data(path: &Path) -> Result<Option<String>, Error> {
     let refused = |m: String| Error::Evidence(format!("init-data {}: {m}", path.display()));
-    let annotation = match std::fs::read_to_string(path) {
-        Ok(annotation) => annotation,
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(refused(e.to_string())),
     };
+    // The same bound for the encoded annotation: gzip of TOML stays far below it.
+    let annotation = read_under_limit(file).map_err(|m| refused(format!("annotation: {m}")))?;
     let gzip = BASE64_STANDARD
         .decode(annotation.trim())
         .map_err(|e| refused(format!("not base64: {e}")))?;
+    read_under_limit(flate2::read::GzDecoder::new(gzip.as_slice()))
+        .map(Some)
+        .map_err(|m| refused(format!("not gzip of UTF-8 or too long: {m}")))
+}
+
+fn read_under_limit(reader: impl Read) -> Result<String, String> {
     let mut text = String::new();
-    flate2::read::GzDecoder::new(gzip.as_slice())
+    reader
         .take(MAX_INIT_DATA as u64)
         .read_to_string(&mut text)
-        .map_err(|e| refused(format!("not gzip of UTF-8: {e}")))?;
+        .map_err(|e| e.to_string())?;
     if text.len() >= MAX_INIT_DATA {
-        return Err(refused(format!("{MAX_INIT_DATA} bytes or more")));
+        return Err(format!("{MAX_INIT_DATA} bytes or more"));
     }
-    Ok(Some(text))
+    Ok(text)
 }
 
 pub fn kata_evidence(quote: Vec<u8>) -> InstanceEvidence {
@@ -1020,6 +1028,8 @@ mod tests {
         assert_eq!(read.as_bytes(), init_data);
 
         std::fs::write(&path, annotation(&vec![b' '; MAX_INIT_DATA])).unwrap();
+        assert!(read_init_data(&path).is_err());
+        std::fs::write(&path, vec![b'A'; MAX_INIT_DATA]).unwrap();
         assert!(read_init_data(&path).is_err());
         std::fs::write(&path, "not base64").unwrap();
         assert!(read_init_data(&path).is_err());
