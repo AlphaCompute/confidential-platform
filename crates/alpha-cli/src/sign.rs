@@ -5,15 +5,50 @@ use std::time::SystemTime;
 
 use alpha_attest::PlatformDocument;
 use alpha_client::platform::{self, SignedDocument};
-use alpha_core::ComposeHash;
+use alpha_core::{ComposeHash, InitData};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::Serialize;
 use serde_json::Value;
 
-/// Signing garbage is refused: the document must already be a platform document.
-pub fn sign(document: Value, key: &SigningKey) -> Result<SignedDocument, String> {
-    serde_json::from_value::<PlatformDocument>(document.clone())
+/// Signing garbage is refused: the document must already be a platform document. Every
+/// `kms_revisions` entry must be one of the supplied node Revisions, a dstack compose or a Kata
+/// init-data; the KMS sees only a Kata node's digest, so its init-data must pass the document's
+/// own `kata_policy` here, as a tenant's does at registration.
+pub fn sign(
+    document: Value,
+    key: &SigningKey,
+    composes: &[String],
+    init_data: &[String],
+) -> Result<SignedDocument, String> {
+    let doc = serde_json::from_value::<PlatformDocument>(document.clone())
         .map_err(|e| format!("document: {e}"))?;
+    let mut supplied = Vec::new();
+    for compose in composes {
+        // An init-data is TOML, so it cannot pass as a compose and skip the policy check.
+        alpha_core::parse(compose.as_bytes()).map_err(|e| format!("compose: {e}"))?;
+        supplied.push(alpha_core::compose_hash(compose));
+    }
+    for toml in init_data {
+        let init_data = InitData::parse(toml.clone()).map_err(|e| e.to_string())?;
+        let digest = init_data.digest();
+        let pinned = doc
+            .kata_policy
+            .as_ref()
+            .ok_or("the document pins no kata_policy for an init-data")?;
+        init_data
+            .check_policy(pinned)
+            .map_err(|e| format!("init-data {digest}: {e}"))?;
+        supplied.push(digest);
+    }
+    let listed: Vec<ComposeHash> = doc.kms_revisions.iter().map(|r| r.compose_hash).collect();
+    if let Some(extra) = supplied.iter().find(|d| !listed.contains(d)) {
+        return Err(format!("{extra} is not in kms_revisions"));
+    }
+    if let Some(missing) = listed.iter().find(|d| !supplied.contains(d)) {
+        return Err(format!(
+            "kms_revisions {missing}: no compose or init-data supplied"
+        ));
+    }
     platform::sign(document, key).map_err(|e| e.to_string())
 }
 
@@ -68,8 +103,9 @@ mod tests {
             "reference_values": [], "kms_ca_pem": "",
             "kms_revisions": [{ "compose_hash": hash, "build": "b", "source_url": "u" }]
         });
-        assert!(sign(json!({"version": 1}), &key).is_err());
-        let artifact = sign(document, &key).unwrap();
+        let compose = ["{}".to_owned()];
+        assert!(sign(json!({"version": 1}), &key, &compose, &[]).is_err());
+        let artifact = sign(document, &key, &compose, &[]).unwrap();
         let summary = check(&artifact, &key.verifying_key(), SystemTime::now()).unwrap();
         assert_eq!(
             summary,
@@ -101,8 +137,33 @@ mod tests {
                 "api_origin": "https://api.example"
             }
         });
-        assert!(sign(document.clone(), &key).is_ok());
+        let compose = ["{}".to_owned()];
+        assert!(sign(document.clone(), &key, &compose, &[]).is_ok());
         document["signer"]["origins"][0] = json!("https://sign.example/path");
-        assert!(sign(document, &key).is_err());
+        assert!(sign(document, &key, &compose, &[]).is_err());
+    }
+
+    #[test]
+    fn sign_checks_a_kata_node_init_data_against_the_document() {
+        let key = SigningKey::from_bytes(&[8u8; 32]);
+        let k3 = include_str!("../../../testdata/attest/b300-kata-4.0.0/k3-app.toml");
+        let mut document: Value = serde_json::from_str(include_str!(
+            "../../../testdata/attest/b300-kata-4.0.0/platform-document.json"
+        ))
+        .unwrap();
+        document["kms_revisions"] = json!([{
+            "compose_hash": alpha_core::compose_hash(k3), "build": "b", "source_url": "u"
+        }]);
+        let init_data = [k3.to_owned()];
+        assert!(sign(document.clone(), &key, &[], &init_data).is_ok());
+
+        let err = sign(document.clone(), &key, &[], &[]).unwrap_err();
+        assert!(err.contains("no compose or init-data"), "{err}");
+        let err = sign(document.clone(), &key, &init_data, &[]).unwrap_err();
+        assert!(err.starts_with("compose:"), "{err}");
+
+        document["kata_policy"]["rules_sha256"] = json!(format!("sha256:{}", "0".repeat(64)));
+        let err = sign(document, &key, &[], &init_data).unwrap_err();
+        assert!(err.contains("not the pinned rules"), "{err}");
     }
 }

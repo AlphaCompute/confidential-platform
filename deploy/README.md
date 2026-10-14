@@ -70,6 +70,13 @@ nodes read as `ALPHACOMPUTE_PLATFORM_DOCUMENT_URL`. The document must also carry
 `reference_values` entry for the dstack guest image and CVM shape the nodes will run on. On
 day 0 `kms_ca_pem` is still empty; it is filled in after bootstrap (below).
 
+`alpha sign` takes the bytes behind every `kms_revisions[]` entry: `--compose
+app-compose.json` for each dstack node Revision, `--init-data <toml>` for each Kata node
+Revision (its `compose_hash` is the SHA-256 of that init-data). It refuses to sign when an
+entry has no file, a file's digest is not listed, or an init-data fails the document's own
+`kata_policy` (the same check `POST /v1/revisions` applies to a tenant's init-data): without
+the pinned agent policy the host could exec into a Kata node and read the intermediates.
+
 ## Day 0
 
 Before anything: the trust-zone Postgres CVM is up and addressed by our CNAME; the PCCS URL and
