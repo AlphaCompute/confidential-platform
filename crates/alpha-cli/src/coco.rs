@@ -499,18 +499,18 @@ mod tests {
             }
         }
 
-        fn creates(&mut self, request: &Value) -> bool {
+        fn allows(&mut self, endpoint: &str, request: &Value) -> bool {
             self.engine.clear_data();
             let data = serde_json::from_value(serde_json::json!({ "pstate": self.state })).unwrap();
             self.engine.add_data(data).unwrap();
             self.engine.set_input_json(&request.to_string()).unwrap();
             let results = self
                 .engine
-                .eval_query("data.agent_policy.CreateContainerRequest".into(), false)
+                .eval_query(format!("data.agent_policy.{endpoint}"), false)
                 .unwrap();
             let value = serde_json::to_value(&results.result[0].expressions[0].value).unwrap();
-            if value == Value::Bool(false) {
-                return false;
+            if let Value::Bool(allowed) = value {
+                return allowed;
             }
             for op in value["ops"].as_array().unwrap() {
                 assert_eq!(op["op"], "add", "{op}");
@@ -522,6 +522,10 @@ mod tests {
                 self.state.insert(key.into(), op["value"].clone());
             }
             value["allowed"] == Value::Bool(true)
+        }
+
+        fn creates(&mut self, request: &Value) -> bool {
+            self.allows("CreateContainerRequest", request)
         }
     }
 
@@ -538,11 +542,64 @@ mod tests {
             rendered.policy_data_sha256,
             golden["policy_data_sha256"].as_str().unwrap()
         );
+        // The recorded policy is this pod's: a spec edited without regenerating it fails here.
+        let pod: Yaml = serde_yaml_ng::from_str(DIND_POD).unwrap();
+        let mut in_pod: Vec<_> = ["initContainers", "containers"]
+            .iter()
+            .flat_map(|list| pod["spec"][list].as_sequence().unwrap())
+            .map(|c| (c["name"].as_str().unwrap(), c["image"].as_str().unwrap()))
+            .collect();
+        let data: Value =
+            serde_json::from_str(DIND_GENPOLICY.split_once(POLICY_DATA).unwrap().1).unwrap();
+        let mut in_policy: Vec<_> = data["containers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| &c["OCI"]["Annotations"])
+            .filter_map(|a| {
+                Some((
+                    a["io.kubernetes.cri.container-name"].as_str()?,
+                    a["io.kubernetes.cri.image-name"].as_str().unwrap(),
+                ))
+            })
+            .collect();
+        in_pod.sort();
+        in_policy.sort();
+        assert_eq!(in_pod, in_policy);
         let mut agent = Agent::new(DIND_GENPOLICY);
         let requests: Vec<Value> = serde_json::from_str(DIND_REQUESTS).unwrap();
         for request in &requests {
             let name = &request["OCI"]["Annotations"]["io.kubernetes.cri.container-name"];
             assert!(agent.creates(request), "{name}");
+        }
+        // With shared_fs=none the shim copies the downward API volume into the guest file by
+        // file, in WalkDir order, under the mount source it gives the runtime container.
+        let runtime = &requests[1]["OCI"]["Mounts"];
+        let base = runtime
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["destination"] == "/run/alpha-init-data")
+            .unwrap()["source"]
+            .as_str()
+            .unwrap();
+        let stamp = "..2026_10_14_09_00_00.123456789";
+        for (file_type, path, target) in [
+            ("Directory", base.to_owned(), None),
+            ("Directory", format!("{base}/{stamp}"), None),
+            ("Regular", format!("{base}/{stamp}/cc_init_data"), None),
+            ("Symlink", format!("{base}/..data"), Some(stamp)),
+            (
+                "Symlink",
+                format!("{base}/cc_init_data"),
+                Some("..data/cc_init_data"),
+            ),
+        ] {
+            let request = serde_json::json!({
+                "path": path, "file_type": file_type, "symlink_target": target,
+                "file_size": 0, "file_mode": 0o644, "dir_mode": 0o755, "uid": 0, "gid": 0, "offset": 0,
+            });
+            assert!(agent.allows("CopyFileRequest", &request), "{path}");
         }
     }
 
@@ -563,7 +620,19 @@ mod tests {
         let mut escalated = requests[launch].clone();
         escalated["OCI"]["Process"]["Capabilities"] =
             requests[dockerd]["OCI"]["Process"]["Capabilities"].clone();
-        for (index, tampered) in [(dockerd, tcp), (dockerd, image), (launch, escalated)] {
+        // What containerd adds to a privileged container when the runtime handler does not set
+        // privileged_without_host_devices.
+        let mut device = requests[dockerd].clone();
+        device["OCI"]["Linux"]["Devices"] = serde_json::json!([{
+            "Path": "/dev/kvm", "Type": "c", "Major": 10, "Minor": 232,
+            "FileMode": 0o660, "UID": 0, "GID": 0,
+        }]);
+        for (index, tampered) in [
+            (dockerd, tcp),
+            (dockerd, image),
+            (dockerd, device),
+            (launch, escalated),
+        ] {
             let mut agent = Agent::new(DIND_GENPOLICY);
             for request in &requests[..index] {
                 assert!(agent.creates(request));
