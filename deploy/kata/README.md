@@ -80,8 +80,9 @@ custodians have run `alpha keygen --custodian` and handed over their public keys
    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
      -subj /CN=postgres.alpha-trust-db.svc -keyout tls.key -out tls.crt
    kubectl -n alpha-trust-db create secret tls postgres-tls --cert tls.crt --key tls.key
-   : "${TRUST_DB_STORAGE_CLASS:?}" "${TRUST_DB_STORAGE_SIZE:?}"
-   envsubst '$TRUST_DB_STORAGE_CLASS $TRUST_DB_STORAGE_SIZE' < trust-db.yaml | kubectl apply -f -
+   : "${TRUST_DB_STORAGE_CLASS:?}" "${TRUST_DB_STORAGE_SIZE:?}" &&
+     export TRUST_DB_STORAGE_CLASS TRUST_DB_STORAGE_SIZE &&
+     envsubst '$TRUST_DB_STORAGE_CLASS $TRUST_DB_STORAGE_SIZE' < trust-db.yaml | kubectl apply -f -
    kubectl -n alpha-trust-db rollout status statefulset/postgres
    ```
 
@@ -104,8 +105,8 @@ custodians have run `alpha keygen --custodian` and handed over their public keys
 5. **Namespace, budget, addresses**, one Service for each address in `KMS_KATA_ENDPOINTS`:
 
    ```sh
-   : "${KMS_MAX_UNAVAILABLE:?}"
-   envsubst '$KMS_MAX_UNAVAILABLE' < kms.yaml | kubectl apply -f -
+   : "${KMS_MAX_UNAVAILABLE:?}" && export KMS_MAX_UNAVAILABLE &&
+     envsubst '$KMS_MAX_UNAVAILABLE' < kms.yaml | kubectl apply -f -
    for n in $(seq <number of nodes>); do KMS_NODE=$n envsubst '$KMS_NODE' < kms-service.yaml | kubectl apply -f -; done
    ```
 
