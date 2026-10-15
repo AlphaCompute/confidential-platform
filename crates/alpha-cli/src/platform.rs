@@ -31,13 +31,19 @@ pub fn state_file() -> Result<PathBuf, String> {
 
 /// Refuses a version below the remembered one, or the remembered version with another digest;
 /// remembers a higher one.
-// ponytail: two concurrent runs read and write without a lock, so the later write wins even
-// when it is the lower version. Take a file lock when runs are scripted in parallel.
 pub fn remember(path: &Path, url: &str, document: &Value, version: u64) -> Result<(), String> {
     let digest = alpha_core::jcs(document)
         .map(|bytes| hex::encode(Sha256::digest(bytes)))
         .map_err(|e| format!("platform document: {e}"))?;
     let failed = |p: &Path, e: &dyn std::fmt::Display| format!("{}: {e}", p.display());
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).map_err(|e| failed(dir, &e))?;
+    }
+    // Held from the read to the rename: two runs that both read version 4 would otherwise let
+    // the one writing 5 overwrite the other's 6, and version 5 would pass again.
+    let lock_path = path.with_extension("lock");
+    let lock = fs::File::create(&lock_path).map_err(|e| failed(&lock_path, &e))?;
+    lock.lock().map_err(|e| failed(&lock_path, &e))?;
     let mut state: BTreeMap<String, Accepted> = match fs::read(path) {
         Ok(text) => serde_json::from_slice(&text).map_err(|e| failed(path, &e))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
@@ -71,9 +77,6 @@ pub fn remember(path: &Path, url: &str, document: &Value, version: u64) -> Resul
         },
     );
     let text = serde_json::to_vec_pretty(&state).map_err(|e| e.to_string())?;
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir).map_err(|e| failed(dir, &e))?;
-    }
     let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
     fs::write(&tmp, text).map_err(|e| failed(&tmp, &e))?;
     fs::rename(&tmp, path).map_err(|e| failed(path, &e))
