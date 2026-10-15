@@ -15,6 +15,8 @@ Flags or environment, nothing else:
 | `--pccs-url` | `ALPHACOMPUTE_PCCS_URL` | `unseal`, `bootstrap`, `verify --kms-node`; default Intel's PCS, `https://api.trustedservices.intel.com` |
 | `--shroud-url`, `--shroud-api-key` | `ALPHACOMPUTE_SHROUD_URL`, `ALPHACOMPUTE_SHROUD_API_KEY` | `deploy` without `--register-only`, `instances`, `request`; the key goes to shroud-go only, never to the KMS |
 
+Every fetched platform document must also be no older than the last one this machine accepted from the same URL: `alpha` keeps the highest accepted `version` and the SHA-256 of the JCS of its `document` per URL in `$XDG_STATE_HOME/alphacompute/platform-documents.json` (`~/.local/state/alphacompute/…` without `XDG_STATE_HOME`). A lower version, or the same version with another digest, is refused even when release-signed; to accept a deliberate rollback, delete that file.
+
 The passphrase of a key file is prompted on the terminal, or read as one line from stdin when stdin is a pipe.
 
 ## Commands

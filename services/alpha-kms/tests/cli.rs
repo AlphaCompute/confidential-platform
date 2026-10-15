@@ -377,9 +377,10 @@ async fn sign_and_check_feed_the_node_and_the_admin_pin() {
     h.release.set(document);
     platform::reload(&h.node).await.unwrap();
     assert_eq!(h.node.platform_document().unwrap().version, 2);
-    let served = alpha_client::platform::fetch(&h.release.url, &keys, h.now())
+    let signed = alpha_client::platform::fetch_signed(&h.release.url)
         .await
         .unwrap();
+    let served = alpha_client::platform::verify(&signed, &keys, h.now()).unwrap();
     let client = pinned(&h, Pin::Ca(tls::cert_from_pem(&served.kms_ca_pem).unwrap()));
     assert!(client.ready().await.is_ok());
 }
