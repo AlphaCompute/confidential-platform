@@ -43,6 +43,7 @@ jobs:
   #   STAND_PLATFORM_DOCUMENT_URL  the stand's platform document; unset skips this job
   #   STAND_KMS_ENDPOINTS          the KMS nodes, whitespace-separated https URLs
   #   STAND_APP_ENDPOINTS          one `<app id> <url>` per line
+  #   STAND_PCCS_URL               the PCCS the KMS fetches collateral from; unset skips it
   owned:
     if: vars.STAND_PLATFORM_DOCUMENT_URL != ''
     runs-on: ubuntu-latest
@@ -64,11 +65,18 @@ jobs:
           ALPHACOMPUTE_PLATFORM_DOCUMENT_URL: ${{ vars.STAND_PLATFORM_DOCUMENT_URL }}
           KMS: ${{ vars.STAND_KMS_ENDPOINTS }}
           APPS: ${{ vars.STAND_APP_ENDPOINTS }}
+          PCCS: ${{ vars.STAND_PCCS_URL }}
         run: |
           alpha=target/release/alpha
           # $1 prefixes each finding: only the last attempt's are errors.
           check() {
             down=0
+            # Appraisal needs the TDX QE identity, and unlike the TCB info it is not per platform.
+            if [ -n "$PCCS" ] && { ! out=$(curl -sS -m 30 -o /dev/null -w '%{http_code} %{size_download}' \
+              "${PCCS%/}/tdx/certification/v4/qe/identity" 2>&1) || [[ $out != "200 "[1-9]* ]]; }; then
+              echo "$1$PCCS: no TDX QE identity (status, bytes): ${out//$'\n'/ }"
+              down=1
+            fi
             for url in $KMS; do
               out=$($alpha verify --kms-node "$url" 2>&1) || { echo "$1$url: $out"; down=1; }
             done
