@@ -1,0 +1,75 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: g3
+spec:
+  runtimeClassName: kata-qemu-nvidia-gpu-tdx
+  terminationGracePeriodSeconds: 5
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  securityContext:
+    supplementalGroups: [1, 2, 3, 4, 6, 10, 11, 20, 26, 27]
+  containers:
+  - name: capture
+    image: public.ecr.aws/docker/library/python@sha256:70729b46c69b4f1e97c4822c1af3df53a1476cf5ddc6c087c0c10bc3a5678c2f
+    command:
+    - python3
+    - -c
+    - |
+      import base64, ctypes, functools, hashlib, http.server, os, traceback
+      try:
+          first = base64.b64decode(os.environ["REPORT_DATA"])
+          nonce = hashlib.sha256(b"alphacompute-gpu/1" + first).digest()
+          class Report(ctypes.Structure):
+              _fields_ = [("present", ctypes.c_uint), ("size", ctypes.c_uint), ("cec_size", ctypes.c_uint), ("nonce", ctypes.c_ubyte * 0x20), ("report", ctypes.c_ubyte * 0x2000), ("cec", ctypes.c_ubyte * 0x1000)]
+          class Certificate(ctypes.Structure):
+              _fields_ = [("size", ctypes.c_uint), ("attestation_size", ctypes.c_uint), ("chain", ctypes.c_ubyte * 0x1000), ("attestation", ctypes.c_ubyte * 0x1400)]
+          nvml = ctypes.CDLL("libnvidia-ml.so.1")
+          def call(name, *args):
+              status = getattr(nvml, name)(*args)
+              if status:
+                  raise RuntimeError(f"{name}: NVML error {status}")
+          call("nvmlInit_v2")
+          count = ctypes.c_uint()
+          call("nvmlDeviceGetCount_v2", ctypes.byref(count))
+          if count.value != 1:
+              raise RuntimeError(f"NVML sees {count.value} GPUs, the pod has 1")
+          device = ctypes.c_void_p()
+          call("nvmlDeviceGetHandleByIndex_v2", 0, ctypes.byref(device))
+          report = Report(nonce=(ctypes.c_ubyte * 0x20)(*nonce))
+          call("nvmlDeviceGetConfComputeGpuAttestationReport", device, ctypes.byref(report))
+          certificate = Certificate()
+          call("nvmlDeviceGetConfComputeGpuCertificate", device, ctypes.byref(certificate))
+          spdm = bytes(report.report)[:report.size]
+          if len(first) != 32 or spdm[4:36] != nonce:
+              raise RuntimeError("attestation report is not over our nonce")
+          tsm = "/sys/kernel/config/tsm/report/g3"
+          os.mkdir(tsm)
+          with open(f"{tsm}/inblob", "wb") as f:
+              f.write(first + hashlib.sha256(len(spdm).to_bytes(8, "big") + spdm).digest())
+          with open(f"{tsm}/outblob", "rb") as f:
+              quote = f.read()
+          for name, data in [("g3.spdm.bin", spdm), ("g3.certchain.pem", bytes(certificate.attestation)[:certificate.attestation_size]), ("g3-app.quote.bin", quote)]:
+              with open(f"/out/{name}", "wb") as f:
+                  f.write(data)
+      except Exception:
+          with open("/out/error.txt", "w") as f:
+              f.write(traceback.format_exc())
+      http.server.ThreadingHTTPServer(("", 8080), functools.partial(http.server.SimpleHTTPRequestHandler, directory="/out")).serve_forever()
+    env:
+    - {name: MODE, value: gpu}
+    - {name: REPORT_DATA, value: ADxW5L7yLR9fNpcZTITHFNTWDNesTMUmMkp9LEnYFp0=}
+    resources:
+      limits: {nvidia.com/pgpu: 1}
+    securityContext:
+      runAsUser: 0
+      allowPrivilegeEscalation: false
+      capabilities: {drop: [ALL]}
+      readOnlyRootFilesystem: true
+    volumeMounts:
+    - {name: tsm, mountPath: /sys/kernel/config}
+    - {name: out, mountPath: /out}
+  volumes:
+  - name: tsm
+    hostPath: {path: /sys/kernel/config, type: Directory}
+  - {name: out, emptyDir: {medium: Memory}}
