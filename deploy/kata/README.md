@@ -283,8 +283,8 @@ Build and push it to the repository `MODEL_REPOSITORY` names (`registry/path`), 
 `MODEL_IMAGE` to its digest:
 
 ```sh
-docker build -t "$MODEL_REPOSITORY" . && docker push "$MODEL_REPOSITORY"
-export MODEL_IMAGE=$(docker inspect --format '{{index .RepoDigests 0}}' "$MODEL_REPOSITORY")
+docker build -t "$MODEL_REPOSITORY" . && docker push "$MODEL_REPOSITORY" &&
+  export MODEL_IMAGE=$(docker inspect --format '{{index .RepoDigests 0}}' "$MODEL_REPOSITORY")
 ```
 
 ### Render, register, set Secrets
@@ -352,8 +352,7 @@ The Secret `database-url` carries that password; the broker applies its migratio
 ```sh
 printf 'postgres://alpha_broker:%s@postgres.alpha-trust-db.svc:5432/alpha_broker?sslmode=require&channel_binding=require&require_auth=scram-sha-256' \
   "$(cat broker-db-password)" > database-url
-put_secret database-url "$BROKER_APP_ID"
-rm broker-db-password database-url
+put_secret database-url "$BROKER_APP_ID" && rm broker-db-password database-url
 ```
 
 ### Apply
