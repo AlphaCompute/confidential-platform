@@ -34,6 +34,7 @@ The bucket and its credentials are the operator's. Before applying `trust-db.yam
 openssl rand -hex 32 | tr -d '\n' > backup-key
 kubectl -n alpha-trust-db create secret generic postgres-backup \
   --from-file=WALG_LIBSODIUM_KEY=backup-key \
+  --from-literal=WALG_LIBSODIUM_KEY_TRANSFORM=hex \
   --from-literal=WALG_S3_PREFIX=s3://<bucket>/<path> \
   --from-literal=AWS_REGION=<region> \
   --from-literal=AWS_ACCESS_KEY_ID=<access key id> \

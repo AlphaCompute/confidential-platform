@@ -87,7 +87,6 @@ spec:
         - name: POSTGRES_PASSWORD
           valueFrom:
             secretKeyRef: {name: postgres, key: password}
-        - {name: WALG_LIBSODIUM_KEY_TRANSFORM, value: hex}
         envFrom:
         - {secretRef: {name: postgres-backup}}
         ports:
@@ -170,7 +169,6 @@ spec:
             - name: PGPASSWORD
               valueFrom:
                 secretKeyRef: {name: postgres, key: password}
-            - {name: WALG_LIBSODIUM_KEY_TRANSFORM, value: hex}
             envFrom:
             - {secretRef: {name: postgres-backup}}
             volumeMounts:

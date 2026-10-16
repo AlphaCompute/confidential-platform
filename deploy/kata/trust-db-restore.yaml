@@ -61,7 +61,6 @@ spec:
           touch "$PGDATA/recovery.signal"
         env:
         - {name: BACKUP, value: "${TRUST_DB_BACKUP}"}
-        - {name: WALG_LIBSODIUM_KEY_TRANSFORM, value: hex}
         envFrom:
         - {secretRef: {name: postgres-backup}}
         volumeMounts:
