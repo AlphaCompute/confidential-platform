@@ -199,6 +199,38 @@ lists. `model-server.yaml` is one vLLM model on one GPU of `kata-qemu-nvidia-gpu
 runs `alpha-runtime` beside its service. The three services read their leaf and Secrets from its
 socket and terminate their own TLS on 8443. Each template is its App's Revision once rendered: a new value of any input below is a new Revision.
 
+On B300 the GPU class needs two drop-ins in the `qemu-nvidia-gpu-tdx` shim's
+`/opt/kata/share/defaults/kata-containers/runtimes/qemu-nvidia-gpu-tdx/config.d/`, both loaded
+after kata-deploy's `50-user-overrides.toml`. Each moves the class's reference values.
+
+- `60-guest-driver-595.91.07.toml` boots a guest rebuilt from Kata 4.0.0 with NVIDIA 595.91.07
+  instead of the 595.58.03 it ships: the guest driver must be the version of the host's
+  `nv-fabricmanager`, 595.91.07.
+
+  ```toml
+  [hypervisor.qemu]
+  kernel = "/opt/kata/share/kata-containers/vmlinuz-6.18.35-200-nvidia-gpu-595.91.07"
+  image = "/opt/kata/share/kata-containers/kata-ubuntu-noble-nvidia-gpu-confidential-595.91.07.image"
+  kernel_verity_params = "root_hash=9ba122583c10330cfcb9a1de735da913a5f4a40fc9672fcad62f6291c4fad773,salt=6626d68de4dc10001d3b66d8e64a50f704b677b398ecd49d6cc487237f59e2f1,data_blocks=135680,data_block_size=4096,hash_block_size=4096"
+  ```
+
+  | `/opt/kata/share/kata-containers/` | SHA-256 |
+  |---|---|
+  | `vmlinuz-6.18.35-200-nvidia-gpu-595.91.07` | `44d7cdd903e6999ce47415fd6756d2ebe8ce2425422d7dd55d5a5147dacef0d5` |
+  | `kata-ubuntu-noble-nvidia-gpu-confidential-595.91.07.image` | `fe709f1e4f71790dd4bd632c8ed2c6fb19cacb5e7fae004687b1fc46808e3d51` |
+
+- `70-visible-cdi-devices.toml`: the runtime container claims no GPU, so without this it sees no
+  `/dev/nvidia*`, sends no GPU evidence, and the KMS refuses it. It adds
+  `agent.visible_cdi_devices=true` to the guest command line, so it is part of RTMR2.
+
+  ```toml
+  [agent.kata]
+  visible_cdi_devices = true
+  ```
+
+A restart of kata-deploy keeps both files and the guest; `helm uninstall` of kata-deploy deletes
+them with the rest of `/opt/kata`.
+
 ### Inputs
 
 Each, and each service's App id, is the operator's, chosen per environment; none has a default.
