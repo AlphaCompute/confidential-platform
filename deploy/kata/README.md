@@ -89,6 +89,10 @@ export ALPHACOMPUTE_PCCS_URL=$(gh variable get KMS_KATA_PCCS_URL -R AlphaCompute
 2. **Postgres.** The owner password stays with the operator. The server certificate is
    self-signed ECDSA (an Ed25519 certificate has no hash for channel binding). The nodes do not
    verify it, but bind their SCRAM login to the TLS connection, so a relay in between fails.
+   Postgres archives its WAL and a CronJob takes a daily base backup with `wal-g`, encrypted under
+   a key that also stays with the operator: [`../backup.md`](../backup.md). The bucket is the
+   operator's: `WALG_S3_PREFIX` is `s3://bucket/path`, `AWS_REGION` and `AWS_ACCESS_KEY_ID` its
+   region and access key id, and the file `aws-secret-access-key` holds the secret access key.
 
    ```sh
    umask 077   # the password files and tls.key; keep this shell for step 4
@@ -98,6 +102,15 @@ export ALPHACOMPUTE_PCCS_URL=$(gh variable get KMS_KATA_PCCS_URL -R AlphaCompute
    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
      -subj /CN=postgres.alpha-trust-db.svc -keyout tls.key -out tls.crt
    kubectl -n alpha-trust-db create secret tls postgres-tls --cert tls.crt --key tls.key
+   : "${WALG_S3_PREFIX:?}" "${AWS_REGION:?}" "${AWS_ACCESS_KEY_ID:?}" &&
+     openssl rand -hex 32 | tr -d '\n' > backup-key &&
+     kubectl -n alpha-trust-db create secret generic postgres-backup \
+       --from-file=WALG_LIBSODIUM_KEY=backup-key \
+       --from-literal=WALG_LIBSODIUM_KEY_TRANSFORM=hex \
+       --from-literal=WALG_S3_PREFIX="$WALG_S3_PREFIX" \
+       --from-literal=AWS_REGION="$AWS_REGION" \
+       --from-literal=AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
+       --from-file=AWS_SECRET_ACCESS_KEY=aws-secret-access-key
    : "${TRUST_DB_STORAGE_CLASS:?}" "${TRUST_DB_STORAGE_SIZE:?}" &&
      export TRUST_DB_STORAGE_CLASS TRUST_DB_STORAGE_SIZE &&
      envsubst '$TRUST_DB_STORAGE_CLASS $TRUST_DB_STORAGE_SIZE' < trust-db.yaml | kubectl apply -f -
@@ -197,14 +210,15 @@ through the nodes' API and the database.
   `alpha unseal --share share-[1-3].json --key custodian.key --endpoint https://localhost:8443`.
   The root gives the node its database password. `kms-1` then joins
   it; if it was already running sealed, delete its pod.
+- **Postgres lost.** Restore it from its backup as in [`../backup.md`](../backup.md#restore).
 
 ## What the operator never sees
 
 The root KEK, the shares in the clear (bootstrap writes each sealed to its custodian's key), the
 two intermediates (`tenant-kek-root`, the CA key), the derived database password, tenant secrets.
-The operator does hold the Postgres owner password, the server key and the volume: ciphertext,
-metadata and the audit log, which the owner can rewrite or roll back. The genesis password is
-dead at the genesis commit.
+The operator does hold the Postgres owner password, the server key, the volume and the backup
+key: ciphertext, metadata and the audit log, which the owner can rewrite or roll back. The
+genesis password is dead at the genesis commit.
 
 ## Platform services
 

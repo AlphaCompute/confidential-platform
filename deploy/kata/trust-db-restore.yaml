@@ -1,0 +1,72 @@
+# A new trust-db volume filled from a base backup, for the StatefulSet's pod to recover from: with
+# recovery.signal, Postgres replays the archived WAL to its end and then serves.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: data-postgres-0
+  namespace: alpha-trust-db
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ${TRUST_DB_STORAGE_CLASS}
+  resources:
+    requests:
+      storage: ${TRUST_DB_STORAGE_SIZE}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: postgres-restore
+  namespace: alpha-trust-db
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      nodeSelector:
+        alphacompute.io/pool: trust-db
+      tolerations:
+      - {key: alphacompute.io/pool, operator: Equal, value: trust-db, effect: NoSchedule}
+      securityContext:
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+      initContainers:
+      - name: wal-g
+        image: curlimages/curl:8.23.0@sha256:a134550be58ab783810e613ae96fd253c38f7bdd16d9bf9be350700c7a29ac06
+        command:
+        - sh
+        - -ec
+        - |
+          curl -fsSLo /wal-g/wal-g https://github.com/wal-g/wal-g/releases/download/v3.0.9/wal-g-pg-24.04-amd64
+          echo '8015836f246a978f27b31a2462eac7765312558ae5b11ac033322b555abf9e22  /wal-g/wal-g' | sha256sum -c
+          chmod 755 /wal-g/wal-g
+        volumeMounts:
+        - {name: wal-g, mountPath: /wal-g}
+      containers:
+      - name: restore
+        image: postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+        command:
+        - bash
+        - -ec
+        - |
+          if [ -e "$PGDATA" ]; then
+            echo "$PGDATA exists: restore only into an empty volume" >&2
+            exit 1
+          fi
+          mkdir -p "$PGDATA"
+          chmod 700 "$PGDATA"
+          /wal-g/wal-g backup-fetch "$PGDATA" "$BACKUP"
+          touch "$PGDATA/recovery.signal"
+        env:
+        - {name: BACKUP, value: "${TRUST_DB_BACKUP}"}
+        envFrom:
+        - {secretRef: {name: postgres-backup}}
+        volumeMounts:
+        - {name: data, mountPath: /var/lib/postgresql}
+        - {name: wal-g, mountPath: /wal-g, readOnly: true}
+      volumes:
+      - {name: wal-g, emptyDir: {}}
+      - name: data
+        persistentVolumeClaim: {claimName: data-postgres-0}

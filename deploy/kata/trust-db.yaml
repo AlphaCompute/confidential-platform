@@ -7,9 +7,11 @@ metadata:
   namespace: alpha-trust-db
 data:
   # Over the network only TLS with SCRAM; the socket is reachable only through `kubectl exec`.
+  # The base backup streams over a replication connection.
   pg_hba.conf: |
     local all postgres trust
     hostssl all all all scram-sha-256
+    hostssl replication postgres all scram-sha-256
 ---
 apiVersion: v1
 kind: Service
@@ -47,10 +49,31 @@ spec:
       securityContext:
         # The image's postgres group: Postgres accepts a root-owned key only as 0640 with its group.
         fsGroup: 999
+      initContainers:
+      - name: wal-g
+        image: curlimages/curl:8.23.0@sha256:a134550be58ab783810e613ae96fd253c38f7bdd16d9bf9be350700c7a29ac06
+        command:
+        - sh
+        - -ec
+        - |
+          curl -fsSLo /wal-g/wal-g https://github.com/wal-g/wal-g/releases/download/v3.0.9/wal-g-pg-24.04-amd64
+          echo '8015836f246a978f27b31a2462eac7765312558ae5b11ac033322b555abf9e22  /wal-g/wal-g' | sha256sum -c
+          chmod 755 /wal-g/wal-g
+        volumeMounts:
+        - {name: wal-g, mountPath: /wal-g}
       containers:
       - name: postgres
         image: postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
         args:
+        - -c
+        - archive_mode=on
+        - -c
+        - archive_command=/wal-g/wal-g wal-push %p
+        - -c
+        - archive_timeout=60
+        # Read only while a restored volume's recovery.signal is present.
+        - -c
+        - restore_command=/wal-g/wal-g wal-fetch %f %p
         - -c
         - ssl=on
         - -c
@@ -64,6 +87,8 @@ spec:
         - name: POSTGRES_PASSWORD
           valueFrom:
             secretKeyRef: {name: postgres, key: password}
+        envFrom:
+        - {secretRef: {name: postgres-backup}}
         ports:
         - {name: postgres, containerPort: 5432}
         # Over TCP: the image's first-start server listens only on the socket, so the probe and
@@ -75,7 +100,9 @@ spec:
         - {name: data, mountPath: /var/lib/postgresql}
         - {name: tls, mountPath: /tls, readOnly: true}
         - {name: hba, mountPath: /hba, readOnly: true}
+        - {name: wal-g, mountPath: /wal-g, readOnly: true}
       volumes:
+      - {name: wal-g, emptyDir: {}}
       - name: tls
         secret: {secretName: postgres-tls, defaultMode: 0640}
       - name: hba
@@ -89,3 +116,62 @@ spec:
       resources:
         requests:
           storage: ${TRUST_DB_STORAGE_SIZE}
+---
+# The roles land in one object per day of the month, so they roll over with the backups.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup
+  namespace: alpha-trust-db
+spec:
+  schedule: "0 3 * * *"
+  timeZone: Etc/UTC
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          enableServiceLinks: false
+          nodeSelector:
+            alphacompute.io/pool: trust-db
+          tolerations:
+          - {key: alphacompute.io/pool, operator: Equal, value: trust-db, effect: NoSchedule}
+          initContainers:
+          - name: wal-g
+            image: curlimages/curl:8.23.0@sha256:a134550be58ab783810e613ae96fd253c38f7bdd16d9bf9be350700c7a29ac06
+            command:
+            - sh
+            - -ec
+            - |
+              curl -fsSLo /wal-g/wal-g https://github.com/wal-g/wal-g/releases/download/v3.0.9/wal-g-pg-24.04-amd64
+              echo '8015836f246a978f27b31a2462eac7765312558ae5b11ac033322b555abf9e22  /wal-g/wal-g' | sha256sum -c
+              chmod 755 /wal-g/wal-g
+            volumeMounts:
+            - {name: wal-g, mountPath: /wal-g}
+          containers:
+          - name: backup
+            image: postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+            command:
+            - bash
+            - -ec
+            - |
+              set -o pipefail
+              /wal-g/wal-g backup-push
+              pg_dumpall --globals-only | /wal-g/wal-g st put -f --read-stdin "globals/$(date -u +%d).sql"
+              /wal-g/wal-g delete retain FULL 30 --confirm
+            env:
+            - {name: PGHOST, value: postgres}
+            - {name: PGUSER, value: postgres}
+            - {name: PGSSLMODE, value: require}
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef: {name: postgres, key: password}
+            envFrom:
+            - {secretRef: {name: postgres-backup}}
+            volumeMounts:
+            - {name: wal-g, mountPath: /wal-g, readOnly: true}
+          volumes:
+          - {name: wal-g, emptyDir: {}}
