@@ -93,6 +93,13 @@ jobs:
         env:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
 
+  trust-db-backup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: deploy/postgres/backup-drill.sh
+
   signer:
     runs-on: ubuntu-latest
     permissions:

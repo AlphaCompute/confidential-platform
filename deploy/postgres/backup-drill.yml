@@ -1,0 +1,118 @@
+# The trust-db's backup and restore from ../kata/trust-db.yaml and ../kata/trust-db-restore.yaml
+# against a local S3, driven by backup-drill.sh. The commands are the manifests'; change them
+# together.
+x-wal-g-env: &wal-g-env
+  WALG_S3_PREFIX: s3://trust-db/drill
+  AWS_ENDPOINT: http://s3:9000
+  AWS_S3_FORCE_PATH_STYLE: "true"
+  AWS_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: drill
+  AWS_SECRET_ACCESS_KEY: drill-secret
+  WALG_LIBSODIUM_KEY: ${WALG_LIBSODIUM_KEY:?}
+  WALG_LIBSODIUM_KEY_TRANSFORM: hex
+
+services:
+  s3:
+    image: cgr.dev/chainguard/minio@sha256:2136d593beacf4461187035eca949fe49abd589d5079735025c711ca58fee0c8
+    command: [server, /tmp/data]
+    environment:
+      MINIO_ROOT_USER: drill
+      MINIO_ROOT_PASSWORD: drill-secret
+
+  bucket:
+    image: curlimages/curl:8.23.0@sha256:a134550be58ab783810e613ae96fd253c38f7bdd16d9bf9be350700c7a29ac06
+    depends_on: [s3]
+    command:
+      - sh
+      - -c
+      - until curl -fsS --aws-sigv4 aws:amz:us-east-1:s3 -u drill:drill-secret -X PUT http://s3:9000/trust-db; do sleep 1; done
+
+  wal-g:
+    image: curlimages/curl:8.23.0@sha256:a134550be58ab783810e613ae96fd253c38f7bdd16d9bf9be350700c7a29ac06
+    user: root
+    volumes: [wal-g:/wal-g]
+    command:
+      - sh
+      - -ec
+      - |
+        curl -fsSLo /wal-g/wal-g https://github.com/wal-g/wal-g/releases/download/v3.0.9/wal-g-pg-24.04-amd64
+        echo '8015836f246a978f27b31a2462eac7765312558ae5b11ac033322b555abf9e22  /wal-g/wal-g' | sha256sum -c
+        chmod 755 /wal-g/wal-g
+
+  postgres:
+    image: postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+    platform: linux/amd64
+    depends_on:
+      wal-g: {condition: service_completed_successfully}
+      bucket: {condition: service_completed_successfully}
+    ports: ["127.0.0.1::5432"]
+    environment:
+      <<: *wal-g-env
+      POSTGRES_DB: alpha
+      POSTGRES_PASSWORD: drill
+    volumes: [pgdata:/var/lib/postgresql, wal-g:/wal-g:ro]
+    healthcheck:
+      test: [CMD, pg_isready, -h, 127.0.0.1, -U, postgres, -d, alpha]
+      interval: 2s
+      retries: 60
+    # The certificate and pg_hba.conf stay outside the volume, which the drill wipes.
+    entrypoint:
+      - bash
+      - -ec
+      - |
+        mkdir -p /etc/drill
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 -subj /CN=postgres \
+          -keyout /etc/drill/tls.key -out /etc/drill/tls.crt 2>/dev/null
+        printf '%s\n' 'local all postgres trust' 'hostssl all all all scram-sha-256' \
+          'hostssl replication postgres all scram-sha-256' > /etc/drill/pg_hba.conf
+        chown -R postgres /etc/drill
+        chmod 600 /etc/drill/tls.key
+        exec docker-entrypoint.sh postgres -c archive_mode=on -c 'archive_command=/wal-g/wal-g wal-push %p' \
+          -c archive_timeout=60 -c 'restore_command=/wal-g/wal-g wal-fetch %f %p' -c ssl=on \
+          -c ssl_cert_file=/etc/drill/tls.crt -c ssl_key_file=/etc/drill/tls.key -c hba_file=/etc/drill/pg_hba.conf
+
+  backup:
+    image: postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+    platform: linux/amd64
+    profiles: [run]
+    environment:
+      <<: *wal-g-env
+      PGHOST: postgres
+      PGUSER: postgres
+      PGSSLMODE: require
+      PGPASSWORD: drill
+    volumes: [wal-g:/wal-g:ro]
+    entrypoint:
+      - bash
+      - -ec
+      - |
+        set -o pipefail
+        /wal-g/wal-g backup-push
+        pg_dumpall --globals-only | /wal-g/wal-g st put -f --read-stdin "globals/$$(date -u +%d).sql"
+        /wal-g/wal-g delete retain FULL 30 --confirm
+
+  restore:
+    image: postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
+    platform: linux/amd64
+    profiles: [run]
+    user: "999:999"
+    environment:
+      <<: *wal-g-env
+      BACKUP: LATEST
+    volumes: [pgdata:/var/lib/postgresql, wal-g:/wal-g:ro]
+    entrypoint:
+      - bash
+      - -ec
+      - |
+        if [ -e "$$PGDATA" ]; then
+          echo "$$PGDATA exists: restore only into an empty volume" >&2
+          exit 1
+        fi
+        mkdir -p "$$PGDATA"
+        chmod 700 "$$PGDATA"
+        /wal-g/wal-g backup-fetch "$$PGDATA" "$$BACKUP"
+        touch "$$PGDATA/recovery.signal"
+
+volumes:
+  pgdata:
+  wal-g:
