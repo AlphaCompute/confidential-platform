@@ -95,9 +95,7 @@ exist before the first tenant.
 
 ## Drills
 
-- **Locally**, `deploy/postgres/backup-drill.sh` runs the same commands against a local S3: a base
-  backup, rows that reach the restore only through archived WAL, a wipe and a restore, then the
-  same `pg_dumpall` as before the wipe, a passing `alpha-kms migrate`, and a roles object that
-  opens under the backup key and not under another. It needs docker and cargo, and CI runs it.
+- **Locally**, `deploy/postgres/backup-drill.sh` backs up to a local S3 with the same commands,
+  wipes, restores and checks the result. It needs docker and cargo, and CI runs it.
 - **On staging, before the first production tenant**: Restore above, end to end, with both KMS
   nodes deleted, so the unseal runs too. Record the times and every step that needed a change.
