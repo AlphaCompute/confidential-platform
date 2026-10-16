@@ -284,7 +284,8 @@ Build and push it to the repository `MODEL_REPOSITORY` names (`registry/path`), 
 
 ```sh
 docker build -t "$MODEL_REPOSITORY" . && docker push "$MODEL_REPOSITORY" &&
-  export MODEL_IMAGE=$(docker inspect --format '{{index .RepoDigests 0}}' "$MODEL_REPOSITORY")
+  MODEL_IMAGE=$(docker inspect --format '{{index .RepoDigests 0}}' "$MODEL_REPOSITORY") &&
+  export MODEL_IMAGE
 ```
 
 ### Render, register, set Secrets
