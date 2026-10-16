@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 
 use alpha_attest::{
     GpuEvidence, GpuReference, KataGpus, KataReference, PlatformDocument, appraise_gpus,
-    appraise_kata_gpus, bind_gpus, verify_quote,
+    appraise_kata_gpus, bind_gpus, gpu_reference, verify_quote,
 };
 
 fn testdata(path: &str) -> Vec<u8> {
@@ -391,5 +391,51 @@ fn insecure_tcb_flags_and_unknown_critical_extensions_are_refused() {
         let err = appraise(evidence).unwrap_err();
         assert_eq!(err.code(), "attestation_failed", "{case}: {err}");
         assert!(err.to_string().contains(fragment), "{case}: {err}");
+    }
+}
+
+#[test]
+fn reference_values_come_from_the_signed_rims() {
+    let read = |name: &str| testdata(&format!("b300-gpu-595.91.07/{name}"));
+    let evidence = GpuEvidence {
+        evidence: read("spdm.bin"),
+        certificate_chain: read("certchain.pem"),
+    };
+    let driver = read("NV_GPU_CC_DRIVER_GB110_595.91.07.xml");
+    let vbios = read("NV_GPU_VBIOS_G540_0216_887_97107E0003.xml");
+    // 2026-10-16, the day of the capture.
+    let now = UNIX_EPOCH + Duration::from_secs(1_792_108_800);
+    let expected: GpuReference = serde_json::from_slice(&read("gpu-reference.json")).unwrap();
+    assert_eq!(
+        gpu_reference(&evidence, &driver, &vbios, now).unwrap(),
+        expected
+    );
+
+    let altered = |rim: &[u8], from: &str, to: &str| {
+        let text = String::from_utf8(rim.to_vec()).unwrap();
+        assert!(text.contains(from), "{from}");
+        text.replacen(from, to, 1).into_bytes()
+    };
+    let value = "ns2:Hash0=\"013c2f";
+    let signature = "<ds:SignatureValue>";
+    for (driver, vbios, fragment) in [
+        (
+            driver.clone(),
+            altered(&vbios, value, "ns2:Hash0=\"113c2f"),
+            "vbios RIM: digest does not match",
+        ),
+        (
+            altered(&driver, signature, "<ds:SignatureValue>A"),
+            vbios.clone(),
+            "driver RIM: SignatureValue",
+        ),
+        (
+            vbios.clone(),
+            driver.clone(),
+            "driver RIM is for GB110 97.10.7E.00.03",
+        ),
+    ] {
+        let err = gpu_reference(&evidence, &driver, &vbios, now).unwrap_err();
+        assert!(err.to_string().contains(fragment), "{err}");
     }
 }

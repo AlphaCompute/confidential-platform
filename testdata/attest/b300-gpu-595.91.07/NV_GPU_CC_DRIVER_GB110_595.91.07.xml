@@ -1,0 +1,125 @@
+<SoftwareIdentity xmlns="http://standards.iso.org/iso/19770/-2/2015/schema.xsd" xmlns:ns0="http://standards.iso.org/iso/19770/-2/2015/schema.xsd" xmlns:ns2="http://www.w3.org/2001/04/xmlenc#sha384" corpus="false" name="GB110" patch="false" supplemental="false" tagId="9e0e6049a49ad3a67cc9f22ed5ea25aff0c9944e2e986bf46fafd5e03f9c1dcd923de000d5426ec34c70dc78e075025f" version="1.0" tagVersion="0">
+    <ns0:Entity name="NVIDIA Corporation" role="softwareCreator tagCreator"/>
+    <ns0:Meta xmlns:ns1="https://trustedcomputinggroup.org/resource/tcg-reference-integrity-manifest-rim-information-model/" colloquialVersion="595.91.07" edition="GPU" product="GB110" revision="r1" PayloadType="direct" ns1:BindingSpec="RIMIM" ns1:BindingSpecVersion="1.01" ns1:PlatformManufacturerId="5703" ns1:PlatformManufacturerStr="NVIDIA Corporation" ns1:PlatformModel="GB110" ns1:FirmwareManufacturer="NVIDIA Corporation" ns1:FirmwareManufacturerId="5703"/>
+    <ns0:Payload xmlns:SHA384="http://www.w3.org/2001/04/xmlenc#sha384">
+        <ns0:Resource type="Measurement" index="0" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_0" size="48"/>
+        <ns0:Resource type="Measurement" index="1" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_1" size="48"/>
+        <ns0:Resource type="Measurement" index="2" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_2" size="48"/>
+        <ns0:Resource type="Measurement" index="3" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_3" size="48"/>
+        <ns0:Resource type="Measurement" index="4" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_4" size="48"/>
+        <ns0:Resource type="Measurement" index="5" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_5" size="48"/>
+        <ns0:Resource type="Measurement" index="6" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_6" size="48"/>
+        <ns0:Resource type="Measurement" index="7" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_7" size="48"/>
+        <ns0:Resource type="Measurement" index="8" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_8" size="48"/>
+        <ns0:Resource type="Measurement" index="9" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_9" size="48"/>
+        <ns0:Resource type="Measurement" index="10" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_10" size="48"/>
+        <ns0:Resource type="Measurement" index="11" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_11" size="48"/>
+        <ns0:Resource type="Measurement" index="12" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_12" size="48"/>
+        <ns0:Resource type="Measurement" index="13" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_13" size="48"/>
+        <ns0:Resource type="Measurement" index="14" active="True" alternatives="1" ns2:Hash0="120c34de7006f5c451a4d8e4849de75afbc7d43d343a71d77a7b2f3190fca9bfe43da28d6cf73b6ee2260e212f48b65c" name="Measurement_14" size="48"/>
+        <ns0:Resource type="Measurement" index="15" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_15" size="48"/>
+        <ns0:Resource type="Measurement" index="16" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_16" size="48"/>
+        <ns0:Resource type="Measurement" index="17" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_17" size="48"/>
+        <ns0:Resource type="Measurement" index="18" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_18" size="48"/>
+        <ns0:Resource type="Measurement" index="19" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_19" size="48"/>
+        <ns0:Resource type="Measurement" index="20" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_20" size="48"/>
+        <ns0:Resource type="Measurement" index="21" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_21" size="48"/>
+        <ns0:Resource type="Measurement" index="22" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_22" size="48"/>
+        <ns0:Resource type="Measurement" index="23" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_23" size="48"/>
+        <ns0:Resource type="Measurement" index="24" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_24" size="48"/>
+        <ns0:Resource type="Measurement" index="25" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_25" size="48"/>
+        <ns0:Resource type="Measurement" index="26" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_26" size="48"/>
+        <ns0:Resource type="Measurement" index="27" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_27" size="48"/>
+        <ns0:Resource type="Measurement" index="28" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_28" size="48"/>
+        <ns0:Resource type="Measurement" index="29" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_29" size="48"/>
+        <ns0:Resource type="Measurement" index="30" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_30" size="48"/>
+        <ns0:Resource type="Measurement" index="31" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_31" size="48"/>
+        <ns0:Resource type="Measurement" index="32" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_32" size="48"/>
+        <ns0:Resource type="Measurement" index="33" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_33" size="48"/>
+        <ns0:Resource type="Measurement" index="34" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_34" size="48"/>
+        <ns0:Resource type="Measurement" index="35" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_35" size="48"/>
+        <ns0:Resource type="Measurement" index="36" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_36" size="48"/>
+        <ns0:Resource type="Measurement" index="37" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_37" size="48"/>
+        <ns0:Resource type="Measurement" index="38" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_38" size="48"/>
+        <ns0:Resource type="Measurement" index="39" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_39" size="48"/>
+        <ns0:Resource type="Measurement" index="40" active="True" alternatives="1" ns2:Hash0="1491ea75288f70706b43f91778e5c99d83f3c3584efa999b530dfd717fde222667b5dae9f3c18118643c1c6d85fe8771" name="MixedMeasurement_40" size="48"/>
+        <ns0:Resource type="Measurement" index="41" active="True" alternatives="1" ns2:Hash0="7ce942a7bc280f6d373fe91ae7836e5772d4bd8687adfe9cfd79385be374432fd0dad94a5392e1d5af8a7f29b3a6a31a" name="MixedMeasurement_41" size="48"/>
+        <ns0:Resource type="Measurement" index="42" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_42" size="48"/>
+        <ns0:Resource type="Measurement" index="43" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_43" size="48"/>
+        <ns0:Resource type="Measurement" index="44" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_44" size="48"/>
+        <ns0:Resource type="Measurement" index="45" active="True" alternatives="1" ns2:Hash0="ff5109860b0f8a3f8a0d2db3263a2b299131dfc9b623f296a8d63af1142b08d5f454216c0f0128c8944b753e6392288d" name="MixedMeasurement_45" size="48"/>
+        <ns0:Resource type="Measurement" index="46" active="True" alternatives="1" ns2:Hash0="dbbda0d90289db05d1438a4343dab847e435dd599a633540b960d918b3f7809ca83fe3bc3e3164598ecff79f2b46d4de" name="MixedMeasurement_46" size="48"/>
+        <ns0:Resource type="Measurement" index="47" active="True" alternatives="1" ns2:Hash0="fb4e378a8222faa7866cebb86b9f1bc04f1c56f23248d03a3c41d0b16878a0ab250f7ef413579905064d2f582b2b35ee" name="HashedMeasurement_47_GSP" size="48"/>
+        <ns0:Resource type="Measurement" index="48" active="True" alternatives="1" ns2:Hash0="fccd6efa76267f5b43fc4a7647ce843a3912f0944a9bcc907456408c368ad5e85bec4512d9d9aedebab31c3b80950627" name="HashedMeasurement_48_GSP" size="48"/>
+        <ns0:Resource type="Measurement" index="49" active="True" alternatives="2" ns2:Hash0="55ca72fa24a1ed43d3baf153695dc0ded0201ec9b01410cb7e867fa186fd27b5605391f34461b70149bd744019316c95" ns2:Hash1="91135c35cfe014d3a305181dcfa93d48acac6a07f626356f69cef97f37491d6d43bf34007fb19f2f3efb2bc4d5c0f2a4" name="HashedMeasurement_49_GSP" size="48"/>
+        <ns0:Resource type="Measurement" index="50" active="True" alternatives="1" ns2:Hash0="21c30a63b240816abcc67b255b1abdbb551ac1f6cf4456112d6ff0a867fbe240fcc757f52be82c1666fc601a425abe08" name="HashedMeasurement_50_GSP" size="48"/>
+        <ns0:Resource type="Measurement" index="51" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_51" size="48"/>
+        <ns0:Resource type="Measurement" index="52" active="True" alternatives="4" ns2:Hash0="778fad6cd644d1197cbd719bd18adb0900494cba918fe0d76dfb75ccc7cbc2bce9a6b40fa9645b1eccd72863614a774c" ns2:Hash1="e4318dc28320cc323cc2e9d3bf5df33583d014d4b369a2ea08da230f366d0fba24ca99ffd6d4c0c3574682d1cb41a0b6" ns2:Hash2="9306d7bf5c6b13dfe626c487529ae6b65735401b927edfd7082d880dfcf5cb93c284c1d0ff49643ebcaa59d63ec9cd40" ns2:Hash3="894d796c5060df7a79bc845edade5a757683d8500e636baea737afe1caf8467d1b9bfce32eef5531446c7bb38f7606ef" name="HashedMeasurement_52_GSP" size="48"/>
+        <ns0:Resource type="Measurement" index="53" active="True" alternatives="2" ns2:Hash0="505fe673cec0521829686924b4efcb987a29cedba32bc11381fe81a08ec98d22d97327a32e59763470e7e1344e9eb1c9" ns2:Hash1="69ec63f5a7111236818c326a08b8fe6c0237f62355ece1cd19c84e6f787082604de65996ab412aa5d620c8f1f09645b3" name="HashedMeasurement_53_GSP" size="48"/>
+        <ns0:Resource type="Measurement" index="54" active="True" alternatives="1" ns2:Hash0="09b836461f879d131b1d47a78778836e3056c58fc7ebdd4a8c04648202ebbc85302e8341006b0ee17764bc7283c02652" name="MixedMeasurement_54" size="48"/>
+        <ns0:Resource type="Measurement" index="55" active="True" alternatives="1" ns2:Hash0="78da0b4c146ccf2714c8ba562e5c761815c6a6eba5290ae0132df19b243a31099c24384f244834443c09ea25750c4afb" name="MixedMeasurement_55" size="48"/>
+        <ns0:Resource type="Measurement" index="56" active="True" alternatives="1" ns2:Hash0="52d40299e4012bd4cda163ebd8b1b4cb0b9b3ebddb44cf44a7032a635711254495ee1a71bc3cd7549869e37a75c6d5be" name="MixedMeasurement_56" size="48"/>
+        <ns0:Resource type="Measurement" index="57" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_57" size="48"/>
+        <ns0:Resource type="Measurement" index="58" active="True" alternatives="1" ns2:Hash0="584ed81a329aae1d15a142cd8c268d769a72e4d8e95836838067cd3de2f55c21db458266acb6c125010385cf026bc953" name="MixedMeasurement_58" size="48"/>
+        <ns0:Resource type="Measurement" index="59" active="True" alternatives="1" ns2:Hash0="c4df8d98ca4267758484e8a807729df1841e2e1599b9b04e75b1a6f427b456a594ab50e13f10bdf65606206db45c5565" name="MixedMeasurement_59" size="48"/>
+        <ns0:Resource type="Measurement" index="60" active="True" alternatives="1" ns2:Hash0="61e3125c30622bd4a67efb1d1befe8925035337ef87208817ff713cc5ce6182600033f06d2e1bdc39f290e5e87a2d2a9" name="MixedMeasurement_60" size="48"/>
+        <ns0:Resource type="Measurement" index="61" active="True" alternatives="2" ns2:Hash0="27bc9f6a354bf0867c7c4394f769eaa02f542a41a9c7b344f85e4b5a209c9c4f54da6de0838124e187570ac91f9dc107" ns2:Hash1="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="MixedMeasurement_61" size="48"/>
+        <ns0:Resource type="Measurement" index="62" active="False" alternatives="1" ns2:Hash0="000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" name="Measurement_62" size="48"/>
+        <ns0:Resource type="Measurement" index="63" active="True" alternatives="1" ns2:Hash0="7886cb872fc7444a77a3a73f24e526927ad864e21ff51f7b06221831f7ce416935da4e91047aa228ae8f27481cfcbcb7" name="MixedMeasurement_63" size="48"/>
+    </ns0:Payload>
+<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2006/12/xml-c14n11"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha384"/><ds:Reference URI=""><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="http://www.w3.org/2006/12/xml-c14n11"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#sha384"/><ds:DigestValue>iqYS3j1UqRHSrsWgUKYvSUxkGFO98LoHHDsM2qrU/TG4Ngdsidq1KiCoPnNnjuUY</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>CkPwANGv2IPKV4mfvQrL8fjnlyWI4JhlyPlziLUGBBQbiIaRNbq+0H2/TUBUO9tvSv91zf9HGSyN5ON8VCsGIvXy7J27jSPyPuFxKcZVqteHNayM9a65anW+kP7Jwdst</ds:SignatureValue><ds:KeyInfo><ds:X509Data><ds:X509Certificate>MIICjzCCAhSgAwIBAgIUfU4wb/GQRbun7+ncPzwZcfjyBMMwCgYIKoZIzj0EAwMw
+TzELMAkGA1UEBhMCVVMxDzANBgNVBAoMBk5WSURJQTEvMC0GA1UEAwwmTlZJRElB
+IFJlZmVyZW5jZSBWYWx1ZSBMMyBHQjExMC1DQyAwMDEwHhcNMjYwNzI5MDE1MjQ3
+WhcNMjgwNzI4MDE1MjQ3WjBlMQswCQYDVQQGEwJVUzELMAkGA1UECAwCQ0ExFDAS
+BgNVBAcMC1NhbnRhIENsYXJhMRswGQYDVQQKDBJOVklESUEgQ29ycG9yYXRpb24x
+FjAUBgNVBAMMDVJJTSBMNCBTaWduZXIwdjAQBgcqhkjOPQIBBgUrgQQAIgNiAAS1
+kxi7XN0Qetw+0CHayuyBWNwJKURqr3xGTlv4cBRorZKDs7Qr4YJLqd40nL82puKA
+g5LOJ1R7LM9eNzApQIV0+6xNuir4KaH+hW8ndJiYwZrxHD8uB4IhPRuwSADxROKj
+gZowgZcwHQYDVR0OBBYEFO+kQmCyXyGvgeS3CefUMiRGGIwRMB8GA1UdIwQYMBaA
+FCnLsjWoJNlGETAx5pSivDATPIgJMAwGA1UdEwEB/wQCMAAwDgYDVR0PAQH/BAQD
+AgeAMDcGCCsGAQUFBwEBBCswKTAnBggrBgEFBQcwAYYbaHR0cDovL29jc3AubmRp
+cy5udmlkaWEuY29tMAoGCCqGSM49BAMDA2kAMGYCMQCjK3bchrqOimqDGRPDBpWF
+EY6fGaAOQaTGfU7OE77gsj/7G4a+km+MMs3xF4wFIOQCMQCftDYP1fk7WAjMkayA
+TzbGaQSYi5LFkBUnVMBCmSksKMkCPlfa/12hOll+EVJMMRQ=
+</ds:X509Certificate><ds:X509Certificate>MIICfDCCAgGgAwIBAgIUXGJKsFPEdMpOKOSkh1ltzD9yeB8wCgYIKoZIzj0EAwMw
+TDELMAkGA1UEBhMCVVMxDzANBgNVBAoMBk5WSURJQTEsMCoGA1UEAwwjTlZJRElB
+IFJlZmVyZW5jZSBWYWx1ZSBHQjFYWCBDQSAwMDEwHhcNMjUxMTA3MDAwMDAwWhcN
+MzUxMTA3MjM1OTU5WjBPMQswCQYDVQQGEwJVUzEPMA0GA1UECgwGTlZJRElBMS8w
+LQYDVQQDDCZOVklESUEgUmVmZXJlbmNlIFZhbHVlIEwzIEdCMTEwLUNDIDAwMTB2
+MBAGByqGSM49AgEGBSuBBAAiA2IABO9s1kIdyH+wrvmNm5JazRZh6J1NWjeoISRi
+rPUGfHc9y/RiGNa2nPPFvCqDL9GnPHrdoWJgzjUi5MvadFI4VMrq2vBrTO3EkRtz
+JgzuHaHVyAy+pB/1xAtmv52fSZHrvaOBoDCBnTAdBgNVHQ4EFgQUKcuyNagk2UYR
+MDHmlKK8MBM8iAkwHwYDVR0jBBgwFoAUFThtr5Swr+O9h3Xm0OuEedqt0zcwEgYD
+VR0TAQH/BAgwBgEB/wIBADAOBgNVHQ8BAf8EBAMCAQYwNwYIKwYBBQUHAQEEKzAp
+MCcGCCsGAQUFBzABhhtodHRwOi8vb2NzcC5uZGlzLm52aWRpYS5jb20wCgYIKoZI
+zj0EAwMDaQAwZgIxAMoABQxxM9Pw35UKARcygf6kVjVk0OOb8bAB4enG0aQzNled
+IYPKypvCVTgLe0tp+QIxAIBegrvkG/pt7T6VIOyiQG4Q15NWO0/Q6wJP5ItT+JF1
+KnMyCvpVWQUrUhmdEwgv8g==
+</ds:X509Certificate><ds:X509Certificate>MIICtTCCAjugAwIBAgIUUzBHMVS/sRSGG+93AIumoMC6x0YwCgYIKoZIzj0EAwMw
+RTELMAkGA1UEBhMCVVMxDzANBgNVBAoMBk5WSURJQTElMCMGA1UEAwwcTlZJRElB
+IENvUklNIHNpZ25pbmcgUm9vdCBDQTAeFw0yNDEyMTkwMDAwMDBaFw0zOTEyMTky
+MzU5NTlaMEwxCzAJBgNVBAYTAlVTMQ8wDQYDVQQKDAZOVklESUExLDAqBgNVBAMM
+I05WSURJQSBSZWZlcmVuY2UgVmFsdWUgR0IxWFggQ0EgMDAxMHYwEAYHKoZIzj0C
+AQYFK4EEACIDYgAErzQfvaGZsEo2yBlUaQIxhUkj3OEA/p/6PgICDKcQZ481dL4E
+mSeXhGjwXOtGAd7wtbm+8NURV32Ut2LCyOaquTHYZPGI9uH+OhAmYTgLD7z/9eJD
+Y8HdrhavEosoti5uo4HkMIHhMB0GA1UdDgQWBBQVOG2vlLCv472HdebQ64R52q3T
+NzAfBgNVHSMEGDAWgBSlpes48rhkMCTTwMGySfn3jN5mMDASBgNVHRMBAf8ECDAG
+AQH/AgEBMA4GA1UdDwEB/wQEAwIBBjBCBgNVHR8EOzA5MDegNaAzhjFodHRwOi8v
+Y3JsLm5kaXMubnZpZGlhLmNvbS9jcmwtY29yaW0vbDEtY29yaW0uY3JsMDcGCCsG
+AQUFBwEBBCswKTAnBggrBgEFBQcwAYYbaHR0cDovL29jc3AubmRpcy5udmlkaWEu
+Y29tMAoGCCqGSM49BAMDA2gAMGUCMQDZXM27fygx/b13llTk0xAVN9bEiaQpn7iq
+LzPFalpdBV4mI0GCJ7rwWgHT5dJQVjECMHw40RZTd/pLiNfaqc5PRR34H8Qhb520
+McJ+Q6VeJhDWC4tqYSCTh1s4j+3Z/A6pkg==
+</ds:X509Certificate><ds:X509Certificate>MIICKTCCAbCgAwIBAgIQRdrjoA5QN73fh1N17LXicDAKBggqhkjOPQQDAzBFMQsw
+CQYDVQQGEwJVUzEPMA0GA1UECgwGTlZJRElBMSUwIwYDVQQDDBxOVklESUEgQ29S
+SU0gc2lnbmluZyBSb290IENBMCAXDTIzMDMxNjE1MzczNFoYDzIwNTMwMzA4MTUz
+NzM0WjBFMQswCQYDVQQGEwJVUzEPMA0GA1UECgwGTlZJRElBMSUwIwYDVQQDDBxO
+VklESUEgQ29SSU0gc2lnbmluZyBSb290IENBMHYwEAYHKoZIzj0CAQYFK4EEACID
+YgAEuECyi9vNM+Iw2lfUzyBldHAwaC1HF7TCgp12QcEyUTm3Tagxwr48d55+K2VI
+lWYIDk7NlAIQdcV/Ff7euGLI+Qauj93HsSI4WX298PpW54RTgz9tC+Q684caR/BX
+WEeZo2MwYTAdBgNVHQ4EFgQUpaXrOPK4ZDAk08DBskn594zeZjAwHwYDVR0jBBgw
+FoAUpaXrOPK4ZDAk08DBskn594zeZjAwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8B
+Af8EBAMCAQYwCgYIKoZIzj0EAwMDZwAwZAIwHGDyscDP6ihHqRvZlI3eqZ4YkvjE
+1duaN84tAHRVgxVMvNrp5Tnom3idHYGW/dskAjATvjIx6VzHm/4e2GiZAyZEIUBD
+OKPzp5ei/A0iUZpdvngenDwV8Qa/wGdiTmJ7Bp4=
+</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature></SoftwareIdentity>

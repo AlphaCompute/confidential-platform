@@ -292,6 +292,23 @@ enum CocoCommand {
         #[arg(long)]
         cmdline: String,
     },
+    /// Prints the platform document's `GpuReference` for the GPU that signed this evidence: its
+    /// identity and FWID as it reports them, each measurement block as NVIDIA's signed RIMs list
+    /// it. Refuses unless both RIMs verify to NVIDIA's RIM root and list every block it reports.
+    GpuReference {
+        /// The SPDM GET_MEASUREMENTS request and signed response, as NVML returns them.
+        #[arg(long)]
+        evidence: PathBuf,
+        /// The device certificate chain in PEM, leaf first, as NVML returns it.
+        #[arg(long)]
+        certificate_chain: PathBuf,
+        /// The XML of `NV_GPU_CC_DRIVER_<chip>_<driver version>` from NVIDIA's RIM service.
+        #[arg(long)]
+        driver_rim: PathBuf,
+        /// The XML of `NV_GPU_VBIOS_<project>_<project SKU>_<chip SKU>_<VBIOS version>`.
+        #[arg(long)]
+        vbios_rim: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -381,8 +398,12 @@ fn passphrase(prompt: &str) -> Result<Vec<u8>, Exit> {
         .map_err(|e| Exit::Refused(format!("passphrase: {e}")))
 }
 
+fn read_file(path: &Path) -> Result<Vec<u8>, Exit> {
+    fs::read(path).map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))
+}
+
 fn read_json(path: &Path) -> Result<Value, Exit> {
-    let text = fs::read(path).map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))?;
+    let text = read_file(path)?;
     serde_json::from_slice(&text).map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))
 }
 
@@ -626,15 +647,32 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                     kernel,
                     cmdline,
                 },
+        } => Ok(json!({
+            "mrtd": coco::measure::mrtd(&read_file(&firmware)?)?,
+            "rtmr1": coco::measure::rtmr1(&read_file(&kernel)?)?,
+            "rtmr2": coco::measure::rtmr2(&cmdline),
+        })),
+        Command::Coco {
+            command:
+                CocoCommand::GpuReference {
+                    evidence,
+                    certificate_chain,
+                    driver_rim,
+                    vbios_rim,
+                },
         } => {
-            let read = |path: &Path| {
-                fs::read(path).map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))
+            let evidence = alpha_attest::GpuEvidence {
+                evidence: read_file(&evidence)?,
+                certificate_chain: read_file(&certificate_chain)?,
             };
-            Ok(json!({
-                "mrtd": coco::measure::mrtd(&read(&firmware)?)?,
-                "rtmr1": coco::measure::rtmr1(&read(&kernel)?)?,
-                "rtmr2": coco::measure::rtmr2(&cmdline),
-            }))
+            let reference = alpha_attest::gpu_reference(
+                &evidence,
+                &read_file(&driver_rim)?,
+                &read_file(&vbios_rim)?,
+                SystemTime::now(),
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(json!(reference))
         }
         Command::Catalog {
             command:
