@@ -284,12 +284,12 @@ fn source<'i>(
 fn open(out: &mut String, node: Node, apex: Node) -> Result<(), AppraisalError> {
     match node.node_type() {
         NodeType::Element => {}
-        NodeType::Text => escape(out, node.text().unwrap_or_default(), false),
+        NodeType::Text => {
+            escape(out, node.text().unwrap_or_default(), false);
+            return Ok(());
+        }
         NodeType::PI => return Err(failed("processing instruction")),
-        NodeType::Comment | NodeType::Root => {}
-    }
-    if !node.is_element() {
-        return Ok(());
+        NodeType::Comment | NodeType::Root => return Ok(()),
     }
     out.push('<');
     out.push_str(qname(source(node, node.range())?));

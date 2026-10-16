@@ -398,8 +398,12 @@ fn passphrase(prompt: &str) -> Result<Vec<u8>, Exit> {
         .map_err(|e| Exit::Refused(format!("passphrase: {e}")))
 }
 
+fn read_file(path: &Path) -> Result<Vec<u8>, Exit> {
+    fs::read(path).map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))
+}
+
 fn read_json(path: &Path) -> Result<Value, Exit> {
-    let text = fs::read(path).map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))?;
+    let text = read_file(path)?;
     serde_json::from_slice(&text).map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))
 }
 
@@ -643,16 +647,11 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                     kernel,
                     cmdline,
                 },
-        } => {
-            let read = |path: &Path| {
-                fs::read(path).map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))
-            };
-            Ok(json!({
-                "mrtd": coco::measure::mrtd(&read(&firmware)?)?,
-                "rtmr1": coco::measure::rtmr1(&read(&kernel)?)?,
-                "rtmr2": coco::measure::rtmr2(&cmdline),
-            }))
-        }
+        } => Ok(json!({
+            "mrtd": coco::measure::mrtd(&read_file(&firmware)?)?,
+            "rtmr1": coco::measure::rtmr1(&read_file(&kernel)?)?,
+            "rtmr2": coco::measure::rtmr2(&cmdline),
+        })),
         Command::Coco {
             command:
                 CocoCommand::GpuReference {
@@ -662,17 +661,14 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                     vbios_rim,
                 },
         } => {
-            let read = |path: &Path| {
-                fs::read(path).map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))
-            };
             let evidence = alpha_attest::GpuEvidence {
-                evidence: read(&evidence)?,
-                certificate_chain: read(&certificate_chain)?,
+                evidence: read_file(&evidence)?,
+                certificate_chain: read_file(&certificate_chain)?,
             };
             let reference = alpha_attest::gpu_reference(
                 &evidence,
-                &read(&driver_rim)?,
-                &read(&vbios_rim)?,
+                &read_file(&driver_rim)?,
+                &read_file(&vbios_rim)?,
                 SystemTime::now(),
             )
             .map_err(|e| e.to_string())?;

@@ -257,10 +257,11 @@ fn read_gpu<'a>(
         .verify(spdm.signed, &signature)
         .map_err(|_| failed("signature does not verify with the leaf key"))?;
     let opaque = Opaque::parse(spdm.opaque)?;
-    if leaf.fwid.is_none() {
-        return Err(failed("leaf has no SHA-384 TcbInfo FWID"));
-    }
-    if leaf.fwid != Some(opaque.fwid) {
+    if leaf
+        .fwid
+        .ok_or_else(|| failed("leaf has no SHA-384 TcbInfo FWID"))?
+        != opaque.fwid
+    {
         return Err(failed("FWID differs from the leaf certificate's"));
     }
     Ok((leaf, spdm, opaque))
