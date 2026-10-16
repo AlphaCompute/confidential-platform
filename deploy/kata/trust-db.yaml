@@ -117,7 +117,6 @@ spec:
         requests:
           storage: ${TRUST_DB_STORAGE_SIZE}
 ---
-# The daily base backup, the roles beside it, then everything older than the 30th base backup goes.
 # The roles land in one object per day of the month, so they roll over with the backups.
 apiVersion: batch/v1
 kind: CronJob
