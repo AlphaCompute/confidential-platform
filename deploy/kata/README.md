@@ -205,7 +205,9 @@ after kata-deploy's `50-user-overrides.toml`. Each moves the class's reference v
 
 - `60-guest-driver-595.91.07.toml` boots a guest rebuilt from Kata 4.0.0 with NVIDIA 595.91.07
   instead of the 595.58.03 it ships: the guest driver must be the version of the host's
-  `nv-fabricmanager`, 595.91.07.
+  `nv-fabricmanager`, 595.91.07. Besides RTMR1 and RTMR2, the class's
+  `gpus.reference_values` need an entry captured with this driver: the KMS matches
+  `driver_version` exactly and refuses a GPU it has no reference for.
 
   ```toml
   [hypervisor.qemu]
