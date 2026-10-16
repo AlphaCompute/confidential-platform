@@ -62,7 +62,7 @@ and taint a new one for the `trust-db` pool (Day 0 step 1).
 kubectl -n alpha-trust-db scale statefulset postgres --replicas=0
 kubectl -n alpha-trust-db delete pvc data-postgres-0 --ignore-not-found
 : "${TRUST_DB_STORAGE_CLASS:?}" "${TRUST_DB_STORAGE_SIZE:?}" &&
-  export TRUST_DB_STORAGE_CLASS TRUST_DB_STORAGE_SIZE TRUST_DB_BACKUP=LATEST &&
+  export TRUST_DB_STORAGE_CLASS TRUST_DB_STORAGE_SIZE TRUST_DB_BACKUP="${TRUST_DB_BACKUP:-LATEST}" &&
   envsubst '$TRUST_DB_STORAGE_CLASS $TRUST_DB_STORAGE_SIZE $TRUST_DB_BACKUP' < kata/trust-db-restore.yaml | kubectl create -f -
 kubectl -n alpha-trust-db wait --for=condition=complete job/postgres-restore --timeout=2h
 kubectl -n alpha-trust-db delete job postgres-restore
