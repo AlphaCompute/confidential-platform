@@ -62,17 +62,28 @@ document.json`, which refuses an init-data that is not listed or fails the docum
 ## Day 0
 
 Before anything: the document above is served, the release's `kata/` is at hand, and the
-custodians have run `alpha keygen --custodian` and handed over their public keys.
+custodians have run `alpha keygen --custodian` and handed over their public keys. Every step
+runs in one shell, where the CLI reads the document and the PCCS from the repository variables
+the release rendered with:
+
+```sh
+export ALPHACOMPUTE_PLATFORM_DOCUMENT_URL=$(gh variable get KMS_KATA_PLATFORM_DOCUMENT_URL -R AlphaCompute/confidential-platform)
+export ALPHACOMPUTE_PCCS_URL=$(gh variable get KMS_KATA_PCCS_URL -R AlphaCompute/confidential-platform)
+```
 
 1. **Node pools.** At least as many TDX hosts with the `kata-qemu-tdx` runtime class as there are
    nodes (pod anti-affinity puts each node on its own host), and one host for Postgres. Exclude
-   both pools from automatic drains and upgrades.
+   both pools from automatic drains and upgrades. `KMS_HOSTS` holds the TDX hosts' node names,
+   space-separated, and `TRUST_DB_HOST` the Postgres host's.
 
    ```sh
-   kubectl label node <tdx host> alphacompute.io/pool=kms
-   kubectl taint node <tdx host> alphacompute.io/pool=kms:NoSchedule
-   kubectl label node <db host> alphacompute.io/pool=trust-db
-   kubectl taint node <db host> alphacompute.io/pool=trust-db:NoSchedule
+   : "${KMS_HOSTS:?}" "${TRUST_DB_HOST:?}"
+   for node in $KMS_HOSTS; do
+     kubectl label node "$node" alphacompute.io/pool=kms
+     kubectl taint node "$node" alphacompute.io/pool=kms:NoSchedule
+   done
+   kubectl label node "$TRUST_DB_HOST" alphacompute.io/pool=trust-db
+   kubectl taint node "$TRUST_DB_HOST" alphacompute.io/pool=trust-db:NoSchedule
    ```
 
 2. **Postgres.** The owner password stays with the operator. The server certificate is
@@ -97,7 +108,7 @@ custodians have run `alpha keygen --custodian` and handed over their public keys
    role `alpha_kms` and its grants.
 
    ```sh
-   KMS_IMAGE=<manifest.json image> envsubst '$KMS_IMAGE' < migrate.yaml | kubectl create -f -
+   KMS_IMAGE=$(jq -r .image manifest.json) envsubst '$KMS_IMAGE' < migrate.yaml | kubectl create -f -
    ```
 
 4. **The nodes' login** with a one-time genesis password, sent on stdin so it never sits in a pod
@@ -129,8 +140,7 @@ custodians have run `alpha keygen --custodian` and handed over their public keys
 
    ```sh
    alpha bootstrap --custodians c1.pub c2.pub c3.pub --endpoint https://localhost:8443 \
-     --database-password-file genesis-db-password \
-     --platform-document-url <KMS_KATA_PLATFORM_DOCUMENT_URL> --pccs-url <KMS_KATA_PCCS_URL>
+     --database-password-file genesis-db-password
    ```
 
    Hand each `share-<n>.json` to its custodian and delete it, then delete `genesis-db-password`
@@ -151,10 +161,14 @@ custodians have run `alpha keygen --custodian` and handed over their public keys
 The policy refuses `kubectl exec` into a node and leaves `kubectl logs` empty, so the checks go
 through the nodes' API and the database.
 
-- Every node pod carries the signed Revision:
-  `kubectl -n alpha-kms get pod <pod> -o jsonpath='{.metadata.annotations.io\.katacontainers\.config\.hypervisor\.cc_init_data}' | base64 -d | gunzip | sha256sum`
-  equals `compose_hash`.
-- `kubectl -n alpha-kms exec <pod> -- /alpha-kms` is refused.
+- Every node pod carries the signed Revision: for each, the hash below equals `compose_hash`.
+
+  ```sh
+  for pod in kms-0 kms-1; do
+    kubectl -n alpha-kms get pod "$pod" -o jsonpath='{.metadata.annotations.io\.katacontainers\.config\.hypervisor\.cc_init_data}' | base64 -d | gunzip | sha256sum
+  done
+  ```
+- `kubectl -n alpha-kms exec kms-0 -- /alpha-kms` is refused.
 - `kubectl -n alpha-kms get statefulset kms` shows `2/2` ready: both nodes serve.
 - The genesis password is dead; this login is refused:
 
@@ -178,9 +192,10 @@ through the nodes' API and the database.
   If the new `kms-1` never becomes ready, apply the old file, then
   `kubectl -n alpha-kms delete pod kms-1`: the StatefulSet does not replace a pod that is not ready.
   Drop the old Revision once no tenant pins it.
-- **All nodes lost.** Port-forward to `pod/kms-0` as in step 6, and two custodians each run
-  `alpha unseal --share share-<n>.json --key custodian.key --endpoint https://localhost:8443`
-  with the same URL options. The root gives the node its database password. `kms-1` then joins
+- **All nodes lost.** Port-forward to `pod/kms-0` as in step 6, and two custodians each export
+  the two variables of Day 0 and, with the one share they were handed, run
+  `alpha unseal --share share-[1-3].json --key custodian.key --endpoint https://localhost:8443`.
+  The root gives the node its database password. `kms-1` then joins
   it; if it was already running sealed, delete its pod.
 
 ## What the operator never sees
@@ -235,13 +250,14 @@ them with the rest of `/opt/kata`.
 
 ### Inputs
 
-Each, and each service's App id, is the operator's, chosen per environment; none has a default.
+Each is the operator's, chosen per environment; none has a default.
 
 | Input | Templates | What |
 |---|---|---|
 | `RUNTIME_IMAGE` | all | the `alpha-runtime` release image by digest |
 | `KMS_CA_SPKI_SHA256`, `KMS_REVISIONS` | all | what `alpha sign --check` prints for the served document |
 | `KMS_ENDPOINTS` | all | `KMS_KATA_ENDPOINTS` |
+| `INFERENCE_APP_ID`, `GUARD_APP_ID`, `BROKER_APP_ID`, `MODEL_APP_ID` | one each | the service's App id |
 | `INFERENCE_IMAGE`, `GUARD_IMAGE`, `BROKER_IMAGE` | one each | the service's release image by digest |
 | `MODELS`, `MODEL_SERVERS` | inference | `services/alpha-inference/README.md`; `MODEL_SERVERS` is `{}` when RedPill serves every model, and a model server's `url` is `https://<MODEL_NAME>.alpha-models.svc:8443` |
 | `UPSTREAM_URL`, `PCCS_URL`, `UPSTREAM_POLICY` | inference | RedPill's settings; with every model on our own servers, delete their three lines before rendering |
@@ -263,18 +279,36 @@ FROM vllm/vllm-openai@sha256:<the pinned vLLM release>
 COPY <the model's directory> /weights
 ```
 
-Push it and set `MODEL_IMAGE` to `<registry>/<repository>@sha256:<digest>`.
+Build and push it to the repository `MODEL_REPOSITORY` names (`registry/path`), and set
+`MODEL_IMAGE` to its digest:
+
+```sh
+: "${MODEL_REPOSITORY:?}"
+docker build -t "$MODEL_REPOSITORY" . && docker push "$MODEL_REPOSITORY"
+export MODEL_IMAGE=$(docker inspect --format '{{index .RepoDigests 0}}' "$MODEL_REPOSITORY")
+```
 
 ### Render, register, set Secrets
 
-Render in this order, since each pins the Revisions of the next one down: model servers, the front, the guard. On Linux x86_64, for each template:
+Render in this order, since each pins the Revisions of the next one down: model servers, the front, the guard. On Linux x86_64, with
+Kata 4.0.0's genpolicy and the id of `admin.key` from `admin-key.json`, the reply that registered
+it:
 
 ```sh
-template=inference.yaml app=<the App id>
+kata=$PWD/kata-tools && mkdir -p "$kata"
+curl -fsSL https://github.com/kata-containers/kata-containers/releases/download/4.0.0/kata-tools-static-4.0.0-amd64.tar.zst \
+  | tar --zstd -x -C "$kata"
+ADMIN_KEY_ID=$(jq -r .id admin-key.json)
+```
+
+then for each template, here the front:
+
+```sh
+template=inference.yaml app=$INFERENCE_APP_ID
 envsubst "$(grep -o '\${[A-Z0-9_]*}' "$template" | sort -u | tr -d '\n')" < "$template" > in.yaml
-alpha coco render --app-id "$app" --kata <opt/kata> --out "rendered-$template" in.yaml > rendered.json
+alpha coco render --app-id "$app" --kata "$kata/opt/kata" --out "rendered-$template" in.yaml > rendered.json
 jq --arg app "$app" '{app_id: $app, init_data, digest: .revision}' rendered.json > revision.json
-alpha call register-revision --key admin.key --key-id <id> revision.json
+alpha call register-revision --key admin.key --key-id "$ADMIN_KEY_ID" revision.json
 ```
 
 `rendered.json`'s `rules_sha256` and `policy_data_sha256` are the document's `kata_policy`, or the
@@ -282,15 +316,24 @@ KMS refuses the Revision. The GPU class
 needs `kata_reference_values` with `gpu: true` at `MODEL_CPUS` and `MODEL_MEMORY`: RTMR0 is
 captured per shape.
 
-Each Secret goes in with `alpha call put-secret --value <file>` and the payload
-`{"name": "<name>", "app_ids": ["<the App id>"]}`:
+Each Secret goes in with `alpha call put-secret` and the payload
+`{"name": "<name>", "app_ids": ["<the App id>"]}`, its value read from the file of its name; the
+guard's `inference-bearer` is the front's `caller-bearer`, and the broker's `database-url` is
+below. The model server has none.
 
-- inference: `redpill-api-key`, `caller-bearer`;
-- guard: `inference-bearer`, the front's `caller-bearer`;
-- broker: `google-client-secret`, `dropbox-client-secret`, `slack-client-secret`,
-  `figma-client-secret`, `hubspot-client-secret`, `connect-bearer`, `database-url`.
-
-The model server has none.
+```sh
+put_secret() {  # name, App id, value file (default: the name)
+  jq -n --arg name "$1" --arg app "$2" '{name: $name, app_ids: [$app]}' > secret.json
+  alpha call put-secret --key admin.key --key-id "$ADMIN_KEY_ID" --value "${3:-$1}" secret.json
+}
+put_secret redpill-api-key "$INFERENCE_APP_ID"
+put_secret caller-bearer "$INFERENCE_APP_ID"
+put_secret inference-bearer "$GUARD_APP_ID" caller-bearer
+for name in google-client-secret dropbox-client-secret slack-client-secret \
+  figma-client-secret hubspot-client-secret connect-bearer; do
+  put_secret "$name" "$BROKER_APP_ID"
+done
+```
 
 ### The broker's database
 
@@ -304,9 +347,14 @@ echo 'create database alpha_broker owner alpha_broker;' \
   | kubectl -n alpha-trust-db exec -i postgres-0 -- psql -X -v ON_ERROR_STOP=1 -U postgres -d alpha
 ```
 
-The Secret `database-url` is
-`postgres://alpha_broker:<broker-db-password>@postgres.alpha-trust-db.svc:5432/alpha_broker?sslmode=require&channel_binding=require&require_auth=scram-sha-256`;
-then delete `broker-db-password`. The broker applies its migrations when it starts.
+The Secret `database-url` carries that password; the broker applies its migrations when it starts.
+
+```sh
+printf 'postgres://alpha_broker:%s@postgres.alpha-trust-db.svc:5432/alpha_broker?sslmode=require&channel_binding=require&require_auth=scram-sha-256' \
+  "$(cat broker-db-password)" > database-url
+put_secret database-url "$BROKER_APP_ID"
+rm broker-db-password database-url
+```
 
 ### Apply
 
@@ -314,7 +362,7 @@ then delete `broker-db-password`. The broker applies its migrations when it star
 kubectl apply -f platform.yaml
 kubectl apply -f rendered-inference.yaml -f rendered-guard.yaml -f rendered-broker.yaml
 kubectl apply -f rendered-model-server.yaml
-kubectl -n alpha-models expose deployment <MODEL_NAME> --port 8443
+kubectl -n alpha-models expose deployment "$MODEL_NAME" --port 8443
 ```
 
 A pod turns ready once its runtime has attested and its service answers: the front once its
