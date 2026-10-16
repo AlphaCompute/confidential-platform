@@ -22,6 +22,10 @@ use x509_parser::time::ASN1Time;
 
 use crate::{AppraisalError, KataReference, Measurement, base64url};
 
+mod rim;
+
+pub use rim::gpu_reference;
+
 /// One GPU's evidence as NVML hands it out: the request and signed response of SPDM
 /// GET_MEASUREMENTS, and the device certificate chain in PEM, leaf first.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -197,19 +201,10 @@ fn appraise_gpu(
     references: &[GpuReference],
     now: SystemTime,
 ) -> Result<String, AppraisalError> {
-    let leaf = verify_chain(&gpu.certificate_chain, references, now)?;
-    let spdm = parse_spdm(&gpu.evidence)?;
-    let signature = Signature::from_slice(&spdm.signature).map_err(|_| failed("signature"))?;
-    leaf.key
-        .verify(spdm.signed, &signature)
-        .map_err(|_| failed("signature does not verify with the leaf key"))?;
+    let roots: Vec<_> = references.iter().map(|r| r.root_sha256).collect();
+    let (leaf, spdm, opaque) = read_gpu(gpu, &roots, now)?;
     if &spdm.nonce != nonce {
         return Err(failed("nonce is not this request's"));
-    }
-
-    let opaque = Opaque::parse(spdm.opaque)?;
-    if opaque.fwid != leaf.fwid {
-        return Err(failed("FWID differs from the leaf certificate's"));
     }
     let reference = references
         .iter()
@@ -240,6 +235,35 @@ fn appraise_gpu(
         }
     }
     Ok(leaf.serial)
+}
+
+/// The evidence's chain verified up to one of `roots`, its signature verified with the leaf
+/// key, and its opaque data, whose FWID must be the leaf's.
+fn read_gpu<'a>(
+    gpu: &'a GpuEvidence,
+    roots: &[ComposeHash],
+    now: SystemTime,
+) -> Result<(Leaf, Spdm<'a>, Opaque), AppraisalError> {
+    let ders = Pem::iter_from_buffer(&gpu.certificate_chain)
+        .map(|block| match block {
+            Ok(block) if block.label == "CERTIFICATE" => Ok(block.contents),
+            _ => Err(failed("certificate chain is not PEM certificates")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let leaf = verify_chain(&ders, roots, now)?;
+    let spdm = parse_spdm(&gpu.evidence)?;
+    let signature = Signature::from_slice(&spdm.signature).map_err(|_| failed("signature"))?;
+    leaf.key
+        .verify(spdm.signed, &signature)
+        .map_err(|_| failed("signature does not verify with the leaf key"))?;
+    let opaque = Opaque::parse(spdm.opaque)?;
+    if leaf.fwid.is_none() {
+        return Err(failed("leaf has no SHA-384 TcbInfo FWID"));
+    }
+    if leaf.fwid != Some(opaque.fwid) {
+        return Err(failed("FWID differs from the leaf certificate's"));
+    }
+    Ok((leaf, spdm, opaque))
 }
 
 struct Spdm<'a> {
@@ -415,23 +439,17 @@ impl Opaque {
 struct Leaf {
     key: VerifyingKey,
     serial: String,
-    fwid: [u8; 48],
+    fwid: Option<[u8; 48]>,
     root: ComposeHash,
 }
 
-/// The chain must end in a root some reference pins; the root shipped in the evidence is
-/// trusted only because its bytes hash to that pin.
+/// The chain, leaf first, must end in one of `roots`; the root shipped with it is trusted only
+/// because its bytes hash to that pin.
 fn verify_chain(
-    pem: &[u8],
-    references: &[GpuReference],
+    ders: &[Vec<u8>],
+    roots: &[ComposeHash],
     now: SystemTime,
 ) -> Result<Leaf, AppraisalError> {
-    let ders = Pem::iter_from_buffer(pem)
-        .map(|block| match block {
-            Ok(block) if block.label == "CERTIFICATE" => Ok(block.contents),
-            _ => Err(failed("certificate chain is not PEM certificates")),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     let certs = ders
         .iter()
         .map(|der| match X509Certificate::from_der(der) {
@@ -443,7 +461,7 @@ fn verify_chain(
         return Err(failed("certificate chain is empty"));
     };
     let root_sha256 = ComposeHash::from(<[u8; 32]>::from(Sha256::digest(root.as_raw())));
-    if !references.iter().any(|r| r.root_sha256 == root_sha256) {
+    if !roots.contains(&root_sha256) {
         return Err(failed(format!(
             "chain ends in {root_sha256}, which is not pinned"
         )));
@@ -529,7 +547,7 @@ fn verify_chain(
     Ok(Leaf {
         key: p384_key(leaf)?,
         serial: hex::encode(leaf.raw_serial()),
-        fwid: leaf_fwid.ok_or_else(|| failed("leaf has no SHA-384 TcbInfo FWID"))?,
+        fwid: leaf_fwid,
         root: root_sha256,
     })
 }

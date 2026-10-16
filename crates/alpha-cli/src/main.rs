@@ -292,6 +292,23 @@ enum CocoCommand {
         #[arg(long)]
         cmdline: String,
     },
+    /// Prints the platform document's `GpuReference` for the GPU that signed this evidence: its
+    /// identity and FWID as it reports them, each measurement block as NVIDIA's signed RIMs list
+    /// it. Refuses unless both RIMs verify to NVIDIA's RIM root and list every block it reports.
+    GpuReference {
+        /// The SPDM GET_MEASUREMENTS request and signed response, as NVML returns them.
+        #[arg(long)]
+        evidence: PathBuf,
+        /// The device certificate chain in PEM, leaf first, as NVML returns it.
+        #[arg(long)]
+        certificate_chain: PathBuf,
+        /// The XML of `NV_GPU_CC_DRIVER_<chip>_<driver version>` from NVIDIA's RIM service.
+        #[arg(long)]
+        driver_rim: PathBuf,
+        /// The XML of `NV_GPU_VBIOS_<project>_<project SKU>_<chip SKU>_<VBIOS version>`.
+        #[arg(long)]
+        vbios_rim: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -635,6 +652,31 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 "rtmr1": coco::measure::rtmr1(&read(&kernel)?)?,
                 "rtmr2": coco::measure::rtmr2(&cmdline),
             }))
+        }
+        Command::Coco {
+            command:
+                CocoCommand::GpuReference {
+                    evidence,
+                    certificate_chain,
+                    driver_rim,
+                    vbios_rim,
+                },
+        } => {
+            let read = |path: &Path| {
+                fs::read(path).map_err(|e| Exit::Usage(format!("{}: {e}", path.display())))
+            };
+            let evidence = alpha_attest::GpuEvidence {
+                evidence: read(&evidence)?,
+                certificate_chain: read(&certificate_chain)?,
+            };
+            let reference = alpha_attest::gpu_reference(
+                &evidence,
+                &read(&driver_rim)?,
+                &read(&vbios_rim)?,
+                SystemTime::now(),
+            )
+            .map_err(|e| e.to_string())?;
+            Ok(json!(reference))
         }
         Command::Catalog {
             command:
