@@ -323,17 +323,17 @@ below. The model server has none.
 
 ```sh
 put_secret() {
-  jq -n --arg name "$1" --arg app "$2" '{name: $name, app_ids: [$app]}' > secret.json
-  alpha call put-secret --key admin.key --key-id "$ADMIN_KEY_ID" --value "$1" secret.json
+  jq -n --arg name "$1" --arg app "$2" '{name: $name, app_ids: [$app]}' > secret.json &&
+    alpha call put-secret --key admin.key --key-id "$ADMIN_KEY_ID" --value "$1" secret.json
 }
-put_secret redpill-api-key "$INFERENCE_APP_ID"
-put_secret caller-bearer "$INFERENCE_APP_ID"
-cp caller-bearer inference-bearer
-put_secret inference-bearer "$GUARD_APP_ID"
-for name in google-client-secret dropbox-client-secret slack-client-secret \
-  figma-client-secret hubspot-client-secret connect-bearer; do
-  put_secret "$name" "$BROKER_APP_ID"
-done
+cp caller-bearer inference-bearer &&
+  put_secret redpill-api-key "$INFERENCE_APP_ID" &&
+  put_secret caller-bearer "$INFERENCE_APP_ID" &&
+  put_secret inference-bearer "$GUARD_APP_ID" &&
+  for name in google-client-secret dropbox-client-secret slack-client-secret \
+    figma-client-secret hubspot-client-secret connect-bearer; do
+    put_secret "$name" "$BROKER_APP_ID" || break
+  done
 ```
 
 ### The broker's database
