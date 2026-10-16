@@ -17,7 +17,7 @@ migrate() {
 globals() { dc run --rm -T "$@" --entrypoint /wal-g/wal-g backup st cat "globals/$(date -u +%d).sql.lz4" --decrypt --decompress; }
 trap 'dc --profile run down -v' EXIT
 
-dc up -d --wait postgres
+dc up -d --wait --wait-timeout 300 postgres
 sql -c 'create database alpha_broker'
 migrate
 dc run --rm backup
@@ -27,8 +27,9 @@ for db in alpha alpha_broker; do
   sql -d "$db" -c 'create table drill as select generate_series(1, 1000) as n'
 done
 segment=$(sql -c 'select pg_walfile_name(pg_switch_wal())')
-for _ in $(seq 120); do
+for i in $(seq 120); do
   [ "$(sql -c 'select last_archived_wal from pg_stat_archiver')" = "$segment" ] && break
+  [ "$i" -lt 120 ] || { echo "WAL segment $segment was not archived" >&2; exit 1; }
   sleep 1
 done
 before=$(dump)
@@ -36,7 +37,7 @@ before=$(dump)
 dc rm -sf postgres
 docker volume rm trust-db-drill_pgdata
 dc run --rm restore
-dc up -d --wait --no-deps postgres
+dc up -d --wait --wait-timeout 300 --no-deps postgres
 
 [ "$before" = "$(dump)" ] || { echo "the restored database differs" >&2; exit 1; }
 migrate

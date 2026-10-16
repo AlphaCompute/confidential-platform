@@ -125,6 +125,7 @@ metadata:
   namespace: alpha-trust-db
 spec:
   schedule: "0 3 * * *"
+  timeZone: Etc/UTC
   concurrencyPolicy: Forbid
   jobTemplate:
     spec:
