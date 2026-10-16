@@ -283,7 +283,6 @@ Build and push it to the repository `MODEL_REPOSITORY` names (`registry/path`), 
 `MODEL_IMAGE` to its digest:
 
 ```sh
-: "${MODEL_REPOSITORY:?}"
 docker build -t "$MODEL_REPOSITORY" . && docker push "$MODEL_REPOSITORY"
 export MODEL_IMAGE=$(docker inspect --format '{{index .RepoDigests 0}}' "$MODEL_REPOSITORY")
 ```
