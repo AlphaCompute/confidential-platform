@@ -8,7 +8,7 @@ backups: `wal-g` encrypts every object with libsodium before it leaves the pod.
 The whole Postgres cluster, so both databases, `alpha` and `alpha_broker`, and the roles:
 
 - every WAL segment, as soon as it is full and at least once every 60 seconds (`archive_timeout`),
-  so a restore loses at most the last minute of commits;
+  so while archiving succeeds a restore loses at most the last minute of commits (see Watch);
 - a base backup every day at 03:00 UTC, by the CronJob `postgres-backup`, streamed over a
   replication connection;
 - beside it, `pg_dumpall --globals-only` as `globals/<day of month>.sql.lz4`, encrypted the same
