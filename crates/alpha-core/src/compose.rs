@@ -99,6 +99,8 @@ pub enum RegistrationError {
     ImageWithoutDigest(String),
     #[error("a build: key is present; every service must resolve to a pinned image")]
     BuildNotAllowed,
+    #[error(transparent)]
+    Coco(#[from] crate::coco::CocoError),
 }
 
 impl RegistrationError {
@@ -107,7 +109,14 @@ impl RegistrationError {
     }
 }
 
+/// A registered document is either a compose (the prototype platform) or a Revision v2 (a Kata
+/// confidential pod); both are stored and signed the same way and hash to the Revision the leaf
+/// names.
 pub fn check_registration(compose: &str, app_id: AppId) -> Result<ComposeHash, RegistrationError> {
+    if crate::coco::is_revision_v2(compose) {
+        crate::coco::CocoRevision::check_registered(compose, app_id)?;
+        return Ok(compose_hash(compose));
+    }
     let value: Value = serde_json::from_str(compose)?;
     let object = value.as_object().ok_or(RegistrationError::NotObject)?;
     let name = object
