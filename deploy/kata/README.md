@@ -206,7 +206,9 @@ through the nodes' API and the database.
   the StatefulSet replaces `kms-1`, waits until it has joined and is ready, then replaces `kms-0`.
   If the new `kms-1` never becomes ready, apply the old file, then
   `kubectl -n alpha-kms delete pod kms-1`: the StatefulSet does not replace a pod that is not ready.
-  Drop the old Revision once no App lists it.
+  Drop the old Revision once no App lists it. A restarted pod of a document-pinned App still
+  accepts any document from its `PLATFORM_MIN_VERSION` on, so to retire a build for good, render
+  and register those Apps again with the version of the document that drops it.
 - **All nodes lost.** Port-forward to `pod/kms-0` as in step 6, and two custodians each export
   the two variables of Day 0 and, with the one share they were handed, run
   `alpha unseal --share share-[1-3].json --key custodian.key --endpoint https://localhost:8443`.
