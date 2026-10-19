@@ -219,7 +219,10 @@ fn verify_rim(xml: &[u8], now: SystemTime) -> Result<Rim, AppraisalError> {
         signers: ders
             .iter()
             .zip(ders.iter().skip(1))
-            .map(|(cert, issuer)| OcspQuery::new(cert.clone(), issuer.clone()))
+            .map(|(cert, issuer)| OcspQuery {
+                cert: cert.clone(),
+                issuer: issuer.clone(),
+            })
             .collect(),
     })
 }

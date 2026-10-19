@@ -37,15 +37,11 @@ fn failed(what: impl Into<String>) -> AppraisalError {
 /// A certificate whose status NVIDIA's responder reports, and the certificate that issued it.
 #[derive(Debug, PartialEq, Eq)]
 pub struct OcspQuery {
-    cert: Vec<u8>,
-    issuer: Vec<u8>,
+    pub(super) cert: Vec<u8>,
+    pub(super) issuer: Vec<u8>,
 }
 
 impl OcspQuery {
-    pub fn new(cert: Vec<u8>, issuer: Vec<u8>) -> Self {
-        Self { cert, issuer }
-    }
-
     /// The DER `OCSPRequest` for this certificate, carrying `nonce`.
     pub fn request(&self, nonce: &[u8; 32]) -> Result<Vec<u8>, AppraisalError> {
         let (_, _, cert_id) = self.parse()?;
@@ -459,7 +455,10 @@ mod tests {
             .unwrap()
             .signed_by(&key, &ca)
             .unwrap();
-        let query = OcspQuery::new(cert.der().to_vec(), ca.der().to_vec());
+        let query = OcspQuery {
+            cert: cert.der().to_vec(),
+            issuer: ca.der().to_vec(),
+        };
         let ocsp = || {
             (
                 ExtendedKeyUsagePurpose::OcspSigning,
