@@ -21,6 +21,7 @@ pub mod instance;
 pub mod keys;
 pub mod node;
 pub mod platform;
+pub mod store;
 pub mod tls;
 pub mod webauthn;
 
@@ -85,14 +86,29 @@ pub enum CollateralSource {
     Fixed(Box<Collateral>),
 }
 
-/// The two intermediates in memory after unseal, join or bootstrap.
+/// The two intermediates in memory after unseal, join or bootstrap, and the database's keys
+/// derived from the first.
 pub struct Intermediates {
     pub tenant_kek_root: Zeroizing<[u8; 32]>,
     pub ca_key_der: Zeroizing<Vec<u8>>,
     pub ca_cert_der: Vec<u8>,
+    pub metadata: store::MetadataKeys,
 }
 
 impl Intermediates {
+    pub fn new(
+        tenant_kek_root: Zeroizing<[u8; 32]>,
+        ca_key_der: Zeroizing<Vec<u8>>,
+        ca_cert_der: Vec<u8>,
+    ) -> Result<Self, ApiError> {
+        Ok(Self {
+            metadata: store::MetadataKeys::derive(&tenant_kek_root)?,
+            tenant_kek_root,
+            ca_key_der,
+            ca_cert_der,
+        })
+    }
+
     pub fn ca_key(&self) -> Result<rcgen::KeyPair, ApiError> {
         certs::key_pair(&self.ca_key_der)
     }
@@ -227,11 +243,29 @@ impl Node {
         matches!(&*self.phase.read(), Phase::Sealed { .. })
     }
 
-    /// Enters the serving phase: intermediates in memory and a leaf from `ca` on the listener.
-    pub fn start_serving(&self, keys: Intermediates) -> Result<(), ApiError> {
+    /// Enters the serving phase: unseal → the database's keys → every plaintext row sealed → serve,
+    /// with intermediates in memory and a leaf from `ca` on the listener. A database that cannot be
+    /// sealed keeps the node sealed.
+    pub async fn start_serving(&self, keys: Intermediates) -> Result<(), ApiError> {
+        let sealed = store::seal_plaintext(&self.pool, &keys.metadata).await?;
+        if !sealed.is_empty() {
+            eprintln!("sealed plaintext rows: {sealed:?}");
+        }
         self.issue_own_leaf(&keys)?;
         *self.phase.write() = Phase::Serving(Arc::new(keys));
         Ok(())
+    }
+
+    /// One maintenance pass while serving: rows an older node wrote in the clear are sealed.
+    pub async fn maintain(&self) {
+        let Ok(keys) = self.intermediates() else {
+            return;
+        };
+        match store::seal_plaintext(&self.pool, &keys.metadata).await {
+            Ok(sealed) if !sealed.is_empty() => eprintln!("sealed plaintext rows: {sealed:?}"),
+            Ok(_) => {}
+            Err(e) => eprintln!("sealing plaintext rows: {}", e.message),
+        }
     }
 
     /// The listener's leaf from `ca`: `alphacompute://kms` and this node's Revision.
@@ -301,15 +335,12 @@ pub fn router(node: Arc<Node>) -> Router {
 }
 
 async fn ready(State(node): State<Arc<Node>>) -> Response {
-    if node.is_sealed() {
-        return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({ "sealed": true })),
-        )
-            .into_response();
-    }
     if let Err(e) = sqlx::query("select 1").execute(&node.pool).await {
         return ApiError::internal(format!("database: {e}")).into_response();
+    }
+    if node.is_sealed() {
+        let body = axum::Json(serde_json::json!({ "sealed": true }));
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response();
     }
     axum::Json(serde_json::json!({ "sealed": false })).into_response()
 }

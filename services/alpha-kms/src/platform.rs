@@ -62,17 +62,17 @@ pub async fn apply(node: &Node, verified: Verified) -> Result<(), ApiError> {
         .await?;
     match stored {
         Some(stored) if stored > version => {
+            let message =
+                format!("platform document version {version} is below the stored {stored}");
             audit::node(
                 "platform.reload",
                 "denied",
-                json!({ "version": version, "stored": stored }),
+                json!({ "version": version, "stored": stored, "message": message }),
             )
-            .insert(&mut *tx)
+            .insert(&node.pool)
             .await?;
             tx.commit().await?;
-            return Err(ApiError::internal(format!(
-                "platform document version {version} is below the stored {stored}"
-            )));
+            return Err(ApiError::internal(message));
         }
         Some(stored) if stored == version => {}
         _ => {
@@ -155,6 +155,8 @@ pub async fn run(node: Arc<Node>) {
             if let Err(e) = reload(&node).await {
                 eprintln!("platform document: {}", e.message);
             }
+            renew_leaf(&node);
+            node.maintain().await;
         }
     };
     tokio::join!(renew, refetch);
@@ -176,7 +178,7 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::*;
-    use crate::{CollateralSource, Config, Intermediates, certs};
+    use crate::{CollateralSource, Config, Intermediates, certs, store};
 
     #[tokio::test(start_paused = true)]
     async fn a_stalled_document_server_neither_holds_up_start_nor_lets_the_leaf_lapse() {
@@ -213,11 +215,15 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(120));
 
         let (ca_key_der, ca_cert_der) = certs::new_ca(node.now()).unwrap();
+        let tenant_kek_root = Zeroizing::new([0u8; 32]);
+        let metadata = store::MetadataKeys::derive(&tenant_kek_root).unwrap();
         node.start_serving(Intermediates {
-            tenant_kek_root: Zeroizing::new([0; 32]),
+            metadata,
+            tenant_kek_root,
             ca_key_der: Zeroizing::new(ca_key_der),
             ca_cert_der,
         })
+        .await
         .unwrap();
         let leaf = node.server_cert.leaf_der().unwrap();
         tokio::spawn(run(node.clone()));

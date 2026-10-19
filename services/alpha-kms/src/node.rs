@@ -81,13 +81,16 @@ pub async fn bootstrap(
     let tenant_kek_root = Zeroizing::new(random()?);
     let (ca_key_der, ca_cert_der) = certs::new_ca(now)?;
     let ca_key_der = Zeroizing::new(ca_key_der);
+    let wrapped_tenant = aead_seal(&root, b"tenant-kek-root", tenant_kek_root.as_slice())?;
+    let wrapped_ca = aead_seal(&root, b"ca", &ca_key_der)?;
+    let keys = Intermediates::new(tenant_kek_root, ca_key_der, ca_cert_der)?;
     let mut tx = node.pool.begin().await?;
     let inserted = sqlx::query!(
         "insert into intermediate_keys (purpose, wrapped, public_part) values
            ('tenant-kek-root', $1, null), ('ca', $2, $3) on conflict (purpose) do nothing",
-        aead_seal(&root, b"tenant-kek-root", tenant_kek_root.as_slice())?,
-        aead_seal(&root, b"ca", &ca_key_der)?,
-        ca_cert_der,
+        wrapped_tenant,
+        wrapped_ca,
+        keys.ca_cert_der,
     )
     .execute(&mut *tx)
     .await?
@@ -122,18 +125,13 @@ pub async fn bootstrap(
         .collect::<Result<_, _>>()
         .map_err(|e| ApiError::internal(format!("seal share: {e}")))?;
     drop(root);
-    let keys = Intermediates {
-        tenant_kek_root,
-        ca_key_der,
-        ca_cert_der,
-    };
     let payload = json!({
         "shares_hpke": shares_hpke,
         "kms_ca_pem": keys.ca_pem(),
     });
     let digest = signing_digest(context::NODE_BOOTSTRAP, &payload)
         .map_err(|e| ApiError::internal(format!("payload: {e}")))?;
-    node.start_serving(keys)?;
+    node.start_serving(keys).await?;
     on_database(&node).await;
     let signature: p256::ecdsa::Signature = node.runtime_key.sign(&digest);
     Ok(Json(json!({
@@ -178,7 +176,7 @@ pub async fn serve_from_root(node: &Node, root: &[u8; 32]) -> Result<(), ApiErro
     if node.is_kata() {
         set_role_password(&node.pool, root).await?;
     }
-    node.start_serving(keys)?;
+    node.start_serving(keys).await?;
     on_database(node).await;
     Ok(())
 }
@@ -213,11 +211,11 @@ pub async fn unwrap_intermediates(node: &Node, root: &[u8; 32]) -> Result<Interm
         .map(Zeroizing::new)
         .map_err(|_| ApiError::internal("tenant-kek-root is not 32 bytes"))?;
     let ca_key_der = unwrap("ca", ca.as_ref().map(|r| r.wrapped.clone()))?;
-    Ok(Intermediates {
+    Intermediates::new(
         tenant_kek_root,
         ca_key_der,
-        ca_cert_der: ca.and_then(|r| r.public_part).unwrap_or_default(),
-    })
+        ca.and_then(|r| r.public_part).unwrap_or_default(),
+    )
 }
 
 pub async fn unseal(
@@ -259,12 +257,10 @@ pub async fn unseal(
             shares.clear();
         }
         // On Kata a wrong root is also a wrong database password: keep the refusal, not that.
-        if let Err(audit) = audit::node("node.unseal", "denied", e.details())
+        audit::node("node.unseal", "denied", e.details())
             .insert(&node.pool)
             .await
-        {
-            eprintln!("node.unseal denied: {audit}");
-        }
+            .ok();
         return Err(e);
     }
     audit::node("node.unseal", "ok", json!({}))
@@ -418,11 +414,12 @@ async fn join_via(
             ));
         }
     }
-    node.start_serving(Intermediates {
+    let keys = Intermediates::new(
         tenant_kek_root,
-        ca_key_der: Zeroizing::new(field("ca_key", &reply.ca_key)?),
-        ca_cert_der: field("ca_cert", &reply.ca_cert)?,
-    })?;
+        Zeroizing::new(field("ca_key", &reply.ca_key)?),
+        field("ca_cert", &reply.ca_cert)?,
+    )?;
+    node.start_serving(keys).await?;
     on_database(node).await;
     Ok(())
 }

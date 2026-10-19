@@ -94,7 +94,10 @@ async fn start_phase(node: &Arc<Node>) {
         }
     }
     match node::try_join(node).await {
-        Ok(()) => eprintln!("joined; serving"),
+        Ok(()) => {
+            eprintln!("joined; serving");
+            node.maintain().await;
+        }
         Err(e) => eprintln!("sealed: {}; waiting for unseal", e.message),
     }
 }
