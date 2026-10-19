@@ -28,7 +28,8 @@ spec:
         image: ${RUNTIME_IMAGE}
         env:
         - {name: ALPHACOMPUTE_KMS_CA_SPKI_SHA256, value: "${KMS_CA_SPKI_SHA256}"}
-        - {name: ALPHACOMPUTE_KMS_REVISIONS, value: "${KMS_REVISIONS}"}
+        - {name: ALPHACOMPUTE_PLATFORM_DOCUMENT_URL, value: "${PLATFORM_DOCUMENT_URL}"}
+        - {name: ALPHACOMPUTE_PLATFORM_MIN_VERSION, value: "${PLATFORM_MIN_VERSION}"}
         - {name: ALPHACOMPUTE_KMS_ENDPOINTS, value: "${KMS_ENDPOINTS}"}
         # An address, not a name: the host writes the pod's /etc/hosts.
         - {name: ALPHACOMPUTE_TLS_UPSTREAM, value: "127.0.0.1:8000"}
