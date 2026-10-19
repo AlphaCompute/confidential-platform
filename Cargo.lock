@@ -345,6 +345,7 @@ name = "alpha-runtime"
 version = "0.1.0"
 dependencies = [
  "alpha-attest",
+ "alpha-channel",
  "alpha-client",
  "alpha-core",
  "alpha-nvml",

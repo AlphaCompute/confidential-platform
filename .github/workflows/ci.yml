@@ -38,7 +38,7 @@ jobs:
           PLATFORM_DOCUMENT_URL: https://platform.invalid/document.json
           PCCS_URL: https://pccs.invalid
           KMS_CA_SPKI_SHA256: sha256:0000000000000000000000000000000000000000000000000000000000000000
-          KMS_REVISIONS: sha256:0000000000000000000000000000000000000000000000000000000000000000
+          PLATFORM_MIN_VERSION: "1"
           UPSTREAM_URL: https://upstream.invalid/v1
           MODELS: model
           MODEL_SERVERS: '{}'
