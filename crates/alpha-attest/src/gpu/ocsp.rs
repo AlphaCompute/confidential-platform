@@ -18,9 +18,6 @@ use x509_parser::time::ASN1Time;
 use super::{asn1_time, p384_key};
 use crate::AppraisalError;
 
-/// The responder every NVIDIA certificate names in its AIA.
-pub const NVIDIA_OCSP_URL: &str = "https://ocsp.ndis.nvidia.com/";
-
 /// `AlgorithmIdentifier { sha384, NULL }`, as OpenSSL and NVIDIA's verifier encode it.
 const SHA384_ID: [u8; 15] = [
     0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, 0x05, 0x00,
@@ -28,7 +25,6 @@ const SHA384_ID: [u8; 15] = [
 /// id-pkix-ocsp-nonce and id-pkix-ocsp-basic, 1.3.6.1.5.5.7.48.1.2 and .1.
 const NONCE_OID: [u8; 9] = [0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x02];
 const BASIC_OID: [u8; 9] = [0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x01];
-const CERTIFICATE_HOLD: u8 = 6;
 /// How far the responder's clock may run ahead of ours.
 const SKEW: Duration = Duration::from_secs(300);
 
@@ -70,7 +66,7 @@ impl OcspQuery {
 
     /// Accepts `response` only when it is a basic response for this certificate, signed by a
     /// responder the issuer delegated, echoing `nonce`, current at `now`, and `good`. A
-    /// certificate on hold is refused like a revoked one.
+    /// certificate on hold is revoked with reason `certificateHold`, so it is refused too.
     pub fn check(
         &self,
         response: &[u8],
@@ -100,8 +96,15 @@ impl OcspQuery {
 
         let mut basic = sequence(basic.data, "basic response")?;
         let (tbs, tbs_der) = next_raw(&mut basic, "response data")?;
-        let algorithm = algorithm(&next(&mut basic, "signature algorithm")?)?;
-        let signature = bit_string(&next(&mut basic, "signature")?)?;
+        let (_, algorithm) = Oid::from_der(next(&mut basic, "signature algorithm")?.data)
+            .map_err(|_| failed("signature algorithm"))?;
+        let signature = match next(&mut basic, "signature")? {
+            bits if bits.tag() == Tag::BitString => match bits.data.split_first() {
+                Some((0, signature)) => signature,
+                _ => return Err(failed("signature")),
+            },
+            _ => return Err(failed("signature")),
+        };
         let certs = next(&mut basic, "responder certificates")?;
         if !is_context(&certs, 0) || !basic.is_empty() {
             return Err(failed("response carries no responder certificate"));
@@ -160,19 +163,7 @@ impl OcspQuery {
 
         match (status.class(), status.tag().0) {
             (Class::ContextSpecific, 0) if status.data.is_empty() => Ok(()),
-            (Class::ContextSpecific, 1) => {
-                let mut info = status.data;
-                let _revoked_at = next(&mut info, "revocationTime")?;
-                let reason = next(&mut info, "revocationReason")
-                    .ok()
-                    .and_then(|r| only(r.data))
-                    .and_then(|r| r.data.first().copied());
-                Err(failed(if reason == Some(CERTIFICATE_HOLD) {
-                    format!("certificate {subject} is on hold")
-                } else {
-                    format!("certificate {subject} is revoked")
-                }))
-            }
+            (Class::ContextSpecific, 1) => Err(failed(format!("certificate {subject} is revoked"))),
             (Class::ContextSpecific, 2) => {
                 Err(failed(format!("responder does not know {subject}")))
             }
@@ -301,19 +292,6 @@ fn extensions(data: &[u8]) -> Result<Vec<(Oid<'_>, Vec<u8>)>, AppraisalError> {
     Ok(out)
 }
 
-fn algorithm<'a>(field: &Any<'a>) -> Result<Oid<'a>, AppraisalError> {
-    Oid::from_der(field.data)
-        .map(|(_, oid)| oid)
-        .map_err(|_| failed("signature algorithm"))
-}
-
-fn bit_string<'a>(field: &Any<'a>) -> Result<&'a [u8], AppraisalError> {
-    match field.data.split_first() {
-        Some((0, bits)) if field.tag() == Tag::BitString => Ok(bits),
-        _ => Err(failed("signature")),
-    }
-}
-
 fn time(der: &[u8]) -> Result<ASN1Time, AppraisalError> {
     match ASN1Time::from_der(der) {
         Ok(([], time)) => Ok(time),
@@ -330,14 +308,6 @@ fn sequence<'a>(data: &'a [u8], what: &str) -> Result<&'a [u8], AppraisalError> 
     match Any::from_der(data) {
         Ok(([], any)) if any.tag() == Tag::Sequence => Ok(any.data),
         _ => Err(failed(what)),
-    }
-}
-
-/// The one element `data` holds.
-fn only(data: &[u8]) -> Option<Any<'_>> {
-    match Any::from_der(data) {
-        Ok(([], any)) => Some(any),
-        _ => None,
     }
 }
 
@@ -491,10 +461,7 @@ mod tests {
         let code_signing = vec![ExtendedKeyUsagePurpose::CodeSigning];
         let cases = [
             (response(&query, &ca, ocsp(), &revoked(1)), "is revoked"),
-            (
-                response(&query, &ca, ocsp(), &revoked(CERTIFICATE_HOLD)),
-                "is on hold",
-            ),
+            (response(&query, &ca, ocsp(), &revoked(6)), "is revoked"),
             (
                 response(&query, &ca, ocsp(), &der(0x82, &[]).unwrap()),
                 "does not know",

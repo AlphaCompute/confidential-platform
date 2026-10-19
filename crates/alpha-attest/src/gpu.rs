@@ -25,7 +25,7 @@ use crate::{AppraisalError, KataReference, Measurement, base64url};
 mod ocsp;
 mod rim;
 
-pub use ocsp::{NVIDIA_OCSP_URL, OcspQuery};
+pub use ocsp::OcspQuery;
 pub use rim::gpu_reference;
 
 /// One GPU's evidence as NVML hands it out: the request and signed response of SPDM

@@ -217,11 +217,9 @@ fn verify_rim(xml: &[u8], now: SystemTime) -> Result<Rim, AppraisalError> {
         product: attribute(meta, "product")?.to_owned(),
         measurements,
         signers: ders
-            .windows(2)
-            .filter_map(|pair| match pair {
-                [cert, issuer] => Some(OcspQuery::new(cert.clone(), issuer.clone())),
-                _ => None,
-            })
+            .iter()
+            .zip(ders.iter().skip(1))
+            .map(|(cert, issuer)| OcspQuery::new(cert.clone(), issuer.clone()))
             .collect(),
     })
 }
