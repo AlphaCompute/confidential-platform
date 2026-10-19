@@ -43,14 +43,14 @@ fifth for a wrapped compose or a Kata pod with an Endpoint, and two optional one
 Endpoint.
 `ALPHACOMPUTE_KMS_CA_SPKI_SHA256` (`sha256:<hex>` of the KMS CA's SubjectPublicKeyInfo) and the
 KMS Revisions are in the measured compose on dstack, and in the policy-pinned environment on Kata,
-and are all the runtime trusts: before the first request it refuses a KMS whose chain does not end
+and are all the runtime trusts, with the release key set when the Revisions come from the document: before the first request it refuses a KMS whose chain does not end
 at a CA with that key or whose leaf carries no allowed Revision, and moves on to the next entry of
 `ALPHACOMPUTE_KMS_ENDPOINTS`. The Revisions are either `ALPHACOMPUTE_KMS_REVISIONS`
 (comma-separated `sha256:<hex>`, not empty), so a new KMS build needs a new Revision of the App, or
 the `kms_revisions` of the platform document at `ALPHACOMPUTE_PLATFORM_DOCUMENT_URL` (`https://`),
 fetched before every attestation and verified under the release key set compiled in (the `dev`
-set when `alpha-channel/dev` is on). A document below `ALPHACOMPUTE_PLATFORM_MIN_VERSION` (from 1)
-or below one this process accepted is not taken; a failed fetch keeps the accepted one, and with
+set when `alpha-channel/dev` is on). A document below `ALPHACOMPUTE_PLATFORM_MIN_VERSION` (from 1),
+or not above one this process accepted, is not taken; a failed fetch keeps the accepted one, and with
 none the attestation fails. The document's `kms_ca_pem` is never read, so no document moves the
 App to another CA. Setting both forms, or neither, is refused at start. `ALPHACOMPUTE_SECRETS`,
 also measured, is a JSON object of service name to the Secret names it declared, for example
