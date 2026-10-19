@@ -210,11 +210,10 @@ fn delegated(
     now: SystemTime,
 ) -> Result<(), AppraisalError> {
     let name = responder.subject().to_string();
-    let algorithm = responder.signature_algorithm.algorithm.clone();
     if responder.issuer().as_raw() != issuer.subject().as_raw()
         || !verify(
             &p384_key(issuer)?,
-            &algorithm,
+            &responder.signature_algorithm.algorithm,
             responder.tbs_certificate.as_ref(),
             &responder.signature_value.data,
         )
