@@ -1,5 +1,5 @@
-//! PRD-06 "evidence to the customer", the Alpha side (draft): an organization exports the KMS's
-//! decisions about its own Instances, signed by the node, and an auditor checks the answer offline.
+//! Customer evidence export: an organization exports the KMS's decisions about its own Instances,
+//! signed by the node, and an auditor checks the answer offline.
 //! Needs `DATABASE_URL`; skipped without it.
 
 #![allow(
@@ -101,15 +101,15 @@ async fn an_organization_reads_its_own_decisions_signed_by_the_kms() {
     assert!(actions.contains(&("secret.get", "ok")), "{actions:?}");
     assert!(actions.contains(&("secret.get", "denied")), "{actions:?}");
     assert!(actions.contains(&("key.derive", "ok")), "{actions:?}");
-    // Control calls are not decisions about Instances (QUESTION(PRD-06 Q1)).
+    // Control calls (secret.put, key registration) are not decisions about Instances.
     assert!(!actions.iter().any(|(a, _)| a.starts_with("secret.put")));
-    // The attest row carries the signed verifier claims of #90 and the evidence digest.
+    // The attest row carries the attestation result details and evidence digest.
     let attest = decisions
         .rows
         .iter()
         .find(|r| r.action == "attest")
         .unwrap();
-    assert!(attest.details.get("verifiers").is_some(), "{attest:?}");
+    assert!(attest.details.get("verdict").is_some(), "{attest:?}");
     assert!(
         attest
             .evidence_sha256

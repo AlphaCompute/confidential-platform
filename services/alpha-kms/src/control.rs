@@ -4,7 +4,9 @@
 
 use std::sync::Arc;
 
-use alpha_core::{AppId, ComposeHash, KataPolicy, KeyId, KeyKind, OrgId, PrincipalId, SecretId, context};
+use alpha_core::{
+    AppId, ComposeHash, KataPolicy, KeyId, KeyKind, OrgId, PrincipalId, SecretId, context,
+};
 use axum::Json;
 use axum::extract::{Path, State};
 use base64::Engine;
@@ -48,7 +50,10 @@ pub struct PutBody {
 
 const ISSUED_AT_WINDOW: Duration = Duration::minutes(5);
 
-pub(crate) fn within_window(at: DateTime<Utc>, now: DateTime<Utc>) -> Result<DateTime<Utc>, ApiError> {
+pub(crate) fn within_window(
+    at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<DateTime<Utc>, ApiError> {
     if at.signed_duration_since(now).abs() > ISSUED_AT_WINDOW {
         return Err(ApiError::malformed("issued_at is outside ±5 minutes"));
     }
