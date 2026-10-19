@@ -268,17 +268,17 @@ Each is the operator's, chosen per environment; none has a default.
 
 The guest pulls every image itself, anonymously: the init-data carries no registry configuration.
 So every image is a public ghcr.io package, referenced by digest. A release pushes
-`ghcr.io/alphacompute/<name>` for each image and prints `pushed <image>@sha256:…` in its summary;
-the `<name>-digest` artifact holds the same reference. A new package is private until an
+`ghcr.io/alphacompute/<name>` for each image and prints `pushed <image>@sha256:…` in its summary.
+A new package is private until an
 organization owner makes it public in its package settings; a workflow cannot.
 
 | Input | Templates | What |
 |---|---|---|
-| `RUNTIME_IMAGE` | all | `ghcr.io/alphacompute/alpha-runtime@sha256:…` from the release |
+| `RUNTIME_IMAGE` | all | the `alpha-runtime` release image by digest |
 | `KMS_CA_SPKI_SHA256`, `KMS_REVISIONS` | all | what `alpha sign --check` prints for the served document |
 | `KMS_ENDPOINTS` | all | `KMS_KATA_ENDPOINTS` |
 | `INFERENCE_APP_ID`, `GUARD_APP_ID`, `BROKER_APP_ID`, `MODEL_APP_ID` | one each | the service's App id |
-| `INFERENCE_IMAGE`, `GUARD_IMAGE`, `BROKER_IMAGE` | one each | `ghcr.io/alphacompute/alpha-<service>@sha256:…` from the release |
+| `INFERENCE_IMAGE`, `GUARD_IMAGE`, `BROKER_IMAGE` | one each | the service's release image by digest |
 | `MODELS`, `MODEL_SERVERS` | inference | `services/alpha-inference/README.md`; `MODEL_SERVERS` is `{}` when RedPill serves every model, and a model server's `url` is `https://<MODEL_NAME>.alpha-models.svc:8443` |
 | `UPSTREAM_URL`, `PCCS_URL`, `UPSTREAM_POLICY` | inference | RedPill's settings; with every model on our own servers, delete their three lines before rendering |
 | `INFERENCE_REVISIONS`, `GUARD_CALLER_APPS` | guard | the front's registered Revisions; the App ids that may ask for a verdict (`CALLER_APPS`) |
