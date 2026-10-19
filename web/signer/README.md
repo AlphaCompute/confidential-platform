@@ -73,7 +73,8 @@ forbids framing, inline code, string evaluation and any other origin. `connect-s
 only while the document's `api_origin` is the page's own origin; a host whose API lives on another
 origin adds it to `connect-src`, or every call fails as unavailable.
 
-On dev, shroud-go serves the page and embeds a copy of this build.
+On dev, shroud-go serves the page and embeds a copy of this build. It serves `/sign/embed` as
+below once that copy ships `headers-embed` (AlphaCompute/shroud-go#467).
 
 ## The embed view (PRD-03 S5, draft)
 
@@ -85,9 +86,12 @@ one view of this page another origin may frame:
   release-signed document lists at most eight exact https origins (no wildcard, path or scheme
   source; never a signer origin). Empty, the default, means no page may frame the view. The host
   serves `/sign/embed` with `headers-embed`, replacing `@EMBED_ANCESTORS@` with that list,
-  space-separated, or with `'none'` when it is empty. In Chromium and Safari the page also checks
-  `location.ancestorOrigins` against the list and refuses if any page around it is not listed;
-  Firefox has no such list, so there the host's `frame-ancestors` is the only check.
+  space-separated, or with `'none'` when it is empty. The host reads the list only from a
+  document that verifies under the release key, and serves `'none'` rather than a partial list if
+  the document does not verify or any entry is not one alpha-core accepts. In Chromium and Safari
+  the page also checks `location.ancestorOrigins` against the list and refuses if any page around
+  it is not listed; Firefox has no such list, so there the host's `frame-ancestors` is the only
+  check.
 - **It never signs.** It shows which launch waits (organization, title, App, compose_hash, when
   the link closes) and one button, "Review and approve", which opens `/sign/approve#<ticket>` in
   a new top-level window with `noopener`. The passkey prompt, the full launch view and every
@@ -110,8 +114,6 @@ Still open (draft):
   (`publickey-credentials-get` delegated to the portal; proposed: no).
 - QUESTION(PRD-03 Q17), Ryan Tharp: whether Firefox, without `ancestorOrigins`, may rely on
   `frame-ancestors` alone (proposed: yes; it is the browser's own enforcement).
-- TODO(draft): shroud-go serves `/sign/embed` with `headers-embed` filled from the document it
-  serves; until it does, the path is not served and nothing can frame the view.
 - TODO(draft): the rafay-plugins adapter shows only `approval_url`; how the portal learns the
   embed URL (the same ticket under `/sign/embed`) waits on Q14.
 - TODO(draft): if the portal sends `Cross-Origin-Embedder-Policy: require-corp`, the view needs
