@@ -162,8 +162,9 @@ export ALPHACOMPUTE_PCCS_URL=$(gh variable get KMS_KATA_PCCS_URL -R AlphaCompute
    role a new genesis password (`alter role alpha_kms_node password …`, as in step 4), migrate and
    bootstrap again after `kubectl -n alpha-kms delete pod kms-0`.
 
-8. **Re-sign the document** with `kms_ca_pem`; `alpha sign --check` prints the CA's SPKI SHA-256
-   and the Revisions, the two values a tenant pins.
+8. **Re-sign the document** with `kms_ca_pem`; `alpha sign --check` prints its `version`, the
+   CA's SPKI SHA-256 and the Revisions. A tenant pins the SPKI, and either the Revisions or the
+   document with that `version` as the minimum.
 
 9. **The other node.** `kms-1` joins `kms-0` on start, which needs the re-signed document. If it
    started before and stays sealed, `kubectl -n alpha-kms delete pod kms-1`; the StatefulSet
@@ -199,12 +200,15 @@ through the nodes' API and the database.
 
 - **Restart.** The StatefulSet recreates a lost node pod; it comes back sealed and joins the
   serving node.
-- **Upgrade.** Sign a document listing the old and the new Revision; every tenant App that pins
-  the KMS gets a Revision listing both. Then `kubectl apply -f` the new release's `kms-node.yaml`:
+- **Upgrade.** Sign a document listing the old and the new Revision; an App that reads the
+  Revisions from the document, as the templates below do, follows it, and an App that lists them in
+  `ALPHACOMPUTE_KMS_REVISIONS` gets a Revision listing both. Then `kubectl apply -f` the new release's `kms-node.yaml`:
   the StatefulSet replaces `kms-1`, waits until it has joined and is ready, then replaces `kms-0`.
   If the new `kms-1` never becomes ready, apply the old file, then
   `kubectl -n alpha-kms delete pod kms-1`: the StatefulSet does not replace a pod that is not ready.
-  Drop the old Revision once no tenant pins it.
+  Drop the old Revision once no App lists it. A restarted pod of a document-pinned App still
+  accepts any document from its `PLATFORM_MIN_VERSION` on, so to retire a build for good, render
+  and register those Apps again with the version of the document that drops it.
 - **All nodes lost.** Port-forward to `pod/kms-0` as in step 6, and two custodians each export
   the two variables of Day 0 and, with the one share they were handed, run
   `alpha unseal --share share-[1-3].json --key custodian.key --endpoint https://localhost:8443`.
@@ -266,10 +270,16 @@ them with the rest of `/opt/kata`.
 
 Each is the operator's, chosen per environment; none has a default.
 
+The guest pulls every image itself, anonymously, as a CVM does ([`../README.md`](../README.md#pulling-from-ghcr)):
+the init-data carries no registry configuration. An image input is the `<image>@sha256:…`
+reference after `pushed` in the release summary. A new package is private until a package admin makes it
+public in its package settings; a workflow cannot.
+
 | Input | Templates | What |
 |---|---|---|
 | `RUNTIME_IMAGE` | all | the `alpha-runtime` release image by digest |
-| `KMS_CA_SPKI_SHA256`, `KMS_REVISIONS` | all | what `alpha sign --check` prints for the served document |
+| `KMS_CA_SPKI_SHA256` | all | the CA's SPKI SHA-256 that `alpha sign --check` prints for the served document |
+| `PLATFORM_DOCUMENT_URL`, `PLATFORM_MIN_VERSION` | all | `KMS_KATA_PLATFORM_DOCUMENT_URL` and the `version` `alpha sign --check` prints for it: the runtime takes the KMS Revisions from that document and refuses one below this version |
 | `KMS_ENDPOINTS` | all | `KMS_KATA_ENDPOINTS` |
 | `INFERENCE_APP_ID`, `GUARD_APP_ID`, `BROKER_APP_ID`, `MODEL_APP_ID` | one each | the service's App id |
 | `INFERENCE_IMAGE`, `GUARD_IMAGE`, `BROKER_IMAGE` | one each | the service's release image by digest |
@@ -288,16 +298,23 @@ Each is the operator's, chosen per environment; none has a default.
 The weights are not sealed: they are layers of an image whose digest the policy pins, and the
 guest's pull checks every layer against it, so a pod runs exactly the weights the digest names.
 
+The image lives in a public ghcr.io repository, `MODEL_REPOSITORY`
+(`ghcr.io/alphacompute/<model>`). ghcr.io refuses a layer over 10 GB, so the weights go in
+several `COPY` lines, each with less than 10 GB of shards. Keep the image under 128 layers with
+the base's: the guest's overlayfs refuses a deeper one, and only at the pull.
+
 ```dockerfile
 FROM vllm/vllm-openai@sha256:<the pinned vLLM release>
-COPY <the model's directory> /weights
+COPY <the model's config and tokenizer files> /weights/
+COPY <shards 1 and 2> /weights/
+COPY <shards 3 and 4> /weights/
 ```
 
-Build and push it to the repository `MODEL_REPOSITORY` names (`registry/path`), and set
-`MODEL_IMAGE` to its digest:
+Build and push it, and set `MODEL_IMAGE` to its digest:
 
 ```sh
-docker build -t "$MODEL_REPOSITORY" . && docker push "$MODEL_REPOSITORY" &&
+: "${MODEL_REPOSITORY:?}" &&
+  docker build -t "$MODEL_REPOSITORY" . && docker push "$MODEL_REPOSITORY" &&
   MODEL_IMAGE=$(docker inspect --format '{{index .RepoDigests 0}}' "$MODEL_REPOSITORY") &&
   export MODEL_IMAGE
 ```

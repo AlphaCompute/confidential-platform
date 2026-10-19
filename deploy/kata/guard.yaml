@@ -24,7 +24,8 @@ spec:
         image: ${RUNTIME_IMAGE}
         env:
         - {name: ALPHACOMPUTE_KMS_CA_SPKI_SHA256, value: "${KMS_CA_SPKI_SHA256}"}
-        - {name: ALPHACOMPUTE_KMS_REVISIONS, value: "${KMS_REVISIONS}"}
+        - {name: ALPHACOMPUTE_PLATFORM_DOCUMENT_URL, value: "${PLATFORM_DOCUMENT_URL}"}
+        - {name: ALPHACOMPUTE_PLATFORM_MIN_VERSION, value: "${PLATFORM_MIN_VERSION}"}
         - {name: ALPHACOMPUTE_KMS_ENDPOINTS, value: "${KMS_ENDPOINTS}"}
         securityContext:
           runAsUser: 0

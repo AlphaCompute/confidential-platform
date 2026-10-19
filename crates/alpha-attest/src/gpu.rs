@@ -286,7 +286,10 @@ pub fn device_ocsp_queries(gpus: &[GpuEvidence]) -> Result<Vec<OcspQuery>, Appra
 /// already.
 fn add_queries(queries: &mut Vec<OcspQuery>, chain: &[Vec<u8>]) {
     for (cert, issuer) in chain.iter().zip(chain.iter().skip(1)) {
-        let query = OcspQuery::new(cert.clone(), issuer.clone());
+        let query = OcspQuery {
+            cert: cert.clone(),
+            issuer: issuer.clone(),
+        };
         if !queries.contains(&query) {
             queries.push(query);
         }

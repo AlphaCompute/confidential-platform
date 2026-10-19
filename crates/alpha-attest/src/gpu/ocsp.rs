@@ -37,15 +37,11 @@ fn failed(what: impl Into<String>) -> AppraisalError {
 /// A certificate whose status NVIDIA's responder reports, and the certificate that issued it.
 #[derive(Debug, PartialEq, Eq)]
 pub struct OcspQuery {
-    cert: Vec<u8>,
-    issuer: Vec<u8>,
+    pub(super) cert: Vec<u8>,
+    pub(super) issuer: Vec<u8>,
 }
 
 impl OcspQuery {
-    pub fn new(cert: Vec<u8>, issuer: Vec<u8>) -> Self {
-        Self { cert, issuer }
-    }
-
     /// The DER `OCSPRequest` for this certificate, carrying `nonce`.
     pub fn request(&self, nonce: &[u8; 32]) -> Result<Vec<u8>, AppraisalError> {
         let (_, _, cert_id) = self.parse()?;
@@ -86,7 +82,7 @@ impl OcspQuery {
         let kind = Oid::from_der(bytes).map_err(|_| failed("response type"))?;
         bytes = kind.0;
         let basic = next(&mut bytes, "basic response")?;
-        if kind.1.as_bytes() != BASIC_OID || basic.tag() != Tag::OctetString {
+        if kind.1.as_bytes() != BASIC_OID || basic.tag() != Tag::OctetString || !bytes.is_empty() {
             return Err(failed("not a basic response"));
         }
 
@@ -150,6 +146,13 @@ impl OcspQuery {
         let next_update = is_context(&next_update, 0)
             .then(|| time(next_update.data))
             .ok_or_else(|| failed("response has no nextUpdate"))??;
+        if !single.is_empty() {
+            let exts = next(&mut single, "single extensions")?;
+            if !is_context(&exts, 1) || !single.is_empty() {
+                return Err(failed("single response"));
+            }
+            extensions(exts.data)?;
+        }
         let ahead = now.checked_add(SKEW).ok_or_else(|| failed("now"))?;
         if this_update > asn1_time(ahead)? || asn1_time(now)? >= next_update {
             return Err(failed(format!(
@@ -230,6 +233,11 @@ fn delegated(
     {
         return Err(failed(format!("responder {name} is not for OCSP signing")));
     }
+    if responder.key_usage().map_or(true, |ku| {
+        ku.is_some_and(|ku| !ku.value.digital_signature())
+    }) {
+        return Err(failed(format!("responder {name} may not sign")));
+    }
     if !responder.validity().is_valid_at(asn1_time(now)?) {
         return Err(failed(format!("responder {name} is outside its validity")));
     }
@@ -275,7 +283,8 @@ fn certificates(mut data: &[u8]) -> Result<Vec<X509Certificate<'_>>, AppraisalEr
     Ok(certs)
 }
 
-/// `(extnID, extnValue)` of each extension in `[n] EXPLICIT Extensions`.
+/// `(extnID, extnValue)` of each extension in `[n] EXPLICIT Extensions`, refusing a critical one
+/// other than the nonce: it would change what the answer means.
 fn extensions(data: &[u8]) -> Result<Vec<(Oid<'_>, &[u8])>, AppraisalError> {
     let mut list = sequence(data, "extensions")?;
     let mut out = Vec::new();
@@ -285,6 +294,9 @@ fn extensions(data: &[u8]) -> Result<Vec<(Oid<'_>, &[u8])>, AppraisalError> {
         ext = rest;
         let mut value = next(&mut ext, "extension value")?;
         if value.tag() == Tag::Boolean {
+            if value.data != [0] && oid.as_bytes() != NONCE_OID {
+                return Err(failed(format!("unknown critical extension {oid}")));
+            }
             value = next(&mut ext, "extension value")?;
         }
         if value.tag() != Tag::OctetString || !ext.is_empty() {
@@ -372,15 +384,18 @@ mod tests {
         CertifiedIssuer::self_signed(params, key).unwrap()
     }
 
-    /// A response for `query` with `status`, from a responder `ca` issues with `eku`.
+    /// A response for `query` with `status` and then `tail` in its single response, from a
+    /// responder `ca` issues with `eku` and `ku`.
     fn response(
         query: &OcspQuery,
         ca: &CertifiedIssuer<'_, KeyPair>,
-        eku: Vec<ExtendedKeyUsagePurpose>,
+        (eku, ku): (ExtendedKeyUsagePurpose, KeyUsagePurpose),
         status: &[u8],
+        tail: &[u8],
     ) -> Vec<u8> {
         let mut params = CertificateParams::new(vec![]).unwrap();
-        params.extended_key_usages = eku;
+        params.extended_key_usages = vec![eku];
+        params.key_usages = vec![ku];
         let key = KeyPair::generate_for(&PKCS_ECDSA_P384_SHA384).unwrap();
         let responder = params.signed_by(&key, ca).unwrap();
         let signer: SigningKey = p384::SecretKey::from_pkcs8_der(&key.serialize_der())
@@ -394,6 +409,7 @@ mod tests {
                 status,
                 &time("20261019100000Z"),
                 &der(0xa0, &[&time("20261020100000Z")]).unwrap(),
+                tail,
             ],
         )
         .unwrap();
@@ -439,13 +455,21 @@ mod tests {
             .unwrap()
             .signed_by(&key, &ca)
             .unwrap();
-        let query = OcspQuery::new(cert.der().to_vec(), ca.der().to_vec());
-        let ocsp = || vec![ExtendedKeyUsagePurpose::OcspSigning];
+        let query = OcspQuery {
+            cert: cert.der().to_vec(),
+            issuer: ca.der().to_vec(),
+        };
+        let ocsp = || {
+            (
+                ExtendedKeyUsagePurpose::OcspSigning,
+                KeyUsagePurpose::DigitalSignature,
+            )
+        };
         // 2026-10-19 12:00 UTC, inside the responses' validity.
         let now = std::time::UNIX_EPOCH + Duration::from_secs(1_792_411_200);
         let good = der(0x80, &[]).unwrap();
         let check = |response: Vec<u8>| query.check(&response, &NONCE, now);
-        check(response(&query, &ca, ocsp(), &good)).unwrap();
+        check(response(&query, &ca, ocsp(), &good, &[])).unwrap();
 
         let revoked = |reason: u8| {
             der(
@@ -457,20 +481,58 @@ mod tests {
             )
             .unwrap()
         };
-        let code_signing = vec![ExtendedKeyUsagePurpose::CodeSigning];
+        let code_signing = (
+            ExtendedKeyUsagePurpose::CodeSigning,
+            KeyUsagePurpose::DigitalSignature,
+        );
+        let cert_signing = (
+            ExtendedKeyUsagePurpose::OcspSigning,
+            KeyUsagePurpose::KeyCertSign,
+        );
+        let critical = der(
+            0xa1,
+            &[&der(
+                0x30,
+                &[&der(
+                    0x30,
+                    &[
+                        &der(0x06, &[&[0x2a, 0x03, 0x04]]).unwrap(),
+                        &[0x01, 0x01, 0xff],
+                        &der(0x04, &[]).unwrap(),
+                    ],
+                )
+                .unwrap()],
+            )
+            .unwrap()],
+        )
+        .unwrap();
         let cases = [
-            (response(&query, &ca, ocsp(), &revoked(1)), "is revoked"),
-            (response(&query, &ca, ocsp(), &revoked(6)), "is revoked"),
             (
-                response(&query, &ca, ocsp(), &der(0x82, &[]).unwrap()),
+                response(&query, &ca, ocsp(), &good, &critical),
+                "unknown critical extension 1.2.3.4",
+            ),
+            (
+                response(&query, &ca, ocsp(), &revoked(1), &[]),
+                "is revoked",
+            ),
+            (
+                response(&query, &ca, ocsp(), &revoked(6), &[]),
+                "is revoked",
+            ),
+            (
+                response(&query, &ca, ocsp(), &der(0x82, &[]).unwrap(), &[]),
                 "does not know",
             ),
             (
-                response(&query, &ca, code_signing, &good),
+                response(&query, &ca, code_signing, &good, &[]),
                 "is not for OCSP signing",
             ),
             (
-                response(&query, &self::ca(), ocsp(), &good),
+                response(&query, &ca, cert_signing, &good, &[]),
+                "may not sign",
+            ),
+            (
+                response(&query, &self::ca(), ocsp(), &good, &[]),
                 "is not issued by the issuer",
             ),
         ];
