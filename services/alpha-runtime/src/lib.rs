@@ -612,16 +612,20 @@ impl Runtime {
             .and_then(|signed| alpha_client::platform::verify(&signed, keys, self.now()));
         let mut accepted = self.accepted.lock();
         let current = accepted.as_ref().map(|(version, _)| *version);
-        let floor = current.map_or(min_version, |v| v.saturating_add(1));
+        let newer = |version: u64| current.map_or(version >= min_version, |v| version > v);
         let refused = match fetched {
-            Ok(doc) if doc.version >= floor => {
+            Ok(doc) if newer(doc.version) => {
                 let revisions: Vec<ComposeHash> =
                     doc.kms_revisions.iter().map(|r| r.compose_hash).collect();
                 *accepted = Some((doc.version, revisions.clone()));
                 return Ok(revisions);
             }
             Ok(doc) if Some(doc.version) == current => None,
-            Ok(doc) => Some(format!("version {} is below {floor}", doc.version)),
+            Ok(doc) => Some(format!(
+                "version {} is below {}",
+                doc.version,
+                current.unwrap_or(min_version)
+            )),
             Err(e) => Some(e.to_string()),
         };
         match (accepted.as_ref(), refused) {
