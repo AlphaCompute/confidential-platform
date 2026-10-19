@@ -388,18 +388,9 @@ mod tests {
         CertifiedIssuer::self_signed(params, key).unwrap()
     }
 
-    fn response(
-        query: &OcspQuery,
-        ca: &CertifiedIssuer<'_, KeyPair>,
-        usages: (ExtendedKeyUsagePurpose, KeyUsagePurpose),
-        status: &[u8],
-    ) -> Vec<u8> {
-        response_with(query, ca, usages, status, &[])
-    }
-
     /// A response for `query` with `status` and then `tail` in its single response, from a
     /// responder `ca` issues with `eku` and `ku`.
-    fn response_with(
+    fn response(
         query: &OcspQuery,
         ca: &CertifiedIssuer<'_, KeyPair>,
         (eku, ku): (ExtendedKeyUsagePurpose, KeyUsagePurpose),
@@ -479,7 +470,7 @@ mod tests {
         let now = std::time::UNIX_EPOCH + Duration::from_secs(1_792_411_200);
         let good = der(0x80, &[]).unwrap();
         let check = |response: Vec<u8>| query.check(&response, &NONCE, now);
-        check(response(&query, &ca, ocsp(), &good)).unwrap();
+        check(response(&query, &ca, ocsp(), &good, &[])).unwrap();
 
         let revoked = |reason: u8| {
             der(
@@ -518,22 +509,31 @@ mod tests {
         .unwrap();
         let cases = [
             (
-                response_with(&query, &ca, ocsp(), &good, &critical),
+                response(&query, &ca, ocsp(), &good, &critical),
                 "unknown critical extension 1.2.3.4",
             ),
-            (response(&query, &ca, ocsp(), &revoked(1)), "is revoked"),
-            (response(&query, &ca, ocsp(), &revoked(6)), "is revoked"),
             (
-                response(&query, &ca, ocsp(), &der(0x82, &[]).unwrap()),
+                response(&query, &ca, ocsp(), &revoked(1), &[]),
+                "is revoked",
+            ),
+            (
+                response(&query, &ca, ocsp(), &revoked(6), &[]),
+                "is revoked",
+            ),
+            (
+                response(&query, &ca, ocsp(), &der(0x82, &[]).unwrap(), &[]),
                 "does not know",
             ),
             (
-                response(&query, &ca, code_signing, &good),
+                response(&query, &ca, code_signing, &good, &[]),
                 "is not for OCSP signing",
             ),
-            (response(&query, &ca, cert_signing, &good), "may not sign"),
             (
-                response(&query, &self::ca(), ocsp(), &good),
+                response(&query, &ca, cert_signing, &good, &[]),
+                "may not sign",
+            ),
+            (
+                response(&query, &self::ca(), ocsp(), &good, &[]),
                 "is not issued by the issuer",
             ),
         ];
