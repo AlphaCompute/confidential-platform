@@ -295,8 +295,8 @@ guest's pull checks every layer against it, so a pod runs exactly the weights th
 
 The image lives in a public ghcr.io repository, `MODEL_REPOSITORY`
 (`ghcr.io/alphacompute/<model>`). ghcr.io refuses a layer over 10 GB, so the weights go in
-several `COPY` lines of a few shards each. Keep the image under 128 layers with the base's: the
-guest's overlayfs refuses a deeper one, and only at the pull.
+several `COPY` lines, each with less than 10 GB of shards. Keep the image under 128 layers with
+the base's: the guest's overlayfs refuses a deeper one, and only at the pull.
 
 ```dockerfile
 FROM vllm/vllm-openai@sha256:<the pinned vLLM release>
@@ -308,7 +308,8 @@ COPY <shards 3 and 4> /weights/
 Build and push it, and set `MODEL_IMAGE` to its digest:
 
 ```sh
-docker build -t "$MODEL_REPOSITORY" . && docker push "$MODEL_REPOSITORY" &&
+: "${MODEL_REPOSITORY:?}" &&
+  docker build -t "$MODEL_REPOSITORY" . && docker push "$MODEL_REPOSITORY" &&
   MODEL_IMAGE=$(docker inspect --format '{{index .RepoDigests 0}}' "$MODEL_REPOSITORY") &&
   export MODEL_IMAGE
 ```
