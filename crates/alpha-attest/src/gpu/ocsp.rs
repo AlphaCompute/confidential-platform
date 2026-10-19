@@ -35,7 +35,7 @@ fn failed(what: impl Into<String>) -> AppraisalError {
 }
 
 /// A certificate whose status NVIDIA's responder reports, and the certificate that issued it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct OcspQuery {
     cert: Vec<u8>,
     issuer: Vec<u8>,
@@ -340,7 +340,10 @@ fn der(tag: u8, parts: &[&[u8]]) -> Result<Vec<u8>, AppraisalError> {
     match (u8::try_from(len), u16::try_from(len)) {
         (Ok(n), _) if n < 0x80 => out.push(n),
         (Ok(n), _) => out.extend([0x81, n]),
-        (_, Ok(n)) => out.extend([[0x82].as_slice(), &n.to_be_bytes()].concat()),
+        (_, Ok(n)) => {
+            out.push(0x82);
+            out.extend(n.to_be_bytes());
+        }
         _ => return Err(failed("length")),
     }
     parts.iter().for_each(|p| out.extend_from_slice(p));
