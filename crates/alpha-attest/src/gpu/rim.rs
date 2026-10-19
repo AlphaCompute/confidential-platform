@@ -77,7 +77,7 @@ pub fn gpu_reference(
                 rim.product, rim.version, opaque.chip
             )));
         }
-        add_queries(&mut signers, &rim.chain, 0);
+        add_queries(&mut signers, &rim.chain);
         for (block, values) in rim.measurements {
             if covered.insert(block, values).is_some() {
                 return Err(failed(format!("block {block} is active in both RIMs")));

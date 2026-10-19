@@ -276,15 +276,16 @@ fn pem_chain(gpu: &GpuEvidence) -> Result<Vec<Vec<u8>>, AppraisalError> {
 pub fn device_ocsp_queries(gpus: &[GpuEvidence]) -> Result<Vec<OcspQuery>, AppraisalError> {
     let mut queries = Vec::new();
     for gpu in gpus {
-        add_queries(&mut queries, &pem_chain(gpu)?, 1);
+        let chain = pem_chain(gpu)?;
+        add_queries(&mut queries, chain.get(1..).unwrap_or_default());
     }
     Ok(queries)
 }
 
-/// Adds a query for each certificate of a verified chain from `first` on, the root excluded,
-/// unless `queries` holds it already.
-fn add_queries(queries: &mut Vec<OcspQuery>, chain: &[Vec<u8>], first: usize) {
-    for (cert, issuer) in chain.iter().zip(chain.iter().skip(1)).skip(first) {
+/// Adds a query for each certificate of a verified chain but the root, unless `queries` holds it
+/// already.
+fn add_queries(queries: &mut Vec<OcspQuery>, chain: &[Vec<u8>]) {
+    for (cert, issuer) in chain.iter().zip(chain.iter().skip(1)) {
         let query = OcspQuery::new(cert.clone(), issuer.clone());
         if !queries.contains(&query) {
             queries.push(query);
