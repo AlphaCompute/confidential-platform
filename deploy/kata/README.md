@@ -270,6 +270,11 @@ them with the rest of `/opt/kata`.
 
 Each is the operator's, chosen per environment; none has a default.
 
+The guest pulls every image itself, anonymously, as a CVM does ([`../README.md`](../README.md#pulling-from-ghcr)):
+the init-data carries no registry configuration. An image input is the `<image>@sha256:…`
+reference after `pushed` in the release summary. A new package is private until a package admin makes it
+public in its package settings; a workflow cannot.
+
 | Input | Templates | What |
 |---|---|---|
 | `RUNTIME_IMAGE` | all | the `alpha-runtime` release image by digest |
@@ -293,16 +298,23 @@ Each is the operator's, chosen per environment; none has a default.
 The weights are not sealed: they are layers of an image whose digest the policy pins, and the
 guest's pull checks every layer against it, so a pod runs exactly the weights the digest names.
 
+The image lives in a public ghcr.io repository, `MODEL_REPOSITORY`
+(`ghcr.io/alphacompute/<model>`). ghcr.io refuses a layer over 10 GB, so the weights go in
+several `COPY` lines, each with less than 10 GB of shards. Keep the image under 128 layers with
+the base's: the guest's overlayfs refuses a deeper one, and only at the pull.
+
 ```dockerfile
 FROM vllm/vllm-openai@sha256:<the pinned vLLM release>
-COPY <the model's directory> /weights
+COPY <the model's config and tokenizer files> /weights/
+COPY <shards 1 and 2> /weights/
+COPY <shards 3 and 4> /weights/
 ```
 
-Build and push it to the repository `MODEL_REPOSITORY` names (`registry/path`), and set
-`MODEL_IMAGE` to its digest:
+Build and push it, and set `MODEL_IMAGE` to its digest:
 
 ```sh
-docker build -t "$MODEL_REPOSITORY" . && docker push "$MODEL_REPOSITORY" &&
+: "${MODEL_REPOSITORY:?}" &&
+  docker build -t "$MODEL_REPOSITORY" . && docker push "$MODEL_REPOSITORY" &&
   MODEL_IMAGE=$(docker inspect --format '{{index .RepoDigests 0}}' "$MODEL_REPOSITORY") &&
   export MODEL_IMAGE
 ```
