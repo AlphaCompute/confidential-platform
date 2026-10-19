@@ -86,7 +86,7 @@ impl OcspQuery {
         let kind = Oid::from_der(bytes).map_err(|_| failed("response type"))?;
         bytes = kind.0;
         let basic = next(&mut bytes, "basic response")?;
-        if kind.1.as_bytes() != BASIC_OID || basic.tag() != Tag::OctetString {
+        if kind.1.as_bytes() != BASIC_OID || basic.tag() != Tag::OctetString || !bytes.is_empty() {
             return Err(failed("not a basic response"));
         }
 
@@ -150,6 +150,13 @@ impl OcspQuery {
         let next_update = is_context(&next_update, 0)
             .then(|| time(next_update.data))
             .ok_or_else(|| failed("response has no nextUpdate"))??;
+        if !single.is_empty() {
+            let exts = next(&mut single, "single extensions")?;
+            if !is_context(&exts, 1) || !single.is_empty() {
+                return Err(failed("single response"));
+            }
+            extensions(exts.data)?;
+        }
         let ahead = now.checked_add(SKEW).ok_or_else(|| failed("now"))?;
         if this_update > asn1_time(ahead)? || asn1_time(now)? >= next_update {
             return Err(failed(format!(
@@ -280,7 +287,8 @@ fn certificates(mut data: &[u8]) -> Result<Vec<X509Certificate<'_>>, AppraisalEr
     Ok(certs)
 }
 
-/// `(extnID, extnValue)` of each extension in `[n] EXPLICIT Extensions`.
+/// `(extnID, extnValue)` of each extension in `[n] EXPLICIT Extensions`, refusing a critical one
+/// other than the nonce: it would change what the answer means.
 fn extensions(data: &[u8]) -> Result<Vec<(Oid<'_>, &[u8])>, AppraisalError> {
     let mut list = sequence(data, "extensions")?;
     let mut out = Vec::new();
@@ -290,6 +298,9 @@ fn extensions(data: &[u8]) -> Result<Vec<(Oid<'_>, &[u8])>, AppraisalError> {
         ext = rest;
         let mut value = next(&mut ext, "extension value")?;
         if value.tag() == Tag::Boolean {
+            if value.data != [0] && oid.as_bytes() != NONCE_OID {
+                return Err(failed(format!("unknown critical extension {oid}")));
+            }
             value = next(&mut ext, "extension value")?;
         }
         if value.tag() != Tag::OctetString || !ext.is_empty() {
@@ -377,12 +388,23 @@ mod tests {
         CertifiedIssuer::self_signed(params, key).unwrap()
     }
 
-    /// A response for `query` with `status`, from a responder `ca` issues with `eku` and `ku`.
     fn response(
+        query: &OcspQuery,
+        ca: &CertifiedIssuer<'_, KeyPair>,
+        usages: (ExtendedKeyUsagePurpose, KeyUsagePurpose),
+        status: &[u8],
+    ) -> Vec<u8> {
+        response_with(query, ca, usages, status, &[])
+    }
+
+    /// A response for `query` with `status` and then `tail` in its single response, from a
+    /// responder `ca` issues with `eku` and `ku`.
+    fn response_with(
         query: &OcspQuery,
         ca: &CertifiedIssuer<'_, KeyPair>,
         (eku, ku): (ExtendedKeyUsagePurpose, KeyUsagePurpose),
         status: &[u8],
+        tail: &[u8],
     ) -> Vec<u8> {
         let mut params = CertificateParams::new(vec![]).unwrap();
         params.extended_key_usages = vec![eku];
@@ -400,6 +422,7 @@ mod tests {
                 status,
                 &time("20261019100000Z"),
                 &der(0xa0, &[&time("20261020100000Z")]).unwrap(),
+                tail,
             ],
         )
         .unwrap();
@@ -476,7 +499,28 @@ mod tests {
             ExtendedKeyUsagePurpose::OcspSigning,
             KeyUsagePurpose::KeyCertSign,
         );
+        let critical = der(
+            0xa1,
+            &[&der(
+                0x30,
+                &[&der(
+                    0x30,
+                    &[
+                        &der(0x06, &[&[0x2a, 0x03, 0x04]]).unwrap(),
+                        &[0x01, 0x01, 0xff],
+                        &der(0x04, &[]).unwrap(),
+                    ],
+                )
+                .unwrap()],
+            )
+            .unwrap()],
+        )
+        .unwrap();
         let cases = [
+            (
+                response_with(&query, &ca, ocsp(), &good, &critical),
+                "unknown critical extension 1.2.3.4",
+            ),
             (response(&query, &ca, ocsp(), &revoked(1)), "is revoked"),
             (response(&query, &ca, ocsp(), &revoked(6)), "is revoked"),
             (
