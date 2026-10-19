@@ -162,8 +162,9 @@ export ALPHACOMPUTE_PCCS_URL=$(gh variable get KMS_KATA_PCCS_URL -R AlphaCompute
    role a new genesis password (`alter role alpha_kms_node password …`, as in step 4), migrate and
    bootstrap again after `kubectl -n alpha-kms delete pod kms-0`.
 
-8. **Re-sign the document** with `kms_ca_pem`; `alpha sign --check` prints the CA's SPKI SHA-256
-   and the Revisions, the two values a tenant pins.
+8. **Re-sign the document** with `kms_ca_pem`; `alpha sign --check` prints its `version`, the
+   CA's SPKI SHA-256 and the Revisions. A tenant pins the SPKI, and either the Revisions or the
+   document with that `version` as the minimum.
 
 9. **The other node.** `kms-1` joins `kms-0` on start, which needs the re-signed document. If it
    started before and stays sealed, `kubectl -n alpha-kms delete pod kms-1`; the StatefulSet
@@ -199,12 +200,13 @@ through the nodes' API and the database.
 
 - **Restart.** The StatefulSet recreates a lost node pod; it comes back sealed and joins the
   serving node.
-- **Upgrade.** Sign a document listing the old and the new Revision; every tenant App that pins
-  the KMS gets a Revision listing both. Then `kubectl apply -f` the new release's `kms-node.yaml`:
+- **Upgrade.** Sign a document listing the old and the new Revision; an App that reads the
+  Revisions from the document, as the templates below do, follows it, and an App that lists them in
+  `ALPHACOMPUTE_KMS_REVISIONS` gets a Revision listing both. Then `kubectl apply -f` the new release's `kms-node.yaml`:
   the StatefulSet replaces `kms-1`, waits until it has joined and is ready, then replaces `kms-0`.
   If the new `kms-1` never becomes ready, apply the old file, then
   `kubectl -n alpha-kms delete pod kms-1`: the StatefulSet does not replace a pod that is not ready.
-  Drop the old Revision once no tenant pins it.
+  Drop the old Revision once no App lists it.
 - **All nodes lost.** Port-forward to `pod/kms-0` as in step 6, and two custodians each export
   the two variables of Day 0 and, with the one share they were handed, run
   `alpha unseal --share share-[1-3].json --key custodian.key --endpoint https://localhost:8443`.
@@ -269,7 +271,8 @@ Each is the operator's, chosen per environment; none has a default.
 | Input | Templates | What |
 |---|---|---|
 | `RUNTIME_IMAGE` | all | the `alpha-runtime` release image by digest |
-| `KMS_CA_SPKI_SHA256`, `KMS_REVISIONS` | all | what `alpha sign --check` prints for the served document |
+| `KMS_CA_SPKI_SHA256` | all | the CA's SPKI SHA-256 that `alpha sign --check` prints for the served document |
+| `PLATFORM_DOCUMENT_URL`, `PLATFORM_MIN_VERSION` | all | `KMS_KATA_PLATFORM_DOCUMENT_URL` and the `version` `alpha sign --check` prints for it: the runtime takes the KMS Revisions from that document and refuses one below this version |
 | `KMS_ENDPOINTS` | all | `KMS_KATA_ENDPOINTS` |
 | `INFERENCE_APP_ID`, `GUARD_APP_ID`, `BROKER_APP_ID`, `MODEL_APP_ID` | one each | the service's App id |
 | `INFERENCE_IMAGE`, `GUARD_IMAGE`, `BROKER_IMAGE` | one each | the service's release image by digest |

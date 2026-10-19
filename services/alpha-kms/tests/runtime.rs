@@ -25,7 +25,9 @@ use alpha_client::tls::{self, Pin};
 use alpha_client::{Client, Error as ClientError};
 use alpha_core::{AppId, ComposeHash, KeyId, context};
 use alpha_kms::{certs, rfc3339};
-use alpha_runtime::{Config, Delivery, Error, EvidenceSource, Exit, Runtime, Secrets, proxy};
+use alpha_runtime::{
+    Config, Delivery, Error, EvidenceSource, Exit, KmsRevisions, Runtime, Secrets, proxy,
+};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use common::*;
@@ -86,7 +88,7 @@ fn capture_evidence() -> EvidenceSource {
 fn config(h: &Harness, endpoints: Vec<String>) -> Config {
     Config {
         kms_ca_spki_sha256: ca_spki_sha256(&h.ca_pem),
-        kms_revisions: vec![h.node.compose_hash],
+        kms_revisions: KmsRevisions::Listed(vec![h.node.compose_hash]),
         kms_endpoints: endpoints,
         secrets: Secrets::new(),
         tls_upstream: None,
@@ -1218,7 +1220,7 @@ fn the_wrap_and_the_runtime_agree_on_the_endpoint() {
     let env = |name: &str| runtime.environment.get(name).map(String::as_str);
     let config = Config::parse(
         env("ALPHACOMPUTE_KMS_CA_SPKI_SHA256").unwrap(),
-        env("ALPHACOMPUTE_KMS_REVISIONS").unwrap(),
+        KmsRevisions::parse(env("ALPHACOMPUTE_KMS_REVISIONS"), None, None).unwrap(),
         env("ALPHACOMPUTE_KMS_ENDPOINTS").unwrap(),
         env("ALPHACOMPUTE_SECRETS"),
         env("ALPHACOMPUTE_TLS_UPSTREAM"),
@@ -1307,7 +1309,7 @@ async fn runtime_refuses_another_ca_or_an_unlisted_revision_and_tries_the_next_e
 
     // The right CA but the node's Revision unlisted: refused before any request.
     let mut unlisted = config(&h, vec![h.url.clone()]);
-    unlisted.kms_revisions = vec![alpha_core::compose_hash("other")];
+    unlisted.kms_revisions = KmsRevisions::Listed(vec![alpha_core::compose_hash("other")]);
     let (runtime, _) = start_runtime(&h, unlisted);
     connect_error(runtime.attest().await);
     assert_eq!(
@@ -1315,6 +1317,63 @@ async fn runtime_refuses_another_ca_or_an_unlisted_revision_and_tries_the_next_e
         1,
         "one attestation reached the node"
     );
+}
+
+#[tokio::test]
+async fn a_document_pinned_runtime_follows_kms_revisions_and_never_goes_back() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    app_with_secret(&h, b"v1").await;
+    let base = h.release.document.read().unwrap().clone();
+    let serve = |version: u64, revision: ComposeHash| {
+        let mut document = base.clone();
+        document["version"] = json!(version);
+        document["kms_revisions"] =
+            json!([{ "compose_hash": revision, "build": "b", "source_url": "u" }]);
+        h.release.set(document);
+    };
+    let runtime = |min_version| {
+        start_runtime(
+            &h,
+            Config {
+                kms_revisions: KmsRevisions::Document {
+                    url: h.release.url.clone(),
+                    min_version,
+                    keys: Arc::new(h.release.key.verifying_key().into()),
+                },
+                ..config(&h, vec![h.url.clone()])
+            },
+        )
+        .0
+    };
+    let refused = |result: Result<Arc<alpha_runtime::Attested>, Error>| {
+        let Err(err) = result else {
+            panic!("the runtime attested");
+        };
+        assert!(matches!(err, Error::Kms(ClientError::Connect(_))), "{err}");
+    };
+    let other = alpha_core::compose_hash("other");
+
+    serve(10, h.node.compose_hash);
+    let pinned = runtime(10);
+    pinned.attest().await.unwrap();
+    // A new document that drops the node's build reaches the running process.
+    serve(11, other);
+    refused(pinned.attest().await);
+    // The older document that still lists it is not taken back.
+    serve(10, h.node.compose_hash);
+    refused(pinned.attest().await);
+    serve(12, h.node.compose_hash);
+    pinned.attest().await.unwrap();
+
+    // A fresh process holds nothing yet, so only its measured floor stops a replay.
+    serve(10, h.node.compose_hash);
+    let Err(Error::Platform(m)) = runtime(11).attest().await else {
+        panic!("a document below the floor was accepted");
+    };
+    assert!(m.contains("below the minimum 11"), "{m}");
+    runtime(10).attest().await.unwrap();
 }
 
 #[tokio::test]

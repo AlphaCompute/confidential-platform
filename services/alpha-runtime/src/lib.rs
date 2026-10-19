@@ -1,7 +1,8 @@
 //! The in-CVM sidecar: one P-256 key for the life of the Instance, attested to the KMS into a
 //! one-hour leaf renewed ten minutes before it expires, handed to the tenant's containers over
 //! a unix socket with four routes. Trust comes from the measured compose (the KMS CA's SPKI
-//! hash and the allowed KMS Revisions); the KMS endpoints are only where to look. In a Kata pod
+//! hash, and the allowed KMS Revisions or the floor of the release-signed platform document that
+//! lists them); the KMS endpoints are only where to look. In a Kata pod
 //! the same variables come from the pod spec, and the evidence is the quote, with every GPU's
 //! evidence when the pod has GPUs.
 
@@ -28,6 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use alpha_attest::{AttestationResult, InstanceEvidence};
+use alpha_client::platform::ReleaseKeys;
 use alpha_client::tls::{self, InstanceSans};
 use alpha_client::{
     AttestReply, AttestRequest, Client, DerivedKey, Identity, Pin, Secret, TimeProvider,
@@ -82,6 +84,8 @@ pub enum Error {
     NotAttested,
     #[error("socket: {0}")]
     Socket(String),
+    #[error("platform document: {0}")]
+    Platform(String),
 }
 
 impl Error {
@@ -204,13 +208,84 @@ pub fn parse_ready(text: Option<&str>, upstream: Option<&str>) -> Result<Option<
     Ok(Some(text.to_owned()))
 }
 
+/// The KMS builds the runtime accepts, under the pinned CA either way.
+#[derive(Clone, Debug)]
+pub enum KmsRevisions {
+    /// `ALPHACOMPUTE_KMS_REVISIONS`: a new KMS build needs a new Revision of the App.
+    Listed(Vec<ComposeHash>),
+    /// `ALPHACOMPUTE_PLATFORM_DOCUMENT_URL`: the `kms_revisions` of the document fetched before
+    /// every attestation, at `ALPHACOMPUTE_PLATFORM_MIN_VERSION` or above, never below a
+    /// version this process accepted.
+    Document {
+        url: String,
+        min_version: u64,
+        keys: Arc<ReleaseKeys>,
+    },
+}
+
+impl KmsRevisions {
+    pub fn parse(
+        listed: Option<&str>,
+        document_url: Option<&str>,
+        min_version: Option<&str>,
+    ) -> Result<Self, Error> {
+        match (listed, document_url, min_version) {
+            (Some(listed), None, None) => {
+                let revisions = list(listed)
+                    .map(|s| {
+                        s.parse().map_err(|_| {
+                            Error::Config(format!(
+                                "ALPHACOMPUTE_KMS_REVISIONS: {s:?} is not sha256:<64 hex>"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<ComposeHash>, _>>()?;
+                if revisions.is_empty() {
+                    return Err(Error::Config("ALPHACOMPUTE_KMS_REVISIONS is empty".into()));
+                }
+                Ok(Self::Listed(revisions))
+            }
+            (None, Some(url), min_version) => {
+                let url = url.trim();
+                if !url.starts_with("https://") {
+                    return Err(Error::Config(
+                        "ALPHACOMPUTE_PLATFORM_DOCUMENT_URL is not https".into(),
+                    ));
+                }
+                // Without a floor a host could serve the oldest signed document, which may list
+                // a build every later one dropped.
+                let min_version = min_version
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .filter(|v| *v > 0)
+                    .ok_or_else(|| {
+                        Error::Config(
+                            "ALPHACOMPUTE_PLATFORM_MIN_VERSION is not a version from 1".into(),
+                        )
+                    })?;
+                let keys = alpha_client::platform::release_keys()
+                    .map_err(|e| Error::Config(format!("release keys: {e}")))?;
+                Ok(Self::Document {
+                    url: url.to_owned(),
+                    min_version,
+                    keys: Arc::new(keys),
+                })
+            }
+            _ => Err(Error::Config(
+                "set either ALPHACOMPUTE_KMS_REVISIONS, or ALPHACOMPUTE_PLATFORM_DOCUMENT_URL \
+                 with ALPHACOMPUTE_PLATFORM_MIN_VERSION"
+                    .into(),
+            )),
+        }
+    }
+}
+
 /// The three environment variables and, when a service declared a Secret,
 /// `ALPHACOMPUTE_SECRETS`; for a wrapped compose or a Kata pod with an Endpoint,
 /// `ALPHACOMPUTE_TLS_UPSTREAM` and optionally its caller pin and readiness path.
 #[derive(Clone, Debug)]
 pub struct Config {
     pub kms_ca_spki_sha256: [u8; 32],
-    pub kms_revisions: Vec<ComposeHash>,
+    pub kms_revisions: KmsRevisions,
     pub kms_endpoints: Vec<String>,
     pub secrets: Secrets,
     pub tls_upstream: Option<String>,
@@ -223,9 +298,14 @@ impl Config {
         let var = |name: &str| {
             std::env::var(name).map_err(|_| Error::Config(format!("{name} is not set")))
         };
+        let optional = |name: &str| std::env::var(name).ok();
         Self::parse(
             &var("ALPHACOMPUTE_KMS_CA_SPKI_SHA256")?,
-            &var("ALPHACOMPUTE_KMS_REVISIONS")?,
+            KmsRevisions::parse(
+                optional("ALPHACOMPUTE_KMS_REVISIONS").as_deref(),
+                optional("ALPHACOMPUTE_PLATFORM_DOCUMENT_URL").as_deref(),
+                optional("ALPHACOMPUTE_PLATFORM_MIN_VERSION").as_deref(),
+            )?,
             &var("ALPHACOMPUTE_KMS_ENDPOINTS")?,
             std::env::var("ALPHACOMPUTE_SECRETS").ok().as_deref(),
             std::env::var("ALPHACOMPUTE_TLS_UPSTREAM").ok().as_deref(),
@@ -240,7 +320,7 @@ impl Config {
 
     pub fn parse(
         ca_spki_sha256: &str,
-        revisions: &str,
+        kms_revisions: KmsRevisions,
         endpoints: &str,
         secrets: Option<&str>,
         tls_upstream: Option<&str>,
@@ -254,18 +334,6 @@ impl Config {
             .ok_or_else(|| {
                 Error::Config("ALPHACOMPUTE_KMS_CA_SPKI_SHA256 is not sha256:<64 hex>".into())
             })?;
-        let kms_revisions = list(revisions)
-            .map(|s| {
-                s.parse().map_err(|_| {
-                    Error::Config(format!(
-                        "ALPHACOMPUTE_KMS_REVISIONS: {s:?} is not sha256:<64 hex>"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<ComposeHash>, _>>()?;
-        if kms_revisions.is_empty() {
-            return Err(Error::Config("ALPHACOMPUTE_KMS_REVISIONS is empty".into()));
-        }
         let kms_endpoints: Vec<String> = list(endpoints)
             .map(|s| s.trim_end_matches('/').to_owned())
             .collect();
@@ -285,10 +353,6 @@ impl Config {
             tls_callers,
             tls_ready,
         })
-    }
-
-    fn pin(&self) -> Pin {
-        Pin::CaSpkiAndRevisions(self.kms_ca_spki_sha256, self.kms_revisions.clone())
     }
 }
 
@@ -425,7 +489,8 @@ pub struct Runtime {
     /// None in a Kata pod that mounts no init-data; the KMS names the Revision from the
     /// verified `MRCONFIGID` either way.
     revision: Option<RevisionText>,
-    kms: Client,
+    /// The version and `kms_revisions` of the newest platform document this process accepted.
+    accepted: Mutex<Option<(u64, Vec<ComposeHash>)>>,
     attested: RwLock<Option<Arc<Attested>>>,
     revoked: watch::Sender<bool>,
 }
@@ -446,12 +511,6 @@ impl Runtime {
             .map_err(|e| key_error(e.into()))?
             .into_vec();
         let pkcs8 = Zeroizing::new(key.to_pkcs8_der().map_err(key_error)?.to_bytes().to_vec());
-        let kms = Client::configured(
-            config.kms_endpoints.clone(),
-            config.pin(),
-            None,
-            time.clone(),
-        )?;
         Ok(Arc::new(Self {
             config,
             pkcs8,
@@ -460,7 +519,7 @@ impl Runtime {
             time,
             evidence,
             revision,
-            kms,
+            accepted: Mutex::new(None),
             attested: RwLock::new(None),
             revoked: watch::Sender::new(false),
         }))
@@ -510,27 +569,77 @@ impl Runtime {
         Ok(attested)
     }
 
+    /// Each attestation dials under the Revisions current at that moment, so a connection from
+    /// a build the latest document dropped is never reused.
     async fn attest_inner(&self) -> Result<Arc<Attested>, Error> {
-        let nonce = self.kms.attest_nonce().await?;
+        let pin =
+            Pin::CaSpkiAndRevisions(self.config.kms_ca_spki_sha256, self.kms_revisions().await?);
+        let kms = Client::configured(
+            self.config.kms_endpoints.clone(),
+            pin.clone(),
+            None,
+            self.time.clone(),
+        )?;
+        let nonce = kms.attest_nonce().await?;
         let nonce: [u8; 32] = alpha_client::decode("nonce", &nonce.nonce)?
             .try_into()
             .map_err(|_| alpha_client::Error::Invalid("nonce is not 32 bytes".into()))?;
         let report_data = alpha_attest::report_data(&self.spki, &nonce, None);
         let evidence = (self.evidence)(&report_data).map_err(Error::Evidence)?;
-        let reply = self
-            .kms
+        let reply = kms
             .attest(&AttestRequest {
                 runtime_pubkey: BASE64_URL_SAFE_NO_PAD.encode(&self.spki),
                 nonce: BASE64_URL_SAFE_NO_PAD.encode(nonce),
                 evidence,
             })
             .await?;
-        self.accept(reply)
+        self.accept(reply, pin)
+    }
+
+    /// A failed fetch, or a document not above the accepted one, keeps the accepted list.
+    async fn kms_revisions(&self) -> Result<Vec<ComposeHash>, Error> {
+        let (url, min_version, keys) = match &self.config.kms_revisions {
+            KmsRevisions::Listed(revisions) => return Ok(revisions.clone()),
+            KmsRevisions::Document {
+                url,
+                min_version,
+                keys,
+            } => (url, *min_version, keys),
+        };
+        let fetched = alpha_client::platform::fetch_signed(url)
+            .await
+            .and_then(|signed| alpha_client::platform::verify(&signed, keys, self.now()));
+        let mut accepted = self.accepted.lock();
+        match (fetched, accepted.as_ref().map(|(version, _)| *version)) {
+            (Ok(doc), floor)
+                if doc.version >= min_version && floor.is_none_or(|v| doc.version > v) =>
+            {
+                let revisions = doc.kms_revisions.iter().map(|r| r.compose_hash).collect();
+                *accepted = Some((doc.version, revisions));
+            }
+            (Ok(doc), None) => {
+                return Err(Error::Platform(format!(
+                    "version {} is below the minimum {min_version}",
+                    doc.version
+                )));
+            }
+            (Err(e), None) => return Err(e.into()),
+            (Ok(doc), Some(v)) if doc.version < v => eprintln!(
+                "alpha-runtime: platform document version {} is below the accepted {v}",
+                doc.version
+            ),
+            (Ok(_), Some(_)) => {}
+            (Err(e), Some(v)) => eprintln!("alpha-runtime: {e}; keeping platform document {v}"),
+        }
+        Ok(accepted
+            .as_ref()
+            .map(|(_, revisions)| revisions.clone())
+            .unwrap_or_default())
     }
 
     /// The reply's chain is ours only if the leaf carries our key and the root the pinned one;
     /// the ids come from the leaf's SANs, never from the reply's text.
-    fn accept(&self, reply: AttestReply) -> Result<Arc<Attested>, Error> {
+    fn accept(&self, reply: AttestReply, pin: Pin) -> Result<Arc<Attested>, Error> {
         let chain: Vec<Vec<u8>> = reply
             .certificate_chain
             .iter()
@@ -566,7 +675,7 @@ impl Runtime {
             .into();
         let client = Client::configured(
             self.config.kms_endpoints.clone(),
-            self.config.pin(),
+            pin,
             Some(Identity {
                 chain: chain.clone(),
                 pkcs8: self.pkcs8.to_vec(),
@@ -782,11 +891,15 @@ mod tests {
 
     const HASH: &str = "sha256:ee097e09c4824eb6424202fe20ed882d19a33a563f3b3dd5988f3ff8ee1b8335";
 
+    fn listed() -> KmsRevisions {
+        KmsRevisions::parse(Some(HASH), None, None).unwrap()
+    }
+
     #[test]
     fn config_parses_the_three_variables_and_refuses_empty_or_malformed_ones() {
         let c = Config::parse(
             &format!(" {HASH} "),
-            &format!("{HASH}, {HASH},"),
+            listed(),
             "https://a:8443/,, https://b:8443",
             None,
             None,
@@ -798,31 +911,66 @@ mod tests {
             c.kms_ca_spki_sha256,
             alpha_core::hex_bytes(&HASH[7..]).unwrap()
         );
-        assert_eq!(c.kms_revisions.len(), 2);
         assert_eq!(c.kms_endpoints, ["https://a:8443", "https://b:8443"]);
-        assert!(
-            matches!(c.pin(), Pin::CaSpkiAndRevisions(spki, r) if spki == c.kms_ca_spki_sha256 && r.len() == 2)
-        );
 
-        let refused = |a: &str, b: &str, c: &str| {
-            let Err(Error::Config(m)) = Config::parse(a, b, c, None, None, None, None) else {
-                panic!("{a} {b} {c} was accepted");
+        let refused = |a: &str, c: &str| {
+            let Err(Error::Config(m)) = Config::parse(a, listed(), c, None, None, None, None)
+            else {
+                panic!("{a} {c} was accepted");
             };
             m
         };
-        assert!(refused(&HASH[7..], HASH, "x").contains("CA_SPKI"));
-        assert!(refused(HASH, "", "x").contains("REVISIONS is empty"));
-        assert!(refused(HASH, "sha256:zz", "x").contains("REVISIONS"));
-        assert!(refused(HASH, HASH, " , ").contains("ENDPOINTS"));
-        assert!(refused("", HASH, "x").contains("CA_SPKI"));
+        assert!(refused(&HASH[7..], "x").contains("CA_SPKI"));
+        assert!(refused(HASH, " , ").contains("ENDPOINTS"));
+        assert!(refused("", "x").contains("CA_SPKI"));
         assert!(c.secrets.is_empty());
         assert!(c.tls_upstream.is_none());
     }
 
     #[test]
+    fn kms_revisions_are_a_list_or_a_document_url_with_a_floor_never_both() {
+        let KmsRevisions::Listed(r) =
+            KmsRevisions::parse(Some(&format!("{HASH}, {HASH},")), None, None).unwrap()
+        else {
+            panic!("not a list");
+        };
+        assert_eq!(r.len(), 2);
+        let url = "https://sign.example/sign/platform.json";
+        let KmsRevisions::Document {
+            url: parsed,
+            min_version,
+            ..
+        } = KmsRevisions::parse(None, Some(url), Some(" 12 ")).unwrap()
+        else {
+            panic!("not a document");
+        };
+        assert_eq!((parsed.as_str(), min_version), (url, 12));
+
+        let refused = |listed, url, min| {
+            let Err(Error::Config(m)) = KmsRevisions::parse(listed, url, min) else {
+                panic!("{listed:?} {url:?} {min:?} was accepted");
+            };
+            m
+        };
+        assert!(refused(Some(""), None, None).contains("REVISIONS is empty"));
+        assert!(refused(Some("sha256:zz"), None, None).contains("REVISIONS"));
+        assert!(refused(None, Some("http://a/p.json"), Some("1")).contains("not https"));
+        for min in [None, Some("0"), Some("x"), Some("-1")] {
+            assert!(refused(None, Some(url), min).contains("MIN_VERSION"));
+        }
+        for (listed, url, min) in [
+            (None, None, None),
+            (Some(HASH), Some(url), Some("1")),
+            (Some(HASH), None, Some("1")),
+        ] {
+            assert!(refused(listed, url, min).starts_with("set either"));
+        }
+    }
+
+    #[test]
     fn secrets_parse_the_wraps_variable() {
         let wrap = r#"{"db":["db_password"],"web":["db_password","session_key"]}"#;
-        let c = Config::parse(HASH, HASH, "https://a", Some(wrap), None, None, None).unwrap();
+        let c = Config::parse(HASH, listed(), "https://a", Some(wrap), None, None, None).unwrap();
         let set = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<BTreeSet<_>>();
         assert_eq!(
             c.secrets,
@@ -853,7 +1001,7 @@ mod tests {
             };
             assert!(m.starts_with("ALPHACOMPUTE_SECRETS:"), "{bad}: {m}");
             let Err(Error::Config(m)) =
-                Config::parse(HASH, HASH, "https://a", Some(bad), None, None, None)
+                Config::parse(HASH, listed(), "https://a", Some(bad), None, None, None)
             else {
                 panic!("{bad} was accepted by Config::parse");
             };
@@ -864,7 +1012,16 @@ mod tests {
     #[test]
     fn the_tls_upstream_is_a_lowercase_service_and_a_port() {
         assert_eq!(parse_upstream(None).unwrap(), None);
-        let c = Config::parse(HASH, HASH, "https://a", None, Some("web:80"), None, None).unwrap();
+        let c = Config::parse(
+            HASH,
+            listed(),
+            "https://a",
+            None,
+            Some("web:80"),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(c.tls_upstream.as_deref(), Some("web:80"));
         assert_eq!(
             parse_upstream(Some("localhost:65535")).unwrap().as_deref(),
@@ -885,7 +1042,7 @@ mod tests {
             "a..b:80",
         ] {
             let Err(Error::Config(m)) =
-                Config::parse(HASH, HASH, "https://a", None, Some(bad), None, None)
+                Config::parse(HASH, listed(), "https://a", None, Some(bad), None, None)
             else {
                 panic!("{bad} was accepted");
             };
@@ -899,7 +1056,7 @@ mod tests {
         let parse = |callers, ready| {
             Config::parse(
                 HASH,
-                HASH,
+                listed(),
                 "https://a",
                 None,
                 Some("web:80"),
@@ -920,7 +1077,7 @@ mod tests {
             assert!(m.starts_with(var), "{m}");
         };
         let unwrapped =
-            |callers, ready| Config::parse(HASH, HASH, "https://a", None, None, callers, ready);
+            |callers, ready| Config::parse(HASH, listed(), "https://a", None, None, callers, ready);
         refused(unwrapped(Some(app), None), "ALPHACOMPUTE_TLS_CALLER_APPS:");
         refused(
             unwrapped(None, Some("/health")),
