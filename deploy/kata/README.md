@@ -266,11 +266,10 @@ them with the rest of `/opt/kata`.
 
 Each is the operator's, chosen per environment; none has a default.
 
-The guest pulls every image itself, anonymously: the init-data carries no registry configuration.
-So every image is a public ghcr.io package, referenced by digest. A release pushes
-`ghcr.io/alphacompute/<name>` for each image and prints `pushed <image>@sha256:…` in its summary.
-A new package is private until an
-organization owner makes it public in its package settings; a workflow cannot.
+The guest pulls every image itself, anonymously, as a CVM does ([`../README.md`](../README.md#pulling-from-ghcr)):
+the init-data carries no registry configuration. An image's digest is the release summary's
+`pushed <image>@sha256:…` line. A new package is private until an organization owner makes it
+public in its package settings; a workflow cannot.
 
 | Input | Templates | What |
 |---|---|---|
