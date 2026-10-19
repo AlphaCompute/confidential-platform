@@ -367,6 +367,7 @@ async function loadPage(options = {}) {
   const timers = [];
   const prompts = [];
   const clicks = [];
+  const opened = [];
   const authenticator = options.authenticator || new SoftwareAuthenticator();
   // The passkey provider the next prompt reaches; `page.use` moves to another device.
   const device = { current: authenticator };
@@ -433,6 +434,8 @@ async function loadPage(options = {}) {
       origin: options.origin || ORIGIN,
       pathname: options.path || "/sign/claim",
       hash: `#${options.hash === undefined ? TICKET : options.hash}`,
+      // Chromium and Safari list the origins of the pages around a frame; Firefox has none.
+      ancestorOrigins: options.ancestorOrigins,
     },
     localStorage: options.localStorage || memoryStorage(),
     sessionStorage: options.sessionStorage || memoryStorage(),
@@ -449,6 +452,11 @@ async function loadPage(options = {}) {
       },
     },
     PublicKeyCredential: options.noPasskeys ? undefined : function PublicKeyCredential() {},
+    // window.open records each call; with noopener a browser returns null either way.
+    open: (...args) => {
+      opened.push({ args, fetches: fetches.length, click: clicks[clicks.length - 1] });
+      return null;
+    },
     crypto: crypto.webcrypto,
     fetch: fakeFetch,
     setTimeout: (fn, ms) => {
@@ -524,6 +532,7 @@ async function loadPage(options = {}) {
     authenticator,
     consoleCalls,
     seals,
+    opened,
     main,
     use(other) {
       device.current = other;
@@ -566,6 +575,10 @@ async function loadPage(options = {}) {
     async startClaim(ticket = TICKET, view = testView()) {
       await page.init();
       await page.call("startClaim", view.view, ticket);
+    },
+    async startEmbed(ticket = TICKET, view = testView()) {
+      await page.init();
+      await page.call("startEmbed", view.view, ticket);
     },
     async startApproval(ticket = TICKET, view = testView()) {
       await page.init();
