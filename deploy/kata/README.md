@@ -268,7 +268,7 @@ Each is the operator's, chosen per environment; none has a default.
 
 The guest pulls every image itself, anonymously, as a CVM does ([`../README.md`](../README.md#pulling-from-ghcr)):
 the init-data carries no registry configuration. An image input is the `<image>@sha256:…`
-reference after `pushed` in the release summary. A new package is private until an organization owner makes it
+reference after `pushed` in the release summary. A new package is private until a package admin makes it
 public in its package settings; a workflow cannot.
 
 | Input | Templates | What |
