@@ -597,6 +597,7 @@ impl Runtime {
     }
 
     /// A failed fetch, or a document not above the accepted one, keeps the accepted list.
+    /// Nothing accepted yet, either refuses.
     async fn kms_revisions(&self) -> Result<Vec<ComposeHash>, Error> {
         let (url, min_version, keys) = match &self.config.kms_revisions {
             KmsRevisions::Listed(revisions) => return Ok(revisions.clone()),
@@ -610,31 +611,28 @@ impl Runtime {
             .await
             .and_then(|signed| alpha_client::platform::verify(&signed, keys, self.now()));
         let mut accepted = self.accepted.lock();
-        match (fetched, accepted.as_ref().map(|(version, _)| *version)) {
-            (Ok(doc), floor)
-                if doc.version >= min_version && floor.is_none_or(|v| doc.version > v) =>
-            {
-                let revisions = doc.kms_revisions.iter().map(|r| r.compose_hash).collect();
-                *accepted = Some((doc.version, revisions));
+        let current = accepted.as_ref().map(|(version, _)| *version);
+        let floor = current.map_or(min_version, |v| v.saturating_add(1));
+        let refused = match fetched {
+            Ok(doc) if doc.version >= floor => {
+                let revisions: Vec<ComposeHash> =
+                    doc.kms_revisions.iter().map(|r| r.compose_hash).collect();
+                *accepted = Some((doc.version, revisions.clone()));
+                return Ok(revisions);
             }
-            (Ok(doc), None) => {
-                return Err(Error::Platform(format!(
-                    "version {} is below the minimum {min_version}",
-                    doc.version
-                )));
+            Ok(doc) if Some(doc.version) == current => None,
+            Ok(doc) => Some(format!("version {} is below {floor}", doc.version)),
+            Err(e) => Some(e.to_string()),
+        };
+        match (accepted.as_ref(), refused) {
+            (Some((version, revisions)), refused) => {
+                if let Some(refused) = refused {
+                    eprintln!("alpha-runtime: platform document {refused}; keeping {version}");
+                }
+                Ok(revisions.clone())
             }
-            (Err(e), None) => return Err(e.into()),
-            (Ok(doc), Some(v)) if doc.version < v => eprintln!(
-                "alpha-runtime: platform document version {} is below the accepted {v}",
-                doc.version
-            ),
-            (Ok(_), Some(_)) => {}
-            (Err(e), Some(v)) => eprintln!("alpha-runtime: {e}; keeping platform document {v}"),
+            (None, refused) => Err(Error::Platform(refused.unwrap_or_default())),
         }
-        Ok(accepted
-            .as_ref()
-            .map(|(_, revisions)| revisions.clone())
-            .unwrap_or_default())
     }
 
     /// The reply's chain is ours only if the leaf carries our key and the root the pinned one;

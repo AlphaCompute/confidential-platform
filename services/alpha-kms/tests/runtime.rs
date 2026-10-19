@@ -1372,7 +1372,7 @@ async fn a_document_pinned_runtime_follows_kms_revisions_and_never_goes_back() {
     let Err(Error::Platform(m)) = runtime(11).attest().await else {
         panic!("a document below the floor was accepted");
     };
-    assert!(m.contains("below the minimum 11"), "{m}");
+    assert!(m.contains("version 10 is below 11"), "{m}");
     runtime(10).attest().await.unwrap();
 }
 
