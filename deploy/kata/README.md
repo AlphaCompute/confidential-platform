@@ -266,13 +266,19 @@ them with the rest of `/opt/kata`.
 
 Each is the operator's, chosen per environment; none has a default.
 
+The guest pulls every image itself, anonymously: the init-data carries no registry configuration.
+So every image is a public ghcr.io package, referenced by digest. A release pushes
+`ghcr.io/alphacompute/<name>` for each image and prints `pushed <image>@sha256:…` in its summary;
+the `<name>-digest` artifact holds the same reference. A new package is private until an
+organization owner makes it public in its package settings; a workflow cannot.
+
 | Input | Templates | What |
 |---|---|---|
-| `RUNTIME_IMAGE` | all | the `alpha-runtime` release image by digest |
+| `RUNTIME_IMAGE` | all | `ghcr.io/alphacompute/alpha-runtime@sha256:…` from the release |
 | `KMS_CA_SPKI_SHA256`, `KMS_REVISIONS` | all | what `alpha sign --check` prints for the served document |
 | `KMS_ENDPOINTS` | all | `KMS_KATA_ENDPOINTS` |
 | `INFERENCE_APP_ID`, `GUARD_APP_ID`, `BROKER_APP_ID`, `MODEL_APP_ID` | one each | the service's App id |
-| `INFERENCE_IMAGE`, `GUARD_IMAGE`, `BROKER_IMAGE` | one each | the service's release image by digest |
+| `INFERENCE_IMAGE`, `GUARD_IMAGE`, `BROKER_IMAGE` | one each | `ghcr.io/alphacompute/alpha-<service>@sha256:…` from the release |
 | `MODELS`, `MODEL_SERVERS` | inference | `services/alpha-inference/README.md`; `MODEL_SERVERS` is `{}` when RedPill serves every model, and a model server's `url` is `https://<MODEL_NAME>.alpha-models.svc:8443` |
 | `UPSTREAM_URL`, `PCCS_URL`, `UPSTREAM_POLICY` | inference | RedPill's settings; with every model on our own servers, delete their three lines before rendering |
 | `INFERENCE_REVISIONS`, `GUARD_CALLER_APPS` | guard | the front's registered Revisions; the App ids that may ask for a verdict (`CALLER_APPS`) |
@@ -288,13 +294,19 @@ Each is the operator's, chosen per environment; none has a default.
 The weights are not sealed: they are layers of an image whose digest the policy pins, and the
 guest's pull checks every layer against it, so a pod runs exactly the weights the digest names.
 
+The image lives in a public ghcr.io repository, `MODEL_REPOSITORY`
+(`ghcr.io/alphacompute/<model>`). ghcr.io refuses a layer over 10 GB, so the weights go in
+several `COPY` lines of a few shards each. Keep the image under 128 layers with the base's: the
+guest's overlayfs refuses a deeper one, and only at the pull.
+
 ```dockerfile
 FROM vllm/vllm-openai@sha256:<the pinned vLLM release>
-COPY <the model's directory> /weights
+COPY <the model's config and tokenizer files> /weights/
+COPY <shards 1 and 2> /weights/
+COPY <shards 3 and 4> /weights/
 ```
 
-Build and push it to the repository `MODEL_REPOSITORY` names (`registry/path`), and set
-`MODEL_IMAGE` to its digest:
+Build and push it, and set `MODEL_IMAGE` to its digest:
 
 ```sh
 docker build -t "$MODEL_REPOSITORY" . && docker push "$MODEL_REPOSITORY" &&
