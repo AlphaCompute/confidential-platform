@@ -32,8 +32,8 @@ use sha2::{Digest, Sha256};
 
 pub use event_log::{EventLogEntry, compose_hash as event_log_compose_hash};
 pub use gpu::{
-    GpuEvidence, GpuReference, KataGpus, appraise_gpus, appraise_kata_gpus, bind_gpus, gpu_nonce,
-    gpu_reference,
+    GpuEvidence, GpuReference, KataGpus, NVIDIA_OCSP_URL, OcspQuery, appraise_gpus,
+    appraise_kata_gpus, bind_gpus, gpu_nonce, gpu_reference,
 };
 
 pub const EVIDENCE_FORMAT: &str = "alphacompute-evidence/1";

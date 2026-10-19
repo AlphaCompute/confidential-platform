@@ -294,7 +294,8 @@ enum CocoCommand {
     },
     /// Prints the platform document's `GpuReference` for the GPU that signed this evidence: its
     /// identity and FWID as it reports them, each measurement block as NVIDIA's signed RIMs list
-    /// it. Refuses unless both RIMs verify to NVIDIA's RIM root and list every block it reports.
+    /// it. Refuses unless both RIMs verify to NVIDIA's RIM root and list every block it reports,
+    /// and NVIDIA's OCSP responder reports each certificate that signs them `good`.
     GpuReference {
         /// The SPDM GET_MEASUREMENTS request and signed response, as NVML returns them.
         #[arg(long)]
@@ -665,13 +666,34 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 evidence: read_file(&evidence)?,
                 certificate_chain: read_file(&certificate_chain)?,
             };
-            let reference = alpha_attest::gpu_reference(
+            let (reference, signers) = alpha_attest::gpu_reference(
                 &evidence,
                 &read_file(&driver_rim)?,
                 &read_file(&vbios_rim)?,
                 SystemTime::now(),
             )
             .map_err(|e| e.to_string())?;
+            let http = reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .map_err(|e| format!("http client: {e}"))?;
+            for signer in &signers {
+                let nonce = alpha_cli::random()?;
+                let response = http
+                    .post(alpha_attest::NVIDIA_OCSP_URL)
+                    .header(reqwest::header::CONTENT_TYPE, "application/ocsp-request")
+                    .body(signer.request(&nonce).map_err(|e| e.to_string())?)
+                    .send()
+                    .await
+                    .and_then(reqwest::Response::error_for_status)
+                    .map_err(|e| format!("ocsp: {e}"))?
+                    .bytes()
+                    .await
+                    .map_err(|e| format!("ocsp: {e}"))?;
+                signer
+                    .check(&response, &nonce, SystemTime::now())
+                    .map_err(|e| e.to_string())?;
+            }
             Ok(json!(reference))
         }
         Command::Catalog {

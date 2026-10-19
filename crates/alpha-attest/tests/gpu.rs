@@ -406,10 +406,32 @@ fn reference_values_come_from_the_signed_rims() {
     // 2026-10-16, the day of the capture.
     let now = UNIX_EPOCH + Duration::from_secs(1_792_108_800);
     let expected: GpuReference = serde_json::from_slice(&read("gpu-reference.json")).unwrap();
-    assert_eq!(
-        gpu_reference(&evidence, &driver, &vbios, now).unwrap(),
-        expected
-    );
+    let (reference, signers) = gpu_reference(&evidence, &driver, &vbios, now).unwrap();
+    assert_eq!(reference, expected);
+
+    // NVIDIA's answers for the four signers, captured 2026-10-19 10:06 UTC for this nonce.
+    let nonce = [0x5a; 32];
+    let answered = UNIX_EPOCH + Duration::from_secs(1_792_411_200);
+    let responses = ["driver-rim-signer", "rim-l3", "rim-ca", "vbios-rim-signer"]
+        .map(|name| read(&format!("ocsp/{name}.der")));
+    assert_eq!(signers.len(), responses.len());
+    for (signer, response) in signers.iter().zip(&responses) {
+        signer.check(response, &nonce, answered).unwrap();
+    }
+    let day_later = answered + Duration::from_secs(86_400);
+    for (response, nonce, now, fragment) in [
+        (
+            &responses[0],
+            [0; 32],
+            answered,
+            "nonce is not this request's",
+        ),
+        (&responses[0], nonce, day_later, "is current from"),
+        (&responses[3], nonce, answered, "for another certificate"),
+    ] {
+        let err = signers[0].check(response, &nonce, now).unwrap_err();
+        assert!(err.to_string().contains(fragment), "{err}");
+    }
 
     let altered = |rim: &[u8], from: &str, to: &str| {
         let text = String::from_utf8(rim.to_vec()).unwrap();
