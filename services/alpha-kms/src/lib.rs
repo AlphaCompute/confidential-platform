@@ -145,6 +145,8 @@ pub struct Node {
     pub platform: RwLock<Option<Arc<PlatformDocument>>>,
     pub phase: RwLock<Phase>,
     pub server_cert: Arc<tls::ServerCert>,
+    /// How far this node has verified the audit chain, or where it found it broken.
+    pub audit_chain: Mutex<Result<audit::Checkpoint, String>>,
     /// On Kata only from bootstrap, unseal or the peer.
     database_password: RwLock<Option<Zeroizing<String>>>,
     bucket: Mutex<(f64, Instant)>,
@@ -191,6 +193,7 @@ impl Node {
             platform: RwLock::new(None),
             phase: RwLock::new(Phase::Sealed { shares: Vec::new() }),
             server_cert,
+            audit_chain: Mutex::new(Ok(audit::Checkpoint::default())),
             database_password: RwLock::new(None),
             bucket: Mutex::new((BUCKET_CAPACITY, Instant::now())),
         }))
@@ -243,6 +246,13 @@ impl Node {
         matches!(&*self.phase.read(), Phase::Sealed { .. })
     }
 
+    /// An audit row in a transaction of its own: sealed while serving, a node fact otherwise.
+    pub async fn audit(&self, row: audit::Audit<'_>) -> Result<i64, ApiError> {
+        let keys = self.intermediates().ok();
+        row.insert_now(&self.pool, keys.as_ref().map(|k| &k.metadata))
+            .await
+    }
+
     /// Enters the serving phase: unseal → the database's keys → every plaintext row sealed → serve,
     /// with intermediates in memory and a leaf from `ca` on the listener. A database that cannot be
     /// sealed keeps the node sealed.
@@ -256,7 +266,8 @@ impl Node {
         Ok(())
     }
 
-    /// One maintenance pass while serving: rows an older node wrote in the clear are sealed.
+    /// One maintenance pass while serving: rows an older node wrote in the clear are sealed, and
+    /// the audit chain is verified from where the last pass stopped.
     pub async fn maintain(&self) {
         let Ok(keys) = self.intermediates() else {
             return;
@@ -265,6 +276,33 @@ impl Node {
             Ok(sealed) if !sealed.is_empty() => eprintln!("sealed plaintext rows: {sealed:?}"),
             Ok(_) => {}
             Err(e) => eprintln!("sealing plaintext rows: {}", e.message),
+        }
+        let Ok(mut from) = self.audit_chain.lock().clone() else {
+            return;
+        };
+        // The pass above moved the unlinked rows already walked into the chain.
+        from.unlinked.clear();
+        let walked = audit::verify(&self.pool, &keys.metadata, from, |_| {}).await;
+        let broken = match walked {
+            Ok(at) => {
+                *self.audit_chain.lock() = Ok(at);
+                return;
+            }
+            Err(audit::ChainError::Read(e)) => {
+                eprintln!("audit chain: {e}");
+                return;
+            }
+            Err(e) => e.to_string(),
+        };
+        eprintln!("{broken}");
+        *self.audit_chain.lock() = Err(broken.clone());
+        let row = audit::node(
+            "audit.verify",
+            "error",
+            serde_json::json!({ "message": broken }),
+        );
+        if let Err(e) = self.audit(row).await {
+            eprintln!("audit.verify: {}", e.message);
         }
     }
 
@@ -342,7 +380,11 @@ async fn ready(State(node): State<Arc<Node>>) -> Response {
         let body = axum::Json(serde_json::json!({ "sealed": true }));
         return (axum::http::StatusCode::SERVICE_UNAVAILABLE, body).into_response();
     }
-    axum::Json(serde_json::json!({ "sealed": false })).into_response()
+    let audit_chain = match &*node.audit_chain.lock() {
+        Ok(at) => serde_json::json!({ "verified_through": at.seq }),
+        Err(broken) => serde_json::json!({ "broken": broken }),
+    };
+    axum::Json(serde_json::json!({ "sealed": false, "audit_chain": audit_chain })).into_response()
 }
 
 pub fn random<const N: usize>() -> Result<[u8; N], ApiError> {

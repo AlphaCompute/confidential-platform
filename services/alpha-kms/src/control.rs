@@ -89,7 +89,7 @@ async fn authorize(
 
 async fn audited(
     tx: &mut PgTransaction<'_>,
-    _keys: &Intermediates,
+    keys: &Intermediates,
     chain: &Chain,
     action: &str,
     object: String,
@@ -105,25 +105,25 @@ async fn audited(
         details,
         evidence_sha256: None,
     }
-    .insert(&mut **tx)
+    .insert(tx, Some(&keys.metadata))
     .await?;
     Ok(())
 }
 
 async fn denied(node: &Node, key_id: Option<KeyId>, action: &str, error: &ApiError) {
     let actor = key_id.map_or_else(|| "unregistered".to_owned(), |k| k.to_string());
-    let _ = Audit {
-        actor_kind: "principal",
-        actor: &actor,
-        action,
-        org_id: None,
-        object: None,
-        outcome: error.outcome(),
-        details: error.details(),
-        evidence_sha256: None,
-    }
-    .insert(&node.pool)
-    .await;
+    let _ = node
+        .audit(Audit {
+            actor_kind: "principal",
+            actor: &actor,
+            action,
+            org_id: None,
+            object: None,
+            outcome: error.outcome(),
+            details: error.details(),
+            evidence_sha256: None,
+        })
+        .await;
 }
 
 fn receipted(
@@ -662,7 +662,7 @@ async fn register_root_key(
         details: json!({ "principal_id": p.principal_id, "root": true }),
         evidence_sha256: None,
     }
-    .insert(&mut *tx)
+    .insert(&mut tx, Some(&keys.metadata))
     .await?;
     tx.commit().await?;
     Ok(root_key_json(

@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select audit_log_scrub($1, $2)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "audit_log_scrub",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "a05ab77ea276b83a6abe0687444fdd316b7068293de6d526a0bc4c82b38c97e5"
+}

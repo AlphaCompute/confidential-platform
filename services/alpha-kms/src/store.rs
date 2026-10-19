@@ -638,6 +638,8 @@ pub async fn seal_plaintext(pool: &PgPool, keys: &MetadataKeys) -> Result<Sealed
         sealed.secrets = sealed.secrets.saturating_add(1);
     }
     tx.commit().await?;
+
+    sealed.audit_rows = crate::audit::import_unlinked(pool, keys).await?;
     Ok(sealed)
 }
 

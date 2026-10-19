@@ -203,7 +203,7 @@ pub async fn attest(
         ),
         Err(e) => (e.outcome(), e.details(), None),
     };
-    Audit {
+    node.audit(Audit {
         actor_kind: "instance",
         actor: &actor,
         action: "attest",
@@ -215,8 +215,7 @@ pub async fn attest(
         outcome,
         details,
         evidence_sha256: Some(evidence_sha256),
-    }
-    .insert(&node.pool)
+    })
     .await?;
     let (leaf_der, result) = result?;
     Ok(Json(json!({
@@ -325,7 +324,7 @@ pub async fn get_secret(
         Ok(_) => ("ok", json!({})),
         Err(e) => (e.outcome(), e.details()),
     };
-    Audit {
+    node.audit(Audit {
         actor_kind: "instance",
         actor: &identity.runtime_pubkey_sha256_hex,
         action: "secret.get",
@@ -334,8 +333,7 @@ pub async fn get_secret(
         outcome,
         details,
         evidence_sha256: None,
-    }
-    .insert(&node.pool)
+    })
     .await?;
     result.map(Json)
 }
@@ -458,7 +456,7 @@ pub async fn derive_key(
         Ok(_) => ("ok", json!({})),
         Err(e) => (e.outcome(), e.details()),
     };
-    Audit {
+    node.audit(Audit {
         actor_kind: "instance",
         actor: &actor,
         action: "key.derive",
@@ -467,8 +465,7 @@ pub async fn derive_key(
         outcome,
         details,
         evidence_sha256: None,
-    }
-    .insert(&node.pool)
+    })
     .await?;
     result.map(Json)
 }

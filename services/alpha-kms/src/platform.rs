@@ -64,12 +64,11 @@ pub async fn apply(node: &Node, verified: Verified) -> Result<(), ApiError> {
         Some(stored) if stored > version => {
             let message =
                 format!("platform document version {version} is below the stored {stored}");
-            audit::node(
+            node.audit(audit::node(
                 "platform.reload",
                 "denied",
                 json!({ "version": version, "stored": stored, "message": message }),
-            )
-            .insert(&node.pool)
+            ))
             .await?;
             tx.commit().await?;
             return Err(ApiError::internal(message));
@@ -88,12 +87,13 @@ pub async fn apply(node: &Node, verified: Verified) -> Result<(), ApiError> {
             )
             .execute(&mut *tx)
             .await?;
+            let keys = node.intermediates().ok();
             audit::node(
                 "platform.reload",
                 "ok",
                 json!({ "version": version, "previous": stored }),
             )
-            .insert(&mut *tx)
+            .insert(&mut tx, keys.as_ref().map(|k| &k.metadata))
             .await?;
         }
     }
@@ -178,7 +178,7 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::*;
-    use crate::{CollateralSource, Config, Intermediates, certs, store};
+    use crate::{CollateralSource, Config, Intermediates, certs};
 
     #[tokio::test(start_paused = true)]
     async fn a_stalled_document_server_neither_holds_up_start_nor_lets_the_leaf_lapse() {
@@ -215,14 +215,14 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(120));
 
         let (ca_key_der, ca_cert_der) = certs::new_ca(node.now()).unwrap();
-        let tenant_kek_root = Zeroizing::new([0u8; 32]);
-        let metadata = store::MetadataKeys::derive(&tenant_kek_root).unwrap();
-        node.start_serving(Intermediates {
-            metadata,
-            tenant_kek_root,
-            ca_key_der: Zeroizing::new(ca_key_der),
-            ca_cert_der,
-        })
+        node.start_serving(
+            Intermediates::new(
+                Zeroizing::new([0u8; 32]),
+                Zeroizing::new(ca_key_der),
+                ca_cert_der,
+            )
+            .unwrap(),
+        )
         .await
         .unwrap();
         let leaf = node.server_cert.leaf_der().unwrap();

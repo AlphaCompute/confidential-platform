@@ -99,7 +99,7 @@ pub async fn bootstrap(
         return Err(ApiError::new("already_exists", "database is not empty"));
     }
     audit::node("node.bootstrap", "ok", json!({}))
-        .insert(&mut *tx)
+        .insert(&mut tx, Some(&keys.metadata))
         .await?;
     let password = if node.is_kata() {
         Some(set_role_password(&mut *tx, &root).await?)
@@ -257,14 +257,15 @@ pub async fn unseal(
             shares.clear();
         }
         // On Kata a wrong root is also a wrong database password: keep the refusal, not that.
-        audit::node("node.unseal", "denied", e.details())
-            .insert(&node.pool)
+        if let Err(audit) = node
+            .audit(audit::node("node.unseal", "denied", e.details()))
             .await
-            .ok();
+        {
+            eprintln!("node.unseal denied: {}", audit.message);
+        }
         return Err(e);
     }
-    audit::node("node.unseal", "ok", json!({}))
-        .insert(&node.pool)
+    node.audit(audit::node("node.unseal", "ok", json!({})))
         .await?;
     Ok(Json(json!({ "sealed": false, "shares": 2 })))
 }
@@ -288,8 +289,7 @@ pub async fn join(
         ),
         Err(e) => (e.outcome(), e.details()),
     };
-    audit::node("node.join", outcome, details)
-        .insert(&node.pool)
+    node.audit(audit::node("node.join", outcome, details))
         .await?;
     result?;
     let keys = node.intermediates()?;
@@ -375,12 +375,11 @@ async fn join_via(
     let nonce_text = client.attest_nonce().await.map_err(http)?.nonce;
     let nonce = decode32("nonce", &nonce_text)?;
     if !node.is_kata() {
-        audit::node(
+        node.audit(audit::node(
             "node.join.request",
             "ok",
             json!({ "runtime_pubkey_sha256": keys::sha256_hex(&node.runtime_spki), "endpoint": endpoint }),
-        )
-        .insert(&node.pool)
+        ))
         .await?;
     }
     let xwing = node.xwing_key.public();
