@@ -1,6 +1,9 @@
 //! RFC 6960 OCSP for NVIDIA's certificates. NVIDIA's responder signs each answer on request and
 //! echoes the request's nonce, so a fresh nonce is what makes an answer current; the answer must
 //! come from a responder its issuer delegated, and only `good` passes.
+// ponytail: DER is encoded and decoded by hand for the one request and response shape NVIDIA's
+// responder uses, as the workspace has no OCSP crate; the upgrade is RustCrypto's `x509-ocsp` once
+// a responder with another shape has to be read.
 
 use std::time::{Duration, SystemTime};
 
@@ -10,12 +13,11 @@ use sha2::{Digest, Sha256, Sha384};
 use x509_parser::asn1_rs::{Any, Class, FromDer, Oid, Tag};
 use x509_parser::certificate::X509Certificate;
 use x509_parser::oid_registry::{
-    OID_SIG_ECDSA_WITH_SHA256, OID_SIG_ECDSA_WITH_SHA384, OID_X509_EXT_BASIC_CONSTRAINTS,
-    OID_X509_EXT_EXTENDED_KEY_USAGE, OID_X509_EXT_KEY_USAGE,
+    OID_SIG_ECDSA_WITH_SHA256, OID_SIG_ECDSA_WITH_SHA384, OID_X509_EXT_EXTENDED_KEY_USAGE,
 };
 use x509_parser::time::ASN1Time;
 
-use super::{asn1_time, p384_key};
+use super::{asn1_time, p384_key, unknown_critical};
 use crate::AppraisalError;
 
 /// `AlgorithmIdentifier { sha384, NULL }`, as OpenSSL and NVIDIA's verifier encode it.
@@ -232,15 +234,10 @@ fn delegated(
     if !responder.validity().is_valid_at(asn1_time(now)?) {
         return Err(failed(format!("responder {name} is outside its validity")));
     }
-    if let Some(ext) = responder.extensions().iter().find(|e| {
-        e.critical
-            && e.oid != OID_X509_EXT_BASIC_CONSTRAINTS
-            && e.oid != OID_X509_EXT_KEY_USAGE
-            && e.oid != OID_X509_EXT_EXTENDED_KEY_USAGE
-    }) {
+    if let Some(oid) = unknown_critical(responder, &OID_X509_EXT_EXTENDED_KEY_USAGE.to_id_string())
+    {
         return Err(failed(format!(
-            "responder {name} has unknown critical extension {}",
-            ext.oid
+            "responder {name} has unknown critical extension {oid}"
         )));
     }
     Ok(())
