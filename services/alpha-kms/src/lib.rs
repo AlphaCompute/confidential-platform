@@ -48,6 +48,8 @@ pub struct Config {
     pub substrate: alpha_tsm::Substrate,
     pub kms_endpoints: Vec<String>,
     pub platform_document_url: String,
+    /// The OCSP responder asked about every GPU device certificate an appraisal accepts.
+    pub nvidia_ocsp_url: String,
     #[cfg(feature = "dev-root")]
     pub dev_root_kek: Option<Zeroizing<[u8; 32]>>,
 }
@@ -66,6 +68,8 @@ impl Config {
                 .filter(|s| !s.is_empty())
                 .collect(),
             platform_document_url: env("ALPHACOMPUTE_PLATFORM_DOCUMENT_URL")?,
+            nvidia_ocsp_url: env("ALPHACOMPUTE_NVIDIA_OCSP_URL")
+                .unwrap_or_else(|_| alpha_client::NVIDIA_OCSP_URL.to_owned()),
             #[cfg(feature = "dev-root")]
             dev_root_kek: std::env::var("ALPHACOMPUTE_KMS_DEV_ROOT_KEK")
                 .ok()

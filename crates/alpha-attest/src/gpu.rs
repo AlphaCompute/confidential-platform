@@ -170,11 +170,8 @@ fn failed(what: impl Into<String>) -> AppraisalError {
 }
 
 /// Appraises `count` GPU evidences, each fresh for `nonce` and from a distinct device, and
-/// returns their leaf certificate serials in lowercase hex, in evidence order.
-// ponytail: no revocation check. Device certificates never expire, so NVIDIA's OCSP responders
-// (ocsp.ndis.nvidia.com, one per chain level) are the only way a leaked device key stops
-// verifying; the upgrade is an OCSP fetch with nonce at appraisal, or a revocation list pinned
-// in the platform document.
+/// returns their leaf certificate serials in lowercase hex, in evidence order. Revocation is the
+/// caller's to check, with [`device_ocsp_queries`].
 pub fn appraise_gpus(
     gpus: &[GpuEvidence],
     nonce: &[u8; 32],
@@ -246,13 +243,7 @@ fn read_gpu<'a>(
     roots: &[ComposeHash],
     now: SystemTime,
 ) -> Result<(Leaf, Spdm<'a>, Opaque), AppraisalError> {
-    let ders = Pem::iter_from_buffer(&gpu.certificate_chain)
-        .map(|block| match block {
-            Ok(block) if block.label == "CERTIFICATE" => Ok(block.contents),
-            _ => Err(failed("certificate chain is not PEM certificates")),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let leaf = verify_chain(&ders, roots, now)?;
+    let leaf = verify_chain(&pem_chain(gpu)?, roots, now)?;
     let spdm = parse_spdm(&gpu.evidence)?;
     let signature = Signature::from_slice(&spdm.signature).map_err(|_| failed("signature"))?;
     leaf.key
@@ -267,6 +258,38 @@ fn read_gpu<'a>(
         return Err(failed("FWID differs from the leaf certificate's"));
     }
     Ok((leaf, spdm, opaque))
+}
+
+fn pem_chain(gpu: &GpuEvidence) -> Result<Vec<Vec<u8>>, AppraisalError> {
+    Pem::iter_from_buffer(&gpu.certificate_chain)
+        .map(|block| match block {
+            Ok(block) if block.label == "CERTIFICATE" => Ok(block.contents),
+            _ => Err(failed("certificate chain is not PEM certificates")),
+        })
+        .collect()
+}
+
+/// An OCSP query for each device certificate of `gpus` from the boot ROM's up, once each: the
+/// leaf names no responder and the root is pinned. Device certificates never expire, so NVIDIA's
+/// responder is the only way a leaked device key stops being accepted. The chains must be ones
+/// an appraisal accepted.
+pub fn device_ocsp_queries(gpus: &[GpuEvidence]) -> Result<Vec<OcspQuery>, AppraisalError> {
+    let mut queries = Vec::new();
+    for gpu in gpus {
+        add_queries(&mut queries, &pem_chain(gpu)?, 1);
+    }
+    Ok(queries)
+}
+
+/// Adds a query for each certificate of a verified chain from `first` on, the root excluded,
+/// unless `queries` holds it already.
+fn add_queries(queries: &mut Vec<OcspQuery>, chain: &[Vec<u8>], first: usize) {
+    for (cert, issuer) in chain.iter().zip(chain.iter().skip(1)).skip(first) {
+        let query = OcspQuery::new(cert.clone(), issuer.clone());
+        if !queries.contains(&query) {
+            queries.push(query);
+        }
+    }
 }
 
 struct Spdm<'a> {

@@ -19,9 +19,6 @@ use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
 
-/// The responder every NVIDIA certificate names in its AIA.
-const NVIDIA_OCSP_URL: &str = "https://ocsp.ndis.nvidia.com/";
-
 /// The alphacompute CLI: keys, Control calls, the platform document, deploys, and the
 /// custodians' bootstrap and unseal.
 #[derive(Parser)]
@@ -676,25 +673,16 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 SystemTime::now(),
             )
             .map_err(|e| e.to_string())?;
-            let http = alpha_client::http()
-                .build()
-                .map_err(|e| format!("http client: {e}"))?;
             for signer in &signers {
                 let nonce = alpha_cli::random()?;
-                let response = http
-                    .post(NVIDIA_OCSP_URL)
-                    .header(reqwest::header::CONTENT_TYPE, "application/ocsp-request")
-                    .body(signer.request(&nonce).map_err(|e| e.to_string())?)
-                    .send()
-                    .await
-                    .and_then(reqwest::Response::error_for_status)
-                    .map_err(|e| format!("ocsp: {e}"))?
-                    .bytes()
-                    .await
-                    .map_err(|e| format!("ocsp: {e}"))?;
-                signer
-                    .check(&response, &nonce, SystemTime::now())
-                    .map_err(|e| e.to_string())?;
+                alpha_client::check_ocsp(
+                    alpha_client::NVIDIA_OCSP_URL,
+                    signer,
+                    &nonce,
+                    SystemTime::now(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
             }
             Ok(json!(reference))
         }

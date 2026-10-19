@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 
 use alpha_attest::{
     GpuEvidence, GpuReference, KataGpus, KataReference, PlatformDocument, appraise_gpus,
-    appraise_kata_gpus, bind_gpus, gpu_reference, verify_quote,
+    appraise_kata_gpus, bind_gpus, device_ocsp_queries, gpu_reference, verify_quote,
 };
 
 fn testdata(path: &str) -> Vec<u8> {
@@ -459,5 +459,23 @@ fn reference_values_come_from_the_signed_rims() {
     ] {
         let err = gpu_reference(&evidence, &driver, &vbios, now).unwrap_err();
         assert!(err.to_string().contains(fragment), "{err}");
+    }
+}
+
+#[test]
+fn device_certificates_are_asked_about_from_the_boot_rom_up() {
+    let read = |name: &str| testdata(&format!("b300-gpu-595.91.07/{name}"));
+    let gpu = GpuEvidence {
+        evidence: read("spdm.bin"),
+        certificate_chain: read("certchain.pem"),
+    };
+    let queries = device_ocsp_queries(&[gpu.clone(), gpu]).unwrap();
+    // NVIDIA's answers, captured 2026-10-19 10:07 UTC for the nonce of 32 bytes 0x5a.
+    let answered = UNIX_EPOCH + Duration::from_secs(1_792_411_200);
+    let responses = ["brom", "provisioner-ica", "identity"];
+    assert_eq!(queries.len(), responses.len());
+    for (query, name) in queries.iter().zip(responses) {
+        let response = read(&format!("ocsp/{name}.der"));
+        query.check(&response, &[0x5a; 32], answered).unwrap();
     }
 }

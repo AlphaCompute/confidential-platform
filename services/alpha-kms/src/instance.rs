@@ -238,6 +238,26 @@ pub async fn attest(
     })))
 }
 
+/// Asks NVIDIA's responder about every device certificate of the accepted GPUs, each with its
+/// own nonce. Without a `good` for each, nothing is released, as without collateral: a host that
+/// blocks the responder would otherwise keep a revoked device in use.
+async fn check_gpu_revocation(
+    node: &Node,
+    gpus: &[alpha_attest::GpuEvidence],
+    now: SystemTime,
+) -> Result<(), ApiError> {
+    let mut checks = tokio::task::JoinSet::new();
+    for query in alpha_attest::device_ocsp_queries(gpus)? {
+        let url = node.config.nvidia_ocsp_url.clone();
+        let nonce = crate::random()?;
+        checks.spawn(async move { alpha_client::check_ocsp(&url, &query, &nonce, now).await });
+    }
+    while let Some(checked) = checks.join_next().await {
+        checked.map_err(|e| ApiError::internal(format!("ocsp: {e}")))??;
+    }
+    Ok(())
+}
+
 /// The leaf's DER and the result behind it.
 async fn attest_inner(
     node: &Node,
@@ -255,6 +275,9 @@ async fn attest_inner(
     let kata = matches!(evidence, InstanceEvidence::Kata(_));
     let collateral = collateral(node, evidence.quote()).await?;
     let appraised = evidence.appraise(&nonce, spki, None, &doc, &collateral, now)?;
+    if let InstanceEvidence::Kata(evidence) = &evidence {
+        check_gpu_revocation(node, &evidence.gpu, now).await?;
+    }
     let keys = node.intermediates()?;
     // A Revision is measured only in the form it was registered in: a compose through the dstack
     // event log, an init-data through MRCONFIGID.

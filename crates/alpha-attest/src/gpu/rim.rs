@@ -16,7 +16,7 @@ use p384::ecdsa::signature::Verifier;
 use roxmltree::{Document, Node, NodeType};
 use sha2::{Digest, Sha384};
 
-use super::{BLOCKS, GpuEvidence, GpuReference, OcspQuery, read_gpu, verify_chain};
+use super::{BLOCKS, GpuEvidence, GpuReference, OcspQuery, add_queries, read_gpu, verify_chain};
 use crate::{AppraisalError, Measurement};
 
 /// SHA-256 of the DER of "NVIDIA CoRIM signing Root CA", the root NVIDIA's local GPU verifier
@@ -43,7 +43,8 @@ struct Rim {
     product: String,
     /// The active measurements by SPDM block index, which is the RIM's index plus one.
     measurements: BTreeMap<u8, Vec<Measurement>>,
-    signers: Vec<OcspQuery>,
+    /// The signer's verified chain, leaf first.
+    chain: Vec<Vec<u8>>,
 }
 
 /// The reference for the GPU that produced `evidence`, whose chain must end in NVIDIA's device
@@ -76,11 +77,7 @@ pub fn gpu_reference(
                 rim.product, rim.version, opaque.chip
             )));
         }
-        for query in rim.signers {
-            if !signers.contains(&query) {
-                signers.push(query);
-            }
-        }
+        add_queries(&mut signers, &rim.chain, 0);
         for (block, values) in rim.measurements {
             if covered.insert(block, values).is_some() {
                 return Err(failed(format!("block {block} is active in both RIMs")));
@@ -216,11 +213,7 @@ fn verify_rim(xml: &[u8], now: SystemTime) -> Result<Rim, AppraisalError> {
         version: attribute(meta, "colloquialVersion")?.to_owned(),
         product: attribute(meta, "product")?.to_owned(),
         measurements,
-        signers: ders
-            .iter()
-            .zip(ders.iter().skip(1))
-            .map(|(cert, issuer)| OcspQuery::new(cert.clone(), issuer.clone()))
-            .collect(),
+        chain: ders,
     })
 }
 
