@@ -46,19 +46,13 @@ impl OcspQuery {
 
     /// The DER `OCSPRequest` for this certificate, carrying `nonce`.
     pub fn request(&self, nonce: &[u8; 32]) -> Result<Vec<u8>, AppraisalError> {
-        let extension = der(
-            0x30,
-            &[
-                &der(0x06, &[&NONCE_OID])?,
-                &der(0x04, &[&der(0x04, &[nonce])?])?,
-            ],
-        )?;
-        let request = der(0x30, &[&self.cert_id()?])?;
+        let (_, _, cert_id) = self.parse()?;
+        let request = der(0x30, &[&cert_id])?;
         let tbs = der(
             0x30,
             &[
                 &der(0x30, &[&request])?,
-                &der(0xa2, &[&der(0x30, &[&extension])?])?,
+                &der(0xa2, &[&der(0x30, &[&nonce_extension(nonce)?])?])?,
             ],
         )?;
         der(0x30, &[&tbs])
@@ -73,7 +67,7 @@ impl OcspQuery {
         nonce: &[u8; 32],
         now: SystemTime,
     ) -> Result<(), AppraisalError> {
-        let (cert, issuer) = (parse(&self.cert)?, parse(&self.issuer)?);
+        let (cert, issuer, cert_id) = self.parse()?;
         let subject = cert.subject().to_string();
         let mut outer = sequence(response, "response")?;
         let status = next(&mut outer, "response status")?;
@@ -130,21 +124,21 @@ impl OcspQuery {
         if !responses.is_empty() {
             return Err(failed("more than one single response"));
         }
-        let nonces: Vec<_> = match next(&mut fields, "response extensions") {
-            Ok(exts) if is_context(&exts, 1) && fields.is_empty() => extensions(exts.data)?
-                .into_iter()
-                .filter(|(oid, _)| oid.as_bytes() == NONCE_OID)
-                .map(|(_, value)| value)
-                .collect(),
+        let exts = match next(&mut fields, "response extensions") {
+            Ok(exts) if is_context(&exts, 1) && fields.is_empty() => extensions(exts.data)?,
             _ => return Err(failed("response carries no nonce")),
         };
-        if nonces != [der(0x04, &[nonce])?] {
+        let nonces: Vec<_> = exts
+            .into_iter()
+            .filter(|(oid, _)| oid.as_bytes() == NONCE_OID)
+            .map(|(_, value)| value)
+            .collect();
+        if nonces != [der(0x04, &[nonce])?.as_slice()] {
             return Err(failed("nonce is not this request's"));
         }
 
         let mut single = single.data;
-        let (_, cert_id) = next_raw(&mut single, "certID")?;
-        if cert_id != self.cert_id()? {
+        if next_raw(&mut single, "certID")?.1 != cert_id {
             return Err(failed("response is for another certificate"));
         }
         let status = next(&mut single, "certStatus")?;
@@ -171,12 +165,13 @@ impl OcspQuery {
         }
     }
 
-    fn cert_id(&self) -> Result<Vec<u8>, AppraisalError> {
+    /// Both certificates and the SHA-384 `CertID` of the first.
+    fn parse(&self) -> Result<(X509Certificate<'_>, X509Certificate<'_>, Vec<u8>), AppraisalError> {
         let (cert, issuer) = (parse(&self.cert)?, parse(&self.issuer)?);
         if cert.issuer().as_raw() != issuer.subject().as_raw() {
             return Err(failed("issuer does not issue the certificate"));
         }
-        der(
+        let cert_id = der(
             0x30,
             &[
                 &SHA384_ID,
@@ -189,8 +184,20 @@ impl OcspQuery {
                 )?,
                 &der(0x02, &[cert.raw_serial()])?,
             ],
-        )
+        )?;
+        Ok((cert, issuer, cert_id))
     }
+}
+
+/// The id-pkix-ocsp-nonce `Extension` carrying `nonce`.
+fn nonce_extension(nonce: &[u8; 32]) -> Result<Vec<u8>, AppraisalError> {
+    der(
+        0x30,
+        &[
+            &der(0x06, &[&NONCE_OID])?,
+            &der(0x04, &[&der(0x04, &[nonce])?])?,
+        ],
+    )
 }
 
 /// The responder must be issued by the checked certificate's issuer for OCSP signing only, and
@@ -273,7 +280,7 @@ fn certificates(mut data: &[u8]) -> Result<Vec<X509Certificate<'_>>, AppraisalEr
 }
 
 /// `(extnID, extnValue)` of each extension in `[n] EXPLICIT Extensions`.
-fn extensions(data: &[u8]) -> Result<Vec<(Oid<'_>, Vec<u8>)>, AppraisalError> {
+fn extensions(data: &[u8]) -> Result<Vec<(Oid<'_>, &[u8])>, AppraisalError> {
     let mut list = sequence(data, "extensions")?;
     let mut out = Vec::new();
     while !list.is_empty() {
@@ -287,7 +294,7 @@ fn extensions(data: &[u8]) -> Result<Vec<(Oid<'_>, Vec<u8>)>, AppraisalError> {
         if value.tag() != Tag::OctetString || !ext.is_empty() {
             return Err(failed("extension value"));
         }
-        out.push((oid, value.data.to_vec()));
+        out.push((oid, value.data));
     }
     Ok(out)
 }
@@ -384,21 +391,14 @@ mod tests {
         let single = der(
             0x30,
             &[
-                &query.cert_id().unwrap(),
+                &query.parse().unwrap().2,
                 status,
                 &time("20261019100000Z"),
                 &der(0xa0, &[&time("20261020100000Z")]).unwrap(),
             ],
         )
         .unwrap();
-        let nonce = der(
-            0x30,
-            &[
-                &der(0x06, &[&NONCE_OID]).unwrap(),
-                &der(0x04, &[&der(0x04, &[&NONCE]).unwrap()]).unwrap(),
-            ],
-        )
-        .unwrap();
+        let nonce = nonce_extension(&NONCE).unwrap();
         let tbs = der(
             0x30,
             &[

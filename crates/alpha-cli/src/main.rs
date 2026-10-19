@@ -676,8 +676,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 SystemTime::now(),
             )
             .map_err(|e| e.to_string())?;
-            let http = reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
+            let http = alpha_client::http()
                 .build()
                 .map_err(|e| format!("http client: {e}"))?;
             for signer in &signers {
