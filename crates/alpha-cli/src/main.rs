@@ -673,16 +673,19 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 SystemTime::now(),
             )
             .map_err(|e| e.to_string())?;
+            let http = alpha_client::http()
+                .build()
+                .map_err(|e| format!("http client: {e}"))?;
             for signer in &signers {
                 let nonce = alpha_cli::random()?;
-                alpha_client::check_ocsp(
-                    alpha_client::NVIDIA_OCSP_URL,
-                    signer,
-                    &nonce,
-                    SystemTime::now(),
-                )
-                .await
-                .map_err(|e| e.to_string())?;
+                let request = signer.request(&nonce).map_err(|e| e.to_string())?;
+                let answer =
+                    alpha_client::fetch_ocsp(&http, alpha_client::NVIDIA_OCSP_URL, request)
+                        .await
+                        .map_err(|e| format!("ocsp: {e}"))?;
+                signer
+                    .check(&answer, &nonce, SystemTime::now())
+                    .map_err(|e| e.to_string())?;
             }
             Ok(json!(reference))
         }

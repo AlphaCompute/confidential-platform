@@ -436,28 +436,23 @@ pub async fn read_capped(mut response: reqwest::Response, cap: usize) -> Result<
 /// The responder every NVIDIA certificate names in its AIA.
 pub const NVIDIA_OCSP_URL: &str = "https://ocsp.ndis.nvidia.com/";
 
-/// Asks the OCSP responder at `url` about `query` with `nonce`, which must be fresh, and accepts
-/// only a current, signed `good` for it.
-pub async fn check_ocsp(
+/// The answer of the OCSP responder at `url` to the DER `request`. An error here is the
+/// transport's, not a verdict on the certificate.
+pub async fn fetch_ocsp(
+    http: &reqwest::Client,
     url: &str,
-    query: &alpha_attest::OcspQuery,
-    nonce: &[u8; 32],
-    now: std::time::SystemTime,
-) -> Result<(), alpha_attest::AppraisalError> {
-    let failed = |e: String| alpha_attest::AppraisalError::Failed(format!("ocsp: {e}"));
-    let response = http()
-        .build()
-        .map_err(|e| failed(e.to_string()))?
+    request: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    let response = http
         .post(url)
         .header(reqwest::header::CONTENT_TYPE, "application/ocsp-request")
-        .body(query.request(nonce)?)
+        .body(request)
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
-        .map_err(|e| failed(e.to_string()))?;
+        .map_err(|e| e.to_string())?;
     // NVIDIA's answers are about a kilobyte.
-    let body = read_capped(response, 64 << 10).await.map_err(failed)?;
-    query.check(&body, nonce, now)
+    read_capped(response, 64 << 10).await
 }
 
 pub struct Client {

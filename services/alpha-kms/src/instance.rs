@@ -240,20 +240,27 @@ pub async fn attest(
 
 /// Asks NVIDIA's responder about every device certificate of the accepted GPUs, each with its
 /// own nonce. Without a `good` for each, nothing is released, as without collateral: a host that
-/// blocks the responder would otherwise keep a revoked device in use.
+/// blocks the responder would otherwise keep a revoked device in use. A responder that cannot be
+/// reached is a 5xx, so the client tries the next KMS node.
 async fn check_gpu_revocation(
     node: &Node,
     gpus: &[alpha_attest::GpuEvidence],
-    now: SystemTime,
 ) -> Result<(), ApiError> {
-    let mut checks = tokio::task::JoinSet::new();
+    let mut fetches = tokio::task::JoinSet::new();
     for query in alpha_attest::device_ocsp_queries(gpus)? {
-        let url = node.config.nvidia_ocsp_url.clone();
         let nonce = crate::random()?;
-        checks.spawn(async move { alpha_client::check_ocsp(&url, &query, &nonce, now).await });
+        let request = query.request(&nonce)?;
+        let (http, url) = (node.ocsp_http.clone(), node.config.nvidia_ocsp_url.clone());
+        fetches.spawn(async move {
+            let answer = alpha_client::fetch_ocsp(&http, &url, request).await;
+            (query, nonce, answer)
+        });
     }
-    while let Some(checked) = checks.join_next().await {
-        checked.map_err(|e| ApiError::internal(format!("ocsp: {e}")))??;
+    while let Some(fetched) = fetches.join_next().await {
+        let (query, nonce, answer) =
+            fetched.map_err(|e| ApiError::internal(format!("ocsp: {e}")))?;
+        let answer = answer.map_err(|e| ApiError::internal(format!("ocsp responder: {e}")))?;
+        query.check(&answer, &nonce, (node.clock)())?;
     }
     Ok(())
 }
@@ -276,7 +283,7 @@ async fn attest_inner(
     let collateral = collateral(node, evidence.quote()).await?;
     let appraised = evidence.appraise(&nonce, spki, None, &doc, &collateral, now)?;
     if let InstanceEvidence::Kata(evidence) = &evidence {
-        check_gpu_revocation(node, &evidence.gpu, now).await?;
+        check_gpu_revocation(node, &evidence.gpu).await?;
     }
     let keys = node.intermediates()?;
     // A Revision is measured only in the form it was registered in: a compose through the dstack

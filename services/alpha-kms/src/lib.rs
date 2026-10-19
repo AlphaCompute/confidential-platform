@@ -121,6 +121,7 @@ pub struct Node {
     pub config: Config,
     pub clock: Clock,
     pub collateral: CollateralSource,
+    pub ocsp_http: reqwest::Client,
     pub nonce_key: [u8; 32],
     pub runtime_key: SigningKey,
     pub runtime_pkcs8: Zeroizing<Vec<u8>>,
@@ -168,6 +169,9 @@ impl Node {
             config,
             clock,
             collateral,
+            ocsp_http: alpha_client::http()
+                .build()
+                .map_err(|e| format!("http client: {e}"))?,
             nonce_key,
             runtime_key,
             runtime_pkcs8,
