@@ -22,8 +22,10 @@ use x509_parser::time::ASN1Time;
 
 use crate::{AppraisalError, KataReference, Measurement, base64url};
 
+mod ocsp;
 mod rim;
 
+pub use ocsp::OcspQuery;
 pub use rim::gpu_reference;
 
 /// One GPU's evidence as NVML hands it out: the request and signed response of SPDM
@@ -468,12 +470,7 @@ fn verify_chain(
         )));
     }
 
-    let now = now
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|d| i64::try_from(d.as_secs()).ok())
-        .and_then(|secs| ASN1Time::from_timestamp(secs).ok())
-        .ok_or_else(|| failed("now"))?;
+    let now = asn1_time(now)?;
     for (depth, (cert, issuer)) in certs.iter().zip(certs.iter().skip(1)).enumerate() {
         let n = depth.saturating_add(1);
         let ca = issuer
@@ -522,15 +519,12 @@ fn verify_chain(
                 if depth == 0 {
                     leaf_fwid = tcb_info.fwid;
                 }
-            } else if ext.critical
-                && ext.oid != OID_X509_EXT_BASIC_CONSTRAINTS
-                && ext.oid != OID_X509_EXT_KEY_USAGE
-            {
-                return Err(failed(format!(
-                    "certificate {depth} has unknown critical extension {}",
-                    ext.oid
-                )));
             }
+        }
+        if let Some(oid) = unknown_critical(cert, TCB_INFO_OID) {
+            return Err(failed(format!(
+                "certificate {depth} has unknown critical extension {oid}"
+            )));
         }
     }
     let leaf_is_ca = leaf
@@ -551,6 +545,27 @@ fn verify_chain(
         fwid: leaf_fwid,
         root: root_sha256,
     })
+}
+
+fn asn1_time(t: SystemTime) -> Result<ASN1Time, AppraisalError> {
+    t.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .and_then(|secs| ASN1Time::from_timestamp(secs).ok())
+        .ok_or_else(|| failed("now"))
+}
+
+/// The first critical extension of `cert` other than basic constraints, key usage and `also`.
+fn unknown_critical(cert: &X509Certificate<'_>, also: &str) -> Option<String> {
+    cert.extensions()
+        .iter()
+        .find(|e| {
+            e.critical
+                && e.oid != OID_X509_EXT_BASIC_CONSTRAINTS
+                && e.oid != OID_X509_EXT_KEY_USAGE
+                && e.oid.to_id_string() != also
+        })
+        .map(|e| e.oid.to_id_string())
 }
 
 fn p384_key(cert: &X509Certificate<'_>) -> Result<VerifyingKey, AppraisalError> {

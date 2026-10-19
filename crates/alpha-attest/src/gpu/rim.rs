@@ -16,7 +16,7 @@ use p384::ecdsa::signature::Verifier;
 use roxmltree::{Document, Node, NodeType};
 use sha2::{Digest, Sha384};
 
-use super::{BLOCKS, GpuEvidence, GpuReference, read_gpu, verify_chain};
+use super::{BLOCKS, GpuEvidence, GpuReference, OcspQuery, read_gpu, verify_chain};
 use crate::{AppraisalError, Measurement};
 
 /// SHA-256 of the DER of "NVIDIA CoRIM signing Root CA", the root NVIDIA's local GPU verifier
@@ -43,23 +43,25 @@ struct Rim {
     product: String,
     /// The active measurements by SPDM block index, which is the RIM's index plus one.
     measurements: BTreeMap<u8, Vec<Measurement>>,
+    signers: Vec<OcspQuery>,
 }
 
 /// The reference for the GPU that produced `evidence`, whose chain must end in NVIDIA's device
 /// root: its identity and FWID as it reports them, and for each measurement block the
 /// alternatives the driver or the VBIOS RIM lists. Refuses when the GPU reports a block neither
 /// RIM lists it with, or a nonzero block neither covers.
-// ponytail: no revocation check of the RIM signers, as for device certificates; the upgrade is
-// an OCSP fetch against ocsp.ndis.nvidia.com when the reference is built.
+/// Also returns an OCSP query for each certificate below the RIM root that signs either RIM;
+/// the reference stands only once each answers `good`.
 pub fn gpu_reference(
     evidence: &GpuEvidence,
     driver_rim: &[u8],
     vbios_rim: &[u8],
     now: SystemTime,
-) -> Result<GpuReference, AppraisalError> {
+) -> Result<(GpuReference, Vec<OcspQuery>), AppraisalError> {
     let device_root = pin(DEVICE_ROOT)?;
     let (leaf, spdm, opaque) = read_gpu(evidence, &[device_root], now)?;
     let mut covered = BTreeMap::new();
+    let mut signers = Vec::new();
     for (name, xml, version) in [
         ("driver", driver_rim, &opaque.driver_version),
         ("vbios", vbios_rim, &opaque.vbios_version),
@@ -73,6 +75,11 @@ pub fn gpu_reference(
                 "{name} RIM is for {} {}, the GPU is {} {version}",
                 rim.product, rim.version, opaque.chip
             )));
+        }
+        for query in rim.signers {
+            if !signers.contains(&query) {
+                signers.push(query);
+            }
         }
         for (block, values) in rim.measurements {
             if covered.insert(block, values).is_some() {
@@ -91,7 +98,7 @@ pub fn gpu_reference(
             )));
         }
     }
-    Ok(GpuReference {
+    let reference = GpuReference {
         root_sha256: leaf.root,
         chip: opaque.chip,
         project: opaque.project,
@@ -102,7 +109,8 @@ pub fn gpu_reference(
         fwid: Measurement(opaque.fwid),
         feature_flag: opaque.feature_flag,
         measurements: covered,
-    })
+    };
+    Ok((reference, signers))
 }
 
 fn pin(hash: &str) -> Result<ComposeHash, AppraisalError> {
@@ -208,6 +216,14 @@ fn verify_rim(xml: &[u8], now: SystemTime) -> Result<Rim, AppraisalError> {
         version: attribute(meta, "colloquialVersion")?.to_owned(),
         product: attribute(meta, "product")?.to_owned(),
         measurements,
+        signers: ders
+            .iter()
+            .zip(ders.iter().skip(1))
+            .map(|(cert, issuer)| OcspQuery {
+                cert: cert.clone(),
+                issuer: issuer.clone(),
+            })
+            .collect(),
     })
 }
 
