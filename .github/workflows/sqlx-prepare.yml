@@ -1,0 +1,47 @@
+name: Regenerate sqlx cache
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Branch to regenerate cache on
+        required: true
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: alpha
+          POSTGRES_PASSWORD: alpha
+          POSTGRES_DB: alpha
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U alpha"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://alpha:alpha@localhost:5432/alpha
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --no-default-features --features postgres,rustls --locked
+      - name: Migrate and prepare
+        run: |
+          cargo sqlx migrate run --source services/alpha-kms/migrations
+          cargo sqlx prepare --workspace -- --all-targets
+      - name: Commit updated cache
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .sqlx/
+          git diff --cached --quiet && echo "cache already up to date" && exit 0
+          git commit -m "chore: regenerate sqlx offline cache [skip ci]"
+          git push
