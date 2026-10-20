@@ -175,16 +175,10 @@ async fn a_device_passkey_claims_its_organization_and_registers_a_key() {
         json!(b64(&chain.key.public_key)),
         a1["payload"]["public_key"]
     );
-    let refused = alpha_kms::keys::walk_chain(
-        &h.pool,
-        &keys,
-        second_id,
-        h.node.now_utc(),
-        None,
-    )
-    .await
-    .err()
-    .unwrap();
+    let refused = alpha_kms::keys::walk_chain(&h.pool, &keys, second_id, h.node.now_utc(), None)
+        .await
+        .err()
+        .unwrap();
     assert_eq!(refused.code, "signature_invalid");
 }
 

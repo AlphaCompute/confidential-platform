@@ -537,7 +537,7 @@ impl Harness {
 
     pub async fn audit(&self, action: &str) -> Vec<(i64, String, Value)> {
         sqlx::query!(
-            "select seq, outcome, details from audit_log where action = $1 order by seq",
+            r#"select seq, outcome as "outcome!", details as "details!" from audit_log where action = $1 order by seq"#,
             action
         )
         .fetch_all(&self.pool)
