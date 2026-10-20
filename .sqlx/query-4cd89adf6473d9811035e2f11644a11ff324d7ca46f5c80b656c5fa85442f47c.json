@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update revisions set compose = left(compose, length(compose) - 1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "4cd89adf6473d9811035e2f11644a11ff324d7ca46f5c80b656c5fa85442f47c"
+}

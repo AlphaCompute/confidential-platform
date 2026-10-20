@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update revisions set revoked_at = null",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "1e0530ed6ad428d4bbca715935cde2731a7f719a1a799194ec16b1575abdfb8d"
+}

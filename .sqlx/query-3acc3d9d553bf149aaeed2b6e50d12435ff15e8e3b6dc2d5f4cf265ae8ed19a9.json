@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update secrets set app_ids = app_ids || $1 where name = 'foreign'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3acc3d9d553bf149aaeed2b6e50d12435ff15e8e3b6dc2d5f4cf265ae8ed19a9"
+}

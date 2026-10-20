@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into audit_log (actor_kind, actor, action, outcome, details) values ('node', 'node', 'node.join.request', 'ok', $1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1e6198887a6c49ccd7bcfcfcf2d22c72e6a047f4b0c3e84c5afdb3a9511926dc"
+}

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update principal_keys set revocation_reason = 'compromised' where id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2f36c088ed118cfa53b58a6ed46135eedbdeec912b46382f4732412e65c9e8c9"
+}

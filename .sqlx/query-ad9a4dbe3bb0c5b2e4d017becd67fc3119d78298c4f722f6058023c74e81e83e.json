@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update principal_keys set revoked_at = null, revocation_reason = null where id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ad9a4dbe3bb0c5b2e4d017becd67fc3119d78298c4f722f6058023c74e81e83e"
+}
