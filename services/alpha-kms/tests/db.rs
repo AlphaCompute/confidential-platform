@@ -238,7 +238,7 @@ async fn two_organizations_live_side_by_side() {
         )
         .unwrap()
     };
-    let aad = alpha_kms::keys::secret_aad(stored.id, &stored.document).unwrap();
+    let aad = alpha_kms::keys::secret_aad(stored.id, stored.document.as_ref().unwrap()).unwrap();
     let key_b = org_key(org_b, &root_b.1);
     assert!(
         alpha_kms::keys::aead_open(&key_b, &aad, &stored.ciphertext).is_none(),

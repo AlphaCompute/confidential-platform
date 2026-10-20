@@ -163,7 +163,7 @@ async fn a_device_passkey_claims_its_organization_and_registers_a_key() {
     let doc = h.node.platform_document().unwrap();
     let chain = alpha_kms::keys::walk_chain(
         &h.pool,
-        &keys.tenant_kek_root,
+        &keys,
         second_id,
         h.node.now_utc(),
         doc.signer.as_ref(),
@@ -177,7 +177,7 @@ async fn a_device_passkey_claims_its_organization_and_registers_a_key() {
     );
     let refused = alpha_kms::keys::walk_chain(
         &h.pool,
-        &keys.tenant_kek_root,
+        &keys,
         second_id,
         h.node.now_utc(),
         None,
