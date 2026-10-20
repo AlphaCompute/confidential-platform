@@ -80,6 +80,18 @@ pub fn quote(report_data: &[u8; 64]) -> Result<Vec<u8>, Error> {
     }
 }
 
+/// CoCo (Kata) pod identity: where the pod's TDX quote comes from.
+pub mod coco {
+    /// The source of a Kata pod's TDX quote.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum QuoteSource {
+        /// The dstack attestation agent running inside the pod.
+        AttestationAgent,
+        /// The kernel's configfs-tsm interface (`/sys/kernel/config/tsm/report`).
+        ConfigFsTsm,
+    }
+}
+
 /// What a TD runs on, and so what it proves itself with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Substrate {

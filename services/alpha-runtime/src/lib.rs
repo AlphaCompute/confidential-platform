@@ -458,6 +458,46 @@ fn read_under_limit(reader: impl Read) -> Result<String, String> {
     Ok(text)
 }
 
+/// The identity of a Kata CoCo pod derived from its init-data alone.
+pub struct CocoIdentity {
+    /// The canonical JSON of the pod's CoCo Revision v2.
+    pub revision: String,
+}
+
+/// Derive the CoCo identity from init-data bytes — the Revision v2 the pod's leaf names. The
+/// `source` says where the quote comes from on real hardware; it is carried for future use.
+pub fn coco_identity(
+    _source: alpha_tsm::coco::QuoteSource,
+    init_data_bytes: Vec<u8>,
+) -> Result<CocoIdentity, Error> {
+    let init_data = alpha_core::coco::InitData::parse(&init_data_bytes)
+        .map_err(|e| Error::Evidence(format!("init-data: {e}")))?;
+    let revision = init_data
+        .revision()
+        .map_err(|e| Error::Evidence(format!("revision: {e}")))?;
+    let revision_json = revision
+        .canonical()
+        .map_err(|e| Error::Evidence(format!("revision canonical: {e}")))?;
+    Ok(CocoIdentity {
+        revision: revision_json,
+    })
+}
+
+/// A valid GPU-class init-data for testing: 8× B300, `kata-qemu-nvidia-gpu-tdx`.
+#[cfg(test)]
+pub const INITDATA: &str = concat!(
+    "algorithm = \"sha384\"\nversion = \"0.1.0\"\n\n[data]\n",
+    "\"policy.rego\" = '''\n",
+    "package agent_policy\ndefault ExecProcessRequest := false\n",
+    "'''\n",
+    "\"alpha.json\" = '{",
+    "\"app_id\":\"01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b\",",
+    "\"format\":\"alphacompute-initdata/1\",",
+    "\"gpu\":{\"count\":8,\"model\":\"B300\"},",
+    "\"runtime_class\":\"kata-qemu-nvidia-gpu-tdx\"",
+    "}'\n"
+);
+
 /// How long to wait before renewing: ten minutes before `not_after`, or at once if that has passed.
 pub fn renewal_delay(not_after: SystemTime, now: SystemTime) -> Duration {
     not_after
