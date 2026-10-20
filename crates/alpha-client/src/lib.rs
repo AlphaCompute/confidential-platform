@@ -433,6 +433,28 @@ pub async fn read_capped(mut response: reqwest::Response, cap: usize) -> Result<
     Ok(body)
 }
 
+/// The responder every NVIDIA certificate names in its AIA.
+pub const NVIDIA_OCSP_URL: &str = "https://ocsp.ndis.nvidia.com/";
+
+/// The answer of the OCSP responder at `url` to the DER `request`. An error here is the
+/// transport's, not a verdict on the certificate.
+pub async fn fetch_ocsp(
+    http: &reqwest::Client,
+    url: &str,
+    request: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    let response = http
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/ocsp-request")
+        .body(request)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| e.to_string())?;
+    // NVIDIA's answers are about a kilobyte.
+    read_capped(response, 64 << 10).await
+}
+
 pub struct Client {
     endpoints: Vec<String>,
     http: reqwest::Client,

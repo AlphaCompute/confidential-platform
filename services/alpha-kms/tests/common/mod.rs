@@ -247,6 +247,7 @@ pub async fn start_node_on(
         substrate,
         kms_endpoints: vec![],
         platform_document_url: release_url.to_owned(),
+        nvidia_ocsp_url: String::new(),
         #[cfg(feature = "dev-root")]
         dev_root_kek: None,
     };
