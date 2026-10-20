@@ -1,11 +1,13 @@
 name: Regenerate sqlx cache
 
 on:
-  workflow_dispatch:
-    inputs:
-      branch:
-        description: Branch to regenerate cache on
-        required: true
+  push:
+    branches:
+      - kms/custodian-sealed-store
+      - core/coco-revision-v2
+    paths:
+      - 'services/alpha-kms/**'
+      - '.github/workflows/sqlx-prepare.yml'
 
 jobs:
   prepare:
@@ -28,7 +30,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.branch }}
           token: ${{ secrets.GITHUB_TOKEN }}
       - uses: Swatinem/rust-cache@v2
       - name: Install sqlx-cli
