@@ -11,6 +11,7 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::Error;
+use crate::keys::Key;
 
 /// A non-stream answer longer than this is not parsed, and its row has no token counts.
 const BODY_MAX: usize = 4 * 1024 * 1024;
@@ -40,8 +41,7 @@ fn tokens(answer: &Value) -> Option<Tokens> {
 
 pub struct Meter {
     pool: PgPool,
-    key_id: Uuid,
-    org_id: Uuid,
+    key: Key,
     model: String,
     status: i16,
     started_at: DateTime<Utc>,
@@ -52,18 +52,10 @@ pub struct Meter {
 }
 
 impl Meter {
-    pub fn new(
-        pool: PgPool,
-        key_id: Uuid,
-        org_id: Uuid,
-        model: String,
-        status: u16,
-        stream: bool,
-    ) -> Self {
+    pub fn new(pool: PgPool, key: Key, model: String, status: u16, stream: bool) -> Self {
         Meter {
             pool,
-            key_id,
-            org_id,
+            key,
             model,
             status: i16::try_from(status).unwrap_or(i16::MAX),
             started_at: Utc::now(),
@@ -76,10 +68,13 @@ impl Meter {
 
     pub fn observe(&mut self, chunk: &[u8]) {
         if !self.stream {
+            if self.overflow {
+                return;
+            }
             if self.buf.len().saturating_add(chunk.len()) > BODY_MAX {
                 self.overflow = true;
                 self.buf = Vec::new();
-            } else if !self.overflow {
+            } else {
                 self.buf.extend_from_slice(chunk);
             }
             return;
@@ -125,13 +120,8 @@ impl Drop for Meter {
         };
         let found = self.result();
         let (id, ended_at) = (Uuid::now_v7(), Utc::now());
-        let (pool, key_id, org_id, status, started_at) = (
-            self.pool.clone(),
-            self.key_id,
-            self.org_id,
-            self.status,
-            self.started_at,
-        );
+        let (pool, key, status, started_at) =
+            (self.pool.clone(), self.key, self.status, self.started_at);
         let model = std::mem::take(&mut self.model);
         runtime.spawn(async move {
             // ponytail: a row whose insert fails three times is lost, and the completion goes
@@ -142,8 +132,8 @@ impl Drop for Meter {
                      values ($1, $2, $3, $4, $5, $6, $7, $8, $9) on conflict (id) do nothing",
                 )
                 .bind(id)
-                .bind(key_id)
-                .bind(org_id)
+                .bind(key.id)
+                .bind(key.org_id)
                 .bind(&model)
                 .bind(status)
                 .bind(found.map(|t| t.prompt))
@@ -228,7 +218,11 @@ mod tests {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://127.0.0.1:1/none")
             .unwrap();
-        Meter::new(pool, Uuid::nil(), Uuid::nil(), "m".into(), 200, stream)
+        let key = Key {
+            id: Uuid::nil(),
+            org_id: Uuid::nil(),
+        };
+        Meter::new(pool, key, "m".into(), 200, stream)
     }
 
     #[tokio::test]

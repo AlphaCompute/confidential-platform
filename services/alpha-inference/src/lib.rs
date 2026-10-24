@@ -491,14 +491,8 @@ async fn chat_completions(
     let stream = upstream_response.bytes_stream();
     let body = match key {
         Some(key) => {
-            let mut meter = usage::Meter::new(
-                state.pool.clone(),
-                key.id,
-                key.org_id,
-                model,
-                status.as_u16(),
-                streamed,
-            );
+            let mut meter =
+                usage::Meter::new(state.pool.clone(), key, model, status.as_u16(), streamed);
             axum::body::Body::from_stream(stream.map(move |chunk| {
                 if let Ok(bytes) = &chunk {
                     meter.observe(bytes);
