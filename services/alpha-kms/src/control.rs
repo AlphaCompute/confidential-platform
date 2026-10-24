@@ -1,4 +1,4 @@
-//! The Control API: five mutations, each `{payload, signature}`, the organization taken from the key,
+//! The Control API: six mutations, each `{payload, signature}`, the organization taken from the key,
 //! idempotent as the table says, one transaction with its audit row; every success carries the
 //! node's receipt.
 
@@ -494,7 +494,7 @@ pub async fn put_secret(
             "insert into secrets (id, org_id, name, app_ids, ciphertext, content_sha256, document, signed_by_key, signature, issued_at)
              values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              on conflict (org_id, name) do update set app_ids = $4, ciphertext = $5, content_sha256 = $6,
-               document = $7, signed_by_key = $8, signature = $9, issued_at = $10",
+               document = $7, signed_by_key = $8, signature = $9, issued_at = $10, deleted_at = null",
             id,
             org_id,
             name,
@@ -521,6 +521,83 @@ pub async fn put_secret(
             "id": id, "name": name, "org_id": org_id, "app_ids": app_ids,
             "content_sha256": p.content_sha256, "issued_at": rfc3339(at),
         }))
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteSecretPayload {
+    name: String,
+    issued_at: DateTime<Utc>,
+}
+
+/// The value is erased but the row stays, with the delete's `issued_at`, so a put replayed
+/// within the window is still older than what is stored.
+pub async fn delete_secret(
+    State(node): State<Arc<Node>>,
+    Path(name): Path<String>,
+    Body(body, request): Body<Signed>,
+) -> Result<Json<Value>, ApiError> {
+    audited_route!(node, body, request, "secret.delete", async {
+        let keys = node.intermediates()?;
+        let p: DeleteSecretPayload = payload(&body.payload)?;
+        if p.name != name {
+            return Err(ApiError::malformed("path and payload name differ"));
+        }
+        let at = within_window(p.issued_at, node.now_utc())?;
+        let chain = authorize(&node, &keys, context::CONTROL, &body, at).await?;
+        let org_id = chain.key.org_id;
+        let mut tx = node.pool.begin().await?;
+        sqlx::query!(
+            "select pg_advisory_xact_lock(hashtext($1))",
+            format!("{org_id}/{name}")
+        )
+        .execute(&mut *tx)
+        .await?;
+        let row = sqlx::query!(
+            "select issued_at, document, deleted_at from secrets where org_id = $1 and name = $2",
+            org_id,
+            name
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| ApiError::not_found("no such secret"))?;
+        let deleted_at = match row.deleted_at {
+            Some(t) if row.document == body.payload => t,
+            _ if row.issued_at >= at => {
+                return Err(ApiError::new(
+                    "already_exists",
+                    "a put or delete with a later issued_at is stored",
+                ));
+            }
+            Some(_) => return Err(ApiError::not_found("no such secret")),
+            None => {
+                let t = sqlx::query_scalar!(
+                    r#"update secrets set app_ids = '{}', ciphertext = '', content_sha256 = '',
+                       document = $3, signed_by_key = $4, signature = $5, issued_at = $6, deleted_at = now()
+                     where org_id = $1 and name = $2 returning deleted_at as "deleted_at!""#,
+                    org_id,
+                    name,
+                    body.payload,
+                    chain.key.id,
+                    json!(body.signature),
+                    at,
+                )
+                .fetch_one(&mut *tx)
+                .await?;
+                audited(
+                    &mut tx,
+                    &chain,
+                    "secret.delete",
+                    format!("secret:{name}"),
+                    json!({}),
+                )
+                .await?;
+                t
+            }
+        };
+        tx.commit().await?;
+        Ok(json!({ "name": name, "deleted_at": rfc3339(deleted_at) }))
     })
 }
 

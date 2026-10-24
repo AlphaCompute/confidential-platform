@@ -1772,6 +1772,71 @@ async fn a_replayed_sealed_put_already_exists_without_a_receipt() {
     assert_eq!(h.secrets_named("replayed").await, 1);
 }
 
+#[tokio::test]
+async fn a_deleted_secret_is_withheld_until_a_later_put() {
+    let Some(h) = harness().await else {
+        return;
+    };
+    let admin = h.register_key(&h.root, 85).await;
+    let app = AppId::mint();
+    h.insert_capture_revision(app, &admin).await;
+    let mut old_put = h.signed(
+        context::SECRET,
+        put_payload("deleted", &[app], b"old", h.now()),
+        &admin,
+    );
+    old_put["value"] = json!(b64(&salted(b"old")));
+    let (status, reply) = h
+        .call(reqwest::Method::PUT, "/v1/secrets/deleted", old_put.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+
+    let delete = h.signed(
+        context::CONTROL,
+        json!({ "name": "deleted", "issued_at": rfc3339(h.now() + Duration::from_secs(1)) }),
+        &admin,
+    );
+    let (status, deleted) = h.post("/v1/secrets/deleted/delete", delete.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{deleted}");
+    let (status, replayed) = h.post("/v1/secrets/deleted/delete", delete).await;
+    assert_eq!(status, StatusCode::OK, "{replayed}");
+    assert_eq!(replayed["deleted_at"], deleted["deleted_at"]);
+    let ciphertext: Vec<u8> =
+        sqlx::query_scalar!("select ciphertext from secrets where name = 'deleted'")
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert!(ciphertext.is_empty());
+
+    let instance = h.instance_client().await;
+    let url = format!("{}/v1/secrets/deleted", h.url);
+    let (status, reply) = send(instance.get(&url)).await;
+    assert_eq!((status, code(&reply)), (StatusCode::NOT_FOUND, "not_found"));
+
+    let (status, reply) = h
+        .call(reqwest::Method::PUT, "/v1/secrets/deleted", old_put)
+        .await;
+    assert_eq!(
+        (status, code(&reply)),
+        (StatusCode::CONFLICT, "already_exists"),
+        "a replayed put does not bring the secret back"
+    );
+
+    let (status, reply) = h
+        .put_secret(
+            "deleted",
+            &[app],
+            b"new",
+            h.now() + Duration::from_secs(2),
+            &admin,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let (status, secret) = send(instance.get(&url)).await;
+    assert_eq!(status, StatusCode::OK, "{secret}");
+    assert_eq!(secret["value"], json!(b64(b"new")));
+}
+
 /// An admin key of a second organization, registered beside the harness's.
 async fn second_organization(h: &Harness) -> (KeyId, SigningKey) {
     let org_b = OrgId::mint();

@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select ciphertext from secrets where name = 'deleted'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "ciphertext",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "secrets",
+            "name": "ciphertext"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "fbcd99ea11b951f8eabb2dc52953b3aefe284ecbecc4b07b3e2fd3eaae909694"
+}

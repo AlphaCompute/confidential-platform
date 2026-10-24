@@ -20,6 +20,7 @@ pub enum Route {
     RegisterRevision,
     RevokeRevision,
     PutSecret,
+    DeleteSecret,
     RegisterKey,
     RevokeKey,
 }
@@ -28,7 +29,7 @@ impl Route {
     pub fn context(self) -> &'static str {
         match self {
             Self::RegisterRevision => context::REVISION,
-            Self::RevokeRevision | Self::RevokeKey => context::CONTROL,
+            Self::RevokeRevision | Self::DeleteSecret | Self::RevokeKey => context::CONTROL,
             Self::PutSecret => context::SECRET,
             Self::RegisterKey => context::PRINCIPAL_KEY,
         }
@@ -91,6 +92,10 @@ pub async fn run(
                     .encode(salted.as_deref().ok_or("put-secret needs --value")?),
             };
             json!(client.put_secret(&name, &body).await.map_err(api)?)
+        }
+        Route::DeleteSecret => {
+            let name = field(&signed.payload, "name")?.to_owned();
+            json!(client.delete_secret(&name, &signed).await.map_err(api)?)
         }
         Route::RegisterKey => json!(client.register_key(&signed).await.map_err(api)?),
         Route::RevokeKey => {

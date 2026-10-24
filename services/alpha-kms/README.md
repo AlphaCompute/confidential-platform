@@ -1,10 +1,12 @@
 # alpha-kms
 
-The key broker of the trust plane: six tables, fourteen `/v1` routes on one TLS port (`:8443`, TLS 1.3, `X25519MLKEM768`), plus `GET /healthz` (process only) and `GET /ready` (database checked, `{"sealed": …}`).
+The key broker of the trust plane: six tables, fifteen `/v1` routes on one TLS port (`:8443`, TLS 1.3, `X25519MLKEM768`), plus `GET /healthz` (process only) and `GET /ready` (database checked, `{"sealed": …}`).
 
 The Instance API is `POST /v1/attest/nonce`, `POST /v1/attest`, and two routes that need the Instance's leaf as a client certificate: `GET /v1/secrets/{name}` and `POST /v1/keys/derive`. The last answers `{"key"}`, 32 bytes derived from the organization's `org_key` and the leaf's App id for the requested `purpose`, the same for every Revision of the App; it is how an App holds a key no person ever sees, and nothing but an attested Instance reaches it.
 
 `POST /v1/channel` answers an inner-channel handshake with the node's leaf and a ticket, and `PUT /v1/secrets/{name}` then takes the value either as `value` or as `sealed: {ticket, frame}`, whose plaintext begins with the signing digest of the put's payload, so a relay sees only ciphertext; any node of the deployment opens the ticket within ten minutes.
+
+`POST /v1/secrets/{name}/delete` erases a Secret's value and keeps its row as a tombstone carrying the delete's `issued_at`, so a replayed put stays `already_exists`; an Instance gets `not_found`, and a later put brings the name back.
 
 Control bodies are signed `ed25519` or `webauthn-es256`, a passkey's WebAuthn assertion over the same signing digest, accepted only on the origins and `rp_id` of the current platform document's `signer` and refused everywhere, stored signatures included, when the document has none; a passkey can be an organization's root key.
 

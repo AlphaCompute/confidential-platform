@@ -1,0 +1,33 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update secrets set app_ids = '{}', ciphertext = '', content_sha256 = '',\n                       document = $3, signed_by_key = $4, signature = $5, issued_at = $6, deleted_at = now()\n                     where org_id = $1 and name = $2 returning deleted_at as \"deleted_at!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deleted_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "secrets",
+            "name": "deleted_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Jsonb",
+        "Uuid",
+        "Jsonb",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "648257175727cbb4906995d48713de3b75c92c4b53bed8e9461e0a26b3f66153"
+}

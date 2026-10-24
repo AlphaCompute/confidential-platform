@@ -227,6 +227,14 @@ pub struct SecretPut {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SecretDeleted {
+    pub name: String,
+    pub deleted_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KeyRegistered {
     pub id: KeyId,
     pub principal_id: PrincipalId,
@@ -593,6 +601,10 @@ impl Client {
             Some(&json!(body)),
         )
         .await
+    }
+
+    pub async fn delete_secret(&self, name: &str, body: &Signed) -> Result<SecretDeleted, Error> {
+        self.post(&format!("/v1/secrets/{name}/delete"), body).await
     }
 
     pub async fn register_key(&self, body: &Signed) -> Result<KeyRegistered, Error> {

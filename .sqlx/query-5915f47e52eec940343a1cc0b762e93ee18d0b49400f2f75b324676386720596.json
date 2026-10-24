@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select issued_at, document, deleted_at from secrets where org_id = $1 and name = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "issued_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "secrets",
+            "name": "issued_at"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "document",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "secrets",
+            "name": "document"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "deleted_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "secrets",
+            "name": "deleted_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "5915f47e52eec940343a1cc0b762e93ee18d0b49400f2f75b324676386720596"
+}
