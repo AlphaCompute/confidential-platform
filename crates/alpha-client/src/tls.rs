@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use alpha_core::ComposeHash;
+use alpha_core::{ComposeHash, OrgId};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::server::graceful::GracefulShutdown;
@@ -51,6 +51,8 @@ pub enum Pin {
     /// The chain ends at this CA and the leaf is an App Instance's carrying one of these
     /// Revisions; an empty list matches nothing.
     CaAndInstanceRevisions(CertificateDer<'static>, Vec<ComposeHash>),
+    /// As `CaAndInstanceRevisions`, and the Instance's App belongs to this organization.
+    CaOrgAndInstanceRevisions(CertificateDer<'static>, OrgId, Vec<ComposeHash>),
     /// The chain ends at a CA the server presents whose SPKI SHA-256 is these bytes, and the
     /// leaf carries one of these Revisions; an empty list matches nothing.
     CaSpkiAndRevisions([u8; 32], Vec<ComposeHash>),
@@ -85,7 +87,8 @@ impl PinnedServer {
                 Pin::Ca(ca)
                 | Pin::CaAndRevisions(ca, _)
                 | Pin::CaRevisionsAndSpki(ca, ..)
-                | Pin::CaAndInstanceRevisions(ca, _),
+                | Pin::CaAndInstanceRevisions(ca, _)
+                | Pin::CaOrgAndInstanceRevisions(ca, ..),
             ) => Some(
                 webpki::anchor_from_trusted_cert(ca)
                     .map_err(|e| Error::Invalid(format!("pinned ca: {e}")))?
@@ -119,7 +122,8 @@ impl ServerCertVerifier for PinnedServer {
             Pin::Ca(_)
             | Pin::CaAndRevisions(..)
             | Pin::CaRevisionsAndSpki(..)
-            | Pin::CaAndInstanceRevisions(..) => Some(
+            | Pin::CaAndInstanceRevisions(..)
+            | Pin::CaOrgAndInstanceRevisions(..) => Some(
                 self.anchor
                     .as_ref()
                     .ok_or_else(|| refuse("pinned ca is not an anchor".into()))?,
@@ -181,12 +185,20 @@ impl ServerCertVerifier for PinnedServer {
                     ));
                 }
             }
-            Pin::CaAndInstanceRevisions(_, revisions) => {
+            Pin::CaAndInstanceRevisions(_, revisions)
+            | Pin::CaOrgAndInstanceRevisions(_, _, revisions) => {
                 let sans = uri_sans(end_entity).map_err(|e| refuse(e.to_string()))?;
                 let instance = parse_instance_sans(&sans).map_err(|e| refuse(e.to_string()))?;
                 if !revisions.contains(&instance.compose_hash) {
                     return Err(refuse(
                         "server certificate carries no allowed App revision".into(),
+                    ));
+                }
+                if let Pin::CaOrgAndInstanceRevisions(_, org, _) = pin
+                    && instance.org_id != *org
+                {
+                    return Err(refuse(
+                        "server certificate is not of the pinned organization".into(),
                     ));
                 }
             }
@@ -595,9 +607,10 @@ mod tests {
         let (ca_key, ca_cert) = new_ca();
         let ca = CertificateDer::from(ca_cert.der().to_vec());
         let revision = alpha_core::compose_hash("front");
+        let org = OrgId::mint();
         let instance = format!(
             "alphacompute://{}/{}/{}",
-            OrgId::mint(),
+            org,
             AppId::mint(),
             "a".repeat(64)
         );
@@ -613,6 +626,9 @@ mod tests {
         let (_, other_ca) = new_ca();
         let foreign = Pin::CaAndInstanceRevisions(other_ca.der().clone(), vec![revision]);
         assert!(!pinned_handshake(&app, foreign).await);
+        let of_org = |org| Pin::CaOrgAndInstanceRevisions(ca.clone(), org, vec![revision]);
+        assert!(pinned_handshake(&app, of_org(org)).await);
+        assert!(!pinned_handshake(&app, of_org(OrgId::mint())).await);
     }
 
     #[tokio::test]

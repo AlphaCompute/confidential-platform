@@ -42,6 +42,12 @@ pub(crate) fn test_state(
         }),
         upstream,
         own: Default::default(),
+        // Never reached unless a test routes to an organization's model; those replace it.
+        org_clients: crate::org_models::Clients::new(
+            rustls::pki_types::CertificateDer::from(Vec::new()),
+            Arc::new(NoCert),
+            crate::COMPLETION_TIMEOUT,
+        ),
         // Never connects unless a test reaches the database; those use `fresh_database`.
         pool: sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://127.0.0.1:1/none")
@@ -49,6 +55,22 @@ pub(crate) fn test_state(
         keys_key: zeroize::Zeroizing::new([7; 32]),
         usage_tasks: Default::default(),
     })
+}
+
+#[derive(Debug)]
+struct NoCert;
+
+impl rustls::client::ResolvesClientCert for NoCert {
+    fn resolve(
+        &self,
+        _: &[&[u8]],
+        _: &[rustls::SignatureScheme],
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        None
+    }
+    fn has_certs(&self) -> bool {
+        false
+    }
 }
 
 pub(crate) const ADMIN_BEARER: &[u8] = b"admin-bearer";
