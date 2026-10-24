@@ -110,7 +110,7 @@ Do these steps on each TDX host, as root, after the platform is registered with 
    questions. Stop the service and configure it as below.
 
    ```sh
-   apt-get install -y tdx-qgs libsgx-dcap-default-qpl sgx-ra-service sgx-dcap-pccs \
+   DEBIAN_FRONTEND=noninteractive apt-get install -y tdx-qgs libsgx-dcap-default-qpl sgx-ra-service sgx-dcap-pccs \
      sgx-pck-id-retrieval-tool
    systemctl stop pccs
    cd /opt/intel/sgx-dcap-pccs
