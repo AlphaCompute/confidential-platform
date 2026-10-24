@@ -117,8 +117,8 @@ You need the subscription key of the Intel PCS API.
    ```
 
 2. **Token and TLS.** The PCCS config holds only the SHA-512 of the user token, and the token is
-   only in the config of `PCKIDRetrievalTool`, so that no process argument holds it. An
-   empty `AdminTokenHash` keeps the admin API closed; the PCCS logs a warning about it at start,
+   only in the config of `PCKIDRetrievalTool`, so that no process argument holds it. The
+   package ships `AdminTokenHash` empty, which keeps the admin API closed; the PCCS logs a warning about it at start,
    which is expected. The certificate is self-signed: QCNL
    reaches the PCCS on the loopback only.
 
@@ -128,7 +128,6 @@ You need the subscription key of the Intel PCS API.
    chmod 600 $C
    printf 'PCCS_URL=https://localhost:8081/sgx/certification/v4/platforms\nUSE_SECURE_CERT=FALSE\nuser_token = %s\n' "$T" >> $C
    sed -i -e "/\"UserTokenHash\"/c\    \"UserTokenHash\" : \"$(printf %s "$T" | sha512sum | cut -d' ' -f1)\"," \
-     -e "/\"AdminTokenHash\"/c\    \"AdminTokenHash\" : \"\"," \
      -e "/\"CachingFillMode\"/c\    \"CachingFillMode\" : \"REQ\"," config/default.json
    sudo -u pccs mkdir -p ssl_key
    sudo -u pccs openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
