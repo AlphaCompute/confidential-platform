@@ -105,8 +105,8 @@ Do these steps on each TDX host, as root, after the platform is registered with 
 `sgx-ra-service` log `/var/log/mpa_registration.log` says `registration is completed`).
 You need the subscription key of the Intel PCS API.
 
-1. **Install.** The package starts the PCCS before it has a config, and its `install.sh` asks
-   questions. Stop the service and configure it as below.
+1. **Install.** The package starts the PCCS before it has a config. Stop the service and
+   configure it as below.
 
    ```sh
    DEBIAN_FRONTEND=noninteractive apt-get install -y tdx-qgs libsgx-dcap-default-qpl sgx-ra-service sgx-dcap-pccs \
@@ -116,11 +116,11 @@ You need the subscription key of the Intel PCS API.
    sudo -u pccs -H npm ci --omit=dev
    ```
 
-2. **Token and TLS.** The PCCS config holds only the SHA-512 of the user token, and the token is
-   only in the config of `PCKIDRetrievalTool`, so that no process argument holds it. The
-   package ships `AdminTokenHash` empty, which keeps the admin API closed; the PCCS logs a warning about it at start,
-   which is expected. The certificate is self-signed: QCNL
-   reaches the PCCS on the loopback only.
+2. **Token, key and TLS.** No process argument holds a secret. The PCCS config holds only the
+   SHA-512 of the user token, and the token is only in the config of `PCKIDRetrievalTool`. The
+   package ships `AdminTokenHash` empty, which keeps the admin API closed; the PCCS logs a warning
+   about it at start, which is expected. The certificate is self-signed: QCNL reaches the PCCS on
+   the loopback only.
 
    ```sh
    T=$(openssl rand -hex 32)
@@ -134,8 +134,8 @@ You need the subscription key of the Intel PCS API.
      -subj /CN=localhost -keyout ssl_key/private.pem -out ssl_key/file.crt
    ```
 
-   Put the subscription key in `"ApiKey"` of `config/default.json` with an editor, so that no
-   process argument holds it. Then start the PCCS: `systemctl enable --now pccs`.
+   Put the subscription key in `"ApiKey"` of `config/default.json` with an editor. Then start the
+   PCCS: `systemctl enable --now pccs`.
 
 3. **Register the platform with the PCCS.** In `REQ` mode the PCCS gets all PCK certificates of
    the platform from Intel during this call. The call fails if the key or the platform is not
@@ -157,8 +157,7 @@ You need the subscription key of the Intel PCS API.
    systemctl restart qgsd
    ```
 
-5. **Check.** Start or restart any Kata TD on the host. The QGS log then shows a quote and no
-   request to Intel.
+5. **Check.** Start or restart any Kata TD on the host.
 
    ```sh
    journalctl -u qgsd --since -5min | grep -E 'tee_att_get_quote return|Request URL'
