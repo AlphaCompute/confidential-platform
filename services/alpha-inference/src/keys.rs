@@ -51,7 +51,7 @@ pub struct Created {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow)]
 pub struct Listed {
     pub id: Uuid,
     pub name: String,
