@@ -442,15 +442,25 @@ async fn chat_completions(
     if !state.config.allows(&model) {
         return Err(Error::ModelNotFound(model));
     }
-    let streamed = parsed.get("stream").and_then(Value::as_bool) == Some(true);
+    let streamed = match parsed.get("stream") {
+        None | Some(Value::Null) => false,
+        Some(Value::Bool(b)) => *b,
+        // An upstream that coerces `"true"` would stream an answer metered as a whole one.
+        Some(_) if key.is_some() => {
+            return Err(Error::BadRequest("stream must be a boolean".into()));
+        }
+        Some(_) => false,
+    };
     if key.is_some() && streamed {
         // A stream carries `usage` only in a last chunk the caller has to ask for.
-        if let Some(options) = parsed
-            .as_object_mut()
-            .map(|o| o.entry("stream_options").or_insert_with(|| json!({})))
-            .and_then(Value::as_object_mut)
-        {
-            options.insert("include_usage".into(), Value::Bool(true));
+        if let Some(request) = parsed.as_object_mut() {
+            let options = request.entry("stream_options").or_insert_with(|| json!({}));
+            if !options.is_object() {
+                *options = json!({});
+            }
+            if let Some(options) = options.as_object_mut() {
+                options.insert("include_usage".into(), Value::Bool(true));
+            }
         }
         body = serde_json::to_vec(&parsed)
             .map_err(|e| Error::internal(format!("body: {e}")))?

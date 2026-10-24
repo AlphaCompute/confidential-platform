@@ -77,7 +77,8 @@ impl Meter {
             }
             return;
         }
-        self.buf.extend_from_slice(chunk);
+        // Only `\n` and `\r\n` line ends are framed; the bytes the caller gets are untouched.
+        self.buf.extend(chunk.iter().filter(|&&b| b != b'\r'));
         while let Some(end) = self.buf.windows(2).position(|w| w == b"\n\n") {
             let event: Vec<u8> = self.buf.drain(..end.saturating_add(2)).collect();
             if let Some(found) = sse_tokens(&event) {
@@ -191,7 +192,7 @@ pub struct Hourly {
 /// Sums per organization, key, model and hour of `started_at`, for `from <= started_at < to`.
 pub async fn hourly(pool: &PgPool, range: &Range) -> Result<Vec<Hourly>, Error> {
     Ok(sqlx::query_as(
-        "select org_id, key_id, model, date_trunc('hour', started_at) as hour, count(*) as requests,
+        "select org_id, key_id, model, date_trunc('hour', started_at, 'UTC') as hour, count(*) as requests,
                 coalesce(sum(prompt_tokens), 0)::bigint as prompt_tokens,
                 coalesce(sum(completion_tokens), 0)::bigint as completion_tokens
          from usage
@@ -233,6 +234,15 @@ mod tests {
         }
         assert_eq!(
             m.result(),
+            Some(Tokens {
+                prompt: 12,
+                completion: 34
+            })
+        );
+        let mut crlf = meter(true);
+        crlf.observe(body.replace("\n", "\r\n").as_bytes());
+        assert_eq!(
+            crlf.result(),
             Some(Tokens {
                 prompt: 12,
                 completion: 34

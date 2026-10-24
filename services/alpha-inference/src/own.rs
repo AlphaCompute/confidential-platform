@@ -486,6 +486,17 @@ mod tests {
             );
         }
 
+        let coerced = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::AUTHORIZATION, format!("Bearer {}", key.key))
+            .body(axum::body::Body::from(
+                json!({ "model": "own", "stream": "true" }).to_string(),
+            ))
+            .unwrap();
+        let response = front.clone().oneshot(coerced).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
         let usage = |bearer: String| {
             let front = front.clone();
             async move {
