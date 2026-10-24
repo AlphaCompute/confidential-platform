@@ -6,6 +6,7 @@
 //! panics.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use alpha_client::runtime::{RuntimeSocket, refresh_forever};
 use alpha_client::tls::{InstanceCert, kms_ca, serve, server_config};
@@ -17,6 +18,8 @@ use tokio::net::TcpListener;
 use zeroize::Zeroizing;
 
 const PORT: u16 = 8443;
+/// Past this, a stalled database cannot hold the exit; the rows still unwritten are lost.
+const USAGE_DRAIN: Duration = Duration::from_secs(10);
 
 #[tokio::main]
 async fn main() {
@@ -103,6 +106,7 @@ async fn run() -> Result<(), Error> {
         own,
         pool,
         keys_key,
+        usage_tasks: Default::default(),
     });
     let app = router(state.clone());
 
@@ -123,6 +127,13 @@ async fn run() -> Result<(), Error> {
         }
     })
     .await;
+    state.usage_tasks.close();
+    if tokio::time::timeout(USAGE_DRAIN, state.usage_tasks.wait())
+        .await
+        .is_err()
+    {
+        eprintln!("alpha-inference: usage rows still unwritten at exit");
+    }
     outcome
 }
 
