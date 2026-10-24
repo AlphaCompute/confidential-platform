@@ -1,0 +1,59 @@
+name: reference-values
+
+# Checks deploy/kata/reference-values.json against what Kata 4.0.0's QEMU, OVMF and kernel give
+# for every shape of deploy/kata/shapes/shapes.tsv. The GPU classes are captured, not computed.
+on:
+  pull_request:
+    paths:
+      - deploy/kata/reference-values.json
+      - deploy/kata/shapes/**
+      - crates/alpha-cli/src/coco/measure.rs
+      - testdata/coco/measure/**
+      - .github/workflows/reference-values.yml
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  compute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Extract QEMU, OVMF and the kernel of Kata 4.0.0
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/kata.tar.zst" \
+            https://github.com/kata-containers/kata-containers/releases/download/4.0.0/kata-static-4.0.0-amd64.tar.zst
+          echo "2c3b9dfeba355582b40aee462b12916c9740654d0230f696adf719d67b063a8c  $RUNNER_TEMP/kata.tar.zst" | sha256sum -c -
+          zstd -dc "$RUNNER_TEMP/kata.tar.zst" | tar -xf - -C "$RUNNER_TEMP" \
+            ./opt/kata/bin/qemu-system-x86_64-tdx-experimental ./opt/kata/share/kata-qemu-tdx-experimental \
+            ./opt/kata/share/ovmf/OVMF.inteltdx.fd ./opt/kata/share/kata-containers/vmlinuz-6.18.35-200
+      # QEMU reserves the guest RAM of the largest shape, more than the runner has; the stub
+      # BIOS touches only the low 640 KiB.
+      - name: Open /dev/kvm and /dev/vhost-vsock and allow the overcommit
+        run: |
+          sudo modprobe vhost_vsock
+          sudo chmod 666 /dev/kvm /dev/vhost-vsock
+          sudo sysctl -w vm.overcommit_memory=1
+          grep -m1 'model name' /proc/cpuinfo | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: RTMR0 of every shape
+        run: |
+          python3 -I deploy/kata/shapes/rtmr0.py "$RUNNER_TEMP/opt/kata" --check deploy/kata/reference-values.json \
+            | tee "$RUNNER_TEMP/rtmr0.txt"
+          { echo '```'; cat "$RUNNER_TEMP/rtmr0.txt"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: MRTD, RTMR1 and RTMR2 of kata-qemu-tdx
+        run: |
+          k=$RUNNER_TEMP/opt/kata/share
+          # The measurement does not read the release key set, so the dev build gives the same values.
+          cargo run -q -p alpha-cli --features dev --bin alpha -- coco measure --firmware "$k/ovmf/OVMF.inteltdx.fd" \
+            --kernel "$k/kata-containers/vmlinuz-6.18.35-200" \
+            --cmdline "$(cat testdata/coco/measure/kata-qemu-tdx.cmdline)" > "$RUNNER_TEMP/measured.json"
+          jq -e --slurpfile m "$RUNNER_TEMP/measured.json" \
+            '[.[] | select(.runtime_class == "kata-qemu-tdx" and .gpu == false) | {mrtd, rtmr1, rtmr2}] == $m' \
+            deploy/kata/reference-values.json
