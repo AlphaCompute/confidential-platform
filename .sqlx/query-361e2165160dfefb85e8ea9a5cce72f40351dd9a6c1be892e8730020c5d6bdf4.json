@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select id, ciphertext, content_sha256, document, signed_by_key, signature\n         from secrets where org_id = $1 and name = $2 and $3 = any(app_ids)",
+  "query": "select id, ciphertext, content_sha256, document, signed_by_key, signature\n         from secrets where org_id = $1 and name = $2 and $3 = any(app_ids) and deleted_at is null",
   "describe": {
     "columns": [
       {
@@ -86,5 +86,5 @@
       false
     ]
   },
-  "hash": "cf10056d3f958d545e65a6b5b6510397bb7c03e8851f80f912971aed3d75a292"
+  "hash": "361e2165160dfefb85e8ea9a5cce72f40351dd9a6c1be892e8730020c5d6bdf4"
 }

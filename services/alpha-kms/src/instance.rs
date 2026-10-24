@@ -406,7 +406,7 @@ async fn get_secret_inner(
     .await?;
     let secret = sqlx::query!(
         "select id, ciphertext, content_sha256, document, signed_by_key, signature
-         from secrets where org_id = $1 and name = $2 and $3 = any(app_ids)",
+         from secrets where org_id = $1 and name = $2 and $3 = any(app_ids) and deleted_at is null",
         Uuid::from(identity.org_id),
         name,
         Uuid::from(identity.app_id),

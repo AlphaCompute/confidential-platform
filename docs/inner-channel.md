@@ -177,8 +177,8 @@ Every successful Control API response carries `receipt` beside its fields:
  "certificate_chain": ["<PEM node leaf>"]}
 ```
 
-`route` is one of `revision.register`, `revision.revoke`, `secret.put`, `key.register` and
-`key.revoke`. `request_sha256` is `sha256:<hex>` of the JCS of the request body as the KMS
+`route` is one of `revision.register`, `revision.revoke`, `secret.put`, `secret.delete`,
+`key.register` and `key.revoke`. `request_sha256` is `sha256:<hex>` of the JCS of the request body as the KMS
 received it; the KMS refuses bodies that repeat a key, so the JCS of the parsed body loses
 nothing. `response` is the response without `receipt`, and `issued_at` is RFC 3339 UTC in whole
 seconds. The node's runtime key signs the document under context `alphacompute/kms-receipt/v1`.

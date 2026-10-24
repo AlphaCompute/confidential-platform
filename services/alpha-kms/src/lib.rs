@@ -296,6 +296,7 @@ pub fn router(node: Arc<Node>) -> Router {
             post(control::revoke_revision),
         )
         .route("/v1/secrets/{name}", put(control::put_secret))
+        .route("/v1/secrets/{name}/delete", post(control::delete_secret))
         .route("/v1/keys", post(control::register_key))
         .route("/v1/keys/{id}/revoke", post(control::revoke_key))
         .route("/v1/node/evidence", get(node::evidence))
