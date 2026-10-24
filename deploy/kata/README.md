@@ -106,14 +106,15 @@ Do these steps on each TDX host, as root, after the platform is registered with 
 `sgx-ra-service` log `/var/log/mpa_registration.log` says `registration is completed`).
 `PCS_API_KEY` is the subscription key of the Intel PCS API.
 
-1. **Install.** `install.sh` of the package asks questions, so configure it as below instead.
+1. **Install.** The package starts the PCCS before it has a config, and its `install.sh` asks
+   questions. Stop the service and configure it as below.
 
    ```sh
    apt-get install -y tdx-qgs libsgx-dcap-default-qpl sgx-ra-service sgx-dcap-pccs \
      sgx-pck-id-retrieval-tool
    systemctl stop pccs
    cd /opt/intel/sgx-dcap-pccs
-   sudo -u pccs -H npm ci --omit=dev --no-audit --no-fund
+   sudo -u pccs -H npm ci --omit=dev
    ```
 
 2. **Tokens and TLS.** The tokens stay in `/etc/pccs`; the config holds only their SHA-512. The
