@@ -456,11 +456,11 @@ async fn chat_completions(
         // A stream carries `usage` only in a last chunk the caller has to ask for.
         if let Some(request) = parsed.as_object_mut() {
             let options = request.entry("stream_options").or_insert_with(|| json!({}));
-            if !options.is_object() {
-                *options = json!({});
-            }
-            if let Some(options) = options.as_object_mut() {
-                options.insert("include_usage".into(), Value::Bool(true));
+            match options.as_object_mut() {
+                Some(o) => {
+                    o.insert("include_usage".into(), Value::Bool(true));
+                }
+                None => *options = json!({ "include_usage": true }),
             }
         }
         body = serde_json::to_vec(&parsed)
