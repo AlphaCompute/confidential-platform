@@ -139,6 +139,7 @@ def stub(entries, pci):
 
 def qmp(sock):
     s = socket.socket(socket.AF_UNIX)
+    s.settimeout(30)
     s.connect(sock)
     f = s.makefile("rb")
 
