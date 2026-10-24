@@ -374,9 +374,10 @@ cp caller-bearer inference-bearer &&
 ### The databases of the broker and the front
 
 Each App's login role and database on the trust-db, with a password sent on stdin, and its
-Secret `database-url` carrying that password; each applies its migrations when it starts. A
-failed run leaves no password file behind; run `db` again, and it sets a new password on the
-role it already made.
+Secret `database-url` carrying that password; each applies its migrations when it starts. Run
+`db` before Apply, while no App uses the role. A failed run leaves no password file behind; run
+`db` again, and it sets a new password on the role it already made. `db` is not a password
+rotation for a running App: it changes the password before the App can read the new Secret.
 
 ```sh
 db() {
