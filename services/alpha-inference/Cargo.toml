@@ -11,8 +11,9 @@ workspace = true
 alpha-attest = { path = "../../crates/alpha-attest" }
 alpha-client = { path = "../../crates/alpha-client" }
 alpha-core = { path = "../../crates/alpha-core" }
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
+futures-util = { version = "0.3", default-features = false }
 getrandom = "0.4"
 hex = "0.4"
 hmac = "0.13"

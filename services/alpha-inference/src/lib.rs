@@ -18,6 +18,7 @@
 pub mod keys;
 pub mod own;
 pub mod upstream;
+pub mod usage;
 
 #[cfg(test)]
 mod test_support;
@@ -27,12 +28,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, State};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -266,8 +268,9 @@ fn bearer(parts: &Parts) -> Result<&str, Error> {
         .ok_or(Error::Unauthorized)
 }
 
-/// Proof of the caller's key or of the shared caller bearer, extracted before any handler runs.
-pub struct AuthedCaller;
+/// Proof of the caller's key, or `None` for the shared caller bearer, extracted before any
+/// handler runs.
+pub struct AuthedCaller(pub Option<keys::Key>);
 
 impl FromRequestParts<Arc<AppState>> for AuthedCaller {
     type Rejection = Error;
@@ -278,13 +281,12 @@ impl FromRequestParts<Arc<AppState>> for AuthedCaller {
     ) -> Result<Self, Self::Rejection> {
         let presented = bearer(parts)?;
         if alpha_client::bearer_matches(presented.as_bytes(), &state.secrets.read().caller_bearer) {
-            return Ok(AuthedCaller);
+            return Ok(AuthedCaller(None));
         }
-        if keys::authenticate(&state.pool, &state.keys_key, presented).await? {
-            Ok(AuthedCaller)
-        } else {
-            Err(Error::Unauthorized)
-        }
+        keys::authenticate(&state.pool, &state.keys_key, presented)
+            .await?
+            .map(|key| AuthedCaller(Some(key)))
+            .ok_or(Error::Unauthorized)
     }
 }
 
@@ -428,10 +430,10 @@ async fn get_model(
 
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    _: AuthedCaller,
-    body: Bytes,
+    AuthedCaller(key): AuthedCaller,
+    mut body: Bytes,
 ) -> Result<Response, Error> {
-    let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    let mut parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let model = parsed
         .get("model")
         .and_then(Value::as_str)
@@ -439,6 +441,20 @@ async fn chat_completions(
         .to_owned();
     if !state.config.allows(&model) {
         return Err(Error::ModelNotFound(model));
+    }
+    let streamed = parsed.get("stream").and_then(Value::as_bool) == Some(true);
+    if key.is_some() && streamed {
+        // A stream carries `usage` only in a last chunk the caller has to ask for.
+        if let Some(options) = parsed
+            .as_object_mut()
+            .map(|o| o.entry("stream_options").or_insert_with(|| json!({})))
+            .and_then(Value::as_object_mut)
+        {
+            options.insert("include_usage".into(), Value::Bool(true));
+        }
+        body = serde_json::to_vec(&parsed)
+            .map_err(|e| Error::internal(format!("body: {e}")))?
+            .into();
     }
     let upstream_response = if let Some(server) = state.own.get(&model) {
         server.complete(&model, body).await?
@@ -473,11 +489,46 @@ async fn chat_completions(
         .cloned()
         .unwrap_or_else(|| header::HeaderValue::from_static("text/event-stream"));
     let stream = upstream_response.bytes_stream();
+    let body = match key {
+        Some(key) => {
+            let mut meter = usage::Meter::new(
+                state.pool.clone(),
+                key.id,
+                key.org_id,
+                model,
+                status.as_u16(),
+                streamed,
+            );
+            axum::body::Body::from_stream(stream.map(move |chunk| {
+                if let Ok(bytes) = &chunk {
+                    meter.observe(bytes);
+                }
+                chunk
+            }))
+        }
+        None => axum::body::Body::from_stream(stream),
+    };
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, content_type)
-        .body(axum::body::Body::from_stream(stream))
+        .body(body)
         .map_err(|e| Error::internal(format!("response: {e}")))
+}
+
+async fn key_usage(
+    State(state): State<Arc<AppState>>,
+    AuthedCaller(key): AuthedCaller,
+) -> Result<Json<Vec<usage::ByModel>>, Error> {
+    let key = key.ok_or(Error::NotFound)?;
+    Ok(Json(usage::of_key(&state.pool, key.id).await?))
+}
+
+async fn usage_export(
+    State(state): State<Arc<AppState>>,
+    _: Admin,
+    Query(range): Query<usage::Range>,
+) -> Result<Json<Vec<usage::Hourly>>, Error> {
+    Ok(Json(usage::hourly(&state.pool, &range).await?))
 }
 
 async fn healthz() -> StatusCode {
@@ -510,6 +561,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(completions)
         .route("/admin/orgs/{org_id}/keys", post(create_key).get(list_keys))
         .route("/admin/keys/{id}", delete(revoke_key))
+        .route("/admin/usage", get(usage_export))
+        .route("/v1/usage", get(key_usage))
         .route("/healthz", get(healthz))
         .route("/ready", get(ready))
         .with_state(state)

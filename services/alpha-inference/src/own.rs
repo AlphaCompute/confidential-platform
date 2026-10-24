@@ -211,13 +211,14 @@ mod tests {
 
     use alpha_client::tls::PeerCerts;
     use axum::http::{Request, StatusCode, header};
+    use axum::response::IntoResponse;
     use axum::routing::{get, post};
     use axum::{Extension, Router};
     use rcgen::string::Ia5String;
     use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, SanType};
     use rustls::server::{ClientHello, ResolvesServerCert};
     use rustls::sign::CertifiedKey;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use tower::ServiceExt;
 
     use super::*;
@@ -284,7 +285,9 @@ mod tests {
     }
 
     /// A model server serving `leaf` that answers a completion after `delay`, refusing one from
-    /// a caller that presented no leaf of `ca`. Counts the completions that reached it.
+    /// a caller that presented no leaf of `ca`, as vLLM does: `usage` at the end of a whole
+    /// answer, and in a last chunk of a stream only when asked for. Counts the completions that
+    /// reached it.
     async fn spawn_model_server(
         ca: &Ca,
         leaf: Arc<Fixed>,
@@ -299,14 +302,29 @@ mod tests {
             )
             .route(
                 "/v1/chat/completions",
-                post(move |Extension(peer): Extension<PeerCerts>| async move {
-                    counted.fetch_add(1, Ordering::SeqCst);
-                    if peer.0.is_empty() {
-                        return StatusCode::UNAUTHORIZED;
-                    }
-                    tokio::time::sleep(delay).await;
-                    StatusCode::OK
-                }),
+                post(
+                    move |Extension(peer): Extension<PeerCerts>, body: Bytes| async move {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        if peer.0.is_empty() {
+                            return StatusCode::UNAUTHORIZED.into_response();
+                        }
+                        tokio::time::sleep(delay).await;
+                        let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                        let usage = json!({ "prompt_tokens": 3, "completion_tokens": 4 });
+                        if request["stream"] != true {
+                            return axum::Json(json!({ "choices": [], "usage": usage }))
+                                .into_response();
+                        }
+                        let mut events =
+                            format!("data: {}\n\n", json!({ "choices": [{ "delta": {} }] }));
+                        if request["stream_options"]["include_usage"] == true {
+                            events +=
+                                &format!("data: {}\n\n", json!({ "choices": [], "usage": usage }));
+                        }
+                        events += "data: [DONE]\n\n";
+                        ([(header::CONTENT_TYPE, "text/event-stream")], events).into_response()
+                    },
+                ),
             );
         let tls = alpha_client::tls::mtls_server_config(leaf, ca.der()).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -412,5 +430,124 @@ mod tests {
             .unwrap();
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_keyed_completion_records_its_tokens_whole_or_streamed() {
+        let Some(pool) = crate::test_support::fresh_database().await else {
+            return;
+        };
+        let ca = Ca::new();
+        let revision = alpha_core::compose_hash("model-server");
+        let (url, _) = spawn_model_server(&ca, ca.leaf(&revision), Duration::ZERO).await;
+        let mut config = test_config("https://example.invalid", &["own"]);
+        config.external = None;
+        config.own.insert(
+            "own".into(),
+            ModelServer {
+                url,
+                revisions: vec![revision],
+            },
+        );
+        let mut state = test_state(config, b"bearer", "key");
+        let front_leaf = ca.leaf(&alpha_core::compose_hash("front"));
+        let own = servers(&state.config.own, &ca.der(), front_leaf, COMPLETION_TIMEOUT).unwrap();
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.own = own;
+        inner.pool = pool.clone();
+        let org = uuid::Uuid::now_v7();
+        let key = crate::keys::create(&pool, &state.keys_key, org, "k")
+            .await
+            .unwrap();
+        let front = crate::router(state);
+
+        for (bearer, stream) in [
+            (key.key.as_str(), false),
+            (&key.key, true),
+            ("bearer", true),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                .body(axum::body::Body::from(
+                    json!({ "model": "own", "stream": stream }).to_string(),
+                ))
+                .unwrap();
+            let response = front.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&body).contains("\"usage\""),
+                bearer != "bearer" || !stream,
+                "the shared bearer's stream is relayed as asked for"
+            );
+        }
+
+        let usage = |bearer: String| {
+            let front = front.clone();
+            async move {
+                let request = Request::builder()
+                    .uri("/v1/usage")
+                    .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let response = front.oneshot(request).await.unwrap();
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null),
+                )
+            }
+        };
+        let expected =
+            json!([{ "model": "own", "requests": 2, "prompt_tokens": 6, "completion_tokens": 8 }]);
+        let mut seen = Value::Null;
+        for _ in 0..50 {
+            seen = usage(key.key.clone()).await.1;
+            if seen == expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(seen, expected);
+        assert_eq!(usage("bearer".into()).await.0, StatusCode::NOT_FOUND);
+
+        let export = |query: String| {
+            let front = front.clone();
+            async move {
+                let admin = std::str::from_utf8(crate::test_support::ADMIN_BEARER).unwrap();
+                let request = Request::builder()
+                    .uri(format!("/admin/usage?{query}"))
+                    .header(header::AUTHORIZATION, format!("Bearer {admin}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                let body = front.oneshot(request).await.unwrap().into_body();
+                serde_json::from_slice::<Value>(
+                    &axum::body::to_bytes(body, usize::MAX).await.unwrap(),
+                )
+                .unwrap()
+            }
+        };
+        let rows = export(format!(
+            "from=2000-01-01T00:00:00Z&to=2100-01-01T00:00:00Z&org_id={org}"
+        ))
+        .await;
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["key_id"], json!(key.id));
+        assert_eq!(rows[0]["prompt_tokens"], 6);
+        let other = uuid::Uuid::now_v7();
+        assert_eq!(
+            export(format!(
+                "from=2000-01-01T00:00:00Z&to=2100-01-01T00:00:00Z&org_id={other}"
+            ))
+            .await,
+            json!([])
+        );
     }
 }

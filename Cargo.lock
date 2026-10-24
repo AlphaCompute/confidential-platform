@@ -270,6 +270,7 @@ dependencies = [
  "alpha-core",
  "axum",
  "chrono",
+ "futures-util",
  "getrandom 0.4.3",
  "hex",
  "hmac 0.13.0",
