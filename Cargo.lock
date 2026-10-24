@@ -272,6 +272,7 @@ dependencies = [
  "chrono",
  "getrandom 0.4.3",
  "hex",
+ "hmac 0.13.0",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -282,10 +283,12 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "sqlx",
  "thiserror",
  "tokio",
  "tokio-rustls",
  "tower",
+ "uuid",
  "zeroize",
 ]
 

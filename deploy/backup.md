@@ -5,7 +5,7 @@ backups: `wal-g` encrypts every object with libsodium before it leaves the pod.
 
 ## What is backed up
 
-The whole Postgres cluster, so both databases, `alpha` and `alpha_broker`, and the roles:
+The whole Postgres cluster, so every database (`alpha`, `alpha_broker`, `alpha_inference`) and the roles:
 
 - every WAL segment, as soon as it is full and at least once every 60 seconds (`archive_timeout`),
   so while archiving succeeds a restore loses at most the last minute of commits (see Watch);

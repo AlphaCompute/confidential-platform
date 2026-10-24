@@ -38,10 +38,42 @@ pub(crate) fn test_state(
         secrets: parking_lot::RwLock::new(crate::Secrets {
             provider_key: Some(zeroize::Zeroizing::new(provider_key.to_string())),
             caller_bearer: zeroize::Zeroizing::new(caller_bearer.to_vec()),
+            admin_bearer: zeroize::Zeroizing::new(ADMIN_BEARER.to_vec()),
         }),
         upstream,
         own: Default::default(),
+        // Never connects unless a test reaches the database; those use `fresh_database`.
+        pool: sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://127.0.0.1:1/none")
+            .unwrap(),
+        keys_key: zeroize::Zeroizing::new([7; 32]),
     })
+}
+
+pub(crate) const ADMIN_BEARER: &[u8] = b"admin-bearer";
+
+/// A fresh database per test, migrated; `None` when `DATABASE_URL` is unset.
+pub(crate) async fn fresh_database() -> Option<sqlx::PgPool> {
+    let admin_url = std::env::var("DATABASE_URL").ok()?;
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await
+        .unwrap();
+    let name = format!("alpha_inference_test_{}", uuid::Uuid::now_v7().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("create database {name}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut url = reqwest::Url::parse(&admin_url).unwrap();
+    url.set_path(&format!("/{name}"));
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(url.as_str())
+        .await
+        .unwrap();
+    crate::keys::migrate(&pool).await.unwrap();
+    Some(pool)
 }
 
 /// A `Config` pointing at `upstream_url` with `models` allowlisted — everything both test
