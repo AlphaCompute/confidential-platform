@@ -433,6 +433,7 @@ async fn chat_completions(
     AuthedCaller(key): AuthedCaller,
     mut body: Bytes,
 ) -> Result<Response, Error> {
+    let started_at = chrono::Utc::now();
     let mut parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let model = parsed
         .get("model")
@@ -501,7 +502,7 @@ async fn chat_completions(
     let stream = upstream_response.bytes_stream();
     let body = match key {
         Some(key) => {
-            let mut meter = usage::Meter::new(state.pool.clone(), key, model, streamed);
+            let mut meter = usage::Meter::new(state.pool.clone(), key, model, streamed, started_at);
             axum::body::Body::from_stream(stream.inspect(move |chunk| {
                 if let Ok(bytes) = chunk {
                     meter.observe(bytes);

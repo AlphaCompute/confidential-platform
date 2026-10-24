@@ -51,12 +51,18 @@ pub struct Meter {
 }
 
 impl Meter {
-    pub fn new(pool: PgPool, key: Key, model: String, stream: bool) -> Self {
+    pub fn new(
+        pool: PgPool,
+        key: Key,
+        model: String,
+        stream: bool,
+        started_at: DateTime<Utc>,
+    ) -> Self {
         Meter {
             pool,
             key,
             model,
-            started_at: Utc::now(),
+            started_at,
             stream,
             buf: Vec::new(),
             overflow: false,
@@ -218,7 +224,7 @@ mod tests {
             id: Uuid::nil(),
             org_id: Uuid::nil(),
         };
-        Meter::new(pool, key, "m".into(), stream)
+        Meter::new(pool, key, "m".into(), stream, Utc::now())
     }
 
     #[tokio::test]
