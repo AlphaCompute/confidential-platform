@@ -45,7 +45,7 @@ def main():
         if same is None:
             merged.append(p)
         else:
-            same["rtmr0"] += [r for r in p["rtmr0"] if r not in same["rtmr0"]]
+            same["rtmr0"] += [r for _, r in missing([p], merged)]
     doc["version"] += 1
     doc["issued_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     doc["kata_reference_values"] = merged
