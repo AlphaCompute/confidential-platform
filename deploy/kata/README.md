@@ -118,7 +118,8 @@ Do these steps on each TDX host, as root, after the platform is registered with 
    ```
 
 2. **Token and TLS.** The user token stays in `/etc/pccs`; the config holds only its SHA-512. An
-   empty `AdminTokenHash` keeps the admin API closed. The certificate is self-signed: QCNL
+   empty `AdminTokenHash` keeps the admin API closed; the PCCS logs a warning about it at start,
+   which is expected. The certificate is self-signed: QCNL
    reaches the PCCS on the loopback only.
 
    ```sh
