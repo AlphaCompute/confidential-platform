@@ -47,17 +47,47 @@ from the tag: `envsubst` the template with the same four values, then
 kata-tools-static-4.0.0-amd64.tar.zst> --out out.yaml kms-node.yaml` prints the same `revision`
 and `init_data`.
 
+## The platform document draft
+
+Every tag `v*` checks `reference-values.json` against Kata 4.0.0 (`shapes/README.md`). With
+`KMS_KATA_PLATFORM_DOCUMENT_URL` set, the release also uploads the artifact
+`platform-document-draft`. `shapes/draft.py` makes its `document.json`, the unsigned document,
+from the published one:
+
+- `version` is one more than the published `version`, and `issued_at` is the time of the run.
+- `kata_reference_values` holds the values of this tag and the previous values. A previous value
+  joins the entry with the same registers apart from RTMR0, or stays as its own entry.
+- All other fields are the published ones. If the URL answers 404, the draft has only `version`
+  1, `issued_at` and `kata_reference_values`. Any other failure stops the job.
+
+The previous values are the values of the previous tag. If the published document does not list
+all of them, nobody signed the previous draft. Then the previous values are the published ones.
+
+The previous values stay for one release. Thus an Instance that booted on them keeps its
+appraisal until it restarts on the new values. The run summary has two lists:
+
+- `kept for one release`: the values that no shape of this tag has. The next release removes them.
+- `removed from the published document`: the values that this draft removes.
+
+Before the release-key holders sign the draft, restart every Instance whose TD has a value from
+the `removed` list. Restart it on a shape whose value is in the published document and in the
+draft, so that the KMS appraises it before and after the new document. An Instance that is not
+restarted gets `attestation_unknown` on its next leaf renewal.
+
 ## Signing the Revision
 
 Each release-key holder downloads the artifact, checks that `sha256sum init-data.toml`
 is `compose_hash` in `manifest.json`, and reads `init-data.toml`: the image is the release's digest, the four `ALPHACOMPUTE_*` values are the
-intended ones and the database URL has no password. The document gets
+intended ones and the database URL has no password. Start from `document.json` of
+`platform-document-draft`: its `kata_reference_values` include the KMS pod's shape (no
+resources: 1 vCPU, 2048 MiB). The document gets
 `{ "compose_hash": "<manifest.json>", "build": "kms <tag>", "source_url": "<the release>" }` in
-`kms_revisions[]`, `kata_policy` with the two digests from `manifest.json`, and
-`kata_reference_values` for `kata-qemu-tdx` with `gpu: false` at the pod's shape (no resources:
-1 vCPU, 2048 MiB). Then `alpha sign --release-key release.key --init-data init-data.toml
-document.json`, which refuses an init-data that is not listed or fails the document's
-`kata_policy`. Publish it at `KMS_KATA_PLATFORM_DOCUMENT_URL`. On day 0 `kms_ca_pem` is empty.
+`kms_revisions[]` and `kata_policy` with the two digests from `manifest.json`. Then `alpha sign
+--release-key release.key --previous <the published document> --init-data init-data.toml
+document.json`, which shows the difference to the published document and refuses an init-data
+that is not listed or fails the document's `kata_policy`. Publish it at
+`KMS_KATA_PLATFORM_DOCUMENT_URL`. On day 0 nothing is published: omit `--previous`, and
+`kms_ca_pem` is empty.
 
 ## Day 0
 
