@@ -91,10 +91,9 @@ that is not listed or fails the document's `kata_policy`. Publish it at
 
 ## Quote generation on a TDX host
 
-A TD gets its quote from the host's QGS. The QGS puts the platform's PCK certificate in the quote
-and gets that certificate through QCNL. QCNL asks by QE ID with a zero encrypted PPID, and only a
-PCCS answers that request: Intel PCS refuses it with `400 InvalidRequestSyntax`. Thus every TDX
-host runs its own PCCS on `127.0.0.1:8081`. The PCCS holds the PCK certificates of all TCB levels
+The QGS gets the PCK certificate for a quote through QCNL. Intel PCS refuses the request of QCNL
+with `400 InvalidRequestSyntax`; only a PCCS answers it. Thus every TDX host runs its own PCCS on
+`127.0.0.1:8081`. The PCCS holds the PCK certificates of all TCB levels
 of its platform, so a microcode update or an empty QCNL cache needs no request to Intel.
 
 The PCCS is untrusted storage, like the trust-zone Postgres. Intel signs all that it serves, and
@@ -117,15 +116,18 @@ You need the subscription key of the Intel PCS API.
    sudo -u pccs -H npm ci --omit=dev
    ```
 
-2. **Token and TLS.** The user token stays in `/etc/pccs`; the config holds only its SHA-512. An
+2. **Token and TLS.** The PCCS config holds only the SHA-512 of the user token, and the token is
+   only in the config of `PCKIDRetrievalTool`, so that no process argument holds it. An
    empty `AdminTokenHash` keeps the admin API closed; the PCCS logs a warning about it at start,
    which is expected. The certificate is self-signed: QCNL
    reaches the PCCS on the loopback only.
 
    ```sh
-   install -d -m 700 /etc/pccs
-   (umask 077; openssl rand -hex 32 | tr -d '\n' > /etc/pccs/user-token)
-   sed -i -e "/\"UserTokenHash\"/c\    \"UserTokenHash\" : \"$(sha512sum < /etc/pccs/user-token | cut -d' ' -f1)\"," \
+   T=$(openssl rand -hex 32)
+   C=/opt/intel/sgx-pck-id-retrieval-tool/network_setting.conf
+   chmod 600 $C
+   printf 'PCCS_URL=https://localhost:8081/sgx/certification/v4/platforms\nUSE_SECURE_CERT=FALSE\nuser_token = %s\n' "$T" >> $C
+   sed -i -e "/\"UserTokenHash\"/c\    \"UserTokenHash\" : \"$(printf %s "$T" | sha512sum | cut -d' ' -f1)\"," \
      -e "/\"AdminTokenHash\"/c\    \"AdminTokenHash\" : \"\"," \
      -e "/\"CachingFillMode\"/c\    \"CachingFillMode\" : \"REQ\"," config/default.json
    sudo -u pccs mkdir -p ssl_key
@@ -138,14 +140,9 @@ You need the subscription key of the Intel PCS API.
 
 3. **Register the platform with the PCCS.** In `REQ` mode the PCCS gets all PCK certificates of
    the platform from Intel during this call. The call fails if the key or the platform is not
-   accepted. The tool reads the URL and the token from its own config, so that no process argument
-   holds the token.
+   accepted.
 
    ```sh
-   C=/opt/intel/sgx-pck-id-retrieval-tool/network_setting.conf
-   chmod 600 $C
-   printf 'PCCS_URL=https://localhost:8081/sgx/certification/v4/platforms\nUSE_SECURE_CERT=FALSE\nuser_token = %s\n' \
-     "$(cat /etc/pccs/user-token)" >> $C
    /opt/intel/sgx-pck-id-retrieval-tool/PCKIDRetrievalTool
    ```
 
