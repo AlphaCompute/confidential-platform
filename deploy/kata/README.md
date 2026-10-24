@@ -93,7 +93,7 @@ that is not listed or fails the document's `kata_policy`. Publish it at
 
 The QGS gets the PCK certificate for a quote through QCNL. Intel PCS refuses the request of QCNL
 with `400 InvalidRequestSyntax`; only a PCCS answers it. Thus every TDX host runs its own PCCS on
-`127.0.0.1:8081`. An empty QCNL cache then needs no request to Intel.
+`localhost:8081`.
 
 The PCCS is untrusted storage, like the trust-zone Postgres. Intel signs all that it serves, and
 the verifiers get their collateral from `KMS_KATA_PCCS_URL`, not from the host. A host that breaks
@@ -136,8 +136,7 @@ You need the subscription key of the Intel PCS API.
    PCCS: `systemctl enable --now pccs`.
 
 3. **Register the platform with the PCCS.** In `REQ` mode the PCCS gets all PCK certificates of
-   the platform from Intel during this call. The call fails if the key or the platform is not
-   accepted.
+   the platform from Intel during this call.
 
    ```sh
    /opt/intel/sgx-pck-id-retrieval-tool/PCKIDRetrievalTool
