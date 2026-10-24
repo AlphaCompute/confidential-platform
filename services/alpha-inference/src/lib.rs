@@ -493,11 +493,10 @@ async fn chat_completions(
         Some(key) => {
             let mut meter =
                 usage::Meter::new(state.pool.clone(), key, model, status.as_u16(), streamed);
-            axum::body::Body::from_stream(stream.map(move |chunk| {
-                if let Ok(bytes) = &chunk {
+            axum::body::Body::from_stream(stream.inspect(move |chunk| {
+                if let Ok(bytes) = chunk {
                     meter.observe(bytes);
                 }
-                chunk
             }))
         }
         None => axum::body::Body::from_stream(stream),
