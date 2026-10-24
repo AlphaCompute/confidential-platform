@@ -1798,7 +1798,7 @@ async fn a_deleted_secret_is_withheld_until_a_later_put() {
     );
     let (status, deleted) = h.post("/v1/secrets/deleted/delete", delete.clone()).await;
     assert_eq!(status, StatusCode::OK, "{deleted}");
-    let (status, replayed) = h.post("/v1/secrets/deleted/delete", delete).await;
+    let (status, replayed) = h.post("/v1/secrets/deleted/delete", delete.clone()).await;
     assert_eq!(status, StatusCode::OK, "{replayed}");
     assert_eq!(replayed["deleted_at"], deleted["deleted_at"]);
     let ciphertext: Vec<u8> =
@@ -1832,6 +1832,12 @@ async fn a_deleted_secret_is_withheld_until_a_later_put() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
+    let (status, reply) = h.post("/v1/secrets/deleted/delete", delete).await;
+    assert_eq!(
+        (status, code(&reply)),
+        (StatusCode::CONFLICT, "already_exists"),
+        "an older delete does not erase a later put"
+    );
     let (status, secret) = send(instance.get(&url)).await;
     assert_eq!(status, StatusCode::OK, "{secret}");
     assert_eq!(secret["value"], json!(b64(b"new")));
