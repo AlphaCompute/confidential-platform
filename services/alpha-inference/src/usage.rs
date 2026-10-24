@@ -43,7 +43,6 @@ pub struct Meter {
     pool: PgPool,
     key: Key,
     model: String,
-    status: i16,
     started_at: DateTime<Utc>,
     stream: bool,
     buf: Vec<u8>,
@@ -52,12 +51,11 @@ pub struct Meter {
 }
 
 impl Meter {
-    pub fn new(pool: PgPool, key: Key, model: String, status: u16, stream: bool) -> Self {
+    pub fn new(pool: PgPool, key: Key, model: String, stream: bool) -> Self {
         Meter {
             pool,
             key,
             model,
-            status: i16::try_from(status).unwrap_or(i16::MAX),
             started_at: Utc::now(),
             stream,
             buf: Vec::new(),
@@ -119,27 +117,24 @@ impl Drop for Meter {
             return;
         };
         let found = self.result();
-        let (id, ended_at) = (Uuid::now_v7(), Utc::now());
-        let (pool, key, status, started_at) =
-            (self.pool.clone(), self.key, self.status, self.started_at);
+        let id = Uuid::now_v7();
+        let (pool, key, started_at) = (self.pool.clone(), self.key, self.started_at);
         let model = std::mem::take(&mut self.model);
         runtime.spawn(async move {
             // ponytail: a row whose insert fails three times is lost, and the completion goes
             // unbilled. Upgrade: an outbox the front drains before it reports ready.
             for attempt in 1..=INSERT_TRIES {
                 let done = sqlx::query(
-                    "insert into usage (id, key_id, org_id, model, status, prompt_tokens, completion_tokens, started_at, ended_at)
-                     values ($1, $2, $3, $4, $5, $6, $7, $8, $9) on conflict (id) do nothing",
+                    "insert into usage (id, key_id, org_id, model, prompt_tokens, completion_tokens, started_at)
+                     values ($1, $2, $3, $4, $5, $6, $7) on conflict (id) do nothing",
                 )
                 .bind(id)
                 .bind(key.id)
                 .bind(key.org_id)
                 .bind(&model)
-                .bind(status)
                 .bind(found.map(|t| t.prompt))
                 .bind(found.map(|t| t.completion))
                 .bind(started_at)
-                .bind(ended_at)
                 .execute(&pool)
                 .await;
                 match done {
@@ -222,7 +217,7 @@ mod tests {
             id: Uuid::nil(),
             org_id: Uuid::nil(),
         };
-        Meter::new(pool, key, "m".into(), 200, stream)
+        Meter::new(pool, key, "m".into(), stream)
     }
 
     #[tokio::test]
