@@ -117,15 +117,15 @@ Do these steps on each TDX host, as root, after the platform is registered with 
    sudo -u pccs -H npm ci --omit=dev
    ```
 
-2. **Tokens and TLS.** The tokens stay in `/etc/pccs`; the config holds only their SHA-512. The
-   certificate is self-signed: QCNL reaches the PCCS on the loopback only.
+2. **Token and TLS.** The user token stays in `/etc/pccs`; the config holds only its SHA-512. An
+   empty `AdminTokenHash` keeps the admin API closed. The certificate is self-signed: QCNL
+   reaches the PCCS on the loopback only.
 
    ```sh
    install -d -m 700 /etc/pccs
-   for t in user admin; do (umask 077; openssl rand -hex 32 | tr -d '\n' > /etc/pccs/$t-token); done
-   token_hash() { sha512sum < /etc/pccs/$1-token | cut -d' ' -f1; }
-   sed -i -e "/\"UserTokenHash\"/c\    \"UserTokenHash\" : \"$(token_hash user)\"," \
-     -e "/\"AdminTokenHash\"/c\    \"AdminTokenHash\" : \"$(token_hash admin)\"," \
+   (umask 077; openssl rand -hex 32 | tr -d '\n' > /etc/pccs/user-token)
+   sed -i -e "/\"UserTokenHash\"/c\    \"UserTokenHash\" : \"$(sha512sum < /etc/pccs/user-token | cut -d' ' -f1)\"," \
+     -e "/\"AdminTokenHash\"/c\    \"AdminTokenHash\" : \"\"," \
      -e "/\"CachingFillMode\"/c\    \"CachingFillMode\" : \"REQ\"," \
      -e "/\"ApiKey\"/c\    \"ApiKey\" : \"$PCS_API_KEY\"," config/default.json
    sudo -u pccs mkdir -p ssl_key
