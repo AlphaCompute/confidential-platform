@@ -14,7 +14,13 @@ The platform's inference front: an App of its own. A model listed in `MODEL_SERV
 
 The three `UPSTREAM_*`/`PCCS_*` variables are required only when some model in `MODELS` is not in `MODEL_SERVERS`.
 
-Secrets, released only to this App's Revision: `caller-bearer` (compared by SHA-256 digest against every `/v1` request's `Authorization: Bearer` header before any upstream contact) and, only when some model goes to RedPill, `redpill-api-key` (RedPill's own key; never sent to any other App, never released to a caller).
+Secrets, released only to this App's Revision: `database-url` (the front's own Postgres database), `admin-bearer` (compared by SHA-256 digest on the key routes), `caller-bearer` (one bearer shared by callers without an API key, compared the same way) and, only when some model goes to RedPill, `redpill-api-key` (RedPill's own key; never sent to any other App, never released to a caller).
+
+## API keys
+
+A tenant's key is `sk-alpha-<id>_<secret>`: the key's UUIDv7 and 32 random bytes, both in lowercase hex. The front shows it once, in the reply that creates it. The database is untrusted storage, so a row holds no key: only `HMAC-SHA256(K, "alphacompute/inference/api-key/v1" ‖ id ‖ org_id ‖ secret)`, with `K` the App's key for purpose `api-keys`, the same for every Revision. A reader of the database learns no key; a writer can neither add one nor move one to another organization. A writer can still clear `revoked_at` and so revive a revoked key. Every `/v1` request reads its key's row, so a revocation holds on the next request on every replica.
+
+`alpha-inference migrate` runs the migrations in `migrations/` and stops; a normal start runs them too.
 
 ## Our own model servers
 
@@ -27,7 +33,11 @@ Every completion, to either kind of upstream, ends after ten minutes, the stream
 - `GET /v1/models` — our own models (`owned_by: "alphacompute"`), then the allowlisted entries of RedPill's public listing (bare `{id, object}` when RedPill lists none of them). No gateway check: it carries no conversation.
 - `GET /v1/models/{model}` — `200 {"id","object":"model","owned_by"}` (`alphacompute` once its server's probe passed, `redpill` once the gateway check has passed within the last minute); `404 model_not_found` outside the allowlist; `502 upstream` for a model server that failed its probe; `502 upstream_unverified` otherwise.
 - `POST /v1/chat/completions` — the body forwarded unchanged, status/content-type/stream relayed: to our own model server over the pinned mTLS connection, without the caller's bearer; or to RedPill over the connection the gateway check pinned, the caller's bearer replaced by the RedPill key. `404 model_not_found` outside the allowlist, checked before any upstream contact; `502 upstream_unverified` when the gateway check fails; `502 upstream` when the pinned connection fails, refuses the server, or times out.
-- `GET /healthz` (process only) and `GET /ready` (200 once the default model's server passes its probe or its gateway check passes) need no bearer.
+- `POST /admin/orgs/{org_id}/keys` `{"name"}` — `201 {id, key, name, created_at}`, the only reply that carries the key; a name of 1 to 128 bytes.
+- `GET /admin/orgs/{org_id}/keys` — `[{id, name, created_at, revoked_at}]`.
+- `DELETE /admin/keys/{id}` — `204`, again `204` for a revoked key; `404 not_found` for an unknown one.
+- The `/admin` routes need `admin-bearer`; every `/v1` route needs a live API key or `caller-bearer`.
+- `GET /healthz` (process only) and `GET /ready` (200 once the database answers and the default model's server passes its probe or its gateway check passes) need no bearer.
 
 Errors are OpenAI-shaped: `{"error":{"message","type","code"}}`; the `upstream_unverified` message is always "The model provider did not pass verification, so nothing was sent."
 
@@ -41,7 +51,7 @@ Before forwarding any request for a model, and at most once a minute per model: 
 
 ## Tests
 
-`cargo test -p alpha-inference` runs the golden and failure-mode tests: `check_report` against a real captured RedPill report (`testdata/redpill/`) and against it mutated (wrong nonce, wrong SPKI, a tampered quote byte, a policy that denies the TCB status, expired collateral); every way the report endpoint can fail (refused, non-2xx, timeout, non-JSON, a missing field); the 60-second reuse window and refetch on expiry; two concurrent checks on a cold model sharing one fetch; SPKI pinning on the forwarding connection; routing between our own model servers and RedPill, a model server of another Revision or CA refused before any request byte, and the completion timeout; and the router (bearer required before any upstream contact, a model outside the allowlist refused before any upstream contact, `Config::build`'s refusals).
+`cargo test -p alpha-inference` runs the golden and failure-mode tests: `check_report` against a real captured RedPill report (`testdata/redpill/`) and against it mutated (wrong nonce, wrong SPKI, a tampered quote byte, a policy that denies the TCB status, expired collateral); every way the report endpoint can fail (refused, non-2xx, timeout, non-JSON, a missing field); the 60-second reuse window and refetch on expiry; two concurrent checks on a cold model sharing one fetch; SPKI pinning on the forwarding connection; routing between our own model servers and RedPill, a model server of another Revision or CA refused before any request byte, and the completion timeout; the key routes (only the admin bearer; with `DATABASE_URL` set, a fresh database per test: a key admits its caller until it is revoked or its row's organization is rewritten); and the router (bearer required before any upstream contact, a model outside the allowlist refused before any upstream contact, `Config::build`'s refusals).
 
 The live test proves the whole front end to end against the real RedPill API and is `#[ignore]`d unless a key is present:
 

@@ -1,8 +1,8 @@
 //! Thin entrypoint: attest, read this Instance's identity and its Secrets (the provider key only
-//! when some model goes to the external provider), then serve the `/v1` routes over TLS on
+//! when some model goes to the external provider), migrate the front's own database, then serve the `/v1` routes over TLS on
 //! `:8443` until SIGTERM, refreshing the leaf and the Secrets every five minutes. A failed read of the Secrets is retried; a lost identity ends the process: the
 //! runtime is gone when the Revision is revoked, and the front must not go on serving with what
-//! it read before. All logic lives in `run`, which maps every error to a non-zero exit and never
+//! it read before. `alpha-inference migrate` stops after the migration. All logic lives in `run`, which maps every error to a non-zero exit and never
 //! panics.
 
 use std::sync::Arc;
@@ -10,8 +10,9 @@ use std::sync::Arc;
 use alpha_client::runtime::{RuntimeSocket, refresh_forever};
 use alpha_client::tls::{InstanceCert, kms_ca, serve, server_config};
 use alpha_inference::{
-    AppState, COMPLETION_TIMEOUT, Config, Error, Secrets, Upstream, own, router,
+    AppState, COMPLETION_TIMEOUT, Config, Error, Secrets, Upstream, keys, own, router,
 };
+use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
 use zeroize::Zeroizing;
 
@@ -41,14 +42,18 @@ async fn read_secrets(runtime: &RuntimeSocket, external: bool) -> Result<Secrets
     } else {
         None
     };
-    let caller_bearer = runtime
-        .secret("caller-bearer")
-        .await
-        .map_err(|e| Error::internal(format!("secret caller-bearer: {e}")))?;
     Ok(Secrets {
         provider_key,
-        caller_bearer: Zeroizing::new(caller_bearer.to_vec()),
+        caller_bearer: secret(runtime, "caller-bearer").await?,
+        admin_bearer: secret(runtime, "admin-bearer").await?,
     })
+}
+
+async fn secret(runtime: &RuntimeSocket, name: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
+    runtime
+        .secret(name)
+        .await
+        .map_err(|e| Error::internal(format!("secret {name}: {e}")))
 }
 
 async fn run() -> Result<(), Error> {
@@ -64,6 +69,24 @@ async fn run() -> Result<(), Error> {
         "alpha-inference: attested as app {} revision {}",
         identity.app_id, identity.compose_hash
     );
+    let database_url = String::from_utf8(secret(&runtime, "database-url").await?.to_vec())
+        .map_err(|_| Error::internal("database-url is not utf8"))?;
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&database_url)
+        .await
+        .map_err(|e| Error::internal(format!("database: {e}")))?;
+    keys::migrate(&pool)
+        .await
+        .map_err(|e| Error::internal(format!("migrate: {e}")))?;
+    if std::env::args().nth(1).as_deref() == Some("migrate") {
+        return Ok(());
+    }
+    let keys_key = runtime
+        .key(keys::KEY_PURPOSE)
+        .await
+        .map_err(|e| Error::internal(format!("key {}: {e}", keys::KEY_PURPOSE)))?;
+
     let cert =
         Arc::new(InstanceCert::new(&identity).map_err(|e| Error::internal(format!("tls: {e}")))?);
     let tls_config =
@@ -78,6 +101,8 @@ async fn run() -> Result<(), Error> {
         secrets: parking_lot::RwLock::new(secrets),
         upstream,
         own,
+        pool,
+        keys_key,
     });
     let app = router(state.clone());
 

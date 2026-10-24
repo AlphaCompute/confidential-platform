@@ -2,7 +2,7 @@
 //! attested model server (`own`); every other allowlisted model goes to RedPill, and only after
 //! `upstream::Upstream::verified` has proven, in this process's own measured code, that the
 //! connection it will forward over terminates inside RedPill's attested gateway — never on a
-//! stale check, an error, or a caller without its bearer.
+//! stale check, an error, or a caller without its key.
 
 #![cfg_attr(
     test,
@@ -15,6 +15,7 @@
     )
 )]
 
+pub mod keys;
 pub mod own;
 pub mod upstream;
 
@@ -30,9 +31,12 @@ use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, State};
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use serde::Deserialize;
 use serde_json::{Value, json};
+use sqlx::PgPool;
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 pub use upstream::Upstream;
@@ -145,7 +149,12 @@ impl External {
 pub struct Secrets {
     /// Read only when some model goes to the external provider.
     pub provider_key: Option<Zeroizing<String>>,
+    // ponytail: one bearer shared by every caller that has no API key, counted under no key.
+    // Upgrade: the Corpus worker gets an API key or is admitted by its leaf, and this goes.
     pub caller_bearer: Zeroizing<Vec<u8>>,
+    // ponytail: one shared bearer for the key routes. Upgrade: the caller-App check of
+    // `alpha-guard` (an Instance leaf of an App in a measured list) once the caller runs in an App.
+    pub admin_bearer: Zeroizing<Vec<u8>>,
 }
 
 impl std::fmt::Debug for Secrets {
@@ -153,6 +162,7 @@ impl std::fmt::Debug for Secrets {
         f.debug_struct("Secrets")
             .field("provider_key", &"<redacted>")
             .field("caller_bearer", &"<redacted>")
+            .field("admin_bearer", &"<redacted>")
             .finish()
     }
 }
@@ -164,6 +174,9 @@ pub struct AppState {
     pub secrets: parking_lot::RwLock<Secrets>,
     pub upstream: Option<Upstream>,
     pub own: BTreeMap<String, own::Server>,
+    pub pool: PgPool,
+    /// The App's `api-keys` key, the same for every Revision, so a new Revision keeps the keys.
+    pub keys_key: Zeroizing<[u8; 32]>,
 }
 
 /// Every error this service answers with, OpenAI-shaped on the wire. Messages never carry a
@@ -172,6 +185,10 @@ pub struct AppState {
 pub enum Error {
     #[error("missing or invalid bearer")]
     Unauthorized,
+    #[error("{0}")]
+    BadRequest(String),
+    #[error("not found")]
+    NotFound,
     #[error("model '{0}' is not available")]
     ModelNotFound(String),
     #[error("The model provider did not pass verification, so nothing was sent.")]
@@ -194,6 +211,12 @@ impl Error {
                 "authentication_error",
                 "unauthorized",
             ),
+            Error::BadRequest(_) => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "invalid_request",
+            ),
+            Error::NotFound => (StatusCode::NOT_FOUND, "invalid_request_error", "not_found"),
             Error::ModelNotFound(_) => (
                 StatusCode::NOT_FOUND,
                 "invalid_request_error",
@@ -214,6 +237,12 @@ impl Error {
     }
 }
 
+impl From<sqlx::Error> for Error {
+    fn from(e: sqlx::Error) -> Self {
+        Error::internal(format!("database: {e}"))
+    }
+}
+
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let (status, error_type, code) = self.parts();
@@ -228,7 +257,16 @@ impl IntoResponse for Error {
     }
 }
 
-/// Proof of the caller's bearer, extracted before any handler runs.
+fn bearer(parts: &Parts) -> Result<&str, Error> {
+    parts
+        .headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(Error::Unauthorized)
+}
+
+/// Proof of the caller's key or of the shared caller bearer, extracted before any handler runs.
 pub struct AuthedCaller;
 
 impl FromRequestParts<Arc<AppState>> for AuthedCaller {
@@ -238,17 +276,72 @@ impl FromRequestParts<Arc<AppState>> for AuthedCaller {
         parts: &mut Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
-        let presented = parts
-            .headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .ok_or(Error::Unauthorized)?;
+        let presented = bearer(parts)?;
         if alpha_client::bearer_matches(presented.as_bytes(), &state.secrets.read().caller_bearer) {
+            return Ok(AuthedCaller);
+        }
+        if keys::authenticate(&state.pool, &state.keys_key, presented).await? {
             Ok(AuthedCaller)
         } else {
             Err(Error::Unauthorized)
         }
+    }
+}
+
+/// Proof of the admin bearer.
+pub struct Admin;
+
+impl FromRequestParts<Arc<AppState>> for Admin {
+    type Rejection = Error;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        if alpha_client::bearer_matches(
+            bearer(parts)?.as_bytes(),
+            &state.secrets.read().admin_bearer,
+        ) {
+            Ok(Admin)
+        } else {
+            Err(Error::Unauthorized)
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateKey {
+    name: String,
+}
+
+async fn create_key(
+    State(state): State<Arc<AppState>>,
+    _: Admin,
+    Path(org_id): Path<Uuid>,
+    Json(body): Json<CreateKey>,
+) -> Result<(StatusCode, Json<keys::Created>), Error> {
+    let created = keys::create(&state.pool, &state.keys_key, org_id, &body.name).await?;
+    Ok((StatusCode::CREATED, Json(created)))
+}
+
+async fn list_keys(
+    State(state): State<Arc<AppState>>,
+    _: Admin,
+    Path(org_id): Path<Uuid>,
+) -> Result<Json<Vec<keys::Listed>>, Error> {
+    Ok(Json(keys::list(&state.pool, org_id).await?))
+}
+
+async fn revoke_key(
+    State(state): State<Arc<AppState>>,
+    _: Admin,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, Error> {
+    if keys::revoke(&state.pool, id).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(Error::NotFound)
     }
 }
 
@@ -392,6 +485,9 @@ async fn healthz() -> StatusCode {
 }
 
 async fn ready(State(state): State<Arc<AppState>>) -> StatusCode {
+    if sqlx::query("select 1").execute(&state.pool).await.is_err() {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
     let model = state.config.default_model();
     let ready = match state.own.get(model) {
         Some(server) => server.live(model).await,
@@ -412,6 +508,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/models/{*model}", get(get_model))
         .merge(completions)
+        .route("/admin/orgs/{org_id}/keys", post(create_key).get(list_keys))
+        .route("/admin/keys/{id}", delete(revoke_key))
         .route("/healthz", get(healthz))
         .route("/ready", get(ready))
         .with_state(state)
@@ -580,6 +678,169 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         assert_eq!(report_hits.load(Ordering::SeqCst), 0);
+    }
+
+    async fn call(
+        app: &Router,
+        method: &str,
+        path: &str,
+        bearer: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(body.map_or_else(Body::empty, |b| Body::from(b.to_string())))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_key_routes_refuse_anything_but_the_admin_bearer() {
+        let state = test_state(
+            test_config("https://example.invalid", &["m1"]),
+            b"right-bearer",
+            "key",
+        );
+        let app = router(state);
+        let org = Uuid::now_v7();
+        for bearer in ["right-bearer", "wrong"] {
+            let (status, _) = call(
+                &app,
+                "POST",
+                &format!("/admin/orgs/{org}/keys"),
+                bearer,
+                Some(json!({"name": "a"})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            let (status, _) = call(
+                &app,
+                "GET",
+                &format!("/admin/orgs/{org}/keys"),
+                bearer,
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            let (status, _) =
+                call(&app, "DELETE", &format!("/admin/keys/{org}"), bearer, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_api_key_admits_its_caller_until_it_is_revoked_or_its_row_is_altered() {
+        let Some(pool) = crate::test_support::fresh_database().await else {
+            return;
+        };
+        let (base, _, _) = spawn_fake_upstream(answering(StatusCode::OK, "{}")).await;
+        let mut state = test_state(test_config(&base, &["m1"]), b"right-bearer", "provider-key");
+        Arc::get_mut(&mut state).unwrap().pool = pool.clone();
+        let app = router(state);
+        let admin = std::str::from_utf8(crate::test_support::ADMIN_BEARER).unwrap();
+        let (org, other_org) = (Uuid::now_v7(), Uuid::now_v7());
+
+        let (status, _) = call(
+            &app,
+            "POST",
+            &format!("/admin/orgs/{org}/keys"),
+            admin,
+            Some(json!({"name": ""})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let mut made = Vec::new();
+        for name in ["first", "second"] {
+            let (status, created) = call(
+                &app,
+                "POST",
+                &format!("/admin/orgs/{org}/keys"),
+                admin,
+                Some(json!({"name": name})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED);
+            made.push(created);
+        }
+        let key = |i: usize| made[i]["key"].as_str().unwrap().to_owned();
+        let id = |i: usize| made[i]["id"].as_str().unwrap().to_owned();
+        for i in 0..2 {
+            assert_eq!(
+                call(&app, "GET", "/v1/models", &key(i), None).await.0,
+                StatusCode::OK
+            );
+        }
+        assert_eq!(
+            call(&app, "GET", "/v1/models", "right-bearer", None)
+                .await
+                .0,
+            StatusCode::OK
+        );
+
+        let (_, listed) = call(&app, "GET", &format!("/admin/orgs/{org}/keys"), admin, None).await;
+        assert_eq!(listed.as_array().unwrap().len(), 2);
+        assert!(
+            !listed.to_string().contains(&key(0)[20..]),
+            "a listing never shows a key"
+        );
+        let (_, other) = call(
+            &app,
+            "GET",
+            &format!("/admin/orgs/{other_org}/keys"),
+            admin,
+            None,
+        )
+        .await;
+        assert_eq!(other, json!([]));
+
+        for _ in 0..2 {
+            let (status, _) = call(
+                &app,
+                "DELETE",
+                &format!("/admin/keys/{}", id(0)),
+                admin,
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+        }
+        assert_eq!(
+            call(&app, "GET", "/v1/models", &key(0), None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            call(&app, "GET", "/v1/models", &key(1), None).await.0,
+            StatusCode::OK
+        );
+        let (status, _) = call(
+            &app,
+            "DELETE",
+            &format!("/admin/keys/{other_org}"),
+            admin,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        sqlx::query("update api_keys set org_id = $1 where id = $2")
+            .bind(other_org)
+            .bind(Uuid::parse_str(&id(1)).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            call(&app, "GET", "/v1/models", &key(1), None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]
