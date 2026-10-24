@@ -5,11 +5,12 @@
 pub mod measure;
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use alpha_client::runtime::TLS_PORT;
 use alpha_core::{AppId, ComposeHash, InitData, has_sha256_digest};
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
@@ -18,6 +19,8 @@ use flate2::write::GzEncoder;
 use serde::Serialize;
 use serde_yaml_ng::{Mapping, Value as Yaml};
 use sha2::{Digest, Sha256};
+
+use crate::deploy::RUNTIME_SERVICE;
 
 const ANNOTATION: &str = "io.katacontainers.config.hypervisor.cc_init_data";
 
@@ -162,6 +165,7 @@ pub fn parse(bytes: &[u8]) -> Result<Pod, String> {
             }
         }
     }
+    add_readiness_probe(pod);
     if pod
         .get("securityContext")
         .and_then(|s| s.get("supplementalGroups"))
@@ -187,6 +191,36 @@ pub fn parse(bytes: &[u8]) -> Result<Pod, String> {
         spec,
         genpolicy_input,
     })
+}
+
+/// The platform replaces a copy only once the new pod is Ready, and `alpha-runtime` opens its TLS
+/// port only after the KMS issued its leaf, so this probe makes Ready mean attested. kubelet
+/// probes TCP from the host, not through the agent, so the policy and the Revision stay the same.
+fn add_readiness_probe(pod: &mut Mapping) {
+    let Some(Yaml::Sequence(containers)) = pod.get_mut("containers") else {
+        return;
+    };
+    for container in containers {
+        let Yaml::Mapping(container) = container else {
+            continue;
+        };
+        if container.get("name").and_then(Yaml::as_str) != Some(RUNTIME_SERVICE)
+            || container.contains_key("readinessProbe")
+        {
+            continue;
+        }
+        let serves_tls = container
+            .get("env")
+            .and_then(Yaml::as_sequence)
+            .into_iter()
+            .flatten()
+            .any(|e| e.get("name").and_then(Yaml::as_str) == Some("ALPHACOMPUTE_TLS_UPSTREAM"));
+        if serves_tls {
+            let port = Mapping::from_iter([("port".into(), TLS_PORT.into())]);
+            let probe = Mapping::from_iter([("tcpSocket".into(), port.into())]);
+            container.insert("readinessProbe".into(), probe.into());
+        }
+    }
 }
 
 /// The mapping holding the pod's `metadata` and `spec`: a Pod itself, or a workload's template,
@@ -331,6 +365,33 @@ fn patch_rules(upstream: Vec<u8>) -> Result<String, String> {
     Ok(rules)
 }
 
+/// The App, Revision and init-data TOML of a Pod `render` wrote, read back from its annotation.
+pub fn rendered_init_data(pod: &str) -> Result<(AppId, ComposeHash, String), String> {
+    let spec: Yaml = serde_yaml_ng::from_str(pod).map_err(|e| format!("pod spec: {e}"))?;
+    if spec.get("kind").and_then(Yaml::as_str) != Some("Pod") {
+        return Err("pod spec: kind is not Pod; deploy the Pod alpha coco render wrote".into());
+    }
+    let annotation = spec
+        .get("metadata")
+        .and_then(|m| m.get("annotations"))
+        .and_then(|a| a.get(ANNOTATION))
+        .and_then(Yaml::as_str)
+        .ok_or_else(|| format!("pod spec: no {ANNOTATION}; render it with alpha coco render"))?;
+    let gzip = BASE64_STANDARD
+        .decode(annotation)
+        .map_err(|e| format!("{ANNOTATION}: {e}"))?;
+    let mut toml = String::new();
+    flate2::read::GzDecoder::new(gzip.as_slice())
+        .take(alpha_core::MAX_INIT_DATA as u64)
+        .read_to_string(&mut toml)
+        .map_err(|e| format!("{ANNOTATION}: {e}"))?;
+    let init_data = InitData::parse(toml.clone()).map_err(|e| format!("init-data: {e}"))?;
+    let app_id = init_data
+        .app_id()
+        .ok_or("init-data: [data] names no app_id")?;
+    Ok((app_id, init_data.digest(), toml))
+}
+
 /// Builds the init-data in one fixed layout: genpolicy's own keeps `[data]` in a hash map, so
 /// the same inputs could give two Revisions.
 pub fn render(mut pod: Pod, app_id: AppId, policy: &str) -> Result<Rendered, String> {
@@ -388,9 +449,6 @@ pub fn render(mut pod: Pod, app_id: AppId, policy: &str) -> Result<Rendered, Str
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
-
-    use flate2::read::GzDecoder;
     use serde_json::Value;
 
     use super::*;
@@ -428,12 +486,6 @@ mod tests {
                 .init_data
                 .contains(&format!("\n\"app_id\" = \"{APP_ID}\"\n"))
         );
-        let gzip = BASE64_STANDARD.decode(&first.annotation).unwrap();
-        let mut toml = String::new();
-        GzDecoder::new(gzip.as_slice())
-            .read_to_string(&mut toml)
-            .unwrap();
-        assert_eq!(toml, first.init_data);
         let pod: Yaml = serde_yaml_ng::from_str(&first.pod).unwrap();
         assert_eq!(
             pod["metadata"]["annotations"][ANNOTATION].as_str(),
@@ -447,6 +499,46 @@ mod tests {
         let input = parse(POD.as_bytes()).unwrap().genpolicy_input;
         assert!(!input.contains("automountServiceAccountToken"));
         assert!(!input.contains("enableServiceLinks"));
+    }
+
+    #[test]
+    fn a_rendered_pod_reads_back_as_its_revision() {
+        let rendered = render_golden();
+        let (app_id, digest, toml) = rendered_init_data(&rendered.pod).unwrap();
+        assert_eq!(app_id.to_string(), APP_ID);
+        assert_eq!(digest, rendered.revision);
+        assert_eq!(toml, rendered.init_data);
+        assert!(rendered_init_data(POD).unwrap_err().contains(ANNOTATION));
+    }
+
+    #[test]
+    fn the_runtime_serving_tls_gets_a_readiness_probe_on_its_port() {
+        let runtime = |extra: &str| {
+            POD.replace(
+                "  containers:\n",
+                &format!(
+                    "  containers:\n  - name: alpha-runtime\n    image: public.ecr.aws/docker/library/alpine@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8\n{extra}"
+                ),
+            )
+        };
+        let probe = |spec: &str| {
+            let input: Yaml =
+                serde_yaml_ng::from_str(&parse(spec.as_bytes()).unwrap().genpolicy_input).unwrap();
+            input["spec"]["containers"][0]
+                .get("readinessProbe")
+                .cloned()
+        };
+        let tls = "    env:\n    - {name: ALPHACOMPUTE_TLS_UPSTREAM, value: '127.0.0.1:8080'}\n";
+        assert_eq!(
+            probe(&runtime(tls)),
+            Some(serde_yaml_ng::from_str("{tcpSocket: {port: 8443}}").unwrap())
+        );
+        assert_eq!(probe(&runtime("")), None, "no TLS listener to wait on");
+        let own = format!("{tls}    readinessProbe: {{tcpSocket: {{port: 9000}}}}\n");
+        assert_eq!(
+            probe(&runtime(&own)),
+            Some(serde_yaml_ng::from_str("{tcpSocket: {port: 9000}}").unwrap())
+        );
     }
 
     #[test]

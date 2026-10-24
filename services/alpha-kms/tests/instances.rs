@@ -186,11 +186,18 @@ async fn a_deploy_waits_for_every_copy_in_reply_order() {
     let first = ca.instance_serving(app, hash, axum::Router::new()).await;
     let second = ca.instance_serving(app, hash, axum::Router::new()).await;
     let reply = json!({ "instances": [copy(app, hash, &first), copy(app, hash, &second)] });
+    let (shroud, _) = shroud(json!({})).await;
 
-    let attested =
-        alpha_cli::deploy::wait_for_every_copy(&reply, &ca.pem(), hash, Duration::from_secs(10))
-            .await
-            .unwrap();
+    let attested = alpha_cli::deploy::wait_for_every_copy(
+        &shroud,
+        app,
+        &reply,
+        &ca.pem(),
+        hash,
+        Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(attested[0]["url"], first);
     assert_eq!(attested[1]["url"], second);
@@ -212,10 +219,18 @@ async fn a_deploy_fails_when_one_copy_serves_another_revision() {
         )
         .await;
     let reply = json!({ "instances": [copy(app, hash, &good), copy(app, hash, &stale)] });
+    let (shroud, _) = shroud(json!({})).await;
 
-    let message = alpha_cli::deploy::wait_for_every_copy(&reply, &ca.pem(), hash, Duration::ZERO)
-        .await
-        .unwrap_err();
+    let message = alpha_cli::deploy::wait_for_every_copy(
+        &shroud,
+        app,
+        &reply,
+        &ca.pem(),
+        hash,
+        Duration::ZERO,
+    )
+    .await
+    .unwrap_err();
 
     assert!(message.contains(&stale), "{message}");
     assert!(message.contains("did not attest"), "{message}");
@@ -225,14 +240,48 @@ async fn a_deploy_fails_when_one_copy_serves_another_revision() {
 async fn a_deploy_reply_without_copies_is_an_error() {
     let hash = compose_hash("{}");
     let pem = Ca::new().pem();
+    let (shroud, _) = shroud(json!({})).await;
     for reply in [
         json!({ "url": "https://old-shape.example" }),
         json!({ "instances": [] }),
     ] {
-        let message =
-            alpha_cli::deploy::wait_for_every_copy(&reply, &pem, hash, Duration::from_secs(1))
-                .await
-                .unwrap_err();
+        let message = alpha_cli::deploy::wait_for_every_copy(
+            &shroud,
+            AppId::mint(),
+            &reply,
+            &pem,
+            hash,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
         assert!(message.contains(&reply.to_string()), "{message}");
     }
+}
+
+#[tokio::test]
+async fn a_copy_deployed_without_a_url_is_waited_on_once_shroud_lists_one() {
+    let ca = Ca::new();
+    let app = AppId::mint();
+    let hash = compose_hash("{\"name\":\"worker\"}");
+    let url = ca.instance_serving(app, hash, axum::Router::new()).await;
+    let (shroud, seen) = shroud(copy(app, hash, &url)).await;
+    let reply = json!({ "instances": [copy(app, hash, "")] });
+
+    let attested = alpha_cli::deploy::wait_for_every_copy(
+        &shroud,
+        app,
+        &reply,
+        &ca.pem(),
+        hash,
+        Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(attested[0]["url"], url);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [format!("GET /v1/apps/{app}/instances Bearer {API_KEY} ")]
+    );
 }

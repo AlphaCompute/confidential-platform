@@ -156,7 +156,11 @@ enum Command {
         /// The CVM's memory, for a wrapped compose.
         #[arg(long, requires = "compose", conflicts_with = "app")]
         memory_mib: Option<u64>,
-        #[arg(required_unless_present = "compose")]
+        /// The Pod `alpha coco render` wrote; its init-data is registered and the file deployed
+        /// as it is, sized by its own limits.
+        #[arg(long, conflicts_with_all = ["app", "compose"])]
+        pod: Option<PathBuf>,
+        #[arg(required_unless_present_any = ["compose", "pod"])]
         app: Option<PathBuf>,
     },
     /// A customer's plain docker-compose as a Revision.
@@ -555,23 +559,45 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             compose,
             cpu,
             memory_mib,
+            pod,
             app,
         } => {
-            let (app_id, compose, resources) = match (compose, app) {
-                (Some(path), _) => {
-                    let (app_id, compose) = wrap::wrapped(&read_json(&path)?)?;
-                    let resources = json!({ "cpu": cpu, "memory_mib": memory_mib });
-                    (app_id, compose, resources)
-                }
-                (None, Some(app)) => {
-                    let spec = read_spec(&app)?;
-                    (
-                        spec.app_id,
-                        alpha_cli::deploy::compose(&spec)?,
-                        spec.resources,
-                    )
-                }
-                (None, None) => return Err(Exit::Usage("give an app spec or --compose".into())),
+            let (app_id, revision, deploy) = if let Some(path) = pod {
+                let usage = |e: String| Exit::Usage(format!("{}: {e}", path.display()));
+                let pod = fs::read_to_string(&path).map_err(|e| usage(e.to_string()))?;
+                let (app_id, digest, init_data) = coco::rendered_init_data(&pod).map_err(usage)?;
+                let revision =
+                    json!({ "app_id": app_id, "init_data": init_data, "digest": digest });
+                (
+                    app_id,
+                    revision,
+                    serde_json::Map::from_iter([("pod".into(), pod.into())]),
+                )
+            } else {
+                let (app_id, compose, resources) = match (compose, app) {
+                    (Some(path), _) => {
+                        let (app_id, compose) = wrap::wrapped(&read_json(&path)?)?;
+                        let resources = json!({ "cpu": cpu, "memory_mib": memory_mib });
+                        (app_id, compose, resources)
+                    }
+                    (None, Some(app)) => {
+                        let spec = read_spec(&app)?;
+                        (
+                            spec.app_id,
+                            alpha_cli::deploy::compose(&spec)?,
+                            spec.resources,
+                        )
+                    }
+                    (None, None) => {
+                        return Err(Exit::Usage("give an app spec or --compose".into()));
+                    }
+                };
+                let revision = json!({ "app_id": app_id, "compose": compose });
+                let deploy = serde_json::Map::from_iter([
+                    ("resources".into(), resources),
+                    ("compose".into(), compose.into()),
+                ]);
+                (app_id, revision, deploy)
             };
             let shroud = if register_only {
                 None
@@ -584,11 +610,11 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let key = read_ed25519(&key)?;
             let (client, doc) = admin_client_and_document(config, now).await?;
             let wait = wait.map(|secs| (Duration::from_secs(secs), doc.kms_ca_pem.as_str()));
-            Ok(alpha_cli::deploy::deploy_compose(
+            Ok(alpha_cli::deploy::deploy_revision(
                 &client,
                 app_id,
-                compose,
-                &resources,
+                revision,
+                deploy,
                 key_id,
                 &key,
                 shroud.as_ref(),
@@ -983,6 +1009,9 @@ mod tests {
         assert!(!deploy(&[&wrapped[..], &["app.yaml"]].concat()));
         assert!(!deploy(&["--compose", "w.json", "--memory-mib", "2048"]));
         assert!(!deploy(&["--cpu", "1", "--memory-mib", "2048", "app.yaml"]));
+        assert!(deploy(&["--pod", "app.yaml", "--wait", "60"]));
+        assert!(!deploy(&["--pod", "app.yaml", "app.yaml"]));
+        assert!(!deploy(&[&wrapped[..], &["--pod", "app.yaml"]].concat()));
         assert!(!deploy(&[]));
     }
 }
