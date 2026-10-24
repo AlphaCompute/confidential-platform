@@ -374,15 +374,20 @@ cp caller-bearer inference-bearer &&
 ### The databases of the broker and the front
 
 Each App's login role and database on the trust-db, with a password sent on stdin, and its
-Secret `database-url` carrying that password; each applies its migrations when it starts.
+Secret `database-url` carrying that password; each applies its migrations when it starts. A
+failed run leaves no password file behind; run `db` again, and it sets a new password on the
+role it already made.
 
 ```sh
 db() {
   openssl rand -hex 32 > "$1-db-password" &&
-    printf "create role $1 login password '%s';\n" "$(cat "$1-db-password")" \
-    | kubectl -n alpha-trust-db exec -i postgres-0 -- psql -X -v ON_ERROR_STOP=1 -U postgres -d alpha &&
-    echo "create database $1 owner $1;" \
-    | kubectl -n alpha-trust-db exec -i postgres-0 -- psql -X -v ON_ERROR_STOP=1 -U postgres -d alpha &&
+    {
+      printf "select format('%%s role %s login password %%L', case when exists (select from pg_roles where rolname = '%s') then 'alter' else 'create' end, '%s')\n" \
+        "$1" "$1" "$(cat "$1-db-password")"
+      printf '%s\n' '\gexec'
+      printf "select 'create database %s owner %s' where not exists (select from pg_database where datname = '%s')\n" "$1" "$1" "$1"
+      printf '%s\n' '\gexec'
+    } | kubectl -n alpha-trust-db exec -i postgres-0 -- psql -X -v ON_ERROR_STOP=1 -U postgres -d alpha &&
     printf "postgres://$1:%s@postgres.alpha-trust-db.svc:5432/$1?sslmode=require&channel_binding=require&require_auth=scram-sha-256" \
       "$(cat "$1-db-password")" > database-url &&
     put_secret database-url "$2"
