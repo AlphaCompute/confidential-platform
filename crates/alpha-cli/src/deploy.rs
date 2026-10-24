@@ -6,7 +6,7 @@ use alpha_core::{AppId, ComposeHash, KeyId, check_registration, context, phala};
 use ed25519_dalek::SigningKey;
 use reqwest::Method;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use serde_yaml_ng::{Mapping, Value as Yaml};
 use std::time::{Duration, Instant};
 
@@ -355,26 +355,21 @@ pub async fn wait_for_attestation(
     }
 }
 
-/// Registers `compose` as a Revision of `app_id`, then deploys it through shroud-go unless
+/// Registers `revision`, then deploys it through shroud-go with `deploy` as the body unless
 /// `shroud` is `None` (`--register-only`), then waits for every copy to attest when `wait` is set.
+/// Registering is idempotent in the KMS, so a redeploy of a registered Revision passes.
 #[allow(clippy::too_many_arguments)]
-pub async fn deploy_compose(
+pub async fn deploy_revision(
     client: &Client,
     app_id: AppId,
-    compose: String,
-    resources: &Value,
+    revision: Value,
+    mut deploy: Map<String, Value>,
     key_id: KeyId,
     key: &SigningKey,
     shroud: Option<&Shroud>,
     wait: Option<(Duration, &str)>,
 ) -> Result<Value, String> {
-    let signed = sign(
-        context::REVISION,
-        json!({ "app_id": app_id, "compose": compose }),
-        key_id,
-        key,
-    )
-    .map_err(|e| e.to_string())?;
+    let signed = sign(context::REVISION, revision, key_id, key).map_err(|e| e.to_string())?;
     let revision = client
         .register_revision(&signed)
         .await
@@ -382,27 +377,34 @@ pub async fn deploy_compose(
     let Some(shroud) = shroud else {
         return Ok(json!({ "revision": revision }));
     };
+    deploy.insert("compose_hash".into(), json!(revision.compose_hash));
     let body = shroud_call(
         shroud,
         Method::POST,
         &format!("/v1/apps/{app_id}/deploy"),
-        Some(json!({
-            "compose_hash": revision.compose_hash,
-            "resources": resources,
-            "compose": compose,
-        })),
+        Some(Value::Object(deploy)),
     )
     .await?;
     let Some((deadline, kms_ca_pem)) = wait else {
         return Ok(json!({ "revision": revision, "deploy": body }));
     };
-    let attested = wait_for_every_copy(&body, kms_ca_pem, revision.compose_hash, deadline).await?;
+    let attested = wait_for_every_copy(
+        shroud,
+        app_id,
+        &body,
+        kms_ca_pem,
+        revision.compose_hash,
+        deadline,
+    )
+    .await?;
     Ok(json!({ "revision": revision, "deploy": body, "attested": attested }))
 }
 
 /// Waits for each copy a deploy replaced, within one `deadline` for them all; one copy that
 /// never attests fails the deploy.
 pub async fn wait_for_every_copy(
+    shroud: &Shroud,
+    app_id: AppId,
     body: &Value,
     kms_ca_pem: &str,
     expected: ComposeHash,
@@ -416,12 +418,9 @@ pub async fn wait_for_every_copy(
     let started = Instant::now();
     let mut attested = Vec::new();
     for copy in copies {
-        let url = copy
-            .get("url")
-            .and_then(Value::as_str)
-            .ok_or_else(|| format!("shroud-go deploy: a copy without a url: {copy}"))?;
+        let url = copy_url(shroud, app_id, copy, started, deadline).await?;
         let left = deadline.saturating_sub(started.elapsed());
-        let copy = wait_for_attestation(url, kms_ca_pem, expected, left)
+        let copy = wait_for_attestation(&url, kms_ca_pem, expected, left)
             .await
             .map_err(|e| {
                 let (done, all) = (attested.len(), copies.len());
@@ -433,6 +432,50 @@ pub async fn wait_for_every_copy(
         attested.push(copy);
     }
     Ok(Value::Array(attested))
+}
+
+/// A pod copy gets its `url` only once its pod has an address, so an empty one is read again
+/// from the App's copies until it is set.
+async fn copy_url(
+    shroud: &Shroud,
+    app_id: AppId,
+    copy: &Value,
+    started: Instant,
+    deadline: Duration,
+) -> Result<String, String> {
+    let url = |copy: &Value| {
+        copy.get("url")
+            .and_then(Value::as_str)
+            .filter(|url| !url.is_empty())
+            .map(str::to_owned)
+    };
+    if let Some(url) = url(copy) {
+        return Ok(url);
+    }
+    let id = copy
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("shroud-go deploy: a copy without an id: {copy}"))?;
+    loop {
+        let listed = crate::instances::list(shroud, app_id).await?;
+        let copy = listed
+            .get("instances")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|c| c.get("id").and_then(Value::as_str) == Some(id))
+            .ok_or_else(|| format!("shroud-go: copy {id} is no longer running"))?;
+        if let Some(url) = url(copy) {
+            return Ok(url);
+        }
+        if started.elapsed() >= deadline {
+            return Err(format!(
+                "copy {id} got no url within {}s",
+                deadline.as_secs()
+            ));
+        }
+        tokio::time::sleep(POLL).await;
+    }
 }
 
 #[cfg(test)]

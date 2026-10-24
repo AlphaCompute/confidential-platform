@@ -300,11 +300,16 @@ async fn deploy_register_only_registers_the_generated_compose() {
 
     let compose = deploy::compose(&spec).unwrap();
     let register = || {
-        deploy::deploy_compose(
+        let revision = json!({ "app_id": spec.app_id, "compose": compose });
+        let body = serde_json::Map::from_iter([
+            ("resources".into(), spec.resources.clone()),
+            ("compose".into(), compose.clone().into()),
+        ]);
+        deploy::deploy_revision(
             &client,
             spec.app_id,
-            compose.clone(),
-            &spec.resources,
+            revision,
+            body,
             admin.0,
             &admin.1,
             None,
