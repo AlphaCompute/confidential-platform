@@ -104,7 +104,7 @@ credential: it stays in the PCCS config on the host and goes nowhere else.
 
 Do these steps on each TDX host, as root, after the platform is registered with Intel (the
 `sgx-ra-service` log `/var/log/mpa_registration.log` says `registration is completed`).
-`PCS_API_KEY` is the subscription key of the Intel PCS API.
+You need the subscription key of the Intel PCS API.
 
 1. **Install.** The package starts the PCCS before it has a config, and its `install.sh` asks
    questions. Stop the service and configure it as below.
@@ -127,21 +127,26 @@ Do these steps on each TDX host, as root, after the platform is registered with 
    (umask 077; openssl rand -hex 32 | tr -d '\n' > /etc/pccs/user-token)
    sed -i -e "/\"UserTokenHash\"/c\    \"UserTokenHash\" : \"$(sha512sum < /etc/pccs/user-token | cut -d' ' -f1)\"," \
      -e "/\"AdminTokenHash\"/c\    \"AdminTokenHash\" : \"\"," \
-     -e "/\"CachingFillMode\"/c\    \"CachingFillMode\" : \"REQ\"," \
-     -e "/\"ApiKey\"/c\    \"ApiKey\" : \"$PCS_API_KEY\"," config/default.json
+     -e "/\"CachingFillMode\"/c\    \"CachingFillMode\" : \"REQ\"," config/default.json
    sudo -u pccs mkdir -p ssl_key
    sudo -u pccs openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
      -subj /CN=localhost -keyout ssl_key/private.pem -out ssl_key/file.crt
-   systemctl enable --now pccs
    ```
+
+   Put the subscription key in `"ApiKey"` of `config/default.json` with an editor, so that no
+   process argument holds it. Then start the PCCS: `systemctl enable --now pccs`.
 
 3. **Register the platform with the PCCS.** In `REQ` mode the PCCS gets all PCK certificates of
    the platform from Intel during this call. The call fails if the key or the platform is not
-   accepted.
+   accepted. The tool reads the URL and the token from its own config, so that no process argument
+   holds the token.
 
    ```sh
-   /opt/intel/sgx-pck-id-retrieval-tool/PCKIDRetrievalTool -url https://localhost:8081 \
-     -use_secure_cert false -user_token "$(cat /etc/pccs/user-token)"
+   C=/opt/intel/sgx-pck-id-retrieval-tool/network_setting.conf
+   chmod 600 $C
+   printf 'PCCS_URL=https://localhost:8081/sgx/certification/v4/platforms\nUSE_SECURE_CERT=FALSE\nuser_token = %s\n' \
+     "$(cat /etc/pccs/user-token)" >> $C
+   /opt/intel/sgx-pck-id-retrieval-tool/PCKIDRetrievalTool
    ```
 
 4. **Point QCNL at the PCCS.**
@@ -165,7 +170,7 @@ Do these steps on each TDX host, as root, after the platform is registered with 
 
    Expect `tee_att_get_quote return Success` and only `https://localhost:8081` URLs.
 
-Do step 3 again after a BIOS update, an SGX factory reset or a new registration with Intel.
+Run `PCKIDRetrievalTool` again after a BIOS update, an SGX factory reset or a new registration with Intel.
 
 ## Day 0
 
