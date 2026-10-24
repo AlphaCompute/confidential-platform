@@ -349,17 +349,21 @@ captured per shape.
 
 Each Secret goes in with `alpha call put-secret` and the payload
 `{"name": "<name>", "app_ids": ["<the App id>"]}`, its value read from the file of its name; the
-guard's `inference-bearer` is the front's `caller-bearer`, and the broker's `database-url` is
-below. The model server has none.
+guard's `inference-bearer` is the front's `caller-bearer`, `admin-bearer` lets its holder make
+and revoke the front's API keys, and the `database-url` of the broker and of the front are
+below. `admin-bearer` is made once, when its file is absent; its callers need that same value.
+The model server has none.
 
 ```sh
 put_secret() {
   jq -n --arg name "$1" --arg app "$2" '{name: $name, app_ids: [$app]}' > secret.json &&
     alpha call put-secret --key admin.key --key-id "$ADMIN_KEY_ID" --value "$1" secret.json
 }
+[ -s admin-bearer ] || openssl rand -hex 32 > admin-bearer
 cp caller-bearer inference-bearer &&
   put_secret redpill-api-key "$INFERENCE_APP_ID" &&
   put_secret caller-bearer "$INFERENCE_APP_ID" &&
+  put_secret admin-bearer "$INFERENCE_APP_ID" &&
   put_secret inference-bearer "$GUARD_APP_ID" &&
   for name in google-client-secret dropbox-client-secret slack-client-secret \
     figma-client-secret hubspot-client-secret connect-bearer; do
@@ -367,24 +371,32 @@ cp caller-bearer inference-bearer &&
   done
 ```
 
-### The broker's database
+### The databases of the broker and the front
 
-The broker's login role and database on the trust-db, with a password sent on stdin:
-
-```sh
-openssl rand -hex 32 > broker-db-password
-printf "create role alpha_broker login password '%s';\n" "$(cat broker-db-password)" \
-  | kubectl -n alpha-trust-db exec -i postgres-0 -- psql -X -v ON_ERROR_STOP=1 -U postgres -d alpha
-echo 'create database alpha_broker owner alpha_broker;' \
-  | kubectl -n alpha-trust-db exec -i postgres-0 -- psql -X -v ON_ERROR_STOP=1 -U postgres -d alpha
-```
-
-The Secret `database-url` carries that password; the broker applies its migrations when it starts.
+Each App's login role and database on the trust-db, with a password sent on stdin, and its
+Secret `database-url` carrying that password; each applies its migrations when it starts. Run
+`db` before Apply, while no App uses the role. A failed run leaves no password file behind; run
+`db` again, and it sets a new password on the role it already made. `db` is not a password
+rotation for a running App: it changes the password before the App can read the new Secret.
 
 ```sh
-printf 'postgres://alpha_broker:%s@postgres.alpha-trust-db.svc:5432/alpha_broker?sslmode=require&channel_binding=require&require_auth=scram-sha-256' \
-  "$(cat broker-db-password)" > database-url
-put_secret database-url "$BROKER_APP_ID" && rm broker-db-password database-url
+db() {
+  openssl rand -hex 32 > "$1-db-password" &&
+    {
+      printf "select format('%%s role %s login password %%L', case when exists (select from pg_roles where rolname = '%s') then 'alter' else 'create' end, '%s')\n" \
+        "$1" "$1" "$(cat "$1-db-password")"
+      printf '%s\n' '\gexec'
+      printf "select 'create database %s owner %s' where not exists (select from pg_database where datname = '%s')\n" "$1" "$1" "$1"
+      printf '%s\n' '\gexec'
+    } | kubectl -n alpha-trust-db exec -i postgres-0 -- psql -X -v ON_ERROR_STOP=1 -U postgres -d alpha &&
+    printf "postgres://$1:%s@postgres.alpha-trust-db.svc:5432/$1?sslmode=require&channel_binding=require&require_auth=scram-sha-256" \
+      "$(cat "$1-db-password")" > database-url &&
+    put_secret database-url "$2"
+  rc=$?
+  rm -f "$1-db-password" database-url
+  return "$rc"
+}
+db alpha_broker "$BROKER_APP_ID" && db alpha_inference "$INFERENCE_APP_ID"
 ```
 
 ### Apply

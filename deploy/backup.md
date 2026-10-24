@@ -5,7 +5,7 @@ backups: `wal-g` encrypts every object with libsodium before it leaves the pod.
 
 ## What is backed up
 
-The whole Postgres cluster, so both databases, `alpha` and `alpha_broker`, and the roles:
+The whole Postgres cluster, so every database (`alpha`, `alpha_broker`, `alpha_inference`) and the roles:
 
 - every WAL segment, as soon as it is full and at least once every 60 seconds (`archive_timeout`),
   so while archiving succeeds a restore loses at most the last minute of commits (see Watch);
@@ -85,6 +85,11 @@ Everything committed after the restore point is gone, revocations included: a re
 after it is applied again before tenants use the KMS, from the external log sink that keeps the
 KMS's audit events outside this database. That sink is not chosen yet, which is why it has to
 exist before the first tenant.
+
+The same holds for the inference front's API keys in `alpha_inference`: a key revoked after the
+restore point admits its caller again. The front keeps no record of its own outside the
+database, so the admin caller that revoked the key (shroud-go, or the deployer until then)
+revokes it again with `DELETE /admin/keys/{id}` before tenants use the front.
 
 ## Drills
 
