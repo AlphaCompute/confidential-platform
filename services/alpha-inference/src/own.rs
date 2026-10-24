@@ -83,7 +83,7 @@ pub fn servers(
     config
         .iter()
         .map(|(model, server)| {
-            let pin = Pin::CaAndInstanceRevisions(kms_ca.clone(), server.revisions.clone());
+            let pin = Pin::CaAndInstanceRevisions(kms_ca.clone(), server.revisions.clone(), None);
             let server = Server::new(&server.url, pin, leaf.clone(), completion_timeout)?;
             Ok((model.clone(), Arc::new(server)))
         })

@@ -107,7 +107,7 @@ pub fn front_client(
     revisions: Vec<ComposeHash>,
 ) -> Result<reqwest::Client, Error> {
     let tls = alpha_client::tls::client_config(
-        Some(Pin::CaAndInstanceRevisions(kms_ca, revisions)),
+        Some(Pin::CaAndInstanceRevisions(kms_ca, revisions, None)),
         None,
         alpha_client::system_time_provider(),
     )

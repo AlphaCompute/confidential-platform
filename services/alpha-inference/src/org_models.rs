@@ -1,9 +1,5 @@
-//! An organization's own model servers, kept in the database so that a new server or a new
-//! Revision of one needs no new Revision of the front. A row is seen only by keys of its
-//! organization. Its MAC under the App's `api-keys` key covers every column, so a database
-//! writer can neither add a row nor point one elsewhere. The connection is pinned to the row's
-//! organization too, so not even the admin bearer can send an organization's prompts to an App
-//! of another organization.
+//! An organization's own model servers in the database, so a new one needs no new front
+//! Revision; the README's "An organization's model servers" gives the trust argument.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -110,10 +106,11 @@ pub async fn find(
     .bind(model)
     .fetch_optional(pool)
     .await?;
-    match row {
-        Some(row) => Ok(verified(k, org_id, row)?.map(|(_, server)| server)),
-        None => Ok(None),
-    }
+    Ok(row
+        .map(|row| verified(k, org_id, row))
+        .transpose()?
+        .flatten()
+        .map(|(_, server)| server))
 }
 
 /// The models of the organization's rows whose MAC matches.
@@ -171,10 +168,10 @@ impl Clients {
         {
             return Ok(client.clone());
         }
-        let pin = Pin::CaOrgAndInstanceRevisions(
+        let pin = Pin::CaAndInstanceRevisions(
             self.kms_ca.clone(),
-            org_id.into(),
             server.revisions.clone(),
+            Some(org_id.into()),
         );
         let client = Arc::new(own::Server::new(
             &server.url,

@@ -22,7 +22,6 @@ pub async fn migrate(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
     sqlx::migrate!("./migrations").run(pool).await
 }
 
-/// HMAC-SHA256 under `k` over `context` and then each part.
 pub(crate) fn mac(k: &[u8; 32], context: &[u8], parts: &[&[u8]]) -> Result<Hmac<Sha256>, Error> {
     let mut mac =
         Hmac::<Sha256>::new_from_slice(k).map_err(|e| Error::internal(format!("hmac: {e}")))?;
