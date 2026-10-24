@@ -89,6 +89,84 @@ that is not listed or fails the document's `kata_policy`. Publish it at
 `KMS_KATA_PLATFORM_DOCUMENT_URL`. On day 0 nothing is published: omit `--previous`, and
 `kms_ca_pem` is empty.
 
+## Quote generation on a TDX host
+
+A TD gets its quote from the host's QGS. The QGS puts the platform's PCK certificate in the quote
+and gets that certificate through QCNL. QCNL asks by QE ID with a zero encrypted PPID, and only a
+PCCS answers that request: Intel PCS refuses it with `400 InvalidRequestSyntax`. Thus every TDX
+host runs its own PCCS on `127.0.0.1:8081`. The PCCS holds the PCK certificates of all TCB levels
+of its platform, so a microcode update or an empty QCNL cache needs no request to Intel.
+
+The PCCS is untrusted storage, like the trust-zone Postgres. Intel signs all that it serves, and
+the verifiers get their collateral from `KMS_KATA_PCCS_URL`, not from the host. A host that breaks
+its PCCS stops its own quotes and changes nothing else. The Intel PCS API key is an operational
+credential: it stays in the PCCS config on the host and goes nowhere else.
+
+Do these steps on each TDX host, as root, after the platform is registered with Intel (the
+`sgx-ra-service` log `/var/log/mpa_registration.log` says `registration is completed`).
+`PCS_API_KEY` is the subscription key of the Intel PCS API.
+
+1. **Install.** The package starts the PCCS before it has a config, and its `install.sh` asks
+   questions. Stop the service and configure it as below.
+
+   ```sh
+   DEBIAN_FRONTEND=noninteractive apt-get install -y tdx-qgs libsgx-dcap-default-qpl sgx-ra-service sgx-dcap-pccs \
+     sgx-pck-id-retrieval-tool
+   systemctl stop pccs
+   cd /opt/intel/sgx-dcap-pccs
+   sudo -u pccs -H npm ci --omit=dev
+   ```
+
+2. **Token and TLS.** The user token stays in `/etc/pccs`; the config holds only its SHA-512. An
+   empty `AdminTokenHash` keeps the admin API closed; the PCCS logs a warning about it at start,
+   which is expected. The certificate is self-signed: QCNL
+   reaches the PCCS on the loopback only.
+
+   ```sh
+   install -d -m 700 /etc/pccs
+   (umask 077; openssl rand -hex 32 | tr -d '\n' > /etc/pccs/user-token)
+   sed -i -e "/\"UserTokenHash\"/c\    \"UserTokenHash\" : \"$(sha512sum < /etc/pccs/user-token | cut -d' ' -f1)\"," \
+     -e "/\"AdminTokenHash\"/c\    \"AdminTokenHash\" : \"\"," \
+     -e "/\"CachingFillMode\"/c\    \"CachingFillMode\" : \"REQ\"," \
+     -e "/\"ApiKey\"/c\    \"ApiKey\" : \"$PCS_API_KEY\"," config/default.json
+   sudo -u pccs mkdir -p ssl_key
+   sudo -u pccs openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
+     -subj /CN=localhost -keyout ssl_key/private.pem -out ssl_key/file.crt
+   systemctl enable --now pccs
+   ```
+
+3. **Register the platform with the PCCS.** In `REQ` mode the PCCS gets all PCK certificates of
+   the platform from Intel during this call. The call fails if the key or the platform is not
+   accepted.
+
+   ```sh
+   /opt/intel/sgx-pck-id-retrieval-tool/PCKIDRetrievalTool -url https://localhost:8081 \
+     -use_secure_cert false -user_token "$(cat /etc/pccs/user-token)"
+   ```
+
+4. **Point QCNL at the PCCS.**
+
+   ```sh
+   cat > /etc/sgx_default_qcnl.conf <<'EOF'
+   {
+     "pccs_url": "https://localhost:8081/sgx/certification/v4/",
+     "use_secure_cert": false
+   }
+   EOF
+   systemctl restart qgsd
+   ```
+
+5. **Check.** Start or restart any Kata TD on the host. The QGS log then shows a quote and no
+   request to Intel.
+
+   ```sh
+   journalctl -u qgsd --since -5min | grep -E 'tee_att_get_quote return|Request URL'
+   ```
+
+   Expect `tee_att_get_quote return Success` and only `https://localhost:8081` URLs.
+
+Do step 3 again after a BIOS update, an SGX factory reset or a new registration with Intel.
+
 ## Day 0
 
 Before anything: the document above is served, the release's `kata/` is at hand, and the
@@ -102,7 +180,8 @@ export ALPHACOMPUTE_PCCS_URL=$(gh variable get KMS_KATA_PCCS_URL -R AlphaCompute
 ```
 
 1. **Node pools.** At least as many TDX hosts with the `kata-qemu-tdx` runtime class as there are
-   nodes (pod anti-affinity puts each node on its own host), and one host for Postgres. Exclude
+   nodes (pod anti-affinity puts each node on its own host), each with its own PCCS (see
+   [Quote generation on a TDX host](#quote-generation-on-a-tdx-host)), and one host for Postgres. Exclude
    both pools from automatic drains and upgrades. `KMS_HOSTS` holds the TDX hosts' node names,
    space-separated, and `TRUST_DB_HOST` the Postgres host's.
 
