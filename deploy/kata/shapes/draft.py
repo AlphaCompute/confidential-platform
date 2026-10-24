@@ -14,11 +14,11 @@ def registers(entry):
 
 
 def missing(entries, others):
-    """(class, value) of each RTMR0 value in `entries` that the entry of `others` with the same
-    other registers does not list."""
+    """(class, value) of each RTMR0 value in `entries` that no entry of `others` with the same
+    other registers lists."""
     out = []
     for e in entries:
-        have = next((o["rtmr0"] for o in others if registers(o) == registers(e)), [])
+        have = {r for o in others if registers(o) == registers(e) for r in o["rtmr0"]}
         out += [(e["runtime_class"], r) for r in e["rtmr0"] if r not in have]
     return out
 
