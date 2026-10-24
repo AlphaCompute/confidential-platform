@@ -177,7 +177,7 @@ pub struct AppState {
     pub config: Config,
     pub secrets: parking_lot::RwLock<Secrets>,
     pub upstream: Option<Upstream>,
-    pub own: BTreeMap<String, own::Server>,
+    pub own: BTreeMap<String, Arc<own::Server>>,
     pub org_clients: org_models::Clients,
     pub pool: PgPool,
     /// The App's `api-keys` key, the same for every Revision, so a new Revision keeps the keys.
@@ -377,15 +377,15 @@ async fn delete_model(
     }
 }
 
-/// `None` for a model of `MODELS`; for any other, the server the caller's organization
-/// registered for it, else `ModelNotFound`.
-async fn org_server(
+/// Our own server of `model`, `None` for a model of RedPill: the measured one for a model of
+/// `MODELS`, else the one the caller's organization registered, else `ModelNotFound`.
+async fn model_server(
     state: &AppState,
     key: Option<&keys::Key>,
     model: &str,
 ) -> Result<Option<Arc<own::Server>>, Error> {
     if state.config.allows(model) {
-        return Ok(None);
+        return Ok(state.own.get(model).cloned());
     }
     let not_found = || Error::ModelNotFound(model.to_owned());
     let key = key.ok_or_else(not_found)?;
@@ -468,8 +468,7 @@ async fn get_model(
     AuthedCaller(key): AuthedCaller,
     Path(model): Path<String>,
 ) -> Result<Json<Value>, Error> {
-    let org_server = org_server(&state, key.as_ref(), &model).await?;
-    let owned_by = match org_server.as_deref().or(state.own.get(&model)) {
+    let owned_by = match model_server(&state, key.as_ref(), &model).await? {
         Some(server) if server.live(&model).await => "alphacompute",
         Some(_) => return Err(Error::Upstream),
         None => {
@@ -494,7 +493,7 @@ async fn chat_completions(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    let org_server = org_server(&state, key.as_ref(), &model).await?;
+    let server = model_server(&state, key.as_ref(), &model).await?;
     let streamed = match parsed.get("stream") {
         None | Some(Value::Null) => false,
         Some(Value::Bool(b)) => *b,
@@ -519,7 +518,7 @@ async fn chat_completions(
             .map_err(|e| Error::internal(format!("body: {e}")))?
             .into();
     }
-    let upstream_response = if let Some(server) = org_server.as_deref().or(state.own.get(&model)) {
+    let upstream_response = if let Some(server) = server {
         server.complete(&model, body).await?
     } else {
         let (upstream, client) = verified_external(&state, &model).await?;

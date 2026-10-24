@@ -79,13 +79,13 @@ pub fn servers(
     kms_ca: &CertificateDer<'static>,
     leaf: Arc<dyn ResolvesClientCert>,
     completion_timeout: Duration,
-) -> Result<BTreeMap<String, Server>, Error> {
+) -> Result<BTreeMap<String, Arc<Server>>, Error> {
     config
         .iter()
         .map(|(model, server)| {
             let pin = Pin::CaAndInstanceRevisions(kms_ca.clone(), server.revisions.clone());
             let server = Server::new(&server.url, pin, leaf.clone(), completion_timeout)?;
-            Ok((model.clone(), server))
+            Ok((model.clone(), Arc::new(server)))
         })
         .collect()
 }

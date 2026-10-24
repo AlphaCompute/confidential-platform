@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use alpha_client::tls::Pin;
 use alpha_core::ComposeHash;
-use hmac::{Hmac, KeyInit, Mac};
+use hmac::{Hmac, Mac};
 use rustls::client::ResolvesClientCert;
 use rustls::pki_types::CertificateDer;
 use sha2::Sha256;
@@ -33,11 +33,7 @@ fn mac(
     // JSON escapes every string, so no two rows encode to the same bytes.
     let fields = serde_json::to_vec(&(org_id, model, &server.url, &server.revisions))
         .map_err(|e| Error::internal(format!("model server mac: {e}")))?;
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(k).map_err(|e| Error::internal(format!("hmac: {e}")))?;
-    mac.update(MAC_CONTEXT);
-    mac.update(&fields);
-    Ok(mac)
+    crate::keys::mac(k, MAC_CONTEXT, &[&fields])
 }
 
 pub async fn put(
