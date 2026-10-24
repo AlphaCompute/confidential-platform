@@ -24,7 +24,7 @@ use crate::Error;
 const PROBE_TTL: Duration = Duration::from_secs(10);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelServer {
     /// `https://host[:port]`, without a path; `/v1/...` is appended.
@@ -33,31 +33,34 @@ pub struct ModelServer {
     pub revisions: Vec<ComposeHash>,
 }
 
+/// `https://host[:port]` without a path, credentials, query or fragment, trailing slash trimmed.
+pub fn origin(raw: &str) -> Option<String> {
+    let url = reqwest::Url::parse(raw).ok()?;
+    (url.scheme() == "https"
+        && url.host_str().is_some()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.username().is_empty()
+        && url.password().is_none())
+    .then(|| url.as_str().trim_end_matches('/').to_owned())
+}
+
 /// `MODEL_SERVERS`: a JSON object of model id to `{url, revisions}`.
 pub fn parse(raw: &str) -> Result<BTreeMap<String, ModelServer>, Error> {
     let mut servers: BTreeMap<String, ModelServer> =
         serde_json::from_str(raw).map_err(|e| Error::internal(format!("MODEL_SERVERS: {e}")))?;
     for (model, server) in &mut servers {
-        let url = reqwest::Url::parse(&server.url)
-            .map_err(|e| Error::internal(format!("MODEL_SERVERS[{model}].url: {e}")))?;
-        if url.scheme() != "https"
-            || url.host_str().is_none()
-            || url.path() != "/"
-            || url.query().is_some()
-            || url.fragment().is_some()
-            || !url.username().is_empty()
-            || url.password().is_some()
-        {
-            return Err(Error::internal(format!(
+        server.url = origin(&server.url).ok_or_else(|| {
+            Error::internal(format!(
                 "MODEL_SERVERS[{model}].url must be an https origin without a path"
-            )));
-        }
+            ))
+        })?;
         if server.revisions.is_empty() {
             return Err(Error::internal(format!(
                 "MODEL_SERVERS[{model}].revisions names no Revision"
             )));
         }
-        server.url = url.as_str().trim_end_matches('/').to_owned();
     }
     Ok(servers)
 }
@@ -76,35 +79,45 @@ pub fn servers(
     kms_ca: &CertificateDer<'static>,
     leaf: Arc<dyn ResolvesClientCert>,
     completion_timeout: Duration,
-) -> Result<BTreeMap<String, Server>, Error> {
+) -> Result<BTreeMap<String, Arc<Server>>, Error> {
     config
         .iter()
         .map(|(model, server)| {
-            let tls = alpha_client::tls::renewing_client_config(
-                Pin::CaAndInstanceRevisions(kms_ca.clone(), server.revisions.clone()),
-                leaf.clone(),
-                alpha_client::system_time_provider(),
-            )
-            .map_err(|e| Error::internal(format!("model server tls: {e}")))?;
-            let client = reqwest::Client::builder()
-                .tls_backend_preconfigured(tls)
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(completion_timeout)
-                .tls_info(true)
-                .build()
-                .map_err(|e| Error::internal(format!("model server client: {e}")))?;
-            let server = Server {
-                url: server.url.clone(),
-                client,
-                probe: Mutex::new(None),
-            };
-            Ok((model.clone(), server))
+            let pin = Pin::CaAndInstanceRevisions(kms_ca.clone(), server.revisions.clone(), None);
+            let server = Server::new(&server.url, pin, leaf.clone(), completion_timeout)?;
+            Ok((model.clone(), Arc::new(server)))
         })
         .collect()
 }
 
 impl Server {
+    pub fn new(
+        url: &str,
+        pin: Pin,
+        leaf: Arc<dyn ResolvesClientCert>,
+        completion_timeout: Duration,
+    ) -> Result<Self, Error> {
+        let tls = alpha_client::tls::renewing_client_config(
+            pin,
+            leaf,
+            alpha_client::system_time_provider(),
+        )
+        .map_err(|e| Error::internal(format!("model server tls: {e}")))?;
+        let client = reqwest::Client::builder()
+            .tls_backend_preconfigured(tls)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(completion_timeout)
+            .tls_info(true)
+            .build()
+            .map_err(|e| Error::internal(format!("model server client: {e}")))?;
+        Ok(Server {
+            url: url.to_owned(),
+            client,
+            probe: Mutex::new(None),
+        })
+    }
+
     /// Whether the server answered `/v1/models` listing `model` within the last [`PROBE_TTL`],
     /// probing again first if not; callers racing a stale probe share one.
     pub async fn live(&self, model: &str) -> bool {
@@ -261,12 +274,16 @@ mod tests {
 
         /// An Instance leaf of some App at `revision`, as the KMS issues it.
         fn leaf(&self, revision: &ComposeHash) -> Arc<Fixed> {
+            self.leaf_of(alpha_core::OrgId::mint(), revision)
+        }
+
+        fn leaf_of(&self, org: alpha_core::OrgId, revision: &ComposeHash) -> Arc<Fixed> {
             let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
             let mut params = CertificateParams::default();
             params.subject_alt_names = [
                 format!(
                     "alphacompute://{}/{}/{}",
-                    alpha_core::OrgId::mint(),
+                    org,
                     alpha_core::AppId::mint(),
                     "a".repeat(64)
                 ),
@@ -555,5 +572,110 @@ mod tests {
             .await,
             json!([])
         );
+    }
+
+    #[tokio::test]
+    async fn an_organization_reaches_only_its_own_model_servers_through_untampered_rows() {
+        let Some(pool) = crate::test_support::fresh_database().await else {
+            return;
+        };
+        let ca = Ca::new();
+        let revision = alpha_core::compose_hash("model-server");
+        let (org, other) = (alpha_core::OrgId::mint(), alpha_core::OrgId::mint());
+        let (url, hits) = spawn_model_server(&ca, ca.leaf_of(org, &revision), Duration::ZERO).await;
+        let mut config = test_config("https://example.invalid", &["shared"]);
+        config.external = None;
+        let mut state = test_state(config, b"bearer", "key");
+        let inner = Arc::get_mut(&mut state).unwrap();
+        inner.pool = pool.clone();
+        inner.org_clients =
+            crate::org_models::Clients::new(ca.der(), ca.leaf(&alpha_core::compose_hash("front")));
+        let key = |org: alpha_core::OrgId| {
+            let (pool, k) = (pool.clone(), *state.keys_key);
+            async move {
+                crate::keys::create(&pool, &k, org.into(), "k")
+                    .await
+                    .unwrap()
+                    .key
+            }
+        };
+        let (mine, theirs) = (key(org).await, key(other).await);
+        let front = crate::router(state);
+        let admin = std::str::from_utf8(crate::test_support::ADMIN_BEARER).unwrap();
+        let call = |method: &'static str, path: String, bearer: String, body: Option<Value>| {
+            let front = front.clone();
+            async move { crate::tests::call(&front, method, &path, &bearer, body).await }
+        };
+        let route = |org| format!("/admin/orgs/{org}/models/acme/private");
+        let row = json!({ "url": url, "revisions": [revision] });
+
+        for (org, body, bearer, status) in [
+            (org, row.clone(), mine.as_str(), StatusCode::UNAUTHORIZED),
+            (
+                org,
+                json!({ "url": format!("{url}/v1"), "revisions": [revision] }),
+                admin,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                org,
+                json!({ "url": url, "revisions": [] }),
+                admin,
+                StatusCode::BAD_REQUEST,
+            ),
+            (org, row.clone(), admin, StatusCode::NO_CONTENT),
+            // The admin may point another organization's row at this server; the pin refuses it.
+            (other, row.clone(), admin, StatusCode::NO_CONTENT),
+        ] {
+            assert_eq!(
+                call("PUT", route(org), bearer.into(), Some(body)).await.0,
+                status
+            );
+        }
+        let shared = format!("/admin/orgs/{org}/models/shared");
+        assert_eq!(
+            call("PUT", shared, admin.into(), Some(row)).await.0,
+            StatusCode::BAD_REQUEST
+        );
+
+        let completion = json!({ "model": "acme/private" });
+        let complete = |bearer: &str| {
+            call(
+                "POST",
+                "/v1/chat/completions".into(),
+                bearer.into(),
+                Some(completion.clone()),
+            )
+        };
+        assert_eq!(complete(&mine).await.0, StatusCode::OK);
+        assert_eq!(complete("bearer").await.0, StatusCode::NOT_FOUND);
+        assert_eq!(complete(&theirs).await.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let listed = |bearer: &str| call("GET", "/v1/models".into(), bearer.into(), None);
+        assert!(listed(&mine).await.1.to_string().contains("acme/private"));
+        assert!(
+            !listed("bearer")
+                .await
+                .1
+                .to_string()
+                .contains("acme/private")
+        );
+
+        sqlx::query("update model_servers set url = 'https://127.0.0.2:8443' where org_id = $1")
+            .bind(uuid::Uuid::from(org))
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(complete(&mine).await.0, StatusCode::NOT_FOUND);
+        assert!(!listed(&mine).await.1.to_string().contains("acme/private"));
+
+        for status in [StatusCode::NO_CONTENT, StatusCode::NOT_FOUND] {
+            assert_eq!(
+                call("DELETE", route(other), admin.into(), None).await.0,
+                status
+            );
+        }
+        assert_eq!(complete(&theirs).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 }

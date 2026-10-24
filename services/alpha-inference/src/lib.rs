@@ -1,5 +1,6 @@
 //! The platform's inference front: an App of its own. A model in `MODEL_SERVERS` goes to our own
-//! attested model server (`own`); every other allowlisted model goes to RedPill, and only after
+//! attested model server (`own`), a model an organization registered goes to that organization's
+//! own model server (`org_models`), and every other allowlisted model goes to RedPill, and only after
 //! `upstream::Upstream::verified` has proven, in this process's own measured code, that the
 //! connection it will forward over terminates inside RedPill's attested gateway — never on a
 //! stale check, an error, or a caller without its key.
@@ -16,6 +17,7 @@
 )]
 
 pub mod keys;
+pub mod org_models;
 pub mod own;
 pub mod upstream;
 pub mod usage;
@@ -32,7 +34,7 @@ use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -175,7 +177,8 @@ pub struct AppState {
     pub config: Config,
     pub secrets: parking_lot::RwLock<Secrets>,
     pub upstream: Option<Upstream>,
-    pub own: BTreeMap<String, own::Server>,
+    pub own: BTreeMap<String, Arc<own::Server>>,
+    pub org_clients: org_models::Clients,
     pub pool: PgPool,
     /// The App's `api-keys` key, the same for every Revision, so a new Revision keeps the keys.
     pub keys_key: Zeroizing<[u8; 32]>,
@@ -349,6 +352,49 @@ async fn revoke_key(
     }
 }
 
+async fn put_model(
+    State(state): State<Arc<AppState>>,
+    _: Admin,
+    Path((org_id, model)): Path<(Uuid, String)>,
+    Json(server): Json<own::ModelServer>,
+) -> Result<StatusCode, Error> {
+    if state.config.allows(&model) {
+        return Err(Error::BadRequest(format!("{model} is a shared model")));
+    }
+    org_models::put(&state.pool, &state.keys_key, org_id, &model, server).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_model(
+    State(state): State<Arc<AppState>>,
+    _: Admin,
+    Path((org_id, model)): Path<(Uuid, String)>,
+) -> Result<StatusCode, Error> {
+    if org_models::delete(&state.pool, org_id, &model).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(Error::NotFound)
+    }
+}
+
+/// Our own server of `model`, `None` for a model of RedPill: the measured one for a model of
+/// `MODELS`, else the one the caller's organization registered, else `ModelNotFound`.
+async fn model_server(
+    state: &AppState,
+    key: Option<&keys::Key>,
+    model: &str,
+) -> Result<Option<Arc<own::Server>>, Error> {
+    if state.config.allows(model) {
+        return Ok(state.own.get(model).cloned());
+    }
+    let not_found = || Error::ModelNotFound(model.to_owned());
+    let key = key.ok_or_else(not_found)?;
+    let server = org_models::find(&state.pool, &state.keys_key, key.org_id, model)
+        .await?
+        .ok_or_else(not_found)?;
+    state.org_clients.get(key.org_id, model, &server).map(Some)
+}
+
 fn verify_error(outcome: upstream::VerifyOutcome, model: &str) -> Error {
     match outcome {
         upstream::VerifyOutcome::Unverified(_) => Error::UpstreamUnverified,
@@ -373,11 +419,19 @@ async fn verified_external<'a>(
     Ok((upstream, client))
 }
 
-async fn list_models(State(state): State<Arc<AppState>>, _: AuthedCaller) -> Json<Value> {
+async fn list_models(
+    State(state): State<Arc<AppState>>,
+    AuthedCaller(key): AuthedCaller,
+) -> Result<Json<Value>, Error> {
+    let org_models = match key {
+        Some(key) => org_models::names(&state.pool, &state.keys_key, key.org_id).await?,
+        None => Vec::new(),
+    };
     let mut data: Vec<Value> = state
         .config
         .own
         .keys()
+        .chain(&org_models)
         .map(|id| json!({ "id": id, "object": "model", "owned_by": "alphacompute" }))
         .collect();
     if let Some(upstream) = &state.upstream {
@@ -406,18 +460,15 @@ async fn list_models(State(state): State<Arc<AppState>>, _: AuthedCaller) -> Jso
             data.extend(allowed);
         }
     }
-    Json(json!({ "object": "list", "data": data }))
+    Ok(Json(json!({ "object": "list", "data": data })))
 }
 
 async fn get_model(
     State(state): State<Arc<AppState>>,
-    _: AuthedCaller,
+    AuthedCaller(key): AuthedCaller,
     Path(model): Path<String>,
 ) -> Result<Json<Value>, Error> {
-    if !state.config.allows(&model) {
-        return Err(Error::ModelNotFound(model));
-    }
-    let owned_by = match state.own.get(&model) {
+    let owned_by = match model_server(&state, key.as_ref(), &model).await? {
         Some(server) if server.live(&model).await => "alphacompute",
         Some(_) => return Err(Error::Upstream),
         None => {
@@ -442,9 +493,7 @@ async fn chat_completions(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    if !state.config.allows(&model) {
-        return Err(Error::ModelNotFound(model));
-    }
+    let server = model_server(&state, key.as_ref(), &model).await?;
     let streamed = match parsed.get("stream") {
         None | Some(Value::Null) => false,
         Some(Value::Bool(b)) => *b,
@@ -469,7 +518,7 @@ async fn chat_completions(
             .map_err(|e| Error::internal(format!("body: {e}")))?
             .into();
     }
-    let upstream_response = if let Some(server) = state.own.get(&model) {
+    let upstream_response = if let Some(server) = server {
         server.complete(&model, body).await?
     } else {
         let (upstream, client) = verified_external(&state, &model).await?;
@@ -573,6 +622,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .merge(completions)
         .route("/admin/orgs/{org_id}/keys", post(create_key).get(list_keys))
         .route("/admin/keys/{id}", delete(revoke_key))
+        .route(
+            "/admin/orgs/{org_id}/models/{*model}",
+            put(put_model).delete(delete_model),
+        )
         .route("/admin/usage", get(usage_export))
         .route("/v1/usage", get(key_usage))
         .route("/healthz", get(healthz))
@@ -745,7 +798,7 @@ mod tests {
         assert_eq!(report_hits.load(Ordering::SeqCst), 0);
     }
 
-    async fn call(
+    pub(crate) async fn call(
         app: &Router,
         method: &str,
         path: &str,

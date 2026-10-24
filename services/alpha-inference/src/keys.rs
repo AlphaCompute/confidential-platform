@@ -22,14 +22,16 @@ pub async fn migrate(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
     sqlx::migrate!("./migrations").run(pool).await
 }
 
-fn mac(k: &[u8; 32], id: Uuid, org_id: Uuid, secret: &[u8; 32]) -> Result<Hmac<Sha256>, Error> {
+pub(crate) fn mac(k: &[u8; 32], context: &[u8], parts: &[&[u8]]) -> Result<Hmac<Sha256>, Error> {
     let mut mac =
         Hmac::<Sha256>::new_from_slice(k).map_err(|e| Error::internal(format!("hmac: {e}")))?;
-    mac.update(MAC_CONTEXT);
-    mac.update(id.as_bytes());
-    mac.update(org_id.as_bytes());
-    mac.update(secret);
+    mac.update(context);
+    parts.iter().for_each(|part| mac.update(part));
     Ok(mac)
+}
+
+fn key_mac(k: &[u8; 32], id: Uuid, org_id: Uuid, secret: &[u8; 32]) -> Result<Hmac<Sha256>, Error> {
+    mac(k, MAC_CONTEXT, &[id.as_bytes(), org_id.as_bytes(), secret])
 }
 
 fn parse(token: &str) -> Option<(Uuid, Zeroizing<[u8; 32]>)> {
@@ -79,7 +81,7 @@ pub async fn create(
     let id = Uuid::now_v7();
     let mut secret = Zeroizing::new([0u8; 32]);
     getrandom::fill(secret.as_mut_slice()).map_err(|e| Error::internal(format!("rng: {e}")))?;
-    let tag = mac(k, id, org_id, &secret)?.finalize().into_bytes();
+    let tag = key_mac(k, id, org_id, &secret)?.finalize().into_bytes();
     let created_at: DateTime<Utc> = sqlx::query_scalar(
         "insert into api_keys (id, org_id, name, mac) values ($1, $2, $3, $4) returning created_at",
     )
@@ -133,7 +135,7 @@ pub async fn authenticate(pool: &PgPool, k: &[u8; 32], token: &str) -> Result<Op
     let Some((org_id, tag)) = row else {
         return Ok(None);
     };
-    let live = mac(k, id, org_id, &secret)?.verify_slice(&tag).is_ok();
+    let live = key_mac(k, id, org_id, &secret)?.verify_slice(&tag).is_ok();
     Ok(live.then_some(Key { id, org_id }))
 }
 

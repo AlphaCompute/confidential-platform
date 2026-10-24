@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use alpha_core::ComposeHash;
+use alpha_core::{ComposeHash, OrgId};
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder;
 use hyper_util::server::graceful::GracefulShutdown;
@@ -49,8 +49,8 @@ pub enum Pin {
     /// node whose evidence was appraised, not another behind the same name.
     CaRevisionsAndSpki(CertificateDer<'static>, Vec<ComposeHash>, Vec<u8>),
     /// The chain ends at this CA and the leaf is an App Instance's carrying one of these
-    /// Revisions; an empty list matches nothing.
-    CaAndInstanceRevisions(CertificateDer<'static>, Vec<ComposeHash>),
+    /// Revisions, of this organization when one is given; an empty list matches nothing.
+    CaAndInstanceRevisions(CertificateDer<'static>, Vec<ComposeHash>, Option<OrgId>),
     /// The chain ends at a CA the server presents whose SPKI SHA-256 is these bytes, and the
     /// leaf carries one of these Revisions; an empty list matches nothing.
     CaSpkiAndRevisions([u8; 32], Vec<ComposeHash>),
@@ -85,7 +85,7 @@ impl PinnedServer {
                 Pin::Ca(ca)
                 | Pin::CaAndRevisions(ca, _)
                 | Pin::CaRevisionsAndSpki(ca, ..)
-                | Pin::CaAndInstanceRevisions(ca, _),
+                | Pin::CaAndInstanceRevisions(ca, ..),
             ) => Some(
                 webpki::anchor_from_trusted_cert(ca)
                     .map_err(|e| Error::Invalid(format!("pinned ca: {e}")))?
@@ -181,12 +181,17 @@ impl ServerCertVerifier for PinnedServer {
                     ));
                 }
             }
-            Pin::CaAndInstanceRevisions(_, revisions) => {
+            Pin::CaAndInstanceRevisions(_, revisions, org) => {
                 let sans = uri_sans(end_entity).map_err(|e| refuse(e.to_string()))?;
                 let instance = parse_instance_sans(&sans).map_err(|e| refuse(e.to_string()))?;
                 if !revisions.contains(&instance.compose_hash) {
                     return Err(refuse(
                         "server certificate carries no allowed App revision".into(),
+                    ));
+                }
+                if org.is_some_and(|org| instance.org_id != org) {
+                    return Err(refuse(
+                        "server certificate is not of the pinned organization".into(),
                     ));
                 }
             }
@@ -595,24 +600,28 @@ mod tests {
         let (ca_key, ca_cert) = new_ca();
         let ca = CertificateDer::from(ca_cert.der().to_vec());
         let revision = alpha_core::compose_hash("front");
+        let org = OrgId::mint();
         let instance = format!(
             "alphacompute://{}/{}/{}",
-            OrgId::mint(),
+            org,
             AppId::mint(),
             "a".repeat(64)
         );
         let revision_san = format!("urn:alphacompute:revision:{revision}");
         let app = leaf_with_sans(&ca_key, &ca_cert, &[instance, revision_san.clone()]);
         let node = leaf_with_sans(&ca_key, &ca_cert, &[KMS_SAN.into(), revision_san]);
-        let pin = |revisions| Pin::CaAndInstanceRevisions(ca.clone(), revisions);
+        let pin = |revisions| Pin::CaAndInstanceRevisions(ca.clone(), revisions, None);
 
         assert!(pinned_handshake(&app, pin(vec![revision])).await);
         assert!(!pinned_handshake(&app, pin(vec![alpha_core::compose_hash("other")])).await);
         assert!(!pinned_handshake(&app, pin(vec![])).await);
         assert!(!pinned_handshake(&node, pin(vec![revision])).await);
         let (_, other_ca) = new_ca();
-        let foreign = Pin::CaAndInstanceRevisions(other_ca.der().clone(), vec![revision]);
+        let foreign = Pin::CaAndInstanceRevisions(other_ca.der().clone(), vec![revision], None);
         assert!(!pinned_handshake(&app, foreign).await);
+        let of_org = |org| Pin::CaAndInstanceRevisions(ca.clone(), vec![revision], Some(org));
+        assert!(pinned_handshake(&app, of_org(org)).await);
+        assert!(!pinned_handshake(&app, of_org(OrgId::mint())).await);
     }
 
     #[tokio::test]

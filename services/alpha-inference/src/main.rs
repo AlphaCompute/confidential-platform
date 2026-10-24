@@ -11,7 +11,7 @@ use std::time::Duration;
 use alpha_client::runtime::{RuntimeSocket, refresh_forever};
 use alpha_client::tls::{InstanceCert, kms_ca, serve, server_config};
 use alpha_inference::{
-    AppState, COMPLETION_TIMEOUT, Config, Error, Secrets, Upstream, keys, own, router,
+    AppState, COMPLETION_TIMEOUT, Config, Error, Secrets, Upstream, keys, org_models, own, router,
 };
 use sqlx::postgres::PgPoolOptions;
 use tokio::net::TcpListener;
@@ -99,11 +99,13 @@ async fn run() -> Result<(), Error> {
     let upstream = Upstream::new(&config)?;
     let kms_ca = kms_ca(&identity).map_err(|e| Error::internal(format!("kms ca: {e}")))?;
     let own = own::servers(&config.own, &kms_ca, cert.clone(), COMPLETION_TIMEOUT)?;
+    let org_clients = org_models::Clients::new(kms_ca, cert.clone());
     let state = Arc::new(AppState {
         config,
         secrets: parking_lot::RwLock::new(secrets),
         upstream,
         own,
+        org_clients,
         pool,
         keys_key,
         usage_tasks: Default::default(),
