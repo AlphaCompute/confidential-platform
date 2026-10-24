@@ -351,13 +351,15 @@ Each Secret goes in with `alpha call put-secret` and the payload
 `{"name": "<name>", "app_ids": ["<the App id>"]}`, its value read from the file of its name; the
 guard's `inference-bearer` is the front's `caller-bearer`, `admin-bearer` lets its holder make
 and revoke the front's API keys, and the `database-url` of the broker and of the front are
-below. The model server has none.
+below. `admin-bearer` is made once, when its file is absent; its callers need that same value.
+The model server has none.
 
 ```sh
 put_secret() {
   jq -n --arg name "$1" --arg app "$2" '{name: $name, app_ids: [$app]}' > secret.json &&
     alpha call put-secret --key admin.key --key-id "$ADMIN_KEY_ID" --value "$1" secret.json
 }
+[ -s admin-bearer ] || openssl rand -hex 32 > admin-bearer
 cp caller-bearer inference-bearer &&
   put_secret redpill-api-key "$INFERENCE_APP_ID" &&
   put_secret caller-bearer "$INFERENCE_APP_ID" &&
@@ -383,7 +385,10 @@ db() {
     | kubectl -n alpha-trust-db exec -i postgres-0 -- psql -X -v ON_ERROR_STOP=1 -U postgres -d alpha &&
     printf "postgres://$1:%s@postgres.alpha-trust-db.svc:5432/$1?sslmode=require&channel_binding=require&require_auth=scram-sha-256" \
       "$(cat "$1-db-password")" > database-url &&
-    put_secret database-url "$2" && rm "$1-db-password" database-url
+    put_secret database-url "$2"
+  rc=$?
+  rm -f "$1-db-password" database-url
+  return "$rc"
 }
 db alpha_broker "$BROKER_APP_ID" && db alpha_inference "$INFERENCE_APP_ID"
 ```
