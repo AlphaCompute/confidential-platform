@@ -130,7 +130,6 @@ Do these steps on each TDX host, as root, after the platform is registered with 
    sudo -u pccs mkdir -p ssl_key
    sudo -u pccs openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
      -subj /CN=localhost -keyout ssl_key/private.pem -out ssl_key/file.crt
-   chmod 600 ssl_key/private.pem
    systemctl enable --now pccs
    ```
 
@@ -143,14 +142,13 @@ Do these steps on each TDX host, as root, after the platform is registered with 
      -use_secure_cert false -user_token "$(cat /etc/pccs/user-token)"
    ```
 
-4. **Point QCNL at the PCCS.** QGS needs no collateral, so `collateral_service` stays Intel PCS.
+4. **Point QCNL at the PCCS.**
 
    ```sh
    cat > /etc/sgx_default_qcnl.conf <<'EOF'
    {
      "pccs_url": "https://localhost:8081/sgx/certification/v4/",
-     "use_secure_cert": false,
-     "collateral_service": "https://api.trustedservices.intel.com/sgx/certification/v4/"
+     "use_secure_cert": false
    }
    EOF
    systemctl restart qgsd
