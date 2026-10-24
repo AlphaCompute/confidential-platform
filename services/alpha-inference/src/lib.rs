@@ -280,10 +280,11 @@ impl FromRequestParts<Arc<AppState>> for AuthedCaller {
         if alpha_client::bearer_matches(presented.as_bytes(), &state.secrets.read().caller_bearer) {
             return Ok(AuthedCaller);
         }
-        keys::authenticate(&state.pool, &state.keys_key, presented)
-            .await?
-            .map(|_| AuthedCaller)
-            .ok_or(Error::Unauthorized)
+        if keys::authenticate(&state.pool, &state.keys_key, presented).await? {
+            Ok(AuthedCaller)
+        } else {
+            Err(Error::Unauthorized)
+        }
     }
 }
 

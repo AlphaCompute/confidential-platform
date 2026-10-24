@@ -110,14 +110,14 @@ pub async fn revoke(pool: &PgPool, id: Uuid) -> Result<bool, Error> {
     Ok(done.rows_affected() > 0)
 }
 
-/// The organization of a live key, or `None` for anything else: a malformed token, an unknown
-/// or revoked id, or a row whose MAC does not match.
+/// True for a live key; false for a malformed token, an unknown or revoked id, or a row whose
+/// MAC does not match.
 // ponytail: `revoked_at` is outside the MAC, so a database writer can revive a revoked key (but
 // never create one, which needs the `api-keys` key). Upgrade: a monotonic revocation counter in a
 // KMS Secret.
-pub async fn authenticate(pool: &PgPool, k: &[u8; 32], token: &str) -> Result<Option<Uuid>, Error> {
+pub async fn authenticate(pool: &PgPool, k: &[u8; 32], token: &str) -> Result<bool, Error> {
     let Some((id, secret)) = parse(token) else {
-        return Ok(None);
+        return Ok(false);
     };
     let row: Option<(Uuid, Vec<u8>)> =
         sqlx::query_as("select org_id, mac from api_keys where id = $1 and revoked_at is null")
@@ -125,12 +125,9 @@ pub async fn authenticate(pool: &PgPool, k: &[u8; 32], token: &str) -> Result<Op
             .fetch_optional(pool)
             .await?;
     let Some((org_id, tag)) = row else {
-        return Ok(None);
+        return Ok(false);
     };
-    Ok(mac(k, id, org_id, &secret)?
-        .verify_slice(&tag)
-        .is_ok()
-        .then_some(org_id))
+    Ok(mac(k, id, org_id, &secret)?.verify_slice(&tag).is_ok())
 }
 
 #[cfg(test)]
