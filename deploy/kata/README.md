@@ -122,15 +122,14 @@ Do these steps on each TDX host, as root, after the platform is registered with 
    ```sh
    install -d -m 700 /etc/pccs
    for t in user admin; do (umask 077; openssl rand -hex 32 | tr -d '\n' > /etc/pccs/$t-token); done
-   token_hash() { tr -d '\n' < /etc/pccs/$1-token | sha512sum | cut -d' ' -f1; }
+   token_hash() { sha512sum < /etc/pccs/$1-token | cut -d' ' -f1; }
    sed -i -e "/\"UserTokenHash\"/c\    \"UserTokenHash\" : \"$(token_hash user)\"," \
      -e "/\"AdminTokenHash\"/c\    \"AdminTokenHash\" : \"$(token_hash admin)\"," \
      -e "/\"CachingFillMode\"/c\    \"CachingFillMode\" : \"REQ\"," \
      -e "/\"ApiKey\"/c\    \"ApiKey\" : \"$PCS_API_KEY\"," config/default.json
    sudo -u pccs mkdir -p ssl_key
    sudo -u pccs openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
-     -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
-     -keyout ssl_key/private.pem -out ssl_key/file.crt
+     -subj /CN=localhost -keyout ssl_key/private.pem -out ssl_key/file.crt
    chmod 600 ssl_key/private.pem
    systemctl enable --now pccs
    ```
@@ -151,12 +150,7 @@ Do these steps on each TDX host, as root, after the platform is registered with 
    {
      "pccs_url": "https://localhost:8081/sgx/certification/v4/",
      "use_secure_cert": false,
-     "collateral_service": "https://api.trustedservices.intel.com/sgx/certification/v4/",
-     "retry_times": 6,
-     "retry_delay": 10,
-     "pck_cache_expire_hours": 168,
-     "verify_collateral_cache_expire_hours": 168,
-     "local_cache_only": false
+     "collateral_service": "https://api.trustedservices.intel.com/sgx/certification/v4/"
    }
    EOF
    systemctl restart qgsd
