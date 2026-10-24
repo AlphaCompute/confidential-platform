@@ -10,6 +10,7 @@ on:
       - crates/alpha-cli/src/coco/measure.rs
       - testdata/coco/measure/**
       - .github/workflows/reference-values.yml
+  workflow_call:
 
 permissions:
   contents: read

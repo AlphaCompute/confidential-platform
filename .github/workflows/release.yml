@@ -16,6 +16,49 @@ jobs:
   ci:
     uses: ./.github/workflows/ci.yml
 
+  reference-values:
+    uses: ./.github/workflows/reference-values.yml
+
+  # The unsigned platform document for the release-key holders (deploy/kata/README.md). CI holds
+  # no release key.
+  document:
+    needs: reference-values
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && vars.KMS_KATA_PLATFORM_DOCUMENT_URL }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Draft the next platform document
+        env:
+          PLATFORM_DOCUMENT_URL: ${{ vars.KMS_KATA_PLATFORM_DOCUMENT_URL }}
+        run: |
+          mkdir draft
+          # Before day 0 nothing is published; any other failure stops the job.
+          code=$(curl -sS --max-time 60 -o "$RUNNER_TEMP/published.json" -w '%{http_code}' "$PLATFORM_DOCUMENT_URL")
+          case $code in
+            200) ;;
+            404) rm "$RUNNER_TEMP/published.json" ;;
+            *) echo "$PLATFORM_DOCUMENT_URL answered $code" >&2; exit 1 ;;
+          esac
+          previous=()
+          if tag=$(git describe --tags --abbrev=0 --first-parent --match 'v*' "$GITHUB_REF_NAME^" 2>/dev/null) &&
+            git show "$tag:deploy/kata/reference-values.json" > "$RUNNER_TEMP/previous.json" 2>/dev/null; then
+            previous=("$RUNNER_TEMP/previous.json")
+          fi
+          {
+            echo '```'
+            python3 -I deploy/kata/shapes/draft.py "$RUNNER_TEMP/published.json" deploy/kata/reference-values.json \
+              "${previous[@]}" > draft/document.json 2>> "$GITHUB_STEP_SUMMARY"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: platform-document-draft
+          path: draft
+          if-no-files-found: error
+
   build:
     runs-on: ubuntu-latest
     strategy:
