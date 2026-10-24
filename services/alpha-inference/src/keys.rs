@@ -43,7 +43,7 @@ fn parse(token: &str) -> Option<(Uuid, Zeroizing<[u8; 32]>)> {
     Some((id, bytes))
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize)]
 pub struct Created {
     pub id: Uuid,
     pub key: String,

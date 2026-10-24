@@ -267,10 +267,7 @@ fn bearer(parts: &Parts) -> Result<&str, Error> {
 }
 
 /// Proof of the caller's key or of the shared caller bearer, extracted before any handler runs.
-pub enum AuthedCaller {
-    Key { org_id: Uuid },
-    Shared,
-}
+pub struct AuthedCaller;
 
 impl FromRequestParts<Arc<AppState>> for AuthedCaller {
     type Rejection = Error;
@@ -281,11 +278,11 @@ impl FromRequestParts<Arc<AppState>> for AuthedCaller {
     ) -> Result<Self, Self::Rejection> {
         let presented = bearer(parts)?;
         if alpha_client::bearer_matches(presented.as_bytes(), &state.secrets.read().caller_bearer) {
-            return Ok(AuthedCaller::Shared);
+            return Ok(AuthedCaller);
         }
         keys::authenticate(&state.pool, &state.keys_key, presented)
             .await?
-            .map(|org_id| AuthedCaller::Key { org_id })
+            .map(|_| AuthedCaller)
             .ok_or(Error::Unauthorized)
     }
 }
