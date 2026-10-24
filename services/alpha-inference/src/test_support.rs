@@ -47,6 +47,7 @@ pub(crate) fn test_state(
             .connect_lazy("postgres://127.0.0.1:1/none")
             .unwrap(),
         keys_key: zeroize::Zeroizing::new([7; 32]),
+        usage_tasks: Default::default(),
     })
 }
 

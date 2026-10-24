@@ -179,6 +179,8 @@ pub struct AppState {
     pub pool: PgPool,
     /// The App's `api-keys` key, the same for every Revision, so a new Revision keeps the keys.
     pub keys_key: Zeroizing<[u8; 32]>,
+    /// Usage inserts still running; `main` waits for them before it exits.
+    pub usage_tasks: tokio_util::task::TaskTracker,
 }
 
 /// Every error this service answers with, OpenAI-shaped on the wire. Messages never carry a
@@ -502,7 +504,14 @@ async fn chat_completions(
     let stream = upstream_response.bytes_stream();
     let body = match key {
         Some(key) => {
-            let mut meter = usage::Meter::new(state.pool.clone(), key, model, streamed, started_at);
+            let mut meter = usage::Meter::new(
+                state.pool.clone(),
+                state.usage_tasks.clone(),
+                key,
+                model,
+                streamed,
+                started_at,
+            );
             axum::body::Body::from_stream(stream.inspect(move |chunk| {
                 if let Ok(bytes) = chunk {
                     meter.observe(bytes);

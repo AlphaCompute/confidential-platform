@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::Error;
 use crate::keys::Key;
+use tokio_util::task::TaskTracker;
 
 /// A non-stream answer longer than this is not parsed, and its row has no token counts.
 const BODY_MAX: usize = 4 * 1024 * 1024;
@@ -41,6 +42,7 @@ fn tokens(answer: &Value) -> Option<Tokens> {
 
 pub struct Meter {
     pool: PgPool,
+    tasks: TaskTracker,
     key: Key,
     model: String,
     started_at: DateTime<Utc>,
@@ -53,6 +55,7 @@ pub struct Meter {
 impl Meter {
     pub fn new(
         pool: PgPool,
+        tasks: TaskTracker,
         key: Key,
         model: String,
         stream: bool,
@@ -60,6 +63,7 @@ impl Meter {
     ) -> Self {
         Meter {
             pool,
+            tasks,
             key,
             model,
             started_at,
@@ -127,7 +131,8 @@ impl Drop for Meter {
         let id = Uuid::now_v7();
         let (pool, key, started_at) = (self.pool.clone(), self.key, self.started_at);
         let model = std::mem::take(&mut self.model);
-        runtime.spawn(async move {
+        self.tasks.spawn_on(
+            async move {
             // ponytail: a row whose insert fails three times is lost, and the completion goes
             // unbilled. Upgrade: an outbox the front drains before it reports ready.
             for attempt in 1..=INSERT_TRIES {
@@ -152,7 +157,9 @@ impl Drop for Meter {
                     Err(_) => tokio::time::sleep(Duration::from_secs(1)).await,
                 }
             }
-        });
+            },
+            &runtime,
+        );
     }
 }
 
@@ -224,7 +231,14 @@ mod tests {
             id: Uuid::nil(),
             org_id: Uuid::nil(),
         };
-        Meter::new(pool, key, "m".into(), stream, Utc::now())
+        Meter::new(
+            pool,
+            TaskTracker::new(),
+            key,
+            "m".into(),
+            stream,
+            Utc::now(),
+        )
     }
 
     #[tokio::test]

@@ -455,6 +455,7 @@ mod tests {
         let inner = Arc::get_mut(&mut state).unwrap();
         inner.own = own;
         inner.pool = pool.clone();
+        let tasks = inner.usage_tasks.clone();
         let org = uuid::Uuid::now_v7();
         let key = crate::keys::create(&pool, &state.keys_key, org, "k")
             .await
@@ -518,15 +519,9 @@ mod tests {
         };
         let expected =
             json!([{ "model": "own", "requests": 2, "prompt_tokens": 6, "completion_tokens": 8 }]);
-        let mut seen = Value::Null;
-        for _ in 0..50 {
-            seen = usage(key.key.clone()).await.1;
-            if seen == expected {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert_eq!(seen, expected);
+        tasks.close();
+        tasks.wait().await;
+        assert_eq!(usage(key.key.clone()).await.1, expected);
         assert_eq!(usage("bearer".into()).await.0, StatusCode::NOT_FOUND);
 
         let export = |query: String| {
