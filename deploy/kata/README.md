@@ -102,7 +102,6 @@ credential: it stays in the PCCS config on the host and goes nowhere else.
 
 Do these steps on each TDX host, as root, after the platform is registered with Intel (the
 `sgx-ra-service` log `/var/log/mpa_registration.log` says `registration is completed`).
-You need the subscription key of the Intel PCS API.
 
 1. **Install.** The package starts the PCCS before it has a config. Stop the service.
 
