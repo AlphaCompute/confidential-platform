@@ -86,6 +86,11 @@ after it is applied again before tenants use the KMS, from the external log sink
 KMS's audit events outside this database. That sink is not chosen yet, which is why it has to
 exist before the first tenant.
 
+The same holds for the inference front's API keys in `alpha_inference`: a key revoked after the
+restore point admits its caller again. The front keeps no record of its own outside the
+database, so the admin caller that revoked the key (shroud-go, or the deployer until then)
+revokes it again with `DELETE /admin/keys/{id}` before tenants use the front.
+
 ## Drills
 
 - **Locally**, `deploy/postgres/backup-drill.sh` backs up to a local S3 with the same commands,
