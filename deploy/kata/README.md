@@ -93,8 +93,7 @@ that is not listed or fails the document's `kata_policy`. Publish it at
 
 The QGS gets the PCK certificate for a quote through QCNL. Intel PCS refuses the request of QCNL
 with `400 InvalidRequestSyntax`; only a PCCS answers it. Thus every TDX host runs its own PCCS on
-`127.0.0.1:8081`. The PCCS holds the PCK certificates of all TCB levels
-of its platform, so a microcode update or an empty QCNL cache needs no request to Intel.
+`127.0.0.1:8081`. A microcode update or an empty QCNL cache then needs no request to Intel.
 
 The PCCS is untrusted storage, like the trust-zone Postgres. Intel signs all that it serves, and
 the verifiers get their collateral from `KMS_KATA_PCCS_URL`, not from the host. A host that breaks
@@ -105,8 +104,7 @@ Do these steps on each TDX host, as root, after the platform is registered with 
 `sgx-ra-service` log `/var/log/mpa_registration.log` says `registration is completed`).
 You need the subscription key of the Intel PCS API.
 
-1. **Install.** The package starts the PCCS before it has a config. Stop the service and
-   configure it as below.
+1. **Install.** The package starts the PCCS before it has a config. Stop the service.
 
    ```sh
    DEBIAN_FRONTEND=noninteractive apt-get install -y tdx-qgs libsgx-dcap-default-qpl sgx-ra-service sgx-dcap-pccs \
