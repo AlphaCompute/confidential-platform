@@ -588,11 +588,8 @@ mod tests {
         let mut state = test_state(config, b"bearer", "key");
         let inner = Arc::get_mut(&mut state).unwrap();
         inner.pool = pool.clone();
-        inner.org_clients = crate::org_models::Clients::new(
-            ca.der(),
-            ca.leaf(&alpha_core::compose_hash("front")),
-            COMPLETION_TIMEOUT,
-        );
+        inner.org_clients =
+            crate::org_models::Clients::new(ca.der(), ca.leaf(&alpha_core::compose_hash("front")));
         let key = |org: alpha_core::OrgId| {
             let (pool, k) = (pool.clone(), *state.keys_key);
             async move {

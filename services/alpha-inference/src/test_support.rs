@@ -46,7 +46,6 @@ pub(crate) fn test_state(
         org_clients: crate::org_models::Clients::new(
             rustls::pki_types::CertificateDer::from(Vec::new()),
             Arc::new(NoCert),
-            crate::COMPLETION_TIMEOUT,
         ),
         // Never connects unless a test reaches the database; those use `fresh_database`.
         pool: sqlx::postgres::PgPoolOptions::new()

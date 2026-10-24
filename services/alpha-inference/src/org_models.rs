@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use alpha_client::tls::Pin;
 use alpha_core::ComposeHash;
@@ -79,7 +78,7 @@ pub async fn delete(pool: &PgPool, org_id: Uuid, model: &str) -> Result<bool, Er
 type Row = (String, String, Vec<String>, Vec<u8>);
 
 /// The row's server, or `None` when its MAC does not match.
-fn verified(k: &[u8; 32], org_id: Uuid, row: Row) -> Result<Option<(String, ModelServer)>, Error> {
+fn verified(k: &[u8; 32], org_id: Uuid, row: &Row) -> Result<Option<ModelServer>, Error> {
     let (model, url, revisions, tag) = row;
     let Ok(revisions) = revisions
         .iter()
@@ -88,9 +87,12 @@ fn verified(k: &[u8; 32], org_id: Uuid, row: Row) -> Result<Option<(String, Mode
     else {
         return Ok(None);
     };
-    let server = ModelServer { url, revisions };
-    let live = mac(k, org_id, &model, &server)?.verify_slice(&tag).is_ok();
-    Ok(live.then_some((model, server)))
+    let server = ModelServer {
+        url: url.clone(),
+        revisions,
+    };
+    let live = mac(k, org_id, model, &server)?.verify_slice(tag).is_ok();
+    Ok(live.then_some(server))
 }
 
 pub async fn find(
@@ -107,10 +109,9 @@ pub async fn find(
     .fetch_optional(pool)
     .await?;
     Ok(row
-        .map(|row| verified(k, org_id, row))
+        .map(|row| verified(k, org_id, &row))
         .transpose()?
-        .flatten()
-        .map(|(_, server)| server))
+        .flatten())
 }
 
 /// The models of the organization's rows whose MAC matches.
@@ -123,34 +124,31 @@ pub async fn names(pool: &PgPool, k: &[u8; 32], org_id: Uuid) -> Result<Vec<Stri
     .await?;
     let mut models = Vec::new();
     for row in rows {
-        if let Some((model, _)) = verified(k, org_id, row)? {
-            models.push(model);
+        if verified(k, org_id, &row)?.is_some() {
+            models.push(row.0);
         }
     }
     Ok(models)
 }
 
+// A named type only because clippy's type_complexity refuses it inline.
 type Pinned = (ModelServer, Arc<own::Server>);
 
 /// This replica's pinned client per row. Each request still reads its row, so a changed or
 /// deleted row takes effect on the next request on every replica.
+// ponytail: a deleted row's client stays cached until the process exits, one idle client per
+// row ever registered. Upgrade: drop the entry when `find` returns no row.
 pub struct Clients {
     kms_ca: CertificateDer<'static>,
     leaf: Arc<dyn ResolvesClientCert>,
-    completion_timeout: Duration,
     cached: parking_lot::Mutex<HashMap<(Uuid, String), Pinned>>,
 }
 
 impl Clients {
-    pub fn new(
-        kms_ca: CertificateDer<'static>,
-        leaf: Arc<dyn ResolvesClientCert>,
-        completion_timeout: Duration,
-    ) -> Self {
+    pub fn new(kms_ca: CertificateDer<'static>, leaf: Arc<dyn ResolvesClientCert>) -> Self {
         Self {
             kms_ca,
             leaf,
-            completion_timeout,
             cached: Default::default(),
         }
     }
@@ -177,7 +175,7 @@ impl Clients {
             &server.url,
             pin,
             self.leaf.clone(),
-            self.completion_timeout,
+            crate::COMPLETION_TIMEOUT,
         )?);
         cached.insert(slot, (server.clone(), client.clone()));
         Ok(client)

@@ -99,7 +99,7 @@ async fn run() -> Result<(), Error> {
     let upstream = Upstream::new(&config)?;
     let kms_ca = kms_ca(&identity).map_err(|e| Error::internal(format!("kms ca: {e}")))?;
     let own = own::servers(&config.own, &kms_ca, cert.clone(), COMPLETION_TIMEOUT)?;
-    let org_clients = org_models::Clients::new(kms_ca, cert.clone(), COMPLETION_TIMEOUT);
+    let org_clients = org_models::Clients::new(kms_ca, cert.clone());
     let state = Arc::new(AppState {
         config,
         secrets: parking_lot::RwLock::new(secrets),
