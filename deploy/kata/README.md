@@ -93,7 +93,7 @@ that is not listed or fails the document's `kata_policy`. Publish it at
 
 The QGS gets the PCK certificate for a quote through QCNL. Intel PCS refuses the request of QCNL
 with `400 InvalidRequestSyntax`; only a PCCS answers it. Thus every TDX host runs its own PCCS on
-`localhost:8081`.
+`127.0.0.1:8081`.
 
 The PCCS is untrusted storage, like the trust-zone Postgres. Intel signs all that it serves, and
 the verifiers get their collateral from `KMS_KATA_PCCS_URL`, not from the host. A host that breaks
@@ -123,7 +123,7 @@ Do these steps on each TDX host, as root, after the platform is registered with 
    T=$(openssl rand -hex 32)
    C=/opt/intel/sgx-pck-id-retrieval-tool/network_setting.conf
    chmod 600 $C
-   printf 'PCCS_URL=https://localhost:8081/sgx/certification/v4/platforms\nUSE_SECURE_CERT=FALSE\nproxy_type = direct\nuser_token = %s\n' "$T" >> $C
+   printf 'PCCS_URL=https://127.0.0.1:8081/sgx/certification/v4/platforms\nUSE_SECURE_CERT=FALSE\nproxy_type = direct\nuser_token = %s\n' "$T" >> $C
    sed -i -e "/\"UserTokenHash\"/c\    \"UserTokenHash\" : \"$(printf %s "$T" | sha512sum | cut -d' ' -f1)\"," \
      -e "/\"CachingFillMode\"/c\    \"CachingFillMode\" : \"REQ\"," config/default.json
    sudo -u pccs mkdir -p ssl_key
@@ -146,7 +146,7 @@ Do these steps on each TDX host, as root, after the platform is registered with 
    ```sh
    cat > /etc/sgx_default_qcnl.conf <<'EOF'
    {
-     "pccs_url": "https://localhost:8081/sgx/certification/v4/",
+     "pccs_url": "https://127.0.0.1:8081/sgx/certification/v4/",
      "use_secure_cert": false
    }
    EOF
@@ -159,7 +159,7 @@ Do these steps on each TDX host, as root, after the platform is registered with 
    journalctl -u qgsd --since -5min | grep -E 'tee_att_get_quote return|Request URL'
    ```
 
-   Expect `tee_att_get_quote return Success` and only `https://localhost:8081` URLs.
+   Expect `tee_att_get_quote return Success` and only `https://127.0.0.1:8081` URLs.
 
 Run `PCKIDRetrievalTool` again after a microcode or BIOS update, an SGX factory reset or a new
 registration with Intel: the PCCS has only the TCB levels that Intel published before the last
