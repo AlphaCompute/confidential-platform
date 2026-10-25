@@ -123,7 +123,7 @@ Do these steps on each TDX host, as root, after the platform is registered with 
    T=$(openssl rand -hex 32)
    C=/opt/intel/sgx-pck-id-retrieval-tool/network_setting.conf
    chmod 600 $C
-   printf 'PCCS_URL=https://localhost:8081/sgx/certification/v4/platforms\nUSE_SECURE_CERT=FALSE\nuser_token = %s\n' "$T" >> $C
+   printf 'PCCS_URL=https://localhost:8081/sgx/certification/v4/platforms\nUSE_SECURE_CERT=FALSE\nproxy_type = direct\nuser_token = %s\n' "$T" >> $C
    sed -i -e "/\"UserTokenHash\"/c\    \"UserTokenHash\" : \"$(printf %s "$T" | sha512sum | cut -d' ' -f1)\"," \
      -e "/\"CachingFillMode\"/c\    \"CachingFillMode\" : \"REQ\"," config/default.json
    sudo -u pccs mkdir -p ssl_key
