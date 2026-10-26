@@ -60,10 +60,12 @@ fn init_data(h: &Harness) -> String {
 async fn register(
     h: &Harness,
     admin: &(alpha_core::KeyId, ed25519_dalek::SigningKey),
+    init_data: String,
 ) -> ComposeHash {
-    let init_data = init_data(h);
-    let digest = InitData::parse(init_data.clone()).unwrap().digest();
-    let payload = json!({ "app_id": kata_app(), "init_data": init_data, "digest": digest });
+    let parsed = InitData::parse(init_data.clone()).unwrap();
+    let digest = parsed.digest();
+    let payload =
+        json!({ "app_id": parsed.app_id().unwrap(), "init_data": init_data, "digest": digest });
     let (status, reply) = h
         .post("/v1/revisions", h.signed(context::REVISION, payload, admin))
         .await;
@@ -144,7 +146,7 @@ async fn a_token_fetches_the_revisions_registry_credential_and_nothing_else() {
         return;
     };
     let admin = h.register_key(&h.root, 41).await;
-    let revision = register(&h, &admin).await;
+    let revision = register(&h, &admin, init_data(&h)).await;
     let bearer = token(&h, revision, 300);
 
     let (status, reply) = resource(&h, "alpha/secret/regcred", Some(&bearer)).await;
@@ -337,7 +339,7 @@ async fn capture_harness() -> Option<Harness> {
         custodians: vec![],
         shares: vec![],
         bootstrap: Value::Null,
-        dir: std::env::temp_dir().join(format!("alpha-harness-{}", uuid::Uuid::now_v7())),
+        dir: std::path::PathBuf::new(),
         ca_pem: String::new(),
         _shutdown: shutdown,
     })
@@ -350,19 +352,12 @@ async fn a_guests_data_hub_attests_and_gets_its_registry_credential() {
     };
     let admin = h.register_key(&h.root, 41).await;
     let request: Value = serde_json::from_slice(&read(CAPTURE, "attest.json")).unwrap();
-    let init_data =
-        InitData::parse(request["init-data"]["body"].as_str().unwrap().to_owned()).unwrap();
-    let app = init_data.app_id().unwrap();
-    let digest = init_data.digest();
-    let payload =
-        json!({ "app_id": app, "init_data": request["init-data"]["body"], "digest": digest });
-    let (status, reply) = h
-        .post(
-            "/v1/revisions",
-            h.signed(context::REVISION, payload, &admin),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "{reply}");
+    let init_data = request["init-data"]["body"].as_str().unwrap().to_owned();
+    let app = InitData::parse(init_data.clone())
+        .unwrap()
+        .app_id()
+        .unwrap();
+    let digest = register(&h, &admin, init_data).await;
     let (status, put) = h
         .put_secret("regcred", &[app], VALUE, h.now(), &admin)
         .await;
