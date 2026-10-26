@@ -12,7 +12,6 @@ use axum::routing::get;
 use parking_lot::Mutex;
 use tokio::net::TcpListener;
 
-/// Responses by route template and status.
 static REQUESTS: Mutex<BTreeMap<(String, u16), u64>> = Mutex::new(BTreeMap::new());
 
 async fn record(request: Request, next: Next) -> Response {
