@@ -156,8 +156,8 @@ fn report_data(
     let jcs =
         alpha_core::jcs(&bound).map_err(|e| ApiError::malformed(format!("runtime-data: {e}")))?;
     let mut out = [0u8; 64];
-    for (dst, src) in out.iter_mut().zip(Sha384::digest(jcs)) {
-        *dst = src;
+    if let Some((digest, _)) = out.split_first_chunk_mut::<48>() {
+        *digest = Sha384::digest(jcs).into();
     }
     Ok(out)
 }
