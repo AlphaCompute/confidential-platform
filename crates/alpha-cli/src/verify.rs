@@ -90,7 +90,7 @@ fn check_init_data(
         .as_ref()
         .ok_or("the platform document pins no kata_policy")?;
     init_data
-        .check_policy(policy)
+        .check_policy(policy, &doc.kms_ca_pem)
         .map_err(|e| format!("init-data: {e}"))
 }
 

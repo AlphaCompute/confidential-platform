@@ -39,7 +39,7 @@ pub fn sign(
             .as_ref()
             .ok_or("the document pins no kata_policy for an init-data")?;
         init_data
-            .check_policy(pinned)
+            .check_policy(pinned, &doc.kms_ca_pem)
             .map_err(|e| format!("init-data {digest}: {e}"))?;
         supplied.push(digest);
     }
