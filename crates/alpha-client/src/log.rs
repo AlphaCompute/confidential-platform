@@ -94,7 +94,7 @@ impl From<&ComposeHash> for Field {
     }
 }
 
-pub fn line(
+fn line(
     level: &'static str,
     service: &'static str,
     event: &'static str,
