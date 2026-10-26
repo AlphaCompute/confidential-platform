@@ -175,9 +175,12 @@ impl From<sqlx::Error> for Error {
 }
 
 impl Error {
-    /// The status and `{"error":{"code","message"}}` body, plaintext or sealed alike.
-    pub fn envelope(&self) -> (StatusCode, serde_json::Value) {
-        let (status, code) = match self {
+    pub fn code(&self) -> &'static str {
+        self.parts().1
+    }
+
+    fn parts(&self) -> (StatusCode, &'static str) {
+        match self {
             Error::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Error::Malformed(_) => (StatusCode::BAD_REQUEST, "malformed"),
             Error::NotFound => (StatusCode::NOT_FOUND, "not_found"),
@@ -197,10 +200,15 @@ impl Error {
             Error::GrantInvalid => (StatusCode::FORBIDDEN, "grant_invalid"),
             Error::GrantExpired => (StatusCode::FORBIDDEN, "grant_expired"),
             Error::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
-        };
+        }
+    }
+
+    /// The status and `{"error":{"code","message"}}` body, plaintext or sealed alike.
+    pub fn envelope(&self) -> (StatusCode, serde_json::Value) {
+        let (status, code) = self.parts();
         let message = match self {
-            Error::Internal(detail) => {
-                eprintln!("alpha-broker: internal: {detail}");
+            Error::Internal(_) => {
+                alpha_client::error!("internal");
                 "internal error".to_string()
             }
             other => other.to_string(),

@@ -211,6 +211,10 @@ impl Error {
         Error::Internal(message.into())
     }
 
+    pub fn code(&self) -> &'static str {
+        self.parts().2
+    }
+
     fn parts(&self) -> (StatusCode, &'static str, &'static str) {
         match self {
             Error::Unauthorized => (

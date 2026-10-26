@@ -24,7 +24,7 @@ async fn main() {
     let code = match run().await {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("alpha-broker: {e}");
+            alpha_client::error!("exit", error = e.code());
             1
         }
     };
@@ -75,9 +75,10 @@ async fn run() -> Result<(), Error> {
         .identity()
         .await
         .map_err(|e| Error::internal(format!("identity: {e}")))?;
-    eprintln!(
-        "alpha-broker: attested as app {} revision {}",
-        identity.app_id, identity.compose_hash
+    alpha_client::info!(
+        "attested",
+        app_id = identity.app_id,
+        revision = &identity.compose_hash,
     );
 
     let database_url = utf8("database-url", &secret(&runtime, "database-url").await?)?;

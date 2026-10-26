@@ -10,8 +10,8 @@ use alpha_tsm::Substrate;
 use p256::ecdsa::SigningKey;
 use tokio::net::UnixListener;
 
-// ponytail: eprintln and no metrics, like alpha-kms; the external receiver with
-// runtime_pubkey_sha256 on every line is chosen at the first deploy.
+// ponytail: JSON lines on stderr only, like alpha-kms, which a Kata pod's policy keeps from the
+// host; the upgrade is a collector App that receives them with runtime_pubkey_sha256 added.
 #[tokio::main]
 async fn main() {
     // First: Docker runs this as a second process in the live container, and the server path
@@ -22,7 +22,7 @@ async fn main() {
     let code = match run().await {
         Ok(exit) => exit.code(),
         Err(e) => {
-            eprintln!("alpha-runtime: {e}");
+            alpha_client::error!("exit", error = e.kind());
             e.exit_code()
         }
     };
@@ -34,7 +34,7 @@ fn healthcheck() -> i32 {
     let secrets = match alpha_runtime::parse_secrets(var.as_deref()) {
         Ok(secrets) => secrets,
         Err(e) => {
-            eprintln!("alpha-runtime: {e}");
+            alpha_client::error!("healthcheck_failed", error = e.kind());
             return EXIT_REFUSED;
         }
     };
@@ -80,11 +80,15 @@ async fn run() -> Result<Exit, Error> {
         revision,
     )?;
     let attested = runtime.attest().await?;
-    eprintln!(
-        "alpha-runtime: attested on {substrate:?} as app {} revision {} until {}",
-        attested.identity.app_id,
-        attested.identity.compose_hash,
-        alpha_runtime::socket::rfc3339(attested.not_after)
+    alpha_client::info!(
+        "attested",
+        substrate = match substrate {
+            Substrate::Dstack => "dstack",
+            Substrate::Kata => "kata",
+        },
+        app_id = attested.identity.app_id,
+        revision = &attested.identity.compose_hash,
+        not_after = attested.not_after,
     );
 
     let socket = |e: std::io::Error| Error::Socket(format!("{SOCKET_PATH}: {e}"));

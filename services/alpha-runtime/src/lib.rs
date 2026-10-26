@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use alpha_attest::{AttestationResult, InstanceEvidence};
+use alpha_client::log::Field;
 use alpha_client::platform::ReleaseKeys;
 use alpha_client::tls::{self, InstanceSans};
 use alpha_client::{
@@ -89,6 +90,19 @@ pub enum Error {
 }
 
 impl Error {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Error::Config(_) => "config",
+            Error::Key(_) => "key",
+            Error::Evidence(_) => "evidence",
+            Error::Kms(e) => e.kind(),
+            Error::Certificate(_) => "certificate",
+            Error::NotAttested => "not_attested",
+            Error::Socket(_) => "socket",
+            Error::Platform(_) => "platform_document",
+        }
+    }
+
     /// The one error that ends the process instead of being retried.
     pub fn revoked(&self) -> bool {
         matches!(self, Error::Kms(alpha_client::Error::Api(e)) if e.code == "revision_revoked")
@@ -630,8 +644,8 @@ impl Runtime {
         };
         match (accepted.as_ref(), refused) {
             (Some((version, revisions)), refused) => {
-                if let Some(refused) = refused {
-                    eprintln!("alpha-runtime: platform document {refused}; keeping {version}");
+                if refused.is_some() {
+                    alpha_client::warn!("platform_document_refused", kept = *version);
                 }
                 Ok(revisions.clone())
             }
@@ -744,7 +758,7 @@ impl Runtime {
         }
         let names: BTreeSet<&String> = self.config.secrets.values().flatten().collect();
         let Some(app_id) = self.attested().map(|a| a.identity.app_id) else {
-            eprintln!("alpha-runtime: secrets: {}", Error::NotAttested);
+            alpha_client::warn!("secrets_not_attested");
             return Delivery::Incomplete(names.into_iter().cloned().collect());
         };
         let mut incomplete = Vec::new();
@@ -757,7 +771,11 @@ impl Runtime {
                 Err(e) => {
                     if !matches!(&e, Error::Kms(alpha_client::Error::Api(api)) if api.code == "not_found")
                     {
-                        eprintln!("alpha-runtime: secret {name}: {e}");
+                        alpha_client::warn!(
+                            "secret_unavailable",
+                            secret = Field::text(name),
+                            error = e.kind(),
+                        );
                     }
                     incomplete.push(name.clone());
                     continue;
@@ -767,7 +785,7 @@ impl Runtime {
                 .decode(&secret.value)
                 .map(Zeroizing::new)
             else {
-                eprintln!("alpha-runtime: secret {name}: value is not base64url");
+                alpha_client::warn!("secret_not_base64url", secret = Field::text(name));
                 incomplete.push(name.clone());
                 continue;
             };
@@ -778,7 +796,12 @@ impl Runtime {
                 .filter(|(_, declared)| declared.contains(name));
             for (service, _) in declaring {
                 if let Err(e) = write_secret(&root.join(service), name, &value) {
-                    eprintln!("alpha-runtime: secret {name} for {service}: {e}");
+                    alpha_client::error!(
+                        "secret_write_failed",
+                        secret = Field::text(name),
+                        target_service = Field::text(service),
+                        error = e.kind(),
+                    );
                     if incomplete.last() != Some(name) {
                         incomplete.push(name.clone());
                     }
@@ -808,7 +831,10 @@ impl Runtime {
                 }
                 Delivery::Incomplete(names) => {
                     if names != waiting {
-                        eprintln!("alpha-runtime: waiting for secrets: {}", names.join(", "));
+                        alpha_client::warn!(
+                            "secrets_waiting",
+                            secrets = Field::text(&names.join(",")),
+                        );
                         waiting = names;
                     }
                     tokio::time::sleep(retry).await;
@@ -826,13 +852,10 @@ impl Runtime {
             };
             tokio::time::sleep(delay).await;
             match self.attest().await {
-                Ok(a) => eprintln!(
-                    "alpha-runtime: renewed until {}",
-                    chrono::DateTime::<chrono::Utc>::from(a.not_after).to_rfc3339()
-                ),
+                Ok(a) => alpha_client::info!("renewed", not_after = a.not_after),
                 Err(e) if e.revoked() => return,
                 Err(e) => {
-                    eprintln!("alpha-runtime: renewal failed: {e}");
+                    alpha_client::warn!("renewal_failed", error = e.kind());
                     tokio::time::sleep(RETRY_AFTER).await;
                 }
             }

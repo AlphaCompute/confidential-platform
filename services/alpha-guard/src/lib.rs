@@ -140,20 +140,28 @@ impl Error {
     pub fn internal(message: impl Into<String>) -> Self {
         Error::Internal(message.into())
     }
-}
 
-impl IntoResponse for Error {
-    fn into_response(self) -> Response {
-        let (status, code) = match &self {
+    pub fn code(&self) -> &'static str {
+        self.parts().1
+    }
+
+    fn parts(&self) -> (StatusCode, &'static str) {
+        match self {
             Error::CertInvalid => (StatusCode::UNAUTHORIZED, "cert_invalid"),
             Error::NotAllowed => (StatusCode::FORBIDDEN, "not_allowed"),
             Error::Malformed(_) => (StatusCode::BAD_REQUEST, "malformed"),
             Error::NoVerdict => (StatusCode::BAD_GATEWAY, "no_verdict"),
             Error::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
-        };
+        }
+    }
+}
+
+impl IntoResponse for Error {
+    fn into_response(self) -> Response {
+        let (status, code) = self.parts();
         let message = match &self {
-            Error::Internal(detail) => {
-                eprintln!("alpha-guard: internal: {detail}");
+            Error::Internal(_) => {
+                alpha_client::error!("internal");
                 "internal error".to_string()
             }
             other => other.to_string(),
@@ -257,14 +265,17 @@ async fn check(
         Err(_) => "no_verdict",
     };
     // Fixed labels and digests only: never the text, the categories or the judge's answer.
-    eprintln!(
-        "alpha-guard: check caller={caller} phase={} outcome={outcome} policy={digest} elapsed_ms={}",
-        if request.response.is_some() {
+    alpha_client::info!(
+        "check",
+        caller = caller,
+        phase = if request.response.is_some() {
             "response"
         } else {
             "user"
         },
-        started.elapsed().as_millis()
+        outcome = outcome,
+        policy = alpha_client::log::Field::text(&digest),
+        elapsed_ms = started.elapsed(),
     );
     let verdict = verdict?;
     Ok(Json(json!({
