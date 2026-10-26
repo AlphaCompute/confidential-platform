@@ -55,6 +55,9 @@ pub const PROBE_PORT: u16 = 8444;
 
 pub const RENEW_BEFORE: Duration = Duration::from_secs(600);
 const RETRY_AFTER: Duration = Duration::from_secs(30);
+/// A quote request lost by the host's quote service never completes; without a bound, the
+/// leaf would expire with no further attempt.
+const ATTEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Each missing Secret is a denied `secret.get` audit row on the KMS; the backoff doubles from
 /// here up to `SECRETS_POLL`, so a Secret never set costs one row a minute.
 const SECRETS_FIRST_RETRY: Duration = Duration::from_secs(2);
@@ -88,6 +91,8 @@ pub enum Error {
     Socket(String),
     #[error("platform document: {0}")]
     Platform(String),
+    #[error("attestation timed out")]
+    TimedOut,
 }
 
 impl Error {
@@ -101,6 +106,7 @@ impl Error {
             Error::NotAttested => "not_attested",
             Error::Socket(_) => "socket",
             Error::Platform(_) => "platform_document",
+            Error::TimedOut => "timed_out",
         }
     }
 
@@ -123,6 +129,9 @@ impl Error {
 pub enum Exit {
     Drained,
     Revoked,
+    /// The leaf expired while attestations kept timing out; a restart is the last way to
+    /// collect a quote again.
+    QuoteStuck,
 }
 
 impl Exit {
@@ -130,6 +139,7 @@ impl Exit {
         match self {
             Exit::Drained => 0,
             Exit::Revoked => EXIT_REVOKED,
+            Exit::QuoteStuck => 1,
         }
     }
 }
@@ -579,7 +589,10 @@ impl Runtime {
 
     /// Nonce → `report_data` → quote → leaf; the first call is the Instance's birth, later ones renew.
     pub async fn attest(&self) -> Result<Arc<Attested>, Error> {
-        let attested = self.attest_inner().await.map_err(|e| self.note(e))?;
+        let attested = tokio::time::timeout(ATTEST_TIMEOUT, self.attest_inner())
+            .await
+            .unwrap_or(Err(Error::TimedOut))
+            .map_err(|e| self.note(e))?;
         *self.attested.write() = Some(attested.clone());
         Ok(attested)
     }
@@ -600,7 +613,11 @@ impl Runtime {
             .try_into()
             .map_err(|_| alpha_client::Error::Invalid("nonce is not 32 bytes".into()))?;
         let report_data = alpha_attest::report_data(&self.spki, &nonce, None);
-        let evidence = (self.evidence)(&report_data).map_err(Error::Evidence)?;
+        let source = self.evidence.clone();
+        let evidence = tokio::task::spawn_blocking(move || source(&report_data))
+            .await
+            .map_err(|e| Error::Evidence(e.to_string()))?
+            .map_err(Error::Evidence)?;
         let reply = kms
             .attest(&AttestRequest {
                 runtime_pubkey: BASE64_URL_SAFE_NO_PAD.encode(&self.spki),
@@ -845,7 +862,7 @@ impl Runtime {
         }
     }
 
-    async fn renew_forever(&self) {
+    async fn renew_forever(&self) -> Exit {
         loop {
             let delay = match self.last() {
                 Some(a) => renewal_delay(a.not_after, self.now()),
@@ -854,7 +871,11 @@ impl Runtime {
             tokio::time::sleep(delay).await;
             match self.attest().await {
                 Ok(a) => alpha_client::info!("renewed", not_after = a.not_after),
-                Err(e) if e.revoked() => return,
+                Err(e) if e.revoked() => return Exit::Revoked,
+                Err(Error::TimedOut) if self.attested().is_none() => {
+                    alpha_client::error!("attestation_stuck");
+                    return Exit::QuoteStuck;
+                }
                 Err(e) => {
                     alpha_client::warn!("renewal_failed", error = e.kind());
                     tokio::time::sleep(RETRY_AFTER).await;
@@ -865,8 +886,9 @@ impl Runtime {
 
     /// Serves the socket, renews the leaf, keeps the declared Secret files under
     /// `secrets_root` current and, given `tls` and an upstream, proxies the Endpoint until
-    /// `shutdown` resolves or the Revision is revoked. Socket connections drain either way;
-    /// proxied ones drain on shutdown and are cut on revocation.
+    /// `shutdown` resolves, the Revision is revoked or the leaf expires behind a stuck quote.
+    /// Socket connections drain, except after a stuck quote; proxied ones drain on shutdown
+    /// and are cut otherwise.
     pub async fn run(
         self: Arc<Self>,
         listener: UnixListener,
@@ -896,12 +918,16 @@ impl Runtime {
         let exit = tokio::select! {
             () = shutdown => Exit::Drained,
             _ = revoked.wait_for(|r| *r) => Exit::Revoked,
-            () = self.renew_forever() => Exit::Revoked,
+            exit = self.renew_forever() => exit,
         };
         delivery.abort();
         let _ = stop.send(());
         let _ = stop_proxy.send(exit);
-        let _ = server.await;
+        if exit == Exit::QuoteStuck {
+            server.abort();
+        } else {
+            let _ = server.await;
+        }
         if let Some(proxy) = proxy {
             let _ = proxy.await;
         }
