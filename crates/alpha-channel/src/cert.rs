@@ -141,7 +141,10 @@ pub fn leaf_appraisal(cert: &[u8]) -> Result<Option<LeafAppraisal>, Error> {
     let Some(ext) = cert.extensions().iter().find(|ext| ext.oid == oid) else {
         return Ok(None);
     };
-    let (_, json) = String::from_der(ext.value).map_err(|e| malformed(e.to_string()))?;
+    let (rest, json) = String::from_der(ext.value).map_err(|e| malformed(e.to_string()))?;
+    if !rest.is_empty() {
+        return Err(malformed("trailing bytes".into()));
+    }
     let json: serde_json::Value =
         serde_json::from_str(&json).map_err(|e| malformed(e.to_string()))?;
     let format = json.get("format").and_then(serde_json::Value::as_str);
