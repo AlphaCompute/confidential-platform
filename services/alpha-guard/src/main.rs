@@ -62,14 +62,13 @@ async fn run() -> Result<(), Error> {
         inference_bearer: parking_lot::RwLock::new(read_bearer(&runtime).await?),
         front,
     });
-    let app = alpha_client::metrics::track(router(state.clone()));
+    let app = alpha_client::metrics::serve(router(state.clone()))
+        .await
+        .map_err(|e| Error::internal(format!("metrics: {e}")))?;
 
     let listener = TcpListener::bind(("0.0.0.0", PORT))
         .await
         .map_err(|e| Error::internal(format!("bind :{PORT}: {e}")))?;
-    alpha_client::metrics::spawn()
-        .await
-        .map_err(|e| Error::internal(format!("metrics: {e}")))?;
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| Error::internal(format!("sigterm: {e}")))?;
     let mut outcome = Ok(());

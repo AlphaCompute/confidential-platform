@@ -32,12 +32,6 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     Metrics { registry, requests }
 });
 
-/// Counts every response of `router` by route template and status. A request that matches no
-/// route counts as `other`, so a probed path never becomes a series.
-pub fn track(router: Router) -> Router {
-    router.layer(axum::middleware::from_fn(record))
-}
-
 async fn record(request: Request, next: Next) -> Response {
     let route = request
         .extensions()
@@ -62,12 +56,14 @@ fn text() -> String {
     text
 }
 
-/// Binds `127.0.0.1:9464` and serves `/metrics` there for the life of the process.
-pub async fn spawn() -> std::io::Result<()> {
+/// Serves `/metrics` on `127.0.0.1:9464` for the life of the process and returns `router`
+/// counting every response by route template and status. A request that matches no route counts
+/// as `other`, so a probed path never becomes a series.
+pub async fn serve(router: Router) -> std::io::Result<Router> {
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 9464)).await?;
-    let router = Router::new().route("/metrics", get(|| async { text() }));
-    tokio::spawn(async move { axum::serve(listener, router).await });
-    Ok(())
+    let metrics = Router::new().route("/metrics", get(|| async { text() }));
+    tokio::spawn(async move { axum::serve(listener, metrics).await });
+    Ok(router.layer(axum::middleware::from_fn(record)))
 }
 
 #[cfg(test)]
@@ -78,7 +74,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_response_counts_under_its_route_template_not_its_path() {
-        let app = track(Router::new().route("/v1/apps/{id}", get(|| async { "" })));
+        let app = Router::new()
+            .route("/v1/apps/{id}", get(|| async { "" }))
+            .layer(axum::middleware::from_fn(record));
         for uri in ["/v1/apps/0192f1d2", "/v1/apps/0192f1d3", "/probe/secret"] {
             let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
             app.clone().oneshot(request).await.unwrap();

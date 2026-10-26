@@ -71,10 +71,9 @@ async fn run() -> Result<(), String> {
     let listener = TcpListener::bind(LISTEN)
         .await
         .map_err(|e| format!("bind {LISTEN}: {e}"))?;
-    alpha_client::metrics::spawn()
+    let app = alpha_client::metrics::serve(alpha_kms::router(node.clone()))
         .await
         .map_err(|e| format!("metrics: {e}"))?;
-    let app = alpha_client::metrics::track(alpha_kms::router(node.clone()));
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| format!("SIGTERM handler: {e}"))?;
     let shutdown = async move {
