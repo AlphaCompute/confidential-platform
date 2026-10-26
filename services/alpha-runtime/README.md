@@ -140,11 +140,16 @@ A KMS node's leaf chains to the same CA but carries no Instance SANs, so it is r
 caller is pinned by App rather than Revision, so a caller that pins this Endpoint's Revision can
 still be registered.
 
-With `ALPHACOMPUTE_TLS_UPSTREAM_READY` the runtime also listens on 8444 in plain HTTP and serves
-only `GET /ready`, for a kubelet probe: a Kata agent policy refuses exec probes, and the kubelet
-has no Instance leaf for a caller-pinned Endpoint. It answers 200 with an empty body only while
-the leaf is current and the upstream answers `GET <path>` with a 2xx status within 2 s, else
-503; nothing of the upstream's reply is relayed.
+With an upstream, the runtime also listens on 8444 in plain HTTP, for the host: a Kata agent
+policy refuses exec, and the host has no Instance leaf for a caller-pinned Endpoint. `GET /leaf`
+answers with the PEM chain that the Endpoint presents now, leaf first, or 503 while no leaf is
+current. The chain is public, because every handshake shows it. The host reads it through the
+Kubernetes API server proxy, and checks it against the KMS CA itself.
+
+With `ALPHACOMPUTE_TLS_UPSTREAM_READY` the same listener also serves `GET /ready`, for a kubelet
+probe. It answers 200 with an empty body only while the leaf is current and the upstream answers
+`GET <path>` with a 2xx status within 2 s, else 503; nothing of the upstream's reply is
+relayed.
 
 ## Tests
 
