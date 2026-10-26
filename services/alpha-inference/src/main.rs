@@ -110,11 +110,14 @@ async fn run() -> Result<(), Error> {
         keys_key,
         usage_tasks: Default::default(),
     });
-    let app = router(state.clone());
+    let app = alpha_client::metrics::track(router(state.clone()));
 
     let listener = TcpListener::bind(("0.0.0.0", PORT))
         .await
         .map_err(|e| Error::internal(format!("bind :{PORT}: {e}")))?;
+    alpha_client::metrics::spawn()
+        .await
+        .map_err(|e| Error::internal(format!("metrics: {e}")))?;
 
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| Error::internal(format!("sigterm: {e}")))?;
