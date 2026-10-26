@@ -506,6 +506,9 @@ pub struct Runtime {
     clock: Clock,
     time: TimeProvider,
     evidence: EvidenceSource,
+    /// One evidence read at a time: a read the kernel never answers keeps its permit, so
+    /// retries wait for it instead of piling up blocked threads.
+    evidence_slot: Arc<tokio::sync::Semaphore>,
     /// None in a Kata pod that mounts no init-data; the KMS names the Revision from the
     /// verified `MRCONFIGID` either way.
     revision: Option<RevisionText>,
@@ -538,6 +541,7 @@ impl Runtime {
             clock,
             time,
             evidence,
+            evidence_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             revision,
             accepted: Mutex::new(None),
             attested: RwLock::new(None),
@@ -609,10 +613,19 @@ impl Runtime {
             .map_err(|_| alpha_client::Error::Invalid("nonce is not 32 bytes".into()))?;
         let report_data = alpha_attest::report_data(&self.spki, &nonce, None);
         let source = self.evidence.clone();
-        let evidence = tokio::task::spawn_blocking(move || source(&report_data))
+        let slot = self
+            .evidence_slot
+            .clone()
+            .acquire_owned()
             .await
-            .map_err(|e| Error::Evidence(e.to_string()))?
-            .map_err(Error::Evidence)?;
+            .map_err(|e| Error::Evidence(e.to_string()))?;
+        let evidence = tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            source(&report_data)
+        })
+        .await
+        .map_err(|e| Error::Evidence(e.to_string()))?
+        .map_err(Error::Evidence)?;
         let reply = kms
             .attest(&AttestRequest {
                 runtime_pubkey: BASE64_URL_SAFE_NO_PAD.encode(&self.spki),
