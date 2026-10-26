@@ -393,8 +393,14 @@ pub fn rendered_init_data(pod: &str) -> Result<(AppId, ComposeHash, String), Str
 }
 
 /// Builds the init-data in one fixed layout: genpolicy's own keeps `[data]` in a hash map, so
-/// the same inputs could give two Revisions.
-pub fn render(mut pod: Pod, app_id: AppId, policy: &str) -> Result<Rendered, String> {
+/// the same inputs could give two Revisions. `registry_auth` is the Secret the guest pulls private
+/// images with and the KMS CA, which [`alpha_core::registry_auth`] renders into `[data]`.
+pub fn render(
+    mut pod: Pod,
+    app_id: AppId,
+    policy: &str,
+    registry_auth: Option<(&str, &str)>,
+) -> Result<Rendered, String> {
     let (rules, data) = policy
         .split_once(POLICY_DATA)
         .ok_or("genpolicy: no policy_data in its output")?;
@@ -413,8 +419,21 @@ pub fn render(mut pod: Pod, app_id: AppId, policy: &str) -> Result<Rendered, Str
             "genpolicy: its output contains ''', which a TOML literal string cannot hold".into(),
         );
     }
+    let (aa, cdh) = match registry_auth {
+        Some((name, kms_ca_pem)) => {
+            if !alpha_core::is_secret_name(name) {
+                return Err(format!("--registry-auth {name:?}: not a Secret name"));
+            }
+            let (aa, cdh) = alpha_core::registry_auth(name, kms_ca_pem);
+            (
+                format!("\"aa.toml\" = '''\n{aa}'''\n"),
+                format!("\"cdh.toml\" = '''\n{cdh}'''\n"),
+            )
+        }
+        None => Default::default(),
+    };
     let toml = format!(
-        "algorithm = \"sha256\"\nversion = \"0.1.0\"\n\n[data]\n\"app_id\" = \"{app_id}\"\n\"policy.rego\" = '''\n{policy}'''\n"
+        "algorithm = \"sha256\"\nversion = \"0.1.0\"\n\n[data]\n{aa}\"app_id\" = \"{app_id}\"\n{cdh}\"policy.rego\" = '''\n{policy}'''\n"
     );
     let init_data = InitData::parse(toml.clone()).map_err(|e| format!("init-data: {e}"))?;
     if init_data.app_id() != Some(app_id) {
@@ -464,6 +483,7 @@ mod tests {
             parse(POD.as_bytes()).unwrap(),
             APP_ID.parse().unwrap(),
             GENPOLICY,
+            None,
         )
         .unwrap()
     }
@@ -499,6 +519,30 @@ mod tests {
         let input = parse(POD.as_bytes()).unwrap().genpolicy_input;
         assert!(!input.contains("automountServiceAccountToken"));
         assert!(!input.contains("enableServiceLinks"));
+    }
+
+    #[test]
+    fn a_registry_credential_renders_into_an_init_data_the_kms_accepts() {
+        let pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+        let pod = parse(POD.as_bytes()).unwrap();
+        let rendered = render(
+            pod,
+            APP_ID.parse().unwrap(),
+            GENPOLICY,
+            Some(("regcred", pem)),
+        )
+        .unwrap();
+        let expected: Value = serde_json::from_str(EXPECTED).unwrap();
+        assert_ne!(rendered.revision.to_string(), expected["revision"]);
+        let pinned = alpha_core::KataPolicy {
+            rules_sha256: rendered.rules_sha256.parse().unwrap(),
+            data_sha256: rendered.policy_data_sha256.parse().unwrap(),
+        };
+        let init_data = InitData::parse(rendered.init_data).unwrap();
+        init_data.check_policy(&pinned, pem).unwrap();
+        assert!(init_data.check_policy(&pinned, "other").is_err());
+        let pod = parse(POD.as_bytes()).unwrap();
+        assert!(render(pod, APP_ID.parse().unwrap(), GENPOLICY, Some(("Reg", pem))).is_err());
     }
 
     #[test]
@@ -563,7 +607,7 @@ mod tests {
                     .get("automountServiceAccountToken")
                     .is_none()
             );
-            let rendered = render(parsed, APP_ID.parse().unwrap(), GENPOLICY).unwrap();
+            let rendered = render(parsed, APP_ID.parse().unwrap(), GENPOLICY, None).unwrap();
             assert_eq!(rendered.revision, render_golden().revision);
             let out: Yaml = serde_yaml_ng::from_str(&rendered.pod).unwrap();
             assert!(out["metadata"].get("annotations").is_none());
@@ -654,7 +698,7 @@ mod tests {
         );
         let other_rules = GENPOLICY.replacen("package agent_policy", "package other", 1);
         let pod = parse(POD.as_bytes()).unwrap();
-        let err = render(pod, APP_ID.parse().unwrap(), &other_rules).unwrap_err();
+        let err = render(pod, APP_ID.parse().unwrap(), &other_rules, None).unwrap_err();
         assert!(err.contains("pinned rules"));
     }
 
@@ -751,6 +795,7 @@ mod tests {
             parse(DIND_POD.as_bytes()).unwrap(),
             APP_ID.parse().unwrap(),
             DIND_GENPOLICY,
+            None,
         )
         .unwrap();
         let golden: Value = serde_json::from_str(EXPECTED).unwrap();
@@ -1095,6 +1140,7 @@ mod tests {
             parse(B300_POD.as_bytes()).unwrap(),
             APP_ID.parse().unwrap(),
             B300_GENPOLICY,
+            None,
         )
         .unwrap();
         let golden: Value = serde_json::from_str(EXPECTED).unwrap();

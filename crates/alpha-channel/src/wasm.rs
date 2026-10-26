@@ -74,18 +74,23 @@ pub fn compose_services(compose: &str) -> Result<String, JsError> {
 /// The payload to sign under `revision` that registers `revision` for `app_id`:
 /// `{app_id, compose}` or `{app_id, init_data, digest}`, refused when the KMS would refuse it.
 /// `kata_policy_json` is the verified platform document's `kata_policy`, or `null` when it has
-/// none, which an init-data must carry.
+/// none, which an init-data must carry; `kms_ca_pem` is the document's, which an init-data that
+/// names a registry credential must carry.
 #[wasm_bindgen(js_name = revisionPayload)]
 pub fn revision_payload(
     app_id: &str,
     revision: &str,
     kata_policy_json: &str,
+    kms_ca_pem: &str,
 ) -> Result<String, JsError> {
     let app_id: alpha_core::AppId = app_id
         .parse()
         .map_err(|_| js(Error::Malformed(format!("app_id {app_id:?} is not a UUID"))))?;
     let kata_policy: Option<alpha_core::KataPolicy> = parse("kata policy", kata_policy_json)?;
-    to_json(&compose::revision_payload(app_id, revision, kata_policy.as_ref()).map_err(js)?)
+    to_json(
+        &compose::revision_payload(app_id, revision, kata_policy.as_ref(), kms_ca_pem)
+            .map_err(js)?,
+    )
 }
 
 fn canonical(value: &serde_json::Value) -> Result<String, JsError> {

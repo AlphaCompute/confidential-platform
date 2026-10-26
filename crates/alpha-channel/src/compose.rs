@@ -50,6 +50,7 @@ pub fn revision_payload(
     app_id: AppId,
     revision: &str,
     kata_policy: Option<&KataPolicy>,
+    kms_ca_pem: &str,
 ) -> Result<Value, Error> {
     if is_compose(revision)? {
         alpha_core::check_registration(revision, app_id).map_err(|e| malformed(&e.to_string()))?;
@@ -62,7 +63,7 @@ pub fn revision_payload(
     let pinned =
         kata_policy.ok_or_else(|| malformed("the platform document pins no Kata agent policy"))?;
     init_data
-        .check_policy(pinned)
+        .check_policy(pinned, kms_ca_pem)
         .map_err(|e| malformed(&e.to_string()))?;
     Ok(json!({ "app_id": app_id, "init_data": revision, "digest": init_data.digest() }))
 }
@@ -466,7 +467,7 @@ mod tests {
         let pinned: KataPolicy = serde_json::from_value(doc["kata_policy"].clone()).unwrap();
         let app: AppId = "0199e000-0000-7000-8000-00000000a11d".parse().unwrap();
 
-        let payload = revision_payload(app, K3, Some(&pinned)).unwrap();
+        let payload = revision_payload(app, K3, Some(&pinned), "").unwrap();
         assert_eq!(
             payload,
             json!({
@@ -477,10 +478,10 @@ mod tests {
         );
 
         let other: AppId = "0199e000-0000-7000-8000-00000000b22e".parse().unwrap();
-        assert!(revision_payload(other, K3, Some(&pinned)).is_err());
-        assert!(revision_payload(app, K3, None).is_err());
+        assert!(revision_payload(other, K3, Some(&pinned), "").is_err());
+        assert!(revision_payload(app, K3, None, "").is_err());
         let off_pin = K3.replacen("(c) 2023", "(c) 2024", 1);
-        assert!(revision_payload(app, &off_pin, Some(&pinned)).is_err());
+        assert!(revision_payload(app, &off_pin, Some(&pinned), "").is_err());
     }
 
     #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]

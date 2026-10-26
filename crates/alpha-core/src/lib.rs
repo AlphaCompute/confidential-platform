@@ -24,7 +24,7 @@ pub use compose::{
     has_sha256_digest, hex_bytes,
 };
 pub use id::{AppId, KeyId, OrgId, PrincipalId, RequestId, SecretId};
-pub use initdata::{InitData, InitDataError, MAX_INIT_DATA};
+pub use initdata::{InitData, InitDataError, MAX_INIT_DATA, registry_auth};
 pub use platform::{CatalogKey, KataPolicy, KmsRevision, Signer};
 pub use signing::{context, jcs, parse, signing_digest};
 

@@ -21,8 +21,14 @@ pub enum InitDataError {
     Version(String),
     #[error("init-data [data] has no \"policy.rego\" string")]
     NoPolicy,
-    #[error("init-data [data] key {0:?} is neither \"app_id\" nor \"policy.rego\"")]
+    #[error(
+        "init-data [data] key {0:?} is none of \"aa.toml\", \"app_id\", \"cdh.toml\", \"policy.rego\""
+    )]
     UnknownKey(String),
+    #[error(
+        "init-data aa.toml and cdh.toml are not the platform's registry credential template: {0}"
+    )]
+    RegistryAuth(&'static str),
     #[error("policy.rego has no \"\\npolicy_data := \"")]
     NoPolicyData,
     #[error("policy.rego rules are {0}, not the pinned rules")]
@@ -38,6 +44,10 @@ pub enum InitDataError {
 }
 
 const POLICY_DATA: &str = "\npolicy_data := ";
+/// The KMS Service in the cluster. Public CAs issue no name under `.svc`, and the guest also
+/// trusts its built-in roots, so this name alone keeps the guest on our key broker.
+const KBS_URL: &str = "https://kms.alpha-kms.svc:8443";
+const CREDENTIAL_URI: &str = "kbs:///alpha/secret/";
 /// The host writes the annotation that carries it, so a gzip bomb there must not exhaust a pod,
 /// nor a page that reads it.
 pub const MAX_INIT_DATA: usize = 1 << 20;
@@ -46,6 +56,19 @@ pub const MAX_INIT_DATA: usize = 1 << 20;
 struct Header {
     algorithm: String,
     version: String,
+}
+
+/// `aa.toml` and `cdh.toml` of a Revision whose images pull with the Secret `name`: the guest's
+/// data hub gets the registry credential from the KMS at [`KBS_URL`], under `kms_ca_pem`. No
+/// `[eventlog]`, so RTMR3 stays zero.
+pub fn registry_auth(name: &str, kms_ca_pem: &str) -> (String, String) {
+    (
+        format!("[token_configs.kbs]\nurl = \"{KBS_URL}\"\ncert = \"\"\"{kms_ca_pem}\"\"\"\n"),
+        format!(
+            "[kbc]\nname = \"cc_kbc\"\nurl = \"{KBS_URL}\"\nkbs_cert = \"\"\"{kms_ca_pem}\"\"\"\n\n\
+             [image]\nauthenticated_registry_credentials_uri = \"{CREDENTIAL_URI}{name}\"\n"
+        ),
+    )
 }
 
 impl InitData {
@@ -95,13 +118,16 @@ impl InitData {
     /// included, decides what the agent allows. No rego is evaluated: any rego after the JSON
     /// would join the pinned rules, so nothing but whitespace may follow it.
     ///
-    /// `[data]` holds nothing else: `aa.toml` or `cdh.toml` could point the guest at another key
-    /// broker, and only alpha-kms releases keys.
+    /// `[data]` holds nothing else, except `aa.toml` and `cdh.toml` together and exactly as
+    /// [`registry_auth`] renders them for one Secret name and `kms_ca_pem`: any other content could
+    /// point the guest at another key broker, and only alpha-kms releases keys.
     ///
     /// No container may list `exec_commands`, the argv of its exec probes and hooks: the agent
     /// runs them whenever the host asks.
-    pub fn check_policy(&self, pinned: &KataPolicy) -> Result<(), InitDataError> {
-        let (rules, data, containers) = self.policy()?;
+    pub fn check_policy(&self, pinned: &KataPolicy, kms_ca_pem: &str) -> Result<(), InitDataError> {
+        let table = self.data()?;
+        let (rules, data, containers) = policy(&table)?;
+        check_registry_auth(&table, kms_ca_pem)?;
         if rules != pinned.rules_sha256 {
             return Err(InitDataError::Rules(rules));
         }
@@ -120,41 +146,78 @@ impl InitData {
         Ok(())
     }
 
-    /// The policy data's `containers`, genpolicy's description of each container the agent lets
-    /// the pod create. The pins are not checked: that is [`Self::check_policy`]'s job.
-    pub fn containers(&self) -> Result<serde_json::Value, InitDataError> {
-        Ok(self.policy()?.2)
-    }
-
-    /// The rules digest, the policy data without `containers`, and `containers`.
-    fn policy(&self) -> Result<(ComposeHash, serde_json::Value, serde_json::Value), InitDataError> {
+    fn data(&self) -> Result<toml::Table, InitDataError> {
         #[derive(Deserialize)]
         struct WithData {
             data: toml::Table,
         }
-        let data = toml::from_str::<WithData>(&self.0)
+        Ok(toml::from_str::<WithData>(&self.0)
             .map_err(|_| InitDataError::NoPolicy)?
-            .data;
-        if let Some(key) = data
-            .keys()
-            .find(|k| !matches!(k.as_str(), "app_id" | "policy.rego"))
-        {
-            return Err(InitDataError::UnknownKey(key.clone()));
-        }
-        let policy = data
-            .get("policy.rego")
-            .and_then(toml::Value::as_str)
-            .ok_or(InitDataError::NoPolicy)?;
-        let (rules, data) = policy
-            .split_once(POLICY_DATA)
-            .ok_or(InitDataError::NoPolicyData)?;
-        let mut data = crate::parse(data.as_bytes()).map_err(InitDataError::PolicyDataJson)?;
-        let containers = data
-            .as_object_mut()
-            .and_then(|d| d.remove("containers"))
-            .ok_or(InitDataError::NoContainers)?;
-        Ok((compose_hash(rules), data, containers))
+            .data)
     }
+
+    /// The policy data's `containers`, genpolicy's description of each container the agent lets
+    /// the pod create. The pins are not checked: that is [`Self::check_policy`]'s job.
+    pub fn containers(&self) -> Result<serde_json::Value, InitDataError> {
+        Ok(policy(&self.data()?)?.2)
+    }
+}
+
+fn credential_name(data: &toml::Table) -> Option<String> {
+    let cdh = data
+        .get("cdh.toml")?
+        .as_str()?
+        .parse::<toml::Table>()
+        .ok()?;
+    let uri = cdh
+        .get("image")?
+        .get("authenticated_registry_credentials_uri")?;
+    Some(uri.as_str()?.strip_prefix(CREDENTIAL_URI)?.to_owned())
+}
+
+fn check_registry_auth(data: &toml::Table, kms_ca_pem: &str) -> Result<(), InitDataError> {
+    if !data.contains_key("aa.toml") && !data.contains_key("cdh.toml") {
+        return Ok(());
+    }
+    let name =
+        credential_name(data).ok_or(InitDataError::RegistryAuth("cdh.toml names no Secret"))?;
+    if !crate::is_secret_name(&name) {
+        return Err(InitDataError::RegistryAuth("the Secret name is not valid"));
+    }
+    let (want_aa, want_cdh) = registry_auth(&name, kms_ca_pem);
+    if data.get("aa.toml") != Some(&toml::Value::String(want_aa))
+        || data.get("cdh.toml") != Some(&toml::Value::String(want_cdh))
+    {
+        return Err(InitDataError::RegistryAuth("they differ"));
+    }
+    Ok(())
+}
+
+/// The rules digest, the policy data without `containers`, and `containers`.
+fn policy(
+    data: &toml::Table,
+) -> Result<(ComposeHash, serde_json::Value, serde_json::Value), InitDataError> {
+    if let Some(key) = data.keys().find(|k| {
+        !matches!(
+            k.as_str(),
+            "aa.toml" | "app_id" | "cdh.toml" | "policy.rego"
+        )
+    }) {
+        return Err(InitDataError::UnknownKey(key.clone()));
+    }
+    let policy = data
+        .get("policy.rego")
+        .and_then(toml::Value::as_str)
+        .ok_or(InitDataError::NoPolicy)?;
+    let (rules, data) = policy
+        .split_once(POLICY_DATA)
+        .ok_or(InitDataError::NoPolicyData)?;
+    let mut data = crate::parse(data.as_bytes()).map_err(InitDataError::PolicyDataJson)?;
+    let containers = data
+        .as_object_mut()
+        .and_then(|d| d.remove("containers"))
+        .ok_or(InitDataError::NoContainers)?;
+    Ok((compose_hash(rules), data, containers))
 }
 
 #[cfg(test)]
@@ -163,6 +226,15 @@ mod tests {
 
     const T1: &str = include_str!("../../../testdata/attest/b300-kata-4.0.0/t1-sha256.toml");
     const K3: &str = include_str!("../../../testdata/attest/b300-kata-4.0.0/k3-app.toml");
+
+    const PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+
+    fn with_auth(aa: &str, cdh: &str) -> String {
+        K3.replace(
+            "[data]\n",
+            &format!("[data]\n\"aa.toml\" = '''\n{aa}'''\n\"cdh.toml\" = '''\n{cdh}'''\n"),
+        )
+    }
 
     fn pinned() -> KataPolicy {
         let doc: serde_json::Value = serde_json::from_str(include_str!(
@@ -215,7 +287,7 @@ mod tests {
     fn the_policy_genpolicy_generated_is_the_pinned_one() {
         InitData::parse(K3.into())
             .unwrap()
-            .check_policy(&pinned())
+            .check_policy(&pinned(), PEM)
             .unwrap();
     }
 
@@ -227,8 +299,8 @@ mod tests {
                 "\"policy.rego\"",
             ),
             (
-                K3.replace("[data]\n", "[data]\n\"cdh.toml\" = \"\"\n"),
-                "\"cdh.toml\" is neither",
+                K3.replace("[data]\n", "[data]\n\"kbs.toml\" = \"\"\n"),
+                "\"kbs.toml\" is none of",
             ),
             (
                 K3.replace(POLICY_DATA, "\npolicy_data = "),
@@ -268,7 +340,74 @@ mod tests {
             assert_ne!(toml, K3, "{fragment}");
             let err = InitData::parse(toml)
                 .unwrap()
-                .check_policy(&pinned())
+                .check_policy(&pinned(), PEM)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(fragment), "{fragment}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_registry_auth_template_is_what_the_guest_reads() {
+        let (aa, cdh) = registry_auth("regcred", PEM);
+        assert_eq!(
+            aa,
+            "[token_configs.kbs]\nurl = \"https://kms.alpha-kms.svc:8443\"\ncert = \"\"\"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n\"\"\"\n"
+        );
+        assert_eq!(
+            cdh,
+            "[kbc]\nname = \"cc_kbc\"\nurl = \"https://kms.alpha-kms.svc:8443\"\nkbs_cert = \"\"\"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n\"\"\"\n\n[image]\nauthenticated_registry_credentials_uri = \"kbs:///alpha/secret/regcred\"\n"
+        );
+        let table: toml::Table = cdh.parse().unwrap();
+        assert_eq!(table["kbc"]["kbs_cert"].as_str(), Some(PEM));
+
+        let init_data = InitData::parse(with_auth(&aa, &cdh)).unwrap();
+        init_data.check_policy(&pinned(), PEM).unwrap();
+    }
+
+    #[test]
+    fn registry_auth_off_the_template_is_refused() {
+        let (aa, cdh) = registry_auth("regcred", PEM);
+        let (other_ca, _) = registry_auth("regcred", "-----BEGIN CERTIFICATE-----\nMIIC\n");
+        let (_, bad_name) = registry_auth("RegCred", PEM);
+        let cases = [
+            (
+                with_auth(&aa, &cdh.replace("https://kms", "http://kms")),
+                "they differ",
+            ),
+            (
+                with_auth(&aa.replace("kms.alpha-kms.svc", "kbs.example.com"), &cdh),
+                "they differ",
+            ),
+            (with_auth(&other_ca, &cdh), "they differ"),
+            (
+                with_auth(&format!("{aa}[eventlog]\nenable_eventlog = true\n"), &cdh),
+                "they differ",
+            ),
+            (
+                with_auth(
+                    &aa,
+                    &format!("{cdh}image_security_policy_uri = \"kbs:///alpha/secret/p\"\n"),
+                ),
+                "they differ",
+            ),
+            (
+                with_auth(&aa, &cdh.replace("alpha/secret/", "default/credential/")),
+                "names no Secret",
+            ),
+            (with_auth(&aa, &bad_name), "not valid"),
+            (
+                K3.replace(
+                    "[data]\n",
+                    &format!("[data]\n\"cdh.toml\" = '''\n{cdh}'''\n"),
+                ),
+                "they differ",
+            ),
+        ];
+        for (toml, fragment) in cases {
+            let err = InitData::parse(toml)
+                .unwrap()
+                .check_policy(&pinned(), PEM)
                 .unwrap_err()
                 .to_string();
             assert!(err.contains(fragment), "{fragment}: {err}");

@@ -279,6 +279,10 @@ enum CocoCommand {
         kata: PathBuf,
         #[arg(long)]
         out: PathBuf,
+        /// The Secret of this App the guest pulls private images with, a Docker `config.json`; the
+        /// guest fetches it from the KMS under `kms_ca_pem` of the platform document.
+        #[arg(long)]
+        registry_auth: Option<String>,
         /// A Pod, or a StatefulSet or Deployment rendered for its pod template, whose images are all pinned
         /// `@sha256:` and whose supplementalGroups are explicit.
         pod: PathBuf,
@@ -655,6 +659,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                     app_id,
                     kata,
                     out,
+                    registry_auth,
                     pod,
                 },
         } => {
@@ -662,7 +667,16 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 fs::read(&pod).map_err(|e| Exit::Usage(format!("{}: {e}", pod.display())))?;
             let pod = coco::parse(&bytes)?;
             let policy = coco::Kata::read(&kata)?.genpolicy(&pod)?;
-            let rendered = coco::render(pod, app_id, &policy)?;
+            let kms_ca_pem = match &registry_auth {
+                Some(_) => Some(platform_document(config, now).await?.kms_ca_pem),
+                None => None,
+            };
+            let rendered = coco::render(
+                pod,
+                app_id,
+                &policy,
+                registry_auth.as_deref().zip(kms_ca_pem.as_deref()),
+            )?;
             fs::write(&out, &rendered.pod)
                 .map_err(|e| Exit::Refused(format!("{}: {e}", out.display())))?;
             Ok(json!(rendered))

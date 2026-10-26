@@ -315,7 +315,7 @@ async fn attest_inner(
     if let Some(init_data) = &revision.init_data {
         let init_data = alpha_core::InitData::parse(init_data.clone())
             .map_err(|e| ApiError::new("policy_denied", e.to_string()))?;
-        crate::control::check_kata_policy(&init_data, doc.kata_policy.as_ref(), "policy_denied")?;
+        crate::control::check_kata_policy(&init_data, Some(&doc), "policy_denied")?;
     }
     let runtime_sha_hex = appraised
         .runtime_pubkey_sha256

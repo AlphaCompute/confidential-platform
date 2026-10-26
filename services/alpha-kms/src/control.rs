@@ -4,7 +4,8 @@
 
 use std::sync::Arc;
 
-use alpha_core::{AppId, ComposeHash, KataPolicy, KeyId, OrgId, PrincipalId, SecretId, context};
+use alpha_attest::PlatformDocument;
+use alpha_core::{AppId, ComposeHash, KeyId, OrgId, PrincipalId, SecretId, context};
 use axum::Json;
 use axum::extract::{Path, State};
 use base64::Engine;
@@ -183,7 +184,7 @@ struct InitDataRevisionPayload {
 /// compose, init-data.
 fn revision_payload(
     value: &Value,
-    kata_policy: Option<&KataPolicy>,
+    doc: Option<&PlatformDocument>,
 ) -> Result<(ComposeHash, AppId, Option<String>, Option<String>), ApiError> {
     if value.get("init_data").is_none() {
         let p: RevisionPayload = payload(value)?;
@@ -205,7 +206,7 @@ fn revision_payload(
             "digest is not the init-data's {digest}"
         )));
     }
-    check_kata_policy(&init_data, kata_policy, "malformed")?;
+    check_kata_policy(&init_data, doc, "malformed")?;
     Ok((digest, p.app_id, None, Some(p.init_data)))
 }
 
@@ -215,17 +216,19 @@ fn revision_payload(
 /// pin at all is always `policy_denied`.
 pub(crate) fn check_kata_policy(
     init_data: &alpha_core::InitData,
-    kata_policy: Option<&KataPolicy>,
+    doc: Option<&PlatformDocument>,
     miss: &'static str,
 ) -> Result<(), ApiError> {
-    let pinned = kata_policy.ok_or_else(|| {
-        ApiError::new(
-            "policy_denied",
-            "the platform document pins no Kata agent policy",
-        )
-    })?;
+    let (pinned, kms_ca_pem) = doc
+        .and_then(|d| Some((d.kata_policy.as_ref()?, d.kms_ca_pem.as_str())))
+        .ok_or_else(|| {
+            ApiError::new(
+                "policy_denied",
+                "the platform document pins no Kata agent policy",
+            )
+        })?;
     init_data
-        .check_policy(pinned)
+        .check_policy(pinned, kms_ca_pem)
         .map_err(|e| ApiError::new(miss, e.to_string()))
 }
 
@@ -236,9 +239,8 @@ pub async fn register_revision(
     audited_route!(node, body, request, "revision.register", async {
         let keys = node.intermediates()?;
         let doc = node.platform_document();
-        let kata_policy = doc.as_deref().and_then(|d| d.kata_policy.as_ref());
         let (compose_hash, app_id, compose, init_data) =
-            revision_payload(&body.payload, kata_policy)?;
+            revision_payload(&body.payload, doc.as_deref())?;
         let chain = authorize(&node, &keys, context::REVISION, &body, node.now_utc()).await?;
         let org_id = chain.key.org_id;
         let mut tx = node.pool.begin().await?;

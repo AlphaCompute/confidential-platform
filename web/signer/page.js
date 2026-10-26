@@ -848,7 +848,9 @@ async function startApproval(view, viewText, ticket) {
   // Built before any Secret is stored: a launch the KMS would not register stops here.
   try {
     const policy = JSON.stringify(view.kata_policy ?? null);
-    launch.payload = JSON.parse(wasm_bindgen.revisionPayload(read.app_id, launch.compose, policy));
+    launch.payload = JSON.parse(
+      wasm_bindgen.revisionPayload(read.app_id, launch.compose, policy, view.kms_ca_pem),
+    );
   } catch (_) {
     return stop(MESSAGES.not_registrable);
   }
