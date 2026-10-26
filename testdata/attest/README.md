@@ -59,6 +59,12 @@ The policy came from the Kata 4.0.0 release `genpolicy` (`kata-tools-static-4.0.
 
 `collateral.json` is Intel's, fetched once for the first five quotes (they share one platform) from the PCS with `cargo run -p alpha-attest --example fetch_collateral -- https://api.trustedservices.intel.com <quote.hex>`, after the hex quote was written with `xxd -p <quote> | tr -d '\n'`. `captured_at.txt` is the time the fetch finished, and the tests verify at that time.
 
+`b300-kata-kbs` holds one KBS handshake of the guest's attestation agent, read by `services/alpha-kms/tests/kbs.rs`. A `kata-qemu-tdx` pod (1 vCPU, 2048 MiB, Kata 4.0.0 on the B300 host, 2026-10-26) booted with an init-data that `alpha coco render` wrote for its pod spec, plus the registry credential template of `alpha_core::registry_auth("regcred", kms_ca_pem)`. A stand-in KBS answered at `kms.alpha-kms.svc:8443` with a certificate under that CA, through a DNS stand-in the pod named in `dnsConfig`. The stand-in answered `/kbs/v0/auth` with the nonce a KMS mints at `captured_at.txt` when its tenant-kek-root is `tenant_kek_root.hex`, and it refused the attestation after it recorded the request:
+
+- `attest.json` — the agent's `POST /kbs/v0/attest` body byte for byte: the init-data, the nonce and TEE key, and the TDX quote with its CCEL. The additional evidence is empty;
+- `platform-document.json` — the Kata reference values and agent policy of the stand's platform document v7, and `kms_ca_pem`, the CA of the stand-in;
+- `collateral.json` — Intel's collateral for the quote, fetched from the PCS before `captured_at.txt`.
+
 ## GPU evidence on owned hardware
 
 `b300-gpu-595.58.03` holds the evidence of two B300 GPUs (driver 595.58.03, VBIOS 97.10.52.00.17), each passed through to its own `kata-qemu-nvidia-gpu-tdx` pod, read by `crates/alpha-attest/tests/gpu.rs`. Each was taken inside the pod with NVML's `nvmlDeviceGetConfComputeGpuAttestationReport` over a verifier challenge:

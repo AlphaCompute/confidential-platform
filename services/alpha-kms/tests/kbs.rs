@@ -13,12 +13,16 @@ mod common;
 
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit};
-use alpha_core::{AppId, ComposeHash, InitData, context};
+use std::sync::Arc;
+
+use alpha_core::{AppId, ComposeHash, InitData, OrgId, context};
 use alpha_kms::kbs::{self, Claims};
+use alpha_kms::keys::aead_seal;
 use alpha_kms::rfc3339;
 use base64::Engine;
 use base64::prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
 use common::*;
+use ed25519_dalek::SigningKey;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -281,4 +285,136 @@ async fn attest_binds_the_quote_to_the_nonce_and_tee_key_of_the_handshake() {
     let audited = h.audit("kbs.attest").await;
     assert_eq!(audited.len(), 3);
     assert!(audited.iter().all(|(_, outcome, _)| outcome == "denied"));
+}
+
+/// The data hub's handshake captured on B300, whose nonce a KMS holding its tenant-kek-root minted.
+const CAPTURE: &str = "b300-kata-kbs";
+
+/// A node at the capture's time and collateral, serving from a root that wraps the capture's
+/// tenant-kek-root, with the capture's reference values, agent policy and KMS CA in its document.
+async fn capture_harness() -> Option<Harness> {
+    let pool = fresh_database().await?;
+    let mut document = platform_document(KEYED);
+    for (field, value) in platform_document(CAPTURE).as_object().unwrap() {
+        document[field] = value.clone();
+    }
+    let release = ReleaseServer::start(document).await;
+    let now = captured_at(CAPTURE);
+    let (node, url, shutdown) = start_node(
+        pool.clone(),
+        &release.url,
+        &release.key,
+        Arc::new(move || now),
+        CAPTURE,
+    )
+    .await;
+    let root = [0x52u8; 32];
+    let tenant_kek_root: [u8; 32] =
+        alpha_core::hex_bytes(text(CAPTURE, "tenant_kek_root.hex").trim()).unwrap();
+    let (ca_key, ca_cert) = alpha_kms::certs::new_ca(now).unwrap();
+    sqlx::query(
+        "insert into intermediate_keys (purpose, wrapped, public_part) values
+           ('tenant-kek-root', $1, null), ('ca', $2, $3)",
+    )
+    .bind(aead_seal(&root, b"tenant-kek-root", &tenant_kek_root).unwrap())
+    .bind(aead_seal(&root, b"ca", &ca_key).unwrap())
+    .bind(ca_cert)
+    .execute(&pool)
+    .await
+    .unwrap();
+    alpha_kms::node::serve_from_root(&node, &root)
+        .await
+        .unwrap();
+    let org = OrgId::mint();
+    let root_key = SigningKey::from_bytes(&[7u8; 32]);
+    let (status, reply) = send(
+        client()
+            .post(format!("{url}/v1/keys"))
+            .json(&root_key_registration(org, &root_key, now)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    Some(Harness {
+        node,
+        pool,
+        url,
+        release,
+        org,
+        root: (reply["id"].as_str().unwrap().parse().unwrap(), root_key),
+        custodians: vec![],
+        shares: vec![],
+        bootstrap: Value::Null,
+        dir: std::env::temp_dir().join(format!("alpha-harness-{}", uuid::Uuid::now_v7())),
+        ca_pem: String::new(),
+        _shutdown: shutdown,
+    })
+}
+
+#[tokio::test]
+async fn a_guests_data_hub_attests_and_gets_its_registry_credential() {
+    let Some(h) = capture_harness().await else {
+        return;
+    };
+    let admin = h.register_key(&h.root, 41).await;
+    let request: Value = serde_json::from_slice(&read(CAPTURE, "attest.json")).unwrap();
+    let init_data =
+        InitData::parse(request["init-data"]["body"].as_str().unwrap().to_owned()).unwrap();
+    let app = init_data.app_id().unwrap();
+    let digest = init_data.digest();
+    let payload =
+        json!({ "app_id": app, "init_data": request["init-data"]["body"], "digest": digest });
+    let (status, reply) = h
+        .post(
+            "/v1/revisions",
+            h.signed(context::REVISION, payload, &admin),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let (status, put) = h
+        .put_secret("regcred", &[app], VALUE, h.now(), &admin)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{put}");
+
+    // The agent hashes the additional evidence into report_data too, empty as it is on a CPU TD.
+    let mut padded = request.clone();
+    padded["tee-evidence"]["additional_evidence"] = json!("{}");
+    let (status, reply) = h.post("/kbs/v0/attest", padded).await;
+    assert_eq!(
+        (status, reply["type"].as_str()),
+        (StatusCode::FORBIDDEN, Some("attestation_failed")),
+        "{reply}"
+    );
+
+    let (status, reply) = h.post("/kbs/v0/attest", request.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let token = reply["token"].as_str().unwrap();
+    let claims: Value = serde_json::from_slice(
+        &BASE64_URL_SAFE_NO_PAD
+            .decode(token.split('.').nth(1).unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(claims["revision"], json!(digest));
+    assert_eq!(claims["tee-pubkey"], request["runtime-data"]["tee-pubkey"]);
+
+    let (status, jwe) = resource(&h, "alpha/secret/regcred", Some(token)).await;
+    assert_eq!(status, StatusCode::OK, "{jwe}");
+    let header: Value = serde_json::from_slice(
+        &BASE64_URL_SAFE_NO_PAD
+            .decode(jwe["protected"].as_str().unwrap())
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        (&header["alg"], &header["enc"]),
+        (&json!("ECDH-ES+A256KW"), &json!("A256GCM"))
+    );
+
+    let attested: Vec<_> = h
+        .audit("kbs.attest")
+        .await
+        .into_iter()
+        .map(|(_, outcome, _)| outcome)
+        .collect();
+    assert_eq!(attested, ["denied", "ok"]);
 }
