@@ -112,10 +112,6 @@ pub async fn fresh_database() -> Option<PgPool> {
         .await
         .unwrap();
     alpha_kms::migrate(&pool).await.unwrap();
-    sqlx::query("select pg_advisory_unlock(0)")
-        .execute(&admin)
-        .await
-        .unwrap();
     Some(pool)
 }
 
