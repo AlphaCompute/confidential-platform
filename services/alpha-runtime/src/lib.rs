@@ -899,8 +899,9 @@ impl Runtime {
 
     /// Serves the socket, renews the leaf, keeps the declared Secret files under
     /// `secrets_root` current and, given `tls` and an upstream, proxies the Endpoint until
-    /// `shutdown` resolves or the Revision is revoked. Socket connections drain either way;
-    /// proxied ones drain on shutdown and are cut on revocation.
+    /// `shutdown` resolves, the Revision is revoked or the leaf expires behind a stuck quote.
+    /// Socket connections drain, except after a stuck quote; proxied ones drain on shutdown
+    /// and are cut otherwise.
     pub async fn run(
         self: Arc<Self>,
         listener: UnixListener,
@@ -935,7 +936,11 @@ impl Runtime {
         delivery.abort();
         let _ = stop.send(());
         let _ = stop_proxy.send(exit);
-        let _ = server.await;
+        if exit == Exit::QuoteStuck {
+            server.abort();
+        } else {
+            let _ = server.await;
+        }
         if let Some(proxy) = proxy {
             let _ = proxy.await;
         }
