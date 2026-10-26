@@ -47,12 +47,6 @@ impl From<u16> for Field {
     }
 }
 
-impl From<usize> for Field {
-    fn from(value: usize) -> Self {
-        Field(Value::from(value))
-    }
-}
-
 impl From<bool> for Field {
     fn from(value: bool) -> Self {
         Field(Value::from(value))
