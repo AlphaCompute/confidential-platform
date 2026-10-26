@@ -110,7 +110,9 @@ async fn run() -> Result<(), Error> {
         keys_key,
         usage_tasks: Default::default(),
     });
-    let app = router(state.clone());
+    let app = alpha_client::metrics::serve(router(state.clone()))
+        .await
+        .map_err(|e| Error::internal(format!("metrics: {e}")))?;
 
     let listener = TcpListener::bind(("0.0.0.0", PORT))
         .await

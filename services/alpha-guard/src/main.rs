@@ -62,7 +62,9 @@ async fn run() -> Result<(), Error> {
         inference_bearer: parking_lot::RwLock::new(read_bearer(&runtime).await?),
         front,
     });
-    let app = router(state.clone());
+    let app = alpha_client::metrics::serve(router(state.clone()))
+        .await
+        .map_err(|e| Error::internal(format!("metrics: {e}")))?;
 
     let listener = TcpListener::bind(("0.0.0.0", PORT))
         .await

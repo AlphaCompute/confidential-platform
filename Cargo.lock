@@ -188,6 +188,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-rustls",
+ "tower",
  "x509-parser",
  "zeroize",
 ]

@@ -12,7 +12,7 @@ alpha-attest = { path = "../alpha-attest" }
 alpha-channel = { path = "../alpha-channel" }
 alpha-core = { path = "../alpha-core" }
 alpha-crypto = { path = "../alpha-crypto" }
-axum = { version = "0.8", default-features = false }
+axum = { version = "0.8", default-features = false, features = ["http1", "matched-path", "tokio"] }
 base64 = "0.23"
 ed25519-dalek = { version = "3", features = ["pkcs8", "alloc"] }
 http-body-util = "0.1"
@@ -34,4 +34,5 @@ zeroize = { version = "1", features = ["serde"] }
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
 x509-parser = "0.18"

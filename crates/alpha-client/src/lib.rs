@@ -12,6 +12,7 @@
         clippy::arithmetic_side_effects
     )
 )]
+pub mod metrics;
 pub mod platform;
 pub mod runtime;
 pub mod tls;

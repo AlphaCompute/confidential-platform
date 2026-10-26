@@ -113,7 +113,9 @@ async fn run() -> Result<(), Error> {
         responder: parking_lot::RwLock::new(channel::responder(&identity)?),
         channels: Default::default(),
     });
-    let app = router(state.clone());
+    let app = alpha_client::metrics::serve(router(state.clone()))
+        .await
+        .map_err(|e| Error::internal(format!("metrics: {e}")))?;
 
     let listener = TcpListener::bind(("0.0.0.0", PORT))
         .await

@@ -10,8 +10,8 @@ use tokio::net::TcpListener;
 
 const LISTEN: &str = "0.0.0.0:8443";
 
-// ponytail: eprintln and no metrics; the external log/metrics receiver with
-// runtime_pubkey_sha256 on every line is chosen at the first deploy.
+// ponytail: eprintln, and metrics on loopback only, which nothing outside a Kata pod reaches; the
+// upgrade is a collector App that scrapes and receives both with runtime_pubkey_sha256 added.
 #[tokio::main]
 async fn main() {
     if let Err(e) = run().await {
@@ -71,7 +71,9 @@ async fn run() -> Result<(), String> {
     let listener = TcpListener::bind(LISTEN)
         .await
         .map_err(|e| format!("bind {LISTEN}: {e}"))?;
-    let app = alpha_kms::router(node.clone());
+    let app = alpha_client::metrics::serve(alpha_kms::router(node.clone()))
+        .await
+        .map_err(|e| format!("metrics: {e}"))?;
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| format!("SIGTERM handler: {e}"))?;
     let shutdown = async move {
