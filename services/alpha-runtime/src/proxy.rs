@@ -10,7 +10,7 @@ use alpha_client::tls;
 use alpha_core::AppId;
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::http::header::{CONTENT_TYPE, HeaderName};
+use axum::http::header::CONTENT_TYPE;
 use rustls::pki_types::CertificateDer;
 use rustls::server::{
     ClientHello, NoServerSessionStorage, ResolvesServerCert, WebPkiClientVerifier,
@@ -112,7 +112,11 @@ impl Endpoint {
             .route("/leaf", axum::routing::get(leaf_chain))
             .with_state(runtime.clone());
         if let Some(path) = config.tls_ready.clone() {
-            probe = probe.merge(ready_router(runtime.clone(), upstream.clone(), path));
+            probe = probe.merge(
+                axum::Router::new()
+                    .route("/ready", axum::routing::get(ready))
+                    .with_state(Arc::new((runtime.clone(), upstream.clone(), path))),
+            );
         }
         let probe = (bind_tcp(probe_addr).await?, probe);
         let acceptor = TlsAcceptor::from(server_config(runtime)?);
@@ -217,23 +221,17 @@ async fn proxy(acceptor: TlsAcceptor, tcp: TcpStream, upstream: String, callers:
 /// The PEM chain the Endpoint presents now, leaf first; it is public, as every handshake shows it.
 async fn leaf_chain(
     State(runtime): State<Arc<Runtime>>,
-) -> Result<([(HeaderName, &'static str); 1], String), StatusCode> {
+) -> Result<impl axum::response::IntoResponse, StatusCode> {
     let attested = runtime.attested().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let chain = attested
         .chain_pem
         .iter()
         .map(|pem| format!("{}\n", pem.trim_end()))
-        .collect();
+        .collect::<String>();
     Ok(([(CONTENT_TYPE, "application/pem-certificate-chain")], chain))
 }
 
 type Ready = (Arc<Runtime>, String, String);
-
-fn ready_router(runtime: Arc<Runtime>, upstream: String, path: String) -> axum::Router {
-    axum::Router::new()
-        .route("/ready", axum::routing::get(ready))
-        .with_state(Arc::new((runtime, upstream, path)))
-}
 
 /// 200 only while the leaf is current and the upstream answers its own path with a 2xx now.
 async fn ready(State(state): State<Arc<Ready>>) -> StatusCode {
