@@ -32,18 +32,19 @@ pub async fn instance(
         "app_id": sans.app_id,
         "revision": sans.compose_hash,
         "runtime_pubkey_sha256": sans.runtime_pubkey_sha256_hex,
-        "appraisal": appraisal(&leaf, &doc.kms_ca_pem, SystemTime::now())?,
+        "appraisal": appraisal(&leaf, &doc.kms_ca_pem)?,
     }))
 }
 
 /// The KMS appraised the Instance when it issued the leaf, under the platform document it held
 /// then; a leaf from a KMS before the appraisal extension says `absent`.
-fn appraisal(leaf: &[u8], kms_ca_pem: &str, now: SystemTime) -> Result<Value, String> {
+fn appraisal(leaf: &[u8], kms_ca_pem: &str) -> Result<Value, String> {
     let Some(appraisal) = cert::leaf_appraisal(leaf).map_err(|e| e.to_string())? else {
         return Ok(json!("absent"));
     };
     let ca = tls::cert_from_pem(kms_ca_pem).map_err(|e| e.to_string())?;
-    let (appraised_at, not_after) = cert::verify_leaf(leaf, &ca, now).map_err(|e| e.to_string())?;
+    let (appraised_at, not_after) =
+        cert::verify_leaf(leaf, &ca, SystemTime::now()).map_err(|e| e.to_string())?;
     Ok(json!({
         "tcb_status": appraisal.tcb_status,
         "advisories": appraisal.advisories,
