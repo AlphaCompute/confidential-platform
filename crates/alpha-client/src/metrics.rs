@@ -1,36 +1,19 @@
 //! Prometheus families of a service, served as text on `127.0.0.1:9464/metrics`. Labels come
 //! from the route template and the response status only, never from a request's content.
 
-use std::sync::LazyLock;
+use std::collections::BTreeMap;
+use std::fmt::Write;
 
 use axum::Router;
 use axum::extract::{MatchedPath, Request};
 use axum::middleware::Next;
 use axum::response::Response;
 use axum::routing::get;
-use prometheus_client::encoding::EncodeLabelSet;
-use prometheus_client::metrics::counter::Counter;
-use prometheus_client::metrics::family::Family;
-use prometheus_client::registry::Registry;
+use parking_lot::Mutex;
 use tokio::net::TcpListener;
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-struct RouteStatus {
-    route: String,
-    status: u16,
-}
-
-struct Metrics {
-    registry: Registry,
-    requests: Family<RouteStatus, Counter>,
-}
-
-static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
-    let requests = Family::<RouteStatus, Counter>::default();
-    let mut registry = Registry::with_prefix("alpha");
-    registry.register("http_requests", "HTTP responses", requests.clone());
-    Metrics { registry, requests }
-});
+/// Responses by route template and status.
+static REQUESTS: Mutex<BTreeMap<(String, u16), u64>> = Mutex::new(BTreeMap::new());
 
 async fn record(request: Request, next: Next) -> Response {
     let route = request
@@ -39,20 +22,26 @@ async fn record(request: Request, next: Next) -> Response {
         .map_or("other", MatchedPath::as_str)
         .to_owned();
     let response = next.run(request).await;
-    METRICS
-        .requests
-        .get_or_create(&RouteStatus {
-            route,
-            status: response.status().as_u16(),
-        })
-        .inc();
+    let mut requests = REQUESTS.lock();
+    let count = requests
+        .entry((route, response.status().as_u16()))
+        .or_default();
+    *count = count.saturating_add(1);
     response
 }
 
+/// Route templates come from code and hold no `"`, `\` or newline, so they need no escaping.
 fn text() -> String {
-    let mut text = String::new();
-    // Writing to a String fails only on a label encoder error, which the derived sets lack.
-    let _ = prometheus_client::encoding::text::encode(&mut text, &METRICS.registry);
+    let mut text = String::from(
+        "# HELP alpha_http_requests_total HTTP responses\n\
+         # TYPE alpha_http_requests_total counter\n",
+    );
+    for ((route, status), count) in REQUESTS.lock().iter() {
+        let _ = writeln!(
+            text,
+            "alpha_http_requests_total{{route=\"{route}\",status=\"{status}\"}} {count}"
+        );
+    }
     text
 }
 

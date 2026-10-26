@@ -20,7 +20,6 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "server-graceful", "service", "tokio"] }
 p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
 parking_lot = "0.12"
-prometheus-client = "0.25"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 serde = { version = "1", features = ["derive"] }
