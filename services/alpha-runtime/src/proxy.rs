@@ -108,16 +108,11 @@ impl Endpoint {
             return Ok(None);
         };
         let callers = config.tls_callers.clone().into();
-        let mut probe = axum::Router::new()
-            .route("/leaf", axum::routing::get(leaf_chain))
-            .with_state(runtime.clone());
-        if let Some(path) = config.tls_ready.clone() {
-            probe = probe.merge(
-                axum::Router::new()
-                    .route("/ready", axum::routing::get(ready))
-                    .with_state(Arc::new((runtime.clone(), upstream.clone(), path))),
-            );
+        let mut probe = axum::Router::new().route("/leaf", axum::routing::get(leaf_chain));
+        if config.tls_ready.is_some() {
+            probe = probe.route("/ready", axum::routing::get(ready));
         }
+        let probe = probe.with_state(runtime.clone());
         let probe = (bind_tcp(probe_addr).await?, probe);
         let acceptor = TlsAcceptor::from(server_config(runtime)?);
         Ok(Some(Self {
@@ -231,11 +226,12 @@ async fn leaf_chain(
     Ok(([(CONTENT_TYPE, "application/pem-certificate-chain")], chain))
 }
 
-type Ready = (Arc<Runtime>, String, String);
-
 /// 200 only while the leaf is current and the upstream answers its own path with a 2xx now.
-async fn ready(State(state): State<Arc<Ready>>) -> StatusCode {
-    let (runtime, upstream, path) = state.as_ref();
+async fn ready(State(runtime): State<Arc<Runtime>>) -> StatusCode {
+    let config = runtime.config();
+    let (Some(upstream), Some(path)) = (&config.tls_upstream, &config.tls_ready) else {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    };
     if runtime.attested().is_some() && upstream_answers(upstream, path).await {
         StatusCode::OK
     } else {
