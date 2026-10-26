@@ -136,8 +136,9 @@ Do these steps on each TDX host, as root, after the platform is registered with 
 3. **Register the platform with the PCCS.** The PCCS gets all PCK certificates of the platform
    from Intel during this call. This step is necessary: QCNL sends no encrypted PPID, so the PCCS
    cannot get the certificates by itself. Do not set `REQ` mode: PCCS 1.27.101.1 fails the
-   registration when Intel marks a TCB level of the platform "Not available". The PCCS refreshes
-   the collateral from Intel each day, so the host needs access to Intel PCS.
+   registration when Intel marks a TCB level of the platform "Not available". Each day, the PCCS
+   refreshes the TCB info, the CRLs and the QE identities from Intel, so the host needs access
+   to Intel PCS. This refresh does not get new PCK certificates; only a registration does.
 
    ```sh
    /opt/intel/sgx-pck-id-retrieval-tool/PCKIDRetrievalTool
