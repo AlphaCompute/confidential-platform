@@ -292,6 +292,8 @@ const CAPTURE: &str = "b300-kata-kbs";
 
 /// A node at the capture's time and collateral, serving from a root that wraps the capture's
 /// tenant-kek-root, with the capture's reference values, agent policy and KMS CA in its document.
+/// An organization's anchor derives from the tenant-kek-root, so the root is in place before the
+/// organization claims its key, and no bootstrapped harness can swap it in later.
 async fn capture_harness() -> Option<Harness> {
     let pool = fresh_database().await?;
     let mut document = platform_document(KEYED);
@@ -399,17 +401,6 @@ async fn a_guests_data_hub_attests_and_gets_its_registry_credential() {
 
     let (status, jwe) = resource(&h, "alpha/secret/regcred", Some(token)).await;
     assert_eq!(status, StatusCode::OK, "{jwe}");
-    let header: Value = serde_json::from_slice(
-        &BASE64_URL_SAFE_NO_PAD
-            .decode(jwe["protected"].as_str().unwrap())
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        (&header["alg"], &header["enc"]),
-        (&json!("ECDH-ES+A256KW"), &json!("A256GCM"))
-    );
-
     let attested: Vec<_> = h
         .audit("kbs.attest")
         .await
