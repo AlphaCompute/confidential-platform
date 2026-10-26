@@ -15,14 +15,13 @@ use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit};
 use std::sync::Arc;
 
-use alpha_core::{AppId, ComposeHash, InitData, OrgId, context};
+use alpha_core::{AppId, ComposeHash, InitData, context};
 use alpha_kms::kbs::{self, Claims};
 use alpha_kms::keys::aead_seal;
 use alpha_kms::rfc3339;
 use base64::Engine;
 use base64::prelude::{BASE64_STANDARD, BASE64_URL_SAFE_NO_PAD};
 use common::*;
-use ed25519_dalek::SigningKey;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -327,22 +326,14 @@ async fn capture_harness() -> Option<Harness> {
     alpha_kms::node::serve_from_root(&node, &root)
         .await
         .unwrap();
-    let org = OrgId::mint();
-    let root_key = SigningKey::from_bytes(&[7u8; 32]);
-    let (status, reply) = send(
-        client()
-            .post(format!("{url}/v1/keys"))
-            .json(&root_key_registration(org, &root_key, now)),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{reply}");
+    let (org, root) = claim_org(&url, now).await;
     Some(Harness {
         node,
         pool,
         url,
         release,
         org,
-        root: (reply["id"].as_str().unwrap().parse().unwrap(), root_key),
+        root,
         custodians: vec![],
         shares: vec![],
         bootstrap: Value::Null,

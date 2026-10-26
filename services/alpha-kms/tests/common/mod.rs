@@ -309,6 +309,23 @@ pub async fn kata_harness() -> Option<Harness> {
     harness_on(Arc::new(move || now), KATA, document).await
 }
 
+/// A new organization claims its identifier with a root key that signs for itself.
+pub async fn claim_org(base: &str, now: SystemTime) -> (OrgId, (KeyId, SigningKey)) {
+    let org = OrgId::mint();
+    let root_key = SigningKey::from_bytes(&[7u8; 32]);
+    let (status, reply) = send(
+        client()
+            .post(format!("{base}/v1/keys"))
+            .json(&root_key_registration(org, &root_key, now)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    (
+        org,
+        (reply["id"].as_str().unwrap().parse().unwrap(), root_key),
+    )
+}
+
 pub async fn harness_on(clock: Clock, collateral_of: &str, document: Value) -> Option<Harness> {
     let pool = fresh_database().await?;
     let release = ReleaseServer::start(document).await;
@@ -334,16 +351,7 @@ pub async fn harness_on(clock: Clock, collateral_of: &str, document: Value) -> O
     )
     .await
     .unwrap();
-    let org = OrgId::mint();
-    let root_key = SigningKey::from_bytes(&[7u8; 32]);
-    let (status, reply) = send(
-        client()
-            .post(format!("{base}/v1/keys"))
-            .json(&root_key_registration(org, &root_key, node.now())),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{reply}");
-    let root_id: KeyId = reply["id"].as_str().unwrap().parse().unwrap();
+    let (org, root) = claim_org(&base, node.now()).await;
     let shares = (1..=3)
         .zip(&custodians)
         .map(|(i, custodian)| {
@@ -364,7 +372,7 @@ pub async fn harness_on(clock: Clock, collateral_of: &str, document: Value) -> O
         url: base,
         release,
         org,
-        root: (root_id, root_key),
+        root,
         custodians,
         shares,
         ca_pem: bootstrap["kms_ca_pem"].as_str().unwrap().to_owned(),
