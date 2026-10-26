@@ -39,7 +39,7 @@ async fn run() -> Result<(), &'static str> {
     let pool_options = PgPoolOptions::new().max_connections(8);
     let pool = match config.substrate {
         Substrate::Kata => {
-            check_kata_database(&options).map_err(|_| "config")?;
+            check_kata_database(&options).map_err(|_| "kata_database_auth")?;
             pool_options.connect_lazy_with(options)
         }
         Substrate::Dstack => pool_options

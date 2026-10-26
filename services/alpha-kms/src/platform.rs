@@ -136,7 +136,7 @@ pub async fn start(node: &Node) {
         }
     }
     if let Err(e) = reload(node).await {
-        alpha_client::warn!("platform_document_fetch_failed", error = e.code);
+        alpha_client::warn!("platform_document_reload_failed", error = e.code);
     }
 }
 
@@ -153,7 +153,7 @@ pub async fn run(node: Arc<Node>) {
         loop {
             tokio::time::sleep(RELOAD_EVERY).await;
             if let Err(e) = reload(&node).await {
-                alpha_client::warn!("platform_document_fetch_failed", error = e.code);
+                alpha_client::warn!("platform_document_reload_failed", error = e.code);
             }
         }
     };

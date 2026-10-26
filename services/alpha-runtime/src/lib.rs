@@ -799,7 +799,7 @@ impl Runtime {
                     alpha_client::error!(
                         "secret_write_failed",
                         secret = Field::text(name),
-                        service = Field::text(service),
+                        target_service = Field::text(service),
                         error = e.kind(),
                     );
                     if incomplete.last() != Some(name) {

@@ -62,8 +62,18 @@ impl From<std::io::ErrorKind> for Field {
     }
 }
 
+/// chrono's own conversions panic on a clock before 1970; this clamps it to the epoch.
+fn utc(t: SystemTime) -> chrono::DateTime<chrono::Utc> {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| {
+            chrono::DateTime::from_timestamp(i64::try_from(d.as_secs()).ok()?, d.subsec_nanos())
+        })
+        .unwrap_or_default()
+}
+
 pub fn rfc3339(t: SystemTime) -> String {
-    chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    utc(t).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 impl From<SystemTime> for Field {
@@ -94,7 +104,7 @@ pub fn line(
         .into_iter()
         .map(|(key, Field(value))| (key.to_owned(), value))
         .collect();
-    let ts = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let ts = utc(SystemTime::now()).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     object.insert("ts".into(), ts.into());
     object.insert("level".into(), level.into());
     object.insert("service".into(), service.into());
