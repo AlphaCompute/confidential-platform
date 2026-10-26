@@ -336,11 +336,7 @@ async fn attest_inner(
             advisories: appraised.advisories.clone(),
             policy_version: appraised.policy_version,
             os_image: appraised.os_image.clone(),
-            gpu_count: appraised
-                .gpu_serials
-                .len()
-                .try_into()
-                .map_err(|_| ApiError::internal("gpu count does not fit the appraisal"))?,
+            gpu_count: appraised.gpu_serials.len(),
         }),
         now,
     )?;

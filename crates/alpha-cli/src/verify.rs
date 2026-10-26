@@ -45,15 +45,12 @@ fn appraisal(leaf: &[u8], kms_ca_pem: &str) -> Result<Value, String> {
     let ca = tls::cert_from_pem(kms_ca_pem).map_err(|e| e.to_string())?;
     let (appraised_at, not_after) =
         cert::verify_leaf(leaf, &ca, SystemTime::now()).map_err(|e| e.to_string())?;
-    Ok(json!({
-        "tcb_status": appraisal.tcb_status,
-        "advisories": appraisal.advisories,
-        "policy_version": appraisal.policy_version,
-        "os_image": appraisal.os_image,
-        "gpu_count": appraisal.gpu_count,
-        "appraised_at": rfc3339(appraised_at),
-        "not_after": rfc3339(not_after),
-    }))
+    let mut out = serde_json::to_value(&appraisal).map_err(|e| e.to_string())?;
+    if let Some(object) = out.as_object_mut() {
+        object.insert("appraised_at".into(), rfc3339(appraised_at).into());
+        object.insert("not_after".into(), rfc3339(not_after).into());
+    }
+    Ok(out)
 }
 
 /// The SANs and the DER of the Instance leaf `url` presents under the KMS CA, refused unless the

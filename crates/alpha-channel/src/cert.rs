@@ -112,7 +112,7 @@ pub struct LeafAppraisal {
     pub advisories: Vec<String>,
     pub policy_version: u64,
     pub os_image: String,
-    pub gpu_count: u64,
+    pub gpu_count: usize,
 }
 
 impl LeafAppraisal {
