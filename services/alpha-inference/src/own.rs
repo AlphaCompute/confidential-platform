@@ -191,7 +191,7 @@ impl Server {
                 "completion",
                 model = Field::text(model),
                 revision = revision,
-                status = response.status().as_u16(),
+                status = u64::from(response.status().as_u16()),
                 duration_ms = duration_ms,
             ),
             Err(_) => alpha_client::warn!(

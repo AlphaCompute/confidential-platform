@@ -26,10 +26,6 @@ pub fn router(runtime: Arc<Runtime>) -> Router {
         .with_state(runtime)
 }
 
-pub fn rfc3339(t: std::time::SystemTime) -> String {
-    chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-}
-
 fn envelope(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
     let body = json!({ "error": {
         "code": code, "message": message.into(), "request_id": RequestId::mint(),
@@ -101,7 +97,7 @@ async fn key(
 pub fn healthz_json(runtime: &Runtime) -> Value {
     json!({
         "attested": runtime.attested().is_some(),
-        "cert_not_after": runtime.last().map(|a| rfc3339(a.not_after)),
+        "cert_not_after": runtime.last().map(|a| alpha_client::log::rfc3339(a.not_after)),
     })
 }
 

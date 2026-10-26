@@ -41,12 +41,6 @@ impl From<u64> for Field {
     }
 }
 
-impl From<u16> for Field {
-    fn from(value: u16) -> Self {
-        Field(Value::from(value))
-    }
-}
-
 impl From<bool> for Field {
     fn from(value: bool) -> Self {
         Field(Value::from(value))
@@ -68,12 +62,13 @@ impl From<std::io::ErrorKind> for Field {
     }
 }
 
+pub fn rfc3339(t: SystemTime) -> String {
+    chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
 impl From<SystemTime> for Field {
     fn from(value: SystemTime) -> Self {
-        Field(Value::from(
-            chrono::DateTime::<chrono::Utc>::from(value)
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-        ))
+        Field(Value::from(rfc3339(value)))
     }
 }
 
