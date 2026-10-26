@@ -33,6 +33,7 @@ async fn instance_serving(hash: alpha_core::ComposeHash) -> (String, String) {
         &ca_cert,
         &runtime.subject_public_key_info(),
         sans,
+        None,
         now,
     )
     .unwrap();

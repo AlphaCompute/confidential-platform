@@ -387,6 +387,12 @@ async fn runtime_attests_with_the_captures_key_and_serves_the_three_routes() {
         (sans.org_id, sans.app_id, sans.compose_hash),
         (h.org, app, hash)
     );
+    let result = &identity["attestation_result"];
+    let appraisal = alpha_channel::cert::leaf_appraisal(&leaf).unwrap().unwrap();
+    assert_eq!(json!(appraisal.tcb_status), result["tcb_status"]);
+    assert_eq!(json!(appraisal.advisories), result["advisories"]);
+    assert_eq!(json!(appraisal.policy_version), result["policy_version"]);
+    assert_eq!(json!(appraisal.os_image), result["os_image"]);
     assert_eq!(
         tls::spki_of(&leaf).unwrap(),
         read(KEYED, "runtime_spki.der")
@@ -1246,6 +1252,7 @@ async fn runtime_refuses_another_ca_or_an_unlisted_revision_and_tries_the_next_e
         &other_ca,
         &server_key.subject_public_key_info(),
         certs::node_sans(h.node.compose_hash),
+        None,
         h.now(),
     )
     .unwrap();
@@ -1284,6 +1291,7 @@ async fn runtime_refuses_another_ca_or_an_unlisted_revision_and_tries_the_next_e
             &"0".repeat(64),
             h.node.compose_hash,
         ),
+        None,
         h.now(),
     )
     .unwrap();

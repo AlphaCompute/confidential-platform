@@ -725,6 +725,7 @@ impl Ca {
             &self.cert,
             &runtime.subject_public_key_info(),
             sans,
+            None,
             now,
         )
         .unwrap();

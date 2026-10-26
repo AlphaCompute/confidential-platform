@@ -1257,6 +1257,7 @@ fn leaf_client(h: &Harness, app: AppId, hash: ComposeHash) -> reqwest::Client {
         &keys.ca_cert_der,
         &spki,
         sans,
+        None,
         h.now(),
     )
     .unwrap();
