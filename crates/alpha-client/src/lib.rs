@@ -12,6 +12,7 @@
         clippy::arithmetic_side_effects
     )
 )]
+pub mod log;
 pub mod metrics;
 pub mod platform;
 pub mod runtime;
@@ -75,6 +76,39 @@ pub struct ApiError {
 #[derive(Deserialize)]
 struct Envelope {
     error: ApiError,
+}
+
+/// The wire codes of the KMS and the runtime socket, so that a peer's code reaches a log line
+/// only as one of ours.
+const CODES: [&str; 14] = [
+    "malformed",
+    "signature_invalid",
+    "nonce_invalid",
+    "cert_invalid",
+    "attestation_failed",
+    "attestation_unknown",
+    "policy_denied",
+    "revision_revoked",
+    "already_exists",
+    "not_found",
+    "rate_limited",
+    "sealed",
+    "internal",
+    "not_attested",
+];
+
+impl Error {
+    /// The error as a closed code: a peer's code outside [`CODES`] is `other`.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Error::Api(e) => CODES
+                .into_iter()
+                .find(|code| *code == e.code)
+                .unwrap_or("other"),
+            Error::Connect(_) => "unreachable",
+            Error::Invalid(_) => "invalid",
+        }
+    }
 }
 
 pub(crate) fn api_error(endpoint: &str, status: reqwest::StatusCode, bytes: &[u8]) -> Error {

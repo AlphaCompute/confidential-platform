@@ -139,7 +139,7 @@ impl Endpoint {
         let ready = self.ready.map(|(listener, router)| {
             tokio::spawn(async move {
                 if let Err(e) = axum::serve(listener, router).await {
-                    eprintln!("alpha-runtime: readiness listener: {e}");
+                    alpha_client::error!("readiness_listener_failed", error = e.kind());
                 }
             })
         });
@@ -198,12 +198,16 @@ async fn proxy(acceptor: TlsAcceptor, tcp: TcpStream, upstream: String, callers:
     }
     let connected = timeout(CONNECT, TcpStream::connect(upstream.as_str()))
         .await
-        .map_err(|_| format!("no answer within {CONNECT:?}"))
-        .and_then(|r| r.map_err(|e| e.to_string()));
+        .map_err(|_| std::io::ErrorKind::TimedOut)
+        .and_then(|r| r.map_err(|e| e.kind()));
     let mut backend = match connected {
         Ok(backend) => backend,
-        Err(reason) => {
-            eprintln!("alpha-runtime: upstream {upstream}: {reason}");
+        Err(kind) => {
+            alpha_client::warn!(
+                "upstream_unreachable",
+                upstream = alpha_client::log::Field::text(&upstream),
+                error = kind,
+            );
             let _ = tls.shutdown().await;
             return;
         }

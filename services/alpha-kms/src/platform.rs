@@ -132,11 +132,11 @@ pub async fn start(node: &Node) {
         match load_stored(node).await {
             Ok(Some(stored)) => remember(node, stored.document),
             Ok(None) => {}
-            Err(e) => eprintln!("{}", e.message),
+            Err(e) => alpha_client::error!("platform_document_load_failed", error = e.code),
         }
     }
     if let Err(e) = reload(node).await {
-        eprintln!("platform document: {}", e.message);
+        alpha_client::warn!("platform_document_fetch_failed", error = e.code);
     }
 }
 
@@ -153,7 +153,7 @@ pub async fn run(node: Arc<Node>) {
         loop {
             tokio::time::sleep(RELOAD_EVERY).await;
             if let Err(e) = reload(&node).await {
-                eprintln!("platform document: {}", e.message);
+                alpha_client::warn!("platform_document_fetch_failed", error = e.code);
             }
         }
     };
@@ -165,7 +165,7 @@ fn renew_leaf(node: &Node) {
     if let Ok(keys) = node.intermediates()
         && let Err(e) = node.issue_own_leaf(&keys)
     {
-        eprintln!("leaf renewal: {}", e.message);
+        alpha_client::error!("leaf_renewal_failed", error = e.code);
     }
 }
 

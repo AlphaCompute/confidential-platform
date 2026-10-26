@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use alpha_client::log::Field;
 use alpha_client::tls::Pin;
 use alpha_core::ComposeHash;
 use axum::body::Bytes;
@@ -129,13 +130,16 @@ impl Server {
         }
         let live = match self.lists(model).await {
             Ok((revision, listed)) => {
-                eprintln!(
-                    "alpha-inference: probe model={model} revision={revision} listed={listed}"
+                alpha_client::info!(
+                    "probe",
+                    model = Field::text(model),
+                    revision = &revision,
+                    listed = listed,
                 );
                 listed
             }
-            Err(e) => {
-                eprintln!("alpha-inference: probe model={model} failed: {e}");
+            Err(_) => {
+                alpha_client::warn!("probe_failed", model = Field::text(model));
                 false
             }
         };
@@ -181,15 +185,20 @@ impl Server {
             .await
             .map_err(transport)
             .and_then(|response| served_revision(&response).map(|revision| (response, revision)));
-        let ms = started.elapsed().as_millis();
+        let duration_ms = started.elapsed();
         match &answered {
-            Ok((response, revision)) => eprintln!(
-                "alpha-inference: completion model={model} revision={revision} status={} duration_ms={ms}",
-                response.status().as_u16()
+            Ok((response, revision)) => alpha_client::info!(
+                "completion",
+                model = Field::text(model),
+                revision = revision,
+                status = response.status().as_u16(),
+                duration_ms = duration_ms,
             ),
-            Err(e) => {
-                eprintln!("alpha-inference: completion model={model} failed: {e} duration_ms={ms}")
-            }
+            Err(_) => alpha_client::warn!(
+                "completion_failed",
+                model = Field::text(model),
+                duration_ms = duration_ms,
+            ),
         }
         answered
             .map(|(response, _)| response)

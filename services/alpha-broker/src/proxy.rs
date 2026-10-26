@@ -449,7 +449,7 @@ async fn access_token(
             return Err(Error::ReconnectRequired);
         }
         Err(RefreshError::Other(reason)) => {
-            eprintln!("alpha-broker: refresh failed: {reason}");
+            alpha_client::warn!("refresh_failed", reason = reason);
             return Err(Error::Upstream);
         }
     };

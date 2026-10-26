@@ -26,7 +26,7 @@ async fn main() {
     let code = match run().await {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("alpha-inference: {e}");
+            alpha_client::error!("exit", error = e.code());
             1
         }
     };
@@ -68,9 +68,10 @@ async fn run() -> Result<(), Error> {
         .identity()
         .await
         .map_err(|e| Error::internal(format!("identity: {e}")))?;
-    eprintln!(
-        "alpha-inference: attested as app {} revision {}",
-        identity.app_id, identity.compose_hash
+    alpha_client::info!(
+        "attested",
+        app_id = identity.app_id,
+        revision = &identity.compose_hash,
     );
     let database_url = String::from_utf8(secret(&runtime, "database-url").await?.to_vec())
         .map_err(|_| Error::internal("database-url is not utf8"))?;
@@ -136,7 +137,7 @@ async fn run() -> Result<(), Error> {
         .await
         .is_err()
     {
-        eprintln!("alpha-inference: usage rows still unwritten at exit");
+        alpha_client::error!("usage_rows_unwritten_at_exit");
     }
     outcome
 }

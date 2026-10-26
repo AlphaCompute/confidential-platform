@@ -151,8 +151,8 @@ impl Drop for Meter {
                 .await;
                 match done {
                     Ok(_) => return,
-                    Err(e) if attempt == INSERT_TRIES => {
-                        eprintln!("alpha-inference: a usage row is lost: {e}");
+                    Err(_) if attempt == INSERT_TRIES => {
+                        alpha_client::error!("usage_row_lost");
                     }
                     Err(_) => tokio::time::sleep(Duration::from_secs(1)).await,
                 }

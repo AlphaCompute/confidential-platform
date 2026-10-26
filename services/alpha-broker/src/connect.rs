@@ -26,7 +26,7 @@ pub(crate) fn parse_body<T: DeserializeOwned>(body: &[u8]) -> Result<T, Error> {
 }
 
 fn exchange_failed(reason: &'static str) -> Error {
-    eprintln!("alpha-broker: exchange_failed: {reason}");
+    alpha_client::warn!("exchange_failed", reason = reason);
     Error::ExchangeFailed
 }
 

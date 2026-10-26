@@ -232,9 +232,10 @@ impl Upstream {
         }
         let outcome = self.check(model, now).await;
         if let Err(reason) = &outcome {
-            eprintln!(
-                "alpha-inference: verification failed for {model}: {}",
-                reason.code()
+            alpha_client::warn!(
+                "upstream_verification_failed",
+                model = alpha_client::log::Field::text(model),
+                error = reason.code(),
             );
         }
         // Replaces whatever was cached before, good or bad — a fresh failure past the TTL

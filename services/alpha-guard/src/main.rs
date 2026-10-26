@@ -19,7 +19,7 @@ async fn main() {
     let code = match run().await {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("alpha-guard: {e}");
+            alpha_client::error!("exit", error = e.code());
             1
         }
     };
@@ -45,9 +45,10 @@ async fn run() -> Result<(), Error> {
         .identity()
         .await
         .map_err(|e| Error::internal(format!("identity: {e}")))?;
-    eprintln!(
-        "alpha-guard: attested as app {} revision {}",
-        identity.app_id, identity.compose_hash
+    alpha_client::info!(
+        "attested",
+        app_id = identity.app_id,
+        revision = &identity.compose_hash,
     );
     let cert =
         Arc::new(InstanceCert::new(&identity).map_err(|e| Error::internal(format!("tls: {e}")))?);

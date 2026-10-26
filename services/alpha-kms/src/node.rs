@@ -259,11 +259,12 @@ pub async fn unseal(
             shares.clear();
         }
         // On Kata a wrong root is also a wrong database password: keep the refusal, not that.
-        if let Err(audit) = audit::node("node.unseal", "denied", e.details())
+        if audit::node("node.unseal", "denied", e.details())
             .insert(&node.pool)
             .await
+            .is_err()
         {
-            eprintln!("node.unseal denied: {audit}");
+            alpha_client::error!("audit_insert_failed", action = "node.unseal");
         }
         return Err(e);
     }
@@ -363,7 +364,11 @@ pub async fn try_join(node: &Node) -> Result<(), ApiError> {
         }
         match join_via(node, &client, endpoint, doc.version).await {
             Ok(()) => return Ok(()),
-            Err(e) => eprintln!("join {endpoint}: {}", e.message),
+            Err(e) => alpha_client::warn!(
+                "join_failed",
+                endpoint = alpha_client::log::Field::text(endpoint),
+                error = e.code,
+            ),
         }
     }
     Err(ApiError::internal("no ready node to join"))
