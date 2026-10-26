@@ -288,6 +288,7 @@ mod tests {
             &ca_cert,
             &runtime.subject_public_key_info(),
             node_sans(hash),
+            None,
             now,
         )
         .unwrap();
