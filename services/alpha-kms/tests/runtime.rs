@@ -888,15 +888,18 @@ async fn served(addr: SocketAddr, config: &Arc<ClientConfig>) -> bool {
     reply.ends_with(BODY.as_bytes())
 }
 
-/// A plain-HTTP `GET /ready` on `addr`: the status.
-async fn ready_status(addr: SocketAddr) -> u16 {
+/// A plain-HTTP `GET <path>` on `addr`: the status and the body.
+async fn probe_get(addr: SocketAddr, path: &str) -> (u16, String) {
     let mut tcp = TcpStream::connect(addr).await.unwrap();
-    tcp.write_all(b"GET /ready HTTP/1.1\r\nHost: kubelet\r\nConnection: close\r\n\r\n")
-        .await
-        .unwrap();
+    let request = format!("GET {path} HTTP/1.1\r\nHost: kubelet\r\nConnection: close\r\n\r\n");
+    tcp.write_all(request.as_bytes()).await.unwrap();
     let mut reply = String::new();
     tcp.read_to_string(&mut reply).await.unwrap();
-    reply.split(' ').nth(1).unwrap().parse().unwrap()
+    let (head, body) = reply.split_once("\r\n\r\n").unwrap();
+    (
+        head.split(' ').nth(1).unwrap().parse().unwrap(),
+        body.to_owned(),
+    )
 }
 
 #[tokio::test]
@@ -924,7 +927,7 @@ async fn a_caller_pinned_endpoint_serves_only_listed_apps_and_answers_ready_in_p
                 .unwrap();
             let addrs = (
                 endpoint.local_addr().unwrap(),
-                endpoint.ready_addr().unwrap(),
+                endpoint.probe_addr().unwrap(),
             );
             (
                 runtime.clone(),
@@ -933,7 +936,7 @@ async fn a_caller_pinned_endpoint_serves_only_listed_apps_and_answers_ready_in_p
             )
         }
     };
-    let (runtime, socket, (addr, ready)) = pinned(vec![app]).await;
+    let (runtime, socket, (addr, probe)) = pinned(vec![app]).await;
     let (_, other_socket, (other_addr, _)) = pinned(vec![AppId::mint()]).await;
 
     let ca = tls::cert_from_pem(&h.ca_pem).unwrap();
@@ -956,7 +959,20 @@ async fn a_caller_pinned_endpoint_serves_only_listed_apps_and_answers_ready_in_p
     assert!(served(addr, &as_instance(Some(leaf()))).await);
     assert!(!served(other_addr, &as_instance(Some(leaf()))).await);
     assert!(!served(addr, &as_instance(None)).await);
-    assert_eq!(ready_status(ready).await, 200);
+    assert_eq!(probe_get(probe, "/ready").await.0, 200);
+    let (status, chain) = probe_get(probe, "/leaf").await;
+    assert_eq!(status, 200);
+    let presented = tls::cert_from_pem(&runtime.attested().unwrap().chain_pem[0]).unwrap();
+    let pem = x509_parser::pem::Pem::iter_from_buffer(chain.as_bytes())
+        .map(|pem| pem.unwrap().contents)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pem,
+        [
+            presented.to_vec(),
+            tls::cert_from_pem(&h.ca_pem).unwrap().to_vec()
+        ]
+    );
 
     assert_eq!(socket.stop().await, Exit::Drained);
     assert_eq!(other_socket.stop().await, Exit::Drained);

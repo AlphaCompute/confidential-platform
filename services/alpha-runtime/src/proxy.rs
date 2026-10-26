@@ -10,6 +10,7 @@ use alpha_client::tls;
 use alpha_core::AppId;
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
 use rustls::pki_types::CertificateDer;
 use rustls::server::{
     ClientHello, NoServerSessionStorage, ResolvesServerCert, WebPkiClientVerifier,
@@ -78,14 +79,14 @@ fn server_config(runtime: Arc<Runtime>) -> Result<Arc<ServerConfig>, Error> {
     Ok(Arc::new(config))
 }
 
-/// The Endpoint's listener with its TLS configuration, bound only for a compose that names an
-/// upstream, and its readiness listener when a readiness path is named.
+/// The Endpoint's listener with its TLS configuration and its plain-HTTP probe listener, bound
+/// only for a compose that names an upstream.
 pub struct Endpoint {
     listener: TcpListener,
     acceptor: TlsAcceptor,
     upstream: String,
     callers: Arc<[AppId]>,
-    ready: Option<(TcpListener, axum::Router)>,
+    probe: (TcpListener, axum::Router),
 }
 
 async fn bind_tcp(addr: SocketAddr) -> Result<TcpListener, Error> {
@@ -100,27 +101,25 @@ impl Endpoint {
     pub async fn bind(
         runtime: Arc<Runtime>,
         addr: SocketAddr,
-        ready_addr: SocketAddr,
+        probe_addr: SocketAddr,
     ) -> Result<Option<Self>, Error> {
         let config = runtime.config();
         let Some(upstream) = config.tls_upstream.clone() else {
             return Ok(None);
         };
         let callers = config.tls_callers.clone().into();
-        let ready = match config.tls_ready.clone() {
-            Some(path) => Some((
-                bind_tcp(ready_addr).await?,
-                ready_router(runtime.clone(), upstream.clone(), path),
-            )),
-            None => None,
-        };
+        let probe = axum::Router::new()
+            .route("/leaf", axum::routing::get(leaf_chain))
+            .route("/ready", axum::routing::get(ready))
+            .with_state(runtime.clone());
+        let probe = (bind_tcp(probe_addr).await?, probe);
         let acceptor = TlsAcceptor::from(server_config(runtime)?);
         Ok(Some(Self {
             listener: bind_tcp(addr).await?,
             acceptor,
             upstream,
             callers,
-            ready,
+            probe,
         }))
     }
 
@@ -128,20 +127,19 @@ impl Endpoint {
         self.listener.local_addr()
     }
 
-    pub fn ready_addr(&self) -> Option<SocketAddr> {
-        self.ready.as_ref()?.0.local_addr().ok()
+    pub fn probe_addr(&self) -> std::io::Result<SocketAddr> {
+        self.probe.0.local_addr()
     }
 
     /// Accepts until `stop` resolves; no idle timeout, so WebSockets and long polls stay open.
     /// Open connections get at most [`DRAIN`] on a shutdown and are cut on revocation.
     pub async fn serve(self, stop: impl Future<Output = Exit>) {
         let mut stop = std::pin::pin!(stop);
-        let ready = self.ready.map(|(listener, router)| {
-            tokio::spawn(async move {
-                if let Err(e) = axum::serve(listener, router).await {
-                    alpha_client::error!("readiness_listener_failed", error = e.kind());
-                }
-            })
+        let (listener, router) = self.probe;
+        let probe = tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, router).await {
+                alpha_client::error!("probe_listener_failed", error = e.kind());
+            }
         });
         let mut open = JoinSet::new();
         let how = loop {
@@ -165,9 +163,7 @@ impl Endpoint {
             ));
         };
         drop(self.listener);
-        if let Some(ready) = ready {
-            ready.abort();
-        }
+        probe.abort();
         if how == Exit::Drained {
             let _ = timeout(DRAIN, async { while open.join_next().await.is_some() {} }).await;
         }
@@ -216,17 +212,25 @@ async fn proxy(acceptor: TlsAcceptor, tcp: TcpStream, upstream: String, callers:
     let _ = tokio::io::copy_bidirectional(&mut tls, &mut backend).await;
 }
 
-type Ready = (Arc<Runtime>, String, String);
-
-fn ready_router(runtime: Arc<Runtime>, upstream: String, path: String) -> axum::Router {
-    axum::Router::new()
-        .route("/ready", axum::routing::get(ready))
-        .with_state(Arc::new((runtime, upstream, path)))
+/// The PEM chain the Endpoint presents now, leaf first; it is public, as every handshake shows it.
+async fn leaf_chain(
+    State(runtime): State<Arc<Runtime>>,
+) -> Result<impl axum::response::IntoResponse, StatusCode> {
+    let attested = runtime.attested().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let chain = attested
+        .chain_pem
+        .iter()
+        .map(|pem| format!("{}\n", pem.trim_end()))
+        .collect::<String>();
+    Ok(([(CONTENT_TYPE, "application/pem-certificate-chain")], chain))
 }
 
 /// 200 only while the leaf is current and the upstream answers its own path with a 2xx now.
-async fn ready(State(state): State<Arc<Ready>>) -> StatusCode {
-    let (runtime, upstream, path) = state.as_ref();
+async fn ready(State(runtime): State<Arc<Runtime>>) -> StatusCode {
+    let config = runtime.config();
+    let (Some(upstream), Some(path)) = (&config.tls_upstream, &config.tls_ready) else {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    };
     if runtime.attested().is_some() && upstream_answers(upstream, path).await {
         StatusCode::OK
     } else {
