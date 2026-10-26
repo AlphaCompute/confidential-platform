@@ -107,6 +107,7 @@ const APPRAISAL_FORMAT: &str = "alphacompute-appraisal/1";
 /// The platform facts of the appraisal behind an Instance leaf, in a non-critical extension. The
 /// leaf's `notBefore` is the appraisal time; the SANs carry the Revision and the instance key.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "format", rename = "alphacompute-appraisal/1")]
 pub struct LeafAppraisal {
     pub tcb_status: String,
     pub advisories: Vec<String>,
@@ -119,10 +120,7 @@ impl LeafAppraisal {
     /// The extension value: a DER UTF8String with the JCS form of the object.
     pub fn to_der(&self) -> Result<Vec<u8>, Error> {
         use x509_parser::asn1_rs::ToDer;
-        let mut json = serde_json::to_value(self).map_err(|e| Error::Malformed(e.to_string()))?;
-        if let Some(object) = json.as_object_mut() {
-            object.insert("format".into(), APPRAISAL_FORMAT.into());
-        }
+        let json = serde_json::to_value(self).map_err(|e| Error::Malformed(e.to_string()))?;
         let jcs = alpha_core::jcs(&json).map_err(|e| Error::Malformed(e.to_string()))?;
         String::from_utf8(jcs)
             .map_err(|e| Error::Malformed(e.to_string()))?
