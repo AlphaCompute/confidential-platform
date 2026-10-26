@@ -31,7 +31,7 @@ pub async fn send_to(
     kms_ca_pem: &str,
     call: &Call<'_>,
 ) -> Result<Value, String> {
-    let sans = verify::app_leaf(url, app, kms_ca_pem).await?;
+    let (sans, _) = verify::app_leaf(url, app, kms_ca_pem).await?;
     let ca = tls::cert_from_pem(kms_ca_pem).map_err(|e| e.to_string())?;
     let pin = Pin::CaAndInstanceRevisions(ca, vec![sans.compose_hash], None);
     let http = reqwest::Client::builder()

@@ -5,12 +5,13 @@
 use std::time::SystemTime;
 
 use alpha_attest::PlatformDocument;
+use alpha_channel::cert;
 use alpha_client::tls::{self, InstanceSans};
 use alpha_client::{Client, Pin, system_time_provider};
 use alpha_core::{AppId, InitData};
 use serde_json::{Value, json};
 
-use crate::node;
+use crate::{node, rfc3339};
 
 /// The leaf `url` presents must chain to the document's KMS CA, be valid now and belong to
 /// `app`; with `init_data`, that file must be the leaf's Revision and pass the document's
@@ -21,7 +22,7 @@ pub async fn instance(
     init_data: Option<&InitData>,
     doc: &PlatformDocument,
 ) -> Result<Value, String> {
-    let sans = app_leaf(url, app, &doc.kms_ca_pem).await?;
+    let (sans, leaf) = app_leaf(url, app, &doc.kms_ca_pem).await?;
     if let Some(init_data) = init_data {
         check_init_data(&sans, init_data, doc)?;
     }
@@ -31,14 +32,35 @@ pub async fn instance(
         "app_id": sans.app_id,
         "revision": sans.compose_hash,
         "runtime_pubkey_sha256": sans.runtime_pubkey_sha256_hex,
-        "appraisal": "the KMS appraised the Instance when it issued its leaf, at most an hour \
-                      ago, under the platform document the KMS held then",
+        "appraisal": appraisal(&leaf, &doc.kms_ca_pem)?,
     }))
 }
 
-/// The SANs of the Instance leaf `url` presents under the KMS CA, refused unless they name `app`.
-pub async fn app_leaf(url: &str, app: AppId, kms_ca_pem: &str) -> Result<InstanceSans, String> {
-    let sans = alpha_client::instance_leaf(url, kms_ca_pem, system_time_provider())
+/// The KMS appraised the Instance when it issued the leaf, under the platform document it held
+/// then; a leaf from a KMS before the appraisal extension says `absent`.
+fn appraisal(leaf: &[u8], kms_ca_pem: &str) -> Result<Value, String> {
+    let Some(appraisal) = cert::leaf_appraisal(leaf).map_err(|e| e.to_string())? else {
+        return Ok(json!("absent"));
+    };
+    let ca = tls::cert_from_pem(kms_ca_pem).map_err(|e| e.to_string())?;
+    let (appraised_at, not_after) =
+        cert::verify_leaf(leaf, &ca, SystemTime::now()).map_err(|e| e.to_string())?;
+    let mut out = serde_json::to_value(&appraisal).map_err(|e| e.to_string())?;
+    if let Some(object) = out.as_object_mut() {
+        object.insert("appraised_at".into(), rfc3339(appraised_at).into());
+        object.insert("not_after".into(), rfc3339(not_after).into());
+    }
+    Ok(out)
+}
+
+/// The SANs and the DER of the Instance leaf `url` presents under the KMS CA, refused unless the
+/// SANs name `app`.
+pub async fn app_leaf(
+    url: &str,
+    app: AppId,
+    kms_ca_pem: &str,
+) -> Result<(InstanceSans, Vec<u8>), String> {
+    let (sans, leaf) = alpha_client::instance_leaf(url, kms_ca_pem, system_time_provider())
         .await
         .map_err(|e| format!("probe: {e}"))?
         .map_err(|why| format!("no Instance leaf from the KMS CA: {why}"))?;
@@ -48,7 +70,7 @@ pub async fn app_leaf(url: &str, app: AppId, kms_ca_pem: &str) -> Result<Instanc
             sans.app_id
         ));
     }
-    Ok(sans)
+    Ok((sans, leaf))
 }
 
 fn check_init_data(

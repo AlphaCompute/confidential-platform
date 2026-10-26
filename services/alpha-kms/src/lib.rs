@@ -248,6 +248,7 @@ impl Node {
             &keys.ca_cert_der,
             &self.runtime_spki,
             certs::node_sans(self.compose_hash),
+            None,
             self.now(),
         )?;
         self.server_cert

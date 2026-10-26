@@ -20,6 +20,20 @@ the same hash the tenant registered and signed. The certificate lives one hour a
 Instance renews it, so a client that checks the chain and the SANs on every connection
 learns within the hour when an App stops being entitled to run.
 
+An Instance's certificate also carries one non-critical extension, OID
+`2.25.7686831627720934303`. Its value is a DER UTF8String with the JCS form of the KMS's
+appraisal:
+
+```json
+{"advisories":[],"format":"alphacompute-appraisal/1","gpu_count":1,
+ "os_image":"kata-b300/32c-256g","policy_version":7,"tcb_status":"UpToDate"}
+```
+
+The appraisal time is the certificate's `notBefore`. The CA signature covers the extension,
+so a client that checks the chain can show the TCB status the KMS accepted. A client that
+does not need it can ignore it. `alpha verify` prints it, or `absent` for a certificate
+without it.
+
 Both values a client pins — the KMS CA and the Revision — come from the release-signed
 platform document, never from the App and never from this API. `alpha sign --check`
 prints them.

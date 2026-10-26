@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alpha_attest::{AttestationResult, InstanceEvidence, RESULT_FORMAT, Revision, Verdict};
+use alpha_channel::cert::LeafAppraisal;
 use alpha_client::DerivedKey;
 use alpha_client::tls::PeerCerts;
 use alpha_core::{ComposeHash, Signer, context};
@@ -330,6 +331,13 @@ async fn attest_inner(
             &runtime_sha_hex,
             appraised.compose_hash,
         ),
+        Some(&LeafAppraisal {
+            tcb_status: appraised.tcb_status.clone(),
+            advisories: appraised.advisories.clone(),
+            policy_version: appraised.policy_version,
+            os_image: appraised.os_image.clone(),
+            gpu_count: appraised.gpu_serials.len(),
+        }),
         now,
     )?;
     let result = AttestationResult {

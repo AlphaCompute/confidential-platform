@@ -1,14 +1,16 @@
 //! P-256 certificates: the node's self-signed sealed-phase certificate, the `ca` root, the
-//! one-hour leaves with exactly two URI SANs, and the checks the extractors run on them.
+//! one-hour leaves with two URI SANs and an Instance's appraisal, and the checks the extractors run on them.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use alpha_channel::cert::{APPRAISAL_OID, LeafAppraisal};
 use alpha_core::{AppId, ComposeHash, OrgId};
 use rcgen::string::Ia5String;
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256, SanType, SubjectPublicKeyInfo,
+    BasicConstraints, CertificateParams, CustomExtension, DistinguishedName, DnType,
+    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
+    SanType, SubjectPublicKeyInfo,
 };
 use rustls::RootCertStore;
 use rustls::pki_types::{CertificateDer, UnixTime};
@@ -75,12 +77,14 @@ pub fn new_ca(now: SystemTime) -> Result<(Vec<u8>, Vec<u8>), ApiError> {
     Ok((key.serialize_der(), cert.der().to_vec()))
 }
 
-/// A one-hour leaf from `ca` over a foreign SPKI with the two URI SANs and both EKUs.
+/// A one-hour leaf from `ca` over a foreign SPKI with the two URI SANs, both EKUs and, for an
+/// Instance, its appraisal.
 pub fn issue_leaf(
     ca_key: &KeyPair,
     ca_cert_der: &[u8],
     spki_der: &[u8],
     sans: [String; 2],
+    appraisal: Option<&LeafAppraisal>,
     now: SystemTime,
 ) -> Result<Vec<u8>, ApiError> {
     let spki = SubjectPublicKeyInfo::from_der(spki_der)
@@ -104,6 +108,12 @@ pub fn issue_leaf(
     params.not_before = now.into();
     params.not_after = later(now, LEAF_TTL)?.into();
     params.serial_number = Some(serial()?);
+    if let Some(appraisal) = appraisal {
+        let der = appraisal
+            .to_der()
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        params.custom_extensions = vec![CustomExtension::from_oid_content(&APPRAISAL_OID, der)];
+    }
     Ok(params
         .signed_by(&spki, &issuer)
         .map_err(|e| ApiError::internal(format!("leaf: {e}")))?
@@ -185,7 +195,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn leaf_chains_to_ca_and_carries_the_two_sans() {
+    fn leaf_chains_to_ca_and_carries_the_two_sans_and_the_appraisal() {
         let now = SystemTime::now();
         let (ca_key_der, ca_cert) = new_ca(now).unwrap();
         let ca_key = key_pair(&ca_key_der).unwrap();
@@ -194,14 +204,37 @@ mod tests {
         let app = AppId::mint();
         let hash = alpha_core::compose_hash("{}");
         let sans = instance_sans(org, app, &"ab".repeat(32), hash);
+        let appraisal = LeafAppraisal {
+            tcb_status: "OutOfDate".into(),
+            advisories: vec!["INTEL-SA-01397".into()],
+            policy_version: 7,
+            os_image: "kata-b300/32c-256g".into(),
+            gpu_count: 1,
+        };
         let leaf = issue_leaf(
             &ca_key,
             &ca_cert,
             &runtime.subject_public_key_info(),
             sans.clone(),
+            Some(&appraisal),
             now,
         )
         .unwrap();
+        let (_, cert) = x509_parser::parse_x509_certificate(&leaf).unwrap();
+        let ext = cert
+            .extensions()
+            .iter()
+            .find(|e| e.oid.to_id_string() == "2.25.7686831627720934303")
+            .unwrap();
+        assert!(!ext.critical);
+        let json = r#"{"advisories":["INTEL-SA-01397"],"format":"alphacompute-appraisal/1","gpu_count":1,"os_image":"kata-b300/32c-256g","policy_version":7,"tcb_status":"OutOfDate"}"#;
+        let mut utf8_string = vec![0x0c, 0x81, json.len() as u8];
+        utf8_string.extend_from_slice(json.as_bytes());
+        assert_eq!(ext.value, utf8_string);
+        assert_eq!(
+            alpha_channel::cert::leaf_appraisal(&leaf).unwrap(),
+            Some(appraisal)
+        );
         let verifier = ca_verifier(&ca_cert).unwrap();
         let chain = vec![CertificateDer::from(leaf.clone())];
         let got = verify_to_ca(verifier.as_ref(), &chain, now + Duration::from_secs(60)).unwrap();
@@ -226,6 +259,10 @@ mod tests {
             "cert_invalid"
         );
         let self_signed = self_signed(&runtime, now).unwrap();
+        assert_eq!(
+            alpha_channel::cert::leaf_appraisal(&self_signed).unwrap(),
+            None
+        );
         assert_eq!(
             verify_to_ca(verifier.as_ref(), &[CertificateDer::from(self_signed)], now)
                 .unwrap_err()

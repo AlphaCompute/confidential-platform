@@ -1,6 +1,6 @@
-//! Instance and KMS node certificates: their two URI SANs, their SPKI, and the check that a leaf
-//! was signed by the pinned KMS CA and is valid at a given time. The chain is exactly leaf then CA, so there is
-//! no path to build.
+//! Instance and KMS node certificates: their two URI SANs, an Instance's appraisal, their SPKI,
+//! and the check that a leaf was signed by the pinned KMS CA and is valid at a given time. The
+//! chain is exactly leaf then CA, so there is no path to build.
 
 use std::time::SystemTime;
 
@@ -96,6 +96,62 @@ pub fn parse_kms_sans(sans: &[String]) -> Result<ComposeHash, Error> {
         .strip_prefix("urn:alphacompute:revision:")
         .and_then(|s| s.parse().ok())
         .ok_or_else(not_node)
+}
+
+/// ponytail: an arc under `2.25` needs no registration, but rcgen writes 64-bit arcs only, so the
+/// last arc is a random 63-bit integer and not a full UUID. Move to an IANA enterprise arc if a
+/// collision ever matters; a reader of the old OID then shows `absent`.
+pub const APPRAISAL_OID: [u64; 3] = [2, 25, 7686831627720934303];
+const APPRAISAL_FORMAT: &str = "alphacompute-appraisal/1";
+
+/// The platform facts of the appraisal behind an Instance leaf, in a non-critical extension. The
+/// leaf's `notBefore` is the appraisal time; the SANs carry the Revision and the instance key.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "format", rename = "alphacompute-appraisal/1")]
+pub struct LeafAppraisal {
+    pub tcb_status: String,
+    pub advisories: Vec<String>,
+    pub policy_version: u64,
+    pub os_image: String,
+    pub gpu_count: usize,
+}
+
+impl LeafAppraisal {
+    /// The extension value: a DER UTF8String with the JCS form of the object.
+    pub fn to_der(&self) -> Result<Vec<u8>, Error> {
+        use x509_parser::asn1_rs::ToDer;
+        let json = serde_json::to_value(self).map_err(|e| Error::Malformed(e.to_string()))?;
+        let jcs = alpha_core::jcs(&json).map_err(|e| Error::Malformed(e.to_string()))?;
+        String::from_utf8(jcs)
+            .map_err(|e| Error::Malformed(e.to_string()))?
+            .to_der_vec()
+            .map_err(|e| Error::Malformed(format!("appraisal: {e}")))
+    }
+}
+
+/// The appraisal a leaf carries; `None` for a leaf without the extension.
+pub fn leaf_appraisal(cert: &[u8]) -> Result<Option<LeafAppraisal>, Error> {
+    use x509_parser::asn1_rs::Oid;
+    let malformed = |m: String| Error::Malformed(format!("appraisal: {m}"));
+    let (_, cert) = X509Certificate::from_der(cert)
+        .map_err(|e| Error::Malformed(format!("certificate: {e}")))?;
+    let oid = Oid::from(&APPRAISAL_OID).map_err(|e| malformed(format!("{e:?}")))?;
+    let Some(ext) = cert.extensions().iter().find(|ext| ext.oid == oid) else {
+        return Ok(None);
+    };
+    let (rest, json) = String::from_der(ext.value).map_err(|e| malformed(e.to_string()))?;
+    if !rest.is_empty() {
+        return Err(malformed("trailing bytes".into()));
+    }
+    let json: serde_json::Value =
+        serde_json::from_str(&json).map_err(|e| malformed(e.to_string()))?;
+    let format = json.get("format").and_then(serde_json::Value::as_str);
+    if format != Some(APPRAISAL_FORMAT) {
+        return Err(malformed(format!("unknown format {format:?}")));
+    }
+    serde_json::from_value(json)
+        .map(Some)
+        .map_err(|e| malformed(e.to_string()))
 }
 
 /// One PEM `CERTIFICATE` block and nothing else.
