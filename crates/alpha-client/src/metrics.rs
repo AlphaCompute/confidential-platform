@@ -2,7 +2,6 @@
 //! from the route template and the response status only, never from a request's content.
 
 use std::sync::LazyLock;
-use std::time::Instant;
 
 use axum::Router;
 use axum::extract::{MatchedPath, Request};
@@ -12,14 +11,8 @@ use axum::routing::get;
 use prometheus_client::encoding::EncodeLabelSet;
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
-use prometheus_client::metrics::histogram::Histogram;
 use prometheus_client::registry::Registry;
 use tokio::net::TcpListener;
-
-/// Loopback only: the runtime in the same pod or a local run reads it.
-pub const LISTEN: (std::net::Ipv4Addr, u16) = (std::net::Ipv4Addr::LOCALHOST, 9464);
-
-const BUCKETS: [f64; 10] = [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 10.0];
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 struct RouteStatus {
@@ -27,34 +20,16 @@ struct RouteStatus {
     status: u16,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
-struct Route {
-    route: String,
-}
-
 struct Metrics {
     registry: Registry,
     requests: Family<RouteStatus, Counter>,
-    durations: Family<Route, Histogram>,
 }
 
 static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     let requests = Family::<RouteStatus, Counter>::default();
-    let durations = Family::<Route, Histogram>::new_with_constructor(
-        (|| Histogram::new(BUCKETS)) as fn() -> Histogram,
-    );
     let mut registry = Registry::with_prefix("alpha");
     registry.register("http_requests", "HTTP responses", requests.clone());
-    registry.register(
-        "http_request_duration_seconds",
-        "Time to the response head",
-        durations.clone(),
-    );
-    Metrics {
-        registry,
-        requests,
-        durations,
-    }
+    Metrics { registry, requests }
 });
 
 /// Counts every response of `router` by route template and status. A request that matches no
@@ -69,14 +44,7 @@ async fn record(request: Request, next: Next) -> Response {
         .get::<MatchedPath>()
         .map_or("other", MatchedPath::as_str)
         .to_owned();
-    let started = Instant::now();
     let response = next.run(request).await;
-    METRICS
-        .durations
-        .get_or_create(&Route {
-            route: route.clone(),
-        })
-        .observe(started.elapsed().as_secs_f64());
     METRICS
         .requests
         .get_or_create(&RouteStatus {
@@ -94,9 +62,9 @@ fn text() -> String {
     text
 }
 
-/// Binds [`LISTEN`] and serves `/metrics` there for the life of the process.
+/// Binds `127.0.0.1:9464` and serves `/metrics` there for the life of the process.
 pub async fn spawn() -> std::io::Result<()> {
-    let listener = TcpListener::bind(LISTEN).await?;
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 9464)).await?;
     let router = Router::new().route("/metrics", get(|| async { text() }));
     tokio::spawn(async move { axum::serve(listener, router).await });
     Ok(())
