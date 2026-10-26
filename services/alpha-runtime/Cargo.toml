@@ -7,7 +7,12 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Verifies platform documents under release-keys/dev.pub: the stand's runtime, never a release.
+dev = ["alpha-channel/dev"]
+
 [dependencies]
+alpha-channel = { path = "../../crates/alpha-channel" }
 alpha-attest = { path = "../../crates/alpha-attest" }
 alpha-client = { path = "../../crates/alpha-client" }
 alpha-core = { path = "../../crates/alpha-core" }
