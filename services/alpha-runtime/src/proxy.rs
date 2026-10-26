@@ -10,6 +10,7 @@ use alpha_client::tls;
 use alpha_core::AppId;
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::http::header::{CONTENT_TYPE, HeaderName};
 use rustls::pki_types::CertificateDer;
 use rustls::server::{
     ClientHello, NoServerSessionStorage, ResolvesServerCert, WebPkiClientVerifier,
@@ -214,23 +215,16 @@ async fn proxy(acceptor: TlsAcceptor, tcp: TcpStream, upstream: String, callers:
 }
 
 /// The PEM chain the Endpoint presents now, leaf first; it is public, as every handshake shows it.
-async fn leaf_chain(State(runtime): State<Arc<Runtime>>) -> axum::response::Response {
-    use axum::response::IntoResponse;
-    match runtime.attested() {
-        Some(attested) => (
-            [(
-                axum::http::header::CONTENT_TYPE,
-                "application/pem-certificate-chain",
-            )],
-            attested
-                .chain_pem
-                .iter()
-                .map(|pem| format!("{}\n", pem.trim_end()))
-                .collect::<String>(),
-        )
-            .into_response(),
-        None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    }
+async fn leaf_chain(
+    State(runtime): State<Arc<Runtime>>,
+) -> Result<([(HeaderName, &'static str); 1], String), StatusCode> {
+    let attested = runtime.attested().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let chain = attested
+        .chain_pem
+        .iter()
+        .map(|pem| format!("{}\n", pem.trim_end()))
+        .collect();
+    Ok(([(CONTENT_TYPE, "application/pem-certificate-chain")], chain))
 }
 
 type Ready = (Arc<Runtime>, String, String);
