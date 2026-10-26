@@ -55,6 +55,9 @@ pub const PROBE_PORT: u16 = 8444;
 
 pub const RENEW_BEFORE: Duration = Duration::from_secs(600);
 const RETRY_AFTER: Duration = Duration::from_secs(30);
+/// A quote request lost by the host's quote service never completes; without a bound, the
+/// leaf would expire with no further attempt.
+const ATTEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Each missing Secret is a denied `secret.get` audit row on the KMS; the backoff doubles from
 /// here up to `SECRETS_POLL`, so a Secret never set costs one row a minute.
 const SECRETS_FIRST_RETRY: Duration = Duration::from_secs(2);
@@ -88,6 +91,8 @@ pub enum Error {
     Socket(String),
     #[error("platform document: {0}")]
     Platform(String),
+    #[error("attestation did not finish in {0:?}")]
+    TimedOut(Duration),
 }
 
 impl Error {
@@ -579,7 +584,10 @@ impl Runtime {
 
     /// Nonce → `report_data` → quote → leaf; the first call is the Instance's birth, later ones renew.
     pub async fn attest(&self) -> Result<Arc<Attested>, Error> {
-        let attested = self.attest_inner().await.map_err(|e| self.note(e))?;
+        let attested = tokio::time::timeout(ATTEST_TIMEOUT, self.attest_inner())
+            .await
+            .unwrap_or(Err(Error::TimedOut(ATTEST_TIMEOUT)))
+            .map_err(|e| self.note(e))?;
         *self.attested.write() = Some(attested.clone());
         Ok(attested)
     }
@@ -600,7 +608,11 @@ impl Runtime {
             .try_into()
             .map_err(|_| alpha_client::Error::Invalid("nonce is not 32 bytes".into()))?;
         let report_data = alpha_attest::report_data(&self.spki, &nonce, None);
-        let evidence = (self.evidence)(&report_data).map_err(Error::Evidence)?;
+        let source = self.evidence.clone();
+        let evidence = tokio::task::spawn_blocking(move || source(&report_data))
+            .await
+            .map_err(|e| Error::Evidence(e.to_string()))?
+            .map_err(Error::Evidence)?;
         let reply = kms
             .attest(&AttestRequest {
                 runtime_pubkey: BASE64_URL_SAFE_NO_PAD.encode(&self.spki),
