@@ -1,6 +1,3 @@
-//! Prometheus families of a service, served as text on `127.0.0.1:9464/metrics`. Labels come
-//! from the route template and the response status only, never from a request's content.
-
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
