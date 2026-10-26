@@ -1126,7 +1126,8 @@ function revocationRefusal(read) {
     !read.revisions.length ||
     !read.revisions.every((h) => /^sha256:[0-9a-f]{64}$/.test(h)) ||
     new Set(read.revisions).size !== read.revisions.length ||
-    !Array.isArray(read.credentials)
+    !Array.isArray(read.credentials) ||
+    !read.credentials.every((c) => typeof c?.credential_id === "string")
   ) {
     return MESSAGES.unavailable;
   }
@@ -1178,13 +1179,15 @@ function offerRevocation(r, note) {
   const total = r.read.revisions.length;
   const step = total - pending.length + 1;
   const label = step === 1 ? "Revoke with passkey" : `Sign ${step} of ${total}`;
-  const payload = { compose_hash: pending[0], issued_at: issuedAt() };
-  const signable = wasm_bindgen.signingDigest("control", JSON.stringify(payload));
-  const options = getOptions(r.view, signable.digest, allowed(r));
-  offer(r.ui, note, button(label, () => revoke(r, payload, options)));
+  offer(r.ui, note, button(label, () => revoke(r, pending[0])));
 }
 
-async function revoke(r, payload, options) {
+// issued_at is taken in the click, before the prompt's await, so a page left open stays inside
+// the KMS's five minutes.
+async function revoke(r, hash) {
+  const payload = { compose_hash: hash, issued_at: issuedAt() };
+  const signable = wasm_bindgen.signingDigest("control", JSON.stringify(payload));
+  const options = getOptions(r.view, signable.digest, allowed(r));
   const { signature, note } = await approvalSignature(r, options);
   if (!signature) return offerRevocation(r, note);
   const body = wasm_bindgen.canonicalJson(JSON.stringify({ payload, signature }));

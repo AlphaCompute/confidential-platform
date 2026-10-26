@@ -148,6 +148,8 @@ test("every refusal is one fixed sentence", async () => {
     [{ revisions: [hash, hash] }, UNAVAILABLE],
     [{ revisions: [hash.toUpperCase()] }, UNAVAILABLE],
     [{ revisions: hash }, UNAVAILABLE],
+    [{ credentials: [null] }, UNAVAILABLE],
+    [{ credentials: [{ key_id: "01920000-0000-7000-8000-00000000000a" }] }, UNAVAILABLE],
     [
       { server_time: iso(now + 7 * 60 * 1000) },
       "Your device clock is off by about 7 minutes. Correct it and reload.",
@@ -189,6 +191,15 @@ test("every refusal is one fixed sentence", async () => {
     }
     assert.deepEqual(page.buttons(), ["Revoke with passkey"]);
   }
+});
+
+test("a page left open signs the time of the click", async () => {
+  const { api, page } = await revocationPage();
+  page.clock.now += 10 * 60 * 1000;
+  const clicked = iso(page.clock.now);
+  await page.click("Revoke with passkey");
+  assert.equal(api.revokes[0].body.payload.issued_at, clicked);
+  assert.ok(page.text().includes(`Revoked at ${RECEIPT_TIME}: ${api.revisions[0]}`), page.text());
 });
 
 test("a closed passkey prompt sends nothing", async () => {
