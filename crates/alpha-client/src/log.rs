@@ -62,7 +62,8 @@ impl From<std::io::ErrorKind> for Field {
     }
 }
 
-/// chrono's own conversions panic on a clock before 1970; this clamps it to the epoch.
+/// chrono's `Utc::now` panics on a clock before 1970 and its `From<SystemTime>` on an
+/// out-of-range time; this falls back to the epoch instead.
 fn utc(t: SystemTime) -> chrono::DateTime<chrono::Utc> {
     t.duration_since(SystemTime::UNIX_EPOCH)
         .ok()
