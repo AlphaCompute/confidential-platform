@@ -205,7 +205,6 @@ mod tests {
         let hash = alpha_core::compose_hash("{}");
         let sans = instance_sans(org, app, &"ab".repeat(32), hash);
         let appraisal = LeafAppraisal {
-            format: alpha_channel::cert::APPRAISAL_FORMAT.into(),
             tcb_status: "OutOfDate".into(),
             advisories: vec!["INTEL-SA-01397".into()],
             policy_version: 7,

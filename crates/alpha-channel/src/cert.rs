@@ -102,13 +102,12 @@ pub fn parse_kms_sans(sans: &[String]) -> Result<ComposeHash, Error> {
 /// last arc is a random 63-bit integer and not a full UUID. Move to an IANA enterprise arc if a
 /// collision ever matters; a reader of the old OID then shows `absent`.
 pub const APPRAISAL_OID: [u64; 3] = [2, 25, 7686831627720934303];
-pub const APPRAISAL_FORMAT: &str = "alphacompute-appraisal/1";
+const APPRAISAL_FORMAT: &str = "alphacompute-appraisal/1";
 
 /// The platform facts of the appraisal behind an Instance leaf, in a non-critical extension. The
 /// leaf's `notBefore` is the appraisal time; the SANs carry the Revision and the instance key.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LeafAppraisal {
-    pub format: String,
     pub tcb_status: String,
     pub advisories: Vec<String>,
     pub policy_version: u64,
@@ -120,7 +119,10 @@ impl LeafAppraisal {
     /// The extension value: a DER UTF8String with the JCS form of the object.
     pub fn to_der(&self) -> Result<Vec<u8>, Error> {
         use x509_parser::asn1_rs::ToDer;
-        let json = serde_json::to_value(self).map_err(|e| Error::Malformed(e.to_string()))?;
+        let mut json = serde_json::to_value(self).map_err(|e| Error::Malformed(e.to_string()))?;
+        if let Some(object) = json.as_object_mut() {
+            object.insert("format".into(), APPRAISAL_FORMAT.into());
+        }
         let jcs = alpha_core::jcs(&json).map_err(|e| Error::Malformed(e.to_string()))?;
         String::from_utf8(jcs)
             .map_err(|e| Error::Malformed(e.to_string()))?
@@ -140,12 +142,15 @@ pub fn leaf_appraisal(cert: &[u8]) -> Result<Option<LeafAppraisal>, Error> {
         return Ok(None);
     };
     let (_, json) = String::from_der(ext.value).map_err(|e| malformed(e.to_string()))?;
-    let appraisal: LeafAppraisal =
+    let json: serde_json::Value =
         serde_json::from_str(&json).map_err(|e| malformed(e.to_string()))?;
-    if appraisal.format != APPRAISAL_FORMAT {
-        return Err(malformed(format!("unknown format {}", appraisal.format)));
+    let format = json.get("format").and_then(serde_json::Value::as_str);
+    if format != Some(APPRAISAL_FORMAT) {
+        return Err(malformed(format!("unknown format {format:?}")));
     }
-    Ok(Some(appraisal))
+    serde_json::from_value(json)
+        .map(Some)
+        .map_err(|e| malformed(e.to_string()))
 }
 
 /// One PEM `CERTIFICATE` block and nothing else.
