@@ -61,16 +61,15 @@ async fn register(
     h: &Harness,
     admin: &(alpha_core::KeyId, ed25519_dalek::SigningKey),
     init_data: String,
-) -> ComposeHash {
+) -> (AppId, ComposeHash) {
     let parsed = InitData::parse(init_data.clone()).unwrap();
-    let digest = parsed.digest();
-    let payload =
-        json!({ "app_id": parsed.app_id().unwrap(), "init_data": init_data, "digest": digest });
+    let (app, digest) = (parsed.app_id().unwrap(), parsed.digest());
+    let payload = json!({ "app_id": app, "init_data": init_data, "digest": digest });
     let (status, reply) = h
         .post("/v1/revisions", h.signed(context::REVISION, payload, admin))
         .await;
     assert_eq!(status, StatusCode::OK, "{reply}");
-    digest
+    (app, digest)
 }
 
 /// A token of the KMS that expires `ttl` seconds from now.
@@ -146,7 +145,7 @@ async fn a_token_fetches_the_revisions_registry_credential_and_nothing_else() {
         return;
     };
     let admin = h.register_key(&h.root, 41).await;
-    let revision = register(&h, &admin, init_data(&h)).await;
+    let (_, revision) = register(&h, &admin, init_data(&h)).await;
     let bearer = token(&h, revision, 300);
 
     let (status, reply) = resource(&h, "alpha/secret/regcred", Some(&bearer)).await;
@@ -353,11 +352,7 @@ async fn a_guests_data_hub_attests_and_gets_its_registry_credential() {
     let admin = h.register_key(&h.root, 41).await;
     let request: Value = serde_json::from_slice(&read(CAPTURE, "attest.json")).unwrap();
     let init_data = request["init-data"]["body"].as_str().unwrap().to_owned();
-    let app = InitData::parse(init_data.clone())
-        .unwrap()
-        .app_id()
-        .unwrap();
-    let digest = register(&h, &admin, init_data).await;
+    let (app, digest) = register(&h, &admin, init_data).await;
     let (status, put) = h
         .put_secret("regcred", &[app], VALUE, h.now(), &admin)
         .await;
