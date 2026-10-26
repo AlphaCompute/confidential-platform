@@ -105,6 +105,13 @@ pub async fn fresh_database() -> Option<PgPool> {
         .connect(&url)
         .await
         .unwrap();
+    // The migrations create the cluster-wide `alpha_kms` role; two databases that migrate at the
+    // same time both try to create it.
+    let mut lock = admin.acquire().await.unwrap();
+    sqlx::query("select pg_advisory_lock(0)")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
     alpha_kms::migrate(&pool).await.unwrap();
     Some(pool)
 }
