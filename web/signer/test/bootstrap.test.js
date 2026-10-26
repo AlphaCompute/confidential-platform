@@ -98,6 +98,8 @@ test("a link with another path or a malformed ticket is not valid", async () => 
     assert.equal(page.text(), BAD_LINK, JSON.stringify(options));
     assert.ok(!page.fetches.some((f) => f.url === "./platform.json"), JSON.stringify(options));
   }
-  const claim = await booted({ path: "/sign/claim" });
-  assert.equal(claim.text(), NOT_SIGNER);
+  for (const path of ["/sign/claim", "/sign/revoke"]) {
+    const page = await booted({ path });
+    assert.equal(page.text(), NOT_SIGNER, path);
+  }
 });

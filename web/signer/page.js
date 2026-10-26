@@ -79,6 +79,10 @@ const MESSAGES = {
   catalog: "The catalog entry for this launch is not signed by AlphaCompute. Nothing was signed.",
   not_from_catalog: "This launch is replacing a launch not from this catalog.",
   revision_revoked: "The KMS refuses this launch because it was revoked before. Nothing was approved.",
+  revoke_expired: "This revocation link has expired.",
+  revoke_effect:
+    "Revoking stops the KMS from giving these launches keys, Secrets or certificates: no copy can start, and a running copy gets none again. It cannot be undone; the same launch can never be approved again.",
+  revoked: "Revoked. You can close this tab.",
   one_key: (expiresAt) =>
     `Your organization has one passkey. If you lose it you lose the organization. Your link stays open until ${expiresAt}.`,
 };
@@ -1108,6 +1112,94 @@ function imageChanges(before, services) {
     );
 }
 
+function revocationRefusal(read) {
+  if (!read || typeof read !== "object") return MESSAGES.unavailable;
+  if (read.state === "expired") return MESSAGES.revoke_expired;
+  if (read.state !== "pending") return MESSAGES.bad_link;
+  const expires = Date.parse(read.expires_at);
+  if (!Number.isFinite(expires) || expires <= Date.now()) return MESSAGES.revoke_expired;
+  if (
+    !UUID.test(read.org_id) ||
+    !UUID.test(read.app_id) ||
+    typeof read.title !== "string" ||
+    !Array.isArray(read.revisions) ||
+    !read.revisions.length ||
+    !read.revisions.every((h) => /^sha256:[0-9a-f]{64}$/.test(h)) ||
+    new Set(read.revisions).size !== read.revisions.length ||
+    !Array.isArray(read.credentials)
+  ) {
+    return MESSAGES.unavailable;
+  }
+  return clockRefusal(read.server_time) || (read.credentials.length ? null : MESSAGES.no_credentials);
+}
+
+// As `failure`, but a link that expired after the page read it says so.
+function revocationFailure(reply) {
+  return reply.status === 409 && reply.body?.details?.state === "expired"
+    ? MESSAGES.revoke_expired
+    : failure(reply);
+}
+
+// Which Revisions to revoke is the service's word: revoking only takes away, and the page can
+// confirm a revocation but not that the list is complete.
+async function startRevocation(view, ticket) {
+  const reply = await api(view, "GET", `/v1/revocations/${ticket}`);
+  if (reply.status !== 200) return stop(failure(reply));
+  const read = reply.body;
+  const refusal = revocationRefusal(read);
+  if (refusal) return stop(refusal);
+  const ui = screen(
+    el(
+      "p",
+      `Revocation for ${typeof read.org_name === "string" ? read.org_name : read.org_id}`,
+      "eyebrow",
+    ),
+    el("h1", read.title),
+  );
+  const r = { view, read, ticket, ui, credential: null, revoked: new Map(), rows: el("div") };
+  ui.facts.replaceChildren(
+    el("p", MESSAGES.revoke_effect, "warning"),
+    fact("App", read.app_id),
+    r.rows,
+  );
+  return offerRevocation(r);
+}
+
+// The next Revision to revoke: each is its own signed document, so each takes a touch.
+function offerRevocation(r, note) {
+  r.rows.replaceChildren(
+    ...r.read.revisions.map((hash) => {
+      const at = r.revoked.get(hash);
+      return fact(at ? `Revoked at ${at}` : "To revoke", hash, "digest");
+    }),
+  );
+  const pending = r.read.revisions.filter((hash) => !r.revoked.has(hash));
+  if (!pending.length) return offer(r.ui, "", el("p", MESSAGES.revoked, "confirmed"));
+  const total = r.read.revisions.length;
+  const step = total - pending.length + 1;
+  const label = step === 1 ? "Revoke with passkey" : `Sign ${step} of ${total}`;
+  const payload = { compose_hash: pending[0], issued_at: issuedAt() };
+  const signable = wasm_bindgen.signingDigest("control", JSON.stringify(payload));
+  const options = getOptions(r.view, signable.digest, allowed(r));
+  offer(r.ui, note, button(label, () => revoke(r, payload, options)));
+}
+
+async function revoke(r, payload, options) {
+  const { signature, note } = await approvalSignature(r, options);
+  if (!signature) return offerRevocation(r, note);
+  const body = wasm_bindgen.canonicalJson(JSON.stringify({ payload, signature }));
+  const reply = await api(r.view, "POST", `/v1/revocations/${r.ticket}/revoke`, body);
+  if (reply.status !== 200) return offerRevocation(r, revocationFailure(reply));
+  const signed = receipt(r.view, reply, "revision.revoke", body, {
+    compose_hash: payload.compose_hash,
+  });
+  if (!signed || typeof signed.revoked_at !== "string") {
+    return offerRevocation(r, MESSAGES.not_confirmed);
+  }
+  r.revoked.set(payload.compose_hash, signed.revoked_at);
+  return offerRevocation(r);
+}
+
 function servedBySigner(view) {
   return Boolean(view.signer?.origins.includes(location.origin));
 }
@@ -1140,7 +1232,9 @@ async function boot() {
 
   const mode = location.pathname.split("/").pop();
   const ticket = location.hash.slice(1);
-  if ((mode !== "claim" && mode !== "approve") || !TICKET.test(ticket)) return stop(MESSAGES.bad_link);
+  if (!["claim", "approve", "revoke"].includes(mode) || !TICKET.test(ticket)) {
+    return stop(MESSAGES.bad_link);
+  }
 
   const platform = await verifiedPlatform();
   if (!platform) return stop(MESSAGES.platform);
@@ -1152,6 +1246,7 @@ async function boot() {
   if (!servedBySigner(view)) return stop(MESSAGES.not_signer);
 
   if (mode === "claim") return startClaim(view, ticket);
+  if (mode === "revoke") return startRevocation(view, ticket);
   return startApproval(view, viewText, ticket);
 }
 

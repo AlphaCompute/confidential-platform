@@ -571,6 +571,10 @@ async function loadPage(options = {}) {
       await page.init();
       await page.call("startApproval", view.view, view.viewText, ticket);
     },
+    async startRevocation(ticket = TICKET, view = testView()) {
+      await page.init();
+      await page.call("startRevocation", view.view, ticket);
+    },
   };
   main.replaceChildren(Object.assign(new Node("p"), { own: "Loading…" }));
   return page;
@@ -754,6 +758,53 @@ function approvalApi(options = {}) {
   return api;
 }
 
+// shroud-go's revocation routes for one ticket, with the KMS behind them answering every revoke
+// with a receipt from `api.revokeReceipt`, which a test may replace; `api.reply` may answer the
+// revoke route instead.
+function revocationApi(options = {}) {
+  const now = options.now === undefined ? Date.now() : options.now;
+  const api = {
+    org_id: crypto.randomUUID(),
+    org_name: "Acme",
+    app_id: crypto.randomUUID(),
+    title: "Production",
+    revisions:
+      options.revisions || ["one", "two"].map((n) => `sha256:${sha256(n).toString("hex")}`),
+    credentials: options.credentials || [],
+    expires_at: options.expires_at || iso(now + 24 * 3600 * 1000),
+    state: options.state || "pending",
+    server_time: options.server_time || iso(now),
+    read: options.read,
+    revokes: [],
+    reply: null,
+    revokeReceipt: (text, response) => mintReceipt("revision.revoke", text, response),
+  };
+  const base = `/v1/revocations/${TICKET}`;
+  const fields = [
+    "org_id",
+    "org_name",
+    "app_id",
+    "title",
+    "revisions",
+    "credentials",
+    "expires_at",
+    "state",
+    "server_time",
+  ];
+  api.routes = {
+    [`GET ${base}`]: () =>
+      api.read || { status: 200, body: Object.fromEntries(fields.map((k) => [k, api[k]])) },
+    [`POST ${base}/revoke`]: (req) => {
+      const body = JSON.parse(req.body);
+      api.revokes.push({ text: req.body, body });
+      if (api.reply) return api.reply(req.body);
+      const response = { compose_hash: body.payload.compose_hash, revoked_at: RECEIPT_TIME };
+      return { status: 200, body: { ...response, receipt: api.revokeReceipt(req.body, response) } };
+    },
+  };
+  return api;
+}
+
 const NOT_CONFIRMED = "Not confirmed by the KMS.";
 // Values made inside the page's context have that context's prototypes.
 const plain = (value) => JSON.parse(JSON.stringify(value));
@@ -776,6 +827,7 @@ module.exports = {
   loadPage,
   memoryStorage,
   mintReceipt,
+  revocationApi,
   sha256,
   testView,
   testdata,

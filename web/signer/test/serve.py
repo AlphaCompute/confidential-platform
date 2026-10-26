@@ -27,7 +27,7 @@ def main():
     class Handler(http.server.BaseHTTPRequestHandler):
         def resolve(self):
             path = self.path.split("?", 1)[0]
-            if path in ("/sign/claim", "/sign/approve"):
+            if path in ("/sign/claim", "/sign/approve", "/sign/revoke"):
                 return dist / "index.html", "text/html; charset=utf-8"
             if path == "/sign/platform.json":
                 return platform, "application/json"

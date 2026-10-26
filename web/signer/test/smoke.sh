@@ -73,6 +73,7 @@ serve "$dist"
 wasm=$(cd "$dist" && ls alpha_channel_bg-*.wasm)
 has_headers "$port" /sign/approve 200 "text/html; charset=utf-8"
 has_headers "$port" /sign/claim 200 "text/html; charset=utf-8"
+has_headers "$port" /sign/revoke 200 "text/html; charset=utf-8"
 has_headers "$port" "/sign/$wasm" 200 application/wasm
 font=$(cd "$dist" && ls public_sans-*.woff2)
 has_headers "$port" "/sign/$font" 200 font/woff2

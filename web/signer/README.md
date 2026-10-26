@@ -1,6 +1,7 @@
 # signer page
 
-The page an organization opens to claim itself with passkeys and to approve or decline a launch.
+The page an organization opens to claim itself with passkeys, to approve or decline a launch, and
+to revoke the launches of an App it deleted.
 It runs `alpha-channel` as wasm, verifies the release-signed platform document with the key
 compiled into that wasm, and signs only what it has verified itself. It is static: plain
 JavaScript in classic scripts, one stylesheet, one font and the wasm, with no host name inside, so the same
@@ -17,6 +18,15 @@ frame, so the document is no test for a guess. At the KMS the Secret is named `<
 of one organization that declare the same name keep separate values. Every put comes before the
 Revision's registration, because shroud-go refuses puts once a request is approved, and the page
 says "Approved" only after the receipt of every put and of the registration verified.
+
+## Revocation
+
+A revocation link names an App and the compose hashes of its Revisions. Each Revision is revoked
+in its own step, `{compose_hash, issued_at}` signed under the Control context by the passkey that
+made the first signature, and relayed to the KMS's `POST /v1/revisions/{compose_hash}/revoke`. The
+page says "Revoked" only after the receipt of every revocation verified. Which Revisions to revoke
+is the service's word: a revocation only takes away, and without a listing the KMS signs the page
+cannot tell that the list is complete.
 
 ## Building
 
@@ -60,8 +70,9 @@ toolchain in `rust-toolchain.toml`, as CI does, to compare with a published `bun
 
 ## Serving
 
-The page lives at `<origin>/sign/claim#<ticket>` and `<origin>/sign/approve#<ticket>`. Both paths
-serve the same `index.html`, which picks its mode from the last path segment; the ticket stays in
+The page lives at `<origin>/sign/claim#<ticket>`, `<origin>/sign/approve#<ticket>` and
+`<origin>/sign/revoke#<ticket>`. All three paths serve the same `index.html`, which picks its mode
+from the last path segment; the ticket stays in
 the fragment, so it never reaches a server. The assets are served next to it under `/sign/`, with
 the types `text/javascript`, `application/wasm`, `text/css` and `font/woff2`, and may be cached forever because
 their names change with their content. `/sign/platform.json` is the release-signed platform
