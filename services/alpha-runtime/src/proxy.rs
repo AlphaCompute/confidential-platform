@@ -108,11 +108,10 @@ impl Endpoint {
             return Ok(None);
         };
         let callers = config.tls_callers.clone().into();
-        let mut probe = axum::Router::new().route("/leaf", axum::routing::get(leaf_chain));
-        if config.tls_ready.is_some() {
-            probe = probe.route("/ready", axum::routing::get(ready));
-        }
-        let probe = probe.with_state(runtime.clone());
+        let probe = axum::Router::new()
+            .route("/leaf", axum::routing::get(leaf_chain))
+            .route("/ready", axum::routing::get(ready))
+            .with_state(runtime.clone());
         let probe = (bind_tcp(probe_addr).await?, probe);
         let acceptor = TlsAcceptor::from(server_config(runtime)?);
         Ok(Some(Self {
