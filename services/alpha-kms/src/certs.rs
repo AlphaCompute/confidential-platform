@@ -236,13 +236,23 @@ mod tests {
         let ext = cert
             .extensions()
             .iter()
-            .find(|e| e.oid.to_id_string() == "2.25.7686831627720934303")
+            .find(|e| e.oid.to_id_string() == "2.25.1858292143.1688857791.1295186308")
             .unwrap();
         assert!(!ext.critical);
         let json = r#"{"advisories":["INTEL-SA-01397"],"format":"alphacompute-appraisal/1","gpu_count":1,"os_image":"kata-b300/32c-256g","policy_version":7,"tcb_status":"OutOfDate"}"#;
         let mut utf8_string = vec![0x0c, 0x81, json.len() as u8];
         utf8_string.extend_from_slice(json.as_bytes());
         assert_eq!(ext.value, utf8_string);
+        let mut first = CertificateParams::default();
+        first.custom_extensions = vec![CustomExtension::from_oid_content(
+            &[2, 25, 7686831627720934303],
+            utf8_string,
+        )];
+        let first = first.self_signed(&runtime).unwrap();
+        assert_eq!(
+            alpha_channel::cert::leaf_appraisal(first.der()).unwrap(),
+            Some(appraisal.clone())
+        );
         assert_eq!(
             alpha_channel::cert::leaf_appraisal(&leaf).unwrap(),
             Some(appraisal)
