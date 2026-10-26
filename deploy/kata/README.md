@@ -124,8 +124,7 @@ Do these steps on each TDX host, as root, after the platform is registered with 
    C=/opt/intel/sgx-pck-id-retrieval-tool/network_setting.conf
    chmod 600 $C
    printf 'PCCS_URL=https://127.0.0.1:8081/sgx/certification/v4/platforms\nUSE_SECURE_CERT=FALSE\nproxy_type = direct\nuser_token = %s\n' "$T" >> $C
-   sed -i -e "/\"UserTokenHash\"/c\    \"UserTokenHash\" : \"$(printf %s "$T" | sha512sum | cut -d' ' -f1)\"," \
-     -e "/\"CachingFillMode\"/c\    \"CachingFillMode\" : \"REQ\"," config/default.json
+   sed -i "/\"UserTokenHash\"/c\    \"UserTokenHash\" : \"$(printf %s "$T" | sha512sum | cut -d' ' -f1)\"," config/default.json
    sudo -u pccs mkdir -p ssl_key
    sudo -u pccs openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
      -subj /CN=localhost -keyout ssl_key/private.pem -out ssl_key/file.crt
@@ -134,8 +133,12 @@ Do these steps on each TDX host, as root, after the platform is registered with 
    Put the subscription key in `"ApiKey"` of `config/default.json` with an editor. Then start the
    PCCS: `systemctl enable --now pccs`.
 
-3. **Register the platform with the PCCS.** In `REQ` mode the PCCS gets all PCK certificates of
-   the platform from Intel during this call.
+3. **Register the platform with the PCCS.** The PCCS gets all PCK certificates of the platform
+   from Intel during this call. This step is necessary: QCNL sends no encrypted PPID, so the PCCS
+   cannot get the certificates by itself. Do not set `REQ` mode: PCCS 1.27.101.1 fails the
+   registration when Intel marks a TCB level of the platform "Not available". Each day, the PCCS
+   refreshes the TCB info, the CRLs and the QE identities from Intel, so the host needs access
+   to Intel PCS. This refresh does not get new PCK certificates; only a registration does.
 
    ```sh
    /opt/intel/sgx-pck-id-retrieval-tool/PCKIDRetrievalTool
