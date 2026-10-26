@@ -416,12 +416,19 @@ fn seal(
     let Some((x, y)) = point.get(1..).and_then(|xy| xy.split_first_chunk::<32>()) else {
         return Err(ApiError::internal("ephemeral key"));
     };
-    // Keys in sorted order: the guest re-serializes the header to rebuild the AAD.
-    let protected = BASE64_URL_SAFE_NO_PAD.encode(format!(
-        r#"{{"alg":"{KEY_WRAP}","enc":"A256GCM","epk":{{"crv":"P-256","kty":"EC","x":"{}","y":"{}"}}}}"#,
-        BASE64_URL_SAFE_NO_PAD.encode(x),
-        BASE64_URL_SAFE_NO_PAD.encode(y),
-    ));
+    // JCS: the guest re-serializes the header with sorted keys to rebuild the AAD.
+    let header = alpha_core::jcs(&json!({
+        "alg": KEY_WRAP,
+        "enc": "A256GCM",
+        "epk": {
+            "crv": "P-256",
+            "kty": "EC",
+            "x": BASE64_URL_SAFE_NO_PAD.encode(x),
+            "y": BASE64_URL_SAFE_NO_PAD.encode(y),
+        },
+    }))
+    .map_err(|e| ApiError::internal(format!("jwe header: {e}")))?;
+    let protected = BASE64_URL_SAFE_NO_PAD.encode(header);
     let mut ciphertext = Zeroizing::new(plaintext.to_vec());
     let tag = Aes256Gcm::new(cek.into())
         .encrypt_inout_detached(
