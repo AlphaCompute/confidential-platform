@@ -106,6 +106,7 @@ impl Error {
             Error::NotAttested => "not_attested",
             Error::Socket(_) => "socket",
             Error::Platform(_) => "platform_document",
+            Error::TimedOut => "timed_out",
         }
     }
 
@@ -128,6 +129,9 @@ impl Error {
 pub enum Exit {
     Drained,
     Revoked,
+    /// The leaf expired while attestations kept timing out: a quote read the kernel never
+    /// answers holds the evidence slot, and only a new process can collect a quote again.
+    QuoteStuck,
 }
 
 impl Exit {
@@ -135,6 +139,7 @@ impl Exit {
         match self {
             Exit::Drained => 0,
             Exit::Revoked => EXIT_REVOKED,
+            Exit::QuoteStuck => 1,
         }
     }
 }
@@ -870,7 +875,7 @@ impl Runtime {
         }
     }
 
-    async fn renew_forever(&self) {
+    async fn renew_forever(&self) -> Exit {
         loop {
             let delay = match self.last() {
                 Some(a) => renewal_delay(a.not_after, self.now()),
@@ -879,7 +884,11 @@ impl Runtime {
             tokio::time::sleep(delay).await;
             match self.attest().await {
                 Ok(a) => alpha_client::info!("renewed", not_after = a.not_after),
-                Err(e) if e.revoked() => return,
+                Err(e) if e.revoked() => return Exit::Revoked,
+                Err(Error::TimedOut) if self.attested().is_none() => {
+                    alpha_client::error!("attestation_stuck");
+                    return Exit::QuoteStuck;
+                }
                 Err(e) => {
                     alpha_client::warn!("renewal_failed", error = e.kind());
                     tokio::time::sleep(RETRY_AFTER).await;
@@ -921,7 +930,7 @@ impl Runtime {
         let exit = tokio::select! {
             () = shutdown => Exit::Drained,
             _ = revoked.wait_for(|r| *r) => Exit::Revoked,
-            () = self.renew_forever() => Exit::Revoked,
+            exit = self.renew_forever() => exit,
         };
         delivery.abort();
         let _ = stop.send(());
