@@ -91,8 +91,8 @@ pub enum Error {
     Socket(String),
     #[error("platform document: {0}")]
     Platform(String),
-    #[error("attestation did not finish in {0:?}")]
-    TimedOut(Duration),
+    #[error("attestation timed out")]
+    TimedOut,
 }
 
 impl Error {
@@ -586,7 +586,7 @@ impl Runtime {
     pub async fn attest(&self) -> Result<Arc<Attested>, Error> {
         let attested = tokio::time::timeout(ATTEST_TIMEOUT, self.attest_inner())
             .await
-            .unwrap_or(Err(Error::TimedOut(ATTEST_TIMEOUT)))
+            .unwrap_or(Err(Error::TimedOut))
             .map_err(|e| self.note(e))?;
         *self.attested.write() = Some(attested.clone());
         Ok(attested)
