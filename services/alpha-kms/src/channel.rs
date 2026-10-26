@@ -9,27 +9,16 @@ use axum::Json;
 use axum::extract::State;
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
-use hkdf::Hkdf;
-use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::body::Body;
 use crate::error::ApiError;
-use crate::keys::{Key32, aead_open, aead_seal};
+use crate::keys::{aead_open, aead_seal, hkdf};
 use crate::{Node, certs, later, random};
 
 pub const TICKET_TTL: Duration = Duration::from_secs(600);
 
 const TICKET_LABEL: &[u8] = b"alphacompute-kms/channel-ticket/v1";
-
-/// The key that seals one channel ticket, from the ticket's own random salt.
-fn ticket_key(tenant_kek_root: &[u8; 32], salt: &[u8; 16]) -> Result<Key32, ApiError> {
-    let mut out = Zeroizing::new([0u8; 32]);
-    Hkdf::<Sha256>::new(Some(TICKET_LABEL), tenant_kek_root)
-        .expand(salt, out.as_mut())
-        .map_err(|e| ApiError::internal(format!("hkdf: {e}")))?;
-    Ok(out)
-}
 
 /// `base64url(salt(16) ‖ nonce(12) ‖ AES-256-GCM(channel(16) ‖ c2s(32) ‖ expires_at(8, BE)))`.
 pub fn seal_ticket(
@@ -47,7 +36,7 @@ pub fn seal_ticket(
         .as_secs()
         .to_be_bytes();
     let plaintext = Zeroizing::new([channel.as_slice(), c2s, &expires_at].concat());
-    let key = ticket_key(tenant_kek_root, &salt)?;
+    let key = hkdf(tenant_kek_root, TICKET_LABEL, &salt)?;
     let sealed = aead_seal(&key, TICKET_LABEL, &plaintext)?;
     Ok(BASE64_URL_SAFE_NO_PAD.encode([salt.as_slice(), &sealed].concat()))
 }
@@ -61,7 +50,7 @@ pub fn open_ticket(
     let bad = || ApiError::malformed("the ticket does not open");
     let bytes = BASE64_URL_SAFE_NO_PAD.decode(ticket).map_err(|_| bad())?;
     let (salt, sealed) = bytes.split_first_chunk::<16>().ok_or_else(bad)?;
-    let key = ticket_key(tenant_kek_root, salt)?;
+    let key = hkdf(tenant_kek_root, TICKET_LABEL, salt)?;
     let plaintext = aead_open(&key, TICKET_LABEL, sealed).ok_or_else(bad)?;
     let (channel, rest) = plaintext.split_first_chunk::<16>().ok_or_else(bad)?;
     let (c2s, rest) = rest.split_first_chunk::<32>().ok_or_else(bad)?;
@@ -160,7 +149,7 @@ mod tests {
         let salt = [5u8; 16];
         for len in [55, 57] {
             let sealed = aead_seal(
-                &ticket_key(&ROOT, &salt).unwrap(),
+                &hkdf(&ROOT, TICKET_LABEL, &salt).unwrap(),
                 TICKET_LABEL,
                 &vec![0; len],
             )

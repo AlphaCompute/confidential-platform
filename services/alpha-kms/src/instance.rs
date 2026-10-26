@@ -4,11 +4,13 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use alpha_attest::{AttestationResult, InstanceEvidence, RESULT_FORMAT, Revision, Verdict};
+use alpha_attest::{
+    AttestationResult, InstanceEvidence, PlatformDocument, RESULT_FORMAT, Revision, Verdict,
+};
 use alpha_channel::cert::LeafAppraisal;
 use alpha_client::DerivedKey;
 use alpha_client::tls::PeerCerts;
-use alpha_core::{ComposeHash, Signer, context};
+use alpha_core::{AppId, ComposeHash, OrgId, Signer, context};
 use axum::Json;
 use axum::body::Bytes;
 use axum::extract::{Extension, Path, State};
@@ -32,7 +34,7 @@ use crate::{CollateralSource, Node, certs, rfc3339};
 
 pub const NONCE_MAX_AGE: Duration = Duration::from_secs(300);
 
-fn unix(now: SystemTime) -> u64 {
+pub(crate) fn unix(now: SystemTime) -> u64 {
     now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
@@ -193,6 +195,32 @@ pub async fn verify_revision(
     Ok(chain)
 }
 
+/// [`verify_revision`] and, for an init-data, its agent policy under `doc`: what a Revision
+/// passes before a leaf or a KBS token. Returns the init-data.
+pub async fn appraise_revision(
+    exec: impl sqlx::PgExecutor<'_> + Copy,
+    tenant_kek_root: &[u8; 32],
+    compose_hash: ComposeHash,
+    revision: &RevisionRow,
+    doc: &PlatformDocument,
+) -> Result<Option<alpha_core::InitData>, ApiError> {
+    verify_revision(
+        exec,
+        tenant_kek_root,
+        compose_hash,
+        revision,
+        doc.signer.as_ref(),
+    )
+    .await?;
+    let Some(init_data) = &revision.init_data else {
+        return Ok(None);
+    };
+    let init_data = alpha_core::InitData::parse(init_data.clone())
+        .map_err(|e| ApiError::new("policy_denied", e.to_string()))?;
+    crate::control::check_kata_policy(&init_data, Some(doc), "policy_denied")?;
+    Ok(Some(init_data))
+}
+
 pub async fn attest(
     State(node): State<Arc<Node>>,
     Body(request, _): Body<AttestRequest>,
@@ -304,19 +332,14 @@ async fn attest_inner(
                 format!("no revision {}", appraised.compose_hash),
             )
         })?;
-    verify_revision(
+    appraise_revision(
         &node.pool,
         &keys.tenant_kek_root,
         appraised.compose_hash,
         &revision,
-        doc.signer.as_ref(),
+        &doc,
     )
     .await?;
-    if let Some(init_data) = &revision.init_data {
-        let init_data = alpha_core::InitData::parse(init_data.clone())
-            .map_err(|e| ApiError::new("policy_denied", e.to_string()))?;
-        crate::control::check_kata_policy(&init_data, Some(&doc), "policy_denied")?;
-    }
     let runtime_sha_hex = appraised
         .runtime_pubkey_sha256
         .trim_start_matches("sha256:")
@@ -370,7 +393,15 @@ pub async fn get_secret(
     let verifier = certs::ca_verifier(&keys.ca_cert_der)?;
     let sans = certs::verify_to_ca(verifier.as_ref(), &peer.0, node.now())?;
     let identity = certs::parse_instance_sans(&sans)?;
-    let result = get_secret_inner(&node, &keys.tenant_kek_root, &identity, &name).await;
+    let result = get_secret_inner(&node, &keys.tenant_kek_root, &identity, &name)
+        .await
+        .map(|r| {
+            json!({
+                "value": BASE64_URL_SAFE_NO_PAD.encode(&*r.value),
+                "content_sha256": r.content_sha256,
+                "issued_at": rfc3339(r.issued_at),
+            })
+        });
     let (outcome, details) = match &result {
         Ok(_) => ("ok", json!({})),
         Err(e) => (e.outcome(), e.details()),
@@ -390,12 +421,18 @@ pub async fn get_secret(
     result.map(Json)
 }
 
+pub struct Released {
+    pub value: Zeroizing<Vec<u8>>,
+    pub content_sha256: String,
+    pub issued_at: DateTime<Utc>,
+}
+
 async fn get_secret_inner(
     node: &Node,
     tenant_kek_root: &[u8; 32],
     identity: &certs::InstanceIdentity,
     name: &str,
-) -> Result<Value, ApiError> {
+) -> Result<Released, ApiError> {
     let doc = node.platform_document();
     let signer = doc.as_deref().and_then(|d| d.signer.as_ref());
     let revision = load_revision(&node.pool, identity.compose_hash)
@@ -412,12 +449,33 @@ async fn get_secret_inner(
         signer,
     )
     .await?;
+    release_secret(
+        node,
+        tenant_kek_root,
+        signer,
+        identity.org_id,
+        identity.app_id,
+        name,
+    )
+    .await
+}
+
+/// The Secret `name` of `org_id` for `app_id`, once its signed document is checked again as it
+/// is now. The caller has checked the Revision.
+pub async fn release_secret(
+    node: &Node,
+    tenant_kek_root: &[u8; 32],
+    signer: Option<&Signer>,
+    org_id: OrgId,
+    app_id: AppId,
+    name: &str,
+) -> Result<Released, ApiError> {
     let secret = sqlx::query!(
         "select id, ciphertext, content_sha256, document, signed_by_key, signature
          from secrets where org_id = $1 and name = $2 and $3 = any(app_ids) and deleted_at is null",
-        Uuid::from(identity.org_id),
+        Uuid::from(org_id),
         name,
-        Uuid::from(identity.app_id),
+        Uuid::from(app_id),
     )
     .fetch_optional(&node.pool)
     .await?
@@ -437,7 +495,7 @@ async fn get_secret_inner(
             "secret row differs from its signed document",
         ));
     }
-    if !document.app_ids.contains(&identity.app_id) {
+    if !document.app_ids.contains(&app_id) {
         return Err(ApiError::not_found("no such secret for this app"));
     }
     let chain = keys::verify_signed(
@@ -450,12 +508,12 @@ async fn get_secret_inner(
         signer,
     )
     .await?;
-    if chain.key.org_id != Uuid::from(identity.org_id) {
+    if chain.key.org_id != Uuid::from(org_id) {
         return Err(ApiError::signature_invalid(
             "secret signer is not of its organization",
         ));
     }
-    let org_key = keys::org_key(tenant_kek_root, identity.org_id, &chain.anchor_spki)?;
+    let org_key = keys::org_key(tenant_kek_root, org_id, &chain.anchor_spki)?;
     let aad = keys::secret_aad(secret.id, &secret.document)?;
     let value = keys::aead_open(&org_key, &aad, &secret.ciphertext)
         .ok_or_else(|| ApiError::internal("secret does not decrypt under org_key"))?;
@@ -467,11 +525,11 @@ async fn get_secret_inner(
     let (_salt, value) = value
         .split_first_chunk::<{ alpha_core::SECRET_SALT_LEN }>()
         .ok_or_else(|| ApiError::internal("secret is shorter than its salt"))?;
-    Ok(json!({
-        "value": BASE64_URL_SAFE_NO_PAD.encode(value),
-        "content_sha256": content_sha256,
-        "issued_at": rfc3339(document.issued_at),
-    }))
+    Ok(Released {
+        value: Zeroizing::new(value.to_vec()),
+        content_sha256,
+        issued_at: document.issued_at,
+    })
 }
 
 #[derive(Deserialize)]

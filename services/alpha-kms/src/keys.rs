@@ -22,13 +22,17 @@ use crate::webauthn;
 
 pub type Key32 = Zeroizing<[u8; 32]>;
 
-fn derive(ikm: &[u8; 32], salt: &[u8], org: OrgId, anchor_spki: &[u8]) -> Result<Key32, ApiError> {
-    let info = [org.as_bytes().as_slice(), &Sha256::digest(anchor_spki)].concat();
+pub fn hkdf(ikm: &[u8; 32], salt: &[u8], info: &[u8]) -> Result<Key32, ApiError> {
     let mut out = Zeroizing::new([0u8; 32]);
     Hkdf::<Sha256>::new(Some(salt), ikm)
-        .expand(&info, out.as_mut())
+        .expand(info, out.as_mut())
         .map_err(|e| ApiError::internal(format!("hkdf: {e}")))?;
     Ok(out)
+}
+
+fn derive(ikm: &[u8; 32], salt: &[u8], org: OrgId, anchor_spki: &[u8]) -> Result<Key32, ApiError> {
+    let info = [org.as_bytes().as_slice(), &Sha256::digest(anchor_spki)].concat();
+    hkdf(ikm, salt, &info)
 }
 
 pub fn org_key(
@@ -62,20 +66,13 @@ pub fn anchor_check(
 /// id before it has a fixed length.
 pub fn app_key(org_key: &[u8; 32], app: AppId, purpose: &str) -> Result<Key32, ApiError> {
     let info = [app.as_bytes().as_slice(), purpose.as_bytes()].concat();
-    let mut out = Zeroizing::new([0u8; 32]);
-    Hkdf::<Sha256>::new(Some(b"alphacompute-kms/app-key/v1"), org_key)
-        .expand(&info, out.as_mut())
-        .map_err(|e| ApiError::internal(format!("hkdf: {e}")))?;
-    Ok(out)
+    hkdf(org_key, b"alphacompute-kms/app-key/v1", &info)
 }
 
 /// A Kata node's database password: a node computes it from the root KEK, so no person and no
 /// configuration ever holds it.
 pub fn database_password(root: &[u8; 32]) -> Result<Zeroizing<String>, ApiError> {
-    let mut out = Zeroizing::new([0u8; 32]);
-    Hkdf::<Sha256>::new(Some(b"alphacompute-kms/database/v1"), root)
-        .expand(&[], out.as_mut())
-        .map_err(|e| ApiError::internal(format!("hkdf: {e}")))?;
+    let out = hkdf(root, b"alphacompute-kms/database/v1", &[])?;
     Ok(Zeroizing::new(hex::encode(out.as_slice())))
 }
 
