@@ -3,6 +3,7 @@ use std::fmt::Write;
 
 use axum::Router;
 use axum::extract::{MatchedPath, Request};
+use axum::http::header::CONTENT_TYPE;
 use axum::middleware::Next;
 use axum::response::Response;
 use axum::routing::get;
@@ -46,7 +47,16 @@ fn text() -> String {
 /// as `other`, so a probed path never becomes a series.
 pub async fn serve(router: Router) -> std::io::Result<Router> {
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 9464)).await?;
-    let metrics = Router::new().route("/metrics", get(|| async { text() }));
+    // Prometheus 3 fails a scrape whose content type it does not recognise as a scrape format.
+    let metrics = Router::new().route(
+        "/metrics",
+        get(|| async {
+            (
+                [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+                text(),
+            )
+        }),
+    );
     tokio::spawn(async move { axum::serve(listener, metrics).await });
     Ok(router.layer(axum::middleware::from_fn(record)))
 }
