@@ -1,6 +1,9 @@
 # syntax=docker/dockerfile:1.7.1@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 # The alpha-runtime image: one binary on glibc and nothing else. Built from the repository root:
-#   docker build --platform linux/amd64 --build-arg SOURCE_DATE_EPOCH=<unix seconds> -f images/manager/Dockerfile .
+#   docker build --platform linux/amd64 --build-arg SOURCE_DATE_EPOCH=<unix seconds> \
+#     [--build-arg FEATURES=dev] -f images/manager/Dockerfile .
+# FEATURES is compiled in: `dev` gives the distinct alpha-runtime-dev image, which trusts the dev
+# release key.
 # The base image is pinned by digest, dependencies are fetched in a stage of their own, the
 # stage that compiles has no network, and every timestamp comes from SOURCE_DATE_EPOCH, so two
 # builds of one commit give one image digest (.github/workflows/release.yml checks that).
@@ -21,8 +24,9 @@ RUN cargo fetch --locked
 
 FROM deps AS build
 ARG SOURCE_DATE_EPOCH
+ARG FEATURES=""
 ENV SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH CARGO_PROFILE_RELEASE_STRIP=true
-RUN --network=none cargo build --release --locked --offline -p alpha-runtime \
+RUN --network=none cargo build --release --locked --offline -p alpha-runtime --features "$FEATURES" \
  && install -D -m 0755 target/release/alpha-runtime /out/alpha-runtime \
  && touch -h -d "@$SOURCE_DATE_EPOCH" /out/alpha-runtime /out
 

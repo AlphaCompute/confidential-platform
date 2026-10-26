@@ -20,6 +20,9 @@ jobs:
         include:
           - name: alpha-runtime
             dockerfile: images/manager/Dockerfile
+          - name: alpha-runtime-dev
+            dockerfile: images/manager/Dockerfile
+            features: dev
           - name: alpha-kms-dev
             dockerfile: images/kms/Dockerfile
             features: dev-root
