@@ -1,4 +1,4 @@
-//! The key broker: six tables, fourteen routes on one TLS port, one process-wide state.
+//! The key broker: six tables, seventeen routes on one TLS port, one process-wide state.
 
 #![cfg_attr(
     test,
@@ -18,6 +18,7 @@ pub mod channel;
 pub mod control;
 pub mod error;
 pub mod instance;
+pub mod kbs;
 pub mod keys;
 pub mod node;
 pub mod platform;
@@ -300,6 +301,12 @@ pub fn router(node: Arc<Node>) -> Router {
         .route("/v1/secrets/{name}/delete", post(control::delete_secret))
         .route("/v1/keys", post(control::register_key))
         .route("/v1/keys/{id}/revoke", post(control::revoke_key))
+        .route("/kbs/v0/auth", post(kbs::auth))
+        .route("/kbs/v0/attest", post(kbs::attest))
+        .route(
+            "/kbs/v0/resource/{repository}/{kind}/{name}",
+            get(kbs::resource),
+        )
         .route("/v1/node/evidence", get(node::evidence))
         .route("/v1/node/bootstrap", post(node::bootstrap))
         .route("/v1/node/unseal", post(node::unseal))

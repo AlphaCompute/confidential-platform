@@ -37,7 +37,7 @@ impl ApiError {
     pub fn status(&self) -> StatusCode {
         match self.code {
             "signature_invalid" | "nonce_invalid" | "malformed" => StatusCode::BAD_REQUEST,
-            "cert_invalid" => StatusCode::UNAUTHORIZED,
+            "cert_invalid" | "token_invalid" => StatusCode::UNAUTHORIZED,
             "attestation_failed" | "attestation_unknown" | "policy_denied" => StatusCode::FORBIDDEN,
             "revision_revoked" | "already_exists" => StatusCode::CONFLICT,
             "not_found" => StatusCode::NOT_FOUND,

@@ -1,0 +1,15 @@
+{
+  "description": "A JWE that alpha-kms seals to a TEE key and that kbs_protocol's TeeKeyPair::decrypt_response (guest-components da8d93f2, rust-crypto) opens to plaintext.",
+  "tee_secret_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+  "ephemeral_secret_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+  "cek_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+  "iv_hex": "444444444444444444444444",
+  "plaintext": "{\"auths\":{\"registry.example\":{\"auth\":\"dXNlcjpwYXNz\"}}}",
+  "jwe": {
+    "protected": "eyJhbGciOiJFQ0RILUVTK0EyNTZLVyIsImVuYyI6IkEyNTZHQ00iLCJlcGsiOnsiY3J2IjoiUC0yNTYiLCJrdHkiOiJFQyIsIngiOiIxbHFUbDN5cVBSc0lHRkxfVjZlZVJsOFdZRmR6QkxycTFRWGRPa2hZblBNIiwieSI6IlVCaGVpVk55MzJJaDZqb1RkVmZrY18zYloxWHdXOVVIdzhVel9PbkpFb1UifX0",
+    "encrypted_key": "Tv226vhM20rpXNoICDhHf0YT2lYcLlnHvVvuv_Fmpi_nXNRYDlyw1A",
+    "iv": "RERERERERERERERE",
+    "ciphertext": "S7Ol575u_Ema-Ybgk_qjAm7-aKQFp94mlSK3USSaIOYnTNjIG1-DRX6kHcYKNEA7Od7lE4vr",
+    "tag": "jy8QL1pSOjBYPTrHgtunOg"
+  }
+}

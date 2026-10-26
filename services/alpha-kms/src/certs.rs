@@ -20,6 +20,9 @@ use rustls::server::danger::ClientCertVerifier;
 use crate::error::ApiError;
 
 pub const LEAF_TTL: Duration = Duration::from_secs(3600);
+/// A node's leaf also names the `kms` Service: a guest's data hub reaches the KMS by it and
+/// checks the name.
+const KMS_DNS_NAMES: [&str; 2] = ["kms.alpha-kms.svc", "kms.alpha-kms.svc.cluster.local"];
 pub use alpha_client::tls::KMS_SAN;
 
 fn serial() -> Result<rcgen::SerialNumber, ApiError> {
@@ -77,8 +80,8 @@ pub fn new_ca(now: SystemTime) -> Result<(Vec<u8>, Vec<u8>), ApiError> {
     Ok((key.serialize_der(), cert.der().to_vec()))
 }
 
-/// A one-hour leaf from `ca` over a foreign SPKI with the two URI SANs, both EKUs and, for an
-/// Instance, its appraisal.
+/// A one-hour leaf from `ca` over a foreign SPKI with the two URI SANs, [`KMS_DNS_NAMES`] for a
+/// node, both EKUs and, for an Instance, its appraisal.
 pub fn issue_leaf(
     ca_key: &KeyPair,
     ca_cert_der: &[u8],
@@ -93,9 +96,18 @@ pub fn issue_leaf(
         .map_err(|e| ApiError::internal(format!("ca certificate: {e}")))?;
     let mut params = CertificateParams::default();
     params.distinguished_name = DistinguishedName::new();
+    let dns_names = match sans.first() {
+        Some(san) if san == KMS_SAN => &KMS_DNS_NAMES[..],
+        _ => &[],
+    };
     params.subject_alt_names = sans
         .into_iter()
         .map(|s| Ia5String::try_from(s).map(SanType::URI))
+        .chain(
+            dns_names
+                .iter()
+                .map(|d| Ia5String::try_from(*d).map(SanType::DnsName)),
+        )
         .collect::<Result<_, _>>()
         .map_err(|e| ApiError::internal(format!("san: {e}")))?;
     params.is_ca = IsCa::ExplicitNoCa;
@@ -270,6 +282,26 @@ mod tests {
             "cert_invalid"
         );
         assert!(parse_instance_sans(&node_sans(hash)).is_err());
+
+        let node_leaf = issue_leaf(
+            &ca_key,
+            &ca_cert,
+            &runtime.subject_public_key_info(),
+            node_sans(hash),
+            now,
+        )
+        .unwrap();
+        let named = |leaf: &[u8], name: &'static str| {
+            let der = CertificateDer::from(leaf.to_vec());
+            let parsed = rustls::server::ParsedCertificate::try_from(&der).unwrap();
+            let name = rustls::pki_types::ServerName::try_from(name).unwrap();
+            rustls::client::verify_server_name(&parsed, &name).is_ok()
+        };
+        assert!(named(&node_leaf, "kms.alpha-kms.svc"));
+        assert!(named(&node_leaf, "kms.alpha-kms.svc.cluster.local"));
+        assert!(!named(&node_leaf, "kms.other.svc"));
+        assert!(!named(&leaf, "kms.alpha-kms.svc"));
+        assert_eq!(uri_sans(&node_leaf).unwrap(), node_sans(hash));
         assert!(parse_instance_sans(&[sans[0].clone()]).is_err());
     }
 }

@@ -146,6 +146,12 @@ impl InitData {
         Ok(())
     }
 
+    /// The Secret the guest pulls images with, from `cdh.toml`; only meaningful once
+    /// [`Self::check_policy`] passed.
+    pub fn registry_credential(&self) -> Option<String> {
+        credential_name(&self.data().ok()?)
+    }
+
     fn data(&self) -> Result<toml::Table, InitDataError> {
         #[derive(Deserialize)]
         struct WithData {
@@ -363,6 +369,9 @@ mod tests {
 
         let init_data = InitData::parse(with_auth(&aa, &cdh)).unwrap();
         init_data.check_policy(&pinned(), PEM).unwrap();
+        assert_eq!(init_data.registry_credential().as_deref(), Some("regcred"));
+        let k3 = InitData::parse(K3.into()).unwrap();
+        assert_eq!(k3.registry_credential(), None);
     }
 
     #[test]
