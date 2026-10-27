@@ -96,6 +96,9 @@ fn public_config(cert: Arc<CertifiedKey>, alpn: &[u8]) -> Option<Arc<ServerConfi
     .with_no_client_auth()
     .with_cert_resolver(Arc::new(SingleCertAndKey::from(cert)));
     config.alpn_protocols = vec![alpn.to_vec()];
+    // The config lives for one connection, so a ticket could never resume.
+    config.send_tls13_tickets = 0;
+    config.session_storage = Arc::new(NoServerSessionStorage {});
     Some(Arc::new(config))
 }
 
