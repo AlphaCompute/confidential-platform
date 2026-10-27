@@ -94,6 +94,7 @@ fn config(h: &Harness, endpoints: Vec<String>) -> Config {
         tls_upstream: None,
         tls_callers: Vec::new(),
         tls_ready: None,
+        public: None,
     }
 }
 

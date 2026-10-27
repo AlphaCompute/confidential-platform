@@ -1,29 +1,35 @@
 //! TLS for a wrapped compose: the current Instance leaf on the Endpoint, then the bytes copied
 //! both ways to the published service's plain port. With caller Apps configured, only a client
-//! presenting an Instance leaf of one of them under the KMS CA gets past the handshake.
+//! presenting an Instance leaf of one of them under the KMS CA gets past the handshake. With a
+//! public name, a browser on that name gets the ACME certificate instead, and the binding of its
+//! key to the Instance leaf at [`binding::PATH`].
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use alpha_channel::binding;
 use alpha_client::tls;
 use alpha_core::AppId;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
+use p256::ecdsa::SigningKey;
+use p256::pkcs8::DecodePrivateKey;
 use rustls::pki_types::CertificateDer;
 use rustls::server::{
-    ClientHello, NoServerSessionStorage, ResolvesServerCert, WebPkiClientVerifier,
+    Acceptor, ClientHello, NoServerSessionStorage, ResolvesServerCert, WebPkiClientVerifier,
 };
 use rustls::sign::CertifiedKey;
 use rustls::{RootCertStore, ServerConfig};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::LazyConfigAcceptor;
 
-use crate::{Error, Exit, Runtime};
+use crate::acme::{self, Edge, PublicName, Route, Slot};
+use crate::{Attested, Error, Exit, Runtime};
 
 const HANDSHAKE: Duration = Duration::from_secs(10);
 const CONNECT: Duration = Duration::from_secs(10);
@@ -79,11 +85,54 @@ fn server_config(runtime: Arc<Runtime>) -> Result<Arc<ServerConfig>, Error> {
     Ok(Arc::new(config))
 }
 
+/// Browsers and the ACME CA's validators may lack `X25519MLKEM768`, the one group the
+/// platform's own hops accept, and TLS 1.3; only the public name is served to them.
+fn public_config(cert: Arc<Slot>, alpn: &[u8]) -> Result<Arc<ServerConfig>, Error> {
+    let mut config = ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| Error::Socket(format!("tls: {e}")))?
+    .with_no_client_auth()
+    .with_cert_resolver(cert);
+    config.alpn_protocols = vec![alpn.to_vec()];
+    Ok(Arc::new(config))
+}
+
+struct Public {
+    name: PublicName,
+    edge: Arc<Edge>,
+    served: Arc<ServerConfig>,
+    challenge: Arc<ServerConfig>,
+}
+
+struct Configs {
+    instance: Arc<ServerConfig>,
+    public: Option<Public>,
+}
+
+impl Configs {
+    /// A browser on the public name keeps the Instance leaf until the first certificate arrives.
+    fn select(&self, hello: &ClientHello<'_>) -> (Route, Arc<ServerConfig>) {
+        let Some(public) = &self.public else {
+            return (Route::Instance, self.instance.clone());
+        };
+        match acme::route(&public.name.name, hello.server_name(), hello.alpn()) {
+            Route::Challenge => (Route::Challenge, public.challenge.clone()),
+            Route::Public if public.edge.served.get().is_some() => {
+                (Route::Public, public.served.clone())
+            }
+            _ => (Route::Instance, self.instance.clone()),
+        }
+    }
+}
+
 /// The Endpoint's listener with its TLS configuration and its plain-HTTP probe listener, bound
 /// only for a compose that names an upstream.
 pub struct Endpoint {
     listener: TcpListener,
-    acceptor: TlsAcceptor,
+    configs: Arc<Configs>,
+    runtime: Arc<Runtime>,
     upstream: String,
     callers: Arc<[AppId]>,
     probe: (TcpListener, axum::Router),
@@ -113,10 +162,26 @@ impl Endpoint {
             .route("/ready", axum::routing::get(ready))
             .with_state(runtime.clone());
         let probe = (bind_tcp(probe_addr).await?, probe);
-        let acceptor = TlsAcceptor::from(server_config(runtime)?);
+        let public = match config.public.clone() {
+            Some(name) => {
+                let edge = Arc::new(Edge::default());
+                Some(Public {
+                    served: public_config(edge.served.clone(), b"http/1.1")?,
+                    challenge: public_config(edge.challenge.clone(), acme::ACME_TLS_ALPN)?,
+                    name,
+                    edge,
+                })
+            }
+            None => None,
+        };
+        let configs = Arc::new(Configs {
+            instance: server_config(runtime.clone())?,
+            public,
+        });
         Ok(Some(Self {
             listener: bind_tcp(addr).await?,
-            acceptor,
+            configs,
+            runtime,
             upstream,
             callers,
             probe,
@@ -141,6 +206,12 @@ impl Endpoint {
                 alpha_client::error!("probe_listener_failed", error = e.kind());
             }
         });
+        let issuer = self.configs.public.as_ref().map(|public| {
+            tokio::spawn(acme::issue_forever(
+                public.edge.clone(),
+                public.name.clone(),
+            ))
+        });
         let mut open = JoinSet::new();
         let how = loop {
             while open.try_join_next().is_some() {}
@@ -156,7 +227,8 @@ impl Endpoint {
                 how = &mut stop => break how,
             };
             open.spawn(proxy(
-                self.acceptor.clone(),
+                self.configs.clone(),
+                self.runtime.clone(),
                 tcp,
                 self.upstream.clone(),
                 self.callers.clone(),
@@ -164,6 +236,9 @@ impl Endpoint {
         };
         drop(self.listener);
         probe.abort();
+        if let Some(issuer) = issuer {
+            issuer.abort();
+        }
         if how == Exit::Drained {
             let _ = timeout(DRAIN, async { while open.join_next().await.is_some() {} }).await;
         }
@@ -183,12 +258,40 @@ fn admitted(peer: Option<&[CertificateDer<'_>]>, callers: &[AppId]) -> bool {
             .is_some_and(|instance| callers.contains(&instance.app_id))
 }
 
-async fn proxy(acceptor: TlsAcceptor, tcp: TcpStream, upstream: String, callers: Arc<[AppId]>) {
+async fn proxy(
+    configs: Arc<Configs>,
+    runtime: Arc<Runtime>,
+    tcp: TcpStream,
+    upstream: String,
+    callers: Arc<[AppId]>,
+) {
     let _ = tcp.set_nodelay(true);
-    let Ok(Ok(mut tls)) = timeout(HANDSHAKE, acceptor.accept(tcp)).await else {
+    let handshake = async {
+        let start = LazyConfigAcceptor::new(Acceptor::default(), tcp)
+            .await
+            .ok()?;
+        let (route, config) = configs.select(&start.client_hello());
+        Some((route, start.into_stream(config).await.ok()?))
+    };
+    let Ok(Some((route, mut tls))) = timeout(HANDSHAKE, handshake).await else {
         return;
     };
-    if !admitted(tls.get_ref().1.peer_certificates(), &callers) {
+    let mut head = Vec::new();
+    let refused = match (route, &configs.public) {
+        (Route::Challenge, _) => true,
+        (Route::Public, Some(public)) => {
+            let Ok(asks) = read_head(&mut tls, &mut head).await else {
+                return;
+            };
+            if asks {
+                let reply = binding_reply(&runtime, &public.name.name, &public.edge);
+                let _ = tls.write_all(&reply).await;
+            }
+            asks
+        }
+        _ => !admitted(tls.get_ref().1.peer_certificates(), &callers),
+    };
+    if refused {
         let _ = tls.shutdown().await;
         return;
     }
@@ -209,7 +312,63 @@ async fn proxy(acceptor: TlsAcceptor, tcp: TcpStream, upstream: String, callers:
         }
     };
     let _ = backend.set_nodelay(true);
+    if backend.write_all(&head).await.is_err() {
+        return;
+    }
     let _ = tokio::io::copy_bidirectional(&mut tls, &mut backend).await;
+}
+
+/// Reads until the bytes can no longer open `GET <binding::PATH> `; true when they do. A request
+/// for the binding later on a kept-alive connection reaches the upstream, so a verifier asks on
+/// a fresh connection.
+async fn read_head(
+    tls: &mut (impl AsyncRead + Unpin),
+    head: &mut Vec<u8>,
+) -> std::io::Result<bool> {
+    let request = format!("GET {} ", binding::PATH);
+    let request = request.as_bytes();
+    let mut buf = [0u8; 64];
+    while head.len() < request.len() && request.starts_with(head) {
+        let n = tls.read(&mut buf).await?;
+        let Some(read) = buf.get(..n).filter(|r| !r.is_empty()) else {
+            break;
+        };
+        head.extend_from_slice(read);
+    }
+    Ok(head.starts_with(request))
+}
+
+/// The binding of the certificate served now, signed with the runtime key, as a whole HTTP
+/// response that closes the connection.
+fn binding_reply(runtime: &Runtime, name: &str, edge: &Edge) -> Vec<u8> {
+    let signed = (|| {
+        let attested = runtime.attested()?;
+        let served = edge.served.get()?;
+        let key = SigningKey::from_pkcs8_der(runtime.tls_private_key()).ok()?;
+        let served = served.end_entity_cert().ok()?;
+        let signed = binding::sign(&key, chain_pem(&attested), name, served).ok()?;
+        serde_json::to_vec(&signed).ok()
+    })();
+    let (status, body) = match &signed {
+        Some(body) => ("200 OK", body.as_slice()),
+        None => ("503 Service Unavailable", &b"{}"[..]),
+    };
+    let mut reply = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    reply.extend_from_slice(body);
+    reply
+}
+
+fn chain_pem(attested: &Attested) -> String {
+    attested
+        .chain_pem
+        .iter()
+        .map(|pem| format!("{}\n", pem.trim_end()))
+        .collect()
 }
 
 /// The PEM chain the Endpoint presents now, leaf first; it is public, as every handshake shows it.
@@ -217,12 +376,10 @@ async fn leaf_chain(
     State(runtime): State<Arc<Runtime>>,
 ) -> Result<impl axum::response::IntoResponse, StatusCode> {
     let attested = runtime.attested().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let chain = attested
-        .chain_pem
-        .iter()
-        .map(|pem| format!("{}\n", pem.trim_end()))
-        .collect::<String>();
-    Ok(([(CONTENT_TYPE, "application/pem-certificate-chain")], chain))
+    Ok((
+        [(CONTENT_TYPE, "application/pem-certificate-chain")],
+        chain_pem(&attested),
+    ))
 }
 
 /// 200 only while the leaf is current and the upstream answers its own path with a 2xx now.
@@ -309,5 +466,22 @@ mod tests {
         let addr = closed.local_addr().unwrap().to_string();
         drop(closed);
         assert!(!upstream_answers(&addr, "/health").await);
+    }
+
+    #[tokio::test]
+    async fn only_a_request_for_the_binding_is_answered_and_other_bytes_reach_the_upstream() {
+        let mut head = Vec::new();
+        let asks = b"GET /.well-known/alphacompute/binding HTTP/1.1\r\nHost: a.example\r\n\r\n";
+        assert!(read_head(&mut &asks[..], &mut head).await.unwrap());
+        for request in [
+            &b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n"[..],
+            b"GET /.well-known/alphacompute/bindings HTTP/1.1\r\n\r\n",
+            b"POST /.well-known/alphacompute/binding HTTP/1.1\r\n\r\n",
+            b"GET /.well",
+        ] {
+            let mut head = Vec::new();
+            assert!(!read_head(&mut &request[..], &mut head).await.unwrap());
+            assert!(request.starts_with(&head) && !head.is_empty());
+        }
     }
 }

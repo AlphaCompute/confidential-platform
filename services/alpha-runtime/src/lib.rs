@@ -17,6 +17,7 @@
     )
 )]
 
+pub mod acme;
 pub mod gpu;
 pub mod proxy;
 pub mod socket;
@@ -306,7 +307,7 @@ impl KmsRevisions {
 
 /// The three environment variables and, when a service declared a Secret,
 /// `ALPHACOMPUTE_SECRETS`; for a wrapped compose or a Kata pod with an Endpoint,
-/// `ALPHACOMPUTE_TLS_UPSTREAM` and optionally its caller pin and readiness path.
+/// `ALPHACOMPUTE_TLS_UPSTREAM` and optionally its caller pin, readiness path or public name.
 #[derive(Clone, Debug)]
 pub struct Config {
     pub kms_ca_spki_sha256: [u8; 32],
@@ -316,6 +317,7 @@ pub struct Config {
     pub tls_upstream: Option<String>,
     pub tls_callers: Vec<AppId>,
     pub tls_ready: Option<String>,
+    pub public: Option<acme::PublicName>,
 }
 
 impl Config {
@@ -324,7 +326,7 @@ impl Config {
             std::env::var(name).map_err(|_| Error::Config(format!("{name} is not set")))
         };
         let optional = |name: &str| std::env::var(name).ok();
-        Self::parse(
+        let mut config = Self::parse(
             &var("ALPHACOMPUTE_KMS_CA_SPKI_SHA256")?,
             KmsRevisions::parse(
                 optional("ALPHACOMPUTE_KMS_REVISIONS").as_deref(),
@@ -340,7 +342,15 @@ impl Config {
             std::env::var("ALPHACOMPUTE_TLS_UPSTREAM_READY")
                 .ok()
                 .as_deref(),
-        )
+        )?;
+        config.public = acme::PublicName::parse(
+            optional("ALPHACOMPUTE_PUBLIC_NAME").as_deref(),
+            optional("ALPHACOMPUTE_ACME_DIRECTORY").as_deref(),
+            optional("ALPHACOMPUTE_ACME_CONTACT").as_deref(),
+            config.tls_upstream.as_deref(),
+            &config.tls_callers,
+        )?;
+        Ok(config)
     }
 
     pub fn parse(
@@ -377,6 +387,7 @@ impl Config {
             tls_upstream,
             tls_callers,
             tls_ready,
+            public: None,
         })
     }
 }

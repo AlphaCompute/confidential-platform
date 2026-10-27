@@ -5,6 +5,7 @@
 use std::time::SystemTime;
 
 use alpha_attest::PlatformDocument;
+use alpha_channel::binding::{self, SignedBinding};
 use alpha_channel::cert;
 use alpha_client::tls::{self, InstanceSans};
 use alpha_client::{Client, Pin, system_time_provider};
@@ -15,18 +16,26 @@ use crate::{node, rfc3339};
 
 /// The leaf `url` presents must chain to the document's KMS CA, be valid now and belong to
 /// `app`; with `init_data`, that file must be the leaf's Revision and pass the document's
-/// `kata_policy`.
+/// `kata_policy`; with `public`, the browser-trusted certificate on `url`'s name must be bound
+/// to an Instance of that Revision.
 pub async fn instance(
     url: &str,
     app: AppId,
     init_data: Option<&InitData>,
+    public: bool,
     doc: &PlatformDocument,
 ) -> Result<Value, String> {
     let (sans, leaf) = app_leaf(url, app, &doc.kms_ca_pem).await?;
     if let Some(init_data) = init_data {
         check_init_data(&sans, init_data, doc)?;
     }
+    let public = if public {
+        Some(public_binding(url, &sans, doc).await?)
+    } else {
+        None
+    };
     Ok(json!({
+        "public": public,
         "platform_document_version": doc.version,
         "org_id": sans.org_id,
         "app_id": sans.app_id,
@@ -51,6 +60,59 @@ fn appraisal(leaf: &[u8], kms_ca_pem: &str) -> Result<Value, String> {
         object.insert("not_after".into(), rfc3339(not_after).into());
     }
     Ok(out)
+}
+
+/// Most of a binding is its two PEM certificates.
+const MAX_BINDING: usize = 64 << 10;
+
+/// A certificate the system trusts proves only control of the zone, which the operator has; it
+/// passes only with a binding, read over the same connection, by an Instance of `sans`'s App and
+/// Revision under the document's KMS CA.
+async fn public_binding(
+    url: &str,
+    sans: &InstanceSans,
+    doc: &PlatformDocument,
+) -> Result<Value, String> {
+    let mut url = reqwest::Url::parse(url).map_err(|e| format!("{url}: {e}"))?;
+    let name = url.host_str().ok_or("the URL names no host")?.to_owned();
+    url.set_path(binding::PATH);
+    url.set_query(None);
+    let response = alpha_client::http()
+        .tls_info(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| e.to_string())?
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("{name} has no browser-trusted certificate: {e}"))?;
+    let served = response
+        .extensions()
+        .get::<reqwest::tls::TlsInfo>()
+        .and_then(reqwest::tls::TlsInfo::peer_certificate)
+        .ok_or("no certificate on the connection")?
+        .to_vec();
+    let status = response.status();
+    let body = alpha_client::read_capped(response, MAX_BINDING).await?;
+    let signed: SignedBinding = serde_json::from_slice(&body)
+        .ok()
+        .filter(|_| status.is_success())
+        .ok_or_else(|| format!("{name} serves no binding (status {status}): nothing ties its certificate to an Instance"))?;
+    let ca = tls::cert_from_pem(&doc.kms_ca_pem).map_err(|e| e.to_string())?;
+    let signer = binding::verify(&signed, &name, &served, &ca, SystemTime::now())
+        .map_err(|e| format!("binding: {e}"))?;
+    if signer.app_id != sans.app_id || signer.compose_hash != sans.compose_hash {
+        return Err(format!(
+            "the binding is signed by App {} at Revision {}, not the Endpoint's",
+            signer.app_id, signer.compose_hash
+        ));
+    }
+    let not_after = cert::not_after(&served).map_err(|e| e.to_string())?;
+    Ok(json!({
+        "name": name,
+        "spki_sha256": alpha_channel::sha256_label(&cert::spki_of(&served).map_err(|e| e.to_string())?),
+        "not_after": rfc3339(not_after),
+    }))
 }
 
 /// The SANs and the DER of the Instance leaf `url` presents under the KMS CA, refused unless the
