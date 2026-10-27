@@ -104,21 +104,21 @@ struct Configs {
     public: Option<(PublicName, Arc<Edge>)>,
 }
 
-enum Handshake {
+enum Handshake<'a> {
     Instance,
     Challenge,
-    Public(Arc<CertifiedKey>),
+    Public(&'a str, Arc<CertifiedKey>),
 }
 
 /// A browser on the public name keeps the Instance leaf until the first certificate arrives,
 /// and while the Instance leaf has expired, so no public handshake outlives the attestation.
 /// A public handshake gets the certificate read here, which its binding then signs, even if a
 /// renewal replaces it in between.
-fn select(
-    configs: &Configs,
+fn select<'a>(
+    configs: &'a Configs,
     runtime: &Runtime,
     hello: &ClientHello<'_>,
-) -> Option<(Handshake, Arc<ServerConfig>)> {
+) -> Option<(Handshake<'a>, Arc<ServerConfig>)> {
     let instance = Some((Handshake::Instance, configs.instance.clone()));
     let Some((name, edge)) = &configs.public else {
         return instance;
@@ -131,7 +131,7 @@ fn select(
         Route::Public if runtime.attested().is_some() => match edge.served.read().clone() {
             Some(cert) => {
                 let config = public_config(cert.clone(), b"http/1.1")?;
-                Some((Handshake::Public(cert), config))
+                Some((Handshake::Public(&name.name, cert), config))
             }
             None => instance,
         },
@@ -276,19 +276,19 @@ async fn proxy(
         return;
     };
     let mut head = Vec::new();
-    let refused = match (picked, &configs.public) {
-        (Handshake::Challenge, _) => true,
-        (Handshake::Public(served), Some((name, _))) => {
+    let refused = match picked {
+        Handshake::Challenge => true,
+        Handshake::Public(name, served) => {
             let Ok(asks) = read_head(&mut tls, &mut head).await else {
                 return;
             };
             if asks {
-                let reply = binding_reply(&runtime, &name.name, &served);
+                let reply = binding_reply(&runtime, name, &served);
                 let _ = tls.write_all(&reply).await;
             }
             asks
         }
-        _ => !admitted(tls.get_ref().1.peer_certificates(), &callers),
+        Handshake::Instance => !admitted(tls.get_ref().1.peer_certificates(), &callers),
     };
     if refused {
         let _ = tls.shutdown().await;

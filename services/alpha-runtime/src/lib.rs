@@ -326,7 +326,7 @@ impl Config {
             std::env::var(name).map_err(|_| Error::Config(format!("{name} is not set")))
         };
         let optional = |name: &str| std::env::var(name).ok();
-        let mut config = Self::parse(
+        let config = Self::parse(
             &var("ALPHACOMPUTE_KMS_CA_SPKI_SHA256")?,
             KmsRevisions::parse(
                 optional("ALPHACOMPUTE_KMS_REVISIONS").as_deref(),
@@ -343,13 +343,13 @@ impl Config {
                 .ok()
                 .as_deref(),
         )?;
-        config.public = acme::PublicName::parse(
+        let public = acme::PublicName::parse(
             optional("ALPHACOMPUTE_PUBLIC_NAME").as_deref(),
             optional("ALPHACOMPUTE_ACME_DIRECTORY").as_deref(),
             config.tls_upstream.as_deref(),
             &config.tls_callers,
         )?;
-        Ok(config)
+        Ok(Self { public, ..config })
     }
 
     pub fn parse(
