@@ -28,12 +28,11 @@ const POLL: RetryPolicy = RetryPolicy::new()
     .initial_delay(Duration::from_secs(1))
     .timeout(Duration::from_secs(120));
 
-/// `ALPHACOMPUTE_PUBLIC_NAME`, `ALPHACOMPUTE_ACME_DIRECTORY` and `ALPHACOMPUTE_ACME_CONTACT`.
+/// `ALPHACOMPUTE_PUBLIC_NAME` and `ALPHACOMPUTE_ACME_DIRECTORY`.
 #[derive(Clone, Debug)]
 pub struct PublicName {
     pub name: String,
     pub directory: String,
-    pub contact: Option<String>,
 }
 
 impl PublicName {
@@ -41,15 +40,14 @@ impl PublicName {
     pub fn parse(
         name: Option<&str>,
         directory: Option<&str>,
-        contact: Option<&str>,
         upstream: Option<&str>,
         callers: &[alpha_core::AppId],
     ) -> Result<Option<Self>, Error> {
         let refused = |m: &str| Error::Config(format!("ALPHACOMPUTE_PUBLIC_NAME: {m}"));
         let Some(name) = name else {
-            return match (directory, contact) {
-                (None, None) => Ok(None),
-                _ => Err(refused("ACME variables set without it")),
+            return match directory {
+                None => Ok(None),
+                Some(_) => Err(refused("ALPHACOMPUTE_ACME_DIRECTORY set without it")),
             };
         };
         if !name.contains('.')
@@ -71,15 +69,9 @@ impl PublicName {
                 "ALPHACOMPUTE_ACME_DIRECTORY is not https".into(),
             ));
         }
-        if contact.is_some_and(|c| !c.contains('@') || c.contains(|ch: char| ch.is_whitespace())) {
-            return Err(Error::Config(
-                "ALPHACOMPUTE_ACME_CONTACT is not an email address".into(),
-            ));
-        }
         Ok(Some(Self {
             name: name.to_owned(),
             directory: directory.to_owned(),
-            contact: contact.map(|c| format!("mailto:{c}")),
         }))
     }
 }
@@ -182,12 +174,11 @@ fn renewal_delay(not_after: SystemTime, now: SystemTime) -> Duration {
 }
 
 async fn account(public: &PublicName) -> Result<Account, String> {
-    let contact: Vec<&str> = public.contact.iter().map(String::as_str).collect();
     let (account, _) = Account::builder()
         .map_err(|e| e.to_string())?
         .create(
             &NewAccount {
-                contact: &contact,
+                contact: &[],
                 terms_of_service_agreed: true,
                 only_return_existing: false,
             },
@@ -289,41 +280,29 @@ mod tests {
     #[test]
     fn a_public_name_is_one_lowercase_dns_name_on_an_endpoint_open_to_any_client() {
         let upstream = Some("app:8080");
-        let parsed =
-            PublicName::parse(Some(NAME), None, Some("ops@alphacompute.cc"), upstream, &[])
-                .unwrap()
-                .unwrap();
+        let parsed = PublicName::parse(Some(NAME), None, upstream, &[])
+            .unwrap()
+            .unwrap();
         assert_eq!(parsed.directory, LETS_ENCRYPT);
-        assert_eq!(
-            parsed.contact.as_deref(),
-            Some("mailto:ops@alphacompute.cc")
-        );
         assert!(
-            PublicName::parse(None, None, None, upstream, &[])
+            PublicName::parse(None, None, upstream, &[])
                 .unwrap()
                 .is_none()
         );
 
         let caller = [alpha_core::AppId::mint()];
-        for (name, directory, contact, upstream, callers) in [
-            (Some("Hello.alphacompute.cc"), None, None, upstream, &[][..]),
-            (Some("localhost"), None, None, upstream, &[]),
-            (Some("10.0.0.1"), None, None, upstream, &[]),
-            (Some(NAME), None, None, None, &[]),
-            (Some(NAME), None, None, upstream, &caller),
-            (
-                Some(NAME),
-                Some("http://ca.example/dir"),
-                None,
-                upstream,
-                &[],
-            ),
-            (Some(NAME), None, Some("not an email"), upstream, &[]),
-            (None, Some("https://ca.example/dir"), None, upstream, &[]),
+        for (name, directory, upstream, callers) in [
+            (Some("Hello.alphacompute.cc"), None, upstream, &[][..]),
+            (Some("localhost"), None, upstream, &[]),
+            (Some("10.0.0.1"), None, upstream, &[]),
+            (Some(NAME), None, None, &[]),
+            (Some(NAME), None, upstream, &caller),
+            (Some(NAME), Some("http://ca.example/dir"), upstream, &[]),
+            (None, Some("https://ca.example/dir"), upstream, &[]),
         ] {
             assert!(
-                PublicName::parse(name, directory, contact, upstream, callers).is_err(),
-                "{name:?} {directory:?} {contact:?} {upstream:?}"
+                PublicName::parse(name, directory, upstream, callers).is_err(),
+                "{name:?} {directory:?} {upstream:?}"
             );
         }
     }
