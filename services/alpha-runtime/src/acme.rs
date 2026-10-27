@@ -77,25 +77,12 @@ impl PublicName {
     }
 }
 
-/// A certificate the issuance task replaces while the listener serves it.
-#[derive(Debug, Default)]
-pub struct Slot(RwLock<Option<Arc<CertifiedKey>>>);
-
-impl Slot {
-    pub fn get(&self) -> Option<Arc<CertifiedKey>> {
-        self.0.read().clone()
-    }
-
-    fn set(&self, cert: Option<Arc<CertifiedKey>>) {
-        *self.0.write() = cert;
-    }
-}
-
-/// The public certificate and the pending challenge's.
+/// The public certificate and the pending challenge's, replaced by the issuance task while the
+/// listener serves them.
 #[derive(Debug, Default)]
 pub struct Edge {
-    pub served: Slot,
-    pub challenge: Slot,
+    pub served: RwLock<Option<Arc<CertifiedKey>>>,
+    pub challenge: RwLock<Option<Arc<CertifiedKey>>>,
 }
 
 /// Which certificate a handshake gets, from its SNI and the protocols it offers.
@@ -206,12 +193,11 @@ async fn issue(edge: &Edge, name: &str, account: &Account) -> Result<SystemTime,
             .challenge(ChallengeType::TlsAlpn01)
             .ok_or("the CA offers no tls-alpn-01 challenge")?;
         let digest = challenge.key_authorization().digest();
-        edge.challenge
-            .set(Some(challenge_cert(name, digest.as_ref())?));
+        *edge.challenge.write() = Some(challenge_cert(name, digest.as_ref())?);
         challenge.set_ready().await.map_err(acme)?;
     }
     let status = order.poll_ready(&POLL).await;
-    edge.challenge.set(None);
+    *edge.challenge.write() = None;
     if status.map_err(acme)? != OrderStatus::Ready {
         return Err("the order did not become ready".into());
     }
@@ -228,7 +214,7 @@ async fn issue(edge: &Edge, name: &str, account: &Account) -> Result<SystemTime,
     let not_after = alpha_channel::cert::not_after(leaf).map_err(|e| e.to_string())?;
     let pkcs8 = Zeroizing::new(key.serialize_der());
     let certified = tls::certified(chain, &pkcs8).map_err(|e| e.to_string())?;
-    edge.served.set(Some(certified));
+    *edge.served.write() = Some(certified);
     Ok(not_after)
 }
 

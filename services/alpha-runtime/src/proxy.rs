@@ -125,10 +125,10 @@ fn select(
     };
     match acme::route(&name.name, hello.server_name(), hello.alpn()) {
         Route::Challenge => {
-            let config = public_config(edge.challenge.get()?, acme::ACME_TLS_ALPN)?;
+            let config = public_config(edge.challenge.read().clone()?, acme::ACME_TLS_ALPN)?;
             Some((Handshake::Challenge, config))
         }
-        Route::Public if runtime.attested().is_some() => match edge.served.get() {
+        Route::Public if runtime.attested().is_some() => match edge.served.read().clone() {
             Some(cert) => {
                 let config = public_config(cert.clone(), b"http/1.1")?;
                 Some((Handshake::Public(cert), config))
