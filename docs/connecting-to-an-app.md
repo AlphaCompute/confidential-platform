@@ -21,8 +21,8 @@ Instance renews it, so a client that checks the chain and the SANs on every conn
 learns within the hour when an App stops being entitled to run.
 
 An Instance's certificate also carries one non-critical extension, OID
-`2.25.7686831627720934303`. Its value is a DER UTF8String with the JCS form of the KMS's
-appraisal:
+`2.25.1858292143.1688857791.1295186308`. Its value is a DER UTF8String with the JCS form of the
+KMS's appraisal:
 
 ```json
 {"advisories":[],"format":"alphacompute-appraisal/1","gpu_count":1,

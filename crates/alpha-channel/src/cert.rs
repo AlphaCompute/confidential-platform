@@ -98,10 +98,14 @@ pub fn parse_kms_sans(sans: &[String]) -> Result<ComposeHash, Error> {
         .ok_or_else(not_node)
 }
 
-/// ponytail: an arc under `2.25` needs no registration, but rcgen writes 64-bit arcs only, so the
-/// last arc is a random 63-bit integer and not a full UUID. Move to an IANA enterprise arc if a
-/// collision ever matters; a reader of the old OID then shows `absent`.
-pub const APPRAISAL_OID: [u64; 3] = [2, 25, 7686831627720934303];
+/// ponytail: an arc under `2.25` needs no registration, but Go's `crypto/x509` refuses a
+/// certificate with any arc above 2^31 - 1, so a Go client could not even finish the handshake.
+/// The OID is therefore three random 31-bit arcs and not a UUID. Move to an IANA enterprise arc
+/// once AlphaCompute has one; a reader of this OID then shows `absent`.
+pub const APPRAISAL_OID: [u64; 5] = [2, 25, 1858292143, 1688857791, 1295186308];
+/// ponytail: the OID leaves carried before [`APPRAISAL_OID`]. Read it until every KMS node writes
+/// the new one and the last old leaf has expired (one hour later), then remove it.
+const FIRST_APPRAISAL_OID: [u64; 3] = [2, 25, 7686831627720934303];
 const APPRAISAL_FORMAT: &str = "alphacompute-appraisal/1";
 
 /// The platform facts of the appraisal behind an Instance leaf, in a non-critical extension. The
@@ -135,8 +139,13 @@ pub fn leaf_appraisal(cert: &[u8]) -> Result<Option<LeafAppraisal>, Error> {
     let malformed = |m: String| Error::Malformed(format!("appraisal: {m}"));
     let (_, cert) = X509Certificate::from_der(cert)
         .map_err(|e| Error::Malformed(format!("certificate: {e}")))?;
-    let oid = Oid::from(&APPRAISAL_OID).map_err(|e| malformed(format!("{e:?}")))?;
-    let Some(ext) = cert.extensions().iter().find(|ext| ext.oid == oid) else {
+    let oid = |arcs: &[u64]| Oid::from(arcs).map_err(|e| malformed(format!("{e:?}")));
+    let (current, first) = (oid(&APPRAISAL_OID)?, oid(&FIRST_APPRAISAL_OID)?);
+    let Some(ext) = cert
+        .extensions()
+        .iter()
+        .find(|ext| ext.oid == current || ext.oid == first)
+    else {
         return Ok(None);
     };
     let (rest, json) = String::from_der(ext.value).map_err(|e| malformed(e.to_string()))?;
@@ -264,6 +273,11 @@ mod tests {
                 "{sans:?}"
             );
         }
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+    fn appraisal_oid_arcs_fit_go() {
+        assert!(APPRAISAL_OID.iter().all(|arc| *arc < 1 << 31));
     }
 
     #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
