@@ -23,8 +23,10 @@ base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 flate2 = "1"
 getrandom = "0.4"
+instant-acme = { version = "0.8.5", default-features = false, features = ["aws-lc-rs", "hyper-rustls"] }
 p256 = { version = "0.14", features = ["ecdsa", "pkcs8"] }
 parking_lot = "0.12"
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 serde_json = "1"
 thiserror = "2"

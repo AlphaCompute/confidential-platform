@@ -23,6 +23,7 @@ use alpha_core::ComposeHash;
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 
+pub mod binding;
 pub mod cert;
 pub mod compose;
 pub mod frame;

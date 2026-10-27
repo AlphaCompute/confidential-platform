@@ -217,6 +217,10 @@ enum Command {
         /// document's `kata_policy`.
         #[arg(long, requires = "app")]
         init_data: Option<PathBuf>,
+        /// Also check the browser-trusted certificate on the URL's name: it passes only when an
+        /// Instance of the same App and Revision signed a binding for its key.
+        #[arg(long, requires = "app")]
+        public: bool,
         #[arg(long)]
         kms_node: bool,
         url: String,
@@ -827,6 +831,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
         Command::Verify {
             app,
             init_data,
+            public,
             kms_node: _,
             url,
         } => {
@@ -841,7 +846,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let doc = platform_document(config, now).await?;
             Ok(match app {
                 Some(app) => {
-                    alpha_cli::verify::instance(&url, app, init_data.as_ref(), &doc).await?
+                    alpha_cli::verify::instance(&url, app, init_data.as_ref(), public, &doc).await?
                 }
                 None => alpha_cli::verify::kms_node(&url, &config.pccs_url, &doc, now).await?,
             })

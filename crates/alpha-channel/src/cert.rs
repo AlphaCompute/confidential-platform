@@ -175,6 +175,13 @@ pub fn pem_to_der(pem: &str) -> Result<Vec<u8>, Error> {
     Ok(pem.contents)
 }
 
+pub fn not_after(cert: &[u8]) -> Result<SystemTime, Error> {
+    let (_, cert) = X509Certificate::from_der(cert)
+        .map_err(|e| Error::Malformed(format!("certificate: {e}")))?;
+    from_unix_seconds(cert.validity().not_after.timestamp())
+        .ok_or_else(|| Error::Malformed("certificate expires before 1970".into()))
+}
+
 /// The leaf is signed with ecdsa-with-SHA256 by the CA's key and `notBefore ≤ now < notAfter`;
 /// returns `(notBefore, notAfter)`.
 pub fn verify_leaf(
