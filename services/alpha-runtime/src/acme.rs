@@ -24,6 +24,8 @@ pub const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
 const LETS_ENCRYPT: &str = "https://acme-v02.api.letsencrypt.org/directory";
 /// Let's Encrypt allows five failed validations per name and hour.
 const RETRY_AFTER: Duration = Duration::from_secs(15 * 60);
+/// The CA validates over the public path, which reaches a new pod only once its Service lists it.
+const ROUTABLE_AFTER: Duration = Duration::from_secs(30);
 const POLL: RetryPolicy = RetryPolicy::new()
     .initial_delay(Duration::from_secs(1))
     .timeout(Duration::from_secs(120));
@@ -139,6 +141,7 @@ pub fn route<'a>(
 // Encrypt's five certificates per name and week; the upgrade is the key and chain sealed under
 // the App's derived key `edge-tls` and stored as a Secret, read back while valid.
 pub async fn issue_forever(edge: Arc<Edge>, public: PublicName) {
+    tokio::time::sleep(ROUTABLE_AFTER).await;
     let account = loop {
         match account(&public).await {
             Ok(account) => break account,
