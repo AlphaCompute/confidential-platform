@@ -345,7 +345,6 @@ impl Config {
         )?;
         let public = acme::PublicName::parse(
             optional("ALPHACOMPUTE_PUBLIC_NAME").as_deref(),
-            optional("ALPHACOMPUTE_ACME_DIRECTORY").as_deref(),
             config.tls_upstream.as_deref(),
             &config.tls_callers,
         )?;

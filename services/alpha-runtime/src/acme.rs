@@ -29,27 +29,22 @@ const POLL: RetryPolicy = RetryPolicy::new()
     .initial_delay(Duration::from_secs(1))
     .timeout(Duration::from_secs(120));
 
-/// `ALPHACOMPUTE_PUBLIC_NAME` and `ALPHACOMPUTE_ACME_DIRECTORY`.
+/// `ALPHACOMPUTE_PUBLIC_NAME`.
 #[derive(Clone, Debug)]
 pub struct PublicName {
     pub name: String,
-    pub directory: String,
 }
 
 impl PublicName {
     /// None when no name is set.
     pub fn parse(
         name: Option<&str>,
-        directory: Option<&str>,
         upstream: Option<&str>,
         callers: &[alpha_core::AppId],
     ) -> Result<Option<Self>, Error> {
         let refused = |m: &str| Error::Config(format!("ALPHACOMPUTE_PUBLIC_NAME: {m}"));
         let Some(name) = name else {
-            return match directory {
-                None => Ok(None),
-                Some(_) => Err(refused("ALPHACOMPUTE_ACME_DIRECTORY set without it")),
-            };
+            return Ok(None);
         };
         if !name.contains('.')
             || name.bytes().any(|b| b.is_ascii_uppercase())
@@ -64,15 +59,8 @@ impl PublicName {
         if !callers.is_empty() {
             return Err(refused("set with ALPHACOMPUTE_TLS_CALLER_APPS"));
         }
-        let directory = directory.unwrap_or(LETS_ENCRYPT);
-        if !directory.starts_with("https://") {
-            return Err(Error::Config(
-                "ALPHACOMPUTE_ACME_DIRECTORY is not https".into(),
-            ));
-        }
         Ok(Some(Self {
             name: name.to_owned(),
-            directory: directory.to_owned(),
         }))
     }
 }
@@ -126,7 +114,7 @@ pub fn route<'a>(
 pub async fn issue_forever(edge: Arc<Edge>, public: PublicName) {
     tokio::time::sleep(ROUTABLE_AFTER).await;
     let account = loop {
-        match account(&public).await {
+        match account().await {
             Ok(account) => break account,
             Err(e) => {
                 alpha_client::warn!("acme_account_failed", error = Field::text(&e));
@@ -159,7 +147,7 @@ fn renewal_delay(not_after: SystemTime, now: SystemTime) -> Duration {
         .saturating_mul(2)
 }
 
-async fn account(public: &PublicName) -> Result<Account, String> {
+async fn account() -> Result<Account, String> {
     let (account, _) = Account::builder()
         .map_err(|e| e.to_string())?
         .create(
@@ -168,7 +156,7 @@ async fn account(public: &PublicName) -> Result<Account, String> {
                 terms_of_service_agreed: true,
                 only_return_existing: false,
             },
-            public.directory.clone(),
+            LETS_ENCRYPT.to_owned(),
             None,
         )
         .await
@@ -265,29 +253,23 @@ mod tests {
     #[test]
     fn a_public_name_is_one_lowercase_dns_name_on_an_endpoint_open_to_any_client() {
         let upstream = Some("app:8080");
-        let parsed = PublicName::parse(Some(NAME), None, upstream, &[])
+        let parsed = PublicName::parse(Some(NAME), upstream, &[])
             .unwrap()
             .unwrap();
-        assert_eq!(parsed.directory, LETS_ENCRYPT);
-        assert!(
-            PublicName::parse(None, None, upstream, &[])
-                .unwrap()
-                .is_none()
-        );
+        assert_eq!(parsed.name, NAME);
+        assert!(PublicName::parse(None, upstream, &[]).unwrap().is_none());
 
         let caller = [alpha_core::AppId::mint()];
-        for (name, directory, upstream, callers) in [
-            (Some("Hello.alphacompute.cc"), None, upstream, &[][..]),
-            (Some("localhost"), None, upstream, &[]),
-            (Some("10.0.0.1"), None, upstream, &[]),
-            (Some(NAME), None, None, &[]),
-            (Some(NAME), None, upstream, &caller),
-            (Some(NAME), Some("http://ca.example/dir"), upstream, &[]),
-            (None, Some("https://ca.example/dir"), upstream, &[]),
+        for (name, upstream, callers) in [
+            ("Hello.alphacompute.cc", upstream, &[][..]),
+            ("localhost", upstream, &[]),
+            ("10.0.0.1", upstream, &[]),
+            (NAME, None, &[]),
+            (NAME, upstream, &caller),
         ] {
             assert!(
-                PublicName::parse(name, directory, upstream, callers).is_err(),
-                "{name:?} {directory:?} {upstream:?}"
+                PublicName::parse(Some(name), upstream, callers).is_err(),
+                "{name:?} {upstream:?}"
             );
         }
     }
