@@ -104,9 +104,9 @@ fn canonical(value: &serde_json::Value) -> Result<String, JsError> {
         })
 }
 
-/// The document's JCS text and its signing digest under one of the four documents the signer
-/// page signs: `revision`, `secret`, `org-root-key` or `principal-key`. Nothing is added to the
-/// document, unlike `signable`.
+/// The document's JCS text and its signing digest under one of the five documents the signer
+/// page signs: `revision`, `secret`, `org-root-key`, `principal-key` or `control`, the last for a
+/// Revision's revocation. Nothing is added to the document, unlike `signable`.
 #[wasm_bindgen(js_name = signingDigest)]
 pub fn signing_digest(context: &str, document_json: &str) -> Result<Signable, JsError> {
     use alpha_core::context;
@@ -115,6 +115,7 @@ pub fn signing_digest(context: &str, document_json: &str) -> Result<Signable, Js
         "secret" => context::SECRET,
         "org-root-key" => context::ORG_ROOT_KEY,
         "principal-key" => context::PRINCIPAL_KEY,
+        "control" => context::CONTROL,
         other => {
             return Err(js(Error::Malformed(format!(
                 "{other:?} is not a context the page signs"

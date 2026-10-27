@@ -399,7 +399,7 @@ fn kms_receipt_vectors_give_their_recorded_result_through_the_export() {
 }
 
 #[wasm_bindgen_test]
-fn signing_digest_matches_the_core_for_the_four_page_contexts() {
+fn signing_digest_matches_the_core_for_the_five_page_contexts() {
     use alpha_core::context;
     let text = r#"{"z":1,"a":{"y":"é","b":[2,1]},"m":null}"#;
     let value: Value = serde_json::from_str(text).unwrap();
@@ -409,6 +409,7 @@ fn signing_digest_matches_the_core_for_the_four_page_contexts() {
         ("secret", context::SECRET),
         ("org-root-key", context::ORG_ROOT_KEY),
         ("principal-key", context::PRINCIPAL_KEY),
+        ("control", context::CONTROL),
     ] {
         let s = signing_digest(name, text).map_err(message).unwrap();
         assert_eq!(s.document, jcs, "{name}");
@@ -418,7 +419,7 @@ fn signing_digest_matches_the_core_for_the_four_page_contexts() {
             "{name}"
         );
     }
-    for other in ["control", "catalog", "kms-receipt", context::REVISION, ""] {
+    for other in ["catalog", "kms-receipt", context::REVISION, ""] {
         let m = message(signing_digest(other, text).err().unwrap());
         assert!(m.starts_with("malformed:"), "{other}: {m}");
     }
