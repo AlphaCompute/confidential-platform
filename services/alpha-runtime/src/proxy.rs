@@ -282,7 +282,7 @@ async fn proxy(
     let refused = match picked {
         Handshake::Challenge => true,
         Handshake::Public(name, served) => {
-            let Ok(asks) = read_head(&mut tls, &mut head).await else {
+            let Ok(Ok(asks)) = timeout(HANDSHAKE, read_head(&mut tls, &mut head)).await else {
                 return;
             };
             if asks {

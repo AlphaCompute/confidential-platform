@@ -25,6 +25,9 @@ const LETS_ENCRYPT: &str = "https://acme-v02.api.letsencrypt.org/directory";
 const RETRY_AFTER: Duration = Duration::from_secs(15 * 60);
 /// The CA validates over the public path, which reaches a new pod only once its Service lists it.
 const ROUTABLE_AFTER: Duration = Duration::from_secs(30);
+/// A certificate already expired by the TD clock means a skewed clock; a new order would expire
+/// too, so wait a day and stay inside Let's Encrypt's five duplicates per name and week.
+const EXPIRED_BACKOFF: Duration = Duration::from_secs(24 * 60 * 60);
 const POLL: RetryPolicy = RetryPolicy::new()
     .initial_delay(Duration::from_secs(1))
     .timeout(Duration::from_secs(120));
@@ -129,12 +132,14 @@ pub async fn issue_forever(edge: Arc<Edge>, name: String) {
 
 /// Renew with a third of the remaining lifetime left.
 fn renewal_delay(not_after: SystemTime, now: SystemTime) -> Duration {
-    not_after
-        .duration_since(now)
-        .unwrap_or_default()
-        .checked_div(3)
-        .unwrap_or_default()
-        .saturating_mul(2)
+    match not_after.duration_since(now) {
+        Ok(left) if !left.is_zero() => left
+            .checked_div(3)
+            .unwrap_or_default()
+            .saturating_mul(2)
+            .max(RETRY_AFTER),
+        _ => EXPIRED_BACKOFF,
+    }
 }
 
 async fn account() -> Result<Account, String> {
@@ -271,6 +276,10 @@ mod tests {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
         let days = |n: u64| Duration::from_secs(n * 86_400);
         assert_eq!(renewal_delay(now + days(90), now), days(60));
-        assert_eq!(renewal_delay(now - days(1), now), Duration::ZERO);
+        assert_eq!(renewal_delay(now - days(1), now), EXPIRED_BACKOFF);
+        assert_eq!(
+            renewal_delay(now + Duration::from_secs(60), now),
+            RETRY_AFTER
+        );
     }
 }
