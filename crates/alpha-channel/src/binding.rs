@@ -73,15 +73,16 @@ pub fn sign(
     })
 }
 
-/// The Instance that signed `signed` under `kms_ca`, refused unless the statement names `name`
-/// and the key of `served`, the certificate that connection presented, and is current at `now`.
+/// The Instance that signed `signed` under `kms_ca` and its statement, refused unless the
+/// statement names `name` and the key of `served`, the certificate that connection presented, and
+/// is current at `now`.
 pub fn verify(
     signed: &SignedBinding,
     name: &str,
     served: &[u8],
     kms_ca: &[u8],
     now: SystemTime,
-) -> Result<InstanceSans, Error> {
+) -> Result<(InstanceSans, Binding), Error> {
     let (_, leaf) = x509_parser::pem::parse_x509_pem(signed.chain_pem.as_bytes())
         .map_err(|e| Error::Malformed(format!("binding chain: {e}")))?;
     cert::verify_leaf(&leaf.contents, kms_ca, now)?;
@@ -119,7 +120,7 @@ pub fn verify(
     if chrono::DateTime::<chrono::Utc>::from(now) >= expires {
         return Err(Error::CertificateExpired);
     }
-    Ok(instance)
+    Ok((instance, binding))
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -180,7 +181,7 @@ mod tests {
         let id = instance();
         let served = public_cert();
         let signed = sign(&id.key, id.chain_pem.clone(), NAME, &served).unwrap();
-        let sans = verify(&signed, NAME, &served, &id.ca, now).unwrap();
+        let (sans, _) = verify(&signed, NAME, &served, &id.ca, now).unwrap();
         assert_eq!(sans.app_id.to_string(), APP);
         assert_eq!(sans.compose_hash, alpha_core::compose_hash("{}"));
 

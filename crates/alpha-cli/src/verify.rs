@@ -99,7 +99,7 @@ async fn public_binding(
         .filter(|_| status.is_success())
         .ok_or_else(|| format!("{name} serves no binding (status {status}): nothing ties its certificate to an Instance"))?;
     let ca = tls::cert_from_pem(&doc.kms_ca_pem).map_err(|e| e.to_string())?;
-    let signer = binding::verify(&signed, &name, &served, &ca, SystemTime::now())
+    let (signer, binding) = binding::verify(&signed, &name, &served, &ca, SystemTime::now())
         .map_err(|e| format!("binding: {e}"))?;
     if signer.app_id != sans.app_id || signer.compose_hash != sans.compose_hash {
         return Err(format!(
@@ -107,11 +107,10 @@ async fn public_binding(
             signer.app_id, signer.compose_hash
         ));
     }
-    let not_after = cert::not_after(&served).map_err(|e| e.to_string())?;
     Ok(json!({
         "name": name,
-        "spki_sha256": alpha_channel::sha256_label(&cert::spki_of(&served).map_err(|e| e.to_string())?),
-        "not_after": rfc3339(not_after),
+        "spki_sha256": binding.spki_sha256,
+        "not_after": binding.not_after,
     }))
 }
 
