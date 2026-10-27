@@ -26,8 +26,9 @@ const RETRY_AFTER: Duration = Duration::from_secs(15 * 60);
 /// The CA validates over the public path, which reaches a new pod only once its Service lists it.
 const ROUTABLE_AFTER: Duration = Duration::from_secs(30);
 /// A certificate already expired by the TD clock means a skewed clock; a new order would expire
-/// too, so wait a day and stay inside Let's Encrypt's five duplicates per name and week.
-const EXPIRED_BACKOFF: Duration = Duration::from_secs(24 * 60 * 60);
+/// too. Let's Encrypt refills one duplicate per name every 34 hours, so wait two days and never
+/// order faster than the refill.
+const EXPIRED_BACKOFF: Duration = Duration::from_secs(48 * 60 * 60);
 const POLL: RetryPolicy = RetryPolicy::new()
     .initial_delay(Duration::from_secs(1))
     .timeout(Duration::from_secs(120));
