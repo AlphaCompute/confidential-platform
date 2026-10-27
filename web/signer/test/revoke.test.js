@@ -150,6 +150,8 @@ test("every refusal is one fixed sentence", async () => {
     [{ revisions: hash }, UNAVAILABLE],
     [{ credentials: [null] }, UNAVAILABLE],
     [{ credentials: [{ key_id: "01920000-0000-7000-8000-00000000000a" }] }, UNAVAILABLE],
+    [{ credentials: [{ credential_id: 7, key_id: "01920000-0000-7000-8000-00000000000a" }] }, UNAVAILABLE],
+    [{ credentials: [{ credential_id: {}, key_id: "01920000-0000-7000-8000-00000000000a" }] }, UNAVAILABLE],
     [
       { server_time: iso(now + 7 * 60 * 1000) },
       "Your device clock is off by about 7 minutes. Correct it and reload.",
@@ -193,8 +195,15 @@ test("every refusal is one fixed sentence", async () => {
   }
 });
 
-test("a page left open signs the time of the click", async () => {
-  const { api, page } = await revocationPage();
+test("a page left open signs the time of the click, not of the prompt's answer", async () => {
+  const { api, page, laptop } = await revocationPage();
+  // A passkey prompt that takes three minutes to answer.
+  page.use({
+    get: async (options) => {
+      page.clock.now += 3 * 60 * 1000;
+      return laptop.get(options);
+    },
+  });
   page.clock.now += 10 * 60 * 1000;
   const clicked = iso(page.clock.now);
   await page.click("Revoke with passkey");
