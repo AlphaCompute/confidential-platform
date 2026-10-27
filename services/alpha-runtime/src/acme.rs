@@ -14,7 +14,6 @@ use instant_acme::{
 use parking_lot::RwLock;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, DnsName};
-use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use zeroize::Zeroizing;
 
@@ -92,17 +91,11 @@ impl Slot {
     }
 }
 
-impl ResolvesServerCert for Slot {
-    fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        self.get()
-    }
-}
-
 /// The public certificate and the pending challenge's.
 #[derive(Debug, Default)]
 pub struct Edge {
-    pub served: Arc<Slot>,
-    pub challenge: Arc<Slot>,
+    pub served: Slot,
+    pub challenge: Slot,
 }
 
 /// Which certificate a handshake gets, from its SNI and the protocols it offers.
@@ -137,6 +130,9 @@ pub fn route<'a>(
     if http { Route::Public } else { Route::Instance }
 }
 
+// ponytail: one copy per App with a public name. Each copy keeps its own challenge and
+// certificate, so the CA's validation routed to another copy fails; the upgrade is the same
+// sealed certificate below, which every copy reads, and one copy that orders it.
 // ponytail: a new account and certificate on every start, so a restart loop runs into Let's
 // Encrypt's five certificates per name and week; the upgrade is the key and chain sealed under
 // the App's derived key `edge-tls` and stored as a Secret, read back while valid.

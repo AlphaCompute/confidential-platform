@@ -20,7 +20,7 @@ use rustls::pki_types::CertificateDer;
 use rustls::server::{
     Acceptor, ClientHello, NoServerSessionStorage, ResolvesServerCert, WebPkiClientVerifier,
 };
-use rustls::sign::CertifiedKey;
+use rustls::sign::{CertifiedKey, SingleCertAndKey};
 use rustls::{RootCertStore, ServerConfig};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -28,7 +28,7 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_rustls::LazyConfigAcceptor;
 
-use crate::acme::{self, Edge, PublicName, Route, Slot};
+use crate::acme::{self, Edge, PublicName, Route};
 use crate::{Attested, Error, Exit, Runtime};
 
 const HANDSHAKE: Duration = Duration::from_secs(10);
@@ -87,43 +87,55 @@ fn server_config(runtime: Arc<Runtime>) -> Result<Arc<ServerConfig>, Error> {
 
 /// Browsers and the ACME CA's validators may lack `X25519MLKEM768`, the one group the
 /// platform's own hops accept, and TLS 1.3; only the public name is served to them.
-fn public_config(cert: Arc<Slot>, alpn: &[u8]) -> Result<Arc<ServerConfig>, Error> {
+fn public_config(cert: Arc<CertifiedKey>, alpn: &[u8]) -> Option<Arc<ServerConfig>> {
     let mut config = ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::aws_lc_rs::default_provider(),
     ))
     .with_safe_default_protocol_versions()
-    .map_err(|e| Error::Socket(format!("tls: {e}")))?
+    .ok()?
     .with_no_client_auth()
-    .with_cert_resolver(cert);
+    .with_cert_resolver(Arc::new(SingleCertAndKey::from(cert)));
     config.alpn_protocols = vec![alpn.to_vec()];
-    Ok(Arc::new(config))
-}
-
-struct Public {
-    name: PublicName,
-    edge: Arc<Edge>,
-    served: Arc<ServerConfig>,
-    challenge: Arc<ServerConfig>,
+    Some(Arc::new(config))
 }
 
 struct Configs {
     instance: Arc<ServerConfig>,
-    public: Option<Public>,
+    public: Option<(PublicName, Arc<Edge>)>,
 }
 
-impl Configs {
-    /// A browser on the public name keeps the Instance leaf until the first certificate arrives.
-    fn select(&self, hello: &ClientHello<'_>) -> (Route, Arc<ServerConfig>) {
-        let Some(public) = &self.public else {
-            return (Route::Instance, self.instance.clone());
-        };
-        match acme::route(&public.name.name, hello.server_name(), hello.alpn()) {
-            Route::Challenge => (Route::Challenge, public.challenge.clone()),
-            Route::Public if public.edge.served.get().is_some() => {
-                (Route::Public, public.served.clone())
-            }
-            _ => (Route::Instance, self.instance.clone()),
+enum Handshake {
+    Instance,
+    Challenge,
+    Public(Arc<CertifiedKey>),
+}
+
+/// A browser on the public name keeps the Instance leaf until the first certificate arrives,
+/// and while the Instance leaf has expired, so no public handshake outlives the attestation.
+/// A public handshake gets the certificate read here, which its binding then signs, even if a
+/// renewal replaces it in between.
+fn select(
+    configs: &Configs,
+    runtime: &Runtime,
+    hello: &ClientHello<'_>,
+) -> Option<(Handshake, Arc<ServerConfig>)> {
+    let instance = Some((Handshake::Instance, configs.instance.clone()));
+    let Some((name, edge)) = &configs.public else {
+        return instance;
+    };
+    match acme::route(&name.name, hello.server_name(), hello.alpn()) {
+        Route::Challenge => {
+            let config = public_config(edge.challenge.get()?, acme::ACME_TLS_ALPN)?;
+            Some((Handshake::Challenge, config))
         }
+        Route::Public if runtime.attested().is_some() => match edge.served.get() {
+            Some(cert) => {
+                let config = public_config(cert.clone(), b"http/1.1")?;
+                Some((Handshake::Public(cert), config))
+            }
+            None => instance,
+        },
+        _ => instance,
     }
 }
 
@@ -162,21 +174,9 @@ impl Endpoint {
             .route("/ready", axum::routing::get(ready))
             .with_state(runtime.clone());
         let probe = (bind_tcp(probe_addr).await?, probe);
-        let public = match config.public.clone() {
-            Some(name) => {
-                let edge = Arc::new(Edge::default());
-                Some(Public {
-                    served: public_config(edge.served.clone(), b"http/1.1")?,
-                    challenge: public_config(edge.challenge.clone(), acme::ACME_TLS_ALPN)?,
-                    name,
-                    edge,
-                })
-            }
-            None => None,
-        };
         let configs = Arc::new(Configs {
             instance: server_config(runtime.clone())?,
-            public,
+            public: config.public.clone().map(|name| (name, Arc::default())),
         });
         Ok(Some(Self {
             listener: bind_tcp(addr).await?,
@@ -206,12 +206,11 @@ impl Endpoint {
                 alpha_client::error!("probe_listener_failed", error = e.kind());
             }
         });
-        let issuer = self.configs.public.as_ref().map(|public| {
-            tokio::spawn(acme::issue_forever(
-                public.edge.clone(),
-                public.name.clone(),
-            ))
-        });
+        let issuer = self
+            .configs
+            .public
+            .as_ref()
+            .map(|(name, edge)| tokio::spawn(acme::issue_forever(edge.clone(), name.clone())));
         let mut open = JoinSet::new();
         let how = loop {
             while open.try_join_next().is_some() {}
@@ -270,21 +269,21 @@ async fn proxy(
         let start = LazyConfigAcceptor::new(Acceptor::default(), tcp)
             .await
             .ok()?;
-        let (route, config) = configs.select(&start.client_hello());
-        Some((route, start.into_stream(config).await.ok()?))
+        let (picked, config) = select(&configs, &runtime, &start.client_hello())?;
+        Some((picked, start.into_stream(config).await.ok()?))
     };
-    let Ok(Some((route, mut tls))) = timeout(HANDSHAKE, handshake).await else {
+    let Ok(Some((picked, mut tls))) = timeout(HANDSHAKE, handshake).await else {
         return;
     };
     let mut head = Vec::new();
-    let refused = match (route, &configs.public) {
-        (Route::Challenge, _) => true,
-        (Route::Public, Some(public)) => {
+    let refused = match (picked, &configs.public) {
+        (Handshake::Challenge, _) => true,
+        (Handshake::Public(served), Some((name, _))) => {
             let Ok(asks) = read_head(&mut tls, &mut head).await else {
                 return;
             };
             if asks {
-                let reply = binding_reply(&runtime, &public.name.name, &public.edge);
+                let reply = binding_reply(&runtime, &name.name, &served);
                 let _ = tls.write_all(&reply).await;
             }
             asks
@@ -338,12 +337,11 @@ async fn read_head(
     Ok(head.starts_with(request))
 }
 
-/// The binding of the certificate served now, signed with the runtime key, as a whole HTTP
-/// response that closes the connection.
-fn binding_reply(runtime: &Runtime, name: &str, edge: &Edge) -> Vec<u8> {
+/// The binding of the certificate this connection was served, signed with the runtime key, as a
+/// whole HTTP response that closes the connection.
+fn binding_reply(runtime: &Runtime, name: &str, served: &CertifiedKey) -> Vec<u8> {
     let signed = (|| {
         let attested = runtime.attested()?;
-        let served = edge.served.get()?;
         let key = SigningKey::from_pkcs8_der(runtime.tls_private_key()).ok()?;
         let served = served.end_entity_cert().ok()?;
         let signed = binding::sign(&key, chain_pem(&attested), name, served).ok()?;
