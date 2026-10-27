@@ -29,40 +29,30 @@ const POLL: RetryPolicy = RetryPolicy::new()
     .initial_delay(Duration::from_secs(1))
     .timeout(Duration::from_secs(120));
 
-/// `ALPHACOMPUTE_PUBLIC_NAME`.
-#[derive(Clone, Debug)]
-pub struct PublicName {
-    pub name: String,
-}
-
-impl PublicName {
-    /// None when no name is set.
-    pub fn parse(
-        name: Option<&str>,
-        upstream: Option<&str>,
-        callers: &[alpha_core::AppId],
-    ) -> Result<Option<Self>, Error> {
-        let refused = |m: &str| Error::Config(format!("ALPHACOMPUTE_PUBLIC_NAME: {m}"));
-        let Some(name) = name else {
-            return Ok(None);
-        };
-        if !name.contains('.')
-            || name.bytes().any(|b| b.is_ascii_uppercase())
-            || DnsName::try_from(name).is_err()
-        {
-            return Err(refused("is not a lowercase DNS name"));
-        }
-        if upstream.is_none() {
-            return Err(refused("set without ALPHACOMPUTE_TLS_UPSTREAM"));
-        }
-        // A browser and the ACME CA present no Instance leaf.
-        if !callers.is_empty() {
-            return Err(refused("set with ALPHACOMPUTE_TLS_CALLER_APPS"));
-        }
-        Ok(Some(Self {
-            name: name.to_owned(),
-        }))
+/// `ALPHACOMPUTE_PUBLIC_NAME`; None when it is not set.
+pub fn parse_public_name(
+    name: Option<&str>,
+    upstream: Option<&str>,
+    callers: &[alpha_core::AppId],
+) -> Result<Option<String>, Error> {
+    let refused = |m: &str| Error::Config(format!("ALPHACOMPUTE_PUBLIC_NAME: {m}"));
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    if !name.contains('.')
+        || name.bytes().any(|b| b.is_ascii_uppercase())
+        || DnsName::try_from(name).is_err()
+    {
+        return Err(refused("is not a lowercase DNS name"));
     }
+    if upstream.is_none() {
+        return Err(refused("set without ALPHACOMPUTE_TLS_UPSTREAM"));
+    }
+    // A browser and the ACME CA present no Instance leaf.
+    if !callers.is_empty() {
+        return Err(refused("set with ALPHACOMPUTE_TLS_CALLER_APPS"));
+    }
+    Ok(Some(name.to_owned()))
 }
 
 /// The public certificate and the pending challenge's, replaced by the issuance task while the
@@ -111,7 +101,7 @@ pub fn route<'a>(
 // ponytail: a new account and certificate on every start, so a restart loop runs into Let's
 // Encrypt's five certificates per name and week; the upgrade is the key and chain sealed under
 // the App's derived key `edge-tls` and stored as a Secret, read back while valid.
-pub async fn issue_forever(edge: Arc<Edge>, public: PublicName) {
+pub async fn issue_forever(edge: Arc<Edge>, name: String) {
     tokio::time::sleep(ROUTABLE_AFTER).await;
     let account = loop {
         match account().await {
@@ -123,7 +113,7 @@ pub async fn issue_forever(edge: Arc<Edge>, public: PublicName) {
         }
     };
     loop {
-        let wait = match issue(&edge, &public.name, &account).await {
+        let wait = match issue(&edge, &name, &account).await {
             Ok(not_after) => {
                 alpha_client::info!("public_certificate_issued", not_after = not_after);
                 renewal_delay(not_after, SystemTime::now())
@@ -253,11 +243,13 @@ mod tests {
     #[test]
     fn a_public_name_is_one_lowercase_dns_name_on_an_endpoint_open_to_any_client() {
         let upstream = Some("app:8080");
-        let parsed = PublicName::parse(Some(NAME), upstream, &[])
-            .unwrap()
-            .unwrap();
-        assert_eq!(parsed.name, NAME);
-        assert!(PublicName::parse(None, upstream, &[]).unwrap().is_none());
+        assert_eq!(
+            parse_public_name(Some(NAME), upstream, &[])
+                .unwrap()
+                .as_deref(),
+            Some(NAME)
+        );
+        assert!(parse_public_name(None, upstream, &[]).unwrap().is_none());
 
         let caller = [alpha_core::AppId::mint()];
         for (name, upstream, callers) in [
@@ -268,7 +260,7 @@ mod tests {
             (NAME, upstream, &caller),
         ] {
             assert!(
-                PublicName::parse(Some(name), upstream, callers).is_err(),
+                parse_public_name(Some(name), upstream, callers).is_err(),
                 "{name:?} {upstream:?}"
             );
         }

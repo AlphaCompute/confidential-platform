@@ -28,7 +28,7 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_rustls::LazyConfigAcceptor;
 
-use crate::acme::{self, Edge, PublicName, Route};
+use crate::acme::{self, Edge, Route};
 use crate::{Attested, Error, Exit, Runtime};
 
 const HANDSHAKE: Duration = Duration::from_secs(10);
@@ -101,7 +101,7 @@ fn public_config(cert: Arc<CertifiedKey>, alpn: &[u8]) -> Option<Arc<ServerConfi
 
 struct Configs {
     instance: Arc<ServerConfig>,
-    public: Option<(PublicName, Arc<Edge>)>,
+    public: Option<(String, Arc<Edge>)>,
 }
 
 enum Handshake<'a> {
@@ -123,7 +123,7 @@ fn select<'a>(
     let Some((name, edge)) = &configs.public else {
         return instance;
     };
-    match acme::route(&name.name, hello.server_name(), hello.alpn()) {
+    match acme::route(name, hello.server_name(), hello.alpn()) {
         Route::Challenge => {
             let config = public_config(edge.challenge.read().clone()?, acme::ACME_TLS_ALPN)?;
             Some((Handshake::Challenge, config))
@@ -131,7 +131,7 @@ fn select<'a>(
         Route::Public if runtime.attested().is_some() => match edge.served.read().clone() {
             Some(cert) => {
                 let config = public_config(cert.clone(), b"http/1.1")?;
-                Some((Handshake::Public(&name.name, cert), config))
+                Some((Handshake::Public(name, cert), config))
             }
             None => instance,
         },

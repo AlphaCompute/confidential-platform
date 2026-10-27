@@ -317,7 +317,7 @@ pub struct Config {
     pub tls_upstream: Option<String>,
     pub tls_callers: Vec<AppId>,
     pub tls_ready: Option<String>,
-    pub public: Option<acme::PublicName>,
+    pub public: Option<String>,
 }
 
 impl Config {
@@ -343,7 +343,7 @@ impl Config {
                 .ok()
                 .as_deref(),
         )?;
-        let public = acme::PublicName::parse(
+        let public = acme::parse_public_name(
             optional("ALPHACOMPUTE_PUBLIC_NAME").as_deref(),
             config.tls_upstream.as_deref(),
             &config.tls_callers,
