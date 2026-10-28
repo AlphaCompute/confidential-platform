@@ -457,12 +457,6 @@ function secretPage(apiOptions = {}, pageOptions = {}) {
 const field = (page, name) => page.find((n) => n.id === `secret-${name}`);
 const keepChoice = (page, name) => page.find((n) => n.id === `keep-${name}`);
 
-function choose(page, name, value) {
-  const choice = keepChoice(page, name);
-  choice.value = value;
-  for (const listener of choice.listeners.change || []) listener({ target: choice });
-}
-
 function fill(page, values) {
   for (const [name, value] of Object.entries(values)) field(page, name).value = value;
 }
@@ -699,7 +693,9 @@ test("a re-approval keeps current values unless replaced", async () => {
   );
 
   const replaced = await secretPage({ current });
-  choose(replaced.page, "db_password", "replace");
+  const replace = keepChoice(replaced.page, "db_password");
+  replace.value = "replace";
+  for (const listener of replace.listeners.change) listener();
   assert.equal(field(replaced.page, "db_password").hidden, false);
   fill(replaced.page, { session_key: SECRET_VALUES.session_key });
   await replaced.page.click("Approve with passkey");
