@@ -45,10 +45,8 @@ pub fn verify_platform(signed_json: &str, now_ms: f64) -> Result<String, JsError
     to_json(&platform::verify(&signed, &keys, at(now_ms)?).map_err(js)?)
 }
 
-/// The [`public::Report`] for `name`: `binding_json` and `attestation_json` are its answers on
-/// the binding and attestation paths, `platform_json` the signed platform document, `issuances_json` Cert Spotter's issuances for the
-/// name, or undefined when they could not be read, and `min_version` the newest document version
-/// seen before. A failed check is in the report; only a broken build is an error.
+/// The [`public::Report`] for `name` over the [`public::Fetched`] texts; a failed check is in the
+/// report, only a broken build is an error.
 #[wasm_bindgen(js_name = verifyPublicName)]
 pub fn verify_public_name(
     name: &str,

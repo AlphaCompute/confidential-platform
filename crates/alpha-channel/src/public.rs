@@ -261,33 +261,36 @@ fn transparency(
             current.push(issuance);
         }
     }
-    let valid = current.len();
+    if current.is_empty() {
+        return Err(format!(
+            "Certificate Transparency lists no current certificate for {name}"
+        ));
+    }
     let foreign: Vec<String> = current
         .iter()
         .filter(|i| binding.spki_sha256 != format!("sha256:{}", i.pubkey_sha256))
         .map(|i| format!("{} ({})", i.id, i.dns_names.join(", ")))
         .collect();
-    if valid == 0 {
-        return Err(format!(
-            "Certificate Transparency lists no current certificate for {name}"
-        ));
-    }
     if !foreign.is_empty() {
         return Err(format!(
-            "{} of {valid} certificates a browser accepts for {name} hold another key, so their \
+            "{} of {} certificates a browser accepts for {name} hold another key, so their \
              holder could serve the name instead of this TD: {}",
             foreign.len(),
+            current.len(),
             foreign.join("; ")
         ));
     }
     Ok((
         (),
-        format!("all {valid} certificates for {name} in Certificate Transparency hold that key"),
+        format!(
+            "all {} certificates for {name} in Certificate Transparency hold that key",
+            current.len()
+        ),
     ))
 }
 
-/// The wasm build verifies with RustCrypto where the native one uses ring, so the real quote is
-/// appraised on both.
+/// The wasm build verifies with RustCrypto, the native one with ring, so the real quote is
+/// appraised here as well.
 #[cfg(all(test, target_arch = "wasm32"))]
 mod golden {
     use super::*;
