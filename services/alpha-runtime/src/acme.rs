@@ -36,6 +36,8 @@ const ROUTABLE_AFTER: Duration = Duration::from_secs(30);
 const EXPIRED_BACKOFF: Duration = Duration::from_secs(48 * 60 * 60);
 /// The App's derived key that seals the cached certificate; only an Instance of the App gets it.
 const CACHE_KEY_PURPOSE: &str = "edge-tls";
+const CACHE_KEY_TRIES: u32 = 24;
+const CACHE_KEY_RETRY: Duration = Duration::from_secs(5);
 const POLL: RetryPolicy = RetryPolicy::new()
     .initial_delay(Duration::from_secs(1))
     .timeout(Duration::from_secs(120));
@@ -237,11 +239,20 @@ fn install(edge: &Edge, pkcs8: &[u8], chain_pem: &str) -> Result<SystemTime, Str
     Ok(not_after)
 }
 
+/// At start the runtime may not have its first leaf yet, so the key is retried for a while before
+/// the cached certificate is given up and a new one ordered.
 async fn cache_key(runtime: &Runtime) -> Result<Zeroizing<[u8; 32]>, String> {
-    let derived = runtime
-        .key(CACHE_KEY_PURPOSE)
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut tries = CACHE_KEY_TRIES;
+    let derived = loop {
+        match runtime.key(CACHE_KEY_PURPOSE).await {
+            Ok(derived) => break derived,
+            Err(e) if tries <= 1 => return Err(e.to_string()),
+            Err(_) => {
+                tries = tries.saturating_sub(1);
+                tokio::time::sleep(CACHE_KEY_RETRY).await;
+            }
+        }
+    };
     let bytes =
         Zeroizing::new(alpha_client::decode("key", &derived.key).map_err(|e| e.to_string())?);
     let key: [u8; 32] = bytes
