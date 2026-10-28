@@ -50,11 +50,10 @@ pub struct SignedBinding {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Attestation {
-    pub evidence: alpha_attest::InstanceEvidence,
+    pub evidence: alpha_attest::KataEvidence,
     /// base64url, 32 bytes.
     pub nonce: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub init_data: Option<String>,
+    pub init_data: String,
     pub collateral: alpha_attest::Collateral,
 }
 

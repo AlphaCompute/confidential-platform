@@ -1,12 +1,12 @@
 //! What a browser checks about an App's public name with no AlphaCompute server in the path: the
 //! platform document under the release keys compiled into the page, the TD's quote under Intel's
-//! root, its measurements under that document, the init-data its `MRCONFIGID` names, the binding
-//! signed by the key the quote attests, and Certificate Transparency for every certificate a
-//! browser would accept for the name. The KMS's certificate is not consulted.
+//! root and its measurements under that document, the init-data its `MRCONFIGID` names, the
+//! binding signed by the key the quote attests, and Certificate Transparency for every certificate
+//! a browser would accept for the name. The KMS's certificate is not consulted.
 
 use std::time::SystemTime;
 
-use alpha_attest::{InstanceEvidence, PlatformDocument, VerifiedQuote};
+use alpha_attest::{Appraised, PlatformDocument};
 use alpha_core::{AppId, ComposeHash, InitData};
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
@@ -53,16 +53,6 @@ fn need<T>(value: Option<T>, what: &str) -> Result<T, String> {
     value.ok_or_else(|| format!("not checked: {what} did not verify"))
 }
 
-/// One certificate as Cert Spotter's issuances API lists it; `pubkey_sha256` is the hex SHA-256
-/// of its SubjectPublicKeyInfo.
-#[derive(Deserialize)]
-struct Issuance {
-    id: String,
-    dns_names: Vec<String>,
-    pubkey_sha256: String,
-    not_after: String,
-}
-
 /// The texts a verifier read: what the name answers on [`binding::PATH`] and
 /// [`binding::ATTESTATION_PATH`], the signed platform document, and Cert Spotter's issuances for
 /// the name with wildcards, None when they could not be read.
@@ -93,56 +83,34 @@ pub fn verify(
         .map_err(|e| format!("{name} serves no binding: {e}"));
     let evidence = serde_json::from_str::<Attestation>(fetched.attestation)
         .map_err(|e| format!("{name} serves no attestation evidence: {e}"));
-    let attestation = evidence.as_ref().ok();
 
-    let quote = report.check(
-        "tdx_quote",
-        need(doc.as_ref(), "the platform document")
-            .and_then(|doc| tdx_quote(evidence.as_ref().map_err(Clone::clone)?, doc, now)),
-    );
-    if let Some(q) = &quote {
-        report.tcb_status = Some(q.tcb_status.clone());
-        report.advisories = q.advisories.clone();
-    }
-
-    let key_bound = report.check(
-        "instance_key",
-        need(quote.as_ref().zip(attestation), "the quote").and_then(|(q, attestation)| {
-            let leaf = signed
-                .as_ref()
-                .map_err(Clone::clone)
-                .and_then(|s| binding::leaf(s).map_err(|e| e.to_string()))?;
-            instance_key(q, &leaf, attestation)
+    let appraised = report.check(
+        "attestation",
+        need(doc.as_ref(), "the platform document").and_then(|doc| {
+            let signed = signed.as_ref().map_err(Clone::clone)?;
+            appraise(evidence.as_ref().map_err(Clone::clone)?, signed, doc, now)
         }),
     );
-
-    let revision = report.check(
-        "measurements",
-        need(
-            doc.as_ref().zip(quote.as_ref()).zip(attestation),
-            "the quote",
-        )
-        .and_then(|((doc, q), a)| measurements(q, &a.evidence, doc, now)),
-    );
-    if let Some((class, digest)) = &revision {
-        report.runtime_class = Some(class.clone());
-        report.revision = Some(*digest);
+    if let Some(a) = &appraised {
+        report.tcb_status = Some(a.tcb_status.clone());
+        report.advisories = a.advisories.clone();
+        report.runtime_class = Some(a.os_image.clone());
+        report.revision = Some(a.compose_hash);
     }
 
     let app_id = report.check(
         "init_data",
-        need(doc.as_ref().zip(revision.as_ref()), "the measurements").and_then(
-            |(doc, (_, digest))| {
-                init_data(attestation.and_then(|a| a.init_data.as_ref()), *digest, doc)
-            },
-        ),
+        need(doc.as_ref().zip(appraised.as_ref()), "the attestation").and_then(|(doc, a)| {
+            let text = &evidence.as_ref().map_err(Clone::clone)?.init_data;
+            init_data(text, a.compose_hash, doc)
+        }),
     );
-    report.init_data = app_id.and(attestation.and_then(|a| a.init_data.clone()));
+    report.init_data = app_id.and(evidence.as_ref().ok().map(|e| e.init_data.clone()));
     report.app_id = app_id;
 
     let bound = report.check(
         "binding",
-        need(key_bound, "the instance key").and_then(|()| {
+        need(appraised.as_ref(), "the attestation").and_then(|_| {
             let signed = signed.as_ref().map_err(Clone::clone)?;
             let binding = binding::open(signed, name, now).map_err(|e| e.to_string())?;
             let detail = format!(
@@ -189,81 +157,50 @@ fn platform_document(
     Ok((doc, detail))
 }
 
-fn tdx_quote(
+/// The KMS's own appraisal of a Kata TD, over the binding leaf's key: the quote must have been
+/// asked for with that key and the served nonce.
+// ponytail: GPU certificates are not checked for revocation here, unlike at the KMS; the upgrade
+// is OCSP through a CORS-enabled responder.
+fn appraise(
     attestation: &Attestation,
+    signed: &SignedBinding,
     doc: &PlatformDocument,
     now: SystemTime,
-) -> Result<(VerifiedQuote, String), String> {
-    let quote = alpha_attest::verify_quote(
-        attestation.evidence.quote(),
-        &attestation.collateral,
-        &doc.policy,
-        now,
-    )
-    .map_err(|e| e.to_string())?;
-    let detail = format!(
-        "signed by an Intel TDX CPU, TCB {}, not a debug TD",
-        quote.tcb_status
-    );
-    Ok((quote, detail))
-}
-
-/// The quote's `report_data` must be the one the runtime asked for with the binding's leaf key,
-/// committing to the GPU evidence as well when there is any.
-fn instance_key(
-    quote: &VerifiedQuote,
-    leaf: &[u8],
-    attestation: &Attestation,
-) -> Result<((), String), String> {
-    let spki = cert::spki_of(leaf).map_err(|e| e.to_string())?;
+) -> Result<(Appraised, String), String> {
+    let leaf = binding::leaf(signed).map_err(|e| e.to_string())?;
+    let spki = cert::spki_of(&leaf).map_err(|e| e.to_string())?;
     let nonce: [u8; 32] = BASE64_URL_SAFE_NO_PAD
         .decode(&attestation.nonce)
         .ok()
         .and_then(|n| n.try_into().ok())
         .ok_or("the nonce is not 32 bytes of base64url")?;
-    let mut expected = alpha_attest::report_data(&spki, &nonce, None);
-    if let InstanceEvidence::Kata(kata) = &attestation.evidence
-        && !kata.gpu.is_empty()
-    {
-        expected = alpha_attest::bind_gpus(&expected, &kata.gpu);
-    }
-    if quote.report_data != expected {
-        return Err("the quote does not bind the key that signs the binding".into());
-    }
-    Ok(((), format!("the TD holds key {}", sha256_label(&spki))))
-}
-
-fn measurements(
-    quote: &VerifiedQuote,
-    evidence: &InstanceEvidence,
-    doc: &PlatformDocument,
-    now: SystemTime,
-) -> Result<((String, ComposeHash), String), String> {
-    let InstanceEvidence::Kata(kata) = evidence else {
-        return Err("only a Kata TD is appraised here".into());
-    };
-    let reference = alpha_attest::kata_reference(quote, &doc.kata_reference_values)
-        .map_err(|e| e.to_string())?;
-    let digest = alpha_attest::init_data_digest(&quote.mr_config_id).map_err(|e| e.to_string())?;
-    // ponytail: GPU certificates are not checked for revocation here, unlike at the KMS; the
-    // upgrade is OCSP through a CORS-enabled responder.
-    let gpus = alpha_attest::appraise_kata_gpus(reference, &quote.report_data, &kata.gpu, now)
-        .map_err(|e| e.to_string())?;
+    let appraised = alpha_attest::appraise_kata_evidence(
+        &attestation.evidence,
+        &nonce,
+        &spki,
+        None,
+        doc,
+        &attestation.collateral,
+        now,
+    )
+    .map_err(|e| e.to_string())?;
     let detail = format!(
-        "firmware, kernel and guest image of {} as the platform document lists, {} GPUs",
-        reference.runtime_class,
-        gpus.len()
+        "an Intel TDX quote, TCB {}, of {} as the platform document lists, with {} GPUs, \
+         holding key {}",
+        appraised.tcb_status,
+        appraised.os_image,
+        appraised.gpu_serials.len(),
+        sha256_label(&spki)
     );
-    Ok(((reference.runtime_class.clone(), digest), detail))
+    Ok((appraised, detail))
 }
 
 fn init_data(
-    text: Option<&String>,
+    text: &str,
     revision: ComposeHash,
     doc: &PlatformDocument,
 ) -> Result<(AppId, String), String> {
-    let text = text.ok_or("the App serves no init-data")?;
-    let init_data = InitData::parse(text.clone()).map_err(|e| e.to_string())?;
+    let init_data = InitData::parse(text.to_owned()).map_err(|e| e.to_string())?;
     if init_data.digest() != revision {
         return Err(format!(
             "the init-data is {}, the TD booted {revision}",
@@ -282,6 +219,16 @@ fn init_data(
         app_id,
         format!("Revision {revision} of App {app_id}, under the platform's agent policy"),
     ))
+}
+
+/// One certificate as Cert Spotter's issuances API lists it; `pubkey_sha256` is the hex SHA-256
+/// of its SubjectPublicKeyInfo.
+#[derive(Deserialize)]
+struct Issuance {
+    id: String,
+    dns_names: Vec<String>,
+    pubkey_sha256: String,
+    not_after: String,
 }
 
 /// A browser accepts any logged certificate for the name, a wildcard one included, and a page
@@ -353,29 +300,29 @@ mod golden {
         )
         .unwrap()
         .into();
-        let attestation = Attestation {
-            evidence: serde_json::from_value(serde_json::json!({
-                "format": alpha_attest::KATA_EVIDENCE_FORMAT,
-                "quote": BASE64_URL_SAFE_NO_PAD.encode(include_bytes!(
-                    "../../../testdata/attest/b300-kata-4.0.0/k3-app.quote.bin"
-                )),
-            }))
-            .unwrap(),
-            nonce: String::new(),
-            init_data: Some(
-                include_str!("../../../testdata/attest/b300-kata-4.0.0/k3-app.toml").into(),
-            ),
-            collateral: serde_json::from_str(include_str!(
-                "../../../testdata/attest/b300-kata-4.0.0/collateral.json"
-            ))
-            .unwrap(),
-        };
-        let (quote, _) = tdx_quote(&attestation, &doc, now).unwrap();
-        assert_eq!(quote.tcb_status, "UpToDate");
-        let ((class, revision), _) =
-            measurements(&quote, &attestation.evidence, &doc, now).unwrap();
-        assert_eq!(class, "kata-qemu-tdx");
-        init_data(attestation.init_data.as_ref(), revision, &doc).unwrap();
+        let evidence = serde_json::from_value(serde_json::json!({
+            "format": alpha_attest::KATA_EVIDENCE_FORMAT,
+            "quote": BASE64_URL_SAFE_NO_PAD.encode(include_bytes!(
+                "../../../testdata/attest/b300-kata-4.0.0/k3-app.quote.bin"
+            )),
+        }))
+        .unwrap();
+        let collateral = serde_json::from_str(include_str!(
+            "../../../testdata/attest/b300-kata-4.0.0/collateral.json"
+        ))
+        .unwrap();
+        let appraised = alpha_attest::appraise_kata_evidence(
+            &evidence,
+            include_bytes!("../../../testdata/attest/b300-kata-4.0.0/nonce.bin"),
+            include_bytes!("../../../testdata/attest/b300-kata-4.0.0/runtime_spki.der"),
+            None,
+            &doc,
+            &collateral,
+            now,
+        )
+        .unwrap();
+        let text = include_str!("../../../testdata/attest/b300-kata-4.0.0/k3-app.toml");
+        init_data(text, appraised.compose_hash, &doc).unwrap();
     }
 }
 
@@ -416,33 +363,22 @@ mod tests {
         serde_json::to_string(&platform::sign(document, &release_key()).unwrap()).unwrap()
     }
 
-    /// A leaf over the captured TD's key; only the TD could sign with it.
-    fn captured_leaf() -> String {
-        let spki = rcgen::SubjectPublicKeyInfo::from_der(&kata("runtime_spki.der")).unwrap();
-        let ca_key = rcgen::KeyPair::generate().unwrap();
-        let ca = rcgen::Issuer::new(rcgen::CertificateParams::default(), &ca_key);
-        let leaf = rcgen::CertificateParams::default()
-            .signed_by(&spki, &ca)
-            .unwrap();
-        leaf.pem()
-    }
-
-    fn own_leaf(key: &SigningKey) -> String {
+    /// A binding that `key` signs under a self-signed leaf, and the hex SHA-256 of the served key.
+    fn binding_json(key: &SigningKey) -> (String, String) {
         let leaf_key = rcgen::KeyPair::try_from(key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
         let leaf = rcgen::CertificateParams::default()
             .self_signed(&leaf_key)
             .unwrap();
-        leaf.pem()
-    }
-
-    /// A binding that `key` signs, with `leaf_pem` as its chain.
-    fn binding_json(key: &SigningKey, leaf_pem: String) -> String {
         let served_key = rcgen::KeyPair::generate().unwrap();
         let mut served = rcgen::CertificateParams::new(vec![NAME.into()]).unwrap();
         served.not_after = rcgen::date_time_ymd(2100, 1, 1);
         let served = served.self_signed(&served_key).unwrap();
-        let signed = binding::sign(key, leaf_pem, NAME, served.der()).unwrap();
-        serde_json::to_string(&signed).unwrap()
+        let signed = binding::sign(key, leaf.pem(), NAME, served.der()).unwrap();
+        let spki = sha256_label(&cert::spki_of(served.der()).unwrap());
+        (
+            serde_json::to_string(&signed).unwrap(),
+            spki.replace("sha256:", ""),
+        )
     }
 
     fn attestation_json() -> String {
@@ -460,55 +396,41 @@ mod tests {
 
     const NAME: &str = "hello.alphacompute.cc";
 
-    fn run(binding: &str, min_version: u64) -> Report {
+    fn run(binding: &str, issuances: &str, min_version: u64) -> Report {
         let keys = release_key().verifying_key().into();
-        verify(
-            NAME,
-            &Fetched {
-                binding,
-                attestation: &attestation_json(),
-                platform: &platform_json(),
-                issuances: Some("[]"),
-            },
-            &keys,
-            min_version,
-            captured_at(),
-        )
+        let fetched = Fetched {
+            binding,
+            attestation: &attestation_json(),
+            platform: &platform_json(),
+            issuances: Some(issuances),
+        };
+        verify(NAME, &fetched, &keys, min_version, captured_at())
     }
 
-    /// The captured TD's key is not ours to sign with, so every check up to the binding's
-    /// signature passes on the real capture, and a binding under any other leaf fails at the key.
+    /// The captured TD's key is the P-256 scalar 0x4b repeated, so the capture verifies end to
+    /// end; a binding by any other key fails where the quote ties in.
     #[test]
-    fn a_real_quote_appraises_and_only_its_key_may_sign_the_binding() {
-        let key = SigningKey::from_bytes(&[7u8; 32].into()).unwrap();
-        let report = run(&binding_json(&key, captured_leaf()), 0);
-        let results: Vec<_> = report.checks.iter().map(|c| (c.name, c.ok)).collect();
-        assert_eq!(
-            results,
-            [
-                ("platform_document", true),
-                ("tdx_quote", true),
-                ("instance_key", true),
-                ("measurements", true),
-                ("init_data", true),
-                ("binding", false),
-                ("certificate_transparency", false),
-            ],
-            "{report:#?}"
-        );
-        assert!(report.checks[5].detail.contains("not signed by its leaf"));
+    fn the_capture_verifies_end_to_end_and_only_under_its_own_key() {
+        let td = SigningKey::from_bytes(&[0x4b; 32].into()).unwrap();
+        let (binding, served) = binding_json(&td);
+        let logged = json!([{ "id": "1", "dns_names": [NAME], "pubkey_sha256": served,
+                              "not_after": "2100-01-01T00:00:00Z" }])
+        .to_string();
+        let report = run(&binding, &logged, 0);
+        assert!(report.verified, "{report:#?}");
         let k3 = InitData::parse(String::from_utf8(kata("k3-app.toml")).unwrap()).unwrap();
         assert_eq!(report.revision, Some(k3.digest()));
         assert_eq!(report.app_id, k3.app_id());
         assert_eq!(report.tcb_status.as_deref(), Some("UpToDate"));
 
-        let report = run(&binding_json(&key, own_leaf(&key)), 0);
+        let (other, _) = binding_json(&SigningKey::from_bytes(&[7u8; 32].into()).unwrap());
+        let report = run(&other, &logged, 0);
         assert!(
-            report.checks[2].detail.contains("does not bind"),
+            report.checks[1].detail.contains("report_data"),
             "{report:#?}"
         );
 
-        let report = run(&binding_json(&key, captured_leaf()), u64::MAX);
+        let report = run(&binding, &logged, u64::MAX);
         assert!(
             report.checks[0].detail.contains("seen before"),
             "{report:#?}"

@@ -15,9 +15,7 @@ const NAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,6
 
 const LABELS = {
   platform_document: "Platform document",
-  tdx_quote: "Intel TDX quote",
-  instance_key: "Key held by the TD",
-  measurements: "Measured boot",
+  attestation: "Intel TDX attestation",
   init_data: "Revision and agent policy",
   binding: "Certificate bound to the TD",
   certificate_transparency: "Every certificate for the name",
@@ -155,15 +153,7 @@ async function main() {
     .filter(([, error]) => error);
 
   const report = JSON.parse(
-    wasm_bindgen.verifyPublicName(
-      name,
-      value(0) || "",
-      value(1) || "",
-      value(2) || "",
-      value(3),
-      storedVersion(),
-      Date.now(),
-    ),
+    wasm_bindgen.verifyPublicName(name, ...[0, 1, 2].map((i) => value(i) || ""), value(3), storedVersion(), Date.now()),
   );
   if (report.checks[0].ok) storeVersion(report.platform_document_version);
   render(root, name, report, fetched);

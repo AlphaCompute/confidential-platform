@@ -670,9 +670,7 @@ fn evidence_sha256(evidence: &impl Serialize) -> Result<String, AppraisalError> 
     Ok(sha256_text(&jcs))
 }
 
-/// The one runtime class whose reference values a verified Kata quote matches, after the TD
-/// fields every class shares.
-pub fn kata_reference<'a>(
+fn kata_reference<'a>(
     quote: &VerifiedQuote,
     references: &'a [KataReference],
 ) -> Result<&'a KataReference, AppraisalError> {
