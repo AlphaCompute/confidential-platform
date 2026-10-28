@@ -1,19 +1,14 @@
 name: verify-page
 
 # Builds the dev stand's verify page twice, the second time from an empty target directory, fails
-# unless both are byte-identical, writes wasm_sha256 and bundle_sha256 to the job summary for anyone
-# who rebuilds the commit, and on main publishes it to this repository's GitHub Pages under dev/.
+# unless both are byte-identical, and writes wasm_sha256 and bundle_sha256 to the job summary, so
+# anyone can rebuild the commit and compare with what verify.alphacompute.cc serves.
 
 on:
   push:
     branches: [main]
   pull_request:
   workflow_dispatch:
-
-# An older run finishing last must not publish over a newer page.
-concurrency:
-  group: verify-page-${{ github.ref }}
-  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -30,24 +25,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo install wasm-bindgen-cli --version 0.2.128 --locked
       - shell: bash
-        run: web/verify/build.sh site/dev | tee -a "$GITHUB_STEP_SUMMARY"
-      - run: CARGO_TARGET_DIR="$RUNNER_TEMP/empty-target" web/verify/build.sh "$RUNNER_TEMP/dev2"
-      - run: diff -r site/dev "$RUNNER_TEMP/dev2"
-      - if: github.ref == 'refs/heads/main'
-        uses: actions/upload-pages-artifact@v3
+        run: web/verify/build.sh dist | tee -a "$GITHUB_STEP_SUMMARY"
+      - run: CARGO_TARGET_DIR="$RUNNER_TEMP/empty-target" web/verify/build.sh "$RUNNER_TEMP/dist2"
+      - run: diff -r dist "$RUNNER_TEMP/dist2"
+      - uses: actions/upload-artifact@v4
         with:
-          path: site
-
-  publish:
-    if: github.ref == 'refs/heads/main'
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}dev/
-    steps:
-      - id: deploy
-        uses: actions/deploy-pages@v4
+          name: verify-bundle
+          path: dist/

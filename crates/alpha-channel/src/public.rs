@@ -231,6 +231,7 @@ struct Issuance {
     id: String,
     dns_names: Vec<String>,
     pubkey_sha256: String,
+    not_before: String,
     not_after: String,
 }
 
@@ -251,9 +252,11 @@ fn transparency(
     let now = chrono::DateTime::<chrono::Utc>::from(now);
     let mut current = Vec::new();
     for issuance in &issuances {
-        let not_after = chrono::DateTime::parse_from_rfc3339(&issuance.not_after)
-            .map_err(|e| format!("Certificate Transparency not_after: {e}"))?;
-        if not_after > now {
+        let time = |t: &str| {
+            chrono::DateTime::parse_from_rfc3339(t)
+                .map_err(|e| format!("Certificate Transparency validity: {e}"))
+        };
+        if time(&issuance.not_before)? <= now && now < time(&issuance.not_after)? {
             current.push(issuance);
         }
     }
@@ -416,7 +419,7 @@ mod tests {
         let td = SigningKey::from_bytes(&[0x4b; 32].into()).unwrap();
         let (binding, served) = binding_json(&td);
         let logged = json!([{ "id": "1", "dns_names": [NAME], "pubkey_sha256": served,
-                              "not_after": "2100-01-01T00:00:00Z" }])
+                              "not_before": "2000-01-01T00:00:00Z", "not_after": "2100-01-01T00:00:00Z" }])
         .to_string();
         let report = run(&binding, &logged, 0);
         assert!(report.verified, "{report:#?}");
@@ -452,14 +455,16 @@ mod tests {
     #[test]
     fn every_current_logged_certificate_must_hold_the_bound_key() {
         let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
-        let issuance = |id: &str, names: &[&str], key: &str, not_after: &str| json!({ "id": id, "dns_names": names, "pubkey_sha256": key, "not_after": not_after });
+        let issuance = |id: &str, names: &[&str], key: &str, not_after: &str| json!({ "id": id, "dns_names": names, "pubkey_sha256": key, "not_before": "2000-01-01T00:00:00Z", "not_after": not_after });
         let ours = "aa".repeat(32);
         let list = |entries: Vec<Value>| Value::Array(entries).to_string();
         let check = |text: Option<&str>| transparency(NAME, &binding(&ours), text, now);
 
         let current = issuance("1", &[NAME], &ours, "2030-01-01T00:00:00Z");
         let expired_other = issuance("2", &[NAME], &"bb".repeat(32), "2020-01-01T00:00:00Z");
-        assert!(check(Some(&list(vec![current.clone(), expired_other]))).is_ok());
+        let mut not_yet = issuance("4", &[NAME], &"dd".repeat(32), "2031-01-01T00:00:00Z");
+        not_yet["not_before"] = json!("2030-06-01T00:00:00Z");
+        assert!(check(Some(&list(vec![current.clone(), expired_other, not_yet]))).is_ok());
 
         let wildcard = issuance(
             "3",

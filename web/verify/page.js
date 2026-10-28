@@ -119,7 +119,7 @@ function render(root, name, report, fetched) {
     el(
       "p",
       "",
-      "This page talks to no AlphaCompute server. It reads the App's evidence from the App itself, the platform document from GitHub, and certificates from Cert Spotter's Certificate Transparency index. It checks the quote against Intel's root, the measurements against the platform document signed by the release keys built into this page, and the binding with the key the quote attests. The KMS's certificate is not consulted.",
+      "This page is served by verify.alphacompute.cc, itself an attested App whose init-data pins the bundle built from the commit below, so anyone can rebuild and compare it. Once loaded, it talks to no other AlphaCompute server. It reads the App's evidence from the App itself, the platform document from GitHub, and certificates from Cert Spotter's Certificate Transparency index. It checks the quote against Intel's root, the measurements against the platform document signed by the release keys built into this page, and the binding with the key the quote attests. The KMS's certificate is not consulted.",
     ),
     el(
       "p",
