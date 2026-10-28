@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use alpha_attest::{AttestationResult, InstanceEvidence};
+use alpha_attest::{AttestationResult, Collateral, InstanceEvidence};
 use alpha_client::log::Field;
 use alpha_client::platform::ReleaseKeys;
 use alpha_client::tls::{self, InstanceSans};
@@ -64,6 +64,11 @@ const ATTEST_TIMEOUT: Duration = Duration::from_secs(60);
 const SECRETS_FIRST_RETRY: Duration = Duration::from_secs(2);
 /// With every file written a pass hits the leaf's cache, so it costs nothing until a renewal.
 const SECRETS_POLL: Duration = Duration::from_secs(60);
+
+/// Intel signs the collateral, so its source does not matter; Intel's own PCS answers without a
+/// key.
+const INTEL_PCS: &str = "https://api.trustedservices.intel.com";
+const COLLATERAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Distinct purposes cached per leaf; beyond it a key is still served, derived again on every
 /// read, so a caller naming ever new purposes cannot grow the process.
@@ -499,6 +504,21 @@ fn read_under_limit(reader: impl Read) -> Result<String, String> {
     Ok(text)
 }
 
+/// Without collateral the Instance still attests to the KMS; only a browser's own check waits for
+/// the next renewal.
+async fn collateral(quote: &[u8]) -> Option<Collateral> {
+    let fetched = tokio::time::timeout(
+        COLLATERAL_TIMEOUT,
+        alpha_attest::fetch_collateral(INTEL_PCS, quote),
+    )
+    .await;
+    if let Ok(Ok(collateral)) = fetched {
+        return Some(collateral);
+    }
+    alpha_client::warn!("collateral_unavailable");
+    None
+}
+
 /// How long to wait before renewing: ten minutes before `not_after`, or at once if that has passed.
 pub fn renewal_delay(not_after: SystemTime, now: SystemTime) -> Duration {
     not_after
@@ -515,6 +535,11 @@ pub struct Attested {
     pub result: AttestationResult,
     /// The leaf and the runtime key as the TLS listener serves them.
     pub certified: Arc<CertifiedKey>,
+    /// What the leaf's key was attested with, and Intel's collateral for the quote on an Endpoint
+    /// with a public name, so a browser can appraise the TD itself.
+    pub evidence: InstanceEvidence,
+    pub nonce: [u8; 32],
+    pub collateral: Option<Collateral>,
     client: Client,
     secrets: Mutex<HashMap<String, Secret>>,
     keys: Mutex<HashMap<String, DerivedKey>>,
@@ -582,6 +607,14 @@ impl Runtime {
         &self.pkcs8
     }
 
+    /// The Kata init-data read at start, the text of the leaf's Revision.
+    pub fn init_data(&self) -> Option<&str> {
+        match &self.revision {
+            Some(RevisionText::InitData(text)) => Some(text),
+            _ => None,
+        }
+    }
+
     pub fn is_revoked(&self) -> bool {
         *self.revoked.borrow()
     }
@@ -638,10 +671,14 @@ impl Runtime {
             .attest(&AttestRequest {
                 runtime_pubkey: BASE64_URL_SAFE_NO_PAD.encode(&self.spki),
                 nonce: BASE64_URL_SAFE_NO_PAD.encode(nonce),
-                evidence,
+                evidence: evidence.clone(),
             })
             .await?;
-        self.accept(reply, pin)
+        let collateral = match self.config.public {
+            Some(_) => collateral(evidence.quote()).await,
+            None => None,
+        };
+        self.accept(reply, pin, evidence, nonce, collateral)
     }
 
     /// A failed fetch, or a document not above the accepted one, keeps the accepted list.
@@ -689,7 +726,14 @@ impl Runtime {
 
     /// The reply's chain is ours only if the leaf carries our key and the root the pinned one;
     /// the ids come from the leaf's SANs, never from the reply's text.
-    fn accept(&self, reply: AttestReply, pin: Pin) -> Result<Arc<Attested>, Error> {
+    fn accept(
+        &self,
+        reply: AttestReply,
+        pin: Pin,
+        evidence: InstanceEvidence,
+        nonce: [u8; 32],
+        collateral: Option<Collateral>,
+    ) -> Result<Arc<Attested>, Error> {
         let chain: Vec<Vec<u8>> = reply
             .certificate_chain
             .iter()
@@ -738,6 +782,9 @@ impl Runtime {
             not_after,
             result: reply.attestation_result,
             certified,
+            evidence,
+            nonce,
+            collateral,
             client,
             secrets: Mutex::new(HashMap::new()),
             keys: Mutex::new(HashMap::new()),

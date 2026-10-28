@@ -1,19 +1,23 @@
 //! TLS for a wrapped compose: the current Instance leaf on the Endpoint, then the bytes copied
 //! both ways to the published service's plain port. With caller Apps configured, only a client
 //! presenting an Instance leaf of one of them under the KMS CA gets past the handshake. With a
-//! public name, a browser on that name gets the ACME certificate instead, and the binding of its
-//! key to the Instance leaf at [`binding::PATH`].
+//! public name, a browser on that name gets the ACME certificate instead, the binding of its
+//! key to the Instance leaf at [`binding::PATH`], and the evidence behind that leaf at
+//! [`ATTESTATION_PATH`].
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use alpha_attest::InstanceEvidence;
 use alpha_channel::binding;
 use alpha_client::tls;
 use alpha_core::AppId;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
+use base64::Engine;
+use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use p256::ecdsa::SigningKey;
 use p256::pkcs8::DecodePrivateKey;
 use rustls::pki_types::CertificateDer;
@@ -37,6 +41,10 @@ const CONNECT: Duration = Duration::from_secs(10);
 const DRAIN: Duration = Duration::from_secs(10);
 /// The whole readiness exchange with the upstream, connect included.
 const READY_CHECK: Duration = Duration::from_secs(2);
+/// The wire of `alpha_channel::binding::Attestation`, which the browser verifier reads.
+const ATTESTATION_PATH: &str = "/.well-known/alphacompute/attestation";
+/// The paths the runtime answers itself on a fresh connection to the public name.
+const ANSWERED: [&str; 2] = [binding::PATH, ATTESTATION_PATH];
 
 struct CurrentLeaf(Arc<Runtime>);
 
@@ -287,11 +295,15 @@ async fn proxy(
             let Ok(Ok(asks)) = timeout(HANDSHAKE, read_head(&mut tls, &mut head)).await else {
                 return;
             };
-            if asks {
-                let reply = binding_reply(&runtime, name, &served);
-                let _ = tls.write_all(&reply).await;
+            if let Some(path) = asks {
+                let body = if path == binding::PATH {
+                    binding_body(&runtime, name, &served)
+                } else {
+                    attestation_body(&runtime)
+                };
+                let _ = tls.write_all(&reply(body)).await;
             }
-            asks
+            asks.is_some()
         }
         Handshake::Instance => !admitted(tls.get_ref().1.peer_certificates(), &callers),
     };
@@ -322,47 +334,71 @@ async fn proxy(
     let _ = tokio::io::copy_bidirectional(&mut tls, &mut backend).await;
 }
 
-/// Reads until the bytes can no longer open `GET <binding::PATH> `; true when they do. A request
-/// for the binding later on a kept-alive connection reaches the upstream, so a verifier asks on
-/// a fresh connection.
+/// Reads until the bytes can no longer open `GET <path> ` for a path in [`ANSWERED`]; returns the
+/// path they open. A request for one later on a kept-alive connection reaches the upstream, so a
+/// verifier asks on a fresh connection.
 async fn read_head(
     tls: &mut (impl AsyncRead + Unpin),
     head: &mut Vec<u8>,
-) -> std::io::Result<bool> {
-    let request = format!("GET {} ", binding::PATH);
-    let request = request.as_bytes();
+) -> std::io::Result<Option<&'static str>> {
+    let requests = ANSWERED.map(|path| format!("GET {path} "));
     let mut buf = [0u8; 64];
-    while head.len() < request.len() && request.starts_with(head) {
+    while requests
+        .iter()
+        .any(|r| head.len() < r.len() && r.as_bytes().starts_with(head))
+    {
         let n = tls.read(&mut buf).await?;
         let Some(read) = buf.get(..n).filter(|r| !r.is_empty()) else {
             break;
         };
         head.extend_from_slice(read);
     }
-    Ok(head.starts_with(request))
+    Ok(ANSWERED
+        .into_iter()
+        .zip(&requests)
+        .find(|(_, r)| head.starts_with(r.as_bytes()))
+        .map(|(path, _)| path))
 }
 
-/// The binding of the certificate this connection was served, signed with the runtime key, as a
-/// whole HTTP response that closes the connection.
-fn binding_reply(runtime: &Runtime, name: &str, served: &CertifiedKey) -> Vec<u8> {
-    let signed = (|| {
-        let attested = runtime.attested()?;
-        let key = SigningKey::from_pkcs8_der(runtime.tls_private_key()).ok()?;
-        let served = served.end_entity_cert().ok()?;
-        let signed = binding::sign(&key, chain_pem(&attested), name, served).ok()?;
-        serde_json::to_vec(&signed).ok()
-    })();
-    let (status, body) = match &signed {
-        Some(body) => ("200 OK", body.as_slice()),
-        None => ("503 Service Unavailable", &b"{}"[..]),
+/// The binding of the certificate this connection was served, signed with the runtime key.
+fn binding_body(runtime: &Runtime, name: &str, served: &CertifiedKey) -> Option<Vec<u8>> {
+    let attested = runtime.attested()?;
+    let key = SigningKey::from_pkcs8_der(runtime.tls_private_key()).ok()?;
+    let served = served.end_entity_cert().ok()?;
+    let signed = binding::sign(&key, chain_pem(&attested), name, served).ok()?;
+    serde_json::to_vec(&signed).ok()
+}
+
+/// The evidence the current leaf's key was attested with, its nonce, the init-data its
+/// `MRCONFIGID` names and Intel's collateral: a Kata TD's only, once the collateral is in.
+fn attestation_body(runtime: &Runtime) -> Option<Vec<u8>> {
+    let attested = runtime.attested()?;
+    let InstanceEvidence::Kata(evidence) = &attested.evidence else {
+        return None;
+    };
+    serde_json::to_vec(&serde_json::json!({
+        "evidence": evidence,
+        "nonce": BASE64_URL_SAFE_NO_PAD.encode(attested.nonce),
+        "init_data": runtime.init_data()?,
+        "collateral": attested.collateral.as_ref()?,
+    }))
+    .ok()
+}
+
+/// A whole HTTP response that closes the connection; any origin may read it, since every byte of
+/// it is public and a verifier page runs on another origin.
+fn reply(body: Option<Vec<u8>>) -> Vec<u8> {
+    let (status, body) = match body {
+        Some(body) => ("200 OK", body),
+        None => ("503 Service Unavailable", b"{}".to_vec()),
     };
     let mut reply = format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nCache-Control: no-store\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n",
+         Access-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     )
     .into_bytes();
-    reply.extend_from_slice(body);
+    reply.extend_from_slice(&body);
     reply
 }
 
@@ -472,10 +508,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_a_request_for_the_binding_is_answered_and_other_bytes_reach_the_upstream() {
-        let mut head = Vec::new();
-        let asks = b"GET /.well-known/alphacompute/binding HTTP/1.1\r\nHost: a.example\r\n\r\n";
-        assert!(read_head(&mut &asks[..], &mut head).await.unwrap());
+    async fn only_the_two_runtime_paths_are_answered_and_other_bytes_reach_the_upstream() {
+        for path in ANSWERED {
+            let mut head = Vec::new();
+            let asks = format!("GET {path} HTTP/1.1\r\nHost: a.example\r\n\r\n");
+            let answered = read_head(&mut asks.as_bytes(), &mut head).await.unwrap();
+            assert_eq!(answered, Some(path));
+        }
         for request in [
             &b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n"[..],
             b"GET /.well-known/alphacompute/bindings HTTP/1.1\r\n\r\n",
@@ -483,7 +522,7 @@ mod tests {
             b"GET /.well",
         ] {
             let mut head = Vec::new();
-            assert!(!read_head(&mut &request[..], &mut head).await.unwrap());
+            assert_eq!(read_head(&mut &request[..], &mut head).await.unwrap(), None);
             assert!(request.starts_with(&head) && !head.is_empty());
         }
     }
