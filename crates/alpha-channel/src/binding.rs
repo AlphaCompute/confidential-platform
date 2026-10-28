@@ -41,20 +41,6 @@ pub struct SignedBinding {
     pub chain_pem: String,
 }
 
-/// What lets a verifier appraise the TD without the KMS: the evidence the leaf's key was attested
-/// with, whose `report_data` binds that key and `nonce` as [`alpha_attest::report_data`] lays
-/// out, the init-data `MRCONFIGID` names, and Intel's collateral for the quote. Intel signs the
-/// collateral, so it comes through the App unharmed or not at all.
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Attestation {
-    pub evidence: alpha_attest::KataEvidence,
-    /// base64url, 32 bytes.
-    pub nonce: String,
-    pub init_data: String,
-    pub collateral: alpha_attest::Collateral,
-}
-
 fn digest(statement: &str) -> [u8; 32] {
     Sha256::new()
         .chain_update(CONTEXT)

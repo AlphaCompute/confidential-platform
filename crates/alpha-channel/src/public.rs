@@ -12,7 +12,7 @@ use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 
-use crate::binding::{self, Attestation, Binding, SignedBinding};
+use crate::binding::{self, Binding, SignedBinding};
 use crate::platform::{self, ReleaseKeys, SignedDocument};
 use crate::{cert, sha256_label};
 
@@ -61,6 +61,20 @@ pub struct Fetched<'a> {
     pub attestation: &'a str,
     pub platform: &'a str,
     pub issuances: Option<&'a str>,
+}
+
+/// What lets a verifier appraise the TD without the KMS: the evidence the leaf's key was attested
+/// with, whose `report_data` binds that key and `nonce` as [`alpha_attest::report_data`] lays
+/// out, the init-data `MRCONFIGID` names, and Intel's collateral for the quote. Intel signs the
+/// collateral, so it comes through the App unharmed or not at all.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Attestation {
+    evidence: alpha_attest::KataEvidence,
+    /// base64url, 32 bytes.
+    nonce: String,
+    init_data: String,
+    collateral: alpha_attest::Collateral,
 }
 
 /// `min_version` is the newest platform document version this verifier saw before.
