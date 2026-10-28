@@ -311,17 +311,16 @@ async fn proxy(
             let Ok(Ok(asks)) = timeout(HANDSHAKE, read_head(&mut tls, &mut head)).await else {
                 return;
             };
-            let answered = asks.is_some();
-            if let Some(asked) = asks {
+            if let Some(asked) = &asks {
                 let body = match asked {
-                    Asked::Binding(challenge) => {
+                    &Asked::Binding(challenge) => {
                         binding_body(&runtime, name, &served, challenge.as_ref())
                     }
                     Asked::Attestation => runtime.attested().and_then(|a| a.attestation.clone()),
                 };
                 let _ = tls.write_all(&reply(body)).await;
             }
-            answered
+            asks.is_some()
         }
         Handshake::Instance => !admitted(tls.get_ref().1.peer_certificates(), &callers),
     };

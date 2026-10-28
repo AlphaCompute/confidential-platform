@@ -90,6 +90,7 @@ impl SignedBinding {
 
     /// Refused unless the key whose SubjectPublicKeyInfo is `spki` answered `challenge` on this
     /// binding's statement.
+    #[cfg(test)]
     pub fn check_answer(&self, spki: &[u8], challenge: &[u8; 32]) -> Result<(), Error> {
         let key = VerifyingKey::from_public_key_der(spki)
             .map_err(|_| Error::ForeignCertificate("the binding key is not P-256".into()))?;
