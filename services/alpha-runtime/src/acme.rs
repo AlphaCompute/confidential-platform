@@ -273,11 +273,7 @@ async fn restore(
     let key = cache_key(runtime).await?;
     let (renew_at, pkcs8, chain_pem) =
         open(&key, name, &blob).ok_or("the cached certificate does not open")?;
-    let Some(wait) = renew_at
-        .duration_since(SystemTime::now())
-        .ok()
-        .filter(|w| !w.is_zero())
-    else {
+    let Ok(wait) = renew_at.duration_since(SystemTime::now()) else {
         return Ok(None);
     };
     install(edge, &pkcs8, &chain_pem)?;
