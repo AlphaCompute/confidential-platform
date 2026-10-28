@@ -899,6 +899,7 @@ function secretFields(services, before, put) {
     if (held.includes(name)) {
       keep = el("select");
       keep.id = `keep-${name}`;
+      keep.ariaLabel = `Secret ${name}`;
       const kept = el("option", "Keep the current value");
       kept.value = "keep";
       const replaced = el("option", "Replace");
