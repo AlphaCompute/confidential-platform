@@ -17,8 +17,6 @@ use crate::{Error, rfc3339, sha256_label};
 
 /// Where the Endpoint serves its [`SignedBinding`] on its public name.
 pub const PATH: &str = "/.well-known/alphacompute/binding";
-/// Where it serves the [`Attestation`] behind the binding's leaf key.
-pub const ATTESTATION_PATH: &str = "/.well-known/alphacompute/attestation";
 const FORMAT: &str = "alphacompute-edge-binding/1";
 /// Keeps a binding's signature apart from every other one the Instance key makes.
 const CONTEXT: &[u8] = b"alphacompute/edge-binding/v1\n";
@@ -102,7 +100,7 @@ pub fn verify(
     let leaf = leaf(signed)?;
     cert::verify_leaf(&leaf, kms_ca, now)?;
     let instance = cert::parse_instance_sans(&cert::uri_sans(&leaf)?)?;
-    let binding = open(signed, name, now)?;
+    let binding = open(signed, &leaf, name, now)?;
     if binding.spki_sha256 != sha256_label(&cert::spki_of(served)?) {
         return Err(Error::ForeignCertificate(
             "the name is served with a key the Instance did not sign for".into(),
@@ -111,12 +109,16 @@ pub fn verify(
     Ok((instance, binding))
 }
 
-/// The statement, refused unless the leaf's key signed it, it names `name` and
-/// it is current at `now`. Neither the leaf's issuer nor the served certificate is checked: a
+/// The statement, refused unless the key of `leaf`, the binding's [`leaf`], signed it, it names
+/// `name` and it is current at `now`. Neither the leaf's issuer nor the served certificate is checked: a
 /// caller that trusts the key for another reason, a quote that binds it, checks what it needs.
-pub fn open(signed: &SignedBinding, name: &str, now: SystemTime) -> Result<Binding, Error> {
-    let leaf = leaf(signed)?;
-    let key = VerifyingKey::from_public_key_der(&cert::spki_of(&leaf)?)
+pub(crate) fn open(
+    signed: &SignedBinding,
+    leaf: &[u8],
+    name: &str,
+    now: SystemTime,
+) -> Result<Binding, Error> {
+    let key = VerifyingKey::from_public_key_der(&cert::spki_of(leaf)?)
         .map_err(|_| Error::ForeignCertificate("the binding leaf is not P-256".into()))?;
     let signature = BASE64_URL_SAFE_NO_PAD
         .decode(&signed.signature)
@@ -148,7 +150,7 @@ pub fn open(signed: &SignedBinding, name: &str, now: SystemTime) -> Result<Bindi
 }
 
 /// The DER of the binding's leaf, unchecked.
-pub fn leaf(signed: &SignedBinding) -> Result<Vec<u8>, Error> {
+pub(crate) fn leaf(signed: &SignedBinding) -> Result<Vec<u8>, Error> {
     let (_, leaf) = x509_parser::pem::parse_x509_pem(signed.chain_pem.as_bytes())
         .map_err(|e| Error::Malformed(format!("binding chain: {e}")))?;
     Ok(leaf.contents)

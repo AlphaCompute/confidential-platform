@@ -53,8 +53,8 @@ fn need<T>(value: Option<T>, what: &str) -> Result<T, String> {
     value.ok_or_else(|| format!("not checked: {what} did not verify"))
 }
 
-/// The texts a verifier read: what the name answers on [`binding::PATH`] and
-/// [`binding::ATTESTATION_PATH`], the signed platform document, and Cert Spotter's issuances for
+/// The texts a verifier read: what the name answers on [`binding::PATH`] and on
+/// `/.well-known/alphacompute/attestation`, the signed platform document, and Cert Spotter's issuances for
 /// the name with wildcards, None when they could not be read.
 pub struct Fetched<'a> {
     pub binding: &'a str,
@@ -81,14 +81,18 @@ pub fn verify(
 
     let signed = serde_json::from_str::<SignedBinding>(fetched.binding)
         .map_err(|e| format!("{name} serves no binding: {e}"));
+    let leaf = signed
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|s| binding::leaf(s).map_err(|e| e.to_string()));
     let evidence = serde_json::from_str::<Attestation>(fetched.attestation)
         .map_err(|e| format!("{name} serves no attestation evidence: {e}"));
 
     let appraised = report.check(
         "attestation",
         need(doc.as_ref(), "the platform document").and_then(|doc| {
-            let signed = signed.as_ref().map_err(Clone::clone)?;
-            appraise(evidence.as_ref().map_err(Clone::clone)?, signed, doc, now)
+            let leaf = leaf.as_ref().map_err(Clone::clone)?;
+            appraise(evidence.as_ref().map_err(Clone::clone)?, leaf, doc, now)
         }),
     );
     if let Some(a) = &appraised {
@@ -111,8 +115,12 @@ pub fn verify(
     let bound = report.check(
         "binding",
         need(appraised.as_ref(), "the attestation").and_then(|_| {
-            let signed = signed.as_ref().map_err(Clone::clone)?;
-            let binding = binding::open(signed, name, now).map_err(|e| e.to_string())?;
+            let (signed, leaf) = signed
+                .as_ref()
+                .ok()
+                .zip(leaf.as_ref().ok())
+                .ok_or("no binding")?;
+            let binding = binding::open(signed, leaf, name, now).map_err(|e| e.to_string())?;
             let detail = format!(
                 "the TD's key signed that it serves {name} with key {} until {}",
                 binding.spki_sha256, binding.not_after
@@ -163,12 +171,11 @@ fn platform_document(
 // is OCSP through a CORS-enabled responder.
 fn appraise(
     attestation: &Attestation,
-    signed: &SignedBinding,
+    leaf: &[u8],
     doc: &PlatformDocument,
     now: SystemTime,
 ) -> Result<(Appraised, String), String> {
-    let leaf = binding::leaf(signed).map_err(|e| e.to_string())?;
-    let spki = cert::spki_of(&leaf).map_err(|e| e.to_string())?;
+    let spki = cert::spki_of(leaf).map_err(|e| e.to_string())?;
     let nonce: [u8; 32] = BASE64_URL_SAFE_NO_PAD
         .decode(&attestation.nonce)
         .ok()
@@ -285,11 +292,11 @@ fn transparency(
 
 /// The wasm build verifies with RustCrypto where the native one uses ring, so the real quote is
 /// appraised on both.
-#[cfg(test)]
+#[cfg(all(test, target_arch = "wasm32"))]
 mod golden {
     use super::*;
 
-    #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+    #[wasm_bindgen_test::wasm_bindgen_test]
     fn the_captured_kata_quote_appraises_to_its_init_data() {
         let doc: PlatformDocument = serde_json::from_str(include_str!(
             "../../../testdata/attest/b300-kata-4.0.0/platform-document.json"
