@@ -55,12 +55,12 @@ fn need<T>(value: Option<T>, what: &str) -> Result<T, String> {
 
 /// One certificate as Cert Spotter's issuances API lists it; `pubkey_sha256` is the hex SHA-256
 /// of its SubjectPublicKeyInfo.
-#[derive(Debug, Deserialize)]
-pub struct Issuance {
-    pub id: String,
-    pub dns_names: Vec<String>,
-    pub pubkey_sha256: String,
-    pub not_after: String,
+#[derive(Deserialize)]
+struct Issuance {
+    id: String,
+    dns_names: Vec<String>,
+    pubkey_sha256: String,
+    not_after: String,
 }
 
 /// `binding_json` is what `name` answers on [`binding::PATH`]; `issuances_json` is Cert Spotter's
@@ -104,7 +104,7 @@ pub fn verify(
 
     let key_bound = report.check(
         "instance_key",
-        need(quote.as_ref(), "the quote").and_then(|q| {
+        need(quote.as_ref().zip(attestation), "the quote").and_then(|(q, attestation)| {
             let leaf = signed
                 .as_ref()
                 .map_err(Clone::clone)
@@ -115,8 +115,11 @@ pub fn verify(
 
     let revision = report.check(
         "measurements",
-        need(doc.as_ref().zip(quote.as_ref()), "the quote")
-            .and_then(|(doc, q)| measurements(q, attestation.map(|a| &a.evidence), doc, now)),
+        need(
+            doc.as_ref().zip(quote.as_ref()).zip(attestation),
+            "the quote",
+        )
+        .and_then(|((doc, q), a)| measurements(q, &a.evidence, doc, now)),
     );
     if let Some((class, digest)) = &revision {
         report.runtime_class = Some(class.clone());
@@ -140,7 +143,7 @@ pub fn verify(
         "binding",
         need(key_bound, "the instance key").and_then(|()| {
             let signed = signed.as_ref().map_err(Clone::clone)?;
-            let (_, binding) = binding::open(signed, name, now).map_err(|e| e.to_string())?;
+            let binding = binding::open(signed, name, now).map_err(|e| e.to_string())?;
             let detail = format!(
                 "the TD's key signed that it serves {name} with key {} until {}",
                 binding.spki_sha256, binding.not_after
@@ -209,9 +212,8 @@ fn tdx_quote(
 fn instance_key(
     quote: &VerifiedQuote,
     leaf: &[u8],
-    attestation: Option<&Attestation>,
+    attestation: &Attestation,
 ) -> Result<((), String), String> {
-    let attestation = attestation.ok_or("no evidence")?;
     let spki = cert::spki_of(leaf).map_err(|e| e.to_string())?;
     let nonce: [u8; 32] = BASE64_URL_SAFE_NO_PAD
         .decode(&attestation.nonce)
@@ -232,11 +234,11 @@ fn instance_key(
 
 fn measurements(
     quote: &VerifiedQuote,
-    evidence: Option<&InstanceEvidence>,
+    evidence: &InstanceEvidence,
     doc: &PlatformDocument,
     now: SystemTime,
 ) -> Result<((String, ComposeHash), String), String> {
-    let Some(InstanceEvidence::Kata(kata)) = evidence else {
+    let InstanceEvidence::Kata(kata) = evidence else {
         return Err("only a Kata TD is appraised here".into());
     };
     let reference = alpha_attest::kata_reference(quote, &doc.kata_reference_values)
@@ -370,7 +372,7 @@ mod golden {
         let (quote, _) = tdx_quote(&attestation, &doc, now).unwrap();
         assert_eq!(quote.tcb_status, "UpToDate");
         let ((class, revision), _) =
-            measurements(&quote, Some(&attestation.evidence), &doc, now).unwrap();
+            measurements(&quote, &attestation.evidence, &doc, now).unwrap();
         assert_eq!(class, "kata-qemu-tdx");
         init_data(attestation.init_data.as_ref(), revision, &doc).unwrap();
     }

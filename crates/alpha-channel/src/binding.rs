@@ -104,7 +104,7 @@ pub fn verify(
     let leaf = leaf(signed)?;
     cert::verify_leaf(&leaf, kms_ca, now)?;
     let instance = cert::parse_instance_sans(&cert::uri_sans(&leaf)?)?;
-    let (_, binding) = open(signed, name, now)?;
+    let binding = open(signed, name, now)?;
     if binding.spki_sha256 != sha256_label(&cert::spki_of(served)?) {
         return Err(Error::ForeignCertificate(
             "the name is served with a key the Instance did not sign for".into(),
@@ -113,14 +113,10 @@ pub fn verify(
     Ok((instance, binding))
 }
 
-/// The leaf's DER and the statement, refused unless the leaf's key signed it, it names `name` and
+/// The statement, refused unless the leaf's key signed it, it names `name` and
 /// it is current at `now`. Neither the leaf's issuer nor the served certificate is checked: a
 /// caller that trusts the key for another reason, a quote that binds it, checks what it needs.
-pub fn open(
-    signed: &SignedBinding,
-    name: &str,
-    now: SystemTime,
-) -> Result<(Vec<u8>, Binding), Error> {
+pub fn open(signed: &SignedBinding, name: &str, now: SystemTime) -> Result<Binding, Error> {
     let leaf = leaf(signed)?;
     let key = VerifyingKey::from_public_key_der(&cert::spki_of(&leaf)?)
         .map_err(|_| Error::ForeignCertificate("the binding leaf is not P-256".into()))?;
@@ -150,7 +146,7 @@ pub fn open(
     if chrono::DateTime::<chrono::Utc>::from(now) >= expires {
         return Err(Error::CertificateExpired);
     }
-    Ok((leaf, binding))
+    Ok(binding)
 }
 
 /// The DER of the binding's leaf, unchecked.
