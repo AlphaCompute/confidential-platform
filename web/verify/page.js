@@ -12,7 +12,7 @@ const ATTESTATION_PATH = "/.well-known/alphacompute/attestation";
 const CT_URL = "https://api.certspotter.com/v1/issuances";
 const CT_PAGES = 10;
 const FETCH_MS = 20000;
-const NAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
+const NAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59})$/;
 
 const LABELS = {
   platform_document: "Platform document",
@@ -29,18 +29,30 @@ function el(tag, className, text) {
   return node;
 }
 
+// Null when the browser keeps no storage for the page; then nothing refuses an older document.
 function storedVersion() {
   try {
     return Number(localStorage.getItem(VERSION_KEY)) || 0;
   } catch {
-    return 0;
+    return null;
   }
 }
 
 function storeVersion(version) {
   try {
     localStorage.setItem(VERSION_KEY, String(version));
-  } catch {}
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function asciiName(raw) {
+  try {
+    return new URL(`https://${raw.trim()}`).hostname;
+  } catch {
+    return "";
+  }
 }
 
 async function get(url) {
@@ -79,7 +91,7 @@ function images(initData) {
   }
 }
 
-function render(root, name, report, fetched) {
+function render(root, name, report, warnings) {
   const verdict = el("section", report.verified ? "verdict ok" : "verdict bad");
   verdict.append(
     el("h1", "", report.verified ? `${name} is verified` : `${name} is not verified`),
@@ -87,7 +99,7 @@ function render(root, name, report, fetched) {
       "p",
       "",
       report.verified
-        ? "It runs the Revision below in an Intel TDX confidential VM, and every certificate a browser accepts for the name is held inside it."
+        ? "Its key was attested in an Intel TDX confidential VM running the Revision below, and every certificate for the name in Certificate Transparency holds that key."
         : "At least one check below failed. Do not rely on this App's confidentiality.",
     ),
   );
@@ -111,7 +123,7 @@ function render(root, name, report, fetched) {
   }
 
   const notes = el("ul", "notes");
-  for (const [what, error] of fetched) notes.append(el("li", "", `Could not read ${what}: ${error}`));
+  for (const warning of warnings) notes.append(el("li", "", warning));
 
   const about = el("details", "about");
   about.append(
@@ -119,12 +131,13 @@ function render(root, name, report, fetched) {
     el(
       "p",
       "",
-      "This page is served by verify.alphacompute.cc, itself an attested App whose init-data pins the bundle built from the commit below, so anyone can rebuild and compare it. Once loaded, it talks to no other AlphaCompute server. It reads the App's evidence from the App itself, the platform document from GitHub, and certificates from Cert Spotter's Certificate Transparency index. It checks the quote against Intel's root, the measurements against the platform document signed by the release keys built into this page, and the binding with the key the quote attests. The KMS's certificate is not consulted.",
+      `This page was served by ${location.origin}. Trust it only as far as you trust that origin: compare the SHA-256 that the command below prints with the bundle_sha256 that the verify-page CI job prints for the commit below, or rebuild that commit with web/verify/build.sh. verify.alphacompute.cc serves this bundle from an attested App whose init-data pins it. Once loaded, it talks to no other AlphaCompute server. It reads the App's evidence from the App itself, the platform document from GitHub, and certificates from Cert Spotter's Certificate Transparency index. It checks the quote against Intel's root, the measurements against the platform document signed by the release keys built into this page, and the binding with the key the quote attests. The KMS's certificate is not consulted.`,
     ),
+    el("p", "mono", `curl -s ${location.origin}${location.pathname} | sha256sum`),
     el(
       "p",
       "",
-      "A page cannot see the certificate of its own connection. Another valid certificate for the name could let its holder serve the name from elsewhere, so every current certificate in Certificate Transparency must hold the key the TD signed for. Cert Spotter is trusted to list them all; browsers accept only logged certificates.",
+      "A page cannot see the certificate of its own connection. Another valid certificate for the name could let its holder serve the name from elsewhere, so every current certificate in Certificate Transparency must hold the key the TD signed for. Cert Spotter is trusted to list them all. Browsers require CT only for publicly trusted CAs: a certificate from a CA your device trusts locally, such as a corporate proxy's, or from a CA exempt from CT, is not logged, so this check cannot see a proxy that uses one.",
     ),
     el(
       "p",
@@ -139,11 +152,12 @@ function render(root, name, report, fetched) {
 
 async function main() {
   const root = document.getElementById("main");
-  const name = (new URLSearchParams(location.search).get("name") || "").trim().toLowerCase();
+  const name = asciiName(new URLSearchParams(location.search).get("name") || "");
   if (!NAME.test(name)) {
     return root.replaceChildren(el("p", "", "Open this page with ?name=<the App's public name>."));
   }
   root.replaceChildren(el("p", "muted", `Checking ${name}…`));
+  const floor = storedVersion();
 
   await wasm_bindgen({ module_or_path: fetch(WASM_URL, { integrity: WASM_SRI }) });
   const sources = [
@@ -154,13 +168,16 @@ async function main() {
   ];
   const settled = await Promise.allSettled(sources.map(([, promise]) => promise));
   const [binding, attestation, platform, ct] = settled.map((r) => r.value);
-  const fetched = settled.flatMap((r, i) => (r.status === "rejected" ? [[sources[i][0], r.reason?.message]] : []));
+  const warnings = settled.flatMap((r, i) => (r.status === "rejected" ? [`Could not read ${sources[i][0]}: ${r.reason?.message}`] : []));
 
   const report = JSON.parse(
-    wasm_bindgen.verifyPublicName(name, binding ?? "", attestation ?? "", platform ?? "", ct, storedVersion(), Date.now()),
+    wasm_bindgen.verifyPublicName(name, binding ?? "", attestation ?? "", platform ?? "", ct, floor ?? 0, Date.now()),
   );
-  if (report.platform_document_version) storeVersion(report.platform_document_version);
-  render(root, name, report, fetched);
+  const stored = floor !== null && (!report.platform_document_version || storeVersion(report.platform_document_version));
+  if (!stored) {
+    warnings.push("This browser keeps no storage for this page, so an older signed platform document would not be refused: rollback protection is off.");
+  }
+  render(root, name, report, warnings);
 }
 
 main().catch((e) => {
