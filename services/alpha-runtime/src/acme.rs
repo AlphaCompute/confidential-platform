@@ -257,8 +257,7 @@ async fn cache_key(runtime: &Runtime) -> Result<Zeroizing<[u8; 32]>, String> {
     Ok(Zeroizing::new(key))
 }
 
-/// The wait until renewal of the cached certificate it installed; None when there is no file or
-/// the certificate is both due for renewal and expired.
+/// The wait until renewal of the cached certificate it installed; None when there is no file.
 async fn restore(
     edge: &Edge,
     runtime: &Runtime,
@@ -273,16 +272,12 @@ async fn restore(
     let key = cache_key(runtime).await?;
     let (renew_at, pkcs8, chain_pem) =
         open(&key, name, &blob).ok_or("the cached certificate does not open")?;
-    let now = SystemTime::now();
-    let due = renew_at.duration_since(now).ok();
-    let not_after = install(edge, &pkcs8, &chain_pem)?;
-    // Before its renewal time even an expired certificate stays, so a skewed clock keeps its
-    // backoff across restarts; after it, a valid one is served while the new order runs.
-    if due.is_none() && not_after <= now {
-        *edge.served.write() = None;
-        return Ok(None);
-    }
-    Ok(Some(due.unwrap_or_default().max(ROUTABLE_AFTER)))
+    install(edge, &pkcs8, &chain_pem)?;
+    // Past its renewal time the cached certificate is still served while the new order runs.
+    let due = renew_at
+        .duration_since(SystemTime::now())
+        .unwrap_or_default();
+    Ok(Some(due.max(ROUTABLE_AFTER)))
 }
 
 async fn store(
