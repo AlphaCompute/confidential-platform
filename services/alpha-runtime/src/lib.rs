@@ -312,8 +312,7 @@ impl KmsRevisions {
 
 /// The three environment variables and, when a service declared a Secret,
 /// `ALPHACOMPUTE_SECRETS`; for a wrapped compose or a Kata pod with an Endpoint,
-/// `ALPHACOMPUTE_TLS_UPSTREAM` and optionally its caller pin, readiness path or public name,
-/// and the file `ALPHACOMPUTE_ACME_CACHE` that keeps the public certificate across restarts.
+/// `ALPHACOMPUTE_TLS_UPSTREAM` and optionally its caller pin, readiness path or public name.
 #[derive(Clone, Debug)]
 pub struct Config {
     pub kms_ca_spki_sha256: [u8; 32],
@@ -324,7 +323,6 @@ pub struct Config {
     pub tls_callers: Vec<AppId>,
     pub tls_ready: Option<String>,
     pub public: Option<String>,
-    pub acme_cache: Option<PathBuf>,
 }
 
 impl Config {
@@ -355,11 +353,7 @@ impl Config {
             config.tls_upstream.as_deref(),
             &config.tls_callers,
         )?;
-        Ok(Self {
-            public,
-            acme_cache: optional("ALPHACOMPUTE_ACME_CACHE").map(PathBuf::from),
-            ..config
-        })
+        Ok(Self { public, ..config })
     }
 
     pub fn parse(
@@ -397,7 +391,6 @@ impl Config {
             tls_callers,
             tls_ready,
             public: None,
-            acme_cache: None,
         })
     }
 }
