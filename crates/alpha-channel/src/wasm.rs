@@ -10,7 +10,8 @@ use serde_json::json;
 use wasm_bindgen::prelude::*;
 
 use crate::{
-    Error, compose, frame, handshake, member, platform, receipt, rfc3339, secret, sha256_label,
+    Error, compose, frame, handshake, member, platform, public, receipt, rfc3339, secret,
+    sha256_label,
 };
 
 fn js(e: Error) -> JsError {
@@ -42,6 +43,40 @@ pub fn verify_platform(signed_json: &str, now_ms: f64) -> Result<String, JsError
     let signed: platform::SignedDocument = parse("platform document", signed_json)?;
     let keys = platform::release_keys().map_err(js)?;
     to_json(&platform::verify(&signed, &keys, at(now_ms)?).map_err(js)?)
+}
+
+/// The [`public::Report`] for `name` over the [`public::Fetched`] texts; a failed check is in the
+/// report, only a broken build or a challenge that is not 32 bytes is an error.
+#[wasm_bindgen(js_name = verifyPublicName)]
+#[allow(clippy::too_many_arguments)]
+pub fn verify_public_name(
+    name: &str,
+    challenge: &[u8],
+    binding_json: &str,
+    attestation_json: &str,
+    platform_json: &str,
+    issuances_json: Option<String>,
+    min_version: u32,
+    now_ms: f64,
+) -> Result<String, JsError> {
+    let keys = platform::release_keys().map_err(js)?;
+    let challenge = challenge
+        .try_into()
+        .map_err(|_| JsError::new("the challenge is not 32 bytes"))?;
+    let fetched = public::Fetched {
+        challenge,
+        binding: binding_json,
+        attestation: attestation_json,
+        platform: platform_json,
+        issuances: issuances_json.as_deref(),
+    };
+    to_json(&public::verify(
+        name,
+        &fetched,
+        &keys,
+        min_version.into(),
+        at(now_ms)?,
+    ))
 }
 
 /// The response the KMS signed, which callers use instead of the reply's top-level fields.

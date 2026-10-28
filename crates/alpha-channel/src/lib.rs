@@ -30,6 +30,7 @@ pub mod frame;
 pub mod handshake;
 pub mod member;
 pub mod platform;
+pub mod public;
 pub mod receipt;
 pub mod secret;
 #[cfg(target_arch = "wasm32")]

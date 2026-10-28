@@ -734,6 +734,7 @@ fn check_policy(
 }
 
 /// The one I/O in the crate: DCAP collateral for `quote` from a PCCS.
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn fetch_collateral(pccs_url: &str, quote: &[u8]) -> Result<Collateral, AppraisalError> {
     dcap_qvl::collateral::CollateralClient::with_default_http(pccs_url)
         .map_err(|e| AppraisalError::Failed(format!("pccs client: {e:#}")))?

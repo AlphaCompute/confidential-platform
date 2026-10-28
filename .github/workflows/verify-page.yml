@@ -1,0 +1,36 @@
+name: verify-page
+
+# Builds the dev stand's verify page twice, the second time from an empty target directory, fails
+# unless both are byte-identical, and writes wasm_sha256 and bundle_sha256 to the job summary, so
+# anyone can rebuild the commit and compare with what verify.alphacompute.cc serves.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FEATURES: dev
+  PLATFORM_DOCUMENT_URL: https://raw.githubusercontent.com/AlphaCompute/platform-documents/dev/platform.json
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo install wasm-bindgen-cli --version 0.2.128 --locked
+      - shell: bash
+        run: web/verify/build.sh dist | tee -a "$GITHUB_STEP_SUMMARY"
+      - run: CARGO_TARGET_DIR="$RUNNER_TEMP/empty-target" web/verify/build.sh "$RUNNER_TEMP/dist2"
+      - run: diff -r dist "$RUNNER_TEMP/dist2"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: verify-bundle
+          path: dist/
