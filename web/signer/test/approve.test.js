@@ -80,6 +80,8 @@ test("an uploaded compose is approved only after the registration receipt verifi
     `Digest: sha256:${"7d".repeat(32)}`,
     "Endpoint: HTTPS on 443, forwarded to web:80",
     "Machine: tdx.medium (chosen by the service, not part of what you sign)",
+    `App: ${WRAP_APP}`,
+    `Revision: ${api.compose_hash}`,
   ]) {
     assert.ok(text.includes(line), `${line}\n${text}`);
   }
@@ -90,8 +92,7 @@ test("an uploaded compose is approved only after the registration receipt verifi
   const technical = details.lines().join("\n");
   assert.ok(technical.includes("Technical details"));
   assert.ok(technical.includes(compose));
-  assert.ok(technical.includes(WRAP_APP));
-  assert.ok(technical.includes(api.compose_hash));
+  assert.ok(!technical.includes(api.compose_hash), "the Revision shows outside the details");
   assert.ok(!text.includes(APPROVED));
 
   await page.click("Approve with passkey");
@@ -675,6 +676,8 @@ test("a re-approval keeps current values unless replaced", async () => {
   assert.equal(choice.value, "keep");
   assert.ok(kept.page.text().includes("Keep the current value"));
   assert.equal(keepChoice(kept.page, "session_key"), undefined);
+  assert.equal(field(kept.page, "db_password").hidden, true);
+  assert.ok(!field(kept.page, "session_key").hidden);
 
   await kept.page.click("Approve with passkey");
   assert.ok(kept.page.text().includes("Enter a value for every secret."));
@@ -690,7 +693,10 @@ test("a re-approval keeps current values unless replaced", async () => {
   );
 
   const replaced = await secretPage({ current });
-  keepChoice(replaced.page, "db_password").value = "replace";
+  const replace = keepChoice(replaced.page, "db_password");
+  replace.value = "replace";
+  for (const listener of replace.listeners.change) listener();
+  assert.equal(field(replaced.page, "db_password").hidden, false);
   fill(replaced.page, { session_key: SECRET_VALUES.session_key });
   await replaced.page.click("Approve with passkey");
   assert.ok(replaced.page.text().includes("Enter a value for every secret."));
