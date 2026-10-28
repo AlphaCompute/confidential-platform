@@ -805,6 +805,7 @@ function describeLaunch(a) {
   const nodes = [];
   if (launch.heading) nodes.push(el("p", launch.heading));
   for (const line of launch.notes || []) nodes.push(el("p", line, "warning"));
+  nodes.push(fact("App", read.app_id), fact("Revision", read.compose_hash, "digest"));
   nodes.push(el("h2", "What will run"));
   const runtime = launch.services["alpha-runtime"];
   for (const [name, service] of Object.entries(launch.services)) {
@@ -827,12 +828,7 @@ function describeLaunch(a) {
   }
   nodes.push(fact("Machine", launch.machine));
   const details = el("details");
-  details.append(
-    el("summary", "Technical details"),
-    fact("App", read.app_id),
-    fact("compose_hash", read.compose_hash, "digest"),
-    el("pre", launch.compose),
-  );
+  details.append(el("summary", "Technical details"), el("pre", launch.compose));
   nodes.push(details);
   return nodes;
 }
@@ -909,6 +905,10 @@ function secretFields(services, before, put) {
       replaced.value = "replace";
       keep.append(kept, replaced);
       keep.value = "keep";
+      input.hidden = true;
+      keep.addEventListener("change", () => {
+        input.hidden = keep.value === "keep";
+      });
       node.append(keep);
     }
     node.append(input);
