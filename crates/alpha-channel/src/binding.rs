@@ -20,6 +20,8 @@ pub const PATH: &str = "/.well-known/alphacompute/binding";
 const FORMAT: &str = "alphacompute-edge-binding/1";
 /// Keeps a binding's signature apart from every other one the Instance key makes.
 const CONTEXT: &[u8] = b"alphacompute/edge-binding/v1\n";
+/// The same for the answer to a verifier's challenge.
+const ANSWER_CONTEXT: &[u8] = b"alphacompute/edge-answer/v1\n";
 
 /// The Instance serves `name` with the key whose SubjectPublicKeyInfo hashes to `spki_sha256`
 /// until `not_after`.
@@ -39,6 +41,12 @@ pub struct SignedBinding {
     pub statement: String,
     pub signature: String,
     pub chain_pem: String,
+    /// The base64url DER ECDSA signature by the same key over
+    /// `SHA-256(ANSWER_CONTEXT || challenge || statement)`, present when the request carried a
+    /// challenge. The key never leaves the TD, so it proves that the TD answered after the
+    /// verifier chose the challenge, which a replayed binding or quote cannot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
 }
 
 fn digest(statement: &str) -> [u8; 32] {
@@ -47,6 +55,53 @@ fn digest(statement: &str) -> [u8; 32] {
         .chain_update(statement)
         .finalize()
         .into()
+}
+
+fn answer_digest(challenge: &[u8; 32], statement: &str) -> [u8; 32] {
+    Sha256::new()
+        .chain_update(ANSWER_CONTEXT)
+        .chain_update(challenge)
+        .chain_update(statement)
+        .finalize()
+        .into()
+}
+
+fn encode(signature: &Signature) -> String {
+    BASE64_URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes())
+}
+
+fn decode(signature: &str) -> Result<Signature, Error> {
+    BASE64_URL_SAFE_NO_PAD
+        .decode(signature)
+        .ok()
+        .and_then(|der| Signature::from_der(&der).ok())
+        .ok_or_else(|| Error::Malformed("binding signature is not base64url DER".into()))
+}
+
+impl SignedBinding {
+    /// Answers `challenge` with `key`, the key that signed the binding.
+    pub fn answer(&mut self, key: &SigningKey, challenge: &[u8; 32]) -> Result<(), Error> {
+        let signature: Signature = key
+            .sign_prehash(&answer_digest(challenge, &self.statement))
+            .map_err(|e| Error::SignatureInvalid(format!("binding answer: {e}")))?;
+        self.answer = Some(encode(&signature));
+        Ok(())
+    }
+
+    /// Refused unless the key whose SubjectPublicKeyInfo is `spki` answered `challenge` on this
+    /// binding's statement.
+    pub fn check_answer(&self, spki: &[u8], challenge: &[u8; 32]) -> Result<(), Error> {
+        let key = VerifyingKey::from_public_key_der(spki)
+            .map_err(|_| Error::ForeignCertificate("the binding key is not P-256".into()))?;
+        let answer = self
+            .answer
+            .as_deref()
+            .ok_or_else(|| Error::SignatureInvalid("the binding answers no challenge".into()))?;
+        key.verify_prehash(&answer_digest(challenge, &self.statement), &decode(answer)?)
+            .map_err(|_| {
+                Error::SignatureInvalid("the binding key did not answer this challenge".into())
+            })
+    }
 }
 
 /// Signs that `key`'s Instance, whose leaf and CA are `chain_pem`, serves `name` with `served`.
@@ -68,8 +123,9 @@ pub fn sign(
         .map_err(|e| Error::SignatureInvalid(format!("binding: {e}")))?;
     Ok(SignedBinding {
         statement,
-        signature: BASE64_URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes()),
+        signature: encode(&signature),
         chain_pem,
+        answer: None,
     })
 }
 
@@ -89,12 +145,7 @@ pub fn verify(
     let instance = cert::parse_instance_sans(&cert::uri_sans(&leaf.contents)?)?;
     let key = VerifyingKey::from_public_key_der(&cert::spki_of(&leaf.contents)?)
         .map_err(|_| Error::ForeignCertificate("the binding leaf is not P-256".into()))?;
-    let signature = BASE64_URL_SAFE_NO_PAD
-        .decode(&signed.signature)
-        .ok()
-        .and_then(|der| Signature::from_der(&der).ok())
-        .ok_or_else(|| Error::Malformed("binding signature is not base64url DER".into()))?;
-    key.verify_prehash(&digest(&signed.statement), &signature)
+    key.verify_prehash(&digest(&signed.statement), &decode(&signed.signature)?)
         .map_err(|_| Error::SignatureInvalid("the binding is not signed by its leaf".into()))?;
     let binding: Binding = serde_json::from_str(&signed.statement)
         .map_err(|e| Error::Malformed(format!("binding statement: {e}")))?;
@@ -127,7 +178,7 @@ pub fn verify(
 mod tests {
     use std::time::Duration;
 
-    use p256::pkcs8::EncodePrivateKey;
+    use p256::pkcs8::{EncodePrivateKey, EncodePublicKey};
 
     use super::*;
 
@@ -223,5 +274,42 @@ mod tests {
                 .code(),
             "certificate_expired"
         );
+    }
+
+    #[test]
+    fn only_the_binding_key_answers_and_only_for_its_challenge_and_statement() {
+        let id = instance();
+        let served = public_cert();
+        let spki = id
+            .key
+            .verifying_key()
+            .to_public_key_der()
+            .unwrap()
+            .into_vec();
+        let mut signed = sign(&id.key, id.chain_pem.clone(), NAME, &served).unwrap();
+        assert!(signed.check_answer(&spki, &[1; 32]).is_err());
+        signed.answer(&id.key, &[1; 32]).unwrap();
+        signed.check_answer(&spki, &[1; 32]).unwrap();
+        assert!(signed.check_answer(&spki, &[2; 32]).is_err());
+
+        let other = SigningKey::from_bytes(&[8u8; 32].into()).unwrap();
+        let other_spki = other
+            .verifying_key()
+            .to_public_key_der()
+            .unwrap()
+            .into_vec();
+        assert!(signed.check_answer(&other_spki, &[1; 32]).is_err());
+        let replayed = SignedBinding {
+            statement: sign(
+                &id.key,
+                id.chain_pem.clone(),
+                "other.alphacompute.cc",
+                &served,
+            )
+            .unwrap()
+            .statement,
+            ..signed
+        };
+        assert!(replayed.check_answer(&spki, &[1; 32]).is_err());
     }
 }

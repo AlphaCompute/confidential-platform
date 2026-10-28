@@ -15,6 +15,8 @@ use alpha_core::AppId;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
+use base64::Engine;
+use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use p256::ecdsa::SigningKey;
 use p256::pkcs8::DecodePrivateKey;
 use rustls::pki_types::CertificateDer;
@@ -40,8 +42,25 @@ const DRAIN: Duration = Duration::from_secs(10);
 const READY_CHECK: Duration = Duration::from_secs(2);
 /// Answered with the JSON the browser verifier appraises the TD from.
 const ATTESTATION_PATH: &str = "/.well-known/alphacompute/attestation";
-/// The paths the runtime answers itself on a fresh connection to the public name.
-const ANSWERED: [&str; 2] = [binding::PATH, ATTESTATION_PATH];
+/// A verifier's challenge on the binding path: `?challenge=` and 32 bytes in base64url, which the
+/// binding key signs back, so the answer cannot be a replay.
+const CHALLENGE: &str = "?challenge=";
+const CHALLENGE_LEN: usize = 43;
+
+/// What a fresh connection to the public name asks the runtime itself for.
+#[derive(Debug, PartialEq, Eq)]
+enum Asked {
+    Binding(Option<[u8; 32]>),
+    Attestation,
+}
+
+/// Where the bytes read so far stand against the requests in [`Asked`].
+#[derive(Debug, PartialEq, Eq)]
+enum Head {
+    Partial,
+    Asked(Asked),
+    Other,
+}
 
 struct CurrentLeaf(Arc<Runtime>);
 
@@ -292,15 +311,17 @@ async fn proxy(
             let Ok(Ok(asks)) = timeout(HANDSHAKE, read_head(&mut tls, &mut head)).await else {
                 return;
             };
-            if let Some(path) = asks {
-                let body = if path == binding::PATH {
-                    binding_body(&runtime, name, &served)
-                } else {
-                    runtime.attested().and_then(|a| a.attestation.clone())
+            let answered = asks.is_some();
+            if let Some(asked) = asks {
+                let body = match asked {
+                    Asked::Binding(challenge) => {
+                        binding_body(&runtime, name, &served, challenge.as_ref())
+                    }
+                    Asked::Attestation => runtime.attested().and_then(|a| a.attestation.clone()),
                 };
                 let _ = tls.write_all(&reply(body)).await;
             }
-            asks.is_some()
+            answered
         }
         Handshake::Instance => !admitted(tls.get_ref().1.peer_certificates(), &callers),
     };
@@ -331,36 +352,83 @@ async fn proxy(
     let _ = tokio::io::copy_bidirectional(&mut tls, &mut backend).await;
 }
 
-/// Reads until the bytes can no longer open `GET <path> ` for a path in [`ANSWERED`]; returns the
-/// path they open. A request for one later on a kept-alive connection reaches the upstream, so a
-/// verifier asks on a fresh connection.
+fn parse_head(head: &[u8]) -> Head {
+    let binding = format!("GET {} ", binding::PATH);
+    let attestation = format!("GET {ATTESTATION_PATH} ");
+    let challenged = format!("GET {}{CHALLENGE}", binding::PATH);
+    if head.starts_with(binding.as_bytes()) {
+        return Head::Asked(Asked::Binding(None));
+    }
+    if head.starts_with(attestation.as_bytes()) {
+        return Head::Asked(Asked::Attestation);
+    }
+    if let Some(rest) = head.strip_prefix(challenged.as_bytes()) {
+        let Some((token, tail)) = rest.split_at_checked(rest.len().min(CHALLENGE_LEN)) else {
+            return Head::Other;
+        };
+        if !token
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_')
+        {
+            return Head::Other;
+        }
+        // A tail exists only after all CHALLENGE_LEN characters.
+        return match tail.first() {
+            None => Head::Partial,
+            Some(b' ') => BASE64_URL_SAFE_NO_PAD
+                .decode(token)
+                .ok()
+                .and_then(|c| c.try_into().ok())
+                .map_or(Head::Other, |c| Head::Asked(Asked::Binding(Some(c)))),
+            Some(_) => Head::Other,
+        };
+    }
+    if [binding, attestation, challenged]
+        .iter()
+        .any(|r| r.as_bytes().starts_with(head))
+    {
+        Head::Partial
+    } else {
+        Head::Other
+    }
+}
+
+/// Reads until the bytes open a request in [`Asked`] or can no longer open one. A request later on
+/// a kept-alive connection reaches the upstream, so a verifier asks on a fresh connection.
 async fn read_head(
     tls: &mut (impl AsyncRead + Unpin),
     head: &mut Vec<u8>,
-) -> std::io::Result<Option<&'static str>> {
-    let request = |path: &str| format!("GET {path} ");
+) -> std::io::Result<Option<Asked>> {
     let mut buf = [0u8; 64];
-    while ANSWERED.iter().any(|path| {
-        let r = request(path);
-        head.len() < r.len() && r.as_bytes().starts_with(head)
-    }) {
+    loop {
+        match parse_head(head) {
+            Head::Asked(asked) => return Ok(Some(asked)),
+            Head::Other => return Ok(None),
+            Head::Partial => {}
+        }
         let n = tls.read(&mut buf).await?;
         let Some(read) = buf.get(..n).filter(|r| !r.is_empty()) else {
-            break;
+            return Ok(None);
         };
         head.extend_from_slice(read);
     }
-    Ok(ANSWERED
-        .into_iter()
-        .find(|path| head.starts_with(request(path).as_bytes())))
 }
 
-/// The binding of the certificate this connection was served, signed with the runtime key.
-fn binding_body(runtime: &Runtime, name: &str, served: &CertifiedKey) -> Option<Vec<u8>> {
+/// The binding of the certificate this connection was served, signed with the runtime key, and
+/// the answer to `challenge` when there is one.
+fn binding_body(
+    runtime: &Runtime,
+    name: &str,
+    served: &CertifiedKey,
+    challenge: Option<&[u8; 32]>,
+) -> Option<Vec<u8>> {
     let attested = runtime.attested()?;
     let key = SigningKey::from_pkcs8_der(runtime.tls_private_key()).ok()?;
     let served = served.end_entity_cert().ok()?;
-    let signed = binding::sign(&key, chain_pem(&attested), name, served).ok()?;
+    let mut signed = binding::sign(&key, chain_pem(&attested), name, served).ok()?;
+    if let Some(challenge) = challenge {
+        signed.answer(&key, challenge).ok()?;
+    }
     serde_json::to_vec(&signed).ok()
 }
 
@@ -487,17 +555,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_the_two_runtime_paths_are_answered_and_other_bytes_reach_the_upstream() {
-        for path in ANSWERED {
+    async fn only_the_runtime_requests_are_answered_and_other_bytes_reach_the_upstream() {
+        let challenge = [7u8; 32];
+        let token = BASE64_URL_SAFE_NO_PAD.encode(challenge);
+        for (target, asked) in [
+            (binding::PATH.to_owned(), Asked::Binding(None)),
+            (
+                format!("{}?challenge={token}", binding::PATH),
+                Asked::Binding(Some(challenge)),
+            ),
+            (ATTESTATION_PATH.to_owned(), Asked::Attestation),
+        ] {
             let mut head = Vec::new();
-            let asks = format!("GET {path} HTTP/1.1\r\nHost: a.example\r\n\r\n");
+            let asks = format!("GET {target} HTTP/1.1\r\nHost: a.example\r\n\r\n");
             let answered = read_head(&mut asks.as_bytes(), &mut head).await.unwrap();
-            assert_eq!(answered, Some(path));
+            assert_eq!(answered, Some(asked));
         }
+        let short = format!(
+            "GET {}?challenge={} HTTP/1.1\r\n\r\n",
+            binding::PATH,
+            &token[1..]
+        );
+        let long = format!("GET {}?challenge={token}A HTTP/1.1\r\n\r\n", binding::PATH);
+        let foreign = format!(
+            "GET {}?challenge={} HTTP/1.1\r\n\r\n",
+            binding::PATH,
+            "+".repeat(43)
+        );
         for request in [
             &b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n"[..],
             b"GET /.well-known/alphacompute/bindings HTTP/1.1\r\n\r\n",
             b"POST /.well-known/alphacompute/binding HTTP/1.1\r\n\r\n",
+            b"GET /.well-known/alphacompute/binding?other=1 HTTP/1.1\r\n\r\n",
+            short.as_bytes(),
+            long.as_bytes(),
+            foreign.as_bytes(),
             b"GET /.well",
         ] {
             let mut head = Vec::new();
