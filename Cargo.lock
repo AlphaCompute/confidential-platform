@@ -362,6 +362,7 @@ dependencies = [
 name = "alpha-runtime"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "alpha-attest",
  "alpha-channel",
  "alpha-client",

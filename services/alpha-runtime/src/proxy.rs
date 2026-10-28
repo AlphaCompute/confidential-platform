@@ -209,11 +209,13 @@ impl Endpoint {
                 alpha_client::error!("probe_listener_failed", error = e.kind());
             }
         });
-        let issuer = self
-            .configs
-            .public
-            .as_ref()
-            .map(|(name, edge)| tokio::spawn(acme::issue_forever(edge.clone(), name.clone())));
+        let issuer = self.configs.public.as_ref().map(|(name, edge)| {
+            tokio::spawn(acme::issue_forever(
+                edge.clone(),
+                name.clone(),
+                self.runtime.clone(),
+            ))
+        });
         let mut open = JoinSet::new();
         let how = loop {
             while open.try_join_next().is_some() {}

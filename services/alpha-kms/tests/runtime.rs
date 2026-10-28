@@ -95,6 +95,7 @@ fn config(h: &Harness, endpoints: Vec<String>) -> Config {
         tls_callers: Vec::new(),
         tls_ready: None,
         public: None,
+        acme_cache: None,
     }
 }
 
