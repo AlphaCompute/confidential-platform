@@ -169,8 +169,9 @@ struct Process {
 }
 
 /// One service per container of the agent policy, under its pod spec name. The image is the one
-/// the pinned rules make the agent pull, and the environment every variable they pin, image
-/// defaults included. The policy says nothing of ports and names no volume, so both stay empty.
+/// the pinned rules make the agent pull, and the environment every variable they pin to one
+/// value, image defaults included. The policy says nothing of ports and names no volume, so both
+/// stay empty.
 fn pod_services(init_data: &str) -> Result<BTreeMap<String, Service>, Error> {
     let containers = InitData::parse(init_data.to_owned())
         .and_then(|i| i.containers())
@@ -195,6 +196,9 @@ fn pod_services(init_data: &str) -> Result<BTreeMap<String, Service>, Error> {
         let image = annotation("io.kubernetes.cri.image-name")
             .ok_or_else(|| malformed(&format!("{name} has no image")))?;
         let mut environment = BTreeMap::new();
+        let mut twice = Vec::new();
+        // A pod that sets a variable its image also sets lists both, and the agent policy admits
+        // either value, so neither is shown. The Secrets the page puts must be one list.
         for var in oci.process.env {
             let (key, value) = var
                 .split_once('=')
@@ -203,8 +207,14 @@ fn pod_services(init_data: &str) -> Result<BTreeMap<String, Service>, Error> {
                 .insert(key.to_owned(), value.to_owned())
                 .is_some()
             {
-                return Err(malformed(&format!("{name} sets {key} twice")));
+                if name == RUNTIME && key == SECRETS {
+                    return Err(malformed(&format!("{name} sets {key} twice")));
+                }
+                twice.push(key.to_owned());
             }
+        }
+        for key in twice {
+            environment.remove(&key);
         }
         let service = Service {
             image: Some(image),
@@ -456,6 +466,13 @@ mod tests {
         .unwrap();
         assert_eq!(s["app"].secrets, ["db_password"]);
         assert_eq!(s["app"].environment["MODE"], "a=b");
+
+        let s = services(&init_data(serde_json::json!([container(
+            "db",
+            &["PGDATA=/data", "MODE=a", "PGDATA=/data/pg"]
+        )])))
+        .unwrap();
+        assert_eq!(s["db"].environment.keys().collect::<Vec<_>>(), ["MODE"]);
     }
 
     #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
@@ -493,7 +510,13 @@ mod tests {
             .remove("io.kubernetes.cri.container-type");
         for containers in [
             serde_json::json!([container("app", &["MODE"])]),
-            serde_json::json!([container("app", &["A=1", "A=2"])]),
+            serde_json::json!([container(
+                RUNTIME,
+                &[
+                    r#"ALPHACOMPUTE_SECRETS={}"#,
+                    r#"ALPHACOMPUTE_SECRETS={"alpha-runtime":["k"]}"#
+                ]
+            )]),
             serde_json::json!([container("app", &[]), container("app", &[])]),
             serde_json::json!([typeless]),
             serde_json::json!({}),
