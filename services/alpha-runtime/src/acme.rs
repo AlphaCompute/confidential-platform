@@ -1,31 +1,50 @@
 //! A browser-trusted certificate for the Endpoint's public name, from an ACME CA through
-//! TLS-ALPN-01 on the Endpoint's own port, the one port the public path forwards. The key is
-//! made here and leaves the TD only sealed under the App's own key;
-//! [`alpha_channel::binding`] ties it to the Instance leaf.
+//! TLS-ALPN-01 on the Endpoint's own port, the one port the public path forwards.
+//!
+//! The certificate key and the ACME account key are derived from the App's `edge-tls` key, which
+//! only Instances of the App receive. So every restart, renewal and Revision of the App holds the
+//! same key, and every current certificate for the name in Certificate Transparency holds it too.
+//! At start the runtime looks up the newest such certificate through Cert Spotter and fetches its
+//! chain from the CA, so a restart orders nothing. [`alpha_channel::binding`] ties the key to the
+//! Instance leaf.
 
-use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use aes_gcm::aead::{Aead, KeyInit, Payload};
-use aes_gcm::{Aes256Gcm, Nonce};
+use std::time::{Duration, SystemTime};
 
 use alpha_client::log::Field;
 use alpha_client::tls;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+use hkdf::Hkdf;
 use instant_acme::{
-    Account, AuthorizationStatus, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
+    Account, AuthorizationStatus, ChallengeType, Identifier, Key, NewOrder, OrderStatus,
     RetryPolicy,
 };
+use p256::elliptic_curve::array::Array;
+use p256::elliptic_curve::consts::U48;
+use p256::elliptic_curve::ops::Reduce;
+use p256::pkcs8::EncodePrivateKey;
+use p256::{NonZeroScalar, Scalar, SecretKey};
 use parking_lot::RwLock;
+use rcgen::PublicKeyData;
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, DnsName};
+use rustls::pki_types::{CertificateDer, DnsName, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
-use zeroize::Zeroizing;
+use sha2::{Digest, Sha256};
+use x509_parser::prelude::{FromDer, X509Certificate};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{Error, Runtime};
 
 pub const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
 const LETS_ENCRYPT: &str = "https://acme-v02.api.letsencrypt.org/directory";
+/// Boulder serves an issued certificate's chain to anyone at its serial, the chain an order
+/// returns.
+const LETS_ENCRYPT_CERT: &str = "https://acme-v02.api.letsencrypt.org/acme/cert/";
+/// Lists the unexpired certificates for a name, oldest discovered first.
+const CT_SEARCH: &str = "https://api.certspotter.com/v1/issuances";
+const CT_PAGES: usize = 4;
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(60);
 /// Let's Encrypt allows five failed validations per name and hour.
 const RETRY_AFTER: Duration = Duration::from_secs(15 * 60);
 /// The CA validates over the public path, which reaches a new pod only once its Service lists it.
@@ -34,10 +53,13 @@ const ROUTABLE_AFTER: Duration = Duration::from_secs(30);
 /// too. Let's Encrypt refills one duplicate per name every 34 hours, so wait two days and never
 /// order faster than the refill.
 const EXPIRED_BACKOFF: Duration = Duration::from_secs(48 * 60 * 60);
-/// The App's derived key that seals the cached certificate; only an Instance of the App gets it.
-const CACHE_KEY_PURPOSE: &str = "edge-tls";
-const CACHE_KEY_WAIT: Duration = Duration::from_secs(120);
-const CACHE_KEY_RETRY: Duration = Duration::from_secs(5);
+const KEY_PURPOSE: &str = "edge-tls";
+const KEY_RETRY: Duration = Duration::from_secs(5);
+// ponytail: one key per name and one account per App for as long as the label stays. A leaked
+// key or a key rotation means a new label version, and the certificates of the old key stay in
+// CT until they expire.
+const CERT_KEY_LABEL: &[u8] = b"alphacompute-runtime/public-name-key/v1/";
+const ACCOUNT_KEY_LABEL: &[u8] = b"alphacompute-runtime/acme-account-key/v1";
 const POLL: RetryPolicy = RetryPolicy::new()
     .initial_delay(Duration::from_secs(1))
     .timeout(Duration::from_secs(120));
@@ -110,53 +132,46 @@ pub fn route<'a>(
 
 // ponytail: one copy per App with a public name. Each copy keeps its own challenge and orders
 // on its own, so the CA's validation routed to another copy fails; the upgrade is one copy that
-// orders and the others that read its sealed certificate from shared storage.
-// ponytail: the certificate survives a restart only in the file `ALPHACOMPUTE_ACME_CACHE` names;
-// without that file, or with a lost one, every start orders anew and a restart loop runs into
-// Let's Encrypt's five certificates per name and week. The upgrade is the same sealed blob
-// stored as a Secret at the KMS.
+// orders and the others that find its certificate in CT.
 pub async fn issue_forever(edge: Arc<Edge>, name: String, runtime: Arc<Runtime>) {
-    let cache = runtime.config().acme_cache.clone();
-    let restored = match &cache {
-        Some(path) => restore(&edge, &runtime, path, &name)
-            .await
-            .inspect_err(|e| alpha_client::warn!("acme_cache_unread", error = Field::text(e)))
-            .ok()
-            .flatten(),
-        None => None,
+    let app_key = edge_tls_key(&runtime).await;
+    let keys = derive_p256(&app_key, &[CERT_KEY_LABEL, name.as_bytes()].concat())
+        .and_then(|cert| Ok((cert, derive_p256(&app_key, ACCOUNT_KEY_LABEL)?)));
+    let (cert_key, account_key) = match keys {
+        Ok(keys) => keys,
+        Err(e) => {
+            alpha_client::error!("public_certificate_key_failed", error = Field::text(&e));
+            return;
+        }
     };
-    tokio::time::sleep(restored.unwrap_or(ROUTABLE_AFTER)).await;
+    let reused = match tokio::time::timeout(LOOKUP_TIMEOUT, reuse(&edge, &name, &cert_key))
+        .await
+        .unwrap_or_else(|_| Err("timed out".into()))
+    {
+        Ok(reused) => reused,
+        Err(e) => {
+            alpha_client::warn!("public_certificate_lookup_failed", error = Field::text(&e));
+            None
+        }
+    };
+    tokio::time::sleep(reused.unwrap_or(ROUTABLE_AFTER)).await;
     let account = loop {
-        match account().await {
+        match account(&account_key).await {
             Ok(account) => break account,
             Err(e) => {
-                alpha_client::warn!("acme_account_failed", error = Field::text(&e.to_string()));
+                alpha_client::warn!("acme_account_failed", error = Field::text(&e));
                 tokio::time::sleep(RETRY_AFTER).await;
             }
         }
     };
     loop {
-        let wait = match issue(&edge, &name, &account).await {
-            Ok((not_after, pkcs8, chain_pem)) => {
+        let wait = match issue(&edge, &name, &account, &cert_key).await {
+            Ok(not_after) => {
                 alpha_client::info!("public_certificate_issued", not_after = not_after);
-                let now = SystemTime::now();
-                let wait = renewal_delay(not_after, now);
-                if let Some(path) = &cache
-                    && let Err(e) =
-                        store(&runtime, path, &name, now, wait, &pkcs8, &chain_pem).await
-                {
-                    alpha_client::warn!(
-                        "acme_cache_unwritten",
-                        error = Field::text(&e.to_string())
-                    );
-                }
-                wait
+                renewal_delay(not_after, SystemTime::now())
             }
             Err(e) => {
-                alpha_client::warn!(
-                    "public_certificate_failed",
-                    error = Field::text(&e.to_string())
-                );
+                alpha_client::warn!("public_certificate_failed", error = Field::text(&e));
                 RETRY_AFTER
             }
         };
@@ -176,29 +191,64 @@ fn renewal_delay(not_after: SystemTime, now: SystemTime) -> Duration {
     }
 }
 
-async fn account() -> Result<Account, String> {
+/// At start the runtime may not have its first leaf yet; nothing can be served or ordered
+/// without the key.
+async fn edge_tls_key(runtime: &Runtime) -> Zeroizing<Vec<u8>> {
+    loop {
+        let decoded = runtime
+            .key(KEY_PURPOSE)
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|k| alpha_client::decode("key", &k.key).map_err(|e| e.to_string()));
+        match decoded {
+            Ok(key) => return Zeroizing::new(key),
+            Err(e) => alpha_client::warn!("edge_tls_key_failed", error = Field::text(&e)),
+        }
+        tokio::time::sleep(KEY_RETRY).await;
+    }
+}
+
+/// The PKCS#8 of the P-256 key HKDF-SHA256 of `app_key` gives for `info`: 48 bytes reduced
+/// modulo the group order, which leaves a bias of about 2^-128 (RFC 9380 §5).
+fn derive_p256(app_key: &[u8], info: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
+    let mut wide = Array::<u8, U48>::default();
+    Hkdf::<Sha256>::new(None, app_key)
+        .expand(info, &mut wide)
+        .map_err(|e| format!("hkdf: {e}"))?;
+    let scalar = <Scalar as Reduce<Array<u8, U48>>>::reduce(&wide);
+    wide.zeroize();
+    let scalar = Option::<NonZeroScalar>::from(NonZeroScalar::new(scalar))
+        .ok_or("the derived scalar is zero")?;
+    let pkcs8 = SecretKey::from(scalar)
+        .to_pkcs8_der()
+        .map_err(|e| format!("pkcs8: {e}"))?;
+    Ok(Zeroizing::new(pkcs8.as_bytes().to_vec()))
+}
+
+fn spki_sha256(pkcs8: &[u8]) -> Result<[u8; 32], String> {
+    let key = rcgen::KeyPair::try_from(pkcs8).map_err(|e| e.to_string())?;
+    Ok(Sha256::digest(key.subject_public_key_info()).into())
+}
+
+/// The same key gives the same Let's Encrypt account on every start.
+async fn account(pkcs8: &[u8]) -> Result<Account, String> {
+    let der = PrivatePkcs8KeyDer::from(pkcs8.to_vec());
+    let key = Key::from_pkcs8_der(der.clone_key()).map_err(|e| e.to_string())?;
     let (account, _) = Account::builder()
         .map_err(|e| e.to_string())?
-        .create(
-            &NewAccount {
-                contact: &[],
-                terms_of_service_agreed: true,
-                only_return_existing: false,
-            },
-            LETS_ENCRYPT.to_owned(),
-            None,
-        )
+        .create_from_key((key, PrivateKeyDer::Pkcs8(der)), LETS_ENCRYPT.to_owned())
         .await
         .map_err(|e| e.to_string())?;
     Ok(account)
 }
 
-/// The certificate's `not_after`, its PKCS#8 key and its chain as the CA sent it.
+/// The issued certificate's `not_after`.
 async fn issue(
     edge: &Edge,
     name: &str,
     account: &Account,
-) -> Result<(SystemTime, Zeroizing<Vec<u8>>, String), String> {
+    pkcs8: &[u8],
+) -> Result<SystemTime, String> {
     let acme = |e: instant_acme::Error| e.to_string();
     let identifiers = [Identifier::Dns(name.to_owned())];
     let mut order = account
@@ -223,165 +273,128 @@ async fn issue(
     if status.map_err(acme)? != OrderStatus::Ready {
         return Err("the order did not become ready".into());
     }
-    let key = rcgen::KeyPair::generate().map_err(|e| e.to_string())?;
+    let key = rcgen::KeyPair::try_from(pkcs8).map_err(|e| e.to_string())?;
     let mut params = rcgen::CertificateParams::new([name.to_owned()]).map_err(|e| e.to_string())?;
     params.distinguished_name = rcgen::DistinguishedName::new();
     let csr = params.serialize_request(&key).map_err(|e| e.to_string())?;
     order.finalize_csr(csr.der()).await.map_err(acme)?;
     let chain_pem = order.poll_certificate(&POLL).await.map_err(acme)?;
-    let pkcs8 = Zeroizing::new(key.serialize_der());
-    let not_after = install(edge, &pkcs8, &chain_pem)?;
-    Ok((not_after, pkcs8, chain_pem))
+    install(edge, pkcs8, &chain_pem)
 }
 
+/// Serves `chain_pem` with the key if its leaf holds that key; returns the leaf's `not_after`.
 fn install(edge: &Edge, pkcs8: &[u8], chain_pem: &str) -> Result<SystemTime, String> {
     let chain = CertificateDer::pem_slice_iter(chain_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("certificate chain: {e}"))?;
     let leaf = chain.first().ok_or("the chain has no certificate")?;
+    if alpha_channel::cert::spki_sha256(leaf) != Some(spki_sha256(pkcs8)?) {
+        return Err("the chain's leaf does not hold the derived key".into());
+    }
     let not_after = alpha_channel::cert::not_after(leaf).map_err(|e| e.to_string())?;
     let certified = tls::certified(chain, pkcs8).map_err(|e| e.to_string())?;
     *edge.served.write() = Some(certified);
     Ok(not_after)
 }
 
-/// At start the runtime may not have its first leaf yet, so the key is retried for a while before
-/// the cached certificate is given up and a new one ordered.
-async fn cache_key(runtime: &Runtime) -> Result<Zeroizing<[u8; 32]>, String> {
-    let derive = async {
-        loop {
-            match runtime.key(CACHE_KEY_PURPOSE).await {
-                Ok(derived) => break derived,
-                Err(e) => {
-                    alpha_client::warn!(
-                        "acme_cache_key_failed",
-                        error = Field::text(&e.to_string())
-                    );
-                    tokio::time::sleep(CACHE_KEY_RETRY).await;
-                }
-            }
-        }
+/// Serves the newest certificate for the name in CT that holds the key, and returns the wait
+/// until its renewal; None when there is none. Both connections end in the TD, and a chain
+/// for another key fails the key check; an old chain that passes it is a certificate of this
+/// App. Cert Spotter or the CA can only withhold or break the certificate, and a new order
+/// replaces it.
+async fn reuse(edge: &Edge, name: &str, pkcs8: &[u8]) -> Result<Option<Duration>, String> {
+    let http = alpha_client::http().build().map_err(|e| e.to_string())?;
+    let spki = spki_sha256(pkcs8)?;
+    let now = SystemTime::now();
+    let mut newest = None;
+    let mut after = String::new();
+    for _ in 0..CT_PAGES {
+        let url = format!("{CT_SEARCH}?domain={name}&expand=cert_der&after={after}");
+        let page: Vec<serde_json::Value> = serde_json::from_slice(&get(&http, &url).await?)
+            .map_err(|e| format!("cert spotter: {e}"))?;
+        let Some(last) = page.last() else { break };
+        last.get("id")
+            .and_then(|id| id.as_str())
+            .filter(|id| id.bytes().all(|b| b.is_ascii_digit()))
+            .ok_or("cert spotter: an issuance without a numeric id")?
+            .clone_into(&mut after);
+        newest = newest
+            .into_iter()
+            .chain(newest_holding(&page, &spki, now))
+            .max_by_key(|issued| issued.not_after);
+    }
+    let Some(found) = newest else {
+        return Ok(None);
     };
-    let derived = tokio::time::timeout(CACHE_KEY_WAIT, derive)
-        .await
-        .map_err(|_| "no edge-tls key within the start-up wait".to_string())?;
-    let bytes =
-        Zeroizing::new(alpha_client::decode("key", &derived.key).map_err(|e| e.to_string())?);
-    let key: [u8; 32] = bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| "the edge-tls key is not 32 bytes")?;
-    Ok(Zeroizing::new(key))
-}
-
-/// The wait until renewal of the cached certificate it installed; None when there is no file.
-async fn restore(
-    edge: &Edge,
-    runtime: &Runtime,
-    path: &Path,
-    name: &str,
-) -> Result<Option<Duration>, String> {
-    let blob = match std::fs::read(path) {
-        Ok(blob) => blob,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(format!("{}: {e}", path.display())),
-    };
-    let key = cache_key(runtime).await?;
-    let (renew_at, pkcs8, chain_pem) =
-        open(&key, name, &blob).ok_or("the cached certificate does not open")?;
-    install(edge, &pkcs8, &chain_pem)?;
-    alpha_client::info!("public_certificate_restored");
-    // Past its renewal time the cached certificate is still served while the new order runs.
-    let due = renew_at
-        .duration_since(SystemTime::now())
-        .unwrap_or_default();
-    Ok(Some(due.max(ROUTABLE_AFTER)))
-}
-
-async fn store(
-    runtime: &Runtime,
-    path: &Path,
-    name: &str,
-    now: SystemTime,
-    wait: Duration,
-    pkcs8: &[u8],
-    chain_pem: &str,
-) -> Result<(), String> {
-    let renew_at = now
-        .checked_add(wait)
+    let chain = get(&http, &format!("{LETS_ENCRYPT_CERT}{}", found.serial)).await?;
+    let chain = String::from_utf8(chain).map_err(|_| "the chain is not PEM")?;
+    install(edge, pkcs8, &chain)?;
+    alpha_client::info!("public_certificate_reused", not_after = found.not_after);
+    // Past its renewal time the certificate is still served while the new order runs.
+    let renew_at = found
+        .not_before
+        .checked_add(renewal_delay(found.not_after, found.not_before))
         .ok_or("the renewal time is out of range")?;
-    let key = cache_key(runtime).await?;
-    let blob = seal(&key, name, renew_at, pkcs8, chain_pem)?;
-    let (Some(dir), Some(file)) = (path.parent(), path.file_name().and_then(|f| f.to_str())) else {
-        return Err(format!("{} names no file", path.display()));
-    };
-    crate::write_secret(dir, file, &blob).map_err(|e| format!("{}: {e}", path.display()))
-}
-
-/// `nonce(12) ‖ AES-256-GCM(renew_at(8, seconds, big-endian) ‖ len(2) ‖ pkcs8 ‖ chain PEM)`,
-/// with the public name as associated data. The file sits on host storage: the host can neither
-/// read the key nor write a certificate of its own, and a file of another name does not open.
-fn seal(
-    key: &[u8; 32],
-    name: &str,
-    renew_at: SystemTime,
-    pkcs8: &[u8],
-    chain_pem: &str,
-) -> Result<Vec<u8>, String> {
-    let renew_at = renew_at
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| e.to_string())?
-        .as_secs();
-    let len = u16::try_from(pkcs8.len()).map_err(|_| "the key is too long")?;
-    let plaintext = Zeroizing::new(
-        [
-            &renew_at.to_be_bytes()[..],
-            &len.to_be_bytes(),
-            pkcs8,
-            chain_pem.as_bytes(),
-        ]
-        .concat(),
-    );
-    let mut nonce = [0u8; 12];
-    getrandom::fill(&mut nonce).map_err(|e| format!("rng: {e}"))?;
-    let ct = Aes256Gcm::new(key.into())
-        .encrypt(
-            &Nonce::from(nonce),
-            Payload {
-                msg: &plaintext,
-                aad: name.as_bytes(),
-            },
-        )
-        .map_err(|_| "aead: encryption failed")?;
-    Ok([nonce.as_slice(), &ct].concat())
-}
-
-fn open(
-    key: &[u8; 32],
-    name: &str,
-    blob: &[u8],
-) -> Option<(SystemTime, Zeroizing<Vec<u8>>, String)> {
-    let (nonce, ct) = blob.split_first_chunk::<12>()?;
-    let plaintext = Zeroizing::new(
-        Aes256Gcm::new(key.into())
-            .decrypt(
-                &Nonce::from(*nonce),
-                Payload {
-                    msg: ct,
-                    aad: name.as_bytes(),
-                },
-            )
-            .ok()?,
-    );
-    let (renew_at, rest) = plaintext.split_first_chunk::<8>()?;
-    let (len, rest) = rest.split_first_chunk::<2>()?;
-    let (pkcs8, chain_pem) = rest.split_at_checked(usize::from(u16::from_be_bytes(*len)))?;
-    let renew_at = UNIX_EPOCH.checked_add(Duration::from_secs(u64::from_be_bytes(*renew_at)))?;
-    Some((
-        renew_at,
-        Zeroizing::new(pkcs8.to_vec()),
-        std::str::from_utf8(chain_pem).ok()?.to_owned(),
+    Ok(Some(
+        renew_at
+            .duration_since(now)
+            .unwrap_or_default()
+            .max(ROUTABLE_AFTER),
     ))
+}
+
+async fn get(http: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
+    let response = http
+        .get(url)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| e.to_string())?;
+    alpha_client::read_capped(response, 1 << 20).await
+}
+
+#[derive(Debug)]
+struct Issued {
+    serial: String,
+    not_before: SystemTime,
+    not_after: SystemTime,
+}
+
+/// Of Cert Spotter's issuances, the unrevoked one valid at `now` whose key is `spki`, with the
+/// latest `not_after`. A precertificate has the serial, key and validity of its certificate, so
+/// either one gives the chain's URL.
+fn newest_holding(page: &[serde_json::Value], spki: &[u8; 32], now: SystemTime) -> Option<Issued> {
+    page.iter()
+        .filter(|issuance| issuance.get("revoked") != Some(&serde_json::Value::Bool(true)))
+        .filter_map(|issuance| {
+            let der = STANDARD.decode(issuance.get("cert_der")?.as_str()?).ok()?;
+            let (_, cert) = X509Certificate::from_der(&der).ok()?;
+            if <[u8; 32]>::from(Sha256::digest(cert.public_key().raw)) != *spki {
+                return None;
+            }
+            let at = |t: x509_parser::time::ASN1Time| {
+                SystemTime::UNIX_EPOCH
+                    .checked_add(Duration::from_secs(u64::try_from(t.timestamp()).ok()?))
+            };
+            let validity = cert.validity();
+            let issued = Issued {
+                serial: serial_hex(cert.raw_serial()),
+                not_before: at(validity.not_before)?,
+                not_after: at(validity.not_after)?,
+            };
+            (issued.not_before <= now && now < issued.not_after).then_some(issued)
+        })
+        .max_by_key(|issued| issued.not_after)
+}
+
+/// Boulder's spelling in a certificate URL: lowercase hex, at least 36 digits, no sign byte.
+fn serial_hex(raw: &[u8]) -> String {
+    let hex: String = raw
+        .iter()
+        .skip_while(|b| **b == 0)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("{hex:0>36}")
 }
 
 /// The self-signed certificate RFC 8737 asks for: the name, and the SHA-256 of the key
@@ -455,20 +468,48 @@ mod tests {
     }
 
     #[test]
-    fn a_cached_certificate_opens_only_under_its_key_and_name_and_unaltered() {
-        let key = [7u8; 32];
-        let renew_at = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
-        let blob = seal(&key, NAME, renew_at, b"pkcs8", "chain").unwrap();
-        let (at, pkcs8, chain) = open(&key, NAME, &blob).unwrap();
-        assert_eq!(
-            (at, pkcs8.as_slice(), chain.as_str()),
-            (renew_at, &b"pkcs8"[..], "chain")
+    fn the_derived_key_depends_only_on_the_app_key_and_the_label() {
+        let label = |name: &str| [CERT_KEY_LABEL, name.as_bytes()].concat();
+        let a = derive_p256(&[7; 32], &label(NAME)).unwrap();
+        assert_eq!(*a, *derive_p256(&[7; 32], &label(NAME)).unwrap());
+        assert_ne!(*a, *derive_p256(&[8; 32], &label(NAME)).unwrap());
+        assert_ne!(
+            *a,
+            *derive_p256(&[7; 32], &label("other.alphacompute.cc")).unwrap()
         );
-        assert!(open(&[8u8; 32], NAME, &blob).is_none());
-        assert!(open(&key, "other.alphacompute.cc", &blob).is_none());
-        let mut tampered = blob.clone();
-        *tampered.last_mut().unwrap() ^= 1;
-        assert!(open(&key, NAME, &tampered).is_none());
+        assert_ne!(*a, *derive_p256(&[7; 32], ACCOUNT_KEY_LABEL).unwrap());
+        tls::certified(vec![CertificateDer::from(vec![0])], &a).unwrap();
+        Key::from_pkcs8_der(PrivatePkcs8KeyDer::from(a.to_vec())).unwrap();
+    }
+
+    #[test]
+    fn the_lookup_takes_the_newest_valid_certificate_holding_the_key() {
+        let ours = rcgen::KeyPair::generate().unwrap();
+        let other = rcgen::KeyPair::generate().unwrap();
+        let day = |d: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + d * 86_400);
+        let issuance = |key: &rcgen::KeyPair, serial: u8, from: u64, to: u64, revoked: bool| {
+            let mut params = rcgen::CertificateParams::new([NAME.to_owned()]).unwrap();
+            params.serial_number = Some(rcgen::SerialNumber::from(vec![serial]));
+            params.not_before = day(from).into();
+            params.not_after = day(to).into();
+            let der = params.self_signed(key).unwrap().der().to_vec();
+            serde_json::json!({"revoked": revoked, "cert_der": STANDARD.encode(der)})
+        };
+        let page = [
+            issuance(&ours, 1, 10, 100, false),
+            issuance(&ours, 2, 0, 20, false),
+            issuance(&other, 3, 30, 120, false),
+            issuance(&ours, 4, 20, 110, false),
+            issuance(&ours, 5, 25, 115, true),
+            issuance(&ours, 6, 50, 140, false),
+        ];
+        let spki: [u8; 32] = Sha256::digest(ours.subject_public_key_info()).into();
+        let found = newest_holding(&page, &spki, day(40)).unwrap();
+        assert_eq!(
+            (found.serial.as_str(), found.not_after),
+            ("000000000000000000000000000000000004", day(110))
+        );
+        assert!(newest_holding(&page[1..3], &spki, day(40)).is_none());
     }
 
     #[test]
