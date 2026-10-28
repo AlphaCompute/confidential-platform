@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use alpha_attest::{AttestationResult, Collateral, InstanceEvidence};
+use alpha_attest::{AttestationResult, Collateral, InstanceEvidence, KataEvidence};
 use alpha_client::log::Field;
 use alpha_client::platform::ReleaseKeys;
 use alpha_client::tls::{self, InstanceSans};
@@ -535,11 +535,10 @@ pub struct Attested {
     pub result: AttestationResult,
     /// The leaf and the runtime key as the TLS listener serves them.
     pub certified: Arc<CertifiedKey>,
-    /// What the leaf's key was attested with, and Intel's collateral for the quote on an Endpoint
-    /// with a public name, so a browser can appraise the TD itself.
-    pub evidence: InstanceEvidence,
+    /// On a Kata Endpoint with a public name, the evidence the leaf's key was attested with and
+    /// Intel's collateral for its quote, so a browser can appraise the TD itself.
+    pub evidence: Option<(KataEvidence, Collateral)>,
     pub nonce: [u8; 32],
-    pub collateral: Option<Collateral>,
     client: Client,
     secrets: Mutex<HashMap<String, Secret>>,
     keys: Mutex<HashMap<String, DerivedKey>>,
@@ -674,11 +673,13 @@ impl Runtime {
                 evidence: evidence.clone(),
             })
             .await?;
-        let collateral = match self.config.public {
-            Some(_) => collateral(evidence.quote()).await,
-            None => None,
+        let evidence = match (&self.config.public, evidence) {
+            (Some(_), InstanceEvidence::Kata(kata)) => {
+                collateral(&kata.quote).await.map(|c| (kata, c))
+            }
+            _ => None,
         };
-        self.accept(reply, pin, evidence, nonce, collateral)
+        self.accept(reply, pin, evidence, nonce)
     }
 
     /// A failed fetch, or a document not above the accepted one, keeps the accepted list.
@@ -730,9 +731,8 @@ impl Runtime {
         &self,
         reply: AttestReply,
         pin: Pin,
-        evidence: InstanceEvidence,
+        evidence: Option<(KataEvidence, Collateral)>,
         nonce: [u8; 32],
-        collateral: Option<Collateral>,
     ) -> Result<Arc<Attested>, Error> {
         let chain: Vec<Vec<u8>> = reply
             .certificate_chain
@@ -784,7 +784,6 @@ impl Runtime {
             certified,
             evidence,
             nonce,
-            collateral,
             client,
             secrets: Mutex::new(HashMap::new()),
             keys: Mutex::new(HashMap::new()),

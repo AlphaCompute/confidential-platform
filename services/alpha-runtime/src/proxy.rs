@@ -9,7 +9,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alpha_attest::InstanceEvidence;
 use alpha_channel::binding;
 use alpha_client::tls;
 use alpha_core::AppId;
@@ -41,7 +40,7 @@ const CONNECT: Duration = Duration::from_secs(10);
 const DRAIN: Duration = Duration::from_secs(10);
 /// The whole readiness exchange with the upstream, connect included.
 const READY_CHECK: Duration = Duration::from_secs(2);
-/// The wire of `alpha_channel::binding::Attestation`, which the browser verifier reads.
+/// Answered with the JSON the browser verifier appraises the TD from.
 const ATTESTATION_PATH: &str = "/.well-known/alphacompute/attestation";
 /// The paths the runtime answers itself on a fresh connection to the public name.
 const ANSWERED: [&str; 2] = [binding::PATH, ATTESTATION_PATH];
@@ -373,14 +372,12 @@ fn binding_body(runtime: &Runtime, name: &str, served: &CertifiedKey) -> Option<
 /// `MRCONFIGID` names and Intel's collateral: a Kata TD's only, once the collateral is in.
 fn attestation_body(runtime: &Runtime) -> Option<Vec<u8>> {
     let attested = runtime.attested()?;
-    let InstanceEvidence::Kata(evidence) = &attested.evidence else {
-        return None;
-    };
+    let (evidence, collateral) = attested.evidence.as_ref()?;
     serde_json::to_vec(&serde_json::json!({
         "evidence": evidence,
         "nonce": BASE64_URL_SAFE_NO_PAD.encode(attested.nonce),
         "init_data": runtime.init_data()?,
-        "collateral": attested.collateral.as_ref()?,
+        "collateral": collateral,
     }))
     .ok()
 }
