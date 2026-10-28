@@ -15,8 +15,6 @@ use alpha_core::AppId;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
-use base64::Engine;
-use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use p256::ecdsa::SigningKey;
 use p256::pkcs8::DecodePrivateKey;
 use rustls::pki_types::CertificateDer;
@@ -298,7 +296,7 @@ async fn proxy(
                 let body = if path == binding::PATH {
                     binding_body(&runtime, name, &served)
                 } else {
-                    attestation_body(&runtime)
+                    runtime.attested().and_then(|a| a.attestation.clone())
                 };
                 let _ = tls.write_all(&reply(body)).await;
             }
@@ -366,20 +364,6 @@ fn binding_body(runtime: &Runtime, name: &str, served: &CertifiedKey) -> Option<
     let served = served.end_entity_cert().ok()?;
     let signed = binding::sign(&key, chain_pem(&attested), name, served).ok()?;
     serde_json::to_vec(&signed).ok()
-}
-
-/// The evidence the current leaf's key was attested with, its nonce, the init-data its
-/// `MRCONFIGID` names and Intel's collateral: a Kata TD's only, once the collateral is in.
-fn attestation_body(runtime: &Runtime) -> Option<Vec<u8>> {
-    let attested = runtime.attested()?;
-    let (evidence, collateral) = attested.evidence.as_ref()?;
-    serde_json::to_vec(&serde_json::json!({
-        "evidence": evidence,
-        "nonce": BASE64_URL_SAFE_NO_PAD.encode(attested.nonce),
-        "init_data": runtime.init_data()?,
-        "collateral": collateral,
-    }))
-    .ok()
 }
 
 /// A whole HTTP response that closes the connection; any origin may read it, since every byte of

@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use alpha_attest::{AttestationResult, Collateral, InstanceEvidence, KataEvidence};
+use alpha_attest::{AttestationResult, Collateral, InstanceEvidence};
 use alpha_client::log::Field;
 use alpha_client::platform::ReleaseKeys;
 use alpha_client::tls::{self, InstanceSans};
@@ -535,10 +535,10 @@ pub struct Attested {
     pub result: AttestationResult,
     /// The leaf and the runtime key as the TLS listener serves them.
     pub certified: Arc<CertifiedKey>,
-    /// On a Kata Endpoint with a public name, the evidence the leaf's key was attested with and
-    /// Intel's collateral for its quote, so a browser can appraise the TD itself.
-    pub evidence: Option<(KataEvidence, Collateral)>,
-    pub nonce: [u8; 32],
+    /// On a Kata Endpoint with a public name, the JSON a browser appraises the TD from: the
+    /// evidence the leaf's key was attested with, the nonce beside that key in `report_data`, the
+    /// init-data `MRCONFIGID` names and Intel's collateral for the quote.
+    pub attestation: Option<Vec<u8>>,
     client: Client,
     secrets: Mutex<HashMap<String, Secret>>,
     keys: Mutex<HashMap<String, DerivedKey>>,
@@ -606,14 +606,6 @@ impl Runtime {
         &self.pkcs8
     }
 
-    /// The Kata init-data read at start, the text of the leaf's Revision.
-    pub fn init_data(&self) -> Option<&str> {
-        match &self.revision {
-            Some(RevisionText::InitData(text)) => Some(text),
-            _ => None,
-        }
-    }
-
     pub fn is_revoked(&self) -> bool {
         *self.revoked.borrow()
     }
@@ -673,13 +665,21 @@ impl Runtime {
                 evidence: evidence.clone(),
             })
             .await?;
-        let evidence = match (&self.config.public, evidence) {
-            (Some(_), InstanceEvidence::Kata(kata)) => {
-                collateral(&kata.quote).await.map(|c| (kata, c))
+        let attestation = match (&self.config.public, evidence, &self.revision) {
+            (Some(_), InstanceEvidence::Kata(kata), Some(RevisionText::InitData(init_data))) => {
+                collateral(&kata.quote).await.and_then(|collateral| {
+                    serde_json::to_vec(&serde_json::json!({
+                        "evidence": kata,
+                        "nonce": BASE64_URL_SAFE_NO_PAD.encode(nonce),
+                        "init_data": init_data,
+                        "collateral": collateral,
+                    }))
+                    .ok()
+                })
             }
             _ => None,
         };
-        self.accept(reply, pin, evidence, nonce)
+        self.accept(reply, pin, attestation)
     }
 
     /// A failed fetch, or a document not above the accepted one, keeps the accepted list.
@@ -731,8 +731,7 @@ impl Runtime {
         &self,
         reply: AttestReply,
         pin: Pin,
-        evidence: Option<(KataEvidence, Collateral)>,
-        nonce: [u8; 32],
+        attestation: Option<Vec<u8>>,
     ) -> Result<Arc<Attested>, Error> {
         let chain: Vec<Vec<u8>> = reply
             .certificate_chain
@@ -782,8 +781,7 @@ impl Runtime {
             not_after,
             result: reply.attestation_result,
             certified,
-            evidence,
-            nonce,
+            attestation,
             client,
             secrets: Mutex::new(HashMap::new()),
             keys: Mutex::new(HashMap::new()),
