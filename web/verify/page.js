@@ -65,7 +65,7 @@ async function issuances(name) {
 }
 
 function fact(list, term, value) {
-  if (value === undefined || value === null || value === "") return;
+  if (value == null || value === "") return;
   list.append(el("dt", "", term), el("dd", "mono", String(value)));
 }
 
@@ -161,7 +161,7 @@ async function main() {
   const report = JSON.parse(
     wasm_bindgen.verifyPublicName(name, ...[0, 1, 2].map((i) => value(i) || ""), value(3), storedVersion(), Date.now()),
   );
-  if (report.checks[0].ok) storeVersion(report.platform_document_version);
+  if (report.platform_document_version) storeVersion(report.platform_document_version);
   render(root, name, report, fetched);
 }
 

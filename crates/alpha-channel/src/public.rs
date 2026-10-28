@@ -253,24 +253,20 @@ fn transparency(
         serde_json::from_str(issuances_json.ok_or("Certificate Transparency could not be read")?)
             .map_err(|e| format!("Certificate Transparency: {e}"))?;
     let now = chrono::DateTime::<chrono::Utc>::from(now);
-    let mut valid = 0usize;
-    let mut foreign = Vec::new();
+    let mut current = Vec::new();
     for issuance in &issuances {
-        let current = chrono::DateTime::parse_from_rfc3339(&issuance.not_after)
-            .map_err(|e| format!("Certificate Transparency not_after: {e}"))?
-            > now;
-        if !current {
-            continue;
-        }
-        valid = valid.saturating_add(1);
-        if binding.spki_sha256 != format!("sha256:{}", issuance.pubkey_sha256) {
-            foreign.push(format!(
-                "{} ({})",
-                issuance.id,
-                issuance.dns_names.join(", ")
-            ));
+        let not_after = chrono::DateTime::parse_from_rfc3339(&issuance.not_after)
+            .map_err(|e| format!("Certificate Transparency not_after: {e}"))?;
+        if not_after > now {
+            current.push(issuance);
         }
     }
+    let valid = current.len();
+    let foreign: Vec<String> = current
+        .iter()
+        .filter(|i| binding.spki_sha256 != format!("sha256:{}", i.pubkey_sha256))
+        .map(|i| format!("{} ({})", i.id, i.dns_names.join(", ")))
+        .collect();
     if valid == 0 {
         return Err(format!(
             "Certificate Transparency lists no current certificate for {name}"
