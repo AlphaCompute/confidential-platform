@@ -45,7 +45,7 @@ pub struct SignedBinding {
 /// with, whose `report_data` binds that key and `nonce` as [`alpha_attest::report_data`] lays
 /// out, the init-data `MRCONFIGID` names, and Intel's collateral for the quote. Intel signs the
 /// collateral, so it comes through the App unharmed or not at all.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Attestation {
     pub evidence: alpha_attest::KataEvidence,
