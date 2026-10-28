@@ -18,6 +18,7 @@ require-release-keys = []
 
 [dependencies]
 aes-gcm = "0.11"
+alpha-attest = { path = "../alpha-attest" }
 alpha-core = { path = "../alpha-core" }
 alpha-crypto = { path = "../alpha-crypto" }
 base64 = "0.23"

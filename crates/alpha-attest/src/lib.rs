@@ -670,7 +670,9 @@ fn evidence_sha256(evidence: &impl Serialize) -> Result<String, AppraisalError> 
     Ok(sha256_text(&jcs))
 }
 
-fn kata_reference<'a>(
+/// The one runtime class whose reference values a verified Kata quote matches, after the TD
+/// fields every class shares.
+pub fn kata_reference<'a>(
     quote: &VerifiedQuote,
     references: &'a [KataReference],
 ) -> Result<&'a KataReference, AppraisalError> {
@@ -734,6 +736,7 @@ fn check_policy(
 }
 
 /// The one I/O in the crate: DCAP collateral for `quote` from a PCCS.
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn fetch_collateral(pccs_url: &str, quote: &[u8]) -> Result<Collateral, AppraisalError> {
     dcap_qvl::collateral::CollateralClient::with_default_http(pccs_url)
         .map_err(|e| AppraisalError::Failed(format!("pccs client: {e:#}")))?

@@ -67,6 +67,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "dcap-qvl",
+ "getrandom 0.2.17",
  "hex",
  "p384 0.14.0",
  "rcgen",
@@ -115,6 +116,7 @@ name = "alpha-channel"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
+ "alpha-attest",
  "alpha-channel",
  "alpha-core",
  "alpha-crypto",

@@ -39,6 +39,23 @@ pub struct SignedBinding {
     pub statement: String,
     pub signature: String,
     pub chain_pem: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation: Option<Attestation>,
+}
+
+/// What lets a verifier appraise the TD without the KMS: the evidence the leaf's key was attested
+/// with, whose `report_data` binds that key and `nonce` as [`alpha_attest::report_data`] lays
+/// out, the init-data `MRCONFIGID` names, and Intel's collateral for the quote. Intel signs the
+/// collateral, so it comes through the App unharmed or not at all.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Attestation {
+    pub evidence: alpha_attest::InstanceEvidence,
+    /// base64url, 32 bytes.
+    pub nonce: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init_data: Option<String>,
+    pub collateral: alpha_attest::Collateral,
 }
 
 fn digest(statement: &str) -> [u8; 32] {
@@ -70,6 +87,7 @@ pub fn sign(
         statement,
         signature: BASE64_URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes()),
         chain_pem,
+        attestation: None,
     })
 }
 
@@ -83,11 +101,28 @@ pub fn verify(
     kms_ca: &[u8],
     now: SystemTime,
 ) -> Result<(InstanceSans, Binding), Error> {
-    let (_, leaf) = x509_parser::pem::parse_x509_pem(signed.chain_pem.as_bytes())
-        .map_err(|e| Error::Malformed(format!("binding chain: {e}")))?;
-    cert::verify_leaf(&leaf.contents, kms_ca, now)?;
-    let instance = cert::parse_instance_sans(&cert::uri_sans(&leaf.contents)?)?;
-    let key = VerifyingKey::from_public_key_der(&cert::spki_of(&leaf.contents)?)
+    let leaf = leaf(signed)?;
+    cert::verify_leaf(&leaf, kms_ca, now)?;
+    let instance = cert::parse_instance_sans(&cert::uri_sans(&leaf)?)?;
+    let (_, binding) = open(signed, name, now)?;
+    if binding.spki_sha256 != sha256_label(&cert::spki_of(served)?) {
+        return Err(Error::ForeignCertificate(
+            "the name is served with a key the Instance did not sign for".into(),
+        ));
+    }
+    Ok((instance, binding))
+}
+
+/// The leaf's DER and the statement, refused unless the leaf's key signed it, it names `name` and
+/// it is current at `now`. Neither the leaf's issuer nor the served certificate is checked: a
+/// caller that trusts the key for another reason, a quote that binds it, checks what it needs.
+pub fn open(
+    signed: &SignedBinding,
+    name: &str,
+    now: SystemTime,
+) -> Result<(Vec<u8>, Binding), Error> {
+    let leaf = leaf(signed)?;
+    let key = VerifyingKey::from_public_key_der(&cert::spki_of(&leaf)?)
         .map_err(|_| Error::ForeignCertificate("the binding leaf is not P-256".into()))?;
     let signature = BASE64_URL_SAFE_NO_PAD
         .decode(&signed.signature)
@@ -110,17 +145,19 @@ pub fn verify(
             binding.name
         )));
     }
-    if binding.spki_sha256 != sha256_label(&cert::spki_of(served)?) {
-        return Err(Error::ForeignCertificate(
-            "the name is served with a key the Instance did not sign for".into(),
-        ));
-    }
     let expires = chrono::DateTime::parse_from_rfc3339(&binding.not_after)
         .map_err(|e| Error::Malformed(format!("binding not_after: {e}")))?;
     if chrono::DateTime::<chrono::Utc>::from(now) >= expires {
         return Err(Error::CertificateExpired);
     }
-    Ok((instance, binding))
+    Ok((leaf, binding))
+}
+
+/// The DER of the binding's leaf, unchecked.
+pub fn leaf(signed: &SignedBinding) -> Result<Vec<u8>, Error> {
+    let (_, leaf) = x509_parser::pem::parse_x509_pem(signed.chain_pem.as_bytes())
+        .map_err(|e| Error::Malformed(format!("binding chain: {e}")))?;
+    Ok(leaf.contents)
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

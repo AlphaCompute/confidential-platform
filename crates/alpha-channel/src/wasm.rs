@@ -10,7 +10,8 @@ use serde_json::json;
 use wasm_bindgen::prelude::*;
 
 use crate::{
-    Error, compose, frame, handshake, member, platform, receipt, rfc3339, secret, sha256_label,
+    Error, compose, frame, handshake, member, platform, public, receipt, rfc3339, secret,
+    sha256_label,
 };
 
 fn js(e: Error) -> JsError {
@@ -42,6 +43,31 @@ pub fn verify_platform(signed_json: &str, now_ms: f64) -> Result<String, JsError
     let signed: platform::SignedDocument = parse("platform document", signed_json)?;
     let keys = platform::release_keys().map_err(js)?;
     to_json(&platform::verify(&signed, &keys, at(now_ms)?).map_err(js)?)
+}
+
+/// The [`public::Report`] for `name`: `binding_json` is its answer on the binding path,
+/// `platform_json` the signed platform document, `issuances_json` Cert Spotter's issuances for the
+/// name, or undefined when they could not be read, and `min_version` the newest document version
+/// seen before. A failed check is in the report; only a broken build is an error.
+#[wasm_bindgen(js_name = verifyPublicName)]
+pub fn verify_public_name(
+    name: &str,
+    binding_json: &str,
+    platform_json: &str,
+    issuances_json: Option<String>,
+    min_version: u32,
+    now_ms: f64,
+) -> Result<String, JsError> {
+    let keys = platform::release_keys().map_err(js)?;
+    to_json(&public::verify(
+        name,
+        binding_json,
+        platform_json,
+        issuances_json.as_deref(),
+        &keys,
+        min_version.into(),
+        at(now_ms)?,
+    ))
 }
 
 /// The response the KMS signed, which callers use instead of the reply's top-level fields.

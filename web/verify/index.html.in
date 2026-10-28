@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; connect-src 'self' https:; base-uri 'none'; form-action 'none'; require-trusted-types-for 'script'; trusted-types 'none'">
+<meta name="referrer" content="no-referrer">
+<title>AlphaCompute verify</title>
+<link rel="stylesheet" href="@STYLE_NAME@" integrity="@STYLE_SRI@">
+<script defer src="@GLUE_NAME@" integrity="@GLUE_SRI@"></script>
+<script defer src="@PAGE_NAME@" integrity="@PAGE_SRI@"></script>
+</head>
+<body>
+<main id="main"><p class="muted">Loading…</p></main>
+</body>
+</html>
