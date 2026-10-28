@@ -11,6 +11,7 @@ const BINDING_PATH = "/.well-known/alphacompute/binding";
 const ATTESTATION_PATH = "/.well-known/alphacompute/attestation";
 const CT_URL = "https://api.certspotter.com/v1/issuances";
 const CT_PAGES = 10;
+const FETCH_MS = 20000;
 const NAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
 
 const LABELS = {
@@ -43,7 +44,7 @@ function storeVersion(version) {
 }
 
 async function get(url) {
-  const reply = await fetch(url, { cache: "no-store", credentials: "omit", redirect: "error" });
+  const reply = await fetch(url, { cache: "no-store", credentials: "omit", redirect: "error", signal: AbortSignal.timeout(FETCH_MS) });
   if (!reply.ok) throw new Error(`HTTP ${reply.status}`);
   return reply.text();
 }
