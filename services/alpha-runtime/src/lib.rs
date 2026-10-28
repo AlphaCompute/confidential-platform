@@ -65,6 +65,11 @@ const SECRETS_FIRST_RETRY: Duration = Duration::from_secs(2);
 /// With every file written a pass hits the leaf's cache, so it costs nothing until a renewal.
 const SECRETS_POLL: Duration = Duration::from_secs(60);
 
+/// Intel signs the collateral, so its source does not matter; Intel's own PCS answers without a
+/// key.
+const INTEL_PCS: &str = "https://api.trustedservices.intel.com";
+const COLLATERAL_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Distinct purposes cached per leaf; beyond it a key is still served, derived again on every
 /// read, so a caller naming ever new purposes cannot grow the process.
 pub const CACHED_KEYS: usize = 64;
@@ -515,6 +520,10 @@ pub struct Attested {
     pub result: AttestationResult,
     /// The leaf and the runtime key as the TLS listener serves them.
     pub certified: Arc<CertifiedKey>,
+    /// On a Kata Endpoint with a public name, the JSON a browser appraises the TD from: the
+    /// evidence the leaf's key was attested with, the nonce beside that key in `report_data`, the
+    /// init-data `MRCONFIGID` names and Intel's collateral for the quote.
+    pub attestation: Option<Vec<u8>>,
     client: Client,
     secrets: Mutex<HashMap<String, Secret>>,
     keys: Mutex<HashMap<String, DerivedKey>>,
@@ -605,17 +614,21 @@ impl Runtime {
 
     /// Nonce → `report_data` → quote → leaf; the first call is the Instance's birth, later ones renew.
     pub async fn attest(&self) -> Result<Arc<Attested>, Error> {
-        let attested = tokio::time::timeout(ATTEST_TIMEOUT, self.attest_inner())
-            .await
-            .unwrap_or(Err(Error::TimedOut))
-            .map_err(|e| self.note(e))?;
+        let (mut attested, evidence, nonce) =
+            tokio::time::timeout(ATTEST_TIMEOUT, self.attest_inner())
+                .await
+                .unwrap_or(Err(Error::TimedOut))
+                .map_err(|e| self.note(e))?;
+        // After the deadline, so a slow PCS can never cost the Instance its leaf.
+        attested.attestation = self.attestation(evidence, nonce).await;
+        let attested = Arc::new(attested);
         *self.attested.write() = Some(attested.clone());
         Ok(attested)
     }
 
     /// Each attestation dials under the Revisions current at that moment, so a connection from
     /// a build the latest document dropped is never reused.
-    async fn attest_inner(&self) -> Result<Arc<Attested>, Error> {
+    async fn attest_inner(&self) -> Result<(Attested, InstanceEvidence, [u8; 32]), Error> {
         let pin =
             Pin::CaSpkiAndRevisions(self.config.kms_ca_spki_sha256, self.kms_revisions().await?);
         let kms = Client::configured(
@@ -638,10 +651,32 @@ impl Runtime {
             .attest(&AttestRequest {
                 runtime_pubkey: BASE64_URL_SAFE_NO_PAD.encode(&self.spki),
                 nonce: BASE64_URL_SAFE_NO_PAD.encode(nonce),
-                evidence,
+                evidence: evidence.clone(),
             })
             .await?;
-        self.accept(reply, pin)
+        Ok((self.accept(reply, pin)?, evidence, nonce))
+    }
+
+    /// The JSON a browser appraises the TD from, for a Kata Endpoint with a public name.
+    async fn attestation(&self, evidence: InstanceEvidence, nonce: [u8; 32]) -> Option<Vec<u8>> {
+        let (Some(_), InstanceEvidence::Kata(kata), Some(RevisionText::InitData(init_data))) =
+            (&self.config.public, evidence, &self.revision)
+        else {
+            return None;
+        };
+        let fetch = alpha_attest::fetch_collateral(INTEL_PCS, &kata.quote);
+        // Without collateral only a browser's own check waits, until the next renewal.
+        let Ok(Ok(collateral)) = tokio::time::timeout(COLLATERAL_TIMEOUT, fetch).await else {
+            alpha_client::warn!("collateral_unavailable");
+            return None;
+        };
+        serde_json::to_vec(&serde_json::json!({
+            "evidence": kata,
+            "nonce": BASE64_URL_SAFE_NO_PAD.encode(nonce),
+            "init_data": init_data,
+            "collateral": collateral,
+        }))
+        .ok()
     }
 
     /// A failed fetch, or a document not above the accepted one, keeps the accepted list.
@@ -689,7 +724,7 @@ impl Runtime {
 
     /// The reply's chain is ours only if the leaf carries our key and the root the pinned one;
     /// the ids come from the leaf's SANs, never from the reply's text.
-    fn accept(&self, reply: AttestReply, pin: Pin) -> Result<Arc<Attested>, Error> {
+    fn accept(&self, reply: AttestReply, pin: Pin) -> Result<Attested, Error> {
         let chain: Vec<Vec<u8>> = reply
             .certificate_chain
             .iter()
@@ -732,16 +767,17 @@ impl Runtime {
             }),
             self.time.clone(),
         )?;
-        Ok(Arc::new(Attested {
+        Ok(Attested {
             identity,
             chain_pem: reply.certificate_chain,
             not_after,
             result: reply.attestation_result,
             certified,
+            attestation: None,
             client,
             secrets: Mutex::new(HashMap::new()),
             keys: Mutex::new(HashMap::new()),
-        }))
+        })
     }
 
     /// From the KMS over mTLS with the current leaf, cached with it.
