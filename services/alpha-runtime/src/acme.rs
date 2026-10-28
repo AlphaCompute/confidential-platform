@@ -123,13 +123,7 @@ pub async fn issue_forever(edge: Arc<Edge>, name: String, runtime: Arc<Runtime>)
             .flatten(),
         None => None,
     };
-    match restored {
-        Some(wait) => {
-            alpha_client::info!("public_certificate_restored");
-            tokio::time::sleep(wait).await;
-        }
-        None => tokio::time::sleep(ROUTABLE_AFTER).await,
-    }
+    tokio::time::sleep(restored.unwrap_or(ROUTABLE_AFTER)).await;
     let account = loop {
         match account().await {
             Ok(account) => break account,
@@ -273,6 +267,7 @@ async fn restore(
     let (renew_at, pkcs8, chain_pem) =
         open(&key, name, &blob).ok_or("the cached certificate does not open")?;
     install(edge, &pkcs8, &chain_pem)?;
+    alpha_client::info!("public_certificate_restored");
     // Past its renewal time the cached certificate is still served while the new order runs.
     let due = renew_at
         .duration_since(SystemTime::now())
