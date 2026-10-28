@@ -338,12 +338,12 @@ async fn read_head(
     tls: &mut (impl AsyncRead + Unpin),
     head: &mut Vec<u8>,
 ) -> std::io::Result<Option<&'static str>> {
-    let requests = ANSWERED.map(|path| format!("GET {path} "));
+    let request = |path: &str| format!("GET {path} ");
     let mut buf = [0u8; 64];
-    while requests
-        .iter()
-        .any(|r| head.len() < r.len() && r.as_bytes().starts_with(head))
-    {
+    while ANSWERED.iter().any(|path| {
+        let r = request(path);
+        head.len() < r.len() && r.as_bytes().starts_with(head)
+    }) {
         let n = tls.read(&mut buf).await?;
         let Some(read) = buf.get(..n).filter(|r| !r.is_empty()) else {
             break;
@@ -352,9 +352,7 @@ async fn read_head(
     }
     Ok(ANSWERED
         .into_iter()
-        .zip(&requests)
-        .find(|(_, r)| head.starts_with(r.as_bytes()))
-        .map(|(path, _)| path))
+        .find(|path| head.starts_with(request(path).as_bytes())))
 }
 
 /// The binding of the certificate this connection was served, signed with the runtime key.

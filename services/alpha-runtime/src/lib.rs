@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use alpha_attest::{AttestationResult, Collateral, InstanceEvidence};
+use alpha_attest::{AttestationResult, InstanceEvidence};
 use alpha_client::log::Field;
 use alpha_client::platform::ReleaseKeys;
 use alpha_client::tls::{self, InstanceSans};
@@ -504,21 +504,6 @@ fn read_under_limit(reader: impl Read) -> Result<String, String> {
     Ok(text)
 }
 
-/// Without collateral the Instance still attests to the KMS; only a browser's own check waits for
-/// the next renewal.
-async fn collateral(quote: &[u8]) -> Option<Collateral> {
-    let fetched = tokio::time::timeout(
-        COLLATERAL_TIMEOUT,
-        alpha_attest::fetch_collateral(INTEL_PCS, quote),
-    )
-    .await;
-    if let Ok(Ok(collateral)) = fetched {
-        return Some(collateral);
-    }
-    alpha_client::warn!("collateral_unavailable");
-    None
-}
-
 /// How long to wait before renewing: ten minutes before `not_after`, or at once if that has passed.
 pub fn renewal_delay(not_after: SystemTime, now: SystemTime) -> Duration {
     not_after
@@ -679,7 +664,12 @@ impl Runtime {
         else {
             return None;
         };
-        let collateral = collateral(&kata.quote).await?;
+        let fetch = alpha_attest::fetch_collateral(INTEL_PCS, &kata.quote);
+        // Without collateral only a browser's own check waits, until the next renewal.
+        let Ok(Ok(collateral)) = tokio::time::timeout(COLLATERAL_TIMEOUT, fetch).await else {
+            alpha_client::warn!("collateral_unavailable");
+            return None;
+        };
         serde_json::to_vec(&serde_json::json!({
             "evidence": kata,
             "nonce": BASE64_URL_SAFE_NO_PAD.encode(nonce),
