@@ -629,17 +629,21 @@ impl Runtime {
 
     /// Nonce → `report_data` → quote → leaf; the first call is the Instance's birth, later ones renew.
     pub async fn attest(&self) -> Result<Arc<Attested>, Error> {
-        let attested = tokio::time::timeout(ATTEST_TIMEOUT, self.attest_inner())
-            .await
-            .unwrap_or(Err(Error::TimedOut))
-            .map_err(|e| self.note(e))?;
+        let (mut attested, evidence, nonce) =
+            tokio::time::timeout(ATTEST_TIMEOUT, self.attest_inner())
+                .await
+                .unwrap_or(Err(Error::TimedOut))
+                .map_err(|e| self.note(e))?;
+        // After the deadline, so a slow PCS can never cost the Instance its leaf.
+        attested.attestation = self.attestation(evidence, nonce).await;
+        let attested = Arc::new(attested);
         *self.attested.write() = Some(attested.clone());
         Ok(attested)
     }
 
     /// Each attestation dials under the Revisions current at that moment, so a connection from
     /// a build the latest document dropped is never reused.
-    async fn attest_inner(&self) -> Result<Arc<Attested>, Error> {
+    async fn attest_inner(&self) -> Result<(Attested, InstanceEvidence, [u8; 32]), Error> {
         let pin =
             Pin::CaSpkiAndRevisions(self.config.kms_ca_spki_sha256, self.kms_revisions().await?);
         let kms = Client::configured(
@@ -665,21 +669,24 @@ impl Runtime {
                 evidence: evidence.clone(),
             })
             .await?;
-        let attestation = match (&self.config.public, evidence, &self.revision) {
-            (Some(_), InstanceEvidence::Kata(kata), Some(RevisionText::InitData(init_data))) => {
-                collateral(&kata.quote).await.and_then(|collateral| {
-                    serde_json::to_vec(&serde_json::json!({
-                        "evidence": kata,
-                        "nonce": BASE64_URL_SAFE_NO_PAD.encode(nonce),
-                        "init_data": init_data,
-                        "collateral": collateral,
-                    }))
-                    .ok()
-                })
-            }
-            _ => None,
+        Ok((self.accept(reply, pin)?, evidence, nonce))
+    }
+
+    /// The JSON a browser appraises the TD from, for a Kata Endpoint with a public name.
+    async fn attestation(&self, evidence: InstanceEvidence, nonce: [u8; 32]) -> Option<Vec<u8>> {
+        let (Some(_), InstanceEvidence::Kata(kata), Some(RevisionText::InitData(init_data))) =
+            (&self.config.public, evidence, &self.revision)
+        else {
+            return None;
         };
-        self.accept(reply, pin, attestation)
+        let collateral = collateral(&kata.quote).await?;
+        serde_json::to_vec(&serde_json::json!({
+            "evidence": kata,
+            "nonce": BASE64_URL_SAFE_NO_PAD.encode(nonce),
+            "init_data": init_data,
+            "collateral": collateral,
+        }))
+        .ok()
     }
 
     /// A failed fetch, or a document not above the accepted one, keeps the accepted list.
@@ -727,12 +734,7 @@ impl Runtime {
 
     /// The reply's chain is ours only if the leaf carries our key and the root the pinned one;
     /// the ids come from the leaf's SANs, never from the reply's text.
-    fn accept(
-        &self,
-        reply: AttestReply,
-        pin: Pin,
-        attestation: Option<Vec<u8>>,
-    ) -> Result<Arc<Attested>, Error> {
+    fn accept(&self, reply: AttestReply, pin: Pin) -> Result<Attested, Error> {
         let chain: Vec<Vec<u8>> = reply
             .certificate_chain
             .iter()
@@ -775,17 +777,17 @@ impl Runtime {
             }),
             self.time.clone(),
         )?;
-        Ok(Arc::new(Attested {
+        Ok(Attested {
             identity,
             chain_pem: reply.certificate_chain,
             not_after,
             result: reply.attestation_result,
             certified,
-            attestation,
+            attestation: None,
             client,
             secrets: Mutex::new(HashMap::new()),
             keys: Mutex::new(HashMap::new()),
-        }))
+        })
     }
 
     /// From the KMS over mTLS with the current leaf, cached with it.
