@@ -80,18 +80,18 @@ pub fn verify(
     report.platform_document_version = doc.as_ref().map(|d| d.version);
 
     let signed = serde_json::from_str::<SignedBinding>(fetched.binding)
-        .map_err(|e| format!("{name} serves no binding: {e}"));
-    let leaf = signed
-        .as_ref()
-        .map_err(Clone::clone)
-        .and_then(|s| binding::leaf(s).map_err(|e| e.to_string()));
+        .map_err(|e| format!("{name} serves no binding: {e}"))
+        .and_then(|s| {
+            let leaf = binding::leaf(&s).map_err(|e| e.to_string())?;
+            Ok((s, leaf))
+        });
     let evidence = serde_json::from_str::<Attestation>(fetched.attestation)
         .map_err(|e| format!("{name} serves no attestation evidence: {e}"));
 
     let appraised = report.check(
         "attestation",
         need(doc.as_ref(), "the platform document").and_then(|doc| {
-            let leaf = leaf.as_ref().map_err(Clone::clone)?;
+            let (_, leaf) = signed.as_ref().map_err(Clone::clone)?;
             appraise(evidence.as_ref().map_err(Clone::clone)?, leaf, doc, now)
         }),
     );
@@ -115,11 +115,7 @@ pub fn verify(
     let bound = report.check(
         "binding",
         need(appraised.as_ref(), "the attestation").and_then(|_| {
-            let (signed, leaf) = signed
-                .as_ref()
-                .ok()
-                .zip(leaf.as_ref().ok())
-                .ok_or("no binding")?;
+            let (signed, leaf) = signed.as_ref().map_err(Clone::clone)?;
             let binding = binding::open(signed, leaf, name, now).map_err(|e| e.to_string())?;
             let detail = format!(
                 "the TD's key signed that it serves {name} with key {} until {}",

@@ -153,13 +153,11 @@ async function main() {
     ["Certificate Transparency", issuances(name)],
   ];
   const settled = await Promise.allSettled(sources.map(([, promise]) => promise));
-  const value = (i) => (settled[i].status === "fulfilled" ? settled[i].value : undefined);
-  const fetched = settled
-    .map((result, i) => [sources[i][0], result.reason && result.reason.message])
-    .filter(([, error]) => error);
+  const [binding, attestation, platform, ct] = settled.map((r) => r.value);
+  const fetched = settled.flatMap((r, i) => (r.status === "rejected" ? [[sources[i][0], r.reason?.message]] : []));
 
   const report = JSON.parse(
-    wasm_bindgen.verifyPublicName(name, ...[0, 1, 2].map((i) => value(i) || ""), value(3), storedVersion(), Date.now()),
+    wasm_bindgen.verifyPublicName(name, binding ?? "", attestation ?? "", platform ?? "", ct, storedVersion(), Date.now()),
   );
   if (report.platform_document_version) storeVersion(report.platform_document_version);
   render(root, name, report, fetched);
