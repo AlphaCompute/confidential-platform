@@ -125,6 +125,11 @@ function render(root, name, report, fetched) {
       "",
       "A page cannot see the certificate of its own connection. Another valid certificate for the name could let its holder serve the name from elsewhere, so every current certificate in Certificate Transparency must hold the key the TD signed for. Cert Spotter is trusted to list them all; browsers accept only logged certificates.",
     ),
+    el(
+      "p",
+      "",
+      "The App picks the quote's nonce and serves Intel's collateral, so the check shows that the key was attested in a TD, not that the quote is fresh, and collateral still within its validity can predate Intel's newest TCB levels.",
+    ),
     el("p", "mono", `Built from ${REVISION}; wasm sha256:${WASM_SHA256}`),
   );
 
