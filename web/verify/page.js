@@ -8,6 +8,7 @@ const PLATFORM_URL = "@PLATFORM_URL@";
 
 const VERSION_KEY = "alphacompute-verify-platform-version";
 const BINDING_PATH = "/.well-known/alphacompute/binding";
+const ATTESTATION_PATH = "/.well-known/alphacompute/attestation";
 const CT_URL = "https://api.certspotter.com/v1/issuances";
 const CT_PAGES = 10;
 const NAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
@@ -142,7 +143,8 @@ async function main() {
 
   await wasm_bindgen({ module_or_path: fetch(WASM_URL, { integrity: WASM_SRI }) });
   const sources = [
-    ["the App's evidence", get(`https://${name}${BINDING_PATH}`)],
+    ["the App's binding", get(`https://${name}${BINDING_PATH}`)],
+    ["the App's evidence", get(`https://${name}${ATTESTATION_PATH}`)],
     ["the platform document", get(PLATFORM_URL)],
     ["Certificate Transparency", issuances(name)],
   ];
@@ -153,7 +155,15 @@ async function main() {
     .filter(([, error]) => error);
 
   const report = JSON.parse(
-    wasm_bindgen.verifyPublicName(name, value(0) || "", value(1) || "", value(2), storedVersion(), Date.now()),
+    wasm_bindgen.verifyPublicName(
+      name,
+      value(0) || "",
+      value(1) || "",
+      value(2) || "",
+      value(3),
+      storedVersion(),
+      Date.now(),
+    ),
   );
   if (report.checks[0].ok) storeVersion(report.platform_document_version);
   render(root, name, report, fetched);

@@ -17,6 +17,8 @@ use crate::{Error, rfc3339, sha256_label};
 
 /// Where the Endpoint serves its [`SignedBinding`] on its public name.
 pub const PATH: &str = "/.well-known/alphacompute/binding";
+/// Where it serves the [`Attestation`] behind the binding's leaf key.
+pub const ATTESTATION_PATH: &str = "/.well-known/alphacompute/attestation";
 const FORMAT: &str = "alphacompute-edge-binding/1";
 /// Keeps a binding's signature apart from every other one the Instance key makes.
 const CONTEXT: &[u8] = b"alphacompute/edge-binding/v1\n";
@@ -39,8 +41,6 @@ pub struct SignedBinding {
     pub statement: String,
     pub signature: String,
     pub chain_pem: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub attestation: Option<Attestation>,
 }
 
 /// What lets a verifier appraise the TD without the KMS: the evidence the leaf's key was attested
@@ -87,7 +87,6 @@ pub fn sign(
         statement,
         signature: BASE64_URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes()),
         chain_pem,
-        attestation: None,
     })
 }
 

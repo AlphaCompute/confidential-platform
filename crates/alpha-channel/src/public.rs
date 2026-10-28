@@ -63,14 +63,20 @@ struct Issuance {
     not_after: String,
 }
 
-/// `binding_json` is what `name` answers on [`binding::PATH`]; `issuances_json` is Cert Spotter's
-/// list for the name with wildcards, or None when it could not be read. `min_version` is the
-/// newest platform document version this verifier saw before.
+/// The texts a verifier read: what the name answers on [`binding::PATH`] and
+/// [`binding::ATTESTATION_PATH`], the signed platform document, and Cert Spotter's issuances for
+/// the name with wildcards, None when they could not be read.
+pub struct Fetched<'a> {
+    pub binding: &'a str,
+    pub attestation: &'a str,
+    pub platform: &'a str,
+    pub issuances: Option<&'a str>,
+}
+
+/// `min_version` is the newest platform document version this verifier saw before.
 pub fn verify(
     name: &str,
-    binding_json: &str,
-    platform_json: &str,
-    issuances_json: Option<&str>,
+    fetched: &Fetched,
     keys: &ReleaseKeys,
     min_version: u64,
     now: SystemTime,
@@ -79,18 +85,15 @@ pub fn verify(
 
     let doc = report.check(
         "platform_document",
-        platform_document(platform_json, keys, min_version, now),
+        platform_document(fetched.platform, keys, min_version, now),
     );
     report.platform_document_version = doc.as_ref().map(|d| d.version);
 
-    let signed = serde_json::from_str::<SignedBinding>(binding_json)
+    let signed = serde_json::from_str::<SignedBinding>(fetched.binding)
         .map_err(|e| format!("{name} serves no binding: {e}"));
-    let evidence = signed.as_ref().map_err(Clone::clone).and_then(|s| {
-        s.attestation.as_ref().ok_or_else(|| {
-            format!("{name} serves no evidence: its runtime predates the evidence route")
-        })
-    });
-    let attestation = evidence.as_ref().ok().copied();
+    let evidence = serde_json::from_str::<Attestation>(fetched.attestation)
+        .map_err(|e| format!("{name} serves no attestation evidence: {e}"));
+    let attestation = evidence.as_ref().ok();
 
     let quote = report.check(
         "tdx_quote",
@@ -134,10 +137,8 @@ pub fn verify(
             },
         ),
     );
-    if app_id.is_some() {
-        report.app_id = app_id;
-        report.init_data = attestation.and_then(|a| a.init_data.clone());
-    }
+    report.init_data = app_id.and(attestation.and_then(|a| a.init_data.clone()));
+    report.app_id = app_id;
 
     let bound = report.check(
         "binding",
@@ -156,7 +157,7 @@ pub fn verify(
     report.check(
         "certificate_transparency",
         need(bound.as_ref(), "the binding")
-            .and_then(|b| transparency(name, b, issuances_json, now)),
+            .and_then(|b| transparency(name, b, fetched.issuances, now)),
     );
 
     report.verified = report.checks.iter().all(|c| c.ok);
@@ -434,24 +435,27 @@ mod tests {
         leaf.pem()
     }
 
-    /// The captured evidence behind a binding that `key` signs, with `leaf_pem` as its chain.
+    /// A binding that `key` signs, with `leaf_pem` as its chain.
     fn binding_json(key: &SigningKey, leaf_pem: String) -> String {
         let served_key = rcgen::KeyPair::generate().unwrap();
         let mut served = rcgen::CertificateParams::new(vec![NAME.into()]).unwrap();
         served.not_after = rcgen::date_time_ymd(2100, 1, 1);
         let served = served.self_signed(&served_key).unwrap();
-        let mut signed = binding::sign(key, leaf_pem, NAME, served.der()).unwrap();
-        signed.attestation = Some(Attestation {
-            evidence: serde_json::from_value(json!({
+        let signed = binding::sign(key, leaf_pem, NAME, served.der()).unwrap();
+        serde_json::to_string(&signed).unwrap()
+    }
+
+    fn attestation_json() -> String {
+        json!({
+            "evidence": {
                 "format": alpha_attest::KATA_EVIDENCE_FORMAT,
                 "quote": BASE64_URL_SAFE_NO_PAD.encode(kata("k3-app.quote.bin")),
-            }))
-            .unwrap(),
-            nonce: BASE64_URL_SAFE_NO_PAD.encode(kata("nonce.bin")),
-            init_data: Some(String::from_utf8(kata("k3-app.toml")).unwrap()),
-            collateral: serde_json::from_slice(&kata("collateral.json")).unwrap(),
-        });
-        serde_json::to_string(&signed).unwrap()
+            },
+            "nonce": BASE64_URL_SAFE_NO_PAD.encode(kata("nonce.bin")),
+            "init_data": String::from_utf8(kata("k3-app.toml")).unwrap(),
+            "collateral": serde_json::from_slice::<Value>(&kata("collateral.json")).unwrap(),
+        })
+        .to_string()
     }
 
     const NAME: &str = "hello.alphacompute.cc";
@@ -460,9 +464,12 @@ mod tests {
         let keys = release_key().verifying_key().into();
         verify(
             NAME,
-            binding,
-            &platform_json(),
-            Some("[]"),
+            &Fetched {
+                binding,
+                attestation: &attestation_json(),
+                platform: &platform_json(),
+                issuances: Some("[]"),
+            },
             &keys,
             min_version,
             captured_at(),
