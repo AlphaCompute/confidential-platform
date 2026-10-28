@@ -364,7 +364,6 @@ dependencies = [
 name = "alpha-runtime"
 version = "0.1.0"
 dependencies = [
- "aes-gcm",
  "alpha-attest",
  "alpha-channel",
  "alpha-client",
@@ -376,17 +375,20 @@ dependencies = [
  "chrono",
  "flate2",
  "getrandom 0.4.3",
+ "hkdf",
  "instant-acme",
  "p256 0.14.0",
  "p384 0.14.0",
  "parking_lot",
  "rcgen",
+ "reqwest",
  "rustls",
  "serde_json",
  "sha2 0.11.0",
  "thiserror",
  "tokio",
  "tokio-rustls",
+ "x509-parser",
  "zeroize",
 ]
 
@@ -1881,6 +1883,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hash2curve"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1eaf40612d7d854743e7189228a6d528f0f6e8502cf6a0cb831d28a218b7f3f6"
+dependencies = [
+ "digest 0.11.3",
+ "elliptic-curve 0.14.1",
+]
+
+[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2855,6 +2867,7 @@ checksum = "d2c9239b2dbc807adbbe147e8cf72ea7450c3a0aabe62cb8e75ff4ec22e1f72a"
 dependencies = [
  "ecdsa 0.17.0",
  "elliptic-curve 0.14.1",
+ "hash2curve",
  "primefield",
  "primeorder 0.14.0",
  "sha2 0.11.0",
