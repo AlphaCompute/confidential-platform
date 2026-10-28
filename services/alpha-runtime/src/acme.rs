@@ -45,7 +45,15 @@ const LETS_ENCRYPT_CERT: &str = "https://acme-v02.api.letsencrypt.org/acme/cert/
 const CT_SEARCH: &str = "https://api.certspotter.com/v1/issuances";
 const CT_PAGES: usize = 4;
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(60);
-/// Let's Encrypt allows five failed validations per name and hour.
+/// Let's Encrypt allows five failed validations per name and account, refilled one every 12
+/// minutes. The quick retries spend four of the five, so a new App whose route the edge router
+/// has not loaded yet gets its certificate within minutes; `RETRY_AFTER` then refills faster
+/// than it spends.
+const QUICK_RETRIES: [Duration; 3] = [
+    Duration::from_secs(60),
+    Duration::from_secs(2 * 60),
+    Duration::from_secs(4 * 60),
+];
 const RETRY_AFTER: Duration = Duration::from_secs(15 * 60);
 /// The CA validates over the public path, which reaches a new pod only once its Service lists it.
 const ROUTABLE_AFTER: Duration = Duration::from_secs(30);
@@ -164,19 +172,30 @@ pub async fn issue_forever(edge: Arc<Edge>, name: String, runtime: Arc<Runtime>)
             }
         }
     };
+    let mut failures = 0usize;
     loop {
         let wait = match issue(&edge, &name, &account, &cert_key).await {
             Ok(not_after) => {
                 alpha_client::info!("public_certificate_issued", not_after = not_after);
+                failures = 0;
                 renewal_delay(not_after, SystemTime::now())
             }
             Err(e) => {
                 alpha_client::warn!("public_certificate_failed", error = Field::text(&e));
-                RETRY_AFTER
+                failures = failures.saturating_add(1);
+                retry_delay(failures)
             }
         };
         tokio::time::sleep(wait).await;
     }
+}
+
+fn retry_delay(failures: usize) -> Duration {
+    failures
+        .checked_sub(1)
+        .and_then(|i| QUICK_RETRIES.get(i))
+        .copied()
+        .unwrap_or(RETRY_AFTER)
 }
 
 /// Renew with a third of the remaining lifetime left.
@@ -522,5 +541,18 @@ mod tests {
             renewal_delay(now + Duration::from_secs(60), now),
             RETRY_AFTER
         );
+    }
+
+    #[test]
+    fn failed_orders_stay_within_the_failed_validation_limit() {
+        // Let's Encrypt's bucket in seconds of refill: five failures, one back every 720 s.
+        let (capacity, cost) = (5 * 720, 720);
+        let mut tokens = capacity;
+        for failures in 1..50 {
+            assert!(tokens >= cost, "failure {failures} is over the limit");
+            tokens -= cost;
+            tokens = (tokens + retry_delay(failures).as_secs()).min(capacity);
+        }
+        assert_eq!(retry_delay(1), QUICK_RETRIES[0]);
     }
 }
