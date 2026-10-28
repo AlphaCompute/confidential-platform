@@ -144,17 +144,13 @@ pub async fn issue_forever(edge: Arc<Edge>, name: String, runtime: Arc<Runtime>)
             return;
         }
     };
-    let reused = match tokio::time::timeout(LOOKUP_TIMEOUT, reuse(&edge, &name, &cert_key)).await {
-        Ok(Ok(reused)) => reused,
-        Ok(Err(e)) => {
+    let reused = match tokio::time::timeout(LOOKUP_TIMEOUT, reuse(&edge, &name, &cert_key))
+        .await
+        .unwrap_or_else(|_| Err("timed out".into()))
+    {
+        Ok(reused) => reused,
+        Err(e) => {
             alpha_client::warn!("public_certificate_lookup_failed", error = Field::text(&e));
-            None
-        }
-        Err(_) => {
-            alpha_client::warn!(
-                "public_certificate_lookup_failed",
-                error = Field::text("timed out")
-            );
             None
         }
     };
@@ -322,7 +318,10 @@ async fn reuse(edge: &Edge, name: &str, pkcs8: &[u8]) -> Result<Option<Duration>
             .filter(|id| id.bytes().all(|b| b.is_ascii_digit()))
             .ok_or("cert spotter: an issuance without a numeric id")?
             .clone_into(&mut after);
-        newest = newer(newest, newest_holding(&page, &spki, now));
+        newest = newest
+            .into_iter()
+            .chain(newest_holding(&page, &spki, now))
+            .max_by_key(|issued| issued.not_after);
     }
     let Some(found) = newest else {
         return Ok(None);
@@ -361,13 +360,6 @@ struct Issued {
     not_after: SystemTime,
 }
 
-fn newer(a: Option<Issued>, b: Option<Issued>) -> Option<Issued> {
-    match (a, b) {
-        (Some(a), Some(b)) => Some(if b.not_after > a.not_after { b } else { a }),
-        (a, b) => a.or(b),
-    }
-}
-
 /// Of Cert Spotter's issuances, the unrevoked one valid at `now` whose key is `spki`, with the
 /// latest `not_after`. A precertificate has the serial, key and validity of its certificate, so
 /// either one gives the chain's URL.
@@ -392,7 +384,7 @@ fn newest_holding(page: &[serde_json::Value], spki: &[u8; 32], now: SystemTime) 
             };
             (issued.not_before <= now && now < issued.not_after).then_some(issued)
         })
-        .fold(None, |a, b| newer(a, Some(b)))
+        .max_by_key(|issued| issued.not_after)
 }
 
 /// Boulder's spelling in a certificate URL: lowercase hex, at least 36 digits, no sign byte.
