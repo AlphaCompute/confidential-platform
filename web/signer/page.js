@@ -868,7 +868,7 @@ async function startApproval(view, viewText, ticket) {
     el("h1", read.title),
   );
   const a = { view, viewText, read, ticket, ui, launch, credential: null, values: null };
-  a.fields = secretFields(launch.services, before);
+  a.fields = secretFields(launch.services, before, putSecrets(read));
   a.secretsBox = el("div");
   a.secretsBox.append(...a.fields.map((f) => f.node));
   ui.facts.replaceChildren(...describeLaunch(a), a.secretsBox);
@@ -879,10 +879,17 @@ function declaredSecrets(services) {
   return [...new Set(Object.values(services).flatMap((s) => s.secrets))].sort();
 }
 
+// The Secrets the service reports as put for this request, by a key of the organization.
+function putSecrets(read) {
+  if (!Array.isArray(read.secrets)) return [];
+  return read.secrets.filter((s) => s && s.set === true).map((s) => s.name);
+}
+
 // One password field per declared Secret. A Secret the current launch also declares is already
-// held by the KMS, because approving that launch put it, so it defaults to keeping that value.
-function secretFields(services, before) {
-  const held = before ? declaredSecrets(before) : [];
+// held by the KMS, because approving that launch put it, and so is one the service reports as
+// put; either defaults to keeping that value.
+function secretFields(services, before, put) {
+  const held = [...(before ? declaredSecrets(before) : []), ...put];
   return declaredSecrets(services).map((name) => {
     const node = el("div", undefined, "secret");
     const input = el("input");

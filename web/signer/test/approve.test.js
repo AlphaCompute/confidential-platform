@@ -705,6 +705,25 @@ test("a re-approval keeps current values unless replaced", async () => {
   );
 });
 
+test("a Secret the service reports as put is kept unless replaced", async () => {
+  const { page, api } = await secretPage({
+    secrets: [
+      { name: "db_password", set: true },
+      { name: "session_key", set: false },
+    ],
+  });
+  assert.equal(keepChoice(page, "db_password").value, "keep");
+  assert.equal(keepChoice(page, "session_key"), undefined);
+  fill(page, { session_key: SECRET_VALUES.session_key });
+  await page.click("Approve with passkey");
+  await page.click("Sign 2 of 2");
+  assert.ok(page.text().includes(APPROVED), page.text());
+  assert.deepEqual(
+    api.puts.map((p) => p.declared),
+    ["session_key"],
+  );
+});
+
 test("relay calls are paced and a 429 is retried once", async () => {
   const { page } = await secretPage();
   fill(page, SECRET_VALUES);
