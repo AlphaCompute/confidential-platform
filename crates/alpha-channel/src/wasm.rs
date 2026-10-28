@@ -46,10 +46,12 @@ pub fn verify_platform(signed_json: &str, now_ms: f64) -> Result<String, JsError
 }
 
 /// The [`public::Report`] for `name` over the [`public::Fetched`] texts; a failed check is in the
-/// report, only a broken build is an error.
+/// report, only a broken build or a challenge that is not 32 bytes is an error.
 #[wasm_bindgen(js_name = verifyPublicName)]
+#[allow(clippy::too_many_arguments)]
 pub fn verify_public_name(
     name: &str,
+    challenge: &[u8],
     binding_json: &str,
     attestation_json: &str,
     platform_json: &str,
@@ -58,7 +60,11 @@ pub fn verify_public_name(
     now_ms: f64,
 ) -> Result<String, JsError> {
     let keys = platform::release_keys().map_err(js)?;
+    let challenge = challenge
+        .try_into()
+        .map_err(|_| JsError::new("the challenge is not 32 bytes"))?;
     let fetched = public::Fetched {
+        challenge,
         binding: binding_json,
         attestation: attestation_json,
         platform: platform_json,

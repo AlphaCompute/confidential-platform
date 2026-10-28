@@ -98,9 +98,11 @@ function render(root, name, report, warnings) {
     el(
       "p",
       "",
-      report.verified
-        ? "Its key was attested in an Intel TDX confidential VM running the Revision below, and every certificate for the name in Certificate Transparency holds that key."
-        : "At least one check below failed. Do not rely on this App's confidentiality.",
+      !report.verified
+        ? "At least one check below failed. Do not rely on this App's confidentiality."
+        : report.live
+          ? "It runs the Revision below in an Intel TDX confidential VM: the key attested there answered this page's challenge just now, and every certificate for the name in Certificate Transparency holds that key."
+          : "Its key was attested in an Intel TDX confidential VM running the Revision below, and every certificate for the name in Certificate Transparency holds that key. It did not answer this page's challenge, so the evidence may come from a TD that has since stopped.",
     ),
   );
 
@@ -142,7 +144,7 @@ function render(root, name, report, warnings) {
     el(
       "p",
       "",
-      "The App picks the quote's nonce and serves Intel's collateral, so the check shows that the key was attested in a TD, not that the quote is fresh, and collateral still within its validity can predate Intel's newest TCB levels.",
+      "The App picks the quote's nonce, so the quote shows that the key was attested in a TD, not that the TD is up now. The page sends a random challenge with the binding request; a signature over it by the attested key shows that the TD answered after the page asked. The App also serves Intel's collateral, and collateral still within its validity can predate Intel's newest TCB levels.",
     ),
     el("p", "mono", `Built from ${REVISION}; wasm sha256:${WASM_SHA256}`),
   );
@@ -160,8 +162,10 @@ async function main() {
   const floor = storedVersion();
 
   await wasm_bindgen({ module_or_path: fetch(WASM_URL, { integrity: WASM_SRI }) });
+  const challenge = crypto.getRandomValues(new Uint8Array(32));
+  const token = btoa(String.fromCharCode(...challenge)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   const sources = [
-    ["the App's binding", get(`https://${name}${BINDING_PATH}`)],
+    ["the App's binding", get(`https://${name}${BINDING_PATH}?challenge=${token}`)],
     ["the App's evidence", get(`https://${name}${ATTESTATION_PATH}`)],
     ["the platform document", get(PLATFORM_URL)],
     ["Certificate Transparency", issuances(name)],
@@ -171,7 +175,7 @@ async function main() {
   const warnings = settled.flatMap((r, i) => (r.status === "rejected" ? [`Could not read ${sources[i][0]}: ${r.reason?.message}`] : []));
 
   const report = JSON.parse(
-    wasm_bindgen.verifyPublicName(name, binding ?? "", attestation ?? "", platform ?? "", ct, floor ?? 0, Date.now()),
+    wasm_bindgen.verifyPublicName(name, challenge, binding ?? "", attestation ?? "", platform ?? "", ct, floor ?? 0, Date.now()),
   );
   const stored = floor !== null && (!report.platform_document_version || storeVersion(report.platform_document_version));
   if (!stored) {

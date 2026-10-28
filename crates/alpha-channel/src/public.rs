@@ -23,10 +23,13 @@ pub struct Check {
     pub detail: String,
 }
 
-/// Every check in order, and what the passing ones established. `verified` only when all pass.
+/// Every check in order, and what the passing ones established. `verified` only when all pass;
+/// `live` when, besides, the TD's key answered the verifier's challenge, so the evidence is no
+/// replay of a TD that has since stopped.
 #[derive(Debug, Default, Serialize)]
 pub struct Report {
     pub verified: bool,
+    pub live: bool,
     pub checks: Vec<Check>,
     pub platform_document_version: Option<u64>,
     pub tcb_status: Option<String>,
@@ -55,8 +58,10 @@ fn need<T>(value: Option<T>, what: &str) -> Result<T, String> {
 
 /// The texts a verifier read: what the name answers on [`binding::PATH`] and on
 /// `/.well-known/alphacompute/attestation`, the signed platform document, and Cert Spotter's issuances for
-/// the name with wildcards, None when they could not be read.
+/// the name with wildcards, None when they could not be read. `challenge` is what the verifier
+/// sent with the binding request.
 pub struct Fetched<'a> {
+    pub challenge: &'a [u8; 32],
     pub binding: &'a str,
     pub attestation: &'a str,
     pub platform: &'a str,
@@ -147,6 +152,11 @@ pub fn verify(
     );
 
     report.verified = report.checks.iter().all(|c| c.ok);
+    report.live = report.verified
+        && signed.as_ref().is_ok_and(|(signed, leaf)| {
+            cert::spki_of(leaf)
+                .is_ok_and(|spki| signed.check_answer(&spki, fetched.challenge).is_ok())
+        });
     report
 }
 
@@ -415,9 +425,12 @@ mod tests {
 
     const NAME: &str = "hello.alphacompute.cc";
 
+    const CHALLENGE: [u8; 32] = [9; 32];
+
     fn run(binding: &str, issuances: &str, min_version: u64) -> Report {
         let keys = release_key().verifying_key().into();
         let fetched = Fetched {
+            challenge: &CHALLENGE,
             binding,
             attestation: &attestation_json(),
             platform: &platform_json(),
@@ -441,6 +454,16 @@ mod tests {
         assert_eq!(report.revision, Some(k3.digest()));
         assert_eq!(report.app_id, k3.app_id());
         assert_eq!(report.tcb_status.as_deref(), Some("UpToDate"));
+        assert!(!report.live);
+
+        let mut answered: SignedBinding = serde_json::from_str(&binding).unwrap();
+        answered.answer(&td, &CHALLENGE).unwrap();
+        let answered = serde_json::to_string(&answered).unwrap();
+        assert!(run(&answered, &logged, 0).live);
+        let mut stale: SignedBinding = serde_json::from_str(&binding).unwrap();
+        stale.answer(&td, &[1; 32]).unwrap();
+        let report = run(&serde_json::to_string(&stale).unwrap(), &logged, 0);
+        assert!(report.verified && !report.live);
 
         let (other, _) = binding_json(&SigningKey::from_bytes(&[7u8; 32].into()).unwrap());
         let report = run(&other, &logged, 0);
