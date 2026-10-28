@@ -37,10 +37,9 @@ function storedVersion() {
   }
 }
 
-// Without storage the floor is this visit's document.
 function storeVersion(version) {
   try {
-    if (version > storedVersion()) localStorage.setItem(VERSION_KEY, String(version));
+    localStorage.setItem(VERSION_KEY, String(version));
   } catch {}
 }
 

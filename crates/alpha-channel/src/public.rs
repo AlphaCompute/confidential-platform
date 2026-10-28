@@ -521,10 +521,7 @@ mod tests {
     #[test]
     fn every_current_logged_certificate_must_hold_the_bound_key() {
         let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
-        let issuance = |id: &str, names: &[&str], key: &str, not_after: &str| {
-            json!({ "id": id, "dns_names": names, "pubkey_sha256": key, "not_after": not_after,
-                    "revoked": false })
-        };
+        let issuance = |id: &str, names: &[&str], key: &str, not_after: &str| json!({ "id": id, "dns_names": names, "pubkey_sha256": key, "not_after": not_after });
         let ours = "aa".repeat(32);
         let list = |entries: Vec<Value>| Value::Array(entries).to_string();
         let check = |text: Option<&str>| transparency(NAME, &binding(&ours), text, now);
