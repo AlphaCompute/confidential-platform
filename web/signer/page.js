@@ -953,8 +953,7 @@ async function approvalSignature(a, options) {
 function offerApproval(a, note) {
   // The browser cannot tell a closed prompt from one that offered no passkey of the organization.
   const missed = note === MESSAGES.prompt_closed || note === MESSAGES.foreign_passkey;
-  const none = !a.read.credentials.length;
-  if ((missed || none) && !a.credential && a.canEnroll === undefined) a.canEnroll = true;
+  if (missed || !a.read.credentials.length) a.canEnroll ??= true;
   const pending = a.values ? a.values.filter((v) => !v.done) : [];
   const total = a.values ? a.values.length + 1 : 1;
   const step = total - pending.length;
