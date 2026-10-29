@@ -122,6 +122,10 @@ client that insists on `h2` by ALPN, such as gRPC, is not served.
 With a public name, a handshake for that name gets the browser-trusted certificate, with or
 without ALPN. Only a client that offers the ALPN protocol id `alphacompute-instance/1` gets the
 Instance leaf; every client in `alpha-client` offers it, together with `http/1.1`.
+An `alpha` CLI built before this rule offers no such id, so against a public name it gets the
+browser-trusted certificate and fails its KMS CA pin: update the CLI before an Endpoint with a public
+name moves to a runtime with this rule. Verifying by address, with no public name in the SNI, still
+works with either CLI.
 
 There is no session resumption (no tickets, no session cache): a resumed session presents no
 certificate, and every connection has to prove the current leaf. A renewal swaps the leaf for
