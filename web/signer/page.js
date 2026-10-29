@@ -869,6 +869,11 @@ async function startApproval(view, viewText, ticket) {
   const ui = screen(el("p", `Launch approval for ${orgName}`, "eyebrow"), el("h1", read.title));
   const a = { view, viewText, read, ticket, ui, launch, orgName, credential: null, values: null };
   a.signedIn = backFromSignIn(ticket);
+  // The sign-in cookie that lets a ticket enroll a passkey is host-only and SameSite=Strict.
+  if (new URL(view.signer.api_origin).origin !== location.origin) {
+    if (!read.credentials.length) return stop(MESSAGES.no_credentials);
+    a.canEnroll = false;
+  }
   a.fields = secretFields(launch.services, before, putSecrets(read));
   a.secretsBox = el("div");
   a.secretsBox.append(...a.fields.map((f) => f.node));

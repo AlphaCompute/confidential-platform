@@ -329,6 +329,15 @@ test("a passkey the service will not enroll leaves the contact sentence", async 
   };
   await other.page.click(CREATE);
   assert.deepEqual(other.page.buttons(), ["Approve with passkey", "Decline"]);
+
+  const crossOrigin = await approvalPage(
+    { compose: withoutSecrets(), credentials: [] },
+    { origin: "https://other-signer.test" },
+  );
+  assert.equal(
+    crossOrigin.page.text(),
+    "No passkey of this organization is known. Ask your AlphaCompute contact.",
+  );
 });
 
 const CATALOG = JSON.parse(testdata("catalog/expected.json"));

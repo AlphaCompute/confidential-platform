@@ -31,6 +31,8 @@ public key, with the cookie, to `POST /v1/approval-requests/{ticket}/passkey`. s
 whether this person may enroll a passkey and registers it at the KMS. The page then reads the
 request again and asks only the new passkey for every signature. A tab that cannot keep the mark
 creates the passkey first, and a `401 sign_in_required` sends the person to sign in.
+Enrollment needs the API on the page's own origin, because the sign-in cookie is host-only and
+`SameSite=Strict`; a page whose `api_origin` is another origin does not offer it.
 
 ## Revocation
 
