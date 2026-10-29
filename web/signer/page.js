@@ -1150,22 +1150,18 @@ async function postRoot(a, key, registration) {
   const path = `/v1/approval-requests/${a.ticket}/root`;
   const orgId = a.read.org_id;
   const { reply, signed } = await relayKey(a.view, path, orgId, key, registration, "same-origin");
-  if (reply.status !== 201) {
-    // The KMS may hold this key already, and then no other passkey can become the root: the
-    // same document is sent again, which the service answers as the first time.
-    const again = () =>
-      offer(
-        a.ui,
-        approvalFailure(reply),
-        button("Try again", () => postRoot(a, key, registration)),
-        declineButton(a),
-      );
-    return refusedKey(a, reply, again);
-  }
+  // The KMS may hold this key already, and then no other passkey can become the root: the same
+  // document is sent again, which the service answers as the first time.
+  const again = (note) =>
+    offer(
+      a.ui,
+      note,
+      button("Try again", () => postRoot(a, key, registration)),
+      declineButton(a),
+    );
+  if (reply.status !== 201) return refusedKey(a, reply, () => again(approvalFailure(reply)));
   // The receipt covers the public key; only the body names the credential the service stored.
-  if (!signed || reply.body.credential_id !== key.id) {
-    return offerOrgRoot(a, key, MESSAGES.not_confirmed);
-  }
+  if (!signed || reply.body.credential_id !== key.id) return again(MESSAGES.not_confirmed);
   a.ui.facts.append(el("p", syncSentence(key), key.backed_up ? "muted" : "warning"));
   return useNewKey(a, key);
 }

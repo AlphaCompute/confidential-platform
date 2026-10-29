@@ -448,15 +448,16 @@ test("an owner the service does not know as signed in signs in before the root",
 test("a root post that may have reached the KMS is sent again unchanged", async () => {
   const { api, page, laptop } = await rootPage(signedIn());
   const refused = { status: 502, body: { error: { code: "kms_refused" } } };
-  const failures = [new Error("network"), refused];
+  const unconfirmed = { status: 201, body: {} };
+  const failures = [new Error("network"), refused, unconfirmed];
   api.reply.root = () => failures.shift();
   await page.click(CREATE_ROOT);
   await page.click("Confirm with passkey");
-  assert.deepEqual(page.buttons(), ["Try again", "Decline"]);
-  await page.click("Try again");
-  assert.deepEqual(page.buttons(), ["Try again", "Decline"]);
-  await page.click("Try again");
-  assert.equal(api.roots.length, 3);
+  for (let i = 0; i < 3; i += 1) {
+    assert.deepEqual(page.buttons(), ["Try again", "Decline"]);
+    await page.click("Try again");
+  }
+  assert.equal(api.roots.length, 4);
   assert.ok(api.roots.every((r) => r.text === api.roots[0].text));
   assert.equal(laptop.log.length, 2);
   await page.click("Approve with passkey");
