@@ -467,13 +467,16 @@ async fn leaf_chain(
     ))
 }
 
-/// 200 only while the leaf is current and the upstream answers its own path with a 2xx now.
+/// 200 only while the leaf is current and, with a readiness path, the upstream answers it with a
+/// 2xx now.
 async fn ready(State(runtime): State<Arc<Runtime>>) -> StatusCode {
     let config = runtime.config();
-    let (Some(upstream), Some(path)) = (&config.tls_upstream, &config.tls_ready) else {
-        return StatusCode::SERVICE_UNAVAILABLE;
-    };
-    if runtime.attested().is_some() && upstream_answers(upstream, path).await {
+    if runtime.attested().is_some()
+        && match (&config.tls_upstream, &config.tls_ready) {
+            (Some(upstream), Some(path)) => upstream_answers(upstream, path).await,
+            _ => true,
+        }
+    {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE

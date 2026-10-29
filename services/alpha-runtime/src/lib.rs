@@ -47,12 +47,7 @@ use tokio::net::UnixListener;
 use tokio::sync::watch;
 use zeroize::Zeroizing;
 
-pub use alpha_client::runtime::{SOCKET_PATH, TLS_PORT};
-
-/// Plain HTTP for the host: `GET /leaf` always, and `GET /ready` for a kubelet probe when a
-/// readiness path is named. A Kata agent policy refuses exec, and the host cannot present an
-/// Instance leaf to a caller-pinned Endpoint.
-pub const PROBE_PORT: u16 = 8444;
+pub use alpha_client::runtime::{PROBE_PORT, SOCKET_PATH, TLS_PORT};
 
 pub const RENEW_BEFORE: Duration = Duration::from_secs(600);
 const RETRY_AFTER: Duration = Duration::from_secs(30);
@@ -221,7 +216,7 @@ pub fn parse_callers(text: Option<&str>, upstream: Option<&str>) -> Result<Vec<A
 }
 
 /// `ALPHACOMPUTE_TLS_UPSTREAM_READY`: the upstream's own readiness path, such as vLLM's
-/// `/health`; set, [`PROBE_PORT`] also serves plain-HTTP `GET /ready`.
+/// `/health`; set, [`PROBE_PORT`]'s `GET /ready` also requires it to answer.
 pub fn parse_ready(text: Option<&str>, upstream: Option<&str>) -> Result<Option<String>, Error> {
     let Some(text) = text else {
         return Ok(None);

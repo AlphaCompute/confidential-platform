@@ -147,9 +147,9 @@ current. The chain is public, because every handshake shows it. The host reads i
 Kubernetes API server proxy, and checks it against the KMS CA itself.
 
 The same listener also serves `GET /ready`, for a kubelet probe. It answers 200 with an empty
-body only while `ALPHACOMPUTE_TLS_UPSTREAM_READY` is set, the leaf is current and the upstream
-answers `GET <path>` with a 2xx status within 2 s, else 503; nothing of the upstream's reply is
-relayed.
+body only while the leaf is current and, when `ALPHACOMPUTE_TLS_UPSTREAM_READY` is set, the
+upstream answers `GET <path>` with a 2xx status within 2 s, else 503; nothing of the upstream's
+reply is relayed.
 
 ## Tests
 
