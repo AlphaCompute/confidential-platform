@@ -888,9 +888,11 @@ async function startApproval(view, viewText, ticket) {
   const a = { view, viewText, read, ticket, ui, launch, orgName, credential: null, values: null };
   a.signedIn = backFromSignIn(ticket);
   let note = a.signedIn ? MESSAGES.signed_in : undefined;
-  if (a.signedIn && read.root_principal_id != null && read.org_id == null) {
+  // The service names an organization without a key only to its signed-in owner, who signs the
+  // root document with that name.
+  if (read.root_principal_id != null && read.org_id == null) {
+    if (a.signedIn) note = MESSAGES.sign_in_failed;
     a.signedIn = false;
-    note = MESSAGES.sign_in_failed;
   }
   if (!sameOrigin(view)) {
     a.canEnroll = false;
@@ -1009,7 +1011,7 @@ function offerApproval(a, note) {
       const exclude = a.read.credentials.map((x) => x.credential_id);
       const options = createOptions(a.view, a.orgName, exclude);
       const retry = (n) => offerApproval(a, n);
-      const next = (key) => (root ? rootWith(a, key) : enroll(a, key));
+      const next = (key) => (root ? offerOrgRoot(a, key).focus() : enroll(a, key));
       create = createButton(label, options, retry, next, className);
     }
     nodes.push(create);
@@ -1089,20 +1091,18 @@ async function enroll(a, key) {
   return useNewKey(a, key);
 }
 
-function signInAgain(a) {
-  // Just back from signing in, a second redirect would only loop.
-  if (!a.signedIn) return signIn(a);
-  a.signedIn = false;
-  return offerApproval(a, MESSAGES.sign_in_failed);
-}
-
 // The next step after the service refused a passkey created through the ticket; `otherwise`
 // answers a refusal the page has no sentence for.
 async function refusedKey(a, reply, otherwise = () => offerApproval(a, approvalFailure(reply))) {
   const code = errorCode(reply.body);
   if (code === "request_expired") return stop(MESSAGES.approval_expired);
   if (code === "root_taken") return stop(MESSAGES.root_taken);
-  if (code === "sign_in_required") return signInAgain(a);
+  if (code === "sign_in_required") {
+    // Just back from signing in, a second redirect would only loop.
+    if (!a.signedIn) return signIn(a);
+    a.signedIn = false;
+    return offerApproval(a, MESSAGES.sign_in_failed);
+  }
   const notes = {
     enroll_not_allowed: MESSAGES.no_credentials,
     already_enrolled: MESSAGES.already_enrolled,
@@ -1129,18 +1129,6 @@ async function useNewKey(a, key) {
   a.read.credentials = read.credentials;
   a.credential = key.id;
   offerApproval(a, MESSAGES.added).sign.focus();
-}
-
-// The root document names the organization, which the service reveals only to its signed-in
-// owner; a tab that could not keep the sign-in mark learns here whether it is signed in.
-async function rootWith(a, key) {
-  if (a.read.org_id == null) {
-    const { read, refusal } = await reread(a.view, a.ticket);
-    if (refusal) return stop(refusal);
-    if (read.org_id == null) return signInAgain(a);
-    a.read.org_id = read.org_id;
-  }
-  offerOrgRoot(a, key).focus();
 }
 
 // The second touch: the new passkey signs the document that makes it the organization's root.

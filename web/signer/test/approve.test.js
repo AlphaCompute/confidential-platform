@@ -442,7 +442,7 @@ test("an owner the service does not know as signed in signs in before the root",
   const unmarked = await rootPage({ sessionStorage: deniedStorage() }, { signedIn: false });
   await unmarked.page.click(CREATE_ROOT);
   assert.deepEqual(unmarked.page.assigned, [ENROLL_LOGIN]);
-  assert.equal(unmarked.api.roots.length, 0);
+  assert.equal(unmarked.laptop.log.length, 0);
 });
 
 test("a root post that may have reached the KMS is sent again unchanged", async () => {
