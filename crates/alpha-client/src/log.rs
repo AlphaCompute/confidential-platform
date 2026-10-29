@@ -244,7 +244,7 @@ mod tests {
     fn a_pipe_nobody_drains_blocks_neither_a_line_nor_a_flush() {
         let (_unread, pipe) = std::io::pipe().unwrap();
         let sink = writer(pipe).unwrap();
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         for _ in 0..4 * QUEUE {
             let _ = sink.try_send(Message::Line("x".repeat(100)));
         }
