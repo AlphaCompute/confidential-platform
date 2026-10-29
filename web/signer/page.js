@@ -71,6 +71,11 @@ const MESSAGES = {
   root_device_bound:
     "This passkey is only on this device. If you lose it, you lose access to your organization.",
   yours: "This organization is yours.",
+  root_first:
+    "Step 1 of 2: create your organization's passkey and confirm it as the organization's key. In step 2 you approve this App with it.",
+  root_then: "Step 2 of 2: approve this App with your organization's new passkey.",
+  machine:
+    "The service sets the machine size, its CPU and memory; the size does not change the code that runs, so you do not sign it.",
   added: "The new passkey is registered.",
   synced: "Synced passkey (backed up by your provider)",
   device_bound: "Device-bound passkey: if you lose this device you lose this key",
@@ -795,7 +800,8 @@ function approvalRefusal(read) {
 function uploadedLaunch(read) {
   if (typeof read.compose !== "string") return { refusal: MESSAGES.mismatch };
   return parsedLaunch(read, read.compose, {
-    machine: `${read.machine || "not stated"} (chosen by the service, not part of what you sign)`,
+    machine: read.machine || "not stated",
+    machineNote: MESSAGES.machine,
   });
 }
 
@@ -858,6 +864,7 @@ function describeLaunch(a) {
     nodes.push(block);
   }
   nodes.push(fact("Machine", launch.machine));
+  if (launch.machineNote) nodes.push(el("p", launch.machineNote, "muted"));
   const details = el("details");
   details.append(el("summary", "Technical details"), el("pre", launch.compose));
   nodes.push(details);
@@ -884,8 +891,13 @@ async function startApproval(view, viewText, ticket) {
   }
 
   const orgName = typeof read.org_name === "string" ? read.org_name : read.org_id;
-  const ui = screen(el("p", `Launch approval for ${orgName}`, "eyebrow"), el("h1", read.title));
-  const a = { view, viewText, read, ticket, ui, launch, orgName, credential: null, values: null };
+  const progress = read.root_principal_id != null ? el("p") : null;
+  const ui = screen(
+    el("p", `Launch approval for ${orgName}`, "eyebrow"),
+    el("h1", read.title),
+    ...(progress ? [progress] : []),
+  );
+  const a = { view, viewText, read, ticket, ui, launch, orgName, progress, credential: null, values: null };
   a.signedIn = backFromSignIn(ticket);
   let note = a.signedIn ? MESSAGES.signed_in : undefined;
   // The service names an organization without a key only to its signed-in owner, who signs the
@@ -990,7 +1002,13 @@ function offerApproval(a, note) {
   const pending = a.values ? a.values.filter((v) => !v.done) : [];
   const total = a.values ? a.values.length + 1 : 1;
   const step = total - pending.length;
-  const label = step === 1 ? "Approve with passkey" : `Sign ${step} of ${total}`;
+  // An organization rooted on this page has a passkey once the root is confirmed.
+  const rooted = a.progress && a.read.credentials.length > 0;
+  if (a.progress) a.progress.textContent = rooted ? MESSAGES.root_then : MESSAGES.root_first;
+  const approve = rooted
+    ? `Approve ${a.read.title}, revision ${a.read.compose_hash.slice(7, 19)}`
+    : "Approve with passkey";
+  const label = step === 1 ? approve : `Sign ${step} of ${total}`;
   const run = a.values ? stepAction(a, pending[0]) : firstAction(a);
   const sign = a.read.credentials.length ? button(label, run) : null;
   const nodes = sign ? [sign] : [];
