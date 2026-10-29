@@ -101,11 +101,12 @@ pub struct Edge {
 /// Which certificate a handshake gets, from its SNI and the protocols it offers.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Route {
-    /// The KMS leaf: an `alpha` client offers no ALPN, and any other name keeps it too.
+    /// The KMS leaf: an `alpha` client offers [`tls::INSTANCE_ALPN`], and any other name keeps
+    /// it too.
     Instance,
     /// The ACME CA's validation (RFC 8737).
     Challenge,
-    /// A browser on the public name.
+    /// Any other client on the public name, with or without ALPN.
     Public,
 }
 
@@ -114,20 +115,18 @@ pub fn route<'a>(
     sni: Option<&str>,
     alpn: Option<impl Iterator<Item = &'a [u8]>>,
 ) -> Route {
-    let (Some(sni), Some(alpn)) = (sni, alpn) else {
-        return Route::Instance;
-    };
-    if !sni.eq_ignore_ascii_case(public) {
+    if !sni.is_some_and(|sni| sni.eq_ignore_ascii_case(public)) {
         return Route::Instance;
     }
-    let mut http = false;
-    for protocol in alpn {
+    for protocol in alpn.into_iter().flatten() {
         if protocol == ACME_TLS_ALPN {
             return Route::Challenge;
         }
-        http |= protocol == b"http/1.1" || protocol == b"h2";
+        if protocol == tls::INSTANCE_ALPN {
+            return Route::Instance;
+        }
     }
-    if http { Route::Public } else { Route::Instance }
+    Route::Public
 }
 
 // ponytail: one copy per App with a public name. Each copy keeps its own challenge and orders
@@ -417,28 +416,32 @@ mod tests {
         route(NAME, sni, alpn.map(|a| a.iter().copied()))
     }
 
+    type Case<'a> = (Option<&'a str>, Option<&'a [&'a [u8]]>, Route);
+
     #[test]
     fn the_certificate_follows_sni_and_alpn() {
-        assert_eq!(routed(Some(NAME), None), Route::Instance);
-        assert_eq!(routed(None, Some(&[b"h2"])), Route::Instance);
-        assert_eq!(
-            routed(Some(NAME), Some(&[b"h2", b"http/1.1"])),
-            Route::Public
-        );
-        assert_eq!(
-            routed(Some("HELLO.alphacompute.cc"), Some(&[b"http/1.1"])),
-            Route::Public
-        );
-        assert_eq!(routed(Some(NAME), Some(&[ACME_TLS_ALPN])), Route::Challenge);
-        assert_eq!(
-            routed(Some("other.alphacompute.cc"), Some(&[ACME_TLS_ALPN])),
-            Route::Instance
-        );
-        assert_eq!(
-            routed(Some("other.alphacompute.cc"), Some(&[b"h2"])),
-            Route::Instance
-        );
-        assert_eq!(routed(Some(NAME), Some(&[b"grpc-exp"])), Route::Instance);
+        const INSTANCE: &[u8] = b"alphacompute-instance/1";
+        let other = Some("other.alphacompute.cc");
+        let cases: [Case; 11] = [
+            (Some(NAME), None, Route::Public),
+            (Some(NAME), Some(&[b"http/1.1"]), Route::Public),
+            (
+                Some("HELLO.alphacompute.cc"),
+                Some(&[b"h2", b"http/1.1"]),
+                Route::Public,
+            ),
+            (Some(NAME), Some(&[INSTANCE, b"http/1.1"]), Route::Instance),
+            (Some(NAME), Some(&[b"h2", INSTANCE]), Route::Instance),
+            (Some(NAME), Some(&[ACME_TLS_ALPN]), Route::Challenge),
+            (None, None, Route::Instance),
+            (None, Some(&[b"h2"]), Route::Instance),
+            (other, None, Route::Instance),
+            (other, Some(&[b"h2"]), Route::Instance),
+            (other, Some(&[ACME_TLS_ALPN]), Route::Instance),
+        ];
+        for (sni, alpn, expected) in cases {
+            assert_eq!(routed(sni, alpn), expected, "{sni:?} {alpn:?}");
+        }
     }
 
     #[test]
