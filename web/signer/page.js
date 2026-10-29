@@ -1146,9 +1146,9 @@ async function relayRoot(a, key, registration) {
     await refusedKey(a, reply);
     return {};
   }
-  const b = reply.body;
-  const named = b.credential_id === key.id && b.public_key === key.spki;
-  return signed && named && b.key_id === signed.id ? { signed } : { note: MESSAGES.not_confirmed };
+  // The receipt covers the public key; only the body names the credential the service stored.
+  const named = reply.body.credential_id === key.id;
+  return signed && named ? { signed } : { note: MESSAGES.not_confirmed };
 }
 
 // The first click reads the Secret values, so its inputs are built in the click, before any await.

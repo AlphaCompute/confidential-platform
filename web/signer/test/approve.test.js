@@ -10,6 +10,7 @@ const {
   b64u,
   catalogFile,
   contextDigest,
+  deniedStorage,
   iso,
   jcs,
   loadPage,
@@ -418,16 +419,7 @@ test("a device-bound root passkey is named as the only copy", async () => {
 });
 
 test("a root the service wants signed in for sends the person to sign in", async () => {
-  const unmarked = {
-    getItem: () => {
-      throw new Error("denied");
-    },
-    setItem: () => {
-      throw new Error("denied");
-    },
-    removeItem: () => {},
-  };
-  const { api, page } = await rootPage({ sessionStorage: unmarked });
+  const { api, page } = await rootPage({ sessionStorage: deniedStorage() });
   api.reply.root = () => ({ status: 401, body: { error: { code: "sign_in_required" } } });
   await page.click(CREATE_ROOT);
   await page.click("Confirm with passkey");

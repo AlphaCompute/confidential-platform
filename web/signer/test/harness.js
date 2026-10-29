@@ -362,6 +362,14 @@ function memoryStorage(initial = {}) {
   };
 }
 
+// Storage a private mode refuses on every call.
+function deniedStorage() {
+  const denied = () => {
+    throw new Error("denied");
+  };
+  return { getItem: denied, setItem: denied, removeItem: denied };
+}
+
 // options: routes {"METHOD /path": (req) => {status, body, headers}}, authenticator, platform
 // (text, Error or null), catalog {"<hex>.json": text}, origin, path, hash, framed,
 // noPasskeys, localStorage, sessionStorage, now.
@@ -870,6 +878,7 @@ module.exports = {
   b64u,
   claimApi,
   contextDigest,
+  deniedStorage,
   iso,
   jcs,
   loadPage,

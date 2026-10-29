@@ -2,7 +2,14 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { TICKET, loadPage, memoryStorage, testView, testdata } = require("./harness.js");
+const {
+  TICKET,
+  deniedStorage,
+  loadPage,
+  memoryStorage,
+  testView,
+  testdata,
+} = require("./harness.js");
 
 // Release-signed, version 11, with no signer: the compiled-in key verifies it.
 const PLATFORM = testdata("channel/platform-document.json");
@@ -58,15 +65,7 @@ test("an older platform document than one seen before is refused", async () => {
     assert.equal(storage.getItem(VERSION_KEY), "11");
   }
 
-  const refusing = {
-    getItem() {
-      throw new Error("denied");
-    },
-    setItem() {
-      throw new Error("denied");
-    },
-  };
-  const page = await booted({ localStorage: refusing });
+  const page = await booted({ localStorage: deniedStorage() });
   assert.equal(page.text(), NOT_SIGNER);
 });
 
