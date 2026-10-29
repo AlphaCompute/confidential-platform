@@ -994,9 +994,12 @@ function enrollKey(ticket) {
 // The service sends a person back from signing in to the bare approval link, so only this tab's
 // mark tells a return from a first visit. Null when the page cannot keep a mark.
 function backFromSignIn(ticket) {
+  const key = enrollKey(ticket);
   try {
-    const back = sessionStorage.getItem(enrollKey(ticket)) === "1";
-    sessionStorage.removeItem(enrollKey(ticket));
+    const back = sessionStorage.getItem(key) === "1";
+    // A tab that can read but not write could never come back marked.
+    sessionStorage.setItem(key, "0");
+    sessionStorage.removeItem(key);
     return back;
   } catch (_) {
     return null;
@@ -1007,7 +1010,7 @@ function backFromSignIn(ticket) {
 // tab leaves; a redirect to the identity provider is all that sends the person on.
 async function signIn(a) {
   const url = `${a.view.signer.api_origin}/v1/approval-requests/${a.ticket}/enroll-login`;
-  let status = 0;
+  let status;
   try {
     const reply = await fetch(url, { redirect: "manual", cache: "no-store" });
     status = reply.type === "opaqueredirect" ? 302 : reply.status;
