@@ -14,7 +14,9 @@
 //! ```
 
 use std::io::Write;
-use std::time::{Duration, SystemTime};
+use std::sync::OnceLock;
+use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::time::{Duration, Instant, SystemTime};
 
 use alpha_core::{AppId, ComposeHash};
 use serde_json::{Map, Value};
@@ -113,6 +115,58 @@ fn line(
     Value::Object(object).to_string()
 }
 
+/// Lines held while stderr does not take them; past this, a line is lost.
+const QUEUE: usize = 1024;
+
+enum Message {
+    Line(String),
+    Flushed(mpsc::Sender<()>),
+}
+
+fn writer(mut out: impl Write + Send + 'static) -> Option<SyncSender<Message>> {
+    let (sink, queue) = mpsc::sync_channel(QUEUE);
+    std::thread::Builder::new()
+        .name("log".into())
+        .spawn(move || {
+            for message in queue {
+                match message {
+                    Message::Line(line) => {
+                        let _ = writeln!(out, "{line}");
+                    }
+                    Message::Flushed(done) => {
+                        let _ = done.send(());
+                    }
+                }
+            }
+        })
+        .ok()?;
+    Some(sink)
+}
+
+/// In a Kata pod the agent policy keeps container output from the host, so nobody may drain the
+/// pipe behind stderr; only this thread ever blocks on it, never a tokio worker.
+fn stderr() -> Option<&'static SyncSender<Message>> {
+    static SINK: OnceLock<Option<SyncSender<Message>>> = OnceLock::new();
+    SINK.get_or_init(|| writer(std::io::stderr())).as_ref()
+}
+
+fn flush_into(sink: &SyncSender<Message>, timeout: Duration) {
+    let start = Instant::now();
+    let (done, flushed) = mpsc::channel();
+    let mut message = Message::Flushed(done);
+    loop {
+        match sink.try_send(message) {
+            Ok(()) => break,
+            Err(TrySendError::Full(back)) if start.elapsed() < timeout => {
+                message = back;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return,
+        }
+    }
+    let _ = flushed.recv_timeout(timeout.saturating_sub(start.elapsed()));
+}
+
 /// A full or closed stderr loses the line rather than stopping the service.
 pub fn emit(
     level: &'static str,
@@ -120,11 +174,26 @@ pub fn emit(
     event: &'static str,
     fields: Vec<(&'static str, Field)>,
 ) {
-    let _ = writeln!(
-        std::io::stderr().lock(),
-        "{}",
-        line(level, service, event, fields)
-    );
+    if let Some(sink) = stderr() {
+        emit_into(sink, level, service, event, fields);
+    }
+}
+
+fn emit_into(
+    sink: &SyncSender<Message>,
+    level: &'static str,
+    service: &'static str,
+    event: &'static str,
+    fields: Vec<(&'static str, Field)>,
+) {
+    let _ = sink.try_send(Message::Line(line(level, service, event, fields)));
+}
+
+/// Waits at most a second for the queued lines to reach stderr; call it before the process exits.
+pub fn flush() {
+    if let Some(sink) = stderr() {
+        flush_into(sink, Duration::from_secs(1));
+    }
 }
 
 #[doc(hidden)]
@@ -179,5 +248,21 @@ mod tests {
         assert_eq!(object["error"], "policy_denied");
         assert_eq!(object["after"], 2000);
         assert!(chrono::DateTime::parse_from_rfc3339(object["ts"].as_str().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn a_pipe_nobody_drains_blocks_neither_a_line_nor_a_flush() {
+        let (_unread, pipe) = std::io::pipe().unwrap();
+        let sink = writer(pipe).unwrap();
+        let start = Instant::now();
+        for _ in 0..4 * QUEUE {
+            emit_into(&sink, "info", "alpha-test", "flood", vec![]);
+        }
+        assert!(matches!(
+            sink.try_send(Message::Line(String::new())),
+            Err(TrySendError::Full(_))
+        ));
+        flush_into(&sink, Duration::from_millis(100));
+        assert!(start.elapsed() < Duration::from_secs(1));
     }
 }
