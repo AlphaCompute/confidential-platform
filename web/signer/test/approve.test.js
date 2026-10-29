@@ -10,6 +10,7 @@ const {
   b64u,
   catalogFile,
   contextDigest,
+  deniedStorage,
   iso,
   jcs,
   loadPage,
@@ -241,6 +242,8 @@ const ENROLL_LOGIN =
 const ENROLL_MARK = `alphacompute-enroll-sha256:${sha256(TICKET).toString("hex")}`;
 // A tab back from the service's sign-in, which the page marked before it left.
 const signedIn = () => ({ sessionStorage: memoryStorage({ [ENROLL_MARK]: "1" }) });
+const focused = (page, label) =>
+  page.find((n) => n.tagName === "BUTTON" && n.textContent === label)?.focused;
 
 test("creating a passkey signs in first, before any passkey is made", async () => {
   const session = memoryStorage();
@@ -278,17 +281,13 @@ test("back from signing in, a new passkey is enrolled and then the only one aske
   laptop.prefer = undefined;
   assert.equal(pageOptions.sessionStorage.getItem(ENROLL_MARK), null);
   assert.ok(page.text().includes("Signed in. Create your passkey to continue."), page.text());
-  const create = page.find((n) => n.tagName === "BUTTON" && n.textContent === CREATE);
-  assert.ok(create?.focused, page.text());
+  assert.ok(focused(page, CREATE), page.text());
   await page.click(CREATE);
   const created = laptop.log[0].result;
   assert.deepEqual(api.enrolled, [{ credential_id: created.id, public_key: created.spki }]);
   const post = page.fetches.find((f) => f.url.endsWith("/passkey"));
   assert.equal(post.credentials, "same-origin");
-  const approve = page.find(
-    (n) => n.tagName === "BUTTON" && n.textContent === "Approve with passkey",
-  );
-  assert.ok(approve?.focused, page.text());
+  assert.ok(focused(page, "Approve with passkey"), page.text());
   await page.click("Approve with passkey");
   const got = laptop.log[1];
   assert.deepEqual(ids(got.options.allowCredentials), [created.id]);
@@ -341,6 +340,143 @@ test("a passkey the service will not enroll leaves the contact sentence", async 
     crossOrigin.page.text(),
   );
   assert.deepEqual(crossOrigin.page.buttons(), ["Decline"]);
+});
+
+const CREATE_ROOT = "Create your organization's passkey";
+const SYNCED_ROOT = "This passkey is saved to your account's password manager.";
+const DEVICE_ROOT =
+  "This passkey is only on this device. If you lose it, you lose access to your organization.";
+const ROOT_TAKEN =
+  "Your organization was claimed by another key. Do not approve. Contact AlphaCompute.";
+// A request of an organization without a key, on a device that holds none of its passkeys.
+async function rootPage(pageOptions, apiOptions = {}) {
+  const request = {
+    compose: withoutSecrets(),
+    credentials: [],
+    root_principal_id: crypto.randomUUID(),
+    ...apiOptions,
+  };
+  const opened = await approvalPage(request, pageOptions);
+  opened.laptop.prefer = undefined;
+  return opened;
+}
+
+test("an organization without a key is rooted by its new passkey, which then approves", async () => {
+  const { api, page, laptop } = await rootPage(signedIn());
+  assert.deepEqual(page.buttons(), [CREATE_ROOT, "Decline"]);
+  assert.ok(focused(page, CREATE_ROOT), page.text());
+  await page.click(CREATE_ROOT);
+  const created = laptop.log[0].result;
+  assert.ok(page.text().includes(SYNCED_ROOT), page.text());
+  assert.deepEqual(page.buttons(), ["Confirm with passkey", "Decline"]);
+  assert.ok(focused(page, "Confirm with passkey"), page.text());
+
+  const principal = api.root_principal_id;
+  await page.click("Confirm with passkey");
+  const confirm = laptop.log[1];
+  assert.deepEqual(ids(confirm.options.allowCredentials), [created.id]);
+  const { payload, signature } = api.roots[0].registration;
+  assert.deepEqual(payload, {
+    org_id: api.org_id,
+    principal_id: principal,
+    public_key: created.spki,
+    label: "passkey-1",
+    issued_at: payload.issued_at,
+  });
+  assert.deepEqual(
+    Buffer.from(confirm.options.challenge),
+    contextDigest("alphacompute/org-root-key/v1", jcs(payload)),
+  );
+  assert.equal(signature.key_id, undefined);
+  assert.equal(
+    api.roots[0].text,
+    `{"credential_id":"${created.id}","registration":${jcs({ payload, signature })}}`,
+  );
+  const post = page.fetches.find((f) => f.url.endsWith("/root"));
+  assert.equal(post.credentials, "same-origin");
+  assert.ok(focused(page, "Approve with passkey"), page.text());
+  assert.ok(page.text().includes(SYNCED_ROOT), page.text());
+
+  await page.click("Approve with passkey");
+  assert.equal(laptop.log.length, 3);
+  assert.deepEqual(ids(laptop.log[2].options.allowCredentials), [created.id]);
+  assert.equal(api.revisions[0].body.signature.key_id, api.credentials[0].key_id);
+  assert.ok(page.text().includes(APPROVED), page.text());
+  assert.deepEqual(page.assigned, []);
+});
+
+test("a device-bound root passkey is named as the only copy", async () => {
+  const { page } = await rootPage({
+    ...signedIn(),
+    authenticator: new SoftwareAuthenticator({ flags: 0x05 }),
+  });
+  await page.click(CREATE_ROOT);
+  assert.ok(page.text().includes(DEVICE_ROOT), page.text());
+  assert.ok(!page.text().includes(SYNCED_ROOT), page.text());
+});
+
+test("a root the service wants signed in for sends the person to sign in", async () => {
+  const { api, page } = await rootPage({ sessionStorage: deniedStorage() });
+  api.reply.root = () => ({ status: 401, body: { error: { code: "sign_in_required" } } });
+  await page.click(CREATE_ROOT);
+  await page.click("Confirm with passkey");
+  assert.deepEqual(page.assigned, [ENROLL_LOGIN]);
+  assert.equal(api.revisions.length, 0);
+});
+
+test("an owner the service does not know as signed in signs in before the root", async () => {
+  const anonymous = await rootPage({}, { signedIn: false });
+  const read = anonymous.page.fetches.find((f) => f.method === "GET" && f.url.endsWith(TICKET));
+  assert.equal(read.credentials, "same-origin");
+  assert.ok(anonymous.page.text().includes(SIGN_IN), anonymous.page.text());
+  await anonymous.page.click(CREATE_ROOT);
+  assert.deepEqual(anonymous.page.assigned, [ENROLL_LOGIN]);
+  assert.equal(anonymous.laptop.log.length, 0);
+
+  const back = await rootPage(signedIn(), { signedIn: false });
+  assert.ok(back.page.text().includes("Sign-in did not complete. Try again."), back.page.text());
+  await back.page.click(CREATE_ROOT);
+  assert.deepEqual(back.page.assigned, [ENROLL_LOGIN]);
+  assert.equal(back.laptop.log.length, 0);
+
+  const unmarked = await rootPage({ sessionStorage: deniedStorage() }, { signedIn: false });
+  await unmarked.page.click(CREATE_ROOT);
+  assert.deepEqual(unmarked.page.assigned, [ENROLL_LOGIN]);
+  assert.equal(unmarked.laptop.log.length, 0);
+});
+
+test("a root post that may have reached the KMS is sent again unchanged", async () => {
+  const { api, page, laptop } = await rootPage(signedIn());
+  const refused = { status: 502, body: { error: { code: "kms_refused" } } };
+  const unconfirmed = { status: 201, body: {} };
+  const failures = [new Error("network"), refused, unconfirmed];
+  api.reply.root = () => failures.shift();
+  await page.click(CREATE_ROOT);
+  await page.click("Confirm with passkey");
+  for (let i = 0; i < 3; i += 1) {
+    assert.deepEqual(page.buttons(), ["Try again", "Decline"]);
+    await page.click("Try again");
+  }
+  assert.equal(api.roots.length, 4);
+  assert.ok(api.roots.every((r) => r.text === api.roots[0].text));
+  assert.equal(laptop.log.length, 2);
+  await page.click("Approve with passkey");
+  assert.ok(page.text().includes(APPROVED), page.text());
+});
+
+test("an organization another key already rooted stops the approval", async () => {
+  const { api, page } = await rootPage(signedIn());
+  api.reply.root = () => ({ status: 409, body: { error: { code: "root_taken" } } });
+  await page.click(CREATE_ROOT);
+  await page.click("Confirm with passkey");
+  assert.equal(page.text(), ROOT_TAKEN);
+  assert.deepEqual(page.buttons(), []);
+  assert.equal(api.revisions.length, 0);
+});
+
+test("a page on another origin than the API offers no root but keeps Decline", async () => {
+  const { page } = await rootPage({ origin: "https://other-signer.test" });
+  assert.deepEqual(page.buttons(), ["Decline"]);
 });
 
 const CATALOG = JSON.parse(testdata("catalog/expected.json"));

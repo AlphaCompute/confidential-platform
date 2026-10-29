@@ -362,6 +362,14 @@ function memoryStorage(initial = {}) {
   };
 }
 
+// Storage a private mode refuses on every call.
+function deniedStorage() {
+  const denied = () => {
+    throw new Error("denied");
+  };
+  return { getItem: denied, setItem: denied, removeItem: denied };
+}
+
 // options: routes {"METHOD /path": (req) => {status, body, headers}}, authenticator, platform
 // (text, Error or null), catalog {"<hex>.json": text}, origin, path, hash, framed,
 // noPasskeys, localStorage, sessionStorage, now.
@@ -425,7 +433,12 @@ async function loadPage(options = {}) {
       );
       const route = routes[key] || routes[prefix];
       if (!route) return jsonReply(404, { error: "no route", error_code: "SHROUD_NOT_FOUND" });
-      const answer = await route({ method, path: pathname, body: init.body });
+      const answer = await route({
+        method,
+        path: pathname,
+        body: init.body,
+        credentials: init.credentials,
+      });
       if (answer instanceof Error) throw new TypeError("network");
       return jsonReply(answer.status, answer.body, answer.headers);
     }
@@ -592,6 +605,31 @@ function iso(ms) {
   return new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
+// The parts of a `{"credential_id":…,"registration":…}` body, with the registration's exact text.
+function keyBody(text) {
+  const prefix = /^\{"credential_id":("[A-Za-z0-9_-]+"),"registration":/.exec(text);
+  assert.ok(prefix && text.endsWith("}"), `unexpected key body ${text}`);
+  const registrationText = text.slice(prefix[0].length, -1);
+  return {
+    credentialId: JSON.parse(prefix[1]),
+    registrationText,
+    registration: JSON.parse(registrationText),
+  };
+}
+
+// The KMS's response to a key registration, with the key added to `api.credentials`.
+function registerKey(api, key) {
+  const response = {
+    id: crypto.randomUUID(),
+    principal_id: key.registration.payload.principal_id,
+    org_id: api.org_id,
+    public_key: key.registration.payload.public_key,
+    created_at: RECEIPT_TIME,
+  };
+  api.credentials.push({ credential_id: key.credentialId, key_id: response.id });
+  return response;
+}
+
 // shroud-go's claim routes for one ticket, with the KMS behind them answering every key
 // registration with a receipt. `api.receiptFor(registrationText, response)` may be replaced to
 // return a receipt that must fail.
@@ -642,26 +680,15 @@ function claimApi(options = {}) {
       return { status: 200, body: { org_id: api.org_id, principal_id: api.principal_id } };
     },
     [`POST ${base}/keys`]: (req) => {
-      const prefix = /^\{"credential_id":("[A-Za-z0-9_-]+"),"registration":/.exec(req.body);
-      assert.ok(prefix && req.body.endsWith("}"), `unexpected keys body ${req.body}`);
-      const credentialId = JSON.parse(prefix[1]);
-      const registrationText = req.body.slice(prefix[0].length, -1);
-      const registration = JSON.parse(registrationText);
-      api.registrations.push({ credentialId, registrationText, registration, body: req.body });
-      if (api.keysReply) return api.keysReply(registrationText);
-      const response = {
-        id: crypto.randomUUID(),
-        principal_id: registration.payload.principal_id,
-        org_id: api.org_id,
-        public_key: registration.payload.public_key,
-        created_at: RECEIPT_TIME,
-      };
-      api.credentials.push({ credential_id: credentialId, key_id: response.id });
+      const key = keyBody(req.body);
+      api.registrations.push({ ...key, body: req.body });
+      if (api.keysReply) return api.keysReply(key.registrationText);
+      const response = registerKey(api, key);
       api.keys_left -= 1;
-      if (!registration.signature.key_id) api.state = "rooted";
+      if (!key.registration.signature.key_id) api.state = "rooted";
       return {
         status: 200,
-        body: { ...response, receipt: api.receiptFor(registrationText, response) },
+        body: { ...response, receipt: api.receiptFor(key.registrationText, response) },
       };
     },
   };
@@ -694,6 +721,10 @@ function approvalApi(options = {}) {
     puts: [],
     channels: [],
     enrolled: [],
+    roots: [],
+    root_principal_id: options.root_principal_id,
+    // Whether the browser holds the service's sign-in cookie for this ticket.
+    signedIn: options.signedIn ?? true,
     reply: {},
     revisionReceipt: (text, response) => mintReceipt("revision.register", text, response),
     putReceipt: (text, response) => mintReceipt("secret.put", text, response),
@@ -714,10 +745,32 @@ function approvalApi(options = {}) {
     "expires_at",
     "state",
     "server_time",
+    "root_principal_id",
   ];
   api.routes = {
-    [`GET ${base}`]: () =>
-      api.read || { status: 200, body: Object.fromEntries(fields.map((k) => [k, api[k]])) },
+    [`GET ${base}`]: (req) => {
+      if (api.read) return api.read;
+      const body = Object.fromEntries(fields.map((k) => [k, api[k]]));
+      const owner = api.signedIn && req.credentials === "same-origin";
+      if (api.root_principal_id != null && !owner) delete body.org_id;
+      return { status: 200, body };
+    },
+    [`POST ${base}/root`]: (req) => {
+      const key = keyBody(req.body);
+      api.roots.push({ ...key, text: req.body });
+      const answer = api.reply.root && api.reply.root();
+      if (answer) return answer;
+      const response = registerKey(api, key);
+      return {
+        status: 201,
+        body: {
+          credential_id: key.credentialId,
+          key_id: response.id,
+          public_key: response.public_key,
+          receipt: mintReceipt("key.register", key.registrationText, response),
+        },
+      };
+    },
     [`POST ${base}/decline`]: () => {
       if (api.state !== "pending") {
         return {
@@ -842,6 +895,7 @@ module.exports = {
   b64u,
   claimApi,
   contextDigest,
+  deniedStorage,
   iso,
   jcs,
   loadPage,

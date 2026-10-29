@@ -34,6 +34,17 @@ creates the passkey first, and a `401 sign_in_required` sends the person to sign
 Enrollment needs the API on the page's own origin, because the sign-in cookie is host-only and
 `SameSite=Strict`; a page whose `api_origin` is another origin does not offer it.
 
+A request of an organization that has no key yet carries `root_principal_id`, and its owner makes
+the new passkey the organization's root. After the same sign-in, the page creates the passkey,
+signs the `org-root-key` document with it, and sends that document with the cookie to
+`POST /v1/approval-requests/{ticket}/root`. The page continues only when the receipt names this
+organization and this public key. It also says whether the provider backs the passkey up. A
+`root_taken` answer means that another key holds the root, and the page stops without approval.
+The service names such an organization only to its signed-in owner, so the page reads the ticket
+with the cookie and signs in until the read names the organization. When the root post gets no
+answer or an answer the page cannot explain, the page sends the same document again. The KMS can
+already hold that key, and then a new passkey can never become the root.
+
 ## Revocation
 
 A revocation link names an App and the compose hashes of its Revisions. Each Revision is revoked

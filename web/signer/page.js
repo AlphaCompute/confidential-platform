@@ -66,6 +66,10 @@ const MESSAGES = {
   sign_in: "Sign in with your AlphaCompute account to create a passkey for this organization.",
   signed_in: "Signed in. Create your passkey to continue.",
   sign_in_failed: "Sign-in did not complete. Try again.",
+  root_taken: "Your organization was claimed by another key. Do not approve. Contact AlphaCompute.",
+  root_synced: "This passkey is saved to your account's password manager.",
+  root_device_bound:
+    "This passkey is only on this device. If you lose it, you lose access to your organization.",
   yours: "This organization is yours.",
   added: "The new passkey is registered.",
   synced: "Synced passkey (backed up by your provider)",
@@ -529,60 +533,72 @@ async function reveal(c, key) {
   return c.read.kind === "root" ? offerRoot(c) : offerAddApproval(c);
 }
 
-// Relays one key registration and returns the response the KMS signed for it, or a note.
-async function register(c, credentialId, registration, publicKey) {
-  const body = `{"credential_id":${JSON.stringify(credentialId)},"registration":${registration}}`;
-  const reply = await api(c.view, "POST", `/v1/claims/${c.ticket}/keys`, body);
-  if (reply.status !== 200) return { note: failure(reply) };
-  const signed = receipt(c.view, reply, "key.register", registration, {
-    org_id: c.session.org_id,
-    public_key: publicKey,
+// Relays one key registration; `signed` is the response the KMS signed for it, or null.
+async function relayKey(view, path, orgId, key, registration, credentials) {
+  const body = `{"credential_id":${JSON.stringify(key.id)},"registration":${registration}}`;
+  const reply = await api(view, "POST", path, body, credentials);
+  const signed = receipt(view, reply, "key.register", registration, {
+    org_id: orgId,
+    public_key: key.spki,
   });
-  if (!signed || typeof signed.id !== "string") return { note: MESSAGES.not_confirmed };
-  return { signed };
+  return { reply, signed: typeof signed?.id === "string" ? signed : null };
 }
 
 // One step that signs a key document and relays it: `allow` limits the passkeys asked, `keyIdFor`
-// maps the one that answered to its KMS key id (undefined for the root's self-signature), and
-// `next` runs once the receipt verified.
+// maps the one that answered to its KMS key id (undefined for the root's self-signature), `relay`
+// sends the signed document and takes the next step, and `next` runs once the receipt verified.
+// Returns the button that signs.
 function offerRegistration(c, note, step) {
   const signable = wasm_bindgen.signingDigest(step.context, JSON.stringify(step.payload));
   const options = getOptions(c.view, signable.digest, step.allow);
-  offer(
-    c.ui,
-    note,
-    button(step.label, async () => {
-      const { credential, note } = await passkey("get", options);
-      if (!credential) return step.retry(note);
-      const keyId = step.keyIdFor(credential);
-      if (keyId === null) return step.retry(MESSAGES.foreign_passkey);
-      const registration = wasm_bindgen.canonicalJson(
-        JSON.stringify({ payload: step.payload, signature: signatureObject(credential, keyId) }),
-      );
-      const result = await register(c, step.key.id, registration, step.key.spki);
-      if (!result.signed) return step.retry(result.note);
-      step.key.key_id = result.signed.id;
+  const relay =
+    step.relay ||
+    (async (registration) => {
+      const path = `/v1/claims/${c.ticket}/keys`;
+      const orgId = c.session.org_id;
+      const { reply, signed } = await relayKey(c.view, path, orgId, step.key, registration);
+      if (reply.status !== 200) return step.retry(failure(reply));
+      if (!signed) return step.retry(MESSAGES.not_confirmed);
+      step.key.key_id = signed.id;
       saveSession(c);
       return step.next();
-    }),
-  );
+    });
+  const sign = button(step.label, async () => {
+    const { credential, note } = await passkey("get", options);
+    if (!credential) return step.retry(note);
+    const keyId = step.keyIdFor(credential);
+    if (keyId === null) return step.retry(MESSAGES.foreign_passkey);
+    const registration = wasm_bindgen.canonicalJson(
+      JSON.stringify({ payload: step.payload, signature: signatureObject(credential, keyId) }),
+    );
+    return relay(registration);
+  });
+  offer(c.ui, note, sign);
+  return sign;
+}
+
+// The self-signed document that makes `key` the first key of an organization.
+function rootStep(orgId, principalId, key) {
+  return {
+    label: "Confirm with passkey",
+    context: "org-root-key",
+    payload: {
+      org_id: orgId,
+      principal_id: principalId,
+      public_key: key.spki,
+      label: "passkey-1",
+      issued_at: issuedAt(),
+    },
+    key,
+    allow: [key.id],
+    keyIdFor: () => undefined,
+  };
 }
 
 function offerRoot(c, note) {
   const s = c.session;
   offerRegistration(c, note, {
-    label: "Confirm with passkey",
-    context: "org-root-key",
-    payload: {
-      org_id: s.org_id,
-      principal_id: s.principal_id,
-      public_key: s.first.spki,
-      label: "passkey-1",
-      issued_at: issuedAt(),
-    },
-    key: s.first,
-    allow: [s.first.id],
-    keyIdFor: () => undefined,
+    ...rootStep(s.org_id, s.principal_id, s.first),
     retry: (n) => offerRoot(c, n),
     next: () => rooted(c),
   });
@@ -760,12 +776,14 @@ function approvalRefusal(read) {
   if (read.state !== "pending") return MESSAGES.decided;
   const expires = Date.parse(read.expires_at);
   if (!Number.isFinite(expires) || expires <= Date.now()) return MESSAGES.approval_expired;
+  const root = read.root_principal_id != null;
   if (
-    !UUID.test(read.org_id) ||
+    !(UUID.test(read.org_id) || (root && read.org_id == null)) ||
     !UUID.test(read.app_id) ||
     !/^sha256:[0-9a-f]{64}$/.test(read.compose_hash) ||
     typeof read.title !== "string" ||
-    !Array.isArray(read.credentials)
+    !Array.isArray(read.credentials) ||
+    (root && !UUID.test(read.root_principal_id))
   ) {
     return MESSAGES.unavailable;
   }
@@ -869,9 +887,14 @@ async function startApproval(view, viewText, ticket) {
   const ui = screen(el("p", `Launch approval for ${orgName}`, "eyebrow"), el("h1", read.title));
   const a = { view, viewText, read, ticket, ui, launch, orgName, credential: null, values: null };
   a.signedIn = backFromSignIn(ticket);
-  // The sign-in cookie that lets a ticket enroll a passkey is host-only and SameSite=Strict.
   let note = a.signedIn ? MESSAGES.signed_in : undefined;
-  if (new URL(view.signer.api_origin).origin !== location.origin) {
+  // The service names an organization without a key only to its signed-in owner, who signs the
+  // root document with that name.
+  if (read.root_principal_id != null && read.org_id == null) {
+    if (a.signedIn) note = MESSAGES.sign_in_failed;
+    a.signedIn = false;
+  }
+  if (!sameOrigin(view)) {
     a.canEnroll = false;
     note = read.credentials.length ? undefined : MESSAGES.no_credentials;
   }
@@ -973,7 +996,10 @@ function offerApproval(a, note) {
   const nodes = sign ? [sign] : [];
   let create = null;
   if (a.canEnroll && !a.credential) {
-    const label = "Create a passkey for this organization";
+    const root = a.read.root_principal_id != null;
+    const label = root
+      ? "Create your organization's passkey"
+      : "Create a passkey for this organization";
     const className = sign ? "secondary" : undefined;
     // Signing in comes first, so that a passkey is never created that the service then refuses.
     // A page that cannot tell whether it came back from signing in creates one and lets the
@@ -985,12 +1011,18 @@ function offerApproval(a, note) {
       const exclude = a.read.credentials.map((x) => x.credential_id);
       const options = createOptions(a.view, a.orgName, exclude);
       const retry = (n) => offerApproval(a, n);
-      create = createButton(label, options, retry, (key) => enroll(a, key), className);
+      const next = (key) => (root ? offerOrgRoot(a, key).focus() : enroll(a, key));
+      create = createButton(label, options, retry, next, className);
     }
     nodes.push(create);
   }
   offer(a.ui, note, ...nodes, declineButton(a));
   return { sign, create };
+}
+
+// The sign-in cookie that lets a ticket enroll a passkey is host-only and SameSite=Strict.
+function sameOrigin(view) {
+  return new URL(view.signer.api_origin).origin === location.origin;
 }
 
 function enrollKey(ticket) {
@@ -1038,9 +1070,11 @@ async function signIn(a) {
   location.assign(url);
 }
 
-// The request, with the sentence that refuses it when the read failed or it is not open.
+// The request, with the sentence that refuses it when the read failed or it is not open. The
+// service names an organization without a key only to its signed-in owner.
 async function reread(view, ticket) {
-  const reply = await api(view, "GET", `/v1/approval-requests/${ticket}`);
+  const credentials = sameOrigin(view) ? "same-origin" : "omit";
+  const reply = await api(view, "GET", `/v1/approval-requests/${ticket}`, undefined, credentials);
   return {
     read: reply.body,
     refusal: reply.status === 200 ? approvalRefusal(reply.body) : failure(reply),
@@ -1053,30 +1087,41 @@ async function enroll(a, key) {
   // The service's sign-in cookie is what lets this ticket enroll a passkey.
   const path = `/v1/approval-requests/${a.ticket}/passkey`;
   const reply = await api(a.view, "POST", path, body, "same-origin");
-  if (reply.status !== 201 || reply.body?.credential_id !== key.id) {
-    const code = errorCode(reply.body);
-    if (code === "request_expired") return stop(MESSAGES.approval_expired);
-    if (code === "sign_in_required") {
-      // Just back from signing in, a second redirect would only loop.
-      if (!a.signedIn) return signIn(a);
-      a.signedIn = false;
-      return offerApproval(a, MESSAGES.sign_in_failed);
-    }
-    const notes = {
-      enroll_not_allowed: MESSAGES.no_credentials,
-      already_enrolled: MESSAGES.already_enrolled,
-      credential_known: MESSAGES.credential_known,
-      enroll_limit: MESSAGES.enroll_limit,
-    };
-    if (Object.hasOwn(notes, code)) {
-      a.canEnroll = false;
-      // A passkey enrolled elsewhere is on the ticket now, so the page reads which ones to ask.
-      const { read, refusal } = await reread(a.view, a.ticket);
-      if (!refusal) a.read.credentials = read.credentials;
-      return offerApproval(a, notes[code]);
-    }
-    return offerApproval(a, approvalFailure(reply));
+  if (reply.status !== 201 || reply.body?.credential_id !== key.id) return refusedKey(a, reply);
+  return useNewKey(a, key);
+}
+
+// The next step after the service refused a passkey created through the ticket; `otherwise`
+// answers a refusal the page has no sentence for.
+async function refusedKey(a, reply, otherwise = () => offerApproval(a, approvalFailure(reply))) {
+  const code = errorCode(reply.body);
+  if (code === "request_expired") return stop(MESSAGES.approval_expired);
+  if (code === "root_taken") return stop(MESSAGES.root_taken);
+  if (code === "sign_in_required") {
+    // Just back from signing in, a second redirect would only loop.
+    if (!a.signedIn) return signIn(a);
+    a.signedIn = false;
+    return offerApproval(a, MESSAGES.sign_in_failed);
   }
+  const notes = {
+    enroll_not_allowed: MESSAGES.no_credentials,
+    already_enrolled: MESSAGES.already_enrolled,
+    already_rooted: MESSAGES.already_enrolled,
+    credential_known: MESSAGES.credential_known,
+    enroll_limit: MESSAGES.enroll_limit,
+  };
+  if (Object.hasOwn(notes, code)) {
+    a.canEnroll = false;
+    // A passkey enrolled elsewhere is on the ticket now, so the page reads which ones to ask.
+    const { read, refusal } = await reread(a.view, a.ticket);
+    if (!refusal) a.read.credentials = read.credentials;
+    return offerApproval(a, notes[code]);
+  }
+  return otherwise();
+}
+
+// Limits every touch to a passkey the service has just put on the ticket.
+async function useNewKey(a, key) {
   // A failed read stops here: a reload finds the new passkey on the ticket.
   const { read, refusal } = await reread(a.view, a.ticket);
   if (refusal) return stop(refusal);
@@ -1084,6 +1129,41 @@ async function enroll(a, key) {
   a.read.credentials = read.credentials;
   a.credential = key.id;
   offerApproval(a, MESSAGES.added).sign.focus();
+}
+
+// The second touch: the new passkey signs the document that makes it the organization's root.
+function offerOrgRoot(a, key, note) {
+  const sign = offerRegistration(a, note ?? syncSentence(key), {
+    ...rootStep(a.read.org_id, a.read.root_principal_id, key),
+    relay: (registration) => postRoot(a, key, registration),
+    retry: (n) => offerOrgRoot(a, key, n),
+  });
+  a.ui.step.append(declineButton(a));
+  return sign;
+}
+
+function syncSentence(key) {
+  return key.backed_up ? MESSAGES.root_synced : MESSAGES.root_device_bound;
+}
+
+async function postRoot(a, key, registration) {
+  const path = `/v1/approval-requests/${a.ticket}/root`;
+  const orgId = a.read.org_id;
+  const { reply, signed } = await relayKey(a.view, path, orgId, key, registration, "same-origin");
+  // The KMS may hold this key already, and then no other passkey can become the root: the same
+  // document is sent again, which the service answers as the first time.
+  const again = (note) =>
+    offer(
+      a.ui,
+      note,
+      button("Try again", () => postRoot(a, key, registration)),
+      declineButton(a),
+    );
+  if (reply.status !== 201) return refusedKey(a, reply, () => again(approvalFailure(reply)));
+  // The receipt covers the public key; only the body names the credential the service stored.
+  if (!signed || reply.body.credential_id !== key.id) return again(MESSAGES.not_confirmed);
+  a.ui.facts.append(el("p", syncSentence(key), key.backed_up ? "muted" : "warning"));
+  return useNewKey(a, key);
 }
 
 // The first click reads the Secret values, so its inputs are built in the click, before any await.
