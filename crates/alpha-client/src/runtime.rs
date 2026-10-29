@@ -27,6 +27,10 @@ pub const SOCKET_PATH: &str = "/run/alpha/runtime.sock";
 /// CVM's 443.
 pub const TLS_PORT: u16 = 8443;
 
+/// Plain HTTP for the host: `GET /leaf` and `GET /ready` for a kubelet probe. A Kata agent policy
+/// refuses exec, and the host cannot present an Instance leaf to a caller-pinned Endpoint.
+pub const PROBE_PORT: u16 = 8444;
+
 /// The service the runtime proxies to, reached by name over the compose network: a key purpose
 /// whose dot-separated labels are 1 to 63 bytes, as DNS requires.
 pub fn is_upstream_host(name: &str) -> bool {

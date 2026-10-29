@@ -912,12 +912,12 @@ async fn a_caller_pinned_endpoint_serves_only_listed_apps_and_answers_ready_in_p
     let (port, _) = start_plain_service().await;
     let local = "127.0.0.1:0".parse().unwrap();
     // A runtime of the App, its Endpoint pinned to `callers`.
-    let pinned = |callers: Vec<AppId>| {
+    let pinned = |callers: Vec<AppId>, tls_ready: Option<String>| {
         let h = &h;
         async move {
             let config = Config {
                 tls_callers: callers,
-                tls_ready: Some("/".into()),
+                tls_ready,
                 ..config_with_upstream(h, port)
             };
             let (runtime, _) = start_runtime(h, config);
@@ -937,8 +937,8 @@ async fn a_caller_pinned_endpoint_serves_only_listed_apps_and_answers_ready_in_p
             )
         }
     };
-    let (runtime, socket, (addr, probe)) = pinned(vec![app]).await;
-    let (_, other_socket, (other_addr, _)) = pinned(vec![AppId::mint()]).await;
+    let (runtime, socket, (addr, probe)) = pinned(vec![app], Some("/".into())).await;
+    let (_, other_socket, (other_addr, other_probe)) = pinned(vec![AppId::mint()], None).await;
 
     let ca = tls::cert_from_pem(&h.ca_pem).unwrap();
     let as_instance = |identity| {
@@ -961,6 +961,11 @@ async fn a_caller_pinned_endpoint_serves_only_listed_apps_and_answers_ready_in_p
     assert!(!served(other_addr, &as_instance(Some(leaf()))).await);
     assert!(!served(addr, &as_instance(None)).await);
     assert_eq!(probe_get(probe, "/ready").await.0, 200);
+    assert_eq!(
+        probe_get(other_probe, "/ready").await.0,
+        200,
+        "no readiness path: the leaf alone"
+    );
     let (status, chain) = probe_get(probe, "/leaf").await;
     assert_eq!(status, 200);
     let presented = tls::cert_from_pem(&runtime.attested().unwrap().chain_pem[0]).unwrap();
