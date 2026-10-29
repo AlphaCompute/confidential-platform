@@ -15,8 +15,8 @@
 
 use std::io::Write;
 use std::sync::OnceLock;
-use std::sync::mpsc::{self, SyncSender};
-use std::time::{Duration, SystemTime};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::time::{Duration, Instant, SystemTime};
 
 use alpha_core::{AppId, ComposeHash};
 use serde_json::{Map, Value};
@@ -155,10 +155,20 @@ fn send(sink: &SyncSender<Message>, line: String) {
 }
 
 fn flush_into(sink: &SyncSender<Message>, timeout: Duration) {
+    let start = Instant::now();
     let (done, flushed) = mpsc::channel();
-    if sink.try_send(Message::Flushed(done)).is_ok() {
-        let _ = flushed.recv_timeout(timeout);
+    let mut message = Message::Flushed(done);
+    loop {
+        match sink.try_send(message) {
+            Ok(()) => break,
+            Err(TrySendError::Full(back)) if start.elapsed() < timeout => {
+                message = back;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return,
+        }
     }
+    let _ = flushed.recv_timeout(timeout.saturating_sub(start.elapsed()));
 }
 
 /// A full or closed stderr loses the line rather than stopping the service.
