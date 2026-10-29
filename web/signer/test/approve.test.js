@@ -378,7 +378,7 @@ test("an organization without a key is rooted by its new passkey, which then app
   await page.click("Confirm with passkey");
   const confirm = laptop.log[1];
   assert.deepEqual(ids(confirm.options.allowCredentials), [created.id]);
-  const { payload, signature } = api.roots[0].body.registration;
+  const { payload, signature } = api.roots[0].registration;
   assert.deepEqual(payload, {
     org_id: api.org_id,
     principal_id: principal,

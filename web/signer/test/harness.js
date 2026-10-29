@@ -745,10 +745,9 @@ function approvalApi(options = {}) {
       api.read || { status: 200, body: Object.fromEntries(fields.map((k) => [k, api[k]])) },
     [`POST ${base}/root`]: (req) => {
       const key = keyBody(req.body);
-      api.roots.push({ text: req.body, body: JSON.parse(req.body) });
+      api.roots.push({ ...key, text: req.body });
       if (api.reply.root) return api.reply.root();
       const response = registerKey(api, key);
-      api.root_principal_id = undefined;
       return {
         status: 201,
         body: {
