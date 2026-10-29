@@ -433,7 +433,12 @@ async function loadPage(options = {}) {
       );
       const route = routes[key] || routes[prefix];
       if (!route) return jsonReply(404, { error: "no route", error_code: "SHROUD_NOT_FOUND" });
-      const answer = await route({ method, path: pathname, body: init.body });
+      const answer = await route({
+        method,
+        path: pathname,
+        body: init.body,
+        credentials: init.credentials,
+      });
       if (answer instanceof Error) throw new TypeError("network");
       return jsonReply(answer.status, answer.body, answer.headers);
     }
@@ -718,6 +723,8 @@ function approvalApi(options = {}) {
     enrolled: [],
     roots: [],
     root_principal_id: options.root_principal_id,
+    // Whether the browser holds the service's sign-in cookie for this ticket.
+    signedIn: options.signedIn ?? true,
     reply: {},
     revisionReceipt: (text, response) => mintReceipt("revision.register", text, response),
     putReceipt: (text, response) => mintReceipt("secret.put", text, response),
@@ -741,12 +748,18 @@ function approvalApi(options = {}) {
     "root_principal_id",
   ];
   api.routes = {
-    [`GET ${base}`]: () =>
-      api.read || { status: 200, body: Object.fromEntries(fields.map((k) => [k, api[k]])) },
+    [`GET ${base}`]: (req) => {
+      if (api.read) return api.read;
+      const body = Object.fromEntries(fields.map((k) => [k, api[k]]));
+      const owner = api.signedIn && req.credentials === "same-origin";
+      if (api.root_principal_id != null && !owner) delete body.org_id;
+      return { status: 200, body };
+    },
     [`POST ${base}/root`]: (req) => {
       const key = keyBody(req.body);
       api.roots.push({ ...key, text: req.body });
-      if (api.reply.root) return api.reply.root();
+      const answer = api.reply.root && api.reply.root();
+      if (answer) return answer;
       const response = registerKey(api, key);
       return {
         status: 201,

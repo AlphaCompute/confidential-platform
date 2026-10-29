@@ -40,6 +40,10 @@ signs the `org-root-key` document with it, and sends that document with the cook
 `POST /v1/approval-requests/{ticket}/root`. The page continues only when the receipt names this
 organization and this public key. It also says whether the provider backs the passkey up. A
 `root_taken` answer means that another key holds the root, and the page stops without approval.
+The service names such an organization only to its signed-in owner, so the page reads the ticket
+with the cookie and signs in until the read names the organization. When the root post gets no
+answer or an answer the page cannot explain, the page sends the same document again. The KMS can
+already hold that key, and then a new passkey can never become the root.
 
 ## Revocation
 

@@ -349,11 +349,12 @@ const DEVICE_ROOT =
 const ROOT_TAKEN =
   "Your organization was claimed by another key. Do not approve. Contact AlphaCompute.";
 // A request of an organization without a key, on a device that holds none of its passkeys.
-async function rootPage(pageOptions) {
+async function rootPage(pageOptions, apiOptions = {}) {
   const request = {
     compose: withoutSecrets(),
     credentials: [],
     root_principal_id: crypto.randomUUID(),
+    ...apiOptions,
   };
   const opened = await approvalPage(request, pageOptions);
   opened.laptop.prefer = undefined;
@@ -421,6 +422,45 @@ test("a root the service wants signed in for sends the person to sign in", async
   await page.click("Confirm with passkey");
   assert.deepEqual(page.assigned, [ENROLL_LOGIN]);
   assert.equal(api.revisions.length, 0);
+});
+
+test("an owner the service does not know as signed in signs in before the root", async () => {
+  const anonymous = await rootPage({}, { signedIn: false });
+  const read = anonymous.page.fetches.find((f) => f.method === "GET" && f.url.endsWith(TICKET));
+  assert.equal(read.credentials, "same-origin");
+  assert.ok(anonymous.page.text().includes(SIGN_IN), anonymous.page.text());
+  await anonymous.page.click(CREATE_ROOT);
+  assert.deepEqual(anonymous.page.assigned, [ENROLL_LOGIN]);
+  assert.equal(anonymous.laptop.log.length, 0);
+
+  const back = await rootPage(signedIn(), { signedIn: false });
+  assert.ok(back.page.text().includes("Sign-in did not complete. Try again."), back.page.text());
+  await back.page.click(CREATE_ROOT);
+  assert.deepEqual(back.page.assigned, [ENROLL_LOGIN]);
+  assert.equal(back.laptop.log.length, 0);
+
+  const unmarked = await rootPage({ sessionStorage: deniedStorage() }, { signedIn: false });
+  await unmarked.page.click(CREATE_ROOT);
+  assert.deepEqual(unmarked.page.assigned, [ENROLL_LOGIN]);
+  assert.equal(unmarked.api.roots.length, 0);
+});
+
+test("a root post that may have reached the KMS is sent again unchanged", async () => {
+  const { api, page, laptop } = await rootPage(signedIn());
+  const refused = { status: 502, body: { error: { code: "kms_refused" } } };
+  const failures = [new Error("network"), refused];
+  api.reply.root = () => failures.shift();
+  await page.click(CREATE_ROOT);
+  await page.click("Confirm with passkey");
+  assert.deepEqual(page.buttons(), ["Try again", "Decline"]);
+  await page.click("Try again");
+  assert.deepEqual(page.buttons(), ["Try again", "Decline"]);
+  await page.click("Try again");
+  assert.equal(api.roots.length, 3);
+  assert.ok(api.roots.every((r) => r.text === api.roots[0].text));
+  assert.equal(laptop.log.length, 2);
+  await page.click("Approve with passkey");
+  assert.ok(page.text().includes(APPROVED), page.text());
 });
 
 test("an organization another key already rooted stops the approval", async () => {
