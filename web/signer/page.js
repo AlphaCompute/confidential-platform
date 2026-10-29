@@ -556,12 +556,17 @@ async function register(c, key, registration) {
 
 // One step that signs a key document and relays it: `allow` limits the passkeys asked, `keyIdFor`
 // maps the one that answered to its KMS key id (undefined for the root's self-signature), `relay`
-// answers `{signed}`, `{note}`, or `{}` once it has handled a refusal itself, and `next` runs
-// once the receipt verified. Returns the button that signs.
+// sends the signed document and takes the next step, and `next` runs once the receipt verified.
+// Returns the button that signs.
 function offerRegistration(c, note, step) {
   const signable = wasm_bindgen.signingDigest(step.context, JSON.stringify(step.payload));
   const options = getOptions(c.view, signable.digest, step.allow);
-  const relay = step.relay || ((registration) => register(c, step.key, registration));
+  const relay =
+    step.relay ||
+    (async (registration) => {
+      const result = await register(c, step.key, registration);
+      return result.signed ? step.next() : step.retry(result.note);
+    });
   const sign = button(step.label, async () => {
     const { credential, note } = await passkey("get", options);
     if (!credential) return step.retry(note);
@@ -570,9 +575,7 @@ function offerRegistration(c, note, step) {
     const registration = wasm_bindgen.canonicalJson(
       JSON.stringify({ payload: step.payload, signature: signatureObject(credential, keyId) }),
     );
-    const result = await relay(registration);
-    if (result.signed) return step.next();
-    if (result.note) return step.retry(result.note);
+    return relay(registration);
   });
   offer(c.ui, note, sign);
   return sign;
@@ -1148,10 +1151,7 @@ async function rootWith(a, key) {
 function offerOrgRoot(a, key, note) {
   const sign = offerRegistration(a, note ?? syncSentence(key), {
     ...rootStep(a.read.org_id, a.read.root_principal_id, key),
-    relay: async (registration) => {
-      await postRoot(a, key, registration);
-      return {};
-    },
+    relay: (registration) => postRoot(a, key, registration),
     retry: (n) => offerOrgRoot(a, key, n),
   });
   a.ui.step.append(declineButton(a));
