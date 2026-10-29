@@ -870,16 +870,17 @@ async function startApproval(view, viewText, ticket) {
   const a = { view, viewText, read, ticket, ui, launch, orgName, credential: null, values: null };
   a.signedIn = backFromSignIn(ticket);
   // The sign-in cookie that lets a ticket enroll a passkey is host-only and SameSite=Strict.
+  let note = a.signedIn ? MESSAGES.signed_in : undefined;
   if (new URL(view.signer.api_origin).origin !== location.origin) {
-    if (!read.credentials.length) return stop(MESSAGES.no_credentials);
     a.canEnroll = false;
+    note = read.credentials.length ? undefined : MESSAGES.no_credentials;
   }
   a.fields = secretFields(launch.services, before, putSecrets(read));
   a.secretsBox = el("div");
   a.secretsBox.append(...a.fields.map((f) => f.node));
   ui.facts.replaceChildren(...describeLaunch(a), a.secretsBox);
-  const shown = offerApproval(a, a.signedIn ? MESSAGES.signed_in : undefined);
-  if (a.signedIn) shown.create.focus();
+  const shown = offerApproval(a, note);
+  if (a.signedIn) shown.create?.focus();
 }
 
 function declaredSecrets(services) {

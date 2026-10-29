@@ -334,10 +334,13 @@ test("a passkey the service will not enroll leaves the contact sentence", async 
     { compose: withoutSecrets(), credentials: [] },
     { origin: "https://other-signer.test" },
   );
-  assert.equal(
+  assert.ok(
+    crossOrigin.page.text().includes(
+      "No passkey of this organization is known. Ask your AlphaCompute contact.",
+    ),
     crossOrigin.page.text(),
-    "No passkey of this organization is known. Ask your AlphaCompute contact.",
   );
+  assert.deepEqual(crossOrigin.page.buttons(), ["Decline"]);
 });
 
 const CATALOG = JSON.parse(testdata("catalog/expected.json"));
