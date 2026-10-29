@@ -175,8 +175,18 @@ pub fn emit(
     fields: Vec<(&'static str, Field)>,
 ) {
     if let Some(sink) = stderr() {
-        let _ = sink.try_send(Message::Line(line(level, service, event, fields)));
+        emit_into(sink, level, service, event, fields);
     }
+}
+
+fn emit_into(
+    sink: &SyncSender<Message>,
+    level: &'static str,
+    service: &'static str,
+    event: &'static str,
+    fields: Vec<(&'static str, Field)>,
+) {
+    let _ = sink.try_send(Message::Line(line(level, service, event, fields)));
 }
 
 /// Waits at most a second for the queued lines to reach stderr; call it before the process exits.
@@ -246,8 +256,12 @@ mod tests {
         let sink = writer(pipe).unwrap();
         let start = Instant::now();
         for _ in 0..4 * QUEUE {
-            let _ = sink.try_send(Message::Line("x".repeat(100)));
+            emit_into(&sink, "info", "alpha-test", "flood", vec![]);
         }
+        assert!(matches!(
+            sink.try_send(Message::Line(String::new())),
+            Err(TrySendError::Full(_))
+        ));
         flush_into(&sink, Duration::from_millis(100));
         assert!(start.elapsed() < Duration::from_secs(1));
     }
