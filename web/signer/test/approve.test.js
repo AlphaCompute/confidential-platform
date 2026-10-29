@@ -242,6 +242,8 @@ const ENROLL_LOGIN =
 const ENROLL_MARK = `alphacompute-enroll-sha256:${sha256(TICKET).toString("hex")}`;
 // A tab back from the service's sign-in, which the page marked before it left.
 const signedIn = () => ({ sessionStorage: memoryStorage({ [ENROLL_MARK]: "1" }) });
+const focused = (page, label) =>
+  page.find((n) => n.tagName === "BUTTON" && n.textContent === label)?.focused;
 
 test("creating a passkey signs in first, before any passkey is made", async () => {
   const session = memoryStorage();
@@ -279,17 +281,13 @@ test("back from signing in, a new passkey is enrolled and then the only one aske
   laptop.prefer = undefined;
   assert.equal(pageOptions.sessionStorage.getItem(ENROLL_MARK), null);
   assert.ok(page.text().includes("Signed in. Create your passkey to continue."), page.text());
-  const create = page.find((n) => n.tagName === "BUTTON" && n.textContent === CREATE);
-  assert.ok(create?.focused, page.text());
+  assert.ok(focused(page, CREATE), page.text());
   await page.click(CREATE);
   const created = laptop.log[0].result;
   assert.deepEqual(api.enrolled, [{ credential_id: created.id, public_key: created.spki }]);
   const post = page.fetches.find((f) => f.url.endsWith("/passkey"));
   assert.equal(post.credentials, "same-origin");
-  const approve = page.find(
-    (n) => n.tagName === "BUTTON" && n.textContent === "Approve with passkey",
-  );
-  assert.ok(approve?.focused, page.text());
+  assert.ok(focused(page, "Approve with passkey"), page.text());
   await page.click("Approve with passkey");
   const got = laptop.log[1];
   assert.deepEqual(ids(got.options.allowCredentials), [created.id]);
@@ -361,8 +359,6 @@ async function rootPage(pageOptions) {
   opened.laptop.prefer = undefined;
   return opened;
 }
-const focused = (page, label) =>
-  page.find((n) => n.tagName === "BUTTON" && n.textContent === label)?.focused;
 
 test("an organization without a key is rooted by its new passkey, which then approves", async () => {
   const { api, page, laptop } = await rootPage(signedIn());
