@@ -150,10 +150,6 @@ fn stderr() -> Option<&'static SyncSender<Message>> {
     SINK.get_or_init(|| writer(std::io::stderr())).as_ref()
 }
 
-fn send(sink: &SyncSender<Message>, line: String) {
-    let _ = sink.try_send(Message::Line(line));
-}
-
 fn flush_into(sink: &SyncSender<Message>, timeout: Duration) {
     let start = Instant::now();
     let (done, flushed) = mpsc::channel();
@@ -179,7 +175,7 @@ pub fn emit(
     fields: Vec<(&'static str, Field)>,
 ) {
     if let Some(sink) = stderr() {
-        send(sink, line(level, service, event, fields));
+        let _ = sink.try_send(Message::Line(line(level, service, event, fields)));
     }
 }
 
@@ -250,7 +246,7 @@ mod tests {
         let sink = writer(pipe).unwrap();
         let start = std::time::Instant::now();
         for _ in 0..4 * QUEUE {
-            send(&sink, "x".repeat(100));
+            let _ = sink.try_send(Message::Line("x".repeat(100)));
         }
         flush_into(&sink, Duration::from_millis(100));
         assert!(start.elapsed() < Duration::from_secs(1));

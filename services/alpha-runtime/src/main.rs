@@ -16,16 +16,15 @@ use tokio::net::UnixListener;
 async fn main() {
     // First: Docker runs this as a second process in the live container, and the server path
     // removes and rebinds the live socket.
-    if std::env::args().nth(1).as_deref() == Some("healthcheck") {
-        let code = healthcheck();
-        alpha_client::log::flush();
-        std::process::exit(code);
-    }
-    let code = match run().await {
-        Ok(exit) => exit.code(),
-        Err(e) => {
-            alpha_client::error!("exit", error = e.kind());
-            e.exit_code()
+    let code = if std::env::args().nth(1).as_deref() == Some("healthcheck") {
+        healthcheck()
+    } else {
+        match run().await {
+            Ok(exit) => exit.code(),
+            Err(e) => {
+                alpha_client::error!("exit", error = e.kind());
+                e.exit_code()
+            }
         }
     };
     alpha_client::log::flush();
