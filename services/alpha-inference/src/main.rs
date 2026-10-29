@@ -30,6 +30,7 @@ async fn main() {
             1
         }
     };
+    alpha_client::log::flush();
     std::process::exit(code);
 }
 

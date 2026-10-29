@@ -17,8 +17,10 @@ const LISTEN: &str = "0.0.0.0:8443";
 async fn main() {
     if let Err(step) = run().await {
         alpha_client::error!("exit", step = step);
+        alpha_client::log::flush();
         std::process::exit(1);
     }
+    alpha_client::log::flush();
 }
 
 /// The failed step; its error text may carry a peer's answer, so it stays out of the line.

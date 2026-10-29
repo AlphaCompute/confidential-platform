@@ -17,7 +17,9 @@ async fn main() {
     // First: Docker runs this as a second process in the live container, and the server path
     // removes and rebinds the live socket.
     if std::env::args().nth(1).as_deref() == Some("healthcheck") {
-        std::process::exit(healthcheck());
+        let code = healthcheck();
+        alpha_client::log::flush();
+        std::process::exit(code);
     }
     let code = match run().await {
         Ok(exit) => exit.code(),
@@ -26,6 +28,7 @@ async fn main() {
             e.exit_code()
         }
     };
+    alpha_client::log::flush();
     std::process::exit(code);
 }
 
