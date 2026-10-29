@@ -238,6 +238,10 @@ impl ServerCertVerifier for PinnedServer {
     }
 }
 
+/// The ALPN protocol id a client offers to get an Endpoint's Instance leaf: an Endpoint with a
+/// public name serves its browser-trusted certificate to every other client.
+pub const INSTANCE_ALPN: &[u8] = b"alphacompute-instance/1";
+
 /// `time` is the clock certificate validity is judged by; `main` passes
 /// `rustls::time_provider::DefaultTimeProvider`, a test can pin it to a capture.
 pub fn client_config(
@@ -246,7 +250,7 @@ pub fn client_config(
     time: Arc<dyn TimeProvider>,
 ) -> Result<ClientConfig, Error> {
     let builder = pinned_builder(pin, time)?;
-    Ok(match identity {
+    Ok(with_instance_alpn(match identity {
         None => builder.with_no_client_auth(),
         Some(identity) => builder
             .with_client_auth_cert(
@@ -258,7 +262,7 @@ pub fn client_config(
                 PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.pkcs8)),
             )
             .map_err(|e| Error::Invalid(format!("client identity: {e}")))?,
-    })
+    }))
 }
 
 /// As [`client_config`], presenting whatever `cert` resolves at each handshake, so a renewed
@@ -268,7 +272,15 @@ pub fn renewing_client_config(
     cert: Arc<dyn ResolvesClientCert>,
     time: Arc<dyn TimeProvider>,
 ) -> Result<ClientConfig, Error> {
-    Ok(pinned_builder(Some(pin), time)?.with_client_cert_resolver(cert))
+    Ok(with_instance_alpn(
+        pinned_builder(Some(pin), time)?.with_client_cert_resolver(cert),
+    ))
+}
+
+/// `http/1.1` too: a listener that advertises only it refuses a client that offers no match.
+fn with_instance_alpn(mut config: ClientConfig) -> ClientConfig {
+    config.alpn_protocols = vec![INSTANCE_ALPN.to_vec(), b"http/1.1".to_vec()];
+    config
 }
 
 fn pinned_builder(

@@ -137,7 +137,7 @@ enum Handshake<'a> {
     Public(&'a str, Arc<CertifiedKey>),
 }
 
-/// A browser on the public name keeps the Instance leaf until the first certificate arrives,
+/// A client on the public name keeps the Instance leaf until the first certificate arrives,
 /// and while the Instance leaf has expired, so no public handshake outlives the attestation.
 /// A public handshake gets the certificate read here, which its binding then signs, even if a
 /// renewal replaces it in between.
