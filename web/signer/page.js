@@ -544,16 +544,6 @@ async function relayKey(view, path, orgId, key, registration, credentials) {
   return { reply, signed: typeof signed?.id === "string" ? signed : null };
 }
 
-async function register(c, key, registration) {
-  const path = `/v1/claims/${c.ticket}/keys`;
-  const { reply, signed } = await relayKey(c.view, path, c.session.org_id, key, registration);
-  if (reply.status !== 200) return { note: failure(reply) };
-  if (!signed) return { note: MESSAGES.not_confirmed };
-  key.key_id = signed.id;
-  saveSession(c);
-  return { signed };
-}
-
 // One step that signs a key document and relays it: `allow` limits the passkeys asked, `keyIdFor`
 // maps the one that answered to its KMS key id (undefined for the root's self-signature), `relay`
 // sends the signed document and takes the next step, and `next` runs once the receipt verified.
@@ -564,8 +554,14 @@ function offerRegistration(c, note, step) {
   const relay =
     step.relay ||
     (async (registration) => {
-      const result = await register(c, step.key, registration);
-      return result.signed ? step.next() : step.retry(result.note);
+      const path = `/v1/claims/${c.ticket}/keys`;
+      const orgId = c.session.org_id;
+      const { reply, signed } = await relayKey(c.view, path, orgId, step.key, registration);
+      if (reply.status !== 200) return step.retry(failure(reply));
+      if (!signed) return step.retry(MESSAGES.not_confirmed);
+      step.key.key_id = signed.id;
+      saveSession(c);
+      return step.next();
     });
   const sign = button(step.label, async () => {
     const { credential, note } = await passkey("get", options);
