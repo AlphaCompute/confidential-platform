@@ -220,7 +220,11 @@ fn add_readiness_probe(pod: &mut Mapping) {
                 ("path".into(), "/ready".into()),
                 ("port".into(), PROBE_PORT.into()),
             ]);
-            let probe = Mapping::from_iter([("httpGet".into(), get.into())]);
+            // kubelet's default of 1 s would cut the runtime's 2 s check of the upstream.
+            let probe = Mapping::from_iter([
+                ("httpGet".into(), get.into()),
+                ("timeoutSeconds".into(), 3.into()),
+            ]);
             container.insert("readinessProbe".into(), probe.into());
         }
     }
@@ -578,7 +582,10 @@ mod tests {
         let tls = "    env:\n    - {name: ALPHACOMPUTE_TLS_UPSTREAM, value: '127.0.0.1:8080'}\n";
         assert_eq!(
             probe(&runtime(tls)),
-            Some(serde_yaml_ng::from_str("{httpGet: {path: /ready, port: 8444}}").unwrap())
+            Some(
+                serde_yaml_ng::from_str("{httpGet: {path: /ready, port: 8444}, timeoutSeconds: 3}")
+                    .unwrap()
+            )
         );
         assert_eq!(probe(&runtime("")), None, "no TLS listener to wait on");
         let own = format!("{tls}    readinessProbe: {{tcpSocket: {{port: 9000}}}}\n");
