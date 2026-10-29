@@ -600,6 +600,31 @@ function iso(ms) {
   return new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
+// The parts of a `{"credential_id":…,"registration":…}` body, with the registration's exact text.
+function keyBody(text) {
+  const prefix = /^\{"credential_id":("[A-Za-z0-9_-]+"),"registration":/.exec(text);
+  assert.ok(prefix && text.endsWith("}"), `unexpected key body ${text}`);
+  const registrationText = text.slice(prefix[0].length, -1);
+  return {
+    credentialId: JSON.parse(prefix[1]),
+    registrationText,
+    registration: JSON.parse(registrationText),
+  };
+}
+
+// The KMS's response to a key registration, with the key added to `api.credentials`.
+function registerKey(api, key) {
+  const response = {
+    id: crypto.randomUUID(),
+    principal_id: key.registration.payload.principal_id,
+    org_id: api.org_id,
+    public_key: key.registration.payload.public_key,
+    created_at: RECEIPT_TIME,
+  };
+  api.credentials.push({ credential_id: key.credentialId, key_id: response.id });
+  return response;
+}
+
 // shroud-go's claim routes for one ticket, with the KMS behind them answering every key
 // registration with a receipt. `api.receiptFor(registrationText, response)` may be replaced to
 // return a receipt that must fail.
@@ -650,26 +675,15 @@ function claimApi(options = {}) {
       return { status: 200, body: { org_id: api.org_id, principal_id: api.principal_id } };
     },
     [`POST ${base}/keys`]: (req) => {
-      const prefix = /^\{"credential_id":("[A-Za-z0-9_-]+"),"registration":/.exec(req.body);
-      assert.ok(prefix && req.body.endsWith("}"), `unexpected keys body ${req.body}`);
-      const credentialId = JSON.parse(prefix[1]);
-      const registrationText = req.body.slice(prefix[0].length, -1);
-      const registration = JSON.parse(registrationText);
-      api.registrations.push({ credentialId, registrationText, registration, body: req.body });
-      if (api.keysReply) return api.keysReply(registrationText);
-      const response = {
-        id: crypto.randomUUID(),
-        principal_id: registration.payload.principal_id,
-        org_id: api.org_id,
-        public_key: registration.payload.public_key,
-        created_at: RECEIPT_TIME,
-      };
-      api.credentials.push({ credential_id: credentialId, key_id: response.id });
+      const key = keyBody(req.body);
+      api.registrations.push({ ...key, body: req.body });
+      if (api.keysReply) return api.keysReply(key.registrationText);
+      const response = registerKey(api, key);
       api.keys_left -= 1;
-      if (!registration.signature.key_id) api.state = "rooted";
+      if (!key.registration.signature.key_id) api.state = "rooted";
       return {
         status: 200,
-        body: { ...response, receipt: api.receiptFor(registrationText, response) },
+        body: { ...response, receipt: api.receiptFor(key.registrationText, response) },
       };
     },
   };
@@ -730,27 +744,18 @@ function approvalApi(options = {}) {
     [`GET ${base}`]: () =>
       api.read || { status: 200, body: Object.fromEntries(fields.map((k) => [k, api[k]])) },
     [`POST ${base}/root`]: (req) => {
-      const body = JSON.parse(req.body);
-      api.roots.push({ text: req.body, body });
-      if (api.reply.root) return api.reply.root(body);
-      const prefix = `{"credential_id":${JSON.stringify(body.credential_id)},"registration":`;
-      const registrationText = req.body.slice(prefix.length, -1);
-      const response = {
-        id: crypto.randomUUID(),
-        principal_id: body.registration.payload.principal_id,
-        org_id: api.org_id,
-        public_key: body.registration.payload.public_key,
-        created_at: RECEIPT_TIME,
-      };
-      api.credentials.push({ credential_id: body.credential_id, key_id: response.id });
+      const key = keyBody(req.body);
+      api.roots.push({ text: req.body, body: JSON.parse(req.body) });
+      if (api.reply.root) return api.reply.root();
+      const response = registerKey(api, key);
       api.root_principal_id = undefined;
       return {
         status: 201,
         body: {
-          credential_id: body.credential_id,
+          credential_id: key.credentialId,
           key_id: response.id,
           public_key: response.public_key,
-          receipt: mintReceipt("key.register", registrationText, response),
+          receipt: mintReceipt("key.register", key.registrationText, response),
         },
       };
     },

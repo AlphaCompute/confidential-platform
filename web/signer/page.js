@@ -991,7 +991,6 @@ function offerApproval(a, note) {
   const nodes = sign ? [sign] : [];
   let create = null;
   if (a.canEnroll && !a.credential) {
-    // An organization with no key yet is rooted by the passkey its owner creates here.
     const root = a.read.root_principal_id != null;
     const label = root
       ? "Create your organization's passkey"
