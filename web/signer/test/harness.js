@@ -747,10 +747,7 @@ function approvalApi(options = {}) {
       const body = JSON.parse(req.body);
       api.enrolled.push(body);
       if (api.reply.enroll) return api.reply.enroll(body);
-      api.credentials = [
-        ...api.credentials,
-        { credential_id: body.credential_id, key_id: crypto.randomUUID() },
-      ];
+      api.credentials.push({ credential_id: body.credential_id, key_id: crypto.randomUUID() });
       return { status: 201, body: { credential_id: body.credential_id } };
     },
     [`POST ${base}/kms-channel`]: (req) => {

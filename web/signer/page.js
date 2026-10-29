@@ -969,17 +969,17 @@ function offerApproval(a, note) {
   const sign = a.read.credentials.length ? button(label, run) : null;
   const nodes = sign ? [sign] : [];
   if (a.canEnroll && !a.credential) {
-    const label = "Create a passkey for this organization";
+    const create = "Create a passkey for this organization";
     const className = sign ? "secondary" : undefined;
     // Signing in comes first, so that a passkey is never created that the service then refuses.
     if (a.signedIn) {
       const exclude = a.read.credentials.map((x) => x.credential_id);
       const options = createOptions(a.view, a.orgName, exclude);
       nodes.push(
-        createButton(label, options, (n) => offerApproval(a, n), (key) => enroll(a, key), className),
+        createButton(create, options, (n) => offerApproval(a, n), (key) => enroll(a, key), className),
       );
     } else {
-      nodes.push(el("p", MESSAGES.sign_in), button(label, () => signIn(a), className));
+      nodes.push(el("p", MESSAGES.sign_in), button(create, () => signIn(a), className));
     }
   }
   offer(a.ui, note, ...nodes, declineButton(a));
@@ -988,6 +988,15 @@ function offerApproval(a, note) {
 
 function signIn(a) {
   location.assign(`${a.view.signer.api_origin}/v1/approval-requests/${a.ticket}/enroll-login`);
+}
+
+// The request read again, with the sentence that refuses it when the read failed or it is closed.
+async function reread(a) {
+  const reply = await api(a.view, "GET", `/v1/approval-requests/${a.ticket}`);
+  return {
+    read: reply.body,
+    refusal: reply.status === 200 ? approvalRefusal(reply.body) : failure(reply),
+  };
 }
 
 // Registers a passkey created here through the ticket, then limits every touch to it.
@@ -1010,23 +1019,17 @@ async function enroll(a, key) {
     if (Object.hasOwn(notes, code)) {
       a.canEnroll = false;
       // A passkey enrolled elsewhere is on the ticket now, so the page reads which ones to ask.
-      const fresh = await api(a.view, "GET", `/v1/approval-requests/${a.ticket}`);
-      if (fresh.status === 200 && !approvalRefusal(fresh.body)) {
-        a.read.credentials = fresh.body.credentials;
-      }
+      const { read, refusal } = await reread(a);
+      if (!refusal) a.read.credentials = read.credentials;
       return offerApproval(a, notes[code]);
     }
     return offerApproval(a, approvalFailure(reply));
   }
   // A failed read stops here: a reload finds the new passkey on the ticket.
-  const read = await api(a.view, "GET", `/v1/approval-requests/${a.ticket}`);
-  if (read.status !== 200) return stop(failure(read));
-  const refusal = approvalRefusal(read.body);
+  const { read, refusal } = await reread(a);
   if (refusal) return stop(refusal);
-  if (!read.body.credentials.some((c) => c.credential_id === key.id)) {
-    return stop(MESSAGES.unavailable);
-  }
-  a.read.credentials = read.body.credentials;
+  if (!read.credentials.some((c) => c.credential_id === key.id)) return stop(MESSAGES.unavailable);
+  a.read.credentials = read.credentials;
   a.credential = key.id;
   offerApproval(a, MESSAGES.added).focus();
 }
