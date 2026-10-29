@@ -236,36 +236,58 @@ test("a compose that hashes to the request but cannot be read is refused as unre
 const CREATE = "Create a passkey for this organization";
 const SIGN_IN =
   "Sign in with your AlphaCompute account to create a passkey for this organization.";
-const ENROLL_LOGIN = `${testView().view.signer.api_origin}/v1/approval-requests/${TICKET}/enroll-login`;
-const signedIn = { hash: `${TICKET}&enroll=1` };
+const ENROLL_LOGIN =
+  `${testView().view.signer.api_origin}/v1/approval-requests/${TICKET}/enroll-login`;
+const ENROLL_MARK = `alphacompute-enroll-sha256:${sha256(TICKET).toString("hex")}`;
+// A tab back from the service's sign-in, which the page marked before it left.
+const signedIn = () => ({ sessionStorage: memoryStorage({ [ENROLL_MARK]: "1" }) });
 
 test("creating a passkey signs in first, before any passkey is made", async () => {
-  const { api, page, laptop } = await approvalPage({ compose: withoutSecrets(), credentials: [] });
+  const session = memoryStorage();
+  const { api, page, laptop } = await approvalPage(
+    { compose: withoutSecrets(), credentials: [] },
+    { sessionStorage: session },
+  );
   assert.ok(page.text().includes(SIGN_IN), page.text());
   await page.click(CREATE);
   assert.deepEqual(page.assigned, [ENROLL_LOGIN]);
+  assert.equal(session.getItem(ENROLL_MARK), "1");
   assert.equal(laptop.log.length, 0);
   assert.equal(api.enrolled.length, 0);
 
-  const stale = await approvalPage({ compose: withoutSecrets(), credentials: [] }, signedIn);
+  const expired = await approvalPage({ compose: withoutSecrets(), credentials: [] });
+  expired.api.reply.login = () => ({ status: 410, body: { error: { code: "request_expired" } } });
+  await expired.page.click(CREATE);
+  assert.equal(expired.page.text(), "This approval link has expired.");
+  assert.deepEqual(expired.page.assigned, []);
+
+  const stale = await approvalPage({ compose: withoutSecrets(), credentials: [] }, signedIn());
   stale.laptop.prefer = undefined;
   stale.api.reply.enroll = () => ({ status: 401, body: { error: { code: "sign_in_required" } } });
   await stale.page.click(CREATE);
-  assert.deepEqual(stale.page.assigned, [ENROLL_LOGIN]);
+  assert.ok(stale.page.text().includes("Sign-in did not complete. Try again."), stale.page.text());
+  assert.deepEqual(stale.page.assigned, []);
 });
 
-test("back from signing in, a passkey created on the page is enrolled and then the only one asked", async () => {
+test("back from signing in, a new passkey is enrolled and then the only one asked", async () => {
+  const pageOptions = signedIn();
   const { api, page, laptop } = await approvalPage(
     { compose: withoutSecrets(), credentials: [] },
-    signedIn,
+    pageOptions,
   );
   laptop.prefer = undefined;
-  assert.deepEqual(page.buttons(), [CREATE, "Decline"]);
-  assert.ok(!page.text().includes(SIGN_IN), page.text());
+  assert.equal(pageOptions.sessionStorage.getItem(ENROLL_MARK), null);
+  assert.ok(page.text().includes("Signed in. Create your passkey to continue."), page.text());
+  const create = page.find((n) => n.tagName === "BUTTON" && n.textContent === CREATE);
+  assert.ok(create?.focused, page.text());
   await page.click(CREATE);
   const created = laptop.log[0].result;
   assert.deepEqual(api.enrolled, [{ credential_id: created.id, public_key: created.spki }]);
-  const approve = page.find((n) => n.tagName === "BUTTON" && n.textContent === "Approve with passkey");
+  const post = page.fetches.find((f) => f.url.endsWith("/passkey"));
+  assert.equal(post.credentials, "same-origin");
+  const approve = page.find(
+    (n) => n.tagName === "BUTTON" && n.textContent === "Approve with passkey",
+  );
   assert.ok(approve?.focused, page.text());
   await page.click("Approve with passkey");
   const got = laptop.log[1];
@@ -286,7 +308,10 @@ test("a prompt that gave no passkey of the request offers to create one", async 
 });
 
 test("a passkey the service will not enroll leaves the contact sentence", async () => {
-  const { api, page } = await approvalPage({ compose: withoutSecrets(), credentials: [] }, signedIn);
+  const { api, page } = await approvalPage(
+    { compose: withoutSecrets(), credentials: [] },
+    signedIn(),
+  );
   api.reply.enroll = () => ({ status: 403, body: { error: { code: "enroll_not_allowed" } } });
   await page.click(CREATE);
   assert.ok(
@@ -296,7 +321,7 @@ test("a passkey the service will not enroll leaves the contact sentence", async 
   assert.deepEqual(page.buttons(), ["Decline"]);
   assert.equal(api.revisions.length, 0);
 
-  const other = await approvalPage({ compose: withoutSecrets(), credentials: [] }, signedIn);
+  const other = await approvalPage({ compose: withoutSecrets(), credentials: [] }, signedIn());
   const elsewhere = other.laptop.enroll();
   other.api.reply.enroll = () => {
     other.api.credentials = [{ credential_id: elsewhere.id, key_id: crypto.randomUUID() }];

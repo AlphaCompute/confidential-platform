@@ -358,6 +358,7 @@ function memoryStorage(initial = {}) {
     data,
     getItem: (k) => (data.has(k) ? data.get(k) : null),
     setItem: (k, v) => data.set(k, String(v)),
+    removeItem: (k) => data.delete(k),
   };
 }
 
@@ -399,7 +400,7 @@ async function loadPage(options = {}) {
   async function fakeFetch(resource, init = {}) {
     const url = String(resource);
     const method = (init.method || "GET").toUpperCase();
-    fetches.push({ method, url, body: init.body, time: clock.now });
+    fetches.push({ method, url, body: init.body, credentials: init.credentials, time: clock.now });
     if (url === b.wasmName) {
       assert.equal(init.integrity, wasmSri, "the page fetched the wasm without its integrity");
       return new Response(b.wasm, { headers: { "Content-Type": "application/wasm" } });
@@ -669,7 +670,7 @@ function claimApi(options = {}) {
 
 // shroud-go's approval routes for one ticket, with the KMS behind them. Receipts come from
 // `api.revisionReceipt` and `api.putReceipt`, which a test may replace; `api.reply[route]` may
-// answer a route instead (route: "revision", "put", "enroll").
+// answer a route instead (route: "revision", "put", "enroll", "login").
 function approvalApi(options = {}) {
   const now = options.now === undefined ? Date.now() : options.now;
   const compose = options.compose;
@@ -743,6 +744,8 @@ function approvalApi(options = {}) {
         body: { ...response, receipt: api.revisionReceipt(req.body, response) },
       };
     },
+    [`GET ${base}/enroll-login`]: () =>
+      (api.reply.login && api.reply.login()) || { status: 302, body: "" },
     [`POST ${base}/passkey`]: (req) => {
       const body = JSON.parse(req.body);
       api.enrolled.push(body);

@@ -24,11 +24,13 @@ says "Approved" only after the receipt of every put and of the registration veri
 When a request names no passkey, or the prompt gave none of the ones it names, the page offers
 to create a passkey for the organization. The ticket alone must not add a key, so the person
 first signs in at `/v1/approval-requests/{ticket}/enroll-login`, and the service sends them back
-to `/sign/approve#<ticket>&enroll=1`. Only then does the page create the passkey and send its
-credential id and public key to `POST /v1/approval-requests/{ticket}/passkey`. shroud-go decides
-whether this person may enroll one and registers it at the KMS. The page then reads the request
-again and asks only the new passkey for every signature. A `401 sign_in_required` sends the
-person to sign in again.
+to the same approval link with a sign-in cookie. The service does not change the link, so before
+the page leaves it puts a mark in the tab's `sessionStorage`. On the return the page finds the
+mark, removes it, and then creates the passkey on one click. It sends the credential id and the
+public key, with the cookie, to `POST /v1/approval-requests/{ticket}/passkey`. shroud-go decides
+whether this person may enroll a passkey and registers it at the KMS. The page then reads the
+request again and asks only the new passkey for every signature. A tab that cannot keep the mark
+creates the passkey first, and a `401 sign_in_required` sends the person to sign in.
 
 ## Revocation
 
