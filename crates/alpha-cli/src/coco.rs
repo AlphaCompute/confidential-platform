@@ -10,7 +10,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use alpha_client::runtime::TLS_PORT;
+use alpha_client::runtime::PROBE_PORT;
 use alpha_core::{AppId, ComposeHash, InitData, has_sha256_digest};
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
@@ -193,9 +193,9 @@ pub fn parse(bytes: &[u8]) -> Result<Pod, String> {
     })
 }
 
-/// The platform replaces a copy only once the new pod is Ready, and `alpha-runtime` opens its TLS
-/// port only after the KMS issued its leaf, so this probe makes Ready mean attested. kubelet
-/// probes TCP from the host, not through the agent, so the policy and the Revision stay the same.
+/// The platform replaces a copy only once the new pod is Ready, and `alpha-runtime` answers
+/// `/ready` only while its KMS leaf is current, so Ready means attested now. kubelet probes HTTP
+/// from the host, not through the agent, so the policy and the Revision stay the same.
 fn add_readiness_probe(pod: &mut Mapping) {
     let Some(Yaml::Sequence(containers)) = pod.get_mut("containers") else {
         return;
@@ -216,8 +216,11 @@ fn add_readiness_probe(pod: &mut Mapping) {
             .flatten()
             .any(|e| e.get("name").and_then(Yaml::as_str) == Some("ALPHACOMPUTE_TLS_UPSTREAM"));
         if serves_tls {
-            let port = Mapping::from_iter([("port".into(), TLS_PORT.into())]);
-            let probe = Mapping::from_iter([("tcpSocket".into(), port.into())]);
+            let get = Mapping::from_iter([
+                ("path".into(), "/ready".into()),
+                ("port".into(), PROBE_PORT.into()),
+            ]);
+            let probe = Mapping::from_iter([("httpGet".into(), get.into())]);
             container.insert("readinessProbe".into(), probe.into());
         }
     }
@@ -575,7 +578,7 @@ mod tests {
         let tls = "    env:\n    - {name: ALPHACOMPUTE_TLS_UPSTREAM, value: '127.0.0.1:8080'}\n";
         assert_eq!(
             probe(&runtime(tls)),
-            Some(serde_yaml_ng::from_str("{tcpSocket: {port: 8443}}").unwrap())
+            Some(serde_yaml_ng::from_str("{httpGet: {path: /ready, port: 8444}}").unwrap())
         );
         assert_eq!(probe(&runtime("")), None, "no TLS listener to wait on");
         let own = format!("{tls}    readinessProbe: {{tcpSocket: {{port: 9000}}}}\n");

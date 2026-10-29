@@ -99,7 +99,7 @@ spec:
     ports:
     - {name: https, containerPort: 8443}
     readinessProbe:
-      tcpSocket: {port: 8443}
+      httpGet: {path: /ready, port: 8444}
       periodSeconds: 5
     volumeMounts:
     - {name: docker-socket, mountPath: /var/run/docker}
