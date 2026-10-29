@@ -694,6 +694,8 @@ function approvalApi(options = {}) {
     puts: [],
     channels: [],
     enrolled: [],
+    roots: [],
+    root_principal_id: options.root_principal_id,
     reply: {},
     revisionReceipt: (text, response) => mintReceipt("revision.register", text, response),
     putReceipt: (text, response) => mintReceipt("secret.put", text, response),
@@ -714,10 +716,36 @@ function approvalApi(options = {}) {
     "expires_at",
     "state",
     "server_time",
+    "root_principal_id",
   ];
   api.routes = {
     [`GET ${base}`]: () =>
       api.read || { status: 200, body: Object.fromEntries(fields.map((k) => [k, api[k]])) },
+    [`POST ${base}/root`]: (req) => {
+      const body = JSON.parse(req.body);
+      api.roots.push({ text: req.body, body });
+      if (api.reply.root) return api.reply.root(body);
+      const prefix = `{"credential_id":${JSON.stringify(body.credential_id)},"registration":`;
+      const registrationText = req.body.slice(prefix.length, -1);
+      const response = {
+        id: crypto.randomUUID(),
+        principal_id: body.registration.payload.principal_id,
+        org_id: api.org_id,
+        public_key: body.registration.payload.public_key,
+        created_at: RECEIPT_TIME,
+      };
+      api.credentials.push({ credential_id: body.credential_id, key_id: response.id });
+      api.root_principal_id = undefined;
+      return {
+        status: 201,
+        body: {
+          credential_id: body.credential_id,
+          key_id: response.id,
+          public_key: response.public_key,
+          receipt: mintReceipt("key.register", registrationText, response),
+        },
+      };
+    },
     [`POST ${base}/decline`]: () => {
       if (api.state !== "pending") {
         return {

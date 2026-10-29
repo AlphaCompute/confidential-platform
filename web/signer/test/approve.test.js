@@ -343,6 +343,113 @@ test("a passkey the service will not enroll leaves the contact sentence", async 
   assert.deepEqual(crossOrigin.page.buttons(), ["Decline"]);
 });
 
+const CREATE_ROOT = "Create your organization's passkey";
+const SYNCED_ROOT = "This passkey is saved to your account's password manager.";
+const DEVICE_ROOT =
+  "This passkey is only on this device. If you lose it, you lose access to your organization.";
+const ROOT_TAKEN =
+  "Your organization was claimed by another key. Do not approve. Contact AlphaCompute.";
+// A request of an organization without a key, on a device that holds none of its passkeys.
+async function rootPage(pageOptions) {
+  const request = {
+    compose: withoutSecrets(),
+    credentials: [],
+    root_principal_id: crypto.randomUUID(),
+  };
+  const opened = await approvalPage(request, pageOptions);
+  opened.laptop.prefer = undefined;
+  return opened;
+}
+const focused = (page, label) =>
+  page.find((n) => n.tagName === "BUTTON" && n.textContent === label)?.focused;
+
+test("an organization without a key is rooted by its new passkey, which then approves", async () => {
+  const { api, page, laptop } = await rootPage(signedIn());
+  assert.deepEqual(page.buttons(), [CREATE_ROOT, "Decline"]);
+  assert.ok(focused(page, CREATE_ROOT), page.text());
+  await page.click(CREATE_ROOT);
+  const created = laptop.log[0].result;
+  assert.ok(page.text().includes(SYNCED_ROOT), page.text());
+  assert.deepEqual(page.buttons(), ["Confirm with passkey", "Decline"]);
+  assert.ok(focused(page, "Confirm with passkey"), page.text());
+
+  const principal = api.root_principal_id;
+  await page.click("Confirm with passkey");
+  const confirm = laptop.log[1];
+  assert.deepEqual(ids(confirm.options.allowCredentials), [created.id]);
+  const { payload, signature } = api.roots[0].body.registration;
+  assert.deepEqual(payload, {
+    org_id: api.org_id,
+    principal_id: principal,
+    public_key: created.spki,
+    label: "passkey-1",
+    issued_at: payload.issued_at,
+  });
+  assert.deepEqual(
+    Buffer.from(confirm.options.challenge),
+    contextDigest("alphacompute/org-root-key/v1", jcs(payload)),
+  );
+  assert.equal(signature.key_id, undefined);
+  assert.equal(
+    api.roots[0].text,
+    `{"credential_id":"${created.id}","registration":${jcs({ payload, signature })}}`,
+  );
+  const post = page.fetches.find((f) => f.url.endsWith("/root"));
+  assert.equal(post.credentials, "same-origin");
+  assert.ok(focused(page, "Approve with passkey"), page.text());
+  assert.ok(page.text().includes(SYNCED_ROOT), page.text());
+
+  await page.click("Approve with passkey");
+  assert.equal(laptop.log.length, 3);
+  assert.deepEqual(ids(laptop.log[2].options.allowCredentials), [created.id]);
+  assert.equal(api.revisions[0].body.signature.key_id, api.credentials[0].key_id);
+  assert.ok(page.text().includes(APPROVED), page.text());
+  assert.deepEqual(page.assigned, []);
+});
+
+test("a device-bound root passkey is named as the only copy", async () => {
+  const { page } = await rootPage({
+    ...signedIn(),
+    authenticator: new SoftwareAuthenticator({ flags: 0x05 }),
+  });
+  await page.click(CREATE_ROOT);
+  assert.ok(page.text().includes(DEVICE_ROOT), page.text());
+  assert.ok(!page.text().includes(SYNCED_ROOT), page.text());
+});
+
+test("a root the service wants signed in for sends the person to sign in", async () => {
+  const unmarked = {
+    getItem: () => {
+      throw new Error("denied");
+    },
+    setItem: () => {
+      throw new Error("denied");
+    },
+    removeItem: () => {},
+  };
+  const { api, page } = await rootPage({ sessionStorage: unmarked });
+  api.reply.root = () => ({ status: 401, body: { error: { code: "sign_in_required" } } });
+  await page.click(CREATE_ROOT);
+  await page.click("Confirm with passkey");
+  assert.deepEqual(page.assigned, [ENROLL_LOGIN]);
+  assert.equal(api.revisions.length, 0);
+});
+
+test("an organization another key already rooted stops the approval", async () => {
+  const { api, page } = await rootPage(signedIn());
+  api.reply.root = () => ({ status: 409, body: { error: { code: "root_taken" } } });
+  await page.click(CREATE_ROOT);
+  await page.click("Confirm with passkey");
+  assert.equal(page.text(), ROOT_TAKEN);
+  assert.deepEqual(page.buttons(), []);
+  assert.equal(api.revisions.length, 0);
+});
+
+test("a page on another origin than the API offers no root but keeps Decline", async () => {
+  const { page } = await rootPage({ origin: "https://other-signer.test" });
+  assert.deepEqual(page.buttons(), ["Decline"]);
+});
+
 const CATALOG = JSON.parse(testdata("catalog/expected.json"));
 const VALID = testdata("catalog/valid.json");
 const VALID_FILE = JSON.parse(VALID);
