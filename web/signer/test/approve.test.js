@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const {
   NOT_CONFIRMED,
   SoftwareAuthenticator,
+  TICKET,
   approvalApi,
   b64u,
   catalogFile,
@@ -232,13 +233,114 @@ test("a compose that hashes to the request but cannot be read is refused as unre
   assert.equal(laptop.log.length, 0);
 });
 
-test("a request without known passkeys is refused", async () => {
-  const { page, laptop } = await approvalPage({ compose: withoutSecrets(), credentials: [] });
-  assert.equal(
-    page.text(),
-    "No passkey of this organization is known. Ask your AlphaCompute contact.",
+const CREATE = "Create a passkey for this organization";
+const SIGN_IN =
+  "Sign in with your AlphaCompute account to create a passkey for this organization.";
+const ENROLL_LOGIN =
+  `${testView().view.signer.api_origin}/v1/approval-requests/${TICKET}/enroll-login`;
+const ENROLL_MARK = `alphacompute-enroll-sha256:${sha256(TICKET).toString("hex")}`;
+// A tab back from the service's sign-in, which the page marked before it left.
+const signedIn = () => ({ sessionStorage: memoryStorage({ [ENROLL_MARK]: "1" }) });
+
+test("creating a passkey signs in first, before any passkey is made", async () => {
+  const session = memoryStorage();
+  const { api, page, laptop } = await approvalPage(
+    { compose: withoutSecrets(), credentials: [] },
+    { sessionStorage: session },
   );
+  assert.ok(page.text().includes(SIGN_IN), page.text());
+  await page.click(CREATE);
+  assert.deepEqual(page.assigned, [ENROLL_LOGIN]);
+  assert.equal(session.getItem(ENROLL_MARK), "1");
   assert.equal(laptop.log.length, 0);
+  assert.equal(api.enrolled.length, 0);
+
+  const expired = await approvalPage({ compose: withoutSecrets(), credentials: [] });
+  expired.api.reply.login = () => ({ status: 410, body: { error: { code: "request_expired" } } });
+  await expired.page.click(CREATE);
+  assert.equal(expired.page.text(), "This approval link has expired.");
+  assert.deepEqual(expired.page.assigned, []);
+
+  const stale = await approvalPage({ compose: withoutSecrets(), credentials: [] }, signedIn());
+  stale.laptop.prefer = undefined;
+  stale.api.reply.enroll = () => ({ status: 401, body: { error: { code: "sign_in_required" } } });
+  await stale.page.click(CREATE);
+  assert.ok(stale.page.text().includes("Sign-in did not complete. Try again."), stale.page.text());
+  assert.deepEqual(stale.page.assigned, []);
+});
+
+test("back from signing in, a new passkey is enrolled and then the only one asked", async () => {
+  const pageOptions = signedIn();
+  const { api, page, laptop } = await approvalPage(
+    { compose: withoutSecrets(), credentials: [] },
+    pageOptions,
+  );
+  laptop.prefer = undefined;
+  assert.equal(pageOptions.sessionStorage.getItem(ENROLL_MARK), null);
+  assert.ok(page.text().includes("Signed in. Create your passkey to continue."), page.text());
+  const create = page.find((n) => n.tagName === "BUTTON" && n.textContent === CREATE);
+  assert.ok(create?.focused, page.text());
+  await page.click(CREATE);
+  const created = laptop.log[0].result;
+  assert.deepEqual(api.enrolled, [{ credential_id: created.id, public_key: created.spki }]);
+  const post = page.fetches.find((f) => f.url.endsWith("/passkey"));
+  assert.equal(post.credentials, "same-origin");
+  const approve = page.find(
+    (n) => n.tagName === "BUTTON" && n.textContent === "Approve with passkey",
+  );
+  assert.ok(approve?.focused, page.text());
+  await page.click("Approve with passkey");
+  const got = laptop.log[1];
+  assert.deepEqual(ids(got.options.allowCredentials), [created.id]);
+  assert.equal(api.revisions[0].body.signature.key_id, api.credentials[0].key_id);
+  assert.ok(page.text().includes(APPROVED), page.text());
+  assert.deepEqual(page.assigned, []);
+});
+
+test("a prompt that gave no passkey of the request offers to create one", async () => {
+  const { page } = await approvalPage({ compose: withoutSecrets() });
+  page.use(new SoftwareAuthenticator());
+  assert.deepEqual(page.buttons(), ["Approve with passkey", "Decline"]);
+  await page.click("Approve with passkey");
+  assert.ok(page.text().includes(SIGN_IN), page.text());
+  await page.click(CREATE);
+  assert.deepEqual(page.assigned, [ENROLL_LOGIN]);
+});
+
+test("a passkey the service will not enroll leaves the contact sentence", async () => {
+  const { api, page } = await approvalPage(
+    { compose: withoutSecrets(), credentials: [] },
+    signedIn(),
+  );
+  api.reply.enroll = () => ({ status: 403, body: { error: { code: "enroll_not_allowed" } } });
+  await page.click(CREATE);
+  assert.ok(
+    page.text().includes("No passkey of this organization is known. Ask your AlphaCompute contact."),
+    page.text(),
+  );
+  assert.deepEqual(page.buttons(), ["Decline"]);
+  assert.equal(api.revisions.length, 0);
+
+  const other = await approvalPage({ compose: withoutSecrets(), credentials: [] }, signedIn());
+  const elsewhere = other.laptop.enroll();
+  other.api.reply.enroll = () => {
+    other.api.credentials = [{ credential_id: elsewhere.id, key_id: crypto.randomUUID() }];
+    return { status: 409, body: { error: { code: "already_enrolled" } } };
+  };
+  await other.page.click(CREATE);
+  assert.deepEqual(other.page.buttons(), ["Approve with passkey", "Decline"]);
+
+  const crossOrigin = await approvalPage(
+    { compose: withoutSecrets(), credentials: [] },
+    { origin: "https://other-signer.test" },
+  );
+  assert.ok(
+    crossOrigin.page.text().includes(
+      "No passkey of this organization is known. Ask your AlphaCompute contact.",
+    ),
+    crossOrigin.page.text(),
+  );
+  assert.deepEqual(crossOrigin.page.buttons(), ["Decline"]);
 });
 
 const CATALOG = JSON.parse(testdata("catalog/expected.json"));

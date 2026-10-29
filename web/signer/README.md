@@ -19,6 +19,21 @@ of one organization that declare the same name keep separate values. Every put c
 Revision's registration, because shroud-go refuses puts once a request is approved, and the page
 says "Approved" only after the receipt of every put and of the registration verified.
 
+## A passkey created on approval
+
+When a request names no passkey, or the prompt gave none of the ones it names, the page offers
+to create a passkey for the organization. The ticket alone must not add a key, so the person
+first signs in at `/v1/approval-requests/{ticket}/enroll-login`, and the service sends them back
+to the same approval link with a sign-in cookie. The service does not change the link, so before
+the page leaves it puts a mark in the tab's `sessionStorage`. On the return the page finds the
+mark, removes it, and then creates the passkey on one click. It sends the credential id and the
+public key, with the cookie, to `POST /v1/approval-requests/{ticket}/passkey`. shroud-go decides
+whether this person may enroll a passkey and registers it at the KMS. The page then reads the
+request again and asks only the new passkey for every signature. A tab that cannot keep the mark
+creates the passkey first, and a `401 sign_in_required` sends the person to sign in.
+Enrollment needs the API on the page's own origin, because the sign-in cookie is host-only and
+`SameSite=Strict`; a page whose `api_origin` is another origin does not offer it.
+
 ## Revocation
 
 A revocation link names an App and the compose hashes of its Revisions. Each Revision is revoked

@@ -316,6 +316,10 @@ class Node {
     this.own = String(value);
   }
 
+  focus() {
+    this.focused = true;
+  }
+
   addEventListener(type, listener) {
     (this.listeners[type] = this.listeners[type] || []).push(listener);
   }
@@ -354,6 +358,7 @@ function memoryStorage(initial = {}) {
     data,
     getItem: (k) => (data.has(k) ? data.get(k) : null),
     setItem: (k, v) => data.set(k, String(v)),
+    removeItem: (k) => data.delete(k),
   };
 }
 
@@ -367,6 +372,7 @@ async function loadPage(options = {}) {
   const timers = [];
   const prompts = [];
   const clicks = [];
+  const assigned = [];
   const authenticator = options.authenticator || new SoftwareAuthenticator();
   // The passkey provider the next prompt reaches; `page.use` moves to another device.
   const device = { current: authenticator };
@@ -394,7 +400,7 @@ async function loadPage(options = {}) {
   async function fakeFetch(resource, init = {}) {
     const url = String(resource);
     const method = (init.method || "GET").toUpperCase();
-    fetches.push({ method, url, body: init.body, time: clock.now });
+    fetches.push({ method, url, body: init.body, credentials: init.credentials, time: clock.now });
     if (url === b.wasmName) {
       assert.equal(init.integrity, wasmSri, "the page fetched the wasm without its integrity");
       return new Response(b.wasm, { headers: { "Content-Type": "application/wasm" } });
@@ -433,6 +439,7 @@ async function loadPage(options = {}) {
       origin: options.origin || ORIGIN,
       pathname: options.path || "/sign/claim",
       hash: `#${options.hash === undefined ? TICKET : options.hash}`,
+      assign: (url) => assigned.push(url),
     },
     localStorage: options.localStorage || memoryStorage(),
     sessionStorage: options.sessionStorage || memoryStorage(),
@@ -524,6 +531,7 @@ async function loadPage(options = {}) {
     authenticator,
     consoleCalls,
     seals,
+    assigned,
     main,
     use(other) {
       device.current = other;
@@ -662,7 +670,7 @@ function claimApi(options = {}) {
 
 // shroud-go's approval routes for one ticket, with the KMS behind them. Receipts come from
 // `api.revisionReceipt` and `api.putReceipt`, which a test may replace; `api.reply[route]` may
-// answer a route instead (route: "revision", "put").
+// answer a route instead (route: "revision", "put", "enroll", "login").
 function approvalApi(options = {}) {
   const now = options.now === undefined ? Date.now() : options.now;
   const compose = options.compose;
@@ -685,6 +693,7 @@ function approvalApi(options = {}) {
     revisions: [],
     puts: [],
     channels: [],
+    enrolled: [],
     reply: {},
     revisionReceipt: (text, response) => mintReceipt("revision.register", text, response),
     putReceipt: (text, response) => mintReceipt("secret.put", text, response),
@@ -734,6 +743,15 @@ function approvalApi(options = {}) {
         status: 200,
         body: { ...response, receipt: api.revisionReceipt(req.body, response) },
       };
+    },
+    [`GET ${base}/enroll-login`]: () =>
+      (api.reply.login && api.reply.login()) || { status: 302, body: "" },
+    [`POST ${base}/passkey`]: (req) => {
+      const body = JSON.parse(req.body);
+      api.enrolled.push(body);
+      if (api.reply.enroll) return api.reply.enroll(body);
+      api.credentials.push({ credential_id: body.credential_id, key_id: crypto.randomUUID() });
+      return { status: 201, body: { credential_id: body.credential_id } };
     },
     [`POST ${base}/kms-channel`]: (req) => {
       api.channels.push(req.body);

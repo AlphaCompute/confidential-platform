@@ -58,6 +58,14 @@ const MESSAGES = {
   no_credentials: "No passkey of this organization is known. Ask your AlphaCompute contact.",
   foreign_passkey: "That passkey does not belong to this organization. Use one that does.",
   check_failed: "This passkey did not sign as expected. Try again.",
+  already_enrolled:
+    "A passkey was already created through this link. Approve with that passkey, or ask your AlphaCompute contact.",
+  credential_known: "This passkey is already registered. Approve with it.",
+  enroll_limit:
+    "This account already has the maximum number of passkeys for this organization. Use one of them.",
+  sign_in: "Sign in with your AlphaCompute account to create a passkey for this organization.",
+  signed_in: "Signed in. Create your passkey to continue.",
+  sign_in_failed: "Sign-in did not complete. Try again.",
   yours: "This organization is yours.",
   added: "The new passkey is registered.",
   synced: "Synced passkey (backed up by your provider)",
@@ -196,7 +204,7 @@ let lastCall = -Infinity;
 
 // One call to shroud-go. A 429 is answered before anything is relayed, so the identical request
 // is sent once more after Retry-After.
-async function api(view, method, path, bodyText) {
+async function api(view, method, path, bodyText, credentials = "omit") {
   for (let attempt = 0; ; attempt += 1) {
     const wait = lastCall + PACE_MS - Date.now();
     if (wait > 0) await sleep(wait);
@@ -208,7 +216,7 @@ async function api(view, method, path, bodyText) {
         headers: bodyText === undefined ? {} : { "Content-Type": "application/json" },
         body: bodyText,
         cache: "no-store",
-        credentials: "omit",
+        credentials,
         referrerPolicy: "no-referrer",
       });
     } catch (_) {
@@ -402,6 +410,7 @@ function screen(...head) {
     step: el("div", undefined, "step"),
     status: el("p", "", "status"),
   };
+  ui.status.role = "status";
   document.getElementById("main").replaceChildren(...head, ui.facts, ui.step, ui.status);
   return ui;
 }
@@ -477,14 +486,18 @@ async function startClaim(view, ticket) {
 }
 
 // A button that creates one passkey and hands its key to `next`, or offers `retry` a note.
-function createButton(label, options, retry, next) {
-  return button(label, async () => {
-    const { credential, note } = await passkey("create", options);
-    if (!credential) return retry(note);
-    const key = createdKey(credential);
-    if (!key) return retry(MESSAGES.unusable_key);
-    return next(key);
-  });
+function createButton(label, options, retry, next, className) {
+  return button(
+    label,
+    async () => {
+      const { credential, note } = await passkey("create", options);
+      if (!credential) return retry(note);
+      const key = createdKey(credential);
+      if (!key) return retry(MESSAGES.unusable_key);
+      return next(key);
+    },
+    className,
+  );
 }
 
 function offerFirst(c, note) {
@@ -756,7 +769,7 @@ function approvalRefusal(read) {
   ) {
     return MESSAGES.unavailable;
   }
-  return clockRefusal(read.server_time) || (read.credentials.length ? null : MESSAGES.no_credentials);
+  return clockRefusal(read.server_time);
 }
 
 // What the request asks to run, or a refusal: the compose bytes it names, only if they hash to
@@ -834,10 +847,7 @@ function describeLaunch(a) {
 }
 
 async function startApproval(view, viewText, ticket) {
-  const reply = await api(view, "GET", `/v1/approval-requests/${ticket}`);
-  if (reply.status !== 200) return stop(failure(reply));
-  const read = reply.body;
-  const refusal = approvalRefusal(read);
+  const { read, refusal } = await reread(view, ticket);
   if (refusal) return stop(refusal);
   const before = currentServices(read.current);
   const launch =
@@ -855,20 +865,22 @@ async function startApproval(view, viewText, ticket) {
     return stop(MESSAGES.not_registrable);
   }
 
-  const ui = screen(
-    el(
-      "p",
-      `Launch approval for ${typeof read.org_name === "string" ? read.org_name : read.org_id}`,
-      "eyebrow",
-    ),
-    el("h1", read.title),
-  );
-  const a = { view, viewText, read, ticket, ui, launch, credential: null, values: null };
+  const orgName = typeof read.org_name === "string" ? read.org_name : read.org_id;
+  const ui = screen(el("p", `Launch approval for ${orgName}`, "eyebrow"), el("h1", read.title));
+  const a = { view, viewText, read, ticket, ui, launch, orgName, credential: null, values: null };
+  a.signedIn = backFromSignIn(ticket);
+  // The sign-in cookie that lets a ticket enroll a passkey is host-only and SameSite=Strict.
+  let note = a.signedIn ? MESSAGES.signed_in : undefined;
+  if (new URL(view.signer.api_origin).origin !== location.origin) {
+    a.canEnroll = false;
+    note = read.credentials.length ? undefined : MESSAGES.no_credentials;
+  }
   a.fields = secretFields(launch.services, before, putSecrets(read));
   a.secretsBox = el("div");
   a.secretsBox.append(...a.fields.map((f) => f.node));
   ui.facts.replaceChildren(...describeLaunch(a), a.secretsBox);
-  return offerApproval(a);
+  const shown = offerApproval(a, note);
+  if (a.signedIn) shown.create?.focus();
 }
 
 function declaredSecrets(services) {
@@ -947,13 +959,131 @@ async function approvalSignature(a, options) {
 }
 
 // The next step: each Secret put, then the registration, which shroud-go refuses Secrets after.
+// Returns the buttons that sign next and that create a passkey, where shown.
 function offerApproval(a, note) {
+  // The browser cannot tell a closed prompt from one that offered no passkey of the organization.
+  const missed = note === MESSAGES.prompt_closed || note === MESSAGES.foreign_passkey;
+  if (missed || a.signedIn || !a.read.credentials.length) a.canEnroll ??= true;
   const pending = a.values ? a.values.filter((v) => !v.done) : [];
   const total = a.values ? a.values.length + 1 : 1;
   const step = total - pending.length;
   const label = step === 1 ? "Approve with passkey" : `Sign ${step} of ${total}`;
   const run = a.values ? stepAction(a, pending[0]) : firstAction(a);
-  offer(a.ui, note, button(label, run), declineButton(a));
+  const sign = a.read.credentials.length ? button(label, run) : null;
+  const nodes = sign ? [sign] : [];
+  let create = null;
+  if (a.canEnroll && !a.credential) {
+    const label = "Create a passkey for this organization";
+    const className = sign ? "secondary" : undefined;
+    // Signing in comes first, so that a passkey is never created that the service then refuses.
+    // A page that cannot tell whether it came back from signing in creates one and lets the
+    // service answer.
+    if (a.signedIn === false) {
+      create = button(label, () => signIn(a), className);
+      nodes.push(el("p", MESSAGES.sign_in));
+    } else {
+      const exclude = a.read.credentials.map((x) => x.credential_id);
+      const options = createOptions(a.view, a.orgName, exclude);
+      const retry = (n) => offerApproval(a, n);
+      create = createButton(label, options, retry, (key) => enroll(a, key), className);
+    }
+    nodes.push(create);
+  }
+  offer(a.ui, note, ...nodes, declineButton(a));
+  return { sign, create };
+}
+
+function enrollKey(ticket) {
+  return `alphacompute-enroll-${wasm_bindgen.bodySha256(utf8(ticket))}`;
+}
+
+// The service sends a person back from signing in to the bare approval link, so only this tab's
+// mark tells a return from a first visit. Null when the page cannot keep a mark.
+function backFromSignIn(ticket) {
+  const key = enrollKey(ticket);
+  try {
+    const back = sessionStorage.getItem(key) === "1";
+    // A tab that can read but not write could never come back marked.
+    sessionStorage.setItem(key, "0");
+    sessionStorage.removeItem(key);
+    return back;
+  } catch (_) {
+    return null;
+  }
+}
+
+// The sign-in route answers an expired or ineligible request itself, so it is asked before the
+// tab leaves; a redirect to the identity provider is all that sends the person on.
+async function signIn(a) {
+  const url = `${a.view.signer.api_origin}/v1/approval-requests/${a.ticket}/enroll-login`;
+  let status;
+  try {
+    const reply = await fetch(url, { redirect: "manual", cache: "no-store" });
+    status = reply.type === "opaqueredirect" ? 302 : reply.status;
+  } catch (_) {
+    return offerApproval(a, MESSAGES.unavailable);
+  }
+  if (status === 410) return stop(MESSAGES.approval_expired);
+  if (status === 403) {
+    a.canEnroll = false;
+    return offerApproval(a, MESSAGES.no_credentials);
+  }
+  if (status !== 302) return offerApproval(a, MESSAGES.unavailable);
+  try {
+    sessionStorage.setItem(enrollKey(a.ticket), "1");
+  } catch (_) {
+    // Without the mark the page creates the passkey and lets the service ask for a sign-in.
+  }
+  a.ui.status.textContent = MESSAGES.sign_in;
+  location.assign(url);
+}
+
+// The request, with the sentence that refuses it when the read failed or it is not open.
+async function reread(view, ticket) {
+  const reply = await api(view, "GET", `/v1/approval-requests/${ticket}`);
+  return {
+    read: reply.body,
+    refusal: reply.status === 200 ? approvalRefusal(reply.body) : failure(reply),
+  };
+}
+
+// Registers a passkey created here through the ticket, then limits every touch to it.
+async function enroll(a, key) {
+  const body = JSON.stringify({ credential_id: key.id, public_key: key.spki });
+  // The service's sign-in cookie is what lets this ticket enroll a passkey.
+  const path = `/v1/approval-requests/${a.ticket}/passkey`;
+  const reply = await api(a.view, "POST", path, body, "same-origin");
+  if (reply.status !== 201 || reply.body?.credential_id !== key.id) {
+    const code = errorCode(reply.body);
+    if (code === "request_expired") return stop(MESSAGES.approval_expired);
+    if (code === "sign_in_required") {
+      // Just back from signing in, a second redirect would only loop.
+      if (!a.signedIn) return signIn(a);
+      a.signedIn = false;
+      return offerApproval(a, MESSAGES.sign_in_failed);
+    }
+    const notes = {
+      enroll_not_allowed: MESSAGES.no_credentials,
+      already_enrolled: MESSAGES.already_enrolled,
+      credential_known: MESSAGES.credential_known,
+      enroll_limit: MESSAGES.enroll_limit,
+    };
+    if (Object.hasOwn(notes, code)) {
+      a.canEnroll = false;
+      // A passkey enrolled elsewhere is on the ticket now, so the page reads which ones to ask.
+      const { read, refusal } = await reread(a.view, a.ticket);
+      if (!refusal) a.read.credentials = read.credentials;
+      return offerApproval(a, notes[code]);
+    }
+    return offerApproval(a, approvalFailure(reply));
+  }
+  // A failed read stops here: a reload finds the new passkey on the ticket.
+  const { read, refusal } = await reread(a.view, a.ticket);
+  if (refusal) return stop(refusal);
+  if (!read.credentials.some((c) => c.credential_id === key.id)) return stop(MESSAGES.unavailable);
+  a.read.credentials = read.credentials;
+  a.credential = key.id;
+  offerApproval(a, MESSAGES.added).sign.focus();
 }
 
 // The first click reads the Secret values, so its inputs are built in the click, before any await.
