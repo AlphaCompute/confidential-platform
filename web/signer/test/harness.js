@@ -316,6 +316,10 @@ class Node {
     this.own = String(value);
   }
 
+  focus() {
+    this.focused = true;
+  }
+
   addEventListener(type, listener) {
     (this.listeners[type] = this.listeners[type] || []).push(listener);
   }
@@ -662,7 +666,7 @@ function claimApi(options = {}) {
 
 // shroud-go's approval routes for one ticket, with the KMS behind them. Receipts come from
 // `api.revisionReceipt` and `api.putReceipt`, which a test may replace; `api.reply[route]` may
-// answer a route instead (route: "revision", "put").
+// answer a route instead (route: "revision", "put", "enroll").
 function approvalApi(options = {}) {
   const now = options.now === undefined ? Date.now() : options.now;
   const compose = options.compose;
@@ -685,6 +689,7 @@ function approvalApi(options = {}) {
     revisions: [],
     puts: [],
     channels: [],
+    enrolled: [],
     reply: {},
     revisionReceipt: (text, response) => mintReceipt("revision.register", text, response),
     putReceipt: (text, response) => mintReceipt("secret.put", text, response),
@@ -734,6 +739,16 @@ function approvalApi(options = {}) {
         status: 200,
         body: { ...response, receipt: api.revisionReceipt(req.body, response) },
       };
+    },
+    [`POST ${base}/passkey`]: (req) => {
+      const body = JSON.parse(req.body);
+      api.enrolled.push(body);
+      if (api.reply.enroll) return api.reply.enroll(body);
+      api.credentials = [
+        ...api.credentials,
+        { credential_id: body.credential_id, key_id: crypto.randomUUID() },
+      ];
+      return { status: 201, body: { credential_id: body.credential_id } };
     },
     [`POST ${base}/kms-channel`]: (req) => {
       api.channels.push(req.body);

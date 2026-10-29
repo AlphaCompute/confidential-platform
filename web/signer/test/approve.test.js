@@ -232,13 +232,32 @@ test("a compose that hashes to the request but cannot be read is refused as unre
   assert.equal(laptop.log.length, 0);
 });
 
-test("a request without known passkeys is refused", async () => {
-  const { page, laptop } = await approvalPage({ compose: withoutSecrets(), credentials: [] });
-  assert.equal(
+test("a passkey created on the page is enrolled and then the only one asked", async () => {
+  const { api, page, laptop } = await approvalPage({ compose: withoutSecrets(), credentials: [] });
+  laptop.prefer = undefined;
+  assert.deepEqual(page.buttons(), ["Create a passkey for this organization", "Decline"]);
+  await page.click("Create a passkey for this organization");
+  const created = laptop.log[0].result;
+  assert.deepEqual(api.enrolled, [{ credential_id: created.id, public_key: created.spki }]);
+  const approve = page.find((n) => n.tagName === "BUTTON" && n.textContent === "Approve with passkey");
+  assert.ok(approve?.focused, page.text());
+  await page.click("Approve with passkey");
+  const got = laptop.log[1];
+  assert.deepEqual(ids(got.options.allowCredentials), [created.id]);
+  assert.equal(api.revisions[0].body.signature.key_id, api.credentials[0].key_id);
+  assert.ok(page.text().includes(APPROVED), page.text());
+});
+
+test("a passkey the service will not enroll leaves the contact sentence", async () => {
+  const { api, page } = await approvalPage({ compose: withoutSecrets(), credentials: [] });
+  api.reply.enroll = () => ({ status: 403, body: { error: { code: "enroll_not_allowed" } } });
+  await page.click("Create a passkey for this organization");
+  assert.ok(
+    page.text().includes("No passkey of this organization is known. Ask your AlphaCompute contact."),
     page.text(),
-    "No passkey of this organization is known. Ask your AlphaCompute contact.",
   );
-  assert.equal(laptop.log.length, 0);
+  assert.deepEqual(page.buttons(), ["Decline"]);
+  assert.equal(api.revisions.length, 0);
 });
 
 const CATALOG = JSON.parse(testdata("catalog/expected.json"));

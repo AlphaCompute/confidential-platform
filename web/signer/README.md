@@ -19,6 +19,14 @@ of one organization that declare the same name keep separate values. Every put c
 Revision's registration, because shroud-go refuses puts once a request is approved, and the page
 says "Approved" only after the receipt of every put and of the registration verified.
 
+## A passkey created on approval
+
+When a request names no passkey, or the prompt gave none of the ones it names, the page offers
+to create a passkey for the organization. It sends the new credential id and public key to
+`POST /v1/approval-requests/{ticket}/passkey`; shroud-go decides whether this ticket may enroll
+one and registers it at the KMS. The page then reads the request again and asks only the new
+passkey for every signature.
+
 ## Revocation
 
 A revocation link names an App and the compose hashes of its Revisions. Each Revision is revoked

@@ -58,6 +58,10 @@ const MESSAGES = {
   no_credentials: "No passkey of this organization is known. Ask your AlphaCompute contact.",
   foreign_passkey: "That passkey does not belong to this organization. Use one that does.",
   check_failed: "This passkey did not sign as expected. Try again.",
+  already_enrolled:
+    "A passkey was already created through this link. Approve with that passkey, or ask your AlphaCompute contact.",
+  credential_known: "This passkey is already registered. Approve with it.",
+  enroll_refused: "The KMS did not accept the new passkey. Nothing was changed. Try again.",
   yours: "This organization is yours.",
   added: "The new passkey is registered.",
   synced: "Synced passkey (backed up by your provider)",
@@ -402,6 +406,7 @@ function screen(...head) {
     step: el("div", undefined, "step"),
     status: el("p", "", "status"),
   };
+  ui.status.role = "status";
   document.getElementById("main").replaceChildren(...head, ui.facts, ui.step, ui.status);
   return ui;
 }
@@ -477,14 +482,18 @@ async function startClaim(view, ticket) {
 }
 
 // A button that creates one passkey and hands its key to `next`, or offers `retry` a note.
-function createButton(label, options, retry, next) {
-  return button(label, async () => {
-    const { credential, note } = await passkey("create", options);
-    if (!credential) return retry(note);
-    const key = createdKey(credential);
-    if (!key) return retry(MESSAGES.unusable_key);
-    return next(key);
-  });
+function createButton(label, options, retry, next, className) {
+  return button(
+    label,
+    async () => {
+      const { credential, note } = await passkey("create", options);
+      if (!credential) return retry(note);
+      const key = createdKey(credential);
+      if (!key) return retry(MESSAGES.unusable_key);
+      return next(key);
+    },
+    className,
+  );
 }
 
 function offerFirst(c, note) {
@@ -756,7 +765,7 @@ function approvalRefusal(read) {
   ) {
     return MESSAGES.unavailable;
   }
-  return clockRefusal(read.server_time) || (read.credentials.length ? null : MESSAGES.no_credentials);
+  return clockRefusal(read.server_time);
 }
 
 // What the request asks to run, or a refusal: the compose bytes it names, only if they hash to
@@ -855,15 +864,10 @@ async function startApproval(view, viewText, ticket) {
     return stop(MESSAGES.not_registrable);
   }
 
-  const ui = screen(
-    el(
-      "p",
-      `Launch approval for ${typeof read.org_name === "string" ? read.org_name : read.org_id}`,
-      "eyebrow",
-    ),
-    el("h1", read.title),
-  );
-  const a = { view, viewText, read, ticket, ui, launch, credential: null, values: null };
+  const orgName = typeof read.org_name === "string" ? read.org_name : read.org_id;
+  const ui = screen(el("p", `Launch approval for ${orgName}`, "eyebrow"), el("h1", read.title));
+  const a = { view, viewText, read, ticket, ui, launch, orgName, credential: null, values: null };
+  if (!read.credentials.length) a.canEnroll = true;
   a.fields = secretFields(launch.services, before, putSecrets(read));
   a.secretsBox = el("div");
   a.secretsBox.append(...a.fields.map((f) => f.node));
@@ -947,13 +951,64 @@ async function approvalSignature(a, options) {
 }
 
 // The next step: each Secret put, then the registration, which shroud-go refuses Secrets after.
+// Returns the button that signs next, if there is one.
 function offerApproval(a, note) {
+  // The browser cannot tell a closed prompt from one that offered no passkey of the organization.
+  const missed = note === MESSAGES.prompt_closed || note === MESSAGES.foreign_passkey;
+  if (missed && !a.credential && a.canEnroll === undefined) a.canEnroll = true;
   const pending = a.values ? a.values.filter((v) => !v.done) : [];
   const total = a.values ? a.values.length + 1 : 1;
   const step = total - pending.length;
   const label = step === 1 ? "Approve with passkey" : `Sign ${step} of ${total}`;
   const run = a.values ? stepAction(a, pending[0]) : firstAction(a);
-  offer(a.ui, note, button(label, run), declineButton(a));
+  const sign = a.read.credentials.length ? button(label, run) : null;
+  const nodes = sign ? [sign] : [];
+  if (a.canEnroll && !a.credential) {
+    const exclude = a.read.credentials.map((x) => x.credential_id);
+    nodes.push(
+      createButton(
+        "Create a passkey for this organization",
+        createOptions(a.view, a.orgName, exclude),
+        (n) => offerApproval(a, n),
+        (key) => enroll(a, key),
+        sign ? "secondary" : undefined,
+      ),
+    );
+  }
+  offer(a.ui, note, ...nodes, declineButton(a));
+  return sign;
+}
+
+// Registers a passkey created here through the ticket, then limits every touch to it.
+async function enroll(a, key) {
+  const body = JSON.stringify({ credential_id: key.id, public_key: key.spki });
+  const reply = await api(a.view, "POST", `/v1/approval-requests/${a.ticket}/passkey`, body);
+  if (reply.status !== 201 || reply.body?.credential_id !== key.id) {
+    const code = errorCode(reply.body);
+    if (code === "request_expired") return stop(MESSAGES.approval_expired);
+    const notes = {
+      enroll_not_allowed: MESSAGES.no_credentials,
+      already_enrolled: MESSAGES.already_enrolled,
+      credential_known: MESSAGES.credential_known,
+    };
+    if (Object.hasOwn(notes, code)) {
+      a.canEnroll = false;
+      return offerApproval(a, notes[code]);
+    }
+    if (code === "kms_refused") return offerApproval(a, MESSAGES.enroll_refused);
+    return offerApproval(a, reply.status === 201 ? MESSAGES.unavailable : approvalFailure(reply));
+  }
+  // A failed read stops here: a reload finds the new passkey on the ticket.
+  const read = await api(a.view, "GET", `/v1/approval-requests/${a.ticket}`);
+  if (read.status !== 200) return stop(failure(read));
+  const refusal = approvalRefusal(read.body);
+  if (refusal) return stop(refusal);
+  if (!read.body.credentials.some((c) => c.credential_id === key.id)) {
+    return stop(MESSAGES.unavailable);
+  }
+  a.read.credentials = read.body.credentials;
+  a.credential = key.id;
+  offerApproval(a, MESSAGES.added).focus();
 }
 
 // The first click reads the Secret values, so its inputs are built in the click, before any await.
