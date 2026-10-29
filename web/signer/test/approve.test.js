@@ -81,7 +81,8 @@ test("an uploaded compose is approved only after the registration receipt verifi
     "Image: ghcr.io/alphacompute/alpha-runtime",
     `Digest: sha256:${"7d".repeat(32)}`,
     "Endpoint: HTTPS on 443, forwarded to web:80",
-    "Machine: tdx.medium (chosen by the service, not part of what you sign)",
+    "Machine: tdx.medium",
+    "The service sets the machine size, its CPU and memory; the size does not change the code that runs, so you do not sign it.",
     `App: ${WRAP_APP}`,
     `Revision: ${api.compose_hash}`,
   ]) {
@@ -348,6 +349,9 @@ const DEVICE_ROOT =
   "This passkey is only on this device. If you lose it, you lose access to your organization.";
 const ROOT_TAKEN =
   "Your organization was claimed by another key. Do not approve. Contact AlphaCompute.";
+const STEP_ONE = "Step 1 of 2: create your organization's passkey";
+const STEP_TWO = "Step 2 of 2: approve this App";
+const approveRoot = (api) => `Approve Production, revision ${api.compose_hash.slice(7, 19)}`;
 // A request of an organization without a key, on a device that holds none of its passkeys.
 async function rootPage(pageOptions, apiOptions = {}) {
   const request = {
@@ -365,6 +369,7 @@ test("an organization without a key is rooted by its new passkey, which then app
   const { api, page, laptop } = await rootPage(signedIn());
   assert.deepEqual(page.buttons(), [CREATE_ROOT, "Decline"]);
   assert.ok(focused(page, CREATE_ROOT), page.text());
+  assert.ok(page.text().includes(STEP_ONE), page.text());
   await page.click(CREATE_ROOT);
   const created = laptop.log[0].result;
   assert.ok(page.text().includes(SYNCED_ROOT), page.text());
@@ -394,10 +399,12 @@ test("an organization without a key is rooted by its new passkey, which then app
   );
   const post = page.fetches.find((f) => f.url.endsWith("/root"));
   assert.equal(post.credentials, "same-origin");
-  assert.ok(focused(page, "Approve with passkey"), page.text());
+  assert.ok(focused(page, approveRoot(api)), page.text());
   assert.ok(page.text().includes(SYNCED_ROOT), page.text());
+  assert.ok(page.text().includes(STEP_TWO), page.text());
+  assert.ok(!page.text().includes(STEP_ONE), page.text());
 
-  await page.click("Approve with passkey");
+  await page.click(approveRoot(api));
   assert.equal(laptop.log.length, 3);
   assert.deepEqual(ids(laptop.log[2].options.allowCredentials), [created.id]);
   assert.equal(api.revisions[0].body.signature.key_id, api.credentials[0].key_id);
@@ -460,7 +467,7 @@ test("a root post that may have reached the KMS is sent again unchanged", async 
   assert.equal(api.roots.length, 4);
   assert.ok(api.roots.every((r) => r.text === api.roots[0].text));
   assert.equal(laptop.log.length, 2);
-  await page.click("Approve with passkey");
+  await page.click(approveRoot(api));
   assert.ok(page.text().includes(APPROVED), page.text());
 });
 
@@ -515,7 +522,7 @@ test("a catalog app is rendered in wasm and its hash must match", async () => {
   ]) {
     assert.ok(text.includes(line), `${line}\n${text}`);
   }
-  assert.ok(!text.includes("chosen by the service"));
+  assert.ok(!text.includes("The service sets the machine size"));
   await page.click("Approve with passkey");
   assert.equal(api.revisions[0].body.payload.compose, CATALOG_COMPOSE);
   assert.ok(page.text().includes(APPROVED), page.text());
