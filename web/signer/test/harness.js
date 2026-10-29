@@ -371,6 +371,7 @@ async function loadPage(options = {}) {
   const timers = [];
   const prompts = [];
   const clicks = [];
+  const assigned = [];
   const authenticator = options.authenticator || new SoftwareAuthenticator();
   // The passkey provider the next prompt reaches; `page.use` moves to another device.
   const device = { current: authenticator };
@@ -437,6 +438,7 @@ async function loadPage(options = {}) {
       origin: options.origin || ORIGIN,
       pathname: options.path || "/sign/claim",
       hash: `#${options.hash === undefined ? TICKET : options.hash}`,
+      assign: (url) => assigned.push(url),
     },
     localStorage: options.localStorage || memoryStorage(),
     sessionStorage: options.sessionStorage || memoryStorage(),
@@ -528,6 +530,7 @@ async function loadPage(options = {}) {
     authenticator,
     consoleCalls,
     seals,
+    assigned,
     main,
     use(other) {
       device.current = other;

@@ -10,6 +10,9 @@ const TICKET = /^[A-Za-z0-9_-]{43}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const NIL_APP = "00000000-0000-0000-0000-000000000000";
 const CODE = /^[A-Za-z_]{1,64}$/;
+// The connector appends this to an approval link's fragment when it sends a person back from
+// signing in to enroll a passkey.
+const SIGNED_IN = "&enroll=1";
 // shroud-go limits its public routes to 5 requests per second per IP.
 const PACE_MS = 250;
 const MAX_RETRY_AFTER_S = 10;
@@ -61,6 +64,9 @@ const MESSAGES = {
   already_enrolled:
     "A passkey was already created through this link. Approve with that passkey, or ask your AlphaCompute contact.",
   credential_known: "This passkey is already registered. Approve with it.",
+  enroll_limit:
+    "This account already has the maximum number of passkeys for this organization. Use one of them.",
+  sign_in: "Sign in with your AlphaCompute account to create a passkey for this organization.",
   yours: "This organization is yours.",
   added: "The new passkey is registered.",
   synced: "Synced passkey (backed up by your provider)",
@@ -866,6 +872,7 @@ async function startApproval(view, viewText, ticket) {
   const orgName = typeof read.org_name === "string" ? read.org_name : read.org_id;
   const ui = screen(el("p", `Launch approval for ${orgName}`, "eyebrow"), el("h1", read.title));
   const a = { view, viewText, read, ticket, ui, launch, orgName, credential: null, values: null };
+  a.signedIn = location.hash === `#${ticket}${SIGNED_IN}`;
   a.fields = secretFields(launch.services, before, putSecrets(read));
   a.secretsBox = el("div");
   a.secretsBox.append(...a.fields.map((f) => f.node));
@@ -953,7 +960,7 @@ async function approvalSignature(a, options) {
 function offerApproval(a, note) {
   // The browser cannot tell a closed prompt from one that offered no passkey of the organization.
   const missed = note === MESSAGES.prompt_closed || note === MESSAGES.foreign_passkey;
-  if (missed || !a.read.credentials.length) a.canEnroll ??= true;
+  if (missed || a.signedIn || !a.read.credentials.length) a.canEnroll ??= true;
   const pending = a.values ? a.values.filter((v) => !v.done) : [];
   const total = a.values ? a.values.length + 1 : 1;
   const step = total - pending.length;
@@ -962,19 +969,25 @@ function offerApproval(a, note) {
   const sign = a.read.credentials.length ? button(label, run) : null;
   const nodes = sign ? [sign] : [];
   if (a.canEnroll && !a.credential) {
-    const exclude = a.read.credentials.map((x) => x.credential_id);
-    nodes.push(
-      createButton(
-        "Create a passkey for this organization",
-        createOptions(a.view, a.orgName, exclude),
-        (n) => offerApproval(a, n),
-        (key) => enroll(a, key),
-        sign ? "secondary" : undefined,
-      ),
-    );
+    const label = "Create a passkey for this organization";
+    const className = sign ? "secondary" : undefined;
+    // Signing in comes first, so that a passkey is never created that the service then refuses.
+    if (a.signedIn) {
+      const exclude = a.read.credentials.map((x) => x.credential_id);
+      const options = createOptions(a.view, a.orgName, exclude);
+      nodes.push(
+        createButton(label, options, (n) => offerApproval(a, n), (key) => enroll(a, key), className),
+      );
+    } else {
+      nodes.push(el("p", MESSAGES.sign_in), button(label, async () => signIn(a), className));
+    }
   }
   offer(a.ui, note, ...nodes, declineButton(a));
   return sign;
+}
+
+function signIn(a) {
+  location.assign(`${a.view.signer.api_origin}/v1/approval-requests/${a.ticket}/enroll-login`);
 }
 
 // Registers a passkey created here through the ticket, then limits every touch to it.
@@ -984,10 +997,15 @@ async function enroll(a, key) {
   if (reply.status !== 201 || reply.body?.credential_id !== key.id) {
     const code = errorCode(reply.body);
     if (code === "request_expired") return stop(MESSAGES.approval_expired);
+    if (code === "sign_in_required") {
+      a.ui.status.textContent = MESSAGES.sign_in;
+      return signIn(a);
+    }
     const notes = {
       enroll_not_allowed: MESSAGES.no_credentials,
       already_enrolled: MESSAGES.already_enrolled,
       credential_known: MESSAGES.credential_known,
+      enroll_limit: MESSAGES.enroll_limit,
     };
     if (Object.hasOwn(notes, code)) {
       a.canEnroll = false;
@@ -1294,7 +1312,8 @@ async function boot() {
   await wasm_bindgen({ module_or_path: fetch(WASM_URL, { integrity: WASM_SRI }) });
 
   const mode = location.pathname.split("/").pop();
-  const ticket = location.hash.slice(1);
+  const fragment = location.hash.slice(1);
+  const ticket = fragment.endsWith(SIGNED_IN) ? fragment.slice(0, -SIGNED_IN.length) : fragment;
   if (!["claim", "approve", "revoke"].includes(mode) || !TICKET.test(ticket)) {
     return stop(MESSAGES.bad_link);
   }

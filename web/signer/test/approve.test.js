@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const {
   NOT_CONFIRMED,
   SoftwareAuthenticator,
+  TICKET,
   approvalApi,
   b64u,
   catalogFile,
@@ -232,11 +233,36 @@ test("a compose that hashes to the request but cannot be read is refused as unre
   assert.equal(laptop.log.length, 0);
 });
 
-test("a passkey created on the page is enrolled and then the only one asked", async () => {
+const CREATE = "Create a passkey for this organization";
+const SIGN_IN =
+  "Sign in with your AlphaCompute account to create a passkey for this organization.";
+const ENROLL_LOGIN = `${testView().view.signer.api_origin}/v1/approval-requests/${TICKET}/enroll-login`;
+const signedIn = { hash: `${TICKET}&enroll=1` };
+
+test("creating a passkey signs in first, before any passkey is made", async () => {
   const { api, page, laptop } = await approvalPage({ compose: withoutSecrets(), credentials: [] });
+  assert.ok(page.text().includes(SIGN_IN), page.text());
+  await page.click(CREATE);
+  assert.deepEqual(page.assigned, [ENROLL_LOGIN]);
+  assert.equal(laptop.log.length, 0);
+  assert.equal(api.enrolled.length, 0);
+
+  const stale = await approvalPage({ compose: withoutSecrets(), credentials: [] }, signedIn);
+  stale.laptop.prefer = undefined;
+  stale.api.reply.enroll = () => ({ status: 401, body: { error: { code: "sign_in_required" } } });
+  await stale.page.click(CREATE);
+  assert.deepEqual(stale.page.assigned, [ENROLL_LOGIN]);
+});
+
+test("back from signing in, a passkey created on the page is enrolled and then the only one asked", async () => {
+  const { api, page, laptop } = await approvalPage(
+    { compose: withoutSecrets(), credentials: [] },
+    signedIn,
+  );
   laptop.prefer = undefined;
-  assert.deepEqual(page.buttons(), ["Create a passkey for this organization", "Decline"]);
-  await page.click("Create a passkey for this organization");
+  assert.deepEqual(page.buttons(), [CREATE, "Decline"]);
+  assert.ok(!page.text().includes(SIGN_IN), page.text());
+  await page.click(CREATE);
   const created = laptop.log[0].result;
   assert.deepEqual(api.enrolled, [{ credential_id: created.id, public_key: created.spki }]);
   const approve = page.find((n) => n.tagName === "BUTTON" && n.textContent === "Approve with passkey");
@@ -246,27 +272,23 @@ test("a passkey created on the page is enrolled and then the only one asked", as
   assert.deepEqual(ids(got.options.allowCredentials), [created.id]);
   assert.equal(api.revisions[0].body.signature.key_id, api.credentials[0].key_id);
   assert.ok(page.text().includes(APPROVED), page.text());
+  assert.deepEqual(page.assigned, []);
 });
 
 test("a prompt that gave no passkey of the request offers to create one", async () => {
-  const { api, page } = await approvalPage({ compose: withoutSecrets() });
-  const phone = new SoftwareAuthenticator();
-  page.use(phone);
+  const { page } = await approvalPage({ compose: withoutSecrets() });
+  page.use(new SoftwareAuthenticator());
   assert.deepEqual(page.buttons(), ["Approve with passkey", "Decline"]);
   await page.click("Approve with passkey");
-  assert.ok(page.buttons().includes("Create a passkey for this organization"), page.buttons());
-  await page.click("Create a passkey for this organization");
-  await page.click("Approve with passkey");
-  const created = phone.log.find((l) => l.kind === "create").result;
-  assert.deepEqual(ids(phone.log.at(-1).options.allowCredentials), [created.id]);
-  assert.ok(page.text().includes(APPROVED), page.text());
-  assert.equal(api.enrolled.length, 1);
+  assert.ok(page.text().includes(SIGN_IN), page.text());
+  await page.click(CREATE);
+  assert.deepEqual(page.assigned, [ENROLL_LOGIN]);
 });
 
 test("a passkey the service will not enroll leaves the contact sentence", async () => {
-  const { api, page } = await approvalPage({ compose: withoutSecrets(), credentials: [] });
+  const { api, page } = await approvalPage({ compose: withoutSecrets(), credentials: [] }, signedIn);
   api.reply.enroll = () => ({ status: 403, body: { error: { code: "enroll_not_allowed" } } });
-  await page.click("Create a passkey for this organization");
+  await page.click(CREATE);
   assert.ok(
     page.text().includes("No passkey of this organization is known. Ask your AlphaCompute contact."),
     page.text(),

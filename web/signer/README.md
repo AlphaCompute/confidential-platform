@@ -22,10 +22,13 @@ says "Approved" only after the receipt of every put and of the registration veri
 ## A passkey created on approval
 
 When a request names no passkey, or the prompt gave none of the ones it names, the page offers
-to create a passkey for the organization. It sends the new credential id and public key to
-`POST /v1/approval-requests/{ticket}/passkey`; shroud-go decides whether this ticket may enroll
-one and registers it at the KMS. The page then reads the request again and asks only the new
-passkey for every signature.
+to create a passkey for the organization. The ticket alone must not add a key, so the person
+first signs in at `/v1/approval-requests/{ticket}/enroll-login`, and the service sends them back
+to `/sign/approve#<ticket>&enroll=1`. Only then does the page create the passkey and send its
+credential id and public key to `POST /v1/approval-requests/{ticket}/passkey`. shroud-go decides
+whether this person may enroll one and registers it at the KMS. The page then reads the request
+again and asks only the new passkey for every signature. A `401 sign_in_required` sends the
+person to sign in again.
 
 ## Revocation
 
