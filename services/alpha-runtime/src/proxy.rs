@@ -196,24 +196,14 @@ impl Endpoint {
             return Ok(None);
         };
         let callers = config.tls_callers.clone().into();
-        let public = config
-            .public
-            .clone()
-            .map(|name| (name, Arc::<Edge>::default()));
-        let edge = public.as_ref().map(|(_, edge)| edge.clone());
         let probe = axum::Router::new()
             .route("/leaf", axum::routing::get(leaf_chain))
-            .route(
-                "/ready",
-                axum::routing::get(move |State(runtime): State<Arc<Runtime>>| {
-                    ready(runtime, edge.clone())
-                }),
-            )
+            .route("/ready", axum::routing::get(ready))
             .with_state(runtime.clone());
         let probe = (bind_tcp(probe_addr).await?, probe);
         let configs = Arc::new(Configs {
             instance: server_config(runtime.clone())?,
-            public,
+            public: config.public.clone().map(|name| (name, Arc::default())),
         });
         Ok(Some(Self {
             listener: bind_tcp(addr).await?,
@@ -477,12 +467,11 @@ async fn leaf_chain(
     ))
 }
 
-/// 200 only while the leaf is current, the public name, if any, has its certificate, and, with a
-/// readiness path, the upstream answers it with a 2xx now.
-async fn ready(runtime: Arc<Runtime>, edge: Option<Arc<Edge>>) -> StatusCode {
+/// 200 only while the leaf is current and, with a readiness path, the upstream answers it with a
+/// 2xx now.
+async fn ready(State(runtime): State<Arc<Runtime>>) -> StatusCode {
     let config = runtime.config();
     if runtime.attested().is_some()
-        && public_served(edge.as_deref())
         && match (&config.tls_upstream, &config.tls_ready) {
             (Some(upstream), Some(path)) => upstream_answers(upstream, path).await,
             _ => true,
@@ -492,12 +481,6 @@ async fn ready(runtime: Arc<Runtime>, edge: Option<Arc<Edge>>) -> StatusCode {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     }
-}
-
-/// Until the first certificate arrives the public name is served the Instance leaf, which no
-/// browser trusts.
-fn public_served(edge: Option<&Edge>) -> bool {
-    edge.is_none_or(|edge| edge.served.read().is_some())
 }
 
 async fn upstream_answers(upstream: &str, path: &str) -> bool {
@@ -557,25 +540,6 @@ mod tests {
         assert!(!admitted(Some(&[node]), &callers));
         assert!(!admitted(None, &callers));
         assert!(admitted(None, &[]));
-    }
-
-    #[test]
-    fn a_public_name_is_ready_only_once_its_certificate_is_served() {
-        assert!(public_served(None));
-        let edge = Edge::default();
-        *edge.challenge.write() = Some(certified_key());
-        assert!(!public_served(Some(&edge)));
-        *edge.served.write() = Some(certified_key());
-        assert!(public_served(Some(&edge)));
-    }
-
-    fn certified_key() -> Arc<CertifiedKey> {
-        let key = rcgen::KeyPair::generate().unwrap();
-        let cert = rcgen::CertificateParams::new(["a.example".to_owned()])
-            .unwrap()
-            .self_signed(&key)
-            .unwrap();
-        tls::certified(vec![cert.der().clone()], &key.serialize_der()).unwrap()
     }
 
     #[tokio::test]
