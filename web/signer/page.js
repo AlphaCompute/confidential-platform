@@ -872,7 +872,7 @@ async function startApproval(view, viewText, ticket) {
   const orgName = typeof read.org_name === "string" ? read.org_name : read.org_id;
   const ui = screen(el("p", `Launch approval for ${orgName}`, "eyebrow"), el("h1", read.title));
   const a = { view, viewText, read, ticket, ui, launch, orgName, credential: null, values: null };
-  a.signedIn = location.hash === `#${ticket}${SIGNED_IN}`;
+  a.signedIn = location.hash.endsWith(SIGNED_IN);
   a.fields = secretFields(launch.services, before, putSecrets(read));
   a.secretsBox = el("div");
   a.secretsBox.append(...a.fields.map((f) => f.node));
@@ -979,7 +979,7 @@ function offerApproval(a, note) {
         createButton(label, options, (n) => offerApproval(a, n), (key) => enroll(a, key), className),
       );
     } else {
-      nodes.push(el("p", MESSAGES.sign_in), button(label, async () => signIn(a), className));
+      nodes.push(el("p", MESSAGES.sign_in), button(label, () => signIn(a), className));
     }
   }
   offer(a.ui, note, ...nodes, declineButton(a));
@@ -1009,6 +1009,11 @@ async function enroll(a, key) {
     };
     if (Object.hasOwn(notes, code)) {
       a.canEnroll = false;
+      // A passkey enrolled elsewhere is on the ticket now, so the page reads which ones to ask.
+      const fresh = await api(a.view, "GET", `/v1/approval-requests/${a.ticket}`);
+      if (fresh.status === 200 && !approvalRefusal(fresh.body)) {
+        a.read.credentials = fresh.body.credentials;
+      }
       return offerApproval(a, notes[code]);
     }
     return offerApproval(a, approvalFailure(reply));

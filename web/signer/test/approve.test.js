@@ -295,6 +295,15 @@ test("a passkey the service will not enroll leaves the contact sentence", async 
   );
   assert.deepEqual(page.buttons(), ["Decline"]);
   assert.equal(api.revisions.length, 0);
+
+  const other = await approvalPage({ compose: withoutSecrets(), credentials: [] }, signedIn);
+  const elsewhere = other.laptop.enroll();
+  other.api.reply.enroll = () => {
+    other.api.credentials = [{ credential_id: elsewhere.id, key_id: crypto.randomUUID() }];
+    return { status: 409, body: { error: { code: "already_enrolled" } } };
+  };
+  await other.page.click(CREATE);
+  assert.deepEqual(other.page.buttons(), ["Approve with passkey", "Decline"]);
 });
 
 const CATALOG = JSON.parse(testdata("catalog/expected.json"));
