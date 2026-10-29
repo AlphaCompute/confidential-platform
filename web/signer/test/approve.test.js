@@ -248,6 +248,21 @@ test("a passkey created on the page is enrolled and then the only one asked", as
   assert.ok(page.text().includes(APPROVED), page.text());
 });
 
+test("a prompt that gave no passkey of the request offers to create one", async () => {
+  const { api, page } = await approvalPage({ compose: withoutSecrets() });
+  const phone = new SoftwareAuthenticator();
+  page.use(phone);
+  assert.deepEqual(page.buttons(), ["Approve with passkey", "Decline"]);
+  await page.click("Approve with passkey");
+  assert.ok(page.buttons().includes("Create a passkey for this organization"), page.buttons());
+  await page.click("Create a passkey for this organization");
+  await page.click("Approve with passkey");
+  const created = phone.log.find((l) => l.kind === "create").result;
+  assert.deepEqual(ids(phone.log.at(-1).options.allowCredentials), [created.id]);
+  assert.ok(page.text().includes(APPROVED), page.text());
+  assert.equal(api.enrolled.length, 1);
+});
+
 test("a passkey the service will not enroll leaves the contact sentence", async () => {
   const { api, page } = await approvalPage({ compose: withoutSecrets(), credentials: [] });
   api.reply.enroll = () => ({ status: 403, body: { error: { code: "enroll_not_allowed" } } });
