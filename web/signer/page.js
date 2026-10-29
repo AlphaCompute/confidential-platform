@@ -61,7 +61,6 @@ const MESSAGES = {
   already_enrolled:
     "A passkey was already created through this link. Approve with that passkey, or ask your AlphaCompute contact.",
   credential_known: "This passkey is already registered. Approve with it.",
-  enroll_refused: "The KMS did not accept the new passkey. Nothing was changed. Try again.",
   yours: "This organization is yours.",
   added: "The new passkey is registered.",
   synced: "Synced passkey (backed up by your provider)",
@@ -867,7 +866,6 @@ async function startApproval(view, viewText, ticket) {
   const orgName = typeof read.org_name === "string" ? read.org_name : read.org_id;
   const ui = screen(el("p", `Launch approval for ${orgName}`, "eyebrow"), el("h1", read.title));
   const a = { view, viewText, read, ticket, ui, launch, orgName, credential: null, values: null };
-  if (!read.credentials.length) a.canEnroll = true;
   a.fields = secretFields(launch.services, before, putSecrets(read));
   a.secretsBox = el("div");
   a.secretsBox.append(...a.fields.map((f) => f.node));
@@ -955,7 +953,8 @@ async function approvalSignature(a, options) {
 function offerApproval(a, note) {
   // The browser cannot tell a closed prompt from one that offered no passkey of the organization.
   const missed = note === MESSAGES.prompt_closed || note === MESSAGES.foreign_passkey;
-  if (missed && !a.credential && a.canEnroll === undefined) a.canEnroll = true;
+  const none = !a.read.credentials.length;
+  if ((missed || none) && !a.credential && a.canEnroll === undefined) a.canEnroll = true;
   const pending = a.values ? a.values.filter((v) => !v.done) : [];
   const total = a.values ? a.values.length + 1 : 1;
   const step = total - pending.length;
@@ -995,8 +994,7 @@ async function enroll(a, key) {
       a.canEnroll = false;
       return offerApproval(a, notes[code]);
     }
-    if (code === "kms_refused") return offerApproval(a, MESSAGES.enroll_refused);
-    return offerApproval(a, reply.status === 201 ? MESSAGES.unavailable : approvalFailure(reply));
+    return offerApproval(a, approvalFailure(reply));
   }
   // A failed read stops here: a reload finds the new passkey on the ticket.
   const read = await api(a.view, "GET", `/v1/approval-requests/${a.ticket}`);
