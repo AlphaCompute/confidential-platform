@@ -111,7 +111,7 @@ fn server_config(runtime: Arc<Runtime>) -> Result<Arc<ServerConfig>, Error> {
 
 /// Browsers and the ACME CA's validators may lack `X25519MLKEM768`, the one group the
 /// platform's own hops accept, and TLS 1.3; only the public name is served to them.
-fn public_config(cert: Arc<CertifiedKey>, alpn: &[u8]) -> Option<Arc<ServerConfig>> {
+fn public_config(cert: Arc<CertifiedKey>, alpn: Option<&[u8]>) -> Option<Arc<ServerConfig>> {
     let mut config = ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::aws_lc_rs::default_provider(),
     ))
@@ -119,7 +119,7 @@ fn public_config(cert: Arc<CertifiedKey>, alpn: &[u8]) -> Option<Arc<ServerConfi
     .ok()?
     .with_no_client_auth()
     .with_cert_resolver(Arc::new(SingleCertAndKey::from(cert)));
-    config.alpn_protocols = vec![alpn.to_vec()];
+    config.alpn_protocols = alpn.into_iter().map(<[u8]>::to_vec).collect();
     // The config lives for one connection, so a ticket could never resume.
     config.send_tls13_tickets = 0;
     config.session_storage = Arc::new(NoServerSessionStorage {});
@@ -137,13 +137,13 @@ enum Handshake<'a> {
     Public(&'a str, Arc<CertifiedKey>),
 }
 
-/// A browser on the public name keeps the Instance leaf until the first certificate arrives,
+/// A client on the public name keeps the Instance leaf until the first certificate arrives,
 /// and while the Instance leaf has expired, so no public handshake outlives the attestation.
 /// A public handshake gets the certificate read here, which its binding then signs, even if a
 /// renewal replaces it in between.
 fn select<'a>(
     configs: &'a Configs,
-    runtime: &Runtime,
+    attested: bool,
     hello: &ClientHello<'_>,
 ) -> Option<(Handshake<'a>, Arc<ServerConfig>)> {
     let instance = Some((Handshake::Instance, configs.instance.clone()));
@@ -152,12 +152,17 @@ fn select<'a>(
     };
     match acme::route(name, hello.server_name(), hello.alpn()) {
         Route::Challenge => {
-            let config = public_config(edge.challenge.read().clone()?, acme::ACME_TLS_ALPN)?;
+            let config = public_config(edge.challenge.read().clone()?, Some(acme::ACME_TLS_ALPN))?;
             Some((Handshake::Challenge, config))
         }
-        Route::Public if runtime.attested().is_some() => match edge.served.read().clone() {
+        Route::Public if attested => match edge.served.read().clone() {
             Some(cert) => {
-                let config = public_config(cert.clone(), b"http/1.1")?;
+                // rustls refuses a client whose ALPN offer misses every advertised protocol,
+                // so a client that does not offer `http/1.1` gets no ALPN at all.
+                let http = hello
+                    .alpn()
+                    .is_some_and(|mut offered| offered.any(|p| p == b"http/1.1"));
+                let config = public_config(cert.clone(), http.then_some(&b"http/1.1"[..]))?;
                 Some((Handshake::Public(name, cert), config))
             }
             None => instance,
@@ -298,7 +303,11 @@ async fn proxy(
         let start = LazyConfigAcceptor::new(Acceptor::default(), tcp)
             .await
             .ok()?;
-        let (picked, config) = select(&configs, &runtime, &start.client_hello())?;
+        let (picked, config) = select(
+            &configs,
+            runtime.attested().is_some(),
+            &start.client_hello(),
+        )?;
         Some((picked, start.into_stream(config).await.ok()?))
     };
     let Ok(Some((picked, mut tls))) = timeout(HANDSHAKE, handshake).await else {
@@ -521,6 +530,79 @@ mod tests {
             .collect();
         let key = rcgen::KeyPair::generate().unwrap();
         params.self_signed(&key).unwrap().der().clone()
+    }
+
+    const PUBLIC_NAME: &str = "hello.alphacompute.cc";
+
+    fn signed_by(issuer: &rcgen::Issuer<'_, rcgen::KeyPair>) -> Arc<CertifiedKey> {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new([PUBLIC_NAME.to_owned()])
+            .unwrap()
+            .signed_by(&key, issuer)
+            .unwrap();
+        tls::certified(vec![cert.der().clone()], &key.serialize_der()).unwrap()
+    }
+
+    /// One full handshake on the public name through `select`: whether the public certificate
+    /// was served and the protocol negotiated, or `None` when the handshake fails.
+    async fn public_handshake(offered: &[&[u8]]) -> Option<(bool, Option<Vec<u8>>)> {
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca = rcgen::CertificateParams::default();
+        ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca.self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::new(ca, ca_key);
+        let (instance, public) = (signed_by(&issuer), signed_by(&issuer));
+        let public_der = public.cert.first().unwrap().clone();
+        let edge = Arc::new(Edge::default());
+        *edge.served.write() = Some(public);
+        let configs = Configs {
+            instance: public_config(instance, None).unwrap(),
+            public: Some((PUBLIC_NAME.to_owned(), edge)),
+        };
+
+        let mut roots = RootCertStore::empty();
+        roots.add(ca_cert.der().clone()).unwrap();
+        let mut client = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        client.alpn_protocols = offered.iter().map(|p| p.to_vec()).collect();
+
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let server = async {
+            let start = LazyConfigAcceptor::new(Acceptor::default(), server_io)
+                .await
+                .ok()?;
+            let (_, config) = select(&configs, true, &start.client_hello())?;
+            start.into_stream(config).await.ok()
+        };
+        let client = tokio_rustls::TlsConnector::from(Arc::new(client)).connect(
+            rustls::pki_types::ServerName::try_from(PUBLIC_NAME).unwrap(),
+            client_io,
+        );
+        let (server, client) = tokio::join!(server, client);
+        server?;
+        let conn = client.ok()?.into_inner().1;
+        let served = conn.peer_certificates()?.first()? == &public_der;
+        Some((served, conn.alpn_protocol().map(<[u8]>::to_vec)))
+    }
+
+    #[tokio::test]
+    async fn the_public_name_serves_any_alpn_offer_and_the_leaf_only_on_the_instance_id() {
+        let http = Some(b"http/1.1".to_vec());
+        assert_eq!(public_handshake(&[]).await, Some((true, None)));
+        assert_eq!(public_handshake(&[b"grpc-exp"]).await, Some((true, None)));
+        assert_eq!(
+            public_handshake(&[b"h2", b"http/1.1"]).await,
+            Some((true, http))
+        );
+        assert_eq!(
+            public_handshake(&[b"alphacompute-instance/1", b"http/1.1"]).await,
+            Some((false, None))
+        );
     }
 
     #[test]

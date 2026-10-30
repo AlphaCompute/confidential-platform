@@ -116,8 +116,17 @@ succeeded (a bind failure exits 1) and terminates TLS there: TLS 1.3 with `X2551
 no client certificate, and the chain of the current attestation, [leaf, KMS CA]. Each accepted
 connection then opens a TCP connection to the upstream and copies bytes both ways until either
 side closes, so HTTP/1.1, keep-alive, WebSocket upgrades, HTTP/2 by prior knowledge and any other
-byte stream pass unchanged. No ALPN protocol is advertised: a browser speaks HTTP/1.1, and a
+byte stream pass unchanged. With the Instance leaf no ALPN protocol is advertised: a browser speaks HTTP/1.1, and a
 client that insists on `h2` by ALPN, such as gRPC, is not served.
+
+With a public name, an ordinary handshake for that name gets the browser-trusted certificate, with
+or without ALPN, and advertises `http/1.1` only when the client offers it; an ACME validation handshake that offers `acme-tls/1` gets the challenge
+certificate. Only a client that offers the ALPN protocol id `alphacompute-instance/1` gets the
+Instance leaf; every client in `alpha-client` offers it, together with `http/1.1`.
+An `alpha` CLI built before this rule offers no such id, so against a public name it gets the
+browser-trusted certificate and fails its KMS CA pin: update the CLI before an Endpoint with a public
+name moves to a runtime with this rule. Verifying by address, with no public name in the SNI, still
+works with either CLI.
 
 There is no session resumption (no tickets, no session cache): a resumed session presents no
 certificate, and every connection has to prove the current leaf. A renewal swaps the leaf for
