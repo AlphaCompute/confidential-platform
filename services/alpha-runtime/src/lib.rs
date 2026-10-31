@@ -51,6 +51,8 @@ pub use alpha_client::runtime::{PROBE_PORT, SOCKET_PATH, TLS_PORT};
 
 pub const RENEW_BEFORE: Duration = Duration::from_secs(600);
 const RETRY_AFTER: Duration = Duration::from_secs(30);
+/// The first attestation retries after this, doubling up to [`RETRY_AFTER`].
+const FIRST_RETRY: Duration = Duration::from_secs(2);
 /// A quote request lost by the host's quote service never completes; without a bound, the
 /// leaf would expire with no further attempt.
 const ATTEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -530,6 +532,8 @@ pub struct Runtime {
     /// The version and `kms_revisions` of the newest platform document this process accepted.
     accepted: Mutex<Option<(u64, Vec<ComposeHash>)>>,
     attested: RwLock<Option<Arc<Attested>>>,
+    /// [`Error::kind`] of the last attestation while it failed.
+    attest_error: Mutex<Option<&'static str>>,
     revoked: watch::Sender<bool>,
 }
 
@@ -559,6 +563,7 @@ impl Runtime {
             revision,
             accepted: Mutex::new(None),
             attested: RwLock::new(None),
+            attest_error: Mutex::new(None),
             revoked: watch::Sender::new(false),
         }))
     }
@@ -593,11 +598,32 @@ impl Runtime {
         self.last().filter(|a| self.now() < a.not_after)
     }
 
+    /// The closed code of the last attestation's error, `None` once one succeeded.
+    pub fn attest_error(&self) -> Option<&'static str> {
+        *self.attest_error.lock()
+    }
+
     fn note(&self, error: Error) -> Error {
         if error.revoked() {
             self.revoked.send_replace(true);
         }
         error
+    }
+
+    /// Attests until it succeeds, so that a refusal reaches the probe instead of a restart. Only
+    /// a revoked Revision and a stuck quote, which a restart may unstick, end it.
+    pub async fn attest_first(&self) -> Result<Arc<Attested>, Error> {
+        let mut retry = FIRST_RETRY;
+        loop {
+            match self.attest().await {
+                Err(e) if !e.revoked() && !matches!(e, Error::TimedOut) => {
+                    alpha_client::warn!("attestation_failed", error = e.kind());
+                    tokio::time::sleep(retry).await;
+                    retry = retry.saturating_mul(2).min(RETRY_AFTER);
+                }
+                attested => return attested,
+            }
+        }
     }
 
     /// Nonce → `report_data` → quote → leaf; the first call is the Instance's birth, later ones renew.
@@ -606,7 +632,11 @@ impl Runtime {
             tokio::time::timeout(ATTEST_TIMEOUT, self.attest_inner())
                 .await
                 .unwrap_or(Err(Error::TimedOut))
-                .map_err(|e| self.note(e))?;
+                .map_err(|e| {
+                    *self.attest_error.lock() = Some(e.kind());
+                    self.note(e)
+                })?;
+        *self.attest_error.lock() = None;
         // After the deadline, so a slow PCS can never cost the Instance its leaf.
         attested.attestation = self.attestation(evidence, nonce).await;
         let attested = Arc::new(attested);

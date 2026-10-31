@@ -171,15 +171,14 @@ fn select<'a>(
     }
 }
 
-/// The Endpoint's listener with its TLS configuration and its plain-HTTP probe listener, bound
-/// only for a compose that names an upstream.
+/// The Endpoint's listener with its TLS configuration, bound only for a compose that names an
+/// upstream.
 pub struct Endpoint {
     listener: TcpListener,
     configs: Arc<Configs>,
     runtime: Arc<Runtime>,
     upstream: String,
     callers: Arc<[AppId]>,
-    probe: (TcpListener, axum::Router),
 }
 
 async fn bind_tcp(addr: SocketAddr) -> Result<TcpListener, Error> {
@@ -188,24 +187,41 @@ async fn bind_tcp(addr: SocketAddr) -> Result<TcpListener, Error> {
         .map_err(|e| Error::Socket(format!("{addr}: {e}")))
 }
 
+/// Serves the plain-HTTP probe listener for a compose that names an upstream, from before the
+/// first attestation, so the host can read why it fails; its address, or `None` without an
+/// upstream.
+pub async fn serve_probe(
+    runtime: Arc<Runtime>,
+    addr: SocketAddr,
+) -> Result<Option<SocketAddr>, Error> {
+    if runtime.config().tls_upstream.is_none() {
+        return Ok(None);
+    }
+    let listener = bind_tcp(addr).await?;
+    let local = listener
+        .local_addr()
+        .map_err(|e| Error::Socket(format!("{addr}: {e}")))?;
+    let router = axum::Router::new()
+        .route("/leaf", axum::routing::get(leaf_chain))
+        .route("/ready", axum::routing::get(ready))
+        .with_state(runtime);
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(listener, router).await {
+            alpha_client::error!("probe_listener_failed", error = e.kind());
+        }
+    });
+    Ok(Some(local))
+}
+
 impl Endpoint {
     /// `None` when the configuration names no upstream. With caller Apps, call it after the
     /// first attestation: the KMS CA comes from its chain.
-    pub async fn bind(
-        runtime: Arc<Runtime>,
-        addr: SocketAddr,
-        probe_addr: SocketAddr,
-    ) -> Result<Option<Self>, Error> {
+    pub async fn bind(runtime: Arc<Runtime>, addr: SocketAddr) -> Result<Option<Self>, Error> {
         let config = runtime.config();
         let Some(upstream) = config.tls_upstream.clone() else {
             return Ok(None);
         };
         let callers = config.tls_callers.clone().into();
-        let probe = axum::Router::new()
-            .route("/leaf", axum::routing::get(leaf_chain))
-            .route("/ready", axum::routing::get(ready))
-            .with_state(runtime.clone());
-        let probe = (bind_tcp(probe_addr).await?, probe);
         let configs = Arc::new(Configs {
             instance: server_config(runtime.clone())?,
             public: config.public.clone().map(|name| (name, Arc::default())),
@@ -216,7 +232,6 @@ impl Endpoint {
             runtime,
             upstream,
             callers,
-            probe,
         }))
     }
 
@@ -224,20 +239,10 @@ impl Endpoint {
         self.listener.local_addr()
     }
 
-    pub fn probe_addr(&self) -> std::io::Result<SocketAddr> {
-        self.probe.0.local_addr()
-    }
-
     /// Accepts until `stop` resolves; no idle timeout, so WebSockets and long polls stay open.
     /// Open connections get at most [`DRAIN`] on a shutdown and are cut on revocation.
     pub async fn serve(self, stop: impl Future<Output = Exit>) {
         let mut stop = std::pin::pin!(stop);
-        let (listener, router) = self.probe;
-        let probe = tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, router).await {
-                alpha_client::error!("probe_listener_failed", error = e.kind());
-            }
-        });
         let issuer = self.configs.public.as_ref().map(|(name, edge)| {
             tokio::spawn(acme::issue_forever(
                 edge.clone(),
@@ -268,7 +273,6 @@ impl Endpoint {
             ));
         };
         drop(self.listener);
-        probe.abort();
         if let Some(issuer) = issuer {
             issuer.abort();
         }
@@ -477,18 +481,24 @@ async fn leaf_chain(
 }
 
 /// 200 only while the leaf is current and, with a readiness path, the upstream answers it with a
-/// 2xx now.
-async fn ready(State(runtime): State<Arc<Runtime>>) -> StatusCode {
+/// 2xx now. Without a current leaf the 503's body is the closed code of the last attestation's
+/// error, never the KMS's message.
+async fn ready(State(runtime): State<Arc<Runtime>>) -> (StatusCode, &'static str) {
+    if runtime.attested().is_none() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            runtime.attest_error().unwrap_or_default(),
+        );
+    }
     let config = runtime.config();
-    if runtime.attested().is_some()
-        && match (&config.tls_upstream, &config.tls_ready) {
-            (Some(upstream), Some(path)) => upstream_answers(upstream, path).await,
-            _ => true,
-        }
-    {
-        StatusCode::OK
+    let up = match (&config.tls_upstream, &config.tls_ready) {
+        (Some(upstream), Some(path)) => upstream_answers(upstream, path).await,
+        _ => true,
+    };
+    if up {
+        (StatusCode::OK, "")
     } else {
-        StatusCode::SERVICE_UNAVAILABLE
+        (StatusCode::SERVICE_UNAVAILABLE, "")
     }
 }
 

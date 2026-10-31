@@ -5,8 +5,11 @@ life), asks the KMS for a nonce, quotes `report_data` over its key and the nonce
 the guest agent's socket, sends the quote and the dstack event log to `POST /v1/attest`, and keeps the
 one-hour leaf it gets back, renewing it with fresh evidence ten minutes before it expires. If
 the KMS answers `revision_revoked` — at the first attestation, a renewal, a secret or a key read — the
-process exits with code 78 and the socket disappears. Startup and configuration refusals exit
-with 1 and name the check; a drain on SIGTERM exits with 0.
+process exits with code 78 and the socket disappears. Any other failure of the first attestation,
+a KMS refusal such as `attestation_unknown` or an unreachable KMS, is retried after 2 s, doubling
+up to 30 s, and the probe listener reports it (see below); only a quote that times out exits with
+1, since a restart is the way to collect it again. Startup and configuration refusals exit with 1
+and name the check; a drain on SIGTERM exits with 0.
 
 In a Kata TDX pod there is no guest agent socket: the runtime quotes through configfs-tsm
 (`/sys/kernel/config/tsm/report`, which the container needs mounted and must run as uid 0 to
@@ -150,7 +153,8 @@ caller is pinned by App rather than Revision, so a caller that pins this Endpoin
 still be registered.
 
 With an upstream, the runtime also listens on 8444 in plain HTTP, for the host: a Kata agent
-policy refuses exec, and the host has no Instance leaf for a caller-pinned Endpoint. `GET /leaf`
+policy refuses exec, and the host has no Instance leaf for a caller-pinned Endpoint. This listener
+opens before the first attestation, the only one that does. `GET /leaf`
 answers with the PEM chain that the Endpoint presents now, leaf first, or 503 while no leaf is
 current. The chain is public, because every handshake shows it. The host reads it through the
 Kubernetes API server proxy, and checks it against the KMS CA itself.
@@ -158,7 +162,11 @@ Kubernetes API server proxy, and checks it against the KMS CA itself.
 The same listener also serves `GET /ready`, for a kubelet probe. It answers 200 with an empty
 body only while the leaf is current and, when `ALPHACOMPUTE_TLS_UPSTREAM_READY` is set, the
 upstream answers `GET <path>` with a 2xx status within 2 s, else 503; nothing of the upstream's
-reply is relayed.
+reply is relayed. Without a current leaf the 503's `text/plain` body is the code of the last
+attestation's error: one of the KMS's error codes, `other` for a code the runtime does not know,
+`unreachable` when no KMS endpoint answered, or a runtime code such as `evidence`, `certificate` or
+`platform_document`. The body is empty before the first attempt ends, and the KMS's message is
+never relayed.
 
 ## Tests
 
@@ -178,7 +186,8 @@ unlisted Revision (and the walk to the next endpoint), the cache expiring with t
 directories of declaring services, waiting for a Secret put later, following a renewal, written
 by the running runtime, and never written for a revoked Revision. The same file proves the TLS listener: the leaf it serves,
 the hybrid group it requires, pass-through, renewal, expiry, revocation, the drain on SIGTERM,
-and with a caller pin: the listed App's leaf served, no client certificate refused, and `/ready`.
+and with a caller pin: the listed App's leaf served, no client certificate refused, and `/ready`,
+which also names the KMS's refusal while the first attestation is retried.
 
 What only a live CVM proves: the real quote and `Info` from the guest agent's socket, the real
 event log from the CCEL table and `/run/log/dstack`, that the registered `compose_hash` equals
