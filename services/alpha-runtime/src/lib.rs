@@ -530,7 +530,6 @@ pub struct Runtime {
     /// The version and `kms_revisions` of the newest platform document this process accepted.
     accepted: Mutex<Option<(u64, Vec<ComposeHash>)>>,
     attested: RwLock<Option<Arc<Attested>>>,
-    /// [`Error::kind`] of the last attestation while it failed.
     attest_error: Mutex<Option<&'static str>>,
     revoked: watch::Sender<bool>,
 }
