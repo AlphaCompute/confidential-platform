@@ -54,11 +54,11 @@ const RETRY_AFTER: Duration = Duration::from_secs(30);
 /// A quote request lost by the host's quote service never completes; without a bound, the
 /// leaf would expire with no further attempt.
 const ATTEST_TIMEOUT: Duration = Duration::from_secs(60);
-/// The first retry of a refused first attestation, doubling up to [`RETRY_AFTER`], and of a
-/// missing Secret: each is a denied `secret.get` audit row on the KMS, so the backoff doubles up
-/// to `SECRETS_POLL` and a Secret never set costs one row a minute.
+/// The first delay of a doubling backoff.
 const FIRST_RETRY: Duration = Duration::from_secs(2);
-/// With every file written a pass hits the leaf's cache, so it costs nothing until a renewal.
+/// With every file written a pass hits the leaf's cache, so it costs nothing until a renewal. Each
+/// missing Secret is a denied `secret.get` audit row on the KMS, so its backoff stops here and a
+/// Secret never set costs one row a minute.
 const SECRETS_POLL: Duration = Duration::from_secs(60);
 
 /// Intel signs the collateral, so its source does not matter; Intel's own PCS answers without a
