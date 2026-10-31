@@ -82,7 +82,7 @@ test("an uploaded compose is approved only after the registration receipt verifi
     `Digest: sha256:${"7d".repeat(32)}`,
     "Endpoint: HTTPS on 443, forwarded to web:80",
     "Machine: tdx.medium",
-    "The service sets the machine size: only CPU and memory, never the code or keys you approve. So you do not sign it.",
+    "The service sets the machine size (CPU and memory). The size never changes the code or keys you approve, so you do not sign it.",
     `App: ${WRAP_APP}`,
     `Revision: ${api.compose_hash}`,
   ]) {
@@ -343,7 +343,7 @@ test("a passkey the service will not enroll leaves the contact sentence", async 
   assert.deepEqual(crossOrigin.page.buttons(), ["Decline"]);
 });
 
-const CREATE_ROOT = "Create your organization's passkey to approve";
+const CREATE_ROOT = "Create your organization's passkey to approve this App";
 const SYNCED_ROOT = "This passkey is saved to your account's password manager.";
 const DEVICE_ROOT =
   "This passkey is only on this device. If you lose it, you lose access to your organization.";

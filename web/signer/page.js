@@ -72,10 +72,10 @@ const MESSAGES = {
     "This passkey is only on this device. If you lose it, you lose access to your organization.",
   yours: "This organization is yours.",
   root_first:
-    "Step 1 of 2: create your organization's passkey and confirm it as the organization's key. In step 2 you approve this App with it. This passkey controls the organization; keep it.",
+    "Step 1 of 2: create your organization's passkey and confirm it. It controls the organization, so keep it. In step 2 you approve this App with it.",
   root_then: "Step 2 of 2: approve this App with your organization's new passkey.",
   machine:
-    "The service sets the machine size: only CPU and memory, never the code or keys you approve. So you do not sign it.",
+    "The service sets the machine size (CPU and memory). The size never changes the code or keys you approve, so you do not sign it.",
   added: "The new passkey is registered.",
   synced: "Synced passkey (backed up by your provider)",
   device_bound: "Device-bound passkey: if you lose this device you lose this key",
@@ -1016,7 +1016,7 @@ function offerApproval(a, note) {
   if (a.canEnroll && !a.credential) {
     const root = a.read.root_principal_id != null;
     const label = root
-      ? "Create your organization's passkey to approve"
+      ? "Create your organization's passkey to approve this App"
       : "Create a passkey for this organization";
     const className = sign ? "secondary" : undefined;
     // Signing in comes first, so that a passkey is never created that the service then refuses.
