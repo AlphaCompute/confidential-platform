@@ -5,10 +5,11 @@ life), asks the KMS for a nonce, quotes `report_data` over its key and the nonce
 the guest agent's socket, sends the quote and the dstack event log to `POST /v1/attest`, and keeps the
 one-hour leaf it gets back, renewing it with fresh evidence ten minutes before it expires. If
 the KMS answers `revision_revoked` — at the first attestation, a renewal, a secret or a key read — the
-process exits with code 78 and the socket disappears. Any other failure of the first attestation,
-a KMS refusal such as `attestation_unknown` or an unreachable KMS, is retried after 2 s, doubling
-up to 30 s, and the probe listener reports it (see below); only a quote that times out exits with
-1, since a restart is the way to collect it again. Startup and configuration refusals exit with 1
+process exits with code 78 and the socket disappears. With an upstream, any other failure of the
+first attestation, a KMS refusal such as `attestation_unknown` or an unreachable KMS, is retried
+after 2 s, doubling up to 30 s, and the probe listener reports it (see below); only a quote that
+times out exits with 1, since a restart is the way to collect it again. Without an upstream there
+is no probe listener, so a failed first attestation exits with 1. Startup and configuration refusals exit with 1
 and name the check; a drain on SIGTERM exits with 0.
 
 In a Kata TDX pod there is no guest agent socket: the runtime quotes through configfs-tsm

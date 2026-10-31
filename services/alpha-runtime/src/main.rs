@@ -81,8 +81,12 @@ async fn run() -> Result<Exit, Error> {
         alpha_client::system_time_provider(),
         revision,
     )?;
-    proxy::serve_probe(runtime.clone(), ([0, 0, 0, 0], PROBE_PORT).into()).await?;
-    let attested = runtime.attest_first().await?;
+    // Without the probe nothing would report a retried refusal, and the exit code is the signal.
+    let attested =
+        match proxy::serve_probe(runtime.clone(), ([0, 0, 0, 0], PROBE_PORT).into()).await? {
+            Some(_) => runtime.attest_first().await?,
+            None => runtime.attest().await?,
+        };
     alpha_client::info!(
         "attested",
         substrate = match substrate {
