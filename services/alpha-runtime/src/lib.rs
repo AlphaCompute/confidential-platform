@@ -51,14 +51,13 @@ pub use alpha_client::runtime::{PROBE_PORT, SOCKET_PATH, TLS_PORT};
 
 pub const RENEW_BEFORE: Duration = Duration::from_secs(600);
 const RETRY_AFTER: Duration = Duration::from_secs(30);
-/// The first attestation retries after this, doubling up to [`RETRY_AFTER`].
-const FIRST_RETRY: Duration = Duration::from_secs(2);
 /// A quote request lost by the host's quote service never completes; without a bound, the
 /// leaf would expire with no further attempt.
 const ATTEST_TIMEOUT: Duration = Duration::from_secs(60);
-/// Each missing Secret is a denied `secret.get` audit row on the KMS; the backoff doubles from
-/// here up to `SECRETS_POLL`, so a Secret never set costs one row a minute.
-const SECRETS_FIRST_RETRY: Duration = Duration::from_secs(2);
+/// The first retry of a refused first attestation, doubling up to [`RETRY_AFTER`], and of a
+/// missing Secret: each is a denied `secret.get` audit row on the KMS, so the backoff doubles up
+/// to `SECRETS_POLL` and a Secret never set costs one row a minute.
+const FIRST_RETRY: Duration = Duration::from_secs(2);
 /// With every file written a pass hits the leaf's cache, so it costs nothing until a renewal.
 const SECRETS_POLL: Duration = Duration::from_secs(60);
 
@@ -907,13 +906,13 @@ impl Runtime {
         if self.config.secrets.is_empty() {
             return;
         }
-        let mut retry = SECRETS_FIRST_RETRY;
+        let mut retry = FIRST_RETRY;
         let mut waiting = Vec::new();
         loop {
             match self.deliver(&root).await {
                 Delivery::Revoked => return,
                 Delivery::Complete => {
-                    retry = SECRETS_FIRST_RETRY;
+                    retry = FIRST_RETRY;
                     waiting.clear();
                     tokio::time::sleep(SECRETS_POLL).await;
                 }

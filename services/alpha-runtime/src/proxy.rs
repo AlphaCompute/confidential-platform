@@ -495,11 +495,12 @@ async fn ready(State(runtime): State<Arc<Runtime>>) -> (StatusCode, &'static str
         (Some(upstream), Some(path)) => upstream_answers(upstream, path).await,
         _ => true,
     };
-    if up {
-        (StatusCode::OK, "")
+    let status = if up {
+        StatusCode::OK
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "")
-    }
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, "")
 }
 
 async fn upstream_answers(upstream: &str, path: &str) -> bool {
