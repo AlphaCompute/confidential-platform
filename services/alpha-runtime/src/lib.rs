@@ -54,7 +54,6 @@ const RETRY_AFTER: Duration = Duration::from_secs(30);
 /// A quote request lost by the host's quote service never completes; without a bound, the
 /// leaf would expire with no further attempt. Every KMS request has its own bound.
 const QUOTE_TIMEOUT: Duration = Duration::from_secs(60);
-/// The first delay of a doubling backoff.
 const FIRST_RETRY: Duration = Duration::from_secs(2);
 /// With every file written a pass hits the leaf's cache, so it costs nothing until a renewal. Each
 /// missing Secret is a denied `secret.get` audit row on the KMS, so its backoff stops here and a

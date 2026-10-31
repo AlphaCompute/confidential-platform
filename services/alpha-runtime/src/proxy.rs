@@ -491,16 +491,12 @@ async fn ready(State(runtime): State<Arc<Runtime>>) -> (StatusCode, &'static str
         );
     }
     let config = runtime.config();
-    let up = match (&config.tls_upstream, &config.tls_ready) {
-        (Some(upstream), Some(path)) => upstream_answers(upstream, path).await,
-        _ => true,
-    };
-    let status = if up {
-        StatusCode::OK
-    } else {
-        StatusCode::SERVICE_UNAVAILABLE
-    };
-    (status, "")
+    match (&config.tls_upstream, &config.tls_ready) {
+        (Some(upstream), Some(path)) if !upstream_answers(upstream, path).await => {
+            (StatusCode::SERVICE_UNAVAILABLE, "")
+        }
+        _ => (StatusCode::OK, ""),
+    }
 }
 
 async fn upstream_answers(upstream: &str, path: &str) -> bool {
