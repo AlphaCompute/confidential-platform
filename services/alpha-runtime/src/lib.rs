@@ -609,13 +609,14 @@ impl Runtime {
         error
     }
 
-    /// Attests until it succeeds, so that a refusal reaches the probe instead of a restart. Only
-    /// a revoked Revision and a stuck quote, which a restart may unstick, end it.
+    /// Attests until it succeeds or the Revision is revoked, so that a refusal reaches the probe
+    /// instead of a restart. A timeout is retried too: it cannot tell a stalled KMS from a stuck
+    /// quote, and the next attempt asks for a fresh quote as a restart would.
     pub async fn attest_first(&self) -> Result<Arc<Attested>, Error> {
         let mut retry = FIRST_RETRY;
         loop {
             match self.attest().await {
-                Err(e) if !e.revoked() && !matches!(e, Error::TimedOut) => {
+                Err(e) if !e.revoked() => {
                     alpha_client::warn!("attestation_failed", error = e.kind());
                     tokio::time::sleep(retry).await;
                     retry = retry.saturating_mul(2).min(RETRY_AFTER);

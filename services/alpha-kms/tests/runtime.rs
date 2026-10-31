@@ -1010,7 +1010,11 @@ async fn a_refused_first_attestation_is_retried_and_named_by_ready() {
     assert_eq!(probe_get(probe, "/leaf").await.0, 503);
 
     app_with_secret(&h, b"v1").await;
-    first.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(30), first)
+        .await
+        .expect("the retry attests once the Revision exists")
+        .unwrap()
+        .unwrap();
     assert_eq!(probe_get(probe, "/ready").await, (200, String::new()));
 }
 
