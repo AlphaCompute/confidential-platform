@@ -174,7 +174,7 @@ impl Socket {
     /// As [`Socket::start`], with the Endpoint listening on a free local port.
     async fn with_endpoint(runtime: Arc<Runtime>) -> (Self, SocketAddr) {
         let local = "127.0.0.1:0".parse().unwrap();
-        let endpoint = proxy::Endpoint::bind(runtime.clone(), local, local)
+        let endpoint = proxy::Endpoint::bind(runtime.clone(), local)
             .await
             .unwrap()
             .expect("the config names an upstream");
@@ -921,15 +921,16 @@ async fn a_caller_pinned_endpoint_serves_only_listed_apps_and_answers_ready_in_p
                 ..config_with_upstream(h, port)
             };
             let (runtime, _) = start_runtime(h, config);
-            runtime.attest().await.unwrap();
-            let endpoint = proxy::Endpoint::bind(runtime.clone(), local, local)
+            let probe = proxy::serve_probe(runtime.clone(), local)
                 .await
                 .unwrap()
                 .unwrap();
-            let addrs = (
-                endpoint.local_addr().unwrap(),
-                endpoint.probe_addr().unwrap(),
-            );
+            runtime.attest().await.unwrap();
+            let endpoint = proxy::Endpoint::bind(runtime.clone(), local)
+                .await
+                .unwrap()
+                .unwrap();
+            let addrs = (endpoint.local_addr().unwrap(), probe);
             (
                 runtime.clone(),
                 Socket::serve(runtime, Some(endpoint)),
@@ -982,6 +983,39 @@ async fn a_caller_pinned_endpoint_serves_only_listed_apps_and_answers_ready_in_p
 
     assert_eq!(socket.stop().await, Exit::Drained);
     assert_eq!(other_socket.stop().await, Exit::Drained);
+}
+
+#[tokio::test]
+async fn a_refused_first_attestation_is_retried_and_named_by_ready() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    let (runtime, _) = start_runtime(&h, config_with_upstream(&h, 1));
+    let probe = proxy::serve_probe(runtime.clone(), "127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let first = tokio::spawn({
+        let runtime = runtime.clone();
+        async move { runtime.attest_first().await }
+    });
+    let refused = (503, "attestation_unknown".to_owned());
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while probe_get(probe, "/ready").await != refused {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the refusal reaches /ready");
+    assert_eq!(probe_get(probe, "/leaf").await.0, 503);
+
+    app_with_secret(&h, b"v1").await;
+    tokio::time::timeout(Duration::from_secs(90), first)
+        .await
+        .expect("the retry attests once the Revision exists")
+        .unwrap()
+        .unwrap();
+    assert_eq!(probe_get(probe, "/ready").await, (200, String::new()));
 }
 
 #[tokio::test]

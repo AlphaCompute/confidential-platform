@@ -52,12 +52,12 @@ pub use alpha_client::runtime::{PROBE_PORT, SOCKET_PATH, TLS_PORT};
 pub const RENEW_BEFORE: Duration = Duration::from_secs(600);
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 /// A quote request lost by the host's quote service never completes; without a bound, the
-/// leaf would expire with no further attempt.
-const ATTEST_TIMEOUT: Duration = Duration::from_secs(60);
-/// Each missing Secret is a denied `secret.get` audit row on the KMS; the backoff doubles from
-/// here up to `SECRETS_POLL`, so a Secret never set costs one row a minute.
-const SECRETS_FIRST_RETRY: Duration = Duration::from_secs(2);
-/// With every file written a pass hits the leaf's cache, so it costs nothing until a renewal.
+/// leaf would expire with no further attempt. Every KMS request has its own bound.
+const QUOTE_TIMEOUT: Duration = Duration::from_secs(60);
+const FIRST_RETRY: Duration = Duration::from_secs(2);
+/// With every file written a pass hits the leaf's cache, so it costs nothing until a renewal. Each
+/// missing Secret is a denied `secret.get` audit row on the KMS, so its backoff stops here and a
+/// Secret never set costs one row a minute.
 const SECRETS_POLL: Duration = Duration::from_secs(60);
 
 /// Intel signs the collateral, so its source does not matter; Intel's own PCS answers without a
@@ -92,7 +92,7 @@ pub enum Error {
     Socket(String),
     #[error("platform document: {0}")]
     Platform(String),
-    #[error("attestation timed out")]
+    #[error("quote timed out")]
     TimedOut,
 }
 
@@ -530,6 +530,7 @@ pub struct Runtime {
     /// The version and `kms_revisions` of the newest platform document this process accepted.
     accepted: Mutex<Option<(u64, Vec<ComposeHash>)>>,
     attested: RwLock<Option<Arc<Attested>>>,
+    attest_error: Mutex<Option<&'static str>>,
     revoked: watch::Sender<bool>,
 }
 
@@ -559,6 +560,7 @@ impl Runtime {
             revision,
             accepted: Mutex::new(None),
             attested: RwLock::new(None),
+            attest_error: Mutex::new(None),
             revoked: watch::Sender::new(false),
         }))
     }
@@ -593,6 +595,11 @@ impl Runtime {
         self.last().filter(|a| self.now() < a.not_after)
     }
 
+    /// The closed code of the last attestation's error, `None` once one succeeded.
+    pub fn attest_error(&self) -> Option<&'static str> {
+        *self.attest_error.lock()
+    }
+
     fn note(&self, error: Error) -> Error {
         if error.revoked() {
             self.revoked.send_replace(true);
@@ -600,14 +607,29 @@ impl Runtime {
         error
     }
 
+    /// Attests until it succeeds, so that a refusal reaches the probe instead of a restart. Only
+    /// a revoked Revision and a stuck quote, whose blocked request a restart drops, end it.
+    pub async fn attest_first(&self) -> Result<Arc<Attested>, Error> {
+        let mut retry = FIRST_RETRY;
+        loop {
+            match self.attest().await {
+                Err(e) if !e.revoked() && !matches!(e, Error::TimedOut) => {
+                    alpha_client::warn!("attestation_failed", error = e.kind());
+                    tokio::time::sleep(retry).await;
+                    retry = retry.saturating_mul(2).min(RETRY_AFTER);
+                }
+                attested => return attested,
+            }
+        }
+    }
+
     /// Nonce → `report_data` → quote → leaf; the first call is the Instance's birth, later ones renew.
     pub async fn attest(&self) -> Result<Arc<Attested>, Error> {
-        let (mut attested, evidence, nonce) =
-            tokio::time::timeout(ATTEST_TIMEOUT, self.attest_inner())
-                .await
-                .unwrap_or(Err(Error::TimedOut))
-                .map_err(|e| self.note(e))?;
-        // After the deadline, so a slow PCS can never cost the Instance its leaf.
+        let (mut attested, evidence, nonce) = self.attest_inner().await.map_err(|e| {
+            *self.attest_error.lock() = Some(e.kind());
+            self.note(e)
+        })?;
+        *self.attest_error.lock() = None;
         attested.attestation = self.attestation(evidence, nonce).await;
         let attested = Arc::new(attested);
         *self.attested.write() = Some(attested.clone());
@@ -631,8 +653,10 @@ impl Runtime {
             .map_err(|_| alpha_client::Error::Invalid("nonce is not 32 bytes".into()))?;
         let report_data = alpha_attest::report_data(&self.spki, &nonce, None);
         let source = self.evidence.clone();
-        let evidence = tokio::task::spawn_blocking(move || source(&report_data))
+        let quote = tokio::task::spawn_blocking(move || source(&report_data));
+        let evidence = tokio::time::timeout(QUOTE_TIMEOUT, quote)
             .await
+            .map_err(|_| Error::TimedOut)?
             .map_err(|e| Error::Evidence(e.to_string()))?
             .map_err(Error::Evidence)?;
         let reply = kms
@@ -877,13 +901,13 @@ impl Runtime {
         if self.config.secrets.is_empty() {
             return;
         }
-        let mut retry = SECRETS_FIRST_RETRY;
+        let mut retry = FIRST_RETRY;
         let mut waiting = Vec::new();
         loop {
             match self.deliver(&root).await {
                 Delivery::Revoked => return,
                 Delivery::Complete => {
-                    retry = SECRETS_FIRST_RETRY;
+                    retry = FIRST_RETRY;
                     waiting.clear();
                     tokio::time::sleep(SECRETS_POLL).await;
                 }

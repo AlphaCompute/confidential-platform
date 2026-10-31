@@ -81,7 +81,12 @@ async fn run() -> Result<Exit, Error> {
         alpha_client::system_time_provider(),
         revision,
     )?;
-    let attested = runtime.attest().await?;
+    // Without the probe nothing would report a retried refusal, and the exit code is the signal.
+    let attested =
+        match proxy::serve_probe(runtime.clone(), ([0, 0, 0, 0], PROBE_PORT).into()).await? {
+            Some(_) => runtime.attest_first().await?,
+            None => runtime.attest().await?,
+        };
     alpha_client::info!(
         "attested",
         substrate = match substrate {
@@ -107,12 +112,7 @@ async fn run() -> Result<Exit, Error> {
         std::os::unix::fs::PermissionsExt::from_mode(0o666),
     )
     .map_err(socket)?;
-    let tls = proxy::Endpoint::bind(
-        runtime.clone(),
-        ([0, 0, 0, 0], TLS_PORT).into(),
-        ([0, 0, 0, 0], PROBE_PORT).into(),
-    )
-    .await?;
+    let tls = proxy::Endpoint::bind(runtime.clone(), ([0, 0, 0, 0], TLS_PORT).into()).await?;
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| Error::Socket(format!("SIGTERM handler: {e}")))?;
     let shutdown = async move {
