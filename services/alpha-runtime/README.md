@@ -6,9 +6,10 @@ the guest agent's socket, sends the quote and the dstack event log to `POST /v1/
 one-hour leaf it gets back, renewing it with fresh evidence ten minutes before it expires. If
 the KMS answers `revision_revoked` — at the first attestation, a renewal, a secret or a key read — the
 process exits with code 78 and the socket disappears. With an upstream, any other failure of the
-first attestation, a KMS refusal such as `attestation_unknown`, an unreachable KMS or a timeout,
-is retried after 2 s, doubling up to 30 s, and the probe listener reports it (see below). Without
-an upstream there is no probe listener, so a failed first attestation exits with 1. Startup and configuration refusals exit with 1
+first attestation, a KMS refusal such as `attestation_unknown` or an unreachable KMS, is retried
+after 2 s, doubling up to 30 s, and the probe listener reports it (see below); a quote that does
+not arrive within 60 s exits with 1, since its request stays blocked until a restart. Without an
+upstream there is no probe listener, so a failed first attestation exits with 1. Startup and configuration refusals exit with 1
 and name the check; a drain on SIGTERM exits with 0.
 
 In a Kata TDX pod there is no guest agent socket: the runtime quotes through configfs-tsm
@@ -164,8 +165,8 @@ body only while the leaf is current and, when `ALPHACOMPUTE_TLS_UPSTREAM_READY` 
 upstream answers `GET <path>` with a 2xx status within 2 s, else 503; nothing of the upstream's
 reply is relayed. Without a current leaf the 503's `text/plain` body is the code of the last
 attestation's error: one of the KMS's error codes, `other` for a code the runtime does not know,
-`unreachable` when no KMS endpoint answered, or a runtime code such as `evidence`, `timed_out`,
-`certificate` or `platform_document`. The body is empty before the first attempt ends, and the
+`unreachable` when no KMS endpoint answered, or a runtime code such as `evidence`, `certificate`
+or `platform_document`. The body is empty before the first attempt ends, and the
 KMS's message is never relayed.
 
 ## Tests

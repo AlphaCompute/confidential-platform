@@ -52,8 +52,8 @@ pub use alpha_client::runtime::{PROBE_PORT, SOCKET_PATH, TLS_PORT};
 pub const RENEW_BEFORE: Duration = Duration::from_secs(600);
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 /// A quote request lost by the host's quote service never completes; without a bound, the
-/// leaf would expire with no further attempt.
-const ATTEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// leaf would expire with no further attempt. Every KMS request has its own bound.
+const QUOTE_TIMEOUT: Duration = Duration::from_secs(60);
 /// The first delay of a doubling backoff.
 const FIRST_RETRY: Duration = Duration::from_secs(2);
 /// With every file written a pass hits the leaf's cache, so it costs nothing until a renewal. Each
@@ -93,7 +93,7 @@ pub enum Error {
     Socket(String),
     #[error("platform document: {0}")]
     Platform(String),
-    #[error("attestation timed out")]
+    #[error("quote timed out")]
     TimedOut,
 }
 
@@ -609,14 +609,13 @@ impl Runtime {
         error
     }
 
-    /// Attests until it succeeds or the Revision is revoked, so that a refusal reaches the probe
-    /// instead of a restart. A timeout is retried too: it cannot tell a stalled KMS from a stuck
-    /// quote, and the next attempt asks for a fresh quote as a restart would.
+    /// Attests until it succeeds, so that a refusal reaches the probe instead of a restart. Only
+    /// a revoked Revision and a stuck quote, whose blocked request a restart drops, end it.
     pub async fn attest_first(&self) -> Result<Arc<Attested>, Error> {
         let mut retry = FIRST_RETRY;
         loop {
             match self.attest().await {
-                Err(e) if !e.revoked() => {
+                Err(e) if !e.revoked() && !matches!(e, Error::TimedOut) => {
                     alpha_client::warn!("attestation_failed", error = e.kind());
                     tokio::time::sleep(retry).await;
                     retry = retry.saturating_mul(2).min(RETRY_AFTER);
@@ -628,16 +627,11 @@ impl Runtime {
 
     /// Nonce → `report_data` → quote → leaf; the first call is the Instance's birth, later ones renew.
     pub async fn attest(&self) -> Result<Arc<Attested>, Error> {
-        let (mut attested, evidence, nonce) =
-            tokio::time::timeout(ATTEST_TIMEOUT, self.attest_inner())
-                .await
-                .unwrap_or(Err(Error::TimedOut))
-                .map_err(|e| {
-                    *self.attest_error.lock() = Some(e.kind());
-                    self.note(e)
-                })?;
+        let (mut attested, evidence, nonce) = self.attest_inner().await.map_err(|e| {
+            *self.attest_error.lock() = Some(e.kind());
+            self.note(e)
+        })?;
         *self.attest_error.lock() = None;
-        // After the deadline, so a slow PCS can never cost the Instance its leaf.
         attested.attestation = self.attestation(evidence, nonce).await;
         let attested = Arc::new(attested);
         *self.attested.write() = Some(attested.clone());
@@ -661,8 +655,10 @@ impl Runtime {
             .map_err(|_| alpha_client::Error::Invalid("nonce is not 32 bytes".into()))?;
         let report_data = alpha_attest::report_data(&self.spki, &nonce, None);
         let source = self.evidence.clone();
-        let evidence = tokio::task::spawn_blocking(move || source(&report_data))
+        let quote = tokio::task::spawn_blocking(move || source(&report_data));
+        let evidence = tokio::time::timeout(QUOTE_TIMEOUT, quote)
             .await
+            .map_err(|_| Error::TimedOut)?
             .map_err(|e| Error::Evidence(e.to_string()))?
             .map_err(Error::Evidence)?;
         let reply = kms
