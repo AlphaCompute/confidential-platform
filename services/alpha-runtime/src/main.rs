@@ -4,7 +4,7 @@ use std::time::SystemTime;
 
 use alpha_runtime::{
     Config, EXIT_REFUSED, Error, Exit, INIT_DATA_PATH, PROBE_PORT, RevisionText, Runtime,
-    SECRETS_DIR, SOCKET_PATH, TLS_PORT, gpu, proxy,
+    SECRETS_DIR, SOCKET_PATH, TLS_PORT, gpu, inference, proxy,
 };
 use alpha_tsm::Substrate;
 use p256::ecdsa::SigningKey;
@@ -113,6 +113,7 @@ async fn run() -> Result<Exit, Error> {
     )
     .map_err(socket)?;
     let tls = proxy::Endpoint::bind(runtime.clone(), ([0, 0, 0, 0], TLS_PORT).into()).await?;
+    let inference = inference::Forwarder::bind(runtime.clone(), inference::ADDR.into()).await?;
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| Error::Socket(format!("SIGTERM handler: {e}")))?;
     let shutdown = async move {
@@ -122,7 +123,13 @@ async fn run() -> Result<Exit, Error> {
         }
     };
     let exit = runtime
-        .run(listener, PathBuf::from(SECRETS_DIR), tls, shutdown)
+        .run(
+            listener,
+            PathBuf::from(SECRETS_DIR),
+            tls,
+            inference,
+            shutdown,
+        )
         .await;
     let _ = std::fs::remove_file(SOCKET_PATH);
     Ok(exit)

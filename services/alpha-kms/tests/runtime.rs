@@ -95,6 +95,7 @@ fn config(h: &Harness, endpoints: Vec<String>) -> Config {
         tls_callers: Vec::new(),
         tls_ready: None,
         public: None,
+        inference: None,
     }
 }
 
@@ -192,9 +193,11 @@ impl Socket {
         let secrets = secrets_root(&["web"]);
         let listener = UnixListener::bind(&path).unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let task = tokio::spawn(runtime.run(listener, secrets.clone(), tls, async move {
-            let _ = rx.await;
-        }));
+        let task = tokio::spawn(
+            runtime.run(listener, secrets.clone(), tls, None, async move {
+                let _ = rx.await;
+            }),
+        );
         Self {
             path,
             secrets,
@@ -1113,6 +1116,173 @@ async fn get_body(mut tls: TlsStream<TcpStream>) -> String {
     let mut reply = String::new();
     tls.read_to_string(&mut reply).await.unwrap();
     reply
+}
+
+/// An inference front serving the runtime's own leaf, so the KMS CA and the capture's Revision
+/// pin it, and requiring a client leaf of that CA. For each request it sends the client leaf
+/// and the request bytes, streams one event, and ends the stream once `release` fires.
+async fn inference_front(
+    h: &Harness,
+    served: Arc<rustls::sign::CertifiedKey>,
+    release: tokio::sync::oneshot::Receiver<()>,
+) -> (String, mpsc::UnboundedReceiver<(Vec<u8>, String)>) {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(tls::cert_from_pem(&h.ca_pem).unwrap()).unwrap();
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        tls::provider(),
+    )
+    .build()
+    .unwrap();
+    let config = ServerConfig::builder_with_details(tls::provider(), pinned_time(h.now()))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_client_cert_verifier(verifier)
+        .with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(served)));
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("https://{}", listener.local_addr().unwrap());
+    let (seen, requests) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut release = Some(release);
+        while let Ok((tcp, _)) = listener.accept().await {
+            let Ok(mut tls) = acceptor.accept(tcp).await else {
+                continue;
+            };
+            let leaf = tls.get_ref().1.peer_certificates().unwrap()[0].to_vec();
+            let mut request = Vec::new();
+            while !request.ends_with(INFERENCE_BODY.as_bytes()) {
+                let mut chunk = [0u8; 1024];
+                let n = tls.read(&mut chunk).await.unwrap();
+                assert_ne!(n, 0, "the request body did not arrive");
+                request.extend_from_slice(&chunk[..n]);
+            }
+            seen.send((leaf, String::from_utf8(request).unwrap()))
+                .unwrap();
+            tls.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n\
+                  data: one\n\n",
+            )
+            .await
+            .unwrap();
+            let _ = release.take().unwrap().await;
+            tls.write_all(b"data: [DONE]\n\n").await.unwrap();
+            let _ = tls.shutdown().await;
+        }
+    });
+    (url, requests)
+}
+
+const INFERENCE_BODY: &str = r#"{"model":"own","stream":true}"#;
+
+/// A runtime attested with the inference front at `url` pinned to `revision`, and its forwarder
+/// on a free local port.
+async fn forwarder(h: &Harness, url: &str, revision: ComposeHash) -> (Arc<Runtime>, SocketAddr) {
+    let config = Config {
+        inference: Some(alpha_runtime::InferenceFront {
+            url: url.to_owned(),
+            revisions: vec![revision],
+        }),
+        ..config(h, vec![h.url.clone()])
+    };
+    let (runtime, _) = start_runtime(h, config);
+    runtime.attest().await.unwrap();
+    let forwarder =
+        alpha_runtime::inference::Forwarder::bind(runtime.clone(), "127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap()
+            .expect("the config names a front");
+    let addr = forwarder.local_addr().unwrap();
+    tokio::spawn(forwarder.serve(std::future::pending()));
+    (runtime, addr)
+}
+
+async fn post_completion(addr: SocketAddr, path: &str) -> TcpStream {
+    let mut tcp = TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer sk-from-the-sdk\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n\
+         {INFERENCE_BODY}",
+        INFERENCE_BODY.len()
+    );
+    tcp.write_all(request.as_bytes()).await.unwrap();
+    tcp
+}
+
+#[tokio::test]
+async fn the_inference_forwarder_presents_the_leaf_without_the_apps_bearer_and_streams() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    let (_, hash, _) = app_with_secret(&h, b"v1").await;
+    // Another Instance of the capture's Revision stands in for the front.
+    let (front, _) = start_runtime(&h, config(&h, vec![h.url.clone()]));
+    let served = front.attest().await.unwrap().certified.clone();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let (url, mut requests) = inference_front(&h, served, released).await;
+    let (runtime, addr) = forwarder(&h, &url, hash).await;
+
+    let mut app = post_completion(addr, "/v1/chat/completions").await;
+    let mut reply = Vec::new();
+    while !String::from_utf8_lossy(&reply).contains("data: one") {
+        let mut chunk = [0u8; 1024];
+        let n = tokio::time::timeout(Duration::from_secs(5), app.read(&mut chunk))
+            .await
+            .expect("the first event is not held back until the stream ends")
+            .unwrap();
+        assert_ne!(n, 0);
+        reply.extend_from_slice(&chunk[..n]);
+    }
+    let (leaf, request) = requests.recv().await.unwrap();
+    assert_eq!(
+        leaf,
+        runtime.attested().unwrap().certified.cert[0].to_vec(),
+        "the front is shown the forwarding runtime's own leaf"
+    );
+    assert!(
+        request.starts_with("POST /v1/chat/completions HTTP/1.1\r\n"),
+        "{request}"
+    );
+    assert!(
+        !request.to_ascii_lowercase().contains("authorization"),
+        "{request}"
+    );
+    assert!(!request.contains("sk-from-the-sdk"), "{request}");
+
+    release.send(()).unwrap();
+    app.read_to_end(&mut reply).await.unwrap();
+    let reply = String::from_utf8(reply).unwrap();
+    assert!(reply.starts_with("HTTP/1.1 200 OK\r\n"), "{reply}");
+    assert!(reply.contains("text/event-stream"), "{reply}");
+    assert!(reply.contains("data: [DONE]"), "{reply}");
+
+    let mut other = post_completion(addr, "/health").await;
+    let mut reply = String::new();
+    other.read_to_string(&mut reply).await.unwrap();
+    assert!(reply.starts_with("HTTP/1.1 404 "), "{reply}");
+    assert!(requests.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn the_inference_forwarder_refuses_a_front_of_an_unpinned_revision() {
+    let Some(h) = nonce_clock_harness().await else {
+        return;
+    };
+    app_with_secret(&h, b"v1").await;
+    let (front, _) = start_runtime(&h, config(&h, vec![h.url.clone()]));
+    let served = front.attest().await.unwrap().certified.clone();
+    let (_release, released) = tokio::sync::oneshot::channel();
+    let (url, mut requests) = inference_front(&h, served, released).await;
+    let (_, addr) = forwarder(&h, &url, alpha_core::compose_hash("another front")).await;
+
+    let mut app = post_completion(addr, "/v1/chat/completions").await;
+    let mut reply = String::new();
+    app.read_to_string(&mut reply).await.unwrap();
+    assert!(reply.starts_with("HTTP/1.1 502 "), "{reply}");
+    let (_, body) = reply.split_once("\r\n\r\n").unwrap();
+    let error: Value = serde_json::from_str(body).unwrap();
+    assert_eq!(error["error"]["code"], "front_unreachable", "{reply}");
+    assert!(requests.try_recv().is_err(), "the front saw a request");
 }
 
 #[tokio::test]
