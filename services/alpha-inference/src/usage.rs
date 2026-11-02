@@ -10,8 +10,7 @@ use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::Error;
-use crate::keys::Key;
+use crate::{Caller, Error};
 use tokio_util::task::TaskTracker;
 
 /// A non-stream answer longer than this is not parsed, and its row has no token counts.
@@ -43,7 +42,7 @@ fn tokens(answer: &Value) -> Option<Tokens> {
 pub struct Meter {
     pool: PgPool,
     tasks: TaskTracker,
-    key: Key,
+    caller: Caller,
     model: String,
     started_at: DateTime<Utc>,
     stream: bool,
@@ -56,7 +55,7 @@ impl Meter {
     pub fn new(
         pool: PgPool,
         tasks: TaskTracker,
-        key: Key,
+        caller: Caller,
         model: String,
         stream: bool,
         started_at: DateTime<Utc>,
@@ -64,7 +63,7 @@ impl Meter {
         Meter {
             pool,
             tasks,
-            key,
+            caller,
             model,
             started_at,
             stream,
@@ -129,7 +128,11 @@ impl Drop for Meter {
         };
         let found = self.result();
         let id = Uuid::now_v7();
-        let (pool, key, started_at) = (self.pool.clone(), self.key, self.started_at);
+        let (pool, started_at) = (self.pool.clone(), self.started_at);
+        let (org_id, key_id, app_id) = match self.caller {
+            Caller::Key(key) => (key.org_id, Some(key.id), None),
+            Caller::App { org_id, app_id } => (org_id, None, Some(app_id)),
+        };
         let model = std::mem::take(&mut self.model);
         self.tasks.spawn_on(
             async move {
@@ -137,12 +140,13 @@ impl Drop for Meter {
             // unbilled. Upgrade: an outbox the front drains before it reports ready.
             for attempt in 1..=INSERT_TRIES {
                 let done = sqlx::query(
-                    "insert into usage (id, key_id, org_id, model, prompt_tokens, completion_tokens, started_at)
-                     values ($1, $2, $3, $4, $5, $6, $7) on conflict (id) do nothing",
+                    "insert into usage (id, key_id, app_id, org_id, model, prompt_tokens, completion_tokens, started_at)
+                     values ($1, $2, $3, $4, $5, $6, $7, $8) on conflict (id) do nothing",
                 )
                 .bind(id)
-                .bind(key.id)
-                .bind(key.org_id)
+                .bind(key_id)
+                .bind(app_id)
+                .bind(org_id)
                 .bind(&model)
                 .bind(found.map(|t| t.prompt))
                 .bind(found.map(|t| t.completion))
@@ -194,7 +198,8 @@ pub struct Range {
 #[derive(Serialize, sqlx::FromRow)]
 pub struct Hourly {
     pub org_id: Uuid,
-    pub key_id: Uuid,
+    pub key_id: Option<Uuid>,
+    pub app_id: Option<Uuid>,
     pub model: String,
     pub hour: DateTime<Utc>,
     pub requests: i64,
@@ -202,15 +207,15 @@ pub struct Hourly {
     pub completion_tokens: i64,
 }
 
-/// Sums per organization, key, model and hour of `started_at`, for `from <= started_at < to`.
+/// Sums per organization, key or App, model and hour of `started_at`, for `from <= started_at < to`.
 pub async fn hourly(pool: &PgPool, range: &Range) -> Result<Vec<Hourly>, Error> {
     Ok(sqlx::query_as(
-        "select org_id, key_id, model, date_trunc('hour', started_at, 'UTC') as hour, count(*) as requests,
+        "select org_id, key_id, app_id, model, date_trunc('hour', started_at, 'UTC') as hour, count(*) as requests,
                 coalesce(sum(prompt_tokens), 0)::bigint as prompt_tokens,
                 coalesce(sum(completion_tokens), 0)::bigint as completion_tokens
          from usage
          where started_at >= $1 and started_at < $2 and ($3::uuid is null or org_id = $3)
-         group by 1, 2, 3, 4 order by 4, 1, 2, 3",
+         group by 1, 2, 3, 4, 5 order by 5, 1, 2, 3, 4",
     )
     .bind(range.from)
     .bind(range.to)
@@ -227,10 +232,10 @@ mod tests {
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://127.0.0.1:1/none")
             .unwrap();
-        let key = Key {
+        let key = Caller::Key(crate::keys::Key {
             id: Uuid::nil(),
             org_id: Uuid::nil(),
-        };
+        });
         Meter::new(
             pool,
             TaskTracker::new(),

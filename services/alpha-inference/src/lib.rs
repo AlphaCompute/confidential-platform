@@ -25,10 +25,11 @@ pub mod usage;
 #[cfg(test)]
 mod test_support;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
+use alpha_client::tls::PeerCerts;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
@@ -40,6 +41,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -61,6 +63,8 @@ pub struct Config {
     pub own: BTreeMap<String, own::ModelServer>,
     /// The provider of every other allowlisted model; `None` when there is none.
     pub external: Option<External>,
+    /// Completions an organization's Apps may have in flight at once.
+    pub app_concurrency_per_org: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -103,10 +107,21 @@ impl Config {
         } else {
             Some(External::build(&get)?)
         };
+        let app_concurrency_per_org = match get("APP_CONCURRENCY_PER_ORG") {
+            None => 4,
+            Some(raw) => raw
+                .parse()
+                .ok()
+                .filter(|n| (1..=Semaphore::MAX_PERMITS).contains(n))
+                .ok_or_else(|| {
+                    Error::internal("APP_CONCURRENCY_PER_ORG must be a positive integer")
+                })?,
+        };
         Ok(Config {
             models,
             own,
             external,
+            app_concurrency_per_org,
         })
     }
 
@@ -184,6 +199,21 @@ pub struct AppState {
     pub keys_key: Zeroizing<[u8; 32]>,
     /// Usage inserts still running; `main` waits for them before it exits.
     pub usage_tasks: tokio_util::task::TaskTracker,
+    // ponytail: the cap holds per front instance, so N replicas admit N times it. Upgrade: a
+    // shared counter in the front's database, or a queue in front of the model server.
+    pub app_slots: parking_lot::Mutex<HashMap<Uuid, Arc<Semaphore>>>,
+}
+
+impl AppState {
+    fn app_slot(&self, org_id: Uuid) -> Result<OwnedSemaphorePermit, Error> {
+        let slots = self
+            .app_slots
+            .lock()
+            .entry(org_id)
+            .or_insert_with(|| Arc::new(Semaphore::new(self.config.app_concurrency_per_org)))
+            .clone();
+        slots.try_acquire_owned().map_err(|_| Error::Busy)
+    }
 }
 
 /// Every error this service answers with, OpenAI-shaped on the wire. Messages never carry a
@@ -202,6 +232,8 @@ pub enum Error {
     UpstreamUnverified,
     #[error("the model provider could not be reached")]
     Upstream,
+    #[error("too many completions in flight for this organization; retry shortly")]
+    Busy,
     #[error("{0}")]
     Internal(String),
 }
@@ -239,6 +271,11 @@ impl Error {
                 "upstream_unverified",
             ),
             Error::Upstream => (StatusCode::BAD_GATEWAY, "upstream_error", "upstream"),
+            Error::Busy => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                "rate_limit_exceeded",
+            ),
             Error::Internal(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
@@ -277,9 +314,36 @@ fn bearer(parts: &Parts) -> Result<&str, Error> {
         .ok_or(Error::Unauthorized)
 }
 
-/// Proof of the caller's key, or `None` for the shared caller bearer, extracted before any
-/// handler runs.
-pub struct AuthedCaller(pub Option<keys::Key>);
+/// A metered caller.
+#[derive(Clone, Copy)]
+pub enum Caller {
+    Key(keys::Key),
+    /// An Instance of a tenant App, by its leaf; it may use only our own model servers.
+    App {
+        org_id: Uuid,
+        app_id: Uuid,
+    },
+}
+
+/// The caller, or `None` for the shared caller bearer, extracted before any handler runs. A
+/// request without a bearer is an App's when its leaf, already chained to the KMS CA in the
+/// handshake, carries an Instance's SANs; a KMS node's leaf chains there too but carries none.
+pub struct AuthedCaller(pub Option<Caller>);
+
+fn app_instance(parts: &Parts) -> Result<Caller, Error> {
+    let leaf = parts
+        .extensions
+        .get::<PeerCerts>()
+        .and_then(|peer| peer.0.first())
+        .ok_or(Error::Unauthorized)?;
+    let instance = alpha_client::tls::uri_sans(leaf)
+        .and_then(|sans| alpha_client::tls::parse_instance_sans(&sans))
+        .map_err(|_| Error::Unauthorized)?;
+    Ok(Caller::App {
+        org_id: instance.org_id.into(),
+        app_id: instance.app_id.into(),
+    })
+}
 
 impl FromRequestParts<Arc<AppState>> for AuthedCaller {
     type Rejection = Error;
@@ -288,13 +352,15 @@ impl FromRequestParts<Arc<AppState>> for AuthedCaller {
         parts: &mut Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
-        let presented = bearer(parts)?;
+        let Ok(presented) = bearer(parts) else {
+            return app_instance(parts).map(|app| AuthedCaller(Some(app)));
+        };
         if alpha_client::bearer_matches(presented.as_bytes(), &state.secrets.read().caller_bearer) {
             return Ok(AuthedCaller(None));
         }
         keys::authenticate(&state.pool, &state.keys_key, presented)
             .await?
-            .map(|key| AuthedCaller(Some(key)))
+            .map(|key| AuthedCaller(Some(Caller::Key(key))))
             .ok_or(Error::Unauthorized)
     }
 }
@@ -382,17 +448,28 @@ async fn delete_model(
 }
 
 /// Our own server of `model`, `None` for a model of RedPill: the measured one for a model of
-/// `MODELS`, else the one the caller's organization registered, else `ModelNotFound`.
+/// `MODELS`, else the one the caller's key's organization registered, else `ModelNotFound`. An
+/// App reaches only the measured ones: RedPill bills per token.
 async fn model_server(
     state: &AppState,
-    key: Option<&keys::Key>,
+    caller: Option<Caller>,
     model: &str,
 ) -> Result<Option<Arc<own::Server>>, Error> {
+    let not_found = || Error::ModelNotFound(model.to_owned());
+    if let Some(Caller::App { .. }) = caller {
+        return state
+            .own
+            .get(model)
+            .cloned()
+            .map(Some)
+            .ok_or_else(not_found);
+    }
     if state.config.allows(model) {
         return Ok(state.own.get(model).cloned());
     }
-    let not_found = || Error::ModelNotFound(model.to_owned());
-    let key = key.ok_or_else(not_found)?;
+    let Some(Caller::Key(key)) = caller else {
+        return Err(not_found());
+    };
     let server = org_models::find(&state.pool, &state.keys_key, key.org_id, model)
         .await?
         .ok_or_else(not_found)?;
@@ -425,11 +502,13 @@ async fn verified_external<'a>(
 
 async fn list_models(
     State(state): State<Arc<AppState>>,
-    AuthedCaller(key): AuthedCaller,
+    AuthedCaller(caller): AuthedCaller,
 ) -> Result<Json<Value>, Error> {
-    let org_models = match key {
-        Some(key) => org_models::names(&state.pool, &state.keys_key, key.org_id).await?,
-        None => Vec::new(),
+    let org_models = match caller {
+        Some(Caller::Key(key)) => {
+            org_models::names(&state.pool, &state.keys_key, key.org_id).await?
+        }
+        _ => Vec::new(),
     };
     let mut data: Vec<Value> = state
         .config
@@ -438,7 +517,11 @@ async fn list_models(
         .chain(&org_models)
         .map(|id| json!({ "id": id, "object": "model", "owned_by": "alphacompute" }))
         .collect();
-    if let Some(upstream) = &state.upstream {
+    let external = state
+        .upstream
+        .as_ref()
+        .filter(|_| !matches!(caller, Some(Caller::App { .. })));
+    if let Some(upstream) = external {
         let listed = upstream.list_models().await;
         let entries = listed
             .get("data")
@@ -469,10 +552,10 @@ async fn list_models(
 
 async fn get_model(
     State(state): State<Arc<AppState>>,
-    AuthedCaller(key): AuthedCaller,
+    AuthedCaller(caller): AuthedCaller,
     Path(model): Path<String>,
 ) -> Result<Json<Value>, Error> {
-    let owned_by = match model_server(&state, key.as_ref(), &model).await? {
+    let owned_by = match model_server(&state, caller, &model).await? {
         Some(server) if server.live(&model).await => "alphacompute",
         Some(_) => return Err(Error::Upstream),
         None => {
@@ -487,7 +570,7 @@ async fn get_model(
 
 async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    AuthedCaller(key): AuthedCaller,
+    AuthedCaller(caller): AuthedCaller,
     mut body: Bytes,
 ) -> Result<Response, Error> {
     let started_at = chrono::Utc::now();
@@ -497,17 +580,21 @@ async fn chat_completions(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    let server = model_server(&state, key.as_ref(), &model).await?;
+    let server = model_server(&state, caller, &model).await?;
+    let slot = match caller {
+        Some(Caller::App { org_id, .. }) => Some(state.app_slot(org_id)?),
+        _ => None,
+    };
     let streamed = match parsed.get("stream") {
         None | Some(Value::Null) => false,
         Some(Value::Bool(b)) => *b,
         // An upstream that coerces `"true"` would stream an answer metered as a whole one.
-        Some(_) if key.is_some() => {
+        Some(_) if caller.is_some() => {
             return Err(Error::BadRequest("stream must be a boolean".into()));
         }
         Some(_) => false,
     };
-    if key.is_some() && streamed {
+    if caller.is_some() && streamed {
         // A stream carries `usage` only in a last chunk the caller has to ask for.
         if let Some(request) = parsed.as_object_mut() {
             let options = request.entry("stream_options").or_insert_with(|| json!({}));
@@ -555,17 +642,19 @@ async fn chat_completions(
         .cloned()
         .unwrap_or_else(|| header::HeaderValue::from_static("text/event-stream"));
     let stream = upstream_response.bytes_stream();
-    let body = match key {
-        Some(key) => {
+    let body = match caller {
+        Some(caller) => {
             let mut meter = usage::Meter::new(
                 state.pool.clone(),
                 state.usage_tasks.clone(),
-                key,
+                caller,
                 model,
                 streamed,
                 started_at,
             );
             axum::body::Body::from_stream(stream.inspect(move |chunk| {
+                // The organization's slot is freed only when the answer's body is dropped.
+                let _slot = &slot;
                 if let Ok(bytes) = chunk {
                     meter.observe(bytes);
                 }
@@ -582,9 +671,11 @@ async fn chat_completions(
 
 async fn key_usage(
     State(state): State<Arc<AppState>>,
-    AuthedCaller(key): AuthedCaller,
+    AuthedCaller(caller): AuthedCaller,
 ) -> Result<Json<Vec<usage::ByModel>>, Error> {
-    let key = key.ok_or(Error::NotFound)?;
+    let Some(Caller::Key(key)) = caller else {
+        return Err(Error::NotFound);
+    };
     Ok(Json(usage::of_key(&state.pool, key.id).await?))
 }
 
