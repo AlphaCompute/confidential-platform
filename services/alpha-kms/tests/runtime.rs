@@ -1256,10 +1256,12 @@ async fn the_inference_forwarder_presents_the_leaf_without_the_apps_bearer_and_s
     assert!(reply.contains("text/event-stream"), "{reply}");
     assert!(reply.contains("data: [DONE]"), "{reply}");
 
-    let mut other = post_completion(addr, "/health").await;
-    let mut reply = String::new();
-    other.read_to_string(&mut reply).await.unwrap();
-    assert!(reply.starts_with("HTTP/1.1 404 "), "{reply}");
+    for path in ["/health", "/v1/../health", "/v1/%2e%2e/health"] {
+        let mut other = post_completion(addr, path).await;
+        let mut reply = String::new();
+        other.read_to_string(&mut reply).await.unwrap();
+        assert!(reply.starts_with("HTTP/1.1 404 "), "{path}: {reply}");
+    }
     assert!(requests.try_recv().is_err());
 }
 

@@ -188,7 +188,7 @@ is harmless. Bodies stream both ways unbuffered, so server-sent events arrive as
 them. There is no request timeout, since the front bounds a completion itself; the connect is
 bounded at 10 s.
 
-Any other path answers 404. Without a current leaf a request answers 503 `not_attested`, and a
+Any other path answers 404, judged after dot segments are removed, so `/v1/../x` is refused. Without a current leaf a request answers 503 `not_attested`, and a
 front that cannot be reached or does not prove a listed Revision 502 `front_unreachable`, both
 in OpenAI's shape, `{"error":{"message","type","code"}}`. On SIGTERM the listener closes and open
 requests get at most 10 s; on `revision_revoked` they are cut.

@@ -35,9 +35,9 @@ use crate::acme::{self, Edge, Route};
 use crate::{Attested, Error, Exit, Runtime};
 
 const HANDSHAKE: Duration = Duration::from_secs(10);
-const CONNECT: Duration = Duration::from_secs(10);
+pub(crate) const CONNECT: Duration = Duration::from_secs(10);
 /// Docker kills the container this long after SIGTERM anyway.
-const DRAIN: Duration = Duration::from_secs(10);
+pub(crate) const DRAIN: Duration = Duration::from_secs(10);
 /// The whole readiness exchange with the upstream, connect included.
 const READY_CHECK: Duration = Duration::from_secs(2);
 /// Answered with the JSON the browser verifier appraises the TD from.
@@ -62,7 +62,7 @@ enum Head {
     Other,
 }
 
-struct CurrentLeaf(Arc<Runtime>);
+pub(crate) struct CurrentLeaf(pub(crate) Arc<Runtime>);
 
 impl std::fmt::Debug for CurrentLeaf {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -73,6 +73,16 @@ impl std::fmt::Debug for CurrentLeaf {
 impl ResolvesServerCert for CurrentLeaf {
     fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         self.0.attested().map(|a| a.certified.clone())
+    }
+}
+
+impl rustls::client::ResolvesClientCert for CurrentLeaf {
+    fn resolve(&self, _: &[&[u8]], _: &[rustls::SignatureScheme]) -> Option<Arc<CertifiedKey>> {
+        self.0.attested().map(|a| a.certified.clone())
+    }
+
+    fn has_certs(&self) -> bool {
+        true
     }
 }
 

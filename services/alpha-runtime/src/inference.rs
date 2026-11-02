@@ -4,28 +4,21 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use alpha_client::tls::{self, Pin};
 use axum::body::{Body, HttpBody};
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderName, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use rustls::SignatureScheme;
-use rustls::client::ResolvesClientCert;
-use rustls::sign::CertifiedKey;
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::time::timeout;
 
+use crate::proxy::{CONNECT, CurrentLeaf, DRAIN};
 use crate::{Error, Exit, Runtime};
 
 /// Loopback only: every container of the pod shares the network namespace, nothing else does.
 pub const ADDR: ([u8; 4], u16) = ([127, 0, 0, 1], 8090);
-
-const CONNECT: Duration = Duration::from_secs(10);
-/// A drain lets a stream in flight finish for this long, the same as the TLS listener.
-const DRAIN: Duration = Duration::from_secs(10);
 
 /// RFC 9110 §7.6.1, and the App's own credentials: the front authenticates the leaf.
 const DROPPED: [HeaderName; 7] = [
@@ -37,24 +30,6 @@ const DROPPED: [HeaderName; 7] = [
     header::TRANSFER_ENCODING,
     header::UPGRADE,
 ];
-
-struct CurrentLeaf(Arc<Runtime>);
-
-impl std::fmt::Debug for CurrentLeaf {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("CurrentLeaf")
-    }
-}
-
-impl ResolvesClientCert for CurrentLeaf {
-    fn resolve(&self, _: &[&[u8]], _: &[SignatureScheme]) -> Option<Arc<CertifiedKey>> {
-        self.0.attested().map(|a| a.certified.clone())
-    }
-
-    fn has_certs(&self) -> bool {
-        true
-    }
-}
 
 struct Front {
     runtime: Arc<Runtime>,
@@ -141,10 +116,12 @@ fn strip(headers: &mut HeaderMap) {
 }
 
 async fn forward(State(front): State<Arc<Front>>, request: Request) -> Response {
-    let Some(target) = request
+    // Judged after the URL parser removes dot segments, so `/v1/../x` cannot leave `/v1/`.
+    let Some(url) = request
         .uri()
         .path_and_query()
-        .filter(|p| p.path().starts_with("/v1/"))
+        .and_then(|target| reqwest::Url::parse(&format!("{}{target}", front.url)).ok())
+        .filter(|url| url.path().starts_with("/v1/"))
     else {
         return refused(
             StatusCode::NOT_FOUND,
@@ -161,7 +138,6 @@ async fn forward(State(front): State<Arc<Front>>, request: Request) -> Response 
             "the runtime holds no valid Instance certificate",
         );
     }
-    let url = format!("{}{target}", front.url);
     let (mut parts, body) = request.into_parts();
     strip(&mut parts.headers);
     let mut sent = front
