@@ -21,12 +21,16 @@ use crate::{Error, Exit, Runtime};
 pub const ADDR: ([u8; 4], u16) = ([127, 0, 0, 1], 8090);
 
 /// RFC 9110 §7.6.1, and the App's own credentials: the front authenticates the leaf.
-const DROPPED: [HeaderName; 7] = [
+const DROPPED: [HeaderName; 11] = [
     header::AUTHORIZATION,
+    header::PROXY_AUTHORIZATION,
+    header::PROXY_AUTHENTICATE,
     header::HOST,
     header::CONNECTION,
     HeaderName::from_static("keep-alive"),
+    HeaderName::from_static("proxy-connection"),
     header::TE,
+    header::TRAILER,
     header::TRANSFER_ENCODING,
     header::UPGRADE,
 ];
@@ -108,7 +112,14 @@ fn refused(status: StatusCode, kind: &str, code: &str, message: &str) -> Respons
 }
 
 fn strip(headers: &mut HeaderMap) {
-    for name in &DROPPED {
+    let named: Vec<HeaderName> = headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .filter_map(|t| HeaderName::from_bytes(t.trim().as_bytes()).ok())
+        .collect();
+    for name in named.iter().chain(&DROPPED) {
         headers.remove(name);
     }
 }
