@@ -353,6 +353,9 @@ impl FromRequestParts<Arc<AppState>> for AuthedCaller {
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
         let Ok(presented) = bearer(parts) else {
+            if parts.headers.contains_key(header::AUTHORIZATION) {
+                return Err(Error::Unauthorized);
+            }
             return app_instance(parts).map(|app| AuthedCaller(Some(app)));
         };
         if alpha_client::bearer_matches(presented.as_bytes(), &state.secrets.read().caller_bearer) {
