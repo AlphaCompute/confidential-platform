@@ -148,24 +148,17 @@ async fn forward(State(front): State<Arc<Front>>, request: Request) -> Response 
     if body.size_hint().exact() != Some(0) {
         sent = sent.body(reqwest::Body::wrap_stream(body.into_data_stream()));
     }
-    let sent = sent.send().await;
-    let answer = match sent {
-        Ok(answer) => answer,
-        Err(_) => {
-            alpha_client::warn!("inference_front_unreachable");
-            return refused(
-                StatusCode::BAD_GATEWAY,
-                "server_error",
-                "front_unreachable",
-                "the inference front could not be reached or did not prove its Revision",
-            );
-        }
+    let Ok(answer) = sent.send().await else {
+        alpha_client::warn!("inference_front_unreachable");
+        return refused(
+            StatusCode::BAD_GATEWAY,
+            "server_error",
+            "front_unreachable",
+            "the inference front could not be reached or did not prove its Revision",
+        );
     };
     let status = answer.status();
     let mut headers = answer.headers().clone();
     strip(&mut headers);
-    let mut response = Response::new(Body::from_stream(answer.bytes_stream()));
-    *response.status_mut() = status;
-    *response.headers_mut() = headers;
-    response
+    (status, headers, Body::from_stream(answer.bytes_stream())).into_response()
 }
