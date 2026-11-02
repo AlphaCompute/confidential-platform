@@ -19,6 +19,7 @@
 
 pub mod acme;
 pub mod gpu;
+pub mod inference;
 pub mod proxy;
 pub mod socket;
 
@@ -234,6 +235,63 @@ pub fn parse_ready(text: Option<&str>, upstream: Option<&str>) -> Result<Option<
     Ok(Some(text.to_owned()))
 }
 
+/// Comma-separated `sha256:<hex>`, not empty.
+fn parse_revisions(var: &str, text: &str) -> Result<Vec<ComposeHash>, Error> {
+    let revisions = list(text)
+        .map(|s| {
+            s.parse()
+                .map_err(|_| Error::Config(format!("{var}: {s:?} is not sha256:<64 hex>")))
+        })
+        .collect::<Result<Vec<ComposeHash>, _>>()?;
+    if revisions.is_empty() {
+        return Err(Error::Config(format!("{var} is empty")));
+    }
+    Ok(revisions)
+}
+
+/// The inference front [`inference::ADDR`] forwards to.
+#[derive(Clone, Debug)]
+pub struct InferenceFront {
+    /// `https://host[:port]`, without a path; the request's `/v1/...` is appended.
+    pub url: String,
+    pub revisions: Vec<ComposeHash>,
+}
+
+/// `ALPHACOMPUTE_INFERENCE_URL` and `ALPHACOMPUTE_INFERENCE_REVISIONS`, both or neither.
+pub fn parse_inference(
+    url: Option<&str>,
+    revisions: Option<&str>,
+) -> Result<Option<InferenceFront>, Error> {
+    let (url, revisions) = match (url, revisions) {
+        (None, None) => return Ok(None),
+        (Some(url), Some(revisions)) => (url, revisions),
+        _ => {
+            return Err(Error::Config(
+                "set both ALPHACOMPUTE_INFERENCE_URL and ALPHACOMPUTE_INFERENCE_REVISIONS, or neither"
+                    .into(),
+            ));
+        }
+    };
+    let origin = reqwest::Url::parse(url.trim()).ok().filter(|u| {
+        u.scheme() == "https"
+            && u.host_str().is_some()
+            && u.path() == "/"
+            && u.query().is_none()
+            && u.fragment().is_none()
+            && u.username().is_empty()
+            && u.password().is_none()
+    });
+    let Some(origin) = origin else {
+        return Err(Error::Config(
+            "ALPHACOMPUTE_INFERENCE_URL is not an https origin without a path".into(),
+        ));
+    };
+    Ok(Some(InferenceFront {
+        url: origin.as_str().trim_end_matches('/').to_owned(),
+        revisions: parse_revisions("ALPHACOMPUTE_INFERENCE_REVISIONS", revisions)?,
+    }))
+}
+
 /// The KMS builds the runtime accepts, under the pinned CA either way.
 #[derive(Clone, Debug)]
 pub enum KmsRevisions {
@@ -256,21 +314,10 @@ impl KmsRevisions {
         min_version: Option<&str>,
     ) -> Result<Self, Error> {
         match (listed, document_url, min_version) {
-            (Some(listed), None, None) => {
-                let revisions = list(listed)
-                    .map(|s| {
-                        s.parse().map_err(|_| {
-                            Error::Config(format!(
-                                "ALPHACOMPUTE_KMS_REVISIONS: {s:?} is not sha256:<64 hex>"
-                            ))
-                        })
-                    })
-                    .collect::<Result<Vec<ComposeHash>, _>>()?;
-                if revisions.is_empty() {
-                    return Err(Error::Config("ALPHACOMPUTE_KMS_REVISIONS is empty".into()));
-                }
-                Ok(Self::Listed(revisions))
-            }
+            (Some(listed), None, None) => Ok(Self::Listed(parse_revisions(
+                "ALPHACOMPUTE_KMS_REVISIONS",
+                listed,
+            )?)),
             (None, Some(url), min_version) => {
                 let url = url.trim();
                 if !url.starts_with("https://") {
@@ -318,6 +365,7 @@ pub struct Config {
     pub tls_callers: Vec<AppId>,
     pub tls_ready: Option<String>,
     pub public: Option<String>,
+    pub inference: Option<InferenceFront>,
 }
 
 impl Config {
@@ -348,7 +396,15 @@ impl Config {
             config.tls_upstream.as_deref(),
             &config.tls_callers,
         )?;
-        Ok(Self { public, ..config })
+        let inference = parse_inference(
+            optional("ALPHACOMPUTE_INFERENCE_URL").as_deref(),
+            optional("ALPHACOMPUTE_INFERENCE_REVISIONS").as_deref(),
+        )?;
+        Ok(Self {
+            public,
+            inference,
+            ..config
+        })
     }
 
     pub fn parse(
@@ -386,6 +442,7 @@ impl Config {
             tls_callers,
             tls_ready,
             public: None,
+            inference: None,
         })
     }
 }
@@ -949,15 +1006,16 @@ impl Runtime {
     }
 
     /// Serves the socket, renews the leaf, keeps the declared Secret files under
-    /// `secrets_root` current and, given `tls` and an upstream, proxies the Endpoint until
-    /// `shutdown` resolves, the Revision is revoked or the leaf expires behind a stuck quote.
-    /// Socket connections drain, except after a stuck quote; proxied ones drain on shutdown
-    /// and are cut otherwise.
+    /// `secrets_root` current, given `tls` and an upstream, proxies the Endpoint and, given
+    /// `inference`, forwards to the inference front until `shutdown` resolves, the Revision is
+    /// revoked or the leaf expires behind a stuck quote. Socket connections drain, except after
+    /// a stuck quote; proxied and forwarded ones drain on shutdown and are cut otherwise.
     pub async fn run(
         self: Arc<Self>,
         listener: UnixListener,
         secrets_root: PathBuf,
         tls: Option<proxy::Endpoint>,
+        inference: Option<inference::Forwarder>,
         shutdown: impl Future<Output = ()>,
     ) -> Exit {
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -978,6 +1036,12 @@ impl Runtime {
                 endpoint.serve(async move { proxy_stopped.await.unwrap_or(Exit::Revoked) }),
             )
         });
+        let (stop_inference, inference_stopped) = tokio::sync::oneshot::channel::<Exit>();
+        let inference = inference.map(|forwarder| {
+            tokio::spawn(
+                forwarder.serve(async move { inference_stopped.await.unwrap_or(Exit::Revoked) }),
+            )
+        });
         let mut revoked = self.revoked.subscribe();
         let exit = tokio::select! {
             () = shutdown => Exit::Drained,
@@ -987,6 +1051,7 @@ impl Runtime {
         delivery.abort();
         let _ = stop.send(());
         let _ = stop_proxy.send(exit);
+        let _ = stop_inference.send(exit);
         if exit == Exit::QuoteStuck {
             server.abort();
         } else {
@@ -994,6 +1059,9 @@ impl Runtime {
         }
         if let Some(proxy) = proxy {
             let _ = proxy.await;
+        }
+        if let Some(inference) = inference {
+            let _ = inference.await;
         }
         exit
     }
@@ -1210,6 +1278,30 @@ mod tests {
             &format!("/{}", "a".repeat(256)),
         ] {
             refused(parse(None, Some(bad)), "ALPHACOMPUTE_TLS_UPSTREAM_READY:");
+        }
+    }
+
+    #[test]
+    fn the_inference_front_is_an_https_origin_with_revisions_both_or_neither() {
+        assert!(parse_inference(None, None).unwrap().is_none());
+        let front = parse_inference(Some("https://front.svc:8443/"), Some(HASH))
+            .unwrap()
+            .unwrap();
+        assert_eq!(front.url, "https://front.svc:8443");
+        assert_eq!(front.revisions, [HASH.parse().unwrap()]);
+        for (url, revisions) in [
+            (Some("https://front.svc"), None),
+            (None, Some(HASH)),
+            (Some("http://front.svc"), Some(HASH)),
+            (Some("https://front.svc/v1"), Some(HASH)),
+            (Some("https://u:p@front.svc"), Some(HASH)),
+            (Some("https://front.svc"), Some("")),
+            (Some("https://front.svc"), Some("sha256:zz")),
+        ] {
+            assert!(
+                matches!(parse_inference(url, revisions), Err(Error::Config(_))),
+                "{url:?} {revisions:?} was accepted"
+            );
         }
     }
 
