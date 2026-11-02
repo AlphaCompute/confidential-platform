@@ -43,8 +43,8 @@ KMS registers no init-data without that pinned policy. A pod spec not produced b
 Revision.
 
 Configuration is three environment variables, a fourth when a service declared a Secret, a
-fifth for a wrapped compose or a Kata pod with an Endpoint, and two optional ones for that
-Endpoint.
+fifth for a wrapped compose or a Kata pod with an Endpoint, two optional ones for that
+Endpoint, and a pair for the inference front (see below).
 `ALPHACOMPUTE_KMS_CA_SPKI_SHA256` (`sha256:<hex>` of the KMS CA's SubjectPublicKeyInfo) and the
 KMS Revisions are in the measured compose on dstack, and in the policy-pinned environment on Kata,
 and are all the runtime trusts, with the release key set when the Revisions come from the document: before the first request it refuses a KMS whose chain does not end
@@ -169,6 +169,30 @@ attestation's error: one of the KMS's error codes, `other` for a code the runtim
 or `platform_document`. The body is empty before the first attempt ends, and the
 KMS's message is never relayed.
 
+## Inference front
+
+A stock OpenAI SDK in the App reaches the platform's inference front with only a base URL,
+`http://127.0.0.1:8090/v1`, and no TLS code. `ALPHACOMPUTE_INFERENCE_URL`, measured, is the
+front's `https://host[:port]` origin without a path, and `ALPHACOMPUTE_INFERENCE_REVISIONS`,
+measured too, the front's Revisions (comma-separated `sha256:<hex>`, not empty). Set both or
+neither; one alone, or either malformed, exits 1 at start naming the variable. With both, the
+runtime listens on `127.0.0.1:8090` in plain HTTP once the first attestation succeeded; the pod's
+containers share that loopback, nothing else reaches it.
+
+Each request under `/v1/` goes to the front with its path and query, over TLS 1.3 with
+`X25519MLKEM768`. The runtime presents the current Instance leaf as its client certificate, so a
+renewed leaf reaches the next connection, and accepts only a front whose chain ends at the KMS CA
+of the first attestation and whose leaf names a listed Revision. The front authenticates the App
+by that leaf alone: the request's `Authorization` header is dropped, so any API key the SDK sends
+is harmless. Bodies stream both ways unbuffered, so server-sent events arrive as the front sends
+them. There is no request timeout, since the front bounds a completion itself; the connect is
+bounded at 10 s.
+
+Any other path answers 404, judged after dot segments are removed, so `/v1/../x` is refused. Without a current leaf a request answers 503 `not_attested`, and a
+front that cannot be reached or does not prove a listed Revision 502 `front_unreachable`, both
+in OpenAI's shape, `{"error":{"message","type","code"}}`. On SIGTERM the listener closes and open
+requests get at most 10 s; on `revision_revoked` they are cut.
+
 ## Tests
 
 `cargo test -p alpha-runtime` covers the configuration parser (the secrets and upstream variables'
@@ -188,7 +212,10 @@ directories of declaring services, waiting for a Secret put later, following a r
 by the running runtime, and never written for a revoked Revision. The same file proves the TLS listener: the leaf it serves,
 the hybrid group it requires, pass-through, renewal, expiry, revocation, the drain on SIGTERM,
 and with a caller pin: the listed App's leaf served, no client certificate refused, and `/ready`,
-which also names the KMS's refusal while the first attestation is retried.
+which also names the KMS's refusal while the first attestation is retried. For the inference
+front it proves the forwarding runtime's leaf shown to the front, no `Authorization` reaching it,
+the first event of a stream arriving before the stream ends, 404 off `/v1/`, and 502 for a front
+of an unlisted Revision, which sees no request.
 
 What only a live CVM proves: the real quote and `Info` from the guest agent's socket, the real
 event log from the CCEL table and `/run/log/dstack`, that the registered `compose_hash` equals

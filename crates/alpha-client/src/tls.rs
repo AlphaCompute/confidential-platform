@@ -272,9 +272,12 @@ pub fn renewing_client_config(
     cert: Arc<dyn ResolvesClientCert>,
     time: Arc<dyn TimeProvider>,
 ) -> Result<ClientConfig, Error> {
-    Ok(with_instance_alpn(
-        pinned_builder(Some(pin), time)?.with_client_cert_resolver(cert),
-    ))
+    let mut config =
+        with_instance_alpn(pinned_builder(Some(pin), time)?.with_client_cert_resolver(cert));
+    // A resumed session keeps the client certificate of the first handshake, so the server would
+    // never see the renewed leaf.
+    config.resumption = rustls::client::Resumption::disabled();
+    Ok(config)
 }
 
 /// `http/1.1` too: a listener that advertises only it refuses a client that offers no match.
