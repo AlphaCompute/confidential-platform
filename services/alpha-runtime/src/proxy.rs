@@ -191,7 +191,7 @@ pub struct Endpoint {
     callers: Arc<[AppId]>,
 }
 
-async fn bind_tcp(addr: SocketAddr) -> Result<TcpListener, Error> {
+pub(crate) async fn bind_tcp(addr: SocketAddr) -> Result<TcpListener, Error> {
     TcpListener::bind(addr)
         .await
         .map_err(|e| Error::Socket(format!("{addr}: {e}")))

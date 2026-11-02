@@ -14,7 +14,7 @@ use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::time::timeout;
 
-use crate::proxy::{CONNECT, CurrentLeaf, DRAIN};
+use crate::proxy::{CONNECT, CurrentLeaf, DRAIN, bind_tcp};
 use crate::{Error, Exit, Runtime};
 
 /// Loopback only: every container of the pod shares the network namespace, nothing else does.
@@ -74,9 +74,7 @@ impl Forwarder {
                 url: front.url,
                 client,
             }));
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(|e| Error::Socket(format!("{addr}: {e}")))?;
+        let listener = bind_tcp(addr).await?;
         Ok(Some(Self { listener, router }))
     }
 
