@@ -14,9 +14,15 @@ defaults:
 
 jobs:
   ci:
+    permissions:
+      contents: read
+      checks: read
     uses: ./.github/workflows/ci.yml
 
   reference-values:
+    permissions:
+      contents: read
+      checks: read
     uses: ./.github/workflows/reference-values.yml
 
   # The unsigned platform document for the release-key holders (deploy/kata/README.md). CI holds
