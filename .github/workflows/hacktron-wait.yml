@@ -1,0 +1,26 @@
+name: Wait for Hacktron
+
+# Holds pull request CI until Hacktron reports success. The wait is skipped on
+# every other event, so pushes and manual runs are not delayed.
+on:
+  workflow_call:
+
+permissions:
+  checks: read
+
+jobs:
+  wait:
+    name: Wait for Hacktron
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Wait for Hacktron Security Check
+        if: github.event_name == 'pull_request'
+        uses: lewagon/wait-on-check-action@369769072fe522a3a8a85c03c96af1e5242a1994 # v1.9.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          check-name: Hacktron Security Check
+          repo-token: ${{ github.token }}
+          allowed-conclusions: success
+          checks-discovery-timeout: 900
+          wait-interval: 60

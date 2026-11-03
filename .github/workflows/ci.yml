@@ -11,9 +11,23 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  hacktron-wait:
+    permissions:
+      checks: read
+    uses: ./.github/workflows/hacktron-wait.yml
+
   check:
+    needs: hacktron-wait
+    if: ${{ !cancelled() || needs.hacktron-wait.result != 'success' }}
     runs-on: ubuntu-latest
     steps:
+      # A skipped required check counts as passing, so fail here instead of skipping.
+      - &hacktron-gate
+        name: Stop unless Hacktron passed
+        if: ${{ always() && needs.hacktron-wait.result != 'success' }}
+        run: |
+          echo "::error::The Hacktron gate did not pass, so this job did not run."
+          exit 1
       - uses: actions/checkout@v4
       # Other repositories copy these vectors and check their copy with this same pipeline, not
       # `sha256sum -c`, which fails on an empty manifest and misses a vector nobody listed. To
@@ -94,6 +108,7 @@ jobs:
           CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
 
   trust-db-backup:
+    needs: hacktron-wait
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -101,6 +116,8 @@ jobs:
       - run: deploy/postgres/backup-drill.sh
 
   signer:
+    needs: hacktron-wait
+    if: ${{ !cancelled() || needs.hacktron-wait.result != 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -108,6 +125,7 @@ jobs:
     env:
       FEATURES: dev
     steps:
+      - *hacktron-gate
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - run: cargo install wasm-bindgen-cli --version 0.2.128 --locked
@@ -127,6 +145,8 @@ jobs:
           path: web/signer/dist/
 
   db-tests:
+    needs: hacktron-wait
+    if: ${{ !cancelled() || needs.hacktron-wait.result != 'success' }}
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -144,6 +164,7 @@ jobs:
     env:
       DATABASE_URL: postgres://alpha:alpha@localhost:5432/alpha
     steps:
+      - *hacktron-gate
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - name: sqlx offline data is current
