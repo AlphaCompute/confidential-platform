@@ -287,9 +287,7 @@ mod tests {
         }
 
         fn leaf_of(&self, org: alpha_core::OrgId, revision: &ComposeHash) -> Arc<Fixed> {
-            let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-            let mut params = CertificateParams::default();
-            params.subject_alt_names = [
+            self.leaf_with([
                 format!(
                     "alphacompute://{}/{}/{}",
                     org,
@@ -297,10 +295,16 @@ mod tests {
                     "a".repeat(64)
                 ),
                 format!("urn:alphacompute:revision:{revision}"),
-            ]
-            .into_iter()
-            .map(|s| SanType::URI(Ia5String::try_from(s).unwrap()))
-            .collect();
+            ])
+        }
+
+        fn leaf_with(&self, sans: [String; 2]) -> Arc<Fixed> {
+            let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+            let mut params = CertificateParams::default();
+            params.subject_alt_names = sans
+                .into_iter()
+                .map(|s| SanType::URI(Ia5String::try_from(s).unwrap()))
+                .collect();
             let issuer = Issuer::from_ca_cert_der(self.1.der(), &self.0).unwrap();
             let cert = params.signed_by(&key, &issuer).unwrap();
             let chain = vec![cert.der().clone(), self.der()];
@@ -427,6 +431,87 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
+    /// A request with no bearer, from a peer that presented `leaf` in the handshake.
+    async fn app_call(
+        front: &Router,
+        leaf: &Fixed,
+        path: &str,
+        model: &str,
+    ) -> axum::response::Response {
+        let mut request = Request::builder().uri(path);
+        if path.ends_with("completions") {
+            request = request.method("POST");
+        }
+        let mut request = request
+            .body(axum::body::Body::from(
+                json!({ "model": model }).to_string(),
+            ))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(PeerCerts(vec![leaf.0.cert[0].clone()]));
+        front.clone().oneshot(request).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_app_instance_reaches_only_our_own_model_servers_a_few_completions_per_org_at_a_time()
+     {
+        let ca = Ca::new();
+        let revision = alpha_core::compose_hash("model-server");
+        let (url, hits) = spawn_model_server(&ca, ca.leaf(&revision), Duration::ZERO).await;
+        let (base, report_hits, _) = spawn_fake_upstream(answering(StatusCode::OK, "{}")).await;
+        let mut config = test_config(&base, &["own", "external"]);
+        config.own.insert(
+            "own".into(),
+            ModelServer {
+                url,
+                revisions: vec![revision],
+            },
+        );
+        config.app_concurrency_per_org = 1;
+        let mut state = test_state(config, b"bearer", "key");
+        let front_leaf = ca.leaf(&alpha_core::compose_hash("front"));
+        let own = servers(&state.config.own, &ca.der(), front_leaf, COMPLETION_TIMEOUT).unwrap();
+        Arc::get_mut(&mut state).unwrap().own = own;
+        let front = crate::router(state);
+        let app = |org| ca.leaf_of(org, &alpha_core::compose_hash("tenant"));
+        let (org, other) = (alpha_core::OrgId::mint(), alpha_core::OrgId::mint());
+        let path = "/v1/chat/completions";
+
+        let kms = ca.leaf_with([
+            "alphacompute://kms".into(),
+            format!("urn:alphacompute:revision:{revision}"),
+        ]);
+        let refused = app_call(&front, &kms, path, "own").await;
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+
+        let held = app_call(&front, &app(org), path, "own").await;
+        assert_eq!(held.status(), StatusCode::OK);
+        let busy = app_call(&front, &app(org), path, "own").await;
+        assert_eq!(busy.status(), StatusCode::TOO_MANY_REQUESTS);
+        let other_org = app_call(&front, &app(other), path, "own").await;
+        assert_eq!(other_org.status(), StatusCode::OK);
+        drop(held);
+        let freed = app_call(&front, &app(org), path, "own").await;
+        assert_eq!(freed.status(), StatusCode::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+
+        for path in [path, "/v1/models/external"] {
+            let external = app_call(&front, &app(other), path, "external").await;
+            assert_eq!(external.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+        let listed = app_call(&front, &app(other), "/v1/models", "").await;
+        let listed = axum::body::to_bytes(listed.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listed = String::from_utf8_lossy(&listed);
+        assert!(
+            listed.contains("own") && !listed.contains("external"),
+            "{listed}"
+        );
+        assert_eq!(report_hits.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn a_server_of_another_revision_or_ca_never_sees_the_request() {
         let ca = Ca::new();
@@ -524,6 +609,17 @@ mod tests {
         let response = front.clone().oneshot(coerced).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
+        let app = ca.leaf_of(org.into(), &alpha_core::compose_hash("tenant"));
+        let app_id = alpha_client::tls::uri_sans(&app.0.cert[0])
+            .and_then(|sans| alpha_client::tls::parse_instance_sans(&sans))
+            .unwrap()
+            .app_id;
+        let response = app_call(&front, &app, "/v1/chat/completions", "own").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
         let usage = |bearer: String| {
             let front = front.clone();
             async move {
@@ -570,9 +666,12 @@ mod tests {
             "from=2000-01-01T00:00:00Z&to=2100-01-01T00:00:00Z&org_id={org}"
         ))
         .await;
-        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows.as_array().unwrap().len(), 2);
         assert_eq!(rows[0]["key_id"], json!(key.id));
         assert_eq!(rows[0]["prompt_tokens"], 6);
+        assert_eq!(rows[1]["key_id"], Value::Null);
+        assert_eq!(rows[1]["app_id"], json!(app_id));
+        assert_eq!(rows[1]["prompt_tokens"], 3);
         let other = uuid::Uuid::now_v7();
         assert_eq!(
             export(format!(

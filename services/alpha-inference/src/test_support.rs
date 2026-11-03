@@ -53,6 +53,7 @@ pub(crate) fn test_state(
             .unwrap(),
         keys_key: zeroize::Zeroizing::new([7; 32]),
         usage_tasks: Default::default(),
+        app_slots: Default::default(),
     })
 }
 
@@ -112,6 +113,7 @@ pub(crate) fn test_config(upstream_url: &str, models: &[&str]) -> crate::Config 
                 tolerated_advisories: vec![],
             },
         }),
+        app_concurrency_per_org: 4,
     }
 }
 

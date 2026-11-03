@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alpha_client::runtime::{RuntimeSocket, refresh_forever};
-use alpha_client::tls::{InstanceCert, kms_ca, serve, server_config};
+use alpha_client::tls::{InstanceCert, kms_ca, mtls_server_config, serve};
 use alpha_inference::{
     AppState, COMPLETION_TIMEOUT, Config, Error, Secrets, Upstream, keys, org_models, own, router,
 };
@@ -94,12 +94,12 @@ async fn run() -> Result<(), Error> {
 
     let cert =
         Arc::new(InstanceCert::new(&identity).map_err(|e| Error::internal(format!("tls: {e}")))?);
-    let tls_config =
-        server_config(cert.clone()).map_err(|e| Error::internal(format!("tls: {e}")))?;
+    let kms_ca = kms_ca(&identity).map_err(|e| Error::internal(format!("kms ca: {e}")))?;
+    let tls_config = mtls_server_config(cert.clone(), kms_ca.clone())
+        .map_err(|e| Error::internal(format!("tls: {e}")))?;
 
     let secrets = read_secrets(&runtime, config.external.is_some()).await?;
     let upstream = Upstream::new(&config)?;
-    let kms_ca = kms_ca(&identity).map_err(|e| Error::internal(format!("kms ca: {e}")))?;
     let own = own::servers(&config.own, &kms_ca, cert.clone(), COMPLETION_TIMEOUT)?;
     let org_clients = org_models::Clients::new(kms_ca, cert.clone());
     let state = Arc::new(AppState {
@@ -111,6 +111,7 @@ async fn run() -> Result<(), Error> {
         pool,
         keys_key,
         usage_tasks: Default::default(),
+        app_slots: Default::default(),
     });
     let app = alpha_client::metrics::serve(router(state.clone()))
         .await
