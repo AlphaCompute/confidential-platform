@@ -173,8 +173,8 @@ test("the App's services come first and the platform's collapse under their role
   assert.ok(text.includes("Provided by AlphaCompute (2)"), text);
   const at = (s) => text.indexOf(s);
   assert.ok(at("\nweb\n") < at("\ndb\n") && at("\ndb\n") < at("Provided by AlphaCompute"), text);
-  assert.ok(at("Provided by AlphaCompute") < at("\napp-edge\n"), text);
-  assert.ok(at("\napp-edge\n") < at("AlphaCompute runtime"), text);
+  assert.ok(at("Provided by AlphaCompute") < at("\napp-edge:2\n"), text);
+  assert.ok(at("\napp-edge:2\n") < at("AlphaCompute runtime"), text);
   assert.ok(!text.includes("\ncache\n"), "a service shows under its role, not its compose key");
   assert.ok(text.includes(`cache: ${digest}`), "the full digest is under Technical details");
 });

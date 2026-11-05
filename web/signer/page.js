@@ -837,8 +837,9 @@ function imageLines(image) {
   const row = el("p", undefined, "fact");
   row.append(el("span", "Image: "), name);
   if (!digest) return [row, fact("Digest", "none (not pinned)", "digest")];
+  // A refused clipboard must not replace the approval with an error, so the write's failure is dropped.
   // The full digest is under Technical details.
-  const copy = button("Copy", () => navigator.clipboard.writeText(digest), "copy");
+  const copy = button("Copy", () => navigator.clipboard.writeText(digest).catch(() => {}), "copy");
   copy.ariaLabel = `Copy the digest of ${short}`;
   const shown = el("p", undefined, "fact");
   shown.append(
