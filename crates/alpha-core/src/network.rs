@@ -14,23 +14,30 @@ use crate::InitDataError;
 const MAX_PER_DIRECTION: usize = 32;
 const MAX_JUSTIFICATION: usize = 200;
 
-/// Reach the cluster, the host and other tenants; the deployer never opens them and excludes
-/// them from any wider opening. Keep in step with the deployer's list.
-const NON_PUBLIC: [(IpAddr, u8); 14] = [
+/// The ranges IANA marks not globally reachable, apart from the documentation ranges, which no network routes.
+const NON_PUBLIC: [(IpAddr, u8); 19] = [
     (IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 8),
     (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8),
     (IpAddr::V4(Ipv4Addr::new(100, 64, 0, 0)), 10),
     (IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)), 8),
     (IpAddr::V4(Ipv4Addr::new(169, 254, 0, 0)), 16),
     (IpAddr::V4(Ipv4Addr::new(172, 16, 0, 0)), 12),
+    (IpAddr::V4(Ipv4Addr::new(192, 0, 0, 0)), 24),
     (IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)), 16),
+    (IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15),
     (IpAddr::V4(Ipv4Addr::new(224, 0, 0, 0)), 4),
     (IpAddr::V4(Ipv4Addr::new(240, 0, 0, 0)), 4),
+    (IpAddr::V6(Ipv6Addr::UNSPECIFIED), 128),
     (IpAddr::V6(Ipv6Addr::LOCALHOST), 128),
+    (IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0)), 96),
+    (
+        IpAddr::V6(Ipv6Addr::new(0x64, 0xff9b, 1, 0, 0, 0, 0, 0)),
+        48,
+    ),
+    (IpAddr::V6(Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, 0)), 64),
     (IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0)), 7),
     (IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0)), 10),
     (IpAddr::V6(Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0)), 8),
-    (IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0)), 96),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -193,6 +200,19 @@ mod tests {
             (format!("{one}{one}"), "repeats"),
             (entry(80, "10.0.0.0/8", ok), "non-public range 10.0.0.0/8"),
             (entry(80, "10.1.0.0/16", ok), "non-public range 10.0.0.0/8"),
+            (
+                entry(80, "198.18.0.0/15", ok),
+                "non-public range 198.18.0.0/15",
+            ),
+            (
+                entry(80, "192.0.0.0/24", ok),
+                "non-public range 192.0.0.0/24",
+            ),
+            (
+                entry(80, "64:ff9b:1::/48", ok),
+                "non-public range 64:ff9b:1::/48",
+            ),
+            (entry(80, "100::/64", ok), "non-public range 100::/64"),
             (
                 entry(80, "192.168.1.1/32", ok),
                 "non-public range 192.168.0.0/16",
