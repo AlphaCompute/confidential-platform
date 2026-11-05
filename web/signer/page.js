@@ -1020,8 +1020,6 @@ function secretFields(services, before, put, reported) {
     if (typeof description === "string" && description) {
       describedBy = el("p", description, "muted");
       describedBy.id = `description-${index}`; // the other ids start with secret-, keep- or generate- plus a Secret name; this prefix cannot match them
-      node.append(describedBy);
-      node.append(el("p", "Written by the service and not covered by the signed launch; check it before entering a credential.", "muted"));
       input.setAttribute("aria-describedby", describedBy.id);
     }
     let keep = null;
@@ -1043,6 +1041,7 @@ function secretFields(services, before, put, reported) {
       node.append(keep);
     }
     node.append(input);
+    if (describedBy) node.append(el("p", "From the App's plan, not verified:", "muted"), describedBy);
     const generate = el("button", "Generate a random value", "secondary");
     generate.type = "button";
     generate.ariaLabel = `Generate a random value for Secret ${name}`;

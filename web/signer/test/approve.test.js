@@ -1066,8 +1066,10 @@ test("a Secret's description is shown as text, and a missing one shows nothing",
   assert.ok(described, page.text());
   assert.equal(described.tagName, "P");
   assert.ok(!page.find((n) => n.tagName === "B"));
-  assert.ok(page.text().includes("not covered by the signed launch"));
+  assert.ok(page.text().includes("From the App's plan, not verified:"));
   assert.equal(described.parent, field(page, "db_password").parent);
+  const siblings = described.parent.children;
+  assert.equal(siblings[siblings.indexOf(described) - 2], field(page, "db_password"));
   assert.ok(!field(page, "session_key").parent.children.some((n) => n.className === "muted"));
   assert.equal(field(page, "db_password").attributes["aria-describedby"], described.id);
   assert.equal(field(page, "session_key").attributes, undefined);
