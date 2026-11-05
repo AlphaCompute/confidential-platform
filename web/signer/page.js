@@ -934,7 +934,7 @@ function putSecrets(read) {
 // The description is unsigned display text: shown as text, never used to choose which Secrets are asked.
 function secretFields(services, before, put, reported) {
   const held = [...(before ? declaredSecrets(before) : []), ...put];
-  return declaredSecrets(services).map((name) => {
+  return declaredSecrets(services).map((name, index) => {
     const node = el("div", undefined, "secret");
     const input = el("input");
     input.type = "password";
@@ -947,7 +947,7 @@ function secretFields(services, before, put, reported) {
     let describedBy = null;
     if (typeof description === "string" && description) {
       describedBy = el("p", description, "muted");
-      describedBy.id = `secret-description-${name}`;
+      describedBy.id = `description-${index}`; // the other ids start with secret-, keep- or generate- plus a Secret name; this prefix cannot match them
       node.append(describedBy);
       input.setAttribute("aria-describedby", describedBy.id);
     }
