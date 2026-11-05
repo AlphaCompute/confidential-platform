@@ -944,12 +944,19 @@ function secretFields(services, before, put, reported) {
     label.htmlFor = input.id;
     node.append(label);
     const description = Array.isArray(reported) ? reported.find((s) => s && s.name === name)?.description : undefined;
-    if (typeof description === "string" && description) node.append(el("p", description, "muted"));
+    let describedBy = null;
+    if (typeof description === "string" && description) {
+      describedBy = el("p", description, "muted");
+      describedBy.id = `secret-description-${name}`;
+      node.append(describedBy);
+      input.setAttribute("aria-describedby", describedBy.id);
+    }
     let keep = null;
     if (held.includes(name)) {
       keep = el("select");
       keep.id = `keep-${name}`;
       keep.ariaLabel = `Secret ${name}`;
+      if (describedBy) keep.setAttribute("aria-describedby", describedBy.id);
       const kept = el("option", "Keep the current value");
       kept.value = "keep";
       const replaced = el("option", "Replace");

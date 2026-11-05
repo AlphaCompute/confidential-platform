@@ -1023,6 +1023,8 @@ test("a Secret's description is shown as text, and a missing one shows nothing",
   assert.ok(!page.find((n) => n.tagName === "B"));
   assert.equal(described.parent, field(page, "db_password").parent);
   assert.ok(!field(page, "session_key").parent.children.some((n) => n.className === "muted"));
+  assert.equal(field(page, "db_password").attributes["aria-describedby"], described.id);
+  assert.equal(field(page, "session_key").attributes, undefined);
 });
 
 test("generating fills 64 hex characters, differently each time", async () => {
@@ -1039,6 +1041,7 @@ test("generating on a kept Secret replaces it and the value is put", async () =>
   const { page, api } = await secretPage({ secrets: [{ name: "db_password", set: true }] });
   assert.equal(field(page, "db_password").hidden, true);
   await generate(page, "db_password");
+  const generated = field(page, "db_password").value;
   assert.equal(keepChoice(page, "db_password").value, "replace");
   assert.equal(field(page, "db_password").hidden, false);
   fill(page, { session_key: SECRET_VALUES.session_key });
@@ -1050,4 +1053,5 @@ test("generating on a kept Secret replaces it and the value is put", async () =>
     api.puts.map((p) => p.declared),
     ["db_password", "session_key"],
   );
+  assert.equal(page.seals[0].value.subarray(32).toString(), generated);
 });
