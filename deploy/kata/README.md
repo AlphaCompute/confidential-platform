@@ -381,7 +381,13 @@ them with the rest of `/opt/kata`.
 Each is the operator's, chosen per environment; none has a default.
 
 The guest pulls every image itself, anonymously, as a CVM does ([`../README.md`](../README.md#pulling-from-ghcr)):
-the init-data carries no registry configuration. An image input is the `<image>@sha256:…`
+the init-data carries no registry configuration, so the pod's egress must reach every registry it
+pulls from: TCP 443 to public addresses. With `alpha coco render --pull-proxy http://<host>[:port]`
+the init-data instead sends every pull through that one in-cluster forward proxy (CONNECT, TLS end
+to end), and the pod's NetworkPolicy opens only the proxy. The proxy is untrusted: the guest checks
+the manifest against the pinned digest and each blob against the manifest, so a proxy can stall a
+pull but not change what runs. It combines with `--registry-auth`; either flag makes `render` read the
+KMS CA from the platform document. An image input is the `<image>@sha256:…`
 reference after `pushed` in the release summary. A new package is private until a package admin makes it
 public in its package settings; a workflow cannot.
 

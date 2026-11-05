@@ -25,10 +25,8 @@ pub enum InitDataError {
         "init-data [data] key {0:?} is none of \"aa.toml\", \"app_id\", \"cdh.toml\", \"policy.rego\""
     )]
     UnknownKey(String),
-    #[error(
-        "init-data aa.toml and cdh.toml are not the platform's registry credential template: {0}"
-    )]
-    RegistryAuth(&'static str),
+    #[error("init-data aa.toml and cdh.toml are not the platform's guest pull template: {0}")]
+    GuestPull(&'static str),
     #[error("policy.rego has no \"\\npolicy_data := \"")]
     NoPolicyData,
     #[error("policy.rego rules are {0}, not the pinned rules")]
@@ -48,6 +46,8 @@ const POLICY_DATA: &str = "\npolicy_data := ";
 /// trusts its built-in roots, so this name alone keeps the guest on our key broker.
 const KBS_URL: &str = "https://kms.alpha-kms.svc:8443";
 const CREDENTIAL_URI: &str = "kbs:///alpha/secret/";
+const MAX_PULL_PROXY: usize = 300;
+const NO_PULL: &str = "cdh.toml names no Secret and no pull proxy";
 /// The host writes the annotation that carries it, so a gzip bomb there must not exhaust a pod,
 /// nor a page that reads it.
 pub const MAX_INIT_DATA: usize = 1 << 20;
@@ -58,17 +58,62 @@ struct Header {
     version: String,
 }
 
-/// `aa.toml` and `cdh.toml` of a Revision whose images pull with the Secret `name`: the guest's
-/// data hub gets the registry credential from the KMS at [`KBS_URL`], under `kms_ca_pem`. No
-/// `[eventlog]`, so RTMR3 stays zero.
-pub fn registry_auth(name: &str, kms_ca_pem: &str) -> (String, String) {
-    (
+/// `aa.toml` and `cdh.toml` of a Revision whose guest pulls its images with the registry
+/// credential Secret `credential` and through the forward proxy `pull_proxy`, `http://host[:port]`
+/// (the guest CONNECTs through it, so TLS stays end to end), at least one of the two. The guest's
+/// data hub gets the credential from the KMS at [`KBS_URL`], under `kms_ca_pem`. No `[eventlog]`,
+/// so RTMR3 stays zero.
+pub fn guest_pull(
+    credential: Option<&str>,
+    pull_proxy: Option<&str>,
+    kms_ca_pem: &str,
+) -> Result<(String, String), InitDataError> {
+    if credential.is_none() && pull_proxy.is_none() {
+        return Err(InitDataError::GuestPull(NO_PULL));
+    }
+    let mut cdh = format!(
+        "[kbc]\nname = \"cc_kbc\"\nurl = \"{KBS_URL}\"\nkbs_cert = \"\"\"{kms_ca_pem}\"\"\"\n\n[image]\n"
+    );
+    if let Some(name) = credential {
+        cdh += &format!("authenticated_registry_credentials_uri = \"{CREDENTIAL_URI}{name}\"\n");
+    }
+    if let Some(url) = pull_proxy {
+        if !is_pull_proxy(url) {
+            return Err(InitDataError::GuestPull("the pull proxy is not valid"));
+        }
+        cdh += &format!("image_pull_proxy = {{ https_proxy = \"{url}\" }}\n");
+    }
+    Ok((
         format!("[token_configs.kbs]\nurl = \"{KBS_URL}\"\ncert = \"\"\"{kms_ca_pem}\"\"\"\n"),
-        format!(
-            "[kbc]\nname = \"cc_kbc\"\nurl = \"{KBS_URL}\"\nkbs_cert = \"\"\"{kms_ca_pem}\"\"\"\n\n\
-             [image]\nauthenticated_registry_credentials_uri = \"{CREDENTIAL_URI}{name}\"\n"
-        ),
-    )
+        cdh,
+    ))
+}
+
+/// `http://host[:port]` with a lowercase DNS name or IPv4 address (digit labels are DNS labels
+/// too): it lands in a TOML string and in the guest's proxy client, so nothing else may pass.
+fn is_pull_proxy(url: &str) -> bool {
+    let Some(rest) = url
+        .strip_prefix("http://")
+        .filter(|_| url.len() <= MAX_PULL_PROXY)
+    else {
+        return false;
+    };
+    let (host, port) = rest
+        .split_once(':')
+        .map_or((rest, None), |(h, p)| (h, Some(p)));
+    let port_ok = port.is_none_or(|p| {
+        p.bytes().all(|b| b.is_ascii_digit()) && p.parse::<u16>().is_ok_and(|p| p != 0)
+    });
+    port_ok
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        })
 }
 
 impl InitData {
@@ -119,7 +164,7 @@ impl InitData {
     /// would join the pinned rules, so nothing but whitespace may follow it.
     ///
     /// `[data]` holds nothing else, except `aa.toml` and `cdh.toml` together and exactly as
-    /// [`registry_auth`] renders them for one Secret name and `kms_ca_pem`: any other content could
+    /// [`guest_pull`] renders them for one Secret name or pull proxy and `kms_ca_pem`: any other content could
     /// point the guest at another key broker, and only alpha-kms releases keys.
     ///
     /// No container may list `exec_commands`, the argv of its exec probes and hooks: the agent
@@ -127,7 +172,7 @@ impl InitData {
     pub fn check_policy(&self, pinned: &KataPolicy, kms_ca_pem: &str) -> Result<(), InitDataError> {
         let table = self.data()?;
         let (rules, data, containers) = policy(&table)?;
-        check_registry_auth(&table, kms_ca_pem)?;
+        check_guest_pull(&table, kms_ca_pem)?;
         if rules != pinned.rules_sha256 {
             return Err(InitDataError::Rules(rules));
         }
@@ -169,32 +214,48 @@ impl InitData {
     }
 }
 
-fn credential_name(data: &toml::Table) -> Option<String> {
-    let cdh = data
+fn cdh_image(data: &toml::Table) -> Option<toml::Value> {
+    let mut cdh = data
         .get("cdh.toml")?
         .as_str()?
         .parse::<toml::Table>()
         .ok()?;
-    let uri = cdh
-        .get("image")?
-        .get("authenticated_registry_credentials_uri")?;
-    Some(uri.as_str()?.strip_prefix(CREDENTIAL_URI)?.to_owned())
+    cdh.remove("image")
 }
 
-fn check_registry_auth(data: &toml::Table, kms_ca_pem: &str) -> Result<(), InitDataError> {
+fn credential_name(data: &toml::Table) -> Option<String> {
+    let image = cdh_image(data)?;
+    let uri = image
+        .get("authenticated_registry_credentials_uri")?
+        .as_str()?;
+    Some(uri.strip_prefix(CREDENTIAL_URI)?.to_owned())
+}
+
+fn pull_proxy(data: &toml::Table) -> Option<String> {
+    let image = cdh_image(data)?;
+    Some(
+        image
+            .get("image_pull_proxy")?
+            .get("https_proxy")?
+            .as_str()?
+            .to_owned(),
+    )
+}
+
+fn check_guest_pull(data: &toml::Table, kms_ca_pem: &str) -> Result<(), InitDataError> {
     if !data.contains_key("aa.toml") && !data.contains_key("cdh.toml") {
         return Ok(());
     }
-    let name =
-        credential_name(data).ok_or(InitDataError::RegistryAuth("cdh.toml names no Secret"))?;
-    if !crate::is_secret_name(&name) {
-        return Err(InitDataError::RegistryAuth("the Secret name is not valid"));
+    let name = credential_name(data);
+    let proxy = pull_proxy(data);
+    if name.as_deref().is_some_and(|n| !crate::is_secret_name(n)) {
+        return Err(InitDataError::GuestPull("the Secret name is not valid"));
     }
-    let (want_aa, want_cdh) = registry_auth(&name, kms_ca_pem);
+    let (want_aa, want_cdh) = guest_pull(name.as_deref(), proxy.as_deref(), kms_ca_pem)?;
     if data.get("aa.toml") != Some(&toml::Value::String(want_aa))
         || data.get("cdh.toml") != Some(&toml::Value::String(want_cdh))
     {
-        return Err(InitDataError::RegistryAuth("they differ"));
+        return Err(InitDataError::GuestPull("they differ"));
     }
     Ok(())
 }
@@ -354,8 +415,8 @@ mod tests {
     }
 
     #[test]
-    fn the_registry_auth_template_is_what_the_guest_reads() {
-        let (aa, cdh) = registry_auth("regcred", PEM);
+    fn the_guest_pull_template_is_what_the_guest_reads() {
+        let (aa, cdh) = guest_pull(Some("regcred"), None, PEM).unwrap();
         assert_eq!(
             aa,
             "[token_configs.kbs]\nurl = \"https://kms.alpha-kms.svc:8443\"\ncert = \"\"\"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n\"\"\"\n"
@@ -375,10 +436,11 @@ mod tests {
     }
 
     #[test]
-    fn registry_auth_off_the_template_is_refused() {
-        let (aa, cdh) = registry_auth("regcred", PEM);
-        let (other_ca, _) = registry_auth("regcred", "-----BEGIN CERTIFICATE-----\nMIIC\n");
-        let (_, bad_name) = registry_auth("RegCred", PEM);
+    fn guest_pull_off_the_template_is_refused() {
+        let (aa, cdh) = guest_pull(Some("regcred"), None, PEM).unwrap();
+        let (other_ca, _) =
+            guest_pull(Some("regcred"), None, "-----BEGIN CERTIFICATE-----\nMIIC\n").unwrap();
+        let (_, bad_name) = guest_pull(Some("RegCred"), None, PEM).unwrap();
         let cases = [
             (
                 with_auth(&aa, &cdh.replace("https://kms", "http://kms")),
@@ -415,6 +477,109 @@ mod tests {
         ];
         for (toml, fragment) in cases {
             let err = InitData::parse(toml)
+                .unwrap()
+                .check_policy(&pinned(), PEM)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(fragment), "{fragment}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_pull_proxy_renders_with_or_without_a_credential() {
+        let url = "http://pull-proxy.alpha-egress.svc:3128";
+        let (_, plain) = guest_pull(Some("regcred"), None, PEM).unwrap();
+        let (aa, only) = guest_pull(None, Some(url), PEM).unwrap();
+        assert_eq!(
+            only,
+            plain.replace(
+                "authenticated_registry_credentials_uri = \"kbs:///alpha/secret/regcred\"\n",
+                ""
+            ) + &format!("image_pull_proxy = {{ https_proxy = \"{url}\" }}\n")
+        );
+        let (_, both) = guest_pull(Some("regcred"), Some(url), PEM).unwrap();
+        assert!(both.ends_with(&format!(
+            "regcred\"\nimage_pull_proxy = {{ https_proxy = \"{url}\" }}\n"
+        )));
+        let table: toml::Table = both.parse().unwrap();
+        assert_eq!(
+            table["image"]["image_pull_proxy"]["https_proxy"].as_str(),
+            Some(url)
+        );
+        for cdh in [&only, &both] {
+            let init_data = InitData::parse(with_auth(&aa, cdh)).unwrap();
+            init_data.check_policy(&pinned(), PEM).unwrap();
+        }
+        let init_data = InitData::parse(with_auth(&aa, &only)).unwrap();
+        assert_eq!(init_data.registry_credential(), None);
+    }
+
+    #[test]
+    fn a_pull_proxy_off_the_grammar_is_refused() {
+        let long_label = format!("http://{}", "a".repeat(64));
+        let long_host = format!("http://{}", vec!["a".repeat(60); 5].join("."));
+        let long_url = format!("http://{}a", "a.".repeat(150));
+        for url in [
+            "https://p.svc:3128",
+            "p.svc:3128",
+            "http://",
+            "http://:3128",
+            "http://P.svc",
+            "http://p_q.svc",
+            "http://p.svc.",
+            "http://p..svc",
+            "http://-p.svc",
+            "http://p-.svc",
+            "http://u:pw@p.svc",
+            "http://p.svc/",
+            "http://p.svc?x=1",
+            "http://p.svc#x",
+            "http://p.svc:",
+            "http://p.svc:0",
+            "http://p.svc:65536",
+            "http://p.svc:+80",
+            "http://p.svc:80:80",
+            "http://[::1]:3128",
+            "http://p.svc\"\n[x]",
+            &long_label,
+            &long_host,
+            &long_url,
+        ] {
+            let err = guest_pull(None, Some(url), PEM).unwrap_err().to_string();
+            assert!(err.contains("pull proxy is not valid"), "{url}: {err}");
+        }
+        for url in ["http://10.0.0.7", "http://p:1", "http://p.svc:65535"] {
+            guest_pull(None, Some(url), PEM).unwrap();
+        }
+        assert!(guest_pull(None, None, PEM).is_err());
+    }
+
+    #[test]
+    fn a_pull_proxy_off_the_template_is_refused() {
+        let (aa, cdh) = guest_pull(Some("regcred"), Some("http://p.svc:3128"), PEM).unwrap();
+        let cases = [
+            (
+                format!("{cdh}http_proxy = \"http://q.svc\"\n"),
+                "they differ",
+            ),
+            (
+                cdh.replace(
+                    "{ https_proxy = \"http://p.svc:3128\" }",
+                    "{ no_proxy = \"x\" }",
+                ),
+                "they differ",
+            ),
+            (
+                cdh.replace("{ https_proxy", "{  https_proxy"),
+                "they differ",
+            ),
+            (
+                cdh.replace("http://p.svc:3128", "http://P.svc"),
+                "pull proxy is not valid",
+            ),
+        ];
+        for (cdh, fragment) in cases {
+            let err = InitData::parse(with_auth(&aa, &cdh))
                 .unwrap()
                 .check_policy(&pinned(), PEM)
                 .unwrap_err()
