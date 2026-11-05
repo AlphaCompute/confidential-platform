@@ -67,9 +67,9 @@ pub struct Openings {
 }
 
 impl Openings {
-    /// The openings in `toml`, each checked: a nonzero port, a canonical network address
-    /// without host bits outside the non-public ranges, a justification of 1 to 200 printable characters, at most 32 per
-    /// direction, none twice.
+    /// The openings in `toml`, each checked: a nonzero port, a canonical network address with no host
+    /// bits set and not inside a non-public range, a justification of 1 to 200 characters with a
+    /// letter or digit and no control characters, at most 32 per direction, none twice.
     pub fn parse(toml: &str) -> Result<Self, InitDataError> {
         let openings: Self = toml::from_str(toml).map_err(|e| bad("network.toml", e))?;
         check("ingress", &openings.ingress)?;
@@ -97,14 +97,14 @@ fn check(direction: &str, list: &[Opening]) -> Result<(), InitDataError> {
         }
         check_cidr(&o.cidr).map_err(|why| bad(&entry, why))?;
         let reason = o.justification.trim();
-        if reason.is_empty()
+        if !reason.chars().any(char::is_alphanumeric)
             || o.justification.chars().count() > MAX_JUSTIFICATION
             || o.justification.chars().any(char::is_control)
         {
             return Err(bad(
                 entry,
                 format!(
-                    "justification is not 1 to {MAX_JUSTIFICATION} characters without control characters"
+                    "justification is not 1 to {MAX_JUSTIFICATION} characters with a letter or digit and no control characters"
                 ),
             ));
         }
@@ -177,6 +177,13 @@ mod tests {
     }
 
     #[test]
+    fn a_justification_with_letters_or_digits_is_accepted() {
+        for why in ["Base de données du client", "Postgres"] {
+            assert!(Openings::parse(&entry(80, "198.51.100.0/24", why)).is_ok());
+        }
+    }
+
+    #[test]
     fn each_malformed_opening_is_refused() {
         let ok = "x";
         let long = "x".repeat(MAX_JUSTIFICATION + 1);
@@ -197,6 +204,8 @@ mod tests {
             (entry(80, "198.51.100.0/24", " "), "justification"),
             (entry(80, "198.51.100.0/24", &long), "justification"),
             (entry(80, "198.51.100.0/24", "a\\tb"), "justification"),
+            (entry(80, "198.51.100.0/24", "\\u200B"), "justification"),
+            (entry(80, "198.51.100.0/24", "--"), "justification"),
             (format!("{one}{one}"), "repeats"),
             (entry(80, "10.0.0.0/8", ok), "non-public range 10.0.0.0/8"),
             (entry(80, "10.1.0.0/16", ok), "non-public range 10.0.0.0/8"),
