@@ -559,7 +559,7 @@ async function loadPage(options = {}) {
     wasm: () => vm.runInContext("wasm_bindgen", context),
     text: () => main.lines().join("\n"),
     buttons: () =>
-      [...main.walk()].filter((n) => n.tagName === "BUTTON").map((n) => n.textContent),
+      [...main.walk()].filter((n) => n.tagName === "BUTTON" && n.className !== "copy").map((n) => n.textContent),
     find(predicate) {
       return [...main.walk()].find(predicate);
     },

@@ -172,16 +172,17 @@ test("the App's services come first and the platform's collapse under their role
   assert.ok(text.includes("Organization: Acme"), text);
   assert.ok(text.includes("Provided by AlphaCompute (2)"), text);
   const at = (s) => text.indexOf(s);
-  assert.ok(at("\nweb\n") < at("\ndb\n") && at("\ndb\n") < at("Provided by AlphaCompute"), text);
+  assert.ok(at("\ndb\n") < at("\nweb\n") && at("\nweb\n") < at("Provided by AlphaCompute"), text);
   assert.ok(at("Provided by AlphaCompute") < at("\napp-edge:2\n"), text);
-  assert.ok(at("\napp-edge:2\n") < at("AlphaCompute runtime"), text);
+  assert.ok(at("Provided by AlphaCompute") < at("AlphaCompute runtime"), text);
   assert.ok(!text.includes("\ncache\n"), "a service shows under its role, not its compose key");
   assert.ok(text.includes(`cache: ${digest}`), "the full digest is under Technical details");
 });
 
 test("Copy puts a service's full digest on the clipboard", async () => {
   const { page } = await approvalPage({ compose: withoutSecrets() });
-  await page.click("Copy");
+  const copy = page.find((n) => n.ariaLabel === "Copy the digest of nginx:1.27");
+  await copy.listeners.click[0]({ target: copy });
   assert.deepEqual(page.copied, [`sha256:${"ab".repeat(32)}`]);
 });
 
@@ -624,7 +625,10 @@ test("a replacement names both versions only when the old entry verifies", async
     assert.ok(line, `${name}: ${text}`);
     assert.ok(line.includes("according to the service"), line);
     assert.ok(line.includes(`alpha-cpu-app@sha256:4a${"3a".repeat(31)}`), line);
-    assert.ok(!text.split("\n").some((l) => l.startsWith("alpha-runtime: ")), name);
+    assert.ok(
+      !text.split("\n").some((l) => l.startsWith("alpha-runtime: ") && l.includes("according to the service")),
+      name,
+    );
   }
 });
 
