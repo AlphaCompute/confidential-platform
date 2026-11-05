@@ -336,7 +336,7 @@ adds only the platform's own: DNS, the KMS on 8443, and the gateway to the runti
 cluster's CNI must enforce NetworkPolicy, or nothing is dropped. The host enforces it, which is
 right because what it protects is everyone else from the workload, not the workload's
 confidentiality. An opening inside a private, shared, loopback, link-local, multicast, reserved or other non-public
-range is refused; a wider one such as `0.0.0.0/0` stays valid and the deployer excludes those ranges.
+range is refused, and so are the IPv6 prefixes that embed IPv4 addresses (NAT64 and 6to4); a wider one such as `0.0.0.0/0` stays valid and the deployer excludes those ranges.
 
 ## What the operator never sees
 

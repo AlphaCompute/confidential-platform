@@ -8,14 +8,15 @@ use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::{Deserialize, Serialize};
+use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
 
 use crate::InitDataError;
 
 const MAX_PER_DIRECTION: usize = 32;
 const MAX_JUSTIFICATION: usize = 200;
 
-/// The ranges IANA marks not globally reachable, apart from the documentation ranges, which no network routes.
-const NON_PUBLIC: [(IpAddr, u8); 19] = [
+/// The ranges IANA marks not globally reachable, apart from documentation, plus the IPv6 prefixes that embed IPv4.
+const NON_PUBLIC: [(IpAddr, u8); 23] = [
     (IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 8),
     (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8),
     (IpAddr::V4(Ipv4Addr::new(100, 64, 0, 0)), 10),
@@ -34,7 +35,14 @@ const NON_PUBLIC: [(IpAddr, u8); 19] = [
         IpAddr::V6(Ipv6Addr::new(0x64, 0xff9b, 1, 0, 0, 0, 0, 0)),
         48,
     ),
+    (
+        IpAddr::V6(Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0, 0)),
+        96,
+    ),
     (IpAddr::V6(Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, 0)), 64),
+    (IpAddr::V6(Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0)), 23),
+    (IpAddr::V6(Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0)), 16),
+    (IpAddr::V6(Ipv6Addr::new(0x5f00, 0, 0, 0, 0, 0, 0, 0)), 16),
     (IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0)), 7),
     (IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0)), 10),
     (IpAddr::V6(Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0)), 8),
@@ -67,9 +75,10 @@ pub struct Openings {
 }
 
 impl Openings {
-    /// The openings in `toml`, each checked: a nonzero port, a canonical network address with no host
-    /// bits set and not inside a non-public range, a justification of 1 to 200 characters with a
-    /// letter or digit and no control characters, at most 32 per direction, none twice.
+    /// The openings in `toml`, each checked: a nonzero port; a canonical network address with no
+    /// host bits set; a cidr not inside a non-public range; a justification of 1 to 200 characters
+    /// with a letter or digit and no control or format characters; at most 32 per direction, none
+    /// twice.
     pub fn parse(toml: &str) -> Result<Self, InitDataError> {
         let openings: Self = toml::from_str(toml).map_err(|e| bad("network.toml", e))?;
         check("ingress", &openings.ingress)?;
@@ -99,12 +108,14 @@ fn check(direction: &str, list: &[Opening]) -> Result<(), InitDataError> {
         let reason = o.justification.trim();
         if !reason.chars().any(char::is_alphanumeric)
             || o.justification.chars().count() > MAX_JUSTIFICATION
-            || o.justification.chars().any(char::is_control)
+            || o.justification
+                .chars()
+                .any(|c| c.is_control() || c.general_category() == GeneralCategory::Format)
         {
             return Err(bad(
                 entry,
                 format!(
-                    "justification is not 1 to {MAX_JUSTIFICATION} characters with a letter or digit and no control characters"
+                    "justification is not 1 to {MAX_JUSTIFICATION} characters with a letter or digit and no control or format characters"
                 ),
             ));
         }
@@ -178,7 +189,7 @@ mod tests {
 
     #[test]
     fn a_justification_with_letters_or_digits_is_accepted() {
-        for why in ["Base de données du client", "Postgres"] {
+        for why in ["Base de données du client", "Postgres", "数据库"] {
             assert!(Openings::parse(&entry(80, "198.51.100.0/24", why)).is_ok());
         }
     }
@@ -206,6 +217,12 @@ mod tests {
             (entry(80, "198.51.100.0/24", "a\\tb"), "justification"),
             (entry(80, "198.51.100.0/24", "\\u200B"), "justification"),
             (entry(80, "198.51.100.0/24", "--"), "justification"),
+            (
+                entry(80, "198.51.100.0/24", "Postgres\\u202Egnp.exe"),
+                "no control or format characters",
+            ),
+            (entry(80, "198.51.100.0/24", "a\\u200Bb"), "justification"),
+            (entry(80, "198.51.100.0/24", "\\uFEFFx"), "justification"),
             (format!("{one}{one}"), "repeats"),
             (entry(80, "10.0.0.0/8", ok), "non-public range 10.0.0.0/8"),
             (entry(80, "10.1.0.0/16", ok), "non-public range 10.0.0.0/8"),
@@ -222,6 +239,17 @@ mod tests {
                 "non-public range 64:ff9b:1::/48",
             ),
             (entry(80, "100::/64", ok), "non-public range 100::/64"),
+            (entry(80, "2001:2::/48", ok), "non-public range 2001::/23"),
+            (entry(80, "2001::/32", ok), "non-public range 2001::/23"),
+            (entry(80, "5f00::/16", ok), "non-public range 5f00::/16"),
+            (
+                entry(80, "64:ff9b::a00:1/128", ok),
+                "non-public range 64:ff9b::/96",
+            ),
+            (
+                entry(80, "2002:a00:1::/48", ok),
+                "non-public range 2002::/16",
+            ),
             (
                 entry(80, "192.168.1.1/32", ok),
                 "non-public range 192.168.0.0/16",
