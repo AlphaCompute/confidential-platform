@@ -964,7 +964,7 @@ async function startApproval(view, viewText, ticket) {
     note = read.credentials.length ? undefined : MESSAGES.no_credentials;
   }
   a.fields = secretFields(launch.services, before, putSecrets(read));
-  a.secretsBox = el("div");
+  a.secretsBox = el("div", undefined, "secrets");
   a.secretsBox.append(...a.fields.map((f) => f.node));
   ui.facts.replaceChildren(...describeLaunch(a));
   // The decision sits beside what the App is on a wide page, and pins its buttons to the bottom

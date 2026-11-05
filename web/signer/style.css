@@ -123,6 +123,11 @@ body::after {
     background: #0c0c0c;
     border-top: 1px solid var(--border);
   }
+
+  .decision.ready .secrets {
+    max-height: 30vh;
+    overflow-y: auto;
+  }
 }
 
 .brand {
