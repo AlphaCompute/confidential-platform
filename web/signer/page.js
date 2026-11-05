@@ -910,7 +910,7 @@ async function startApproval(view, viewText, ticket) {
     a.canEnroll = false;
     note = read.credentials.length ? undefined : MESSAGES.no_credentials;
   }
-  a.fields = secretFields(launch.services, before, putSecrets(read));
+  a.fields = secretFields(launch.services, before, putSecrets(read), describedSecrets(read));
   a.secretsBox = el("div");
   a.secretsBox.append(...a.fields.map((f) => f.node));
   ui.facts.replaceChildren(...describeLaunch(a), a.secretsBox);
@@ -928,10 +928,21 @@ function putSecrets(read) {
   return read.secrets.filter((s) => s && s.set === true).map((s) => s.name);
 }
 
+// The service's display text for each Secret. It is unsigned: shown as text, never used to
+// choose which Secrets are asked for.
+function describedSecrets(read) {
+  const described = new Map();
+  if (!Array.isArray(read.secrets)) return described;
+  for (const s of read.secrets) {
+    if (s && typeof s.description === "string" && s.description) described.set(s.name, s.description);
+  }
+  return described;
+}
+
 // One password field per declared Secret. A Secret the current launch also declares is already
 // held by the KMS, because approving that launch put it, and so is one the service reports as
 // put; either defaults to keeping that value.
-function secretFields(services, before, put) {
+function secretFields(services, before, put, described) {
   const held = [...(before ? declaredSecrets(before) : []), ...put];
   return declaredSecrets(services).map((name) => {
     const node = el("div", undefined, "secret");
@@ -942,6 +953,7 @@ function secretFields(services, before, put) {
     const label = el("label", `Secret ${name}`);
     label.htmlFor = input.id;
     node.append(label);
+    if (described.has(name)) node.append(el("p", described.get(name), "muted"));
     let keep = null;
     if (held.includes(name)) {
       keep = el("select");
@@ -960,6 +972,17 @@ function secretFields(services, before, put) {
       node.append(keep);
     }
     node.append(input);
+    const generate = el("button", "Generate a random value", "secondary");
+    generate.type = "button";
+    generate.id = `generate-${name}`;
+    generate.addEventListener("click", () => {
+      input.value = [...crypto.getRandomValues(new Uint8Array(32))]
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+      if (keep) keep.value = "replace";
+      input.hidden = false;
+    });
+    node.append(generate);
     return { name, input, keep, node };
   });
 }
