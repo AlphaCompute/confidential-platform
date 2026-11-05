@@ -316,6 +316,10 @@ class Node {
     this.own = String(value);
   }
 
+  setAttribute(name, value) {
+    (this.attributes = this.attributes || {})[name] = String(value);
+  }
+
   focus() {
     this.focused = true;
   }

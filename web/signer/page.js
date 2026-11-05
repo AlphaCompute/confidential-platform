@@ -963,7 +963,7 @@ async function startApproval(view, viewText, ticket) {
     a.canEnroll = false;
     note = read.credentials.length ? undefined : MESSAGES.no_credentials;
   }
-  a.fields = secretFields(launch.services, before, putSecrets(read));
+  a.fields = secretFields(launch.services, before, putSecrets(read), read.secrets);
   a.secretsBox = el("div", undefined, "secrets");
   a.secretsBox.append(...a.fields.map((f) => f.node));
   ui.facts.replaceChildren(...describeLaunch(a));
@@ -976,6 +976,7 @@ async function startApproval(view, viewText, ticket) {
   };
   for (const f of a.fields) {
     f.input.addEventListener("input", sync);
+    f.generate.addEventListener("click", sync);
     f.keep?.addEventListener("change", sync);
   }
   sync();
@@ -1002,9 +1003,10 @@ function putSecrets(read) {
 // One password field per declared Secret. A Secret the current launch also declares is already
 // held by the KMS, because approving that launch put it, and so is one the service reports as
 // put; either defaults to keeping that value.
-function secretFields(services, before, put) {
+// The description is unsigned display text: shown as text, never used to choose which Secrets are asked.
+function secretFields(services, before, put, reported) {
   const held = [...(before ? declaredSecrets(before) : []), ...put];
-  return declaredSecrets(services).map((name) => {
+  return declaredSecrets(services).map((name, index) => {
     const node = el("div", undefined, "secret");
     const input = el("input");
     input.type = "password";
@@ -1013,11 +1015,24 @@ function secretFields(services, before, put) {
     const label = el("label", `Secret ${name}`);
     label.htmlFor = input.id;
     node.append(label);
+    const description = Array.isArray(reported) ? reported.find((s) => s && s.name === name)?.description : undefined;
+    let describedBy = null;
+    let caption = null;
+    let describedIds = "";
+    if (typeof description === "string" && description) {
+      describedBy = el("p", description, "muted");
+      describedBy.id = `description-${index}`; // the other ids start with secret-, keep- or generate- plus a Secret name; this prefix cannot match them
+      caption = el("p", "From the App's plan, not verified:", "muted");
+      caption.id = `caption-${index}`;
+      describedIds = `${caption.id} ${describedBy.id}`;
+      input.setAttribute("aria-describedby", describedIds);
+    }
     let keep = null;
     if (held.includes(name)) {
       keep = el("select");
       keep.id = `keep-${name}`;
       keep.ariaLabel = `Secret ${name}`;
+      if (describedBy) keep.setAttribute("aria-describedby", describedIds);
       const kept = el("option", "Keep the current value");
       kept.value = "keep";
       const replaced = el("option", "Replace");
@@ -1031,7 +1046,20 @@ function secretFields(services, before, put) {
       node.append(keep);
     }
     node.append(input);
-    return { name, input, keep, node };
+    if (describedBy) node.append(caption, describedBy);
+    const generate = el("button", "Generate a random value", "secondary");
+    generate.type = "button";
+    generate.ariaLabel = `Generate a random value for Secret ${name}`;
+    generate.id = `generate-${name}`;
+    generate.addEventListener("click", () => {
+      input.value = [...crypto.getRandomValues(new Uint8Array(32))]
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+      if (keep) keep.value = "replace";
+      input.hidden = false;
+    });
+    node.append(generate);
+    return { name, input, keep, generate, node };
   });
 }
 

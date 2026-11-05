@@ -1049,3 +1049,57 @@ test("relay calls are paced and a 429 is retried once", async () => {
   assert.equal(tries[0].text, tries[1].text);
   assert.ok(limited.page.timers.includes(2000));
 });
+
+const generateButton = (page, name) => page.find((n) => n.id === `generate-${name}`);
+const generate = async (page, name) => {
+  for (const listener of generateButton(page, name).listeners.click) await listener({});
+};
+
+test("a Secret's description is shown as text, and a missing one shows nothing", async () => {
+  const { page } = await secretPage({
+    secrets: [
+      { name: "db_password", set: false, description: "Database <b>password</b>" },
+      { name: "session_key", set: false },
+    ],
+  });
+  const described = page.find((n) => n.textContent === "Database <b>password</b>");
+  assert.ok(described, page.text());
+  assert.equal(described.tagName, "P");
+  assert.ok(!page.find((n) => n.tagName === "B"));
+  assert.ok(page.text().includes("From the App's plan, not verified:"));
+  assert.equal(described.parent, field(page, "db_password").parent);
+  const siblings = described.parent.children;
+  assert.equal(siblings[siblings.indexOf(described) - 2], field(page, "db_password"));
+  assert.ok(!field(page, "session_key").parent.children.some((n) => n.className === "muted"));
+  assert.equal(field(page, "db_password").attributes["aria-describedby"], `${siblings[siblings.indexOf(described) - 1].id} ${described.id}`);
+  assert.equal(field(page, "session_key").attributes, undefined);
+});
+
+test("generating fills 64 hex characters, differently each time", async () => {
+  const { page } = await secretPage();
+  assert.equal(generateButton(page, "db_password").type, "button");
+  await generate(page, "db_password");
+  const first = field(page, "db_password").value;
+  assert.match(first, /^[0-9a-f]{64}$/);
+  await generate(page, "db_password");
+  assert.notEqual(field(page, "db_password").value, first);
+});
+
+test("generating on a kept Secret replaces it and the value is put", async () => {
+  const { page, api } = await secretPage({ secrets: [{ name: "db_password", set: true }] });
+  assert.equal(field(page, "db_password").hidden, true);
+  await generate(page, "db_password");
+  const generated = field(page, "db_password").value;
+  assert.equal(keepChoice(page, "db_password").value, "replace");
+  assert.equal(field(page, "db_password").hidden, false);
+  fill(page, { session_key: SECRET_VALUES.session_key });
+  await page.click("Approve with passkey");
+  await page.click("Sign 2 of 3");
+  await page.click("Sign 3 of 3");
+  assert.ok(page.text().includes(APPROVED), page.text());
+  assert.deepEqual(
+    api.puts.map((p) => p.declared),
+    ["db_password", "session_key"],
+  );
+  assert.equal(page.seals[0].value.subarray(32).toString(), generated);
+});
