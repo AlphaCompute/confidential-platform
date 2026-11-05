@@ -1021,6 +1021,7 @@ function secretFields(services, before, put, reported) {
       describedBy = el("p", description, "muted");
       describedBy.id = `description-${index}`; // the other ids start with secret-, keep- or generate- plus a Secret name; this prefix cannot match them
       node.append(describedBy);
+      node.append(el("p", "Written by the service and not covered by the signed launch; check it before entering a credential.", "muted"));
       input.setAttribute("aria-describedby", describedBy.id);
     }
     let keep = null;
