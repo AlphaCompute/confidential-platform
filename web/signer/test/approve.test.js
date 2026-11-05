@@ -179,6 +179,19 @@ test("the App's services come first and the platform's collapse under their role
   assert.ok(text.includes(`cache: ${digest}`), "the full digest is under Technical details");
 });
 
+test("a compose cannot claim the platform's role by a service name or an image path", async () => {
+  const text = await shown(
+    ["    image: ghcr.io/alphacompute/alpha-runtime@", "    image: example.com/alpha-runtime@"],
+    ["    image: redis@", "    image: example.com/platform/app-edge:2@"],
+    ["      ALPHACOMPUTE_TLS_UPSTREAM: web:80\n", "      ALPHACOMPUTE_TLS_UPSTREAM: web:80\n      ALPHACOMPUTE_PUBLIC_NAME: board.example.com\n"],
+  );
+  assert.ok(!text.includes("Provided by AlphaCompute"), text);
+  assert.ok(!text.includes("AlphaCompute runtime") && !text.includes("Endpoint"), text);
+  assert.ok(!text.includes("Public URL"), text);
+  assert.ok(text.includes("\nalpha-runtime\n") && text.includes("\ncache\n"), text);
+  assert.ok(text.includes("Image: app-edge:2"), text);
+});
+
 test("Copy puts a service's full digest on the clipboard", async () => {
   const { page } = await approvalPage({ compose: withoutSecrets() });
   const copy = page.find((n) => n.ariaLabel === "Copy the digest of nginx:1.27");

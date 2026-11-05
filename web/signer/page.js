@@ -864,10 +864,14 @@ function serviceBlock(name, service, ports = service.ports) {
   return block;
 }
 
-// ponytail: a service is the platform's by its image path (a `platform/` segment) or by being the
-// runtime, until the read marks them; the upgrade is a flag from the service or the catalog.
-function isPlatform(name, service) {
-  return name === "alpha-runtime" || splitImage(service.image).repo.split("/").slice(0, -1).includes("platform");
+// ponytail: a service is AlphaCompute's only when its image is in the AlphaCompute registry, where
+// only AlphaCompute publishes, and pinned by digest, which fixes the exact code; the compose's own
+// names and paths are requester-controlled and prove nothing. Ceiling: every pinned image in that
+// registry counts, with no per-image allowlist; the upgrade is a signed list of platform images in
+// the platform document or the catalog.
+const PLATFORM_IMAGE = /^ghcr\.io\/alphacompute\/[^@]+@sha256:[0-9a-f]{64}$/;
+function isPlatform(service) {
+  return PLATFORM_IMAGE.test(service.image || "");
 }
 
 function runtimeBlock(runtime) {
@@ -893,7 +897,8 @@ function describeLaunch(a) {
   if (launch.heading) nodes.push(el("p", launch.heading));
   for (const line of launch.notes || []) nodes.push(el("p", line, "warning"));
   const services = Object.entries(launch.services);
-  const publicName = launch.services["alpha-runtime"]?.environment.ALPHACOMPUTE_PUBLIC_NAME;
+  const runtime = launch.services["alpha-runtime"];
+  const publicName = runtime && isPlatform(runtime) ? runtime.environment.ALPHACOMPUTE_PUBLIC_NAME : undefined;
   const summary = el("div", undefined, "summary");
   if (publicName) summary.append(fact("Public URL", `https://${publicName}`));
   summary.append(fact("Organization", a.orgName), fact("Machine", launch.machine));
@@ -901,9 +906,9 @@ function describeLaunch(a) {
   if (launch.machineNote) nodes.push(el("p", launch.machineNote, "muted"));
   nodes.push(fact("App", read.app_id), fact("Revision", read.compose_hash, "digest"));
   nodes.push(el("h2", "What will run"));
-  const provided = services.filter(([n, s]) => isPlatform(n, s));
+  const provided = services.filter(([, s]) => isPlatform(s));
   for (const [n, s] of services) {
-    if (!isPlatform(n, s)) nodes.push(serviceBlock(n, s));
+    if (!isPlatform(s)) nodes.push(serviceBlock(n, s));
   }
   if (provided.length) {
     const platform = el("details");

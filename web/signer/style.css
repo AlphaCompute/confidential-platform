@@ -111,10 +111,24 @@ body::after {
 }
 
 @media (max-width: 959px) {
+  /* The bar is fixed to the viewport so it stays in reach while the facts scroll; the panel's
+     backdrop-filter, and the fill of the fade-in's transform, would make it fixed to those. */
+  .panel:has(.decision.ready) {
+    padding-bottom: 120px;
+    backdrop-filter: none;
+  }
+
+  .approval {
+    animation-fill-mode: backwards;
+  }
+
   .decision.ready .step {
-    position: sticky;
+    position: fixed;
+    left: 0;
+    right: 0;
     bottom: 0;
-    padding: 12px 0;
+    z-index: 2;
+    padding: 12px 22px;
     background: #0c0c0c;
   }
 }
