@@ -111,25 +111,17 @@ body::after {
 }
 
 @media (max-width: 959px) {
-  /* The bar is fixed to the viewport so it stays in reach while the facts scroll; the panel's
-     backdrop-filter, and the fill of the fade-in's transform, would make it fixed to those. */
-  .panel:has(.decision.ready) {
-    padding-bottom: 120px;
-    backdrop-filter: none;
-  }
-
-  .approval {
-    animation-fill-mode: backwards;
-  }
-
-  .decision.ready .step {
-    position: fixed;
-    left: 0;
-    right: 0;
+  /* Pinned to the viewport bottom while the facts above scroll; it keeps its flow space, and the
+     cap keeps every control and message reachable on short or zoomed screens. */
+  .decision.ready {
+    position: sticky;
     bottom: 0;
     z-index: 2;
-    padding: 12px 22px;
+    max-height: 60vh;
+    overflow-y: auto;
+    padding: 12px 0;
     background: #0c0c0c;
+    border-top: 1px solid var(--border);
   }
 }
 
