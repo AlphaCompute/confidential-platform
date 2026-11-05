@@ -16,8 +16,8 @@ const MAX_PER_DIRECTION: usize = 32;
 const MAX_JUSTIFICATION: usize = 200;
 const MAX_MARKS_IN_A_ROW: u8 = 4;
 
-/// The ranges IANA marks not globally reachable, apart from documentation, plus the IPv6 prefixes that embed IPv4 (IPv4-compatible, IPv4-mapped, NAT64, 6to4).
-const NON_PUBLIC: [(IpAddr, u8); 26] = [
+/// The ranges IANA marks not globally reachable, apart from documentation, plus the IPv6 prefixes that embed IPv4 (IPv4-compatible, IPv4-mapped, IPv4-translated, NAT64, 6to4).
+const NON_PUBLIC: [(IpAddr, u8); 27] = [
     (IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 8),
     (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8),
     (IpAddr::V4(Ipv4Addr::new(100, 64, 0, 0)), 10),
@@ -34,6 +34,7 @@ const NON_PUBLIC: [(IpAddr, u8); 26] = [
     (IpAddr::V6(Ipv6Addr::UNSPECIFIED), 128),
     (IpAddr::V6(Ipv6Addr::LOCALHOST), 128),
     (IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0)), 96),
+    (IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0xffff, 0, 0, 0)), 96),
     (
         IpAddr::V6(Ipv6Addr::new(0x64, 0xff9b, 1, 0, 0, 0, 0, 0)),
         48,
@@ -353,6 +354,14 @@ mod tests {
             (
                 entry(80, "::ffff:10.0.0.1/128", ok),
                 "non-public range ::ffff:0.0.0.0/96",
+            ),
+            (
+                entry(80, "::ffff:0:a00:0/104", ok),
+                "non-public range ::ffff:0:0:0/96",
+            ),
+            (
+                entry(80, "::ffff:0:0:0/96", ok),
+                "non-public range ::ffff:0:0:0/96",
             ),
             (
                 (0..=MAX_PER_DIRECTION)
