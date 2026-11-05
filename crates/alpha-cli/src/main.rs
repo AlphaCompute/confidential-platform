@@ -273,7 +273,7 @@ enum ComposeCommand {
 #[derive(Subcommand)]
 enum CocoCommand {
     /// Writes the spec with its pod's init-data annotation to `--out` and prints
-    /// `{revision, init_data, annotation, rules_sha256, policy_data_sha256}`.
+    /// `{revision, init_data, annotation, rules_sha256, policy_data_sha256, network}`.
     Render {
         #[arg(long)]
         app_id: AppId,
@@ -287,6 +287,10 @@ enum CocoCommand {
         /// guest fetches it from the KMS under `kms_ca_pem` of the platform document.
         #[arg(long)]
         registry_auth: Option<String>,
+        /// The pod's declared network openings, a TOML file of `[[ingress]]` and `[[egress]]`
+        /// entries (protocol, port, cidr, justification); without it the pod is network-dark.
+        #[arg(long)]
+        network: Option<PathBuf>,
         /// A Pod, or a StatefulSet or Deployment rendered for its pod template, whose images are all pinned
         /// `@sha256:` and whose supplementalGroups are explicit.
         pod: PathBuf,
@@ -664,6 +668,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                     kata,
                     out,
                     registry_auth,
+                    network,
                     pod,
                 },
         } => {
@@ -671,6 +676,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 fs::read(&pod).map_err(|e| Exit::Usage(format!("{}: {e}", pod.display())))?;
             let pod = coco::parse(&bytes)?;
             let policy = coco::Kata::read(&kata)?.genpolicy(&pod)?;
+            let network = network.as_deref().map(coco::read_network).transpose()?;
             let kms_ca_pem = match &registry_auth {
                 Some(_) => Some(platform_document(config, now).await?.kms_ca_pem),
                 None => None,
@@ -680,6 +686,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 app_id,
                 &policy,
                 registry_auth.as_deref().zip(kms_ca_pem.as_deref()),
+                network.as_deref(),
             )?;
             fs::write(&out, &rendered.pod)
                 .map_err(|e| Exit::Refused(format!("{}: {e}", out.display())))?;

@@ -326,6 +326,17 @@ through the nodes' API and the database.
   it; if it was already running sealed, delete its pod.
 - **Postgres lost.** Restore it from its backup as in [`../backup.md`](../backup.md#restore).
 
+## Network openings
+
+A Revision without `"network.toml"` in its init-data is network-dark. Each opening (direction,
+protocol, port, address range) is declared there with a justification, and so is measured: the
+approver signs it, the KMS refuses a malformed one at registration, and a relying party reads it
+with `alpha verify --init-data`. The deployer turns the openings into the pod's NetworkPolicy and
+adds only the platform's own: DNS, the KMS on 8443, and the gateway to the runtime's 8443. The
+cluster's CNI must enforce NetworkPolicy, or nothing is dropped. The host enforces it, which is
+right because what it protects is everyone else from the workload, not the workload's
+confidentiality.
+
 ## What the operator never sees
 
 The root KEK, the shares in the clear (bootstrap writes each sealed to its custodian's key), the
