@@ -9,7 +9,9 @@ bytes can be served from any origin the platform document lists under `signer.or
 
 ## Secrets
 
-A launch whose compose declares Secrets gets one password field per Secret. Each value is read
+A launch whose compose declares Secrets gets one password field per Secret. The service may add a
+description of each Secret to the ticket; the page shows it as plain text, and it never changes which
+Secrets are asked for. "Generate a random value" fills a field with 32 random bytes as hex. Each value is read
 once, sealed with `KmsSecretSealer` to a KMS node that proves itself against the platform
 document, and put in its own step, signed by the same passkey that made the first signature; the
 relay sees the value only as the sealed frame. The signed document it also sees commits to 32

@@ -822,23 +822,77 @@ function parsedLaunch(read, compose, extra) {
   }
 }
 
-function imageLines(image) {
+// The image's repository, its last path segment with the tag, and its digest, which is empty
+// when the image is not pinned.
+function splitImage(image) {
   const at = (image || "").indexOf("@sha256:");
-  return at < 0
-    ? [fact("Image", image || "none"), fact("Digest", "none (not pinned)", "digest")]
-    : [fact("Image", image.slice(0, at)), fact("Digest", image.slice(at + 1), "digest")];
+  const named = at < 0 ? image || "" : image.slice(0, at);
+  const tagAt = named.lastIndexOf(":");
+  const slashAt = named.lastIndexOf("/");
+  return {
+    repo: tagAt > slashAt ? named.slice(0, tagAt) : named,
+    short: named.slice(slashAt + 1),
+    digest: at < 0 ? "" : image.slice(at + 1),
+  };
 }
 
-function serviceBlock(name, service) {
+function imageLines(image) {
+  const { repo, short, digest } = splitImage(image);
+  const name = el("span", short || "none");
+  name.title = repo;
+  const row = el("p", undefined, "fact");
+  row.append(el("span", "Image: "), name);
+  if (!digest) return [row, fact("Digest", "none (not pinned)", "digest")];
+  // A refused clipboard must not replace the approval with an error, so the write's failure is dropped.
+  // The full digest is under Technical details.
+  const copy = button("Copy", () => navigator.clipboard.writeText(digest).catch(() => {}), "copy");
+  copy.ariaLabel = `Copy the digest of ${short}`;
+  const shown = el("p", undefined, "fact");
+  shown.append(
+    el("span", "Digest: "),
+    el("span", `${digest.slice(0, 15)}…${digest.slice(-6)}`, "digest"),
+    copy,
+  );
+  return [row, shown];
+}
+
+function serviceBlock(name, service, ports = service.ports) {
   const block = el("div", undefined, "service");
   block.append(el("h3", name), ...imageLines(service.image));
   const lists = [
-    ["Published ports", service.ports],
+    ["Published ports", ports],
     ["Named volumes", service.volumes],
     ["Receives secrets", service.secrets],
   ];
   for (const [title, items] of lists) {
     if (items.length) block.append(fact(title, items.join(", ")));
+  }
+  return block;
+}
+
+// ponytail: a service is AlphaCompute's only when its image is in the AlphaCompute registry, where
+// only AlphaCompute publishes, and pinned by digest, which fixes the exact code; the compose's own
+// names and paths are requester-controlled and prove nothing. Ceiling: every pinned image in that
+// registry counts, with no per-image allowlist; the upgrade is a signed list of platform images in
+// the platform document or the catalog.
+const PLATFORM_IMAGE = /^ghcr\.io\/alphacompute\/[^@]+@sha256:[0-9a-f]{64}$/;
+function isPlatform(service) {
+  return PLATFORM_IMAGE.test(service.image || "");
+}
+
+function runtimeBlock(runtime) {
+  const upstream = runtime.environment.ALPHACOMPUTE_TLS_UPSTREAM;
+  // The runtime terminates TLS only on its container port 8443 over TCP; a port without a host
+  // side is published on a random host port, so neither names an endpoint.
+  const hostOfTls = (p) => upstream && /^(.+):8443(\/tcp)?$/.exec(p)?.[1];
+  const hosts = runtime.ports.map(hostOfTls).filter(Boolean);
+  const block = serviceBlock(
+    "AlphaCompute runtime",
+    runtime,
+    runtime.ports.filter((p) => !hostOfTls(p)),
+  );
+  if (hosts.length) {
+    block.append(fact("Endpoint", `HTTPS on ${hosts.join(", ")}, forwarded to ${upstream}`));
   }
   return block;
 }
@@ -862,32 +916,35 @@ function describeLaunch(a) {
   const nodes = [];
   if (launch.heading) nodes.push(el("p", launch.heading));
   for (const line of launch.notes || []) nodes.push(el("p", line, "warning"));
+  const services = Object.entries(launch.services);
+  const runtime = launch.services["alpha-runtime"];
+  const publicName = runtime && isPlatform(runtime) ? runtime.environment.ALPHACOMPUTE_PUBLIC_NAME : undefined;
+  const summary = el("div", undefined, "summary");
+  if (publicName) summary.append(fact("Public URL", `https://${publicName}`));
+  summary.append(fact("Organization", a.orgName), fact("Machine", launch.machine));
+  nodes.push(summary);
+  if (launch.machineNote) nodes.push(el("p", launch.machineNote, "muted"));
   nodes.push(fact("App", read.app_id), fact("Revision", read.compose_hash, "digest"));
   nodes.push(el("h2", "What will run"));
-  const runtime = launch.services["alpha-runtime"];
-  for (const [name, service] of Object.entries(launch.services)) {
-    if (name !== "alpha-runtime") nodes.push(serviceBlock(name, service));
+  const provided = services.filter(([, s]) => isPlatform(s));
+  for (const [n, s] of services) {
+    if (!isPlatform(s)) nodes.push(serviceBlock(n, s));
   }
-  if (runtime) {
-    const block = el("div", undefined, "service");
-    block.append(el("h3", "AlphaCompute runtime"), ...imageLines(runtime.image));
-    const upstream = runtime.environment.ALPHACOMPUTE_TLS_UPSTREAM;
-    // The runtime terminates TLS only on its container port 8443 over TCP; a port without a host
-    // side is published on a random host port, so neither names an endpoint.
-    const hostOfTls = (p) => upstream && /^(.+):8443(\/tcp)?$/.exec(p)?.[1];
-    const hosts = runtime.ports.map(hostOfTls).filter(Boolean);
-    const published = runtime.ports.filter((p) => !hostOfTls(p));
-    if (hosts.length) {
-      block.append(fact("Endpoint", `HTTPS on ${hosts.join(", ")}, forwarded to ${upstream}`));
+  if (provided.length) {
+    const platform = el("details");
+    platform.append(el("summary", `Provided by AlphaCompute (${provided.length})`));
+    for (const [n, s] of provided) {
+      platform.append(n === "alpha-runtime" ? runtimeBlock(s) : serviceBlock(splitImage(s.image).short, s));
     }
-    if (published.length) block.append(fact("Published ports", published.join(", ")));
-    nodes.push(block);
+    nodes.push(platform);
   }
   if (launch.openings) nodes.push(networkBlock(launch.openings));
-  nodes.push(fact("Machine", launch.machine));
-  if (launch.machineNote) nodes.push(el("p", launch.machineNote, "muted"));
   const details = el("details");
-  details.append(el("summary", "Technical details"), el("pre", launch.compose));
+  details.append(el("summary", "Technical details"));
+  for (const [n, s] of services) {
+    details.append(fact(n, splitImage(s.image).digest || "not pinned", "digest"));
+  }
+  details.append(el("pre", launch.compose));
   nodes.push(details);
   return nodes;
 }
@@ -913,11 +970,7 @@ async function startApproval(view, viewText, ticket) {
 
   const orgName = typeof read.org_name === "string" ? read.org_name : read.org_id;
   const progress = read.root_principal_id != null ? el("p") : null;
-  const ui = screen(
-    el("p", `Launch approval for ${orgName}`, "eyebrow"),
-    el("h1", read.title),
-    ...(progress ? [progress] : []),
-  );
+  const ui = screen();
   const a = { view, viewText, read, ticket, ui, launch, orgName, progress, credential: null, values: null };
   a.signedIn = backFromSignIn(ticket);
   let note = a.signedIn ? MESSAGES.signed_in : undefined;
@@ -931,10 +984,29 @@ async function startApproval(view, viewText, ticket) {
     a.canEnroll = false;
     note = read.credentials.length ? undefined : MESSAGES.no_credentials;
   }
-  a.fields = secretFields(launch.services, before, putSecrets(read));
-  a.secretsBox = el("div");
+  a.fields = secretFields(launch.services, before, putSecrets(read), read.secrets);
+  a.secretsBox = el("div", undefined, "secrets");
   a.secretsBox.append(...a.fields.map((f) => f.node));
-  ui.facts.replaceChildren(...describeLaunch(a), a.secretsBox);
+  ui.facts.replaceChildren(...describeLaunch(a));
+  // The decision sits beside what the App is on a wide page, and pins its buttons to the bottom
+  // of a narrow one once every Secret is filled.
+  const decision = el("div", undefined, "decision");
+  const sync = () => {
+    const filled = a.fields.every((f) => f.keep?.value === "keep" || f.input.value);
+    decision.className = filled ? "decision ready" : "decision";
+  };
+  for (const f of a.fields) {
+    f.input.addEventListener("input", sync);
+    f.generate.addEventListener("click", sync);
+    f.keep?.addEventListener("change", sync);
+  }
+  sync();
+  decision.append(a.secretsBox, ui.step, ui.status);
+  const layout = el("div", undefined, "approval");
+  layout.append(ui.facts, decision);
+  document
+    .getElementById("main")
+    .replaceChildren(el("p", `Launch approval for ${orgName}`, "eyebrow"), el("h1", read.title), ...(progress ? [progress] : []), layout);
   const shown = offerApproval(a, note);
   if (a.signedIn) shown.create?.focus();
 }
@@ -952,9 +1024,10 @@ function putSecrets(read) {
 // One password field per declared Secret. A Secret the current launch also declares is already
 // held by the KMS, because approving that launch put it, and so is one the service reports as
 // put; either defaults to keeping that value.
-function secretFields(services, before, put) {
+// The description is unsigned display text: shown as text, never used to choose which Secrets are asked.
+function secretFields(services, before, put, reported) {
   const held = [...(before ? declaredSecrets(before) : []), ...put];
-  return declaredSecrets(services).map((name) => {
+  return declaredSecrets(services).map((name, index) => {
     const node = el("div", undefined, "secret");
     const input = el("input");
     input.type = "password";
@@ -963,11 +1036,24 @@ function secretFields(services, before, put) {
     const label = el("label", `Secret ${name}`);
     label.htmlFor = input.id;
     node.append(label);
+    const description = Array.isArray(reported) ? reported.find((s) => s && s.name === name)?.description : undefined;
+    let describedBy = null;
+    let caption = null;
+    let describedIds = "";
+    if (typeof description === "string" && description) {
+      describedBy = el("p", description, "muted");
+      describedBy.id = `description-${index}`; // the other ids start with secret-, keep- or generate- plus a Secret name; this prefix cannot match them
+      caption = el("p", "From the App's plan, not verified:", "muted");
+      caption.id = `caption-${index}`;
+      describedIds = `${caption.id} ${describedBy.id}`;
+      input.setAttribute("aria-describedby", describedIds);
+    }
     let keep = null;
     if (held.includes(name)) {
       keep = el("select");
       keep.id = `keep-${name}`;
       keep.ariaLabel = `Secret ${name}`;
+      if (describedBy) keep.setAttribute("aria-describedby", describedIds);
       const kept = el("option", "Keep the current value");
       kept.value = "keep";
       const replaced = el("option", "Replace");
@@ -981,7 +1067,20 @@ function secretFields(services, before, put) {
       node.append(keep);
     }
     node.append(input);
-    return { name, input, keep, node };
+    if (describedBy) node.append(caption, describedBy);
+    const generate = el("button", "Generate a random value", "secondary");
+    generate.type = "button";
+    generate.ariaLabel = `Generate a random value for Secret ${name}`;
+    generate.id = `generate-${name}`;
+    generate.addEventListener("click", () => {
+      input.value = [...crypto.getRandomValues(new Uint8Array(32))]
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+      if (keep) keep.value = "replace";
+      input.hidden = false;
+    });
+    node.append(generate);
+    return { name, input, keep, generate, node };
   });
 }
 
