@@ -47,7 +47,6 @@ const POLICY_DATA: &str = "\npolicy_data := ";
 const KBS_URL: &str = "https://kms.alpha-kms.svc:8443";
 const CREDENTIAL_URI: &str = "kbs:///alpha/secret/";
 const MAX_PULL_PROXY: usize = 300;
-const NO_PULL: &str = "cdh.toml names no Secret and no pull proxy";
 /// The host writes the annotation that carries it, so a gzip bomb there must not exhaust a pod,
 /// nor a page that reads it.
 pub const MAX_INIT_DATA: usize = 1 << 20;
@@ -69,7 +68,9 @@ pub fn guest_pull(
     kms_ca_pem: &str,
 ) -> Result<(String, String), InitDataError> {
     if credential.is_none() && pull_proxy.is_none() {
-        return Err(InitDataError::GuestPull(NO_PULL));
+        return Err(InitDataError::GuestPull(
+            "cdh.toml names no Secret and no pull proxy",
+        ));
     }
     let mut cdh = format!(
         "[kbc]\nname = \"cc_kbc\"\nurl = \"{KBS_URL}\"\nkbs_cert = \"\"\"{kms_ca_pem}\"\"\"\n\n[image]\n"
@@ -194,7 +195,8 @@ impl InitData {
     /// The Secret the guest pulls images with, from `cdh.toml`; only meaningful once
     /// [`Self::check_policy`] passed.
     pub fn registry_credential(&self) -> Option<String> {
-        credential_name(&self.data().ok()?)
+        let data = self.data().ok()?;
+        credential_name(&cdh_image(&data)?)
     }
 
     fn data(&self) -> Result<toml::Table, InitDataError> {
@@ -223,16 +225,14 @@ fn cdh_image(data: &toml::Table) -> Option<toml::Value> {
     cdh.remove("image")
 }
 
-fn credential_name(data: &toml::Table) -> Option<String> {
-    let image = cdh_image(data)?;
+fn credential_name(image: &toml::Value) -> Option<String> {
     let uri = image
         .get("authenticated_registry_credentials_uri")?
         .as_str()?;
     Some(uri.strip_prefix(CREDENTIAL_URI)?.to_owned())
 }
 
-fn pull_proxy(data: &toml::Table) -> Option<String> {
-    let image = cdh_image(data)?;
+fn pull_proxy(image: &toml::Value) -> Option<String> {
     Some(
         image
             .get("image_pull_proxy")?
@@ -246,8 +246,9 @@ fn check_guest_pull(data: &toml::Table, kms_ca_pem: &str) -> Result<(), InitData
     if !data.contains_key("aa.toml") && !data.contains_key("cdh.toml") {
         return Ok(());
     }
-    let name = credential_name(data);
-    let proxy = pull_proxy(data);
+    let image = cdh_image(data);
+    let name = image.as_ref().and_then(credential_name);
+    let proxy = image.as_ref().and_then(pull_proxy);
     if name.as_deref().is_some_and(|n| !crate::is_secret_name(n)) {
         return Err(InitDataError::GuestPull("the Secret name is not valid"));
     }
