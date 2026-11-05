@@ -1,10 +1,11 @@
 //! The network openings a Kata Revision declares in `[data] "network.toml"`. A pod has none
 //! unless it lists them: each is one (direction, protocol, port, address range) with the reason
 //! the tenant gives. The deployer enforces them as the pod's only NetworkPolicy; the approver
-//! signs them as part of the init-data.
+//! signs them as part of the init-data. An opening may contain the non-public ranges (the deployer
+//! excludes them) but may not lie inside one.
 
 use std::collections::HashSet;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::{Deserialize, Serialize};
 
@@ -12,6 +13,25 @@ use crate::InitDataError;
 
 const MAX_PER_DIRECTION: usize = 32;
 const MAX_JUSTIFICATION: usize = 200;
+
+/// Reach the cluster, the host and other tenants; the deployer never opens them and excludes
+/// them from any wider opening. Keep in step with the deployer's list.
+const NON_PUBLIC: [(IpAddr, u8); 14] = [
+    (IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 8),
+    (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8),
+    (IpAddr::V4(Ipv4Addr::new(100, 64, 0, 0)), 10),
+    (IpAddr::V4(Ipv4Addr::new(127, 0, 0, 0)), 8),
+    (IpAddr::V4(Ipv4Addr::new(169, 254, 0, 0)), 16),
+    (IpAddr::V4(Ipv4Addr::new(172, 16, 0, 0)), 12),
+    (IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)), 16),
+    (IpAddr::V4(Ipv4Addr::new(224, 0, 0, 0)), 4),
+    (IpAddr::V4(Ipv4Addr::new(240, 0, 0, 0)), 4),
+    (IpAddr::V6(Ipv6Addr::LOCALHOST), 128),
+    (IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0)), 7),
+    (IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0)), 10),
+    (IpAddr::V6(Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0)), 8),
+    (IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0)), 96),
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -41,7 +61,7 @@ pub struct Openings {
 
 impl Openings {
     /// The openings in `toml`, each checked: a nonzero port, a canonical network address
-    /// without host bits, a justification of 1 to 200 printable characters, at most 32 per
+    /// without host bits outside the non-public ranges, a justification of 1 to 200 printable characters, at most 32 per
     /// direction, none twice.
     pub fn parse(toml: &str) -> Result<Self, InitDataError> {
         let openings: Self = toml::from_str(toml).map_err(|e| bad("network.toml", e))?;
@@ -88,29 +108,45 @@ fn check(direction: &str, list: &[Opening]) -> Result<(), InitDataError> {
     Ok(())
 }
 
-fn check_cidr(cidr: &str) -> Result<(), &'static str> {
+fn check_cidr(cidr: &str) -> Result<(), String> {
     let (addr, prefix) = cidr
         .split_once('/')
         .ok_or("cidr is not <address>/<prefix>")?;
     let addr: IpAddr = addr.parse().map_err(|_| "cidr address does not parse")?;
     let prefix: u8 = prefix.parse().map_err(|_| "cidr prefix does not parse")?;
-    let (bits, width) = match addr {
-        IpAddr::V4(a) => (u128::from(u32::from(a)), 32u32),
-        IpAddr::V6(a) => (u128::from(a), 128),
-    };
+    let (bits, width) = addr_bits(addr);
     let host_bits = width
         .checked_sub(u32::from(prefix))
         .ok_or("cidr prefix is longer than the address")?;
     if format!("{addr}/{prefix}") != cidr {
-        return Err("cidr is not written canonically");
+        return Err("cidr is not written canonically".into());
     }
-    let host = 1u128
-        .checked_shl(host_bits)
-        .map_or(u128::MAX, |b| b.saturating_sub(1));
-    if bits & host != 0 {
-        return Err("cidr has host bits set");
+    if bits & host_mask(host_bits) != 0 {
+        return Err("cidr has host bits set".into());
+    }
+    for (range, range_prefix) in NON_PUBLIC {
+        let (range_bits, range_width) = addr_bits(range);
+        let range_host = host_mask(range_width.saturating_sub(u32::from(range_prefix)));
+        if range_width == width && prefix >= range_prefix && bits & !range_host == range_bits {
+            return Err(format!(
+                "cidr lies inside the non-public range {range}/{range_prefix}"
+            ));
+        }
     }
     Ok(())
+}
+
+fn addr_bits(addr: IpAddr) -> (u128, u32) {
+    match addr {
+        IpAddr::V4(a) => (u128::from(u32::from(a)), 32),
+        IpAddr::V6(a) => (u128::from(a), 128),
+    }
+}
+
+fn host_mask(host_bits: u32) -> u128 {
+    1u128
+        .checked_shl(host_bits)
+        .map_or(u128::MAX, |b| b.saturating_sub(1))
 }
 
 #[cfg(test)]
@@ -137,11 +173,11 @@ mod tests {
     fn each_malformed_opening_is_refused() {
         let ok = "x";
         let long = "x".repeat(MAX_JUSTIFICATION + 1);
-        let one = entry(1, "10.0.0.0/8", ok);
+        let one = entry(1, "198.51.100.0/24", ok);
         let cases = [
             (EXAMPLE.replace("tcp", "icmp"), "network.toml"),
             (format!("{EXAMPLE}[[egres]]\n"), "network.toml"),
-            (entry(0, "10.0.0.0/8", ok), "port is 0"),
+            (entry(0, "198.51.100.0/24", ok), "port is 0"),
             (entry(80, "10.0.0.0", ok), "<address>/<prefix>"),
             (entry(80, "10.0.0/8", ok), "does not parse"),
             (entry(80, "10.0.0.0/33", ok), "longer than the address"),
@@ -149,15 +185,27 @@ mod tests {
             (entry(80, "010.0.0.0/8", ok), "does not parse"),
             (entry(80, "2001:DB8::/32", ok), "canonically"),
             (entry(80, "10.0.0.0/+8", ok), "canonically"),
-            (entry(80, "10.0.0.1/8", ok), "host bits"),
+            (entry(80, "198.51.100.1/24", ok), "host bits"),
             (entry(80, "2001:db8::1/32", ok), "host bits"),
-            (entry(80, "10.0.0.0/8", " "), "justification"),
-            (entry(80, "10.0.0.0/8", &long), "justification"),
-            (entry(80, "10.0.0.0/8", "a\\tb"), "justification"),
+            (entry(80, "198.51.100.0/24", " "), "justification"),
+            (entry(80, "198.51.100.0/24", &long), "justification"),
+            (entry(80, "198.51.100.0/24", "a\\tb"), "justification"),
             (format!("{one}{one}"), "repeats"),
+            (entry(80, "10.0.0.0/8", ok), "non-public range 10.0.0.0/8"),
+            (entry(80, "10.1.0.0/16", ok), "non-public range 10.0.0.0/8"),
+            (
+                entry(80, "192.168.1.1/32", ok),
+                "non-public range 192.168.0.0/16",
+            ),
+            (entry(80, "::1/128", ok), "non-public range ::1/128"),
+            (entry(80, "fd00::/8", ok), "non-public range fc00::/7"),
+            (
+                entry(80, "::ffff:10.0.0.1/128", ok),
+                "non-public range ::ffff:0.0.0.0/96",
+            ),
             (
                 (0..=MAX_PER_DIRECTION)
-                    .map(|i| entry(i as u16 + 1, "10.0.0.0/8", ok))
+                    .map(|i| entry(i as u16 + 1, "198.51.100.0/24", ok))
                     .collect(),
                 "more than 32",
             ),
@@ -170,7 +218,14 @@ mod tests {
 
     #[test]
     fn the_whole_internet_and_a_host_are_valid_networks() {
-        for cidr in ["0.0.0.0/0", "::/0", "203.0.113.10/32", "2001:db8::1/128"] {
+        for cidr in [
+            "0.0.0.0/0",
+            "::/0",
+            "8.0.0.0/7",
+            "2001:db8::/32",
+            "203.0.113.10/32",
+            "2001:db8::1/128",
+        ] {
             Openings::parse(&entry(443, cidr, "x")).unwrap();
         }
     }

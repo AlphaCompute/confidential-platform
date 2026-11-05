@@ -335,7 +335,8 @@ with `alpha verify --init-data`. The deployer turns the openings into the pod's 
 adds only the platform's own: DNS, the KMS on 8443, and the gateway to the runtime's 8443. The
 cluster's CNI must enforce NetworkPolicy, or nothing is dropped. The host enforces it, which is
 right because what it protects is everyone else from the workload, not the workload's
-confidentiality.
+confidentiality. An opening inside a private, loopback, link-local, multicast or other non-public
+range is refused; a wider one such as `0.0.0.0/0` stays valid and the deployer excludes those ranges.
 
 ## What the operator never sees
 
