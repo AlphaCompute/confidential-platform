@@ -91,6 +91,21 @@ function images(initData) {
   }
 }
 
+function network(initData) {
+  try {
+    const o = JSON.parse(wasm_bindgen.revisionOpenings(initData));
+    const lines = [
+      ...o.ingress.map((x) => `ingress ${x.protocol} ${x.port} ${x.cidr} \u2014 ${x.justification}`),
+      ...o.egress.map((x) => `egress ${x.protocol} ${x.port} ${x.cidr} \u2014 ${x.justification}`),
+    ];
+    return lines.length
+      ? lines.join("\n")
+      : "None: the App is network-dark apart from the platform's own connections.";
+  } catch {
+    return "";
+  }
+}
+
 function render(root, name, report, warnings) {
   const verdict = el("section", report.verified ? "verdict ok" : "verdict bad");
   verdict.append(
@@ -110,6 +125,7 @@ function render(root, name, report, warnings) {
   fact(facts, "App", report.app_id);
   fact(facts, "Revision", report.revision);
   fact(facts, "Containers", report.init_data ? images(report.init_data) : "");
+  fact(facts, "Network", report.init_data ? network(report.init_data) : "");
   fact(facts, "Runtime class", report.runtime_class);
   fact(facts, "TCB status", report.tcb_status);
   fact(facts, "Advisories", report.advisories.join(", "));

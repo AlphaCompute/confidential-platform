@@ -17,7 +17,7 @@ use crate::{node, rfc3339};
 /// The leaf `url` presents must chain to the document's KMS CA, be valid now and belong to
 /// `app`; with `init_data`, that file must be the leaf's Revision and pass the document's
 /// `kata_policy`; with `public`, the browser-trusted certificate on `url`'s name must be bound
-/// to an Instance of that Revision. The report lists the init-data's network openings.
+/// to an Instance of that Revision. The report lists the init-data's network openings, and has no `network` key without it.
 pub async fn instance(
     url: &str,
     app: AppId,
@@ -34,16 +34,20 @@ pub async fn instance(
     } else {
         None
     };
-    Ok(json!({
+    let mut report = json!({
         "public": public,
         "platform_document_version": doc.version,
         "org_id": sans.org_id,
         "app_id": sans.app_id,
         "revision": sans.compose_hash,
-        "network": network,
         "runtime_pubkey_sha256": sans.runtime_pubkey_sha256_hex,
         "appraisal": appraisal(&leaf, &doc.kms_ca_pem)?,
-    }))
+    });
+    // Absent, not null, without `--init-data`: "not checked" must differ from "checked, none".
+    if let (Some(network), Some(report)) = (network, report.as_object_mut()) {
+        report.insert("network".to_owned(), json!(network));
+    }
+    Ok(report)
 }
 
 /// The KMS appraised the Instance when it issued the leaf, under the platform document it held

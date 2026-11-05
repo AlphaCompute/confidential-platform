@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use alpha_core::{AppId, InitData, KataPolicy, MAX_INIT_DATA};
+use alpha_core::{AppId, InitData, KataPolicy, MAX_INIT_DATA, Openings};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use yaml_rust2::{Yaml, YamlLoader};
@@ -66,6 +66,17 @@ pub fn revision_payload(
         .check_policy(pinned, kms_ca_pem)
         .map_err(|e| malformed(&e.to_string()))?;
     Ok(json!({ "app_id": app_id, "init_data": revision, "digest": init_data.digest() }))
+}
+
+/// The network openings an init-data declares, or `None` for a compose, which has no such list.
+pub fn openings(revision: &str) -> Result<Option<Openings>, Error> {
+    if is_compose(revision)? {
+        return Ok(None);
+    }
+    InitData::parse(revision.to_owned())
+        .and_then(|i| i.openings())
+        .map(Some)
+        .map_err(|e| malformed(&e.to_string()))
 }
 
 pub fn services(revision: &str) -> Result<BTreeMap<String, Service>, Error> {
@@ -473,6 +484,26 @@ mod tests {
         )])))
         .unwrap();
         assert_eq!(s["db"].environment.keys().collect::<Vec<_>>(), ["MODE"]);
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]
+    fn reads_the_openings_an_init_data_declares() {
+        assert_eq!(openings(K3).unwrap(), Some(Openings::default()));
+        assert_eq!(openings(WRAP).unwrap(), None);
+
+        let toml = "[[egress]]\nprotocol = \"tcp\"\nport = 443\ncidr = \"203.0.113.0/24\"\njustification = \"payments API\"\n";
+        let with = K3.replacen(
+            "[data]\n",
+            &format!("[data]\n\"network.toml\" = '''\n{toml}'''\n"),
+            1,
+        );
+        let o = openings(&with).unwrap().unwrap();
+        assert!(o.ingress.is_empty());
+        assert_eq!(o.egress.len(), 1);
+        assert_eq!(o.egress[0].justification, "payments API");
+
+        let bad = K3.replacen("[data]\n", "[data]\n\"network.toml\" = 'x = 1'\n", 1);
+        assert_eq!(openings(&bad).unwrap_err().code(), "malformed");
     }
 
     #[wasm_bindgen_test::wasm_bindgen_test(unsupported = test)]

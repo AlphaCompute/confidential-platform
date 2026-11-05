@@ -50,6 +50,7 @@ const MESSAGES = {
     "This device already holds a passkey for this organization; use another device or provider.",
   unusable_key:
     "This passkey cannot be used: it did not give a P-256 public key. Use another device or provider.",
+  network_dark: "None: the App is network-dark apart from the platform's own connections.",
   not_confirmed: "Not confirmed by the KMS.",
   conflict: "The service refused this step because it was already done. Reload to see where it stands.",
   signature_invalid: "The KMS did not accept the passkey's signature. Nothing was changed.",
@@ -810,7 +811,12 @@ function parsedLaunch(read, compose, extra) {
     return { refusal: MESSAGES.mismatch };
   }
   try {
-    return { compose, services: JSON.parse(wasm_bindgen.composeServices(compose)), ...extra };
+    return {
+      compose,
+      services: JSON.parse(wasm_bindgen.composeServices(compose)),
+      openings: JSON.parse(wasm_bindgen.revisionOpenings(compose)),
+      ...extra,
+    };
   } catch (_) {
     return { refusal: MESSAGES.unreadable };
   }
@@ -834,6 +840,20 @@ function serviceBlock(name, service) {
   for (const [title, items] of lists) {
     if (items.length) block.append(fact(title, items.join(", ")));
   }
+  return block;
+}
+
+// A Kata Revision's declared openings, one line each; a compose has none to show (null).
+function networkBlock(openings) {
+  const block = el("div", undefined, "service");
+  block.append(el("h3", "Network"));
+  const lines = [
+    ...openings.ingress.map((o) => ["ingress", o]),
+    ...openings.egress.map((o) => ["egress", o]),
+  ].map(([direction, o]) =>
+    el("p", `${direction} ${o.protocol} ${o.port} ${o.cidr} \u2014 ${o.justification}`),
+  );
+  block.append(...(lines.length ? lines : [el("p", MESSAGES.network_dark)]));
   return block;
 }
 
@@ -863,6 +883,7 @@ function describeLaunch(a) {
     if (published.length) block.append(fact("Published ports", published.join(", ")));
     nodes.push(block);
   }
+  if (launch.openings) nodes.push(networkBlock(launch.openings));
   nodes.push(fact("Machine", launch.machine));
   if (launch.machineNote) nodes.push(el("p", launch.machineNote, "muted"));
   const details = el("details");
