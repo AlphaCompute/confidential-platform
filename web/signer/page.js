@@ -965,6 +965,7 @@ function secretFields(services, before, put, reported) {
     node.append(input);
     const generate = el("button", "Generate a random value", "secondary");
     generate.type = "button";
+    generate.ariaLabel = `Generate a random value for Secret ${name}`;
     generate.id = `generate-${name}`;
     generate.addEventListener("click", () => {
       input.value = [...crypto.getRandomValues(new Uint8Array(32))]
