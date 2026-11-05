@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::{Deserialize, Serialize};
-use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
+use unicode_properties::{GeneralCategoryGroup, UnicodeGeneralCategory};
 
 use crate::InitDataError;
 
@@ -16,7 +16,7 @@ const MAX_PER_DIRECTION: usize = 32;
 const MAX_JUSTIFICATION: usize = 200;
 
 /// The ranges IANA marks not globally reachable, apart from documentation, plus the IPv6 prefixes that embed IPv4.
-const NON_PUBLIC: [(IpAddr, u8); 23] = [
+const NON_PUBLIC: [(IpAddr, u8); 24] = [
     (IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 8),
     (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8),
     (IpAddr::V4(Ipv4Addr::new(100, 64, 0, 0)), 10),
@@ -40,6 +40,7 @@ const NON_PUBLIC: [(IpAddr, u8); 23] = [
         96,
     ),
     (IpAddr::V6(Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, 0)), 64),
+    (IpAddr::V6(Ipv6Addr::new(0x100, 0, 0, 1, 0, 0, 0, 0)), 64),
     (IpAddr::V6(Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0)), 23),
     (IpAddr::V6(Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0)), 16),
     (IpAddr::V6(Ipv6Addr::new(0x5f00, 0, 0, 0, 0, 0, 0, 0)), 16),
@@ -76,9 +77,9 @@ pub struct Openings {
 
 impl Openings {
     /// The openings in `toml`, each checked: a nonzero port; a canonical network address with no
-    /// host bits set; a cidr not inside a non-public range; a justification of 1 to 200 characters
-    /// with a letter or digit and no control or format characters; at most 32 per direction, none
-    /// twice.
+    /// host bits set; a cidr not inside a non-public range; a justification of 1 to 200 visible
+    /// characters (letters, marks, numbers, punctuation, symbols, spaces) with a letter or digit;
+    /// at most 32 per direction, none twice.
     pub fn parse(toml: &str) -> Result<Self, InitDataError> {
         let openings: Self = toml::from_str(toml).map_err(|e| bad("network.toml", e))?;
         check("ingress", &openings.ingress)?;
@@ -89,6 +90,26 @@ impl Openings {
 
 fn bad(entry: impl std::fmt::Display, why: impl std::fmt::Display) -> InitDataError {
     InitDataError::Network(format!("{entry}: {why}"))
+}
+
+/// The approver signs this text, so it must render as what it says: no controls, separators,
+/// private-use or unassigned code points, and a real letter or digit (not a blank-rendering filler).
+fn justification_ok(text: &str) -> bool {
+    text.chars().count() <= MAX_JUSTIFICATION
+        && text.chars().all(|c| {
+            c == ' '
+                || matches!(
+                    c.general_category_group(),
+                    GeneralCategoryGroup::Letter
+                        | GeneralCategoryGroup::Mark
+                        | GeneralCategoryGroup::Number
+                        | GeneralCategoryGroup::Punctuation
+                        | GeneralCategoryGroup::Symbol
+                )
+        })
+        && text.chars().any(|c| {
+            c.is_alphanumeric() && !matches!(c, '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}')
+        })
 }
 
 fn check(direction: &str, list: &[Opening]) -> Result<(), InitDataError> {
@@ -105,17 +126,11 @@ fn check(direction: &str, list: &[Opening]) -> Result<(), InitDataError> {
             return Err(bad(entry, "port is 0"));
         }
         check_cidr(&o.cidr).map_err(|why| bad(&entry, why))?;
-        let reason = o.justification.trim();
-        if !reason.chars().any(char::is_alphanumeric)
-            || o.justification.chars().count() > MAX_JUSTIFICATION
-            || o.justification
-                .chars()
-                .any(|c| c.is_control() || c.general_category() == GeneralCategory::Format)
-        {
+        if !justification_ok(&o.justification) {
             return Err(bad(
                 entry,
                 format!(
-                    "justification is not 1 to {MAX_JUSTIFICATION} characters with a letter or digit and no control or format characters"
+                    "justification is not 1 to {MAX_JUSTIFICATION} characters of letters, marks, numbers, punctuation, symbols and spaces, with a letter or digit"
                 ),
             ));
         }
@@ -189,7 +204,14 @@ mod tests {
 
     #[test]
     fn a_justification_with_letters_or_digits_is_accepted() {
-        for why in ["Base de données du client", "Postgres", "数据库"] {
+        for why in [
+            "Postgres at the provider",
+            "Base de données du client",
+            "数据库",
+            "á accent",
+            "Port 443 — HTTPS (TLS 1.3)",
+            "a\\u2800b",
+        ] {
             assert!(Openings::parse(&entry(80, "198.51.100.0/24", why)).is_ok());
         }
     }
@@ -217,13 +239,27 @@ mod tests {
             (entry(80, "198.51.100.0/24", "a\\tb"), "justification"),
             (entry(80, "198.51.100.0/24", "\\u200B"), "justification"),
             (entry(80, "198.51.100.0/24", "--"), "justification"),
+            (entry(80, "198.51.100.0/24", "\\u3164"), "justification"),
+            (entry(80, "198.51.100.0/24", "\\u115F"), "justification"),
+            (entry(80, "198.51.100.0/24", "\\u1160"), "justification"),
+            (entry(80, "198.51.100.0/24", "\\uFFA0"), "justification"),
+            (entry(80, "198.51.100.0/24", "a\\u2028b"), "justification"),
+            (entry(80, "198.51.100.0/24", "a\\u2029b"), "justification"),
+            (entry(80, "198.51.100.0/24", "a\\uE000b"), "justification"),
+            (entry(80, "198.51.100.0/24", "a\\u0378b"), "justification"),
+            (entry(80, "198.51.100.0/24", "a\\u00A0b"), "justification"),
+            (entry(80, "198.51.100.0/24", "\\u2800"), "justification"),
             (
                 entry(80, "198.51.100.0/24", "Postgres\\u202Egnp.exe"),
-                "no control or format characters",
+                "letters, marks, numbers",
             ),
             (entry(80, "198.51.100.0/24", "a\\u200Bb"), "justification"),
             (entry(80, "198.51.100.0/24", "\\uFEFFx"), "justification"),
             (format!("{one}{one}"), "repeats"),
+            (
+                entry(80, "100:0:0:1::/64", ok),
+                "non-public range 100:0:0:1::/64",
+            ),
             (entry(80, "10.0.0.0/8", ok), "non-public range 10.0.0.0/8"),
             (entry(80, "10.1.0.0/16", ok), "non-public range 10.0.0.0/8"),
             (
