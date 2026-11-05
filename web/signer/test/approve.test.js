@@ -1071,7 +1071,7 @@ test("a Secret's description is shown as text, and a missing one shows nothing",
   const siblings = described.parent.children;
   assert.equal(siblings[siblings.indexOf(described) - 2], field(page, "db_password"));
   assert.ok(!field(page, "session_key").parent.children.some((n) => n.className === "muted"));
-  assert.equal(field(page, "db_password").attributes["aria-describedby"], described.id);
+  assert.equal(field(page, "db_password").attributes["aria-describedby"], `${siblings[siblings.indexOf(described) - 1].id} ${described.id}`);
   assert.equal(field(page, "session_key").attributes, undefined);
 });
 

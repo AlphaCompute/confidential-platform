@@ -1017,17 +1017,22 @@ function secretFields(services, before, put, reported) {
     node.append(label);
     const description = Array.isArray(reported) ? reported.find((s) => s && s.name === name)?.description : undefined;
     let describedBy = null;
+    let caption = null;
+    let describedIds = "";
     if (typeof description === "string" && description) {
       describedBy = el("p", description, "muted");
       describedBy.id = `description-${index}`; // the other ids start with secret-, keep- or generate- plus a Secret name; this prefix cannot match them
-      input.setAttribute("aria-describedby", describedBy.id);
+      caption = el("p", "From the App's plan, not verified:", "muted");
+      caption.id = `caption-${index}`;
+      describedIds = `${caption.id} ${describedBy.id}`;
+      input.setAttribute("aria-describedby", describedIds);
     }
     let keep = null;
     if (held.includes(name)) {
       keep = el("select");
       keep.id = `keep-${name}`;
       keep.ariaLabel = `Secret ${name}`;
-      if (describedBy) keep.setAttribute("aria-describedby", describedBy.id);
+      if (describedBy) keep.setAttribute("aria-describedby", describedIds);
       const kept = el("option", "Keep the current value");
       kept.value = "keep";
       const replaced = el("option", "Replace");
@@ -1041,7 +1046,7 @@ function secretFields(services, before, put, reported) {
       node.append(keep);
     }
     node.append(input);
-    if (describedBy) node.append(el("p", "From the App's plan, not verified:", "muted"), describedBy);
+    if (describedBy) node.append(caption, describedBy);
     const generate = el("button", "Generate a random value", "secondary");
     generate.type = "button";
     generate.ariaLabel = `Generate a random value for Secret ${name}`;
