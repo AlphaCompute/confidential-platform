@@ -80,7 +80,9 @@ pub fn guest_pull(
     }
     if let Some(url) = pull_proxy {
         if !is_pull_proxy(url) {
-            return Err(InitDataError::GuestPull("the pull proxy is not valid"));
+            return Err(InitDataError::GuestPull(
+                "the pull proxy is not valid: write http://<host>[:<port>] with a lowercase DNS name or IPv4 address (port 1-65535), no path, at most 300 bytes",
+            ));
         }
         cdh += &format!("image_pull_proxy = {{ https_proxy = \"{url}\" }}\n");
     }
