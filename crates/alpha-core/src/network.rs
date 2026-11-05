@@ -96,29 +96,35 @@ fn bad(entry: impl std::fmt::Display, why: impl std::fmt::Display) -> InitDataEr
 /// The approver signs this text, so it must render as what it says: no controls, separators,
 /// private-use or unassigned code points, and a real letter or digit (not a blank-rendering filler).
 fn justification_ok(text: &str) -> bool {
+    let letter_or_mark = |c: char| {
+        matches!(
+            c.general_category_group(),
+            GeneralCategoryGroup::Letter | GeneralCategoryGroup::Mark
+        )
+    };
     let mut prev = ' ';
     text.chars().count() <= MAX_JUSTIFICATION
-        && text.chars().all(|c| {
-            // ZWNJ and ZWJ (format characters) are needed to spell Persian and Indic words, but
-            // only joining a letter or mark; anywhere else they would be invisible.
-            let joiner = matches!(c, '\u{200C}' | '\u{200D}')
-                && matches!(
-                    prev.general_category_group(),
-                    GeneralCategoryGroup::Letter | GeneralCategoryGroup::Mark
-                );
-            let ok = c == ' '
-                || joiner
-                || matches!(
-                    c.general_category_group(),
-                    GeneralCategoryGroup::Letter
-                        | GeneralCategoryGroup::Mark
-                        | GeneralCategoryGroup::Number
-                        | GeneralCategoryGroup::Punctuation
-                        | GeneralCategoryGroup::Symbol
-                );
-            prev = c;
-            ok
-        })
+        && text
+            .chars()
+            .zip(text.chars().skip(1).chain(std::iter::once(' ')))
+            .all(|(c, next)| {
+                // ZWNJ and ZWJ spell Persian and Indic words, so only between two letters or marks.
+                let joiner = matches!(c, '\u{200C}' | '\u{200D}')
+                    && letter_or_mark(prev)
+                    && letter_or_mark(next);
+                let ok = c == ' '
+                    || joiner
+                    || matches!(
+                        c.general_category_group(),
+                        GeneralCategoryGroup::Letter
+                            | GeneralCategoryGroup::Mark
+                            | GeneralCategoryGroup::Number
+                            | GeneralCategoryGroup::Punctuation
+                            | GeneralCategoryGroup::Symbol
+                    );
+                prev = c;
+                ok
+            })
         && text.chars().any(|c| {
             c.is_alphanumeric() && !matches!(c, '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}')
         })
@@ -271,6 +277,8 @@ mod tests {
             (entry(80, "198.51.100.0/24", "\\uFEFFx"), "justification"),
             (entry(80, "198.51.100.0/24", "\\u200Cabc"), "justification"),
             (entry(80, "198.51.100.0/24", " \\u200Dx"), "justification"),
+            (entry(80, "198.51.100.0/24", "a\\u200D!"), "justification"),
+            (entry(80, "198.51.100.0/24", "abc\\u200C"), "justification"),
             (
                 entry(80, "192.88.99.2/32", ok),
                 "non-public range 192.88.99.0/24",
