@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use alpha_client::runtime::PROBE_PORT;
-use alpha_core::{AppId, ComposeHash, InitData, Openings, has_sha256_digest};
+use alpha_core::{AppId, ComposeHash, InitData, has_sha256_digest};
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD;
 use flate2::Compression;
@@ -96,8 +96,6 @@ pub struct Rendered {
     /// `containers` as JCS.
     pub rules_sha256: String,
     pub policy_data_sha256: String,
-    /// The network openings the Revision declares; none is a fully dark pod.
-    pub network: Openings,
     #[serde(skip)]
     pub pod: String,
 }
@@ -401,24 +399,10 @@ pub fn rendered_init_data(pod: &str) -> Result<(AppId, ComposeHash, String), Str
     Ok((app_id, init_data.digest(), toml))
 }
 
-const MAX_NETWORK: u64 = 16 << 10;
-
-/// The `--network` file, which [`render`] validates as [`Openings`].
-pub fn read_network(path: &Path) -> Result<String, String> {
-    let mut text = String::new();
-    fs::File::open(path)
-        .and_then(|f| f.take(MAX_NETWORK + 1).read_to_string(&mut text))
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    if text.len() as u64 > MAX_NETWORK {
-        return Err(format!("{}: over {MAX_NETWORK} bytes", path.display()));
-    }
-    Ok(text)
-}
-
 /// Builds the init-data in one fixed layout: genpolicy's own keeps `[data]` in a hash map, so
 /// the same inputs could give two Revisions. `registry_auth` is the Secret the guest pulls private
 /// images with and the KMS CA, which [`alpha_core::registry_auth`] renders into `[data]`.
-/// `network` is the content of `"network.toml"`, as [`read_network`] returns it.
+/// `network` is the content of `"network.toml"`, validated as `Openings` before it is used.
 pub fn render(
     mut pod: Pod,
     app_id: AppId,
@@ -471,7 +455,7 @@ pub fn render(
     if init_data.app_id() != Some(app_id) {
         return Err("init-data: app_id does not read back".into());
     }
-    let network = init_data
+    init_data
         .openings()
         .map_err(|e| format!("--network: {e}"))?;
     let mut gzip = GzEncoder::new(Vec::new(), Compression::best());
@@ -497,7 +481,6 @@ pub fn render(
         annotation,
         rules_sha256: format!("sha256:{rules_sha256}"),
         policy_data_sha256: format!("sha256:{}", sha256_hex(data)),
-        network,
         pod: serde_yaml_ng::to_string(&pod.spec).map_err(|e| format!("pod spec: {e}"))?,
     })
 }
@@ -605,18 +588,15 @@ mod tests {
             )
         };
         let golden = render_golden();
-        assert_eq!(golden.network, Openings::default());
         let rendered = render_with(net).unwrap();
         assert_ne!(rendered.revision, golden.revision);
-        let printed = serde_json::to_value(&rendered).unwrap();
-        assert_eq!(printed["network"]["egress"][0]["port"], 5432);
         assert!(
             rendered
                 .init_data
                 .contains(&format!("\n\"network.toml\" = '''\n{net}'''\n"))
         );
         let read_back = InitData::parse(rendered.init_data).unwrap();
-        assert_eq!(read_back.openings().unwrap(), rendered.network);
+        assert_eq!(read_back.openings().unwrap().egress[0].port, 5432);
         assert!(render_with("[[egress]]\nport = 1\n").is_err());
         assert!(render_with("# '''\n").is_err());
     }

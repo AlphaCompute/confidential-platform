@@ -273,7 +273,7 @@ enum ComposeCommand {
 #[derive(Subcommand)]
 enum CocoCommand {
     /// Writes the spec with its pod's init-data annotation to `--out` and prints
-    /// `{revision, init_data, annotation, rules_sha256, policy_data_sha256, network}`.
+    /// `{revision, init_data, annotation, rules_sha256, policy_data_sha256}`.
     Render {
         #[arg(long)]
         app_id: AppId,
@@ -676,7 +676,11 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 fs::read(&pod).map_err(|e| Exit::Usage(format!("{}: {e}", pod.display())))?;
             let pod = coco::parse(&bytes)?;
             let policy = coco::Kata::read(&kata)?.genpolicy(&pod)?;
-            let network = network.as_deref().map(coco::read_network).transpose()?;
+            let network = network
+                .map(|p| {
+                    fs::read_to_string(&p).map_err(|e| Exit::Usage(format!("{}: {e}", p.display())))
+                })
+                .transpose()?;
             let kms_ca_pem = match &registry_auth {
                 Some(_) => Some(platform_document(config, now).await?.kms_ca_pem),
                 None => None,
