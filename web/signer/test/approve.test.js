@@ -23,6 +23,9 @@ const {
   testdata,
 } = require("./harness.js");
 
+// The digest as the page shortens it beside a service.
+const shortDigest = (d) => `${d.slice(0, 15)}…${d.slice(-6)}`;
+
 const APPROVED = "Approved. You can close this tab.";
 const MISMATCH =
   "What the service asked you to approve does not match what it would run. Nothing was signed.";
@@ -73,13 +76,13 @@ test("an uploaded compose is approved only after the registration receipt verifi
     "Production",
     "web",
     "Image: nginx:1.27",
-    `Digest: sha256:${"ab".repeat(32)}`,
+    `Digest: ${shortDigest(`sha256:${"ab".repeat(32)}`)}`,
     "Image: postgres",
     "Named volumes: pgdata, alpha-secrets-db",
     "Named volumes: cachedata",
     "AlphaCompute runtime",
-    "Image: ghcr.io/alphacompute/alpha-runtime",
-    `Digest: sha256:${"7d".repeat(32)}`,
+    "Image: alpha-runtime",
+    `Digest: ${shortDigest(`sha256:${"7d".repeat(32)}`)}`,
     "Endpoint: HTTPS on 443, forwarded to web:80",
     "Machine: tdx.medium",
     "The service sets the machine size (CPU and memory). The size never changes the code or keys you approve, so you do not sign it.",
@@ -90,10 +93,12 @@ test("an uploaded compose is approved only after the registration receipt verifi
   }
   assert.ok(!text.includes("Receives secrets"));
   assert.ok(!text.includes("Published ports"), "only the runtime publishes a port");
-  const details = page.find((n) => n.tagName === "DETAILS");
+  const details = page.find(
+    (n) => n.tagName === "DETAILS" && n.children[0].textContent === "Technical details",
+  );
   assert.ok(details && !details.open);
   const technical = details.lines().join("\n");
-  assert.ok(technical.includes("Technical details"));
+  assert.ok(technical.includes(`web: sha256:${"ab".repeat(32)}`), technical);
   assert.ok(technical.includes(compose));
   assert.ok(!technical.includes(api.compose_hash), "the Revision shows outside the details");
   assert.ok(!text.includes(APPROVED));
@@ -137,7 +142,7 @@ test("a Kata init-data registers as init-data, and only under the pinned agent p
     testdata("attest/b300-kata-4.0.0/platform-document.json"),
   ).kata_policy;
   const { api, page } = await approvalPage({ compose: initData, app_id }, {}, view);
-  assert.ok(page.text().includes("Image: public.ecr.aws/docker/library/alpine"), page.text());
+  assert.ok(page.text().includes("Image: alpine"), page.text());
   await page.click("Approve with passkey");
   assert.deepEqual(api.revisions[0].body.payload, {
     app_id,
@@ -156,6 +161,29 @@ async function shown(...replacements) {
   const { page } = await approvalPage({ compose: jcs(compose) });
   return page.text();
 }
+
+test("the App's services come first and the platform's collapse under their role", async () => {
+  const digest = `sha256:${"ef".repeat(32)}`;
+  const text = await shown(
+    ["    image: redis@", "    image: ghcr.io/alphacompute/platform/app-edge:2@"],
+    ["      ALPHACOMPUTE_TLS_UPSTREAM: web:80\n", "      ALPHACOMPUTE_TLS_UPSTREAM: web:80\n      ALPHACOMPUTE_PUBLIC_NAME: board.example.com\n"],
+  );
+  assert.ok(text.includes("Public URL: https://board.example.com"), text);
+  assert.ok(text.includes("Organization: Acme"), text);
+  assert.ok(text.includes("Provided by AlphaCompute (2)"), text);
+  const at = (s) => text.indexOf(s);
+  assert.ok(at("\nweb\n") < at("\ndb\n") && at("\ndb\n") < at("Provided by AlphaCompute"), text);
+  assert.ok(at("Provided by AlphaCompute") < at("\napp-edge\n"), text);
+  assert.ok(at("\napp-edge\n") < at("AlphaCompute runtime"), text);
+  assert.ok(!text.includes("\ncache\n"), "a service shows under its role, not its compose key");
+  assert.ok(text.includes(`cache: ${digest}`), "the full digest is under Technical details");
+});
+
+test("Copy puts a service's full digest on the clipboard", async () => {
+  const { page } = await approvalPage({ compose: withoutSecrets() });
+  await page.click("Copy");
+  assert.deepEqual(page.copied, [`sha256:${"ab".repeat(32)}`]);
+});
 
 test("a runtime port is an endpoint only with an upstream, a host side and TCP", async () => {
   const upstream = ["      ALPHACOMPUTE_TLS_UPSTREAM: web:80\n", ""];
@@ -515,10 +543,10 @@ test("a catalog app is rendered in wasm and its hash must match", async () => {
   for (const line of [
     "CPU App, version 1",
     "Machine: 1 vCPU, 2048 MiB",
-    "Image: ghcr.io/alphacompute/alpha-cpu-app",
-    `Digest: sha256:${"3a".repeat(32)}`,
+    "Image: alpha-cpu-app",
+    `Digest: ${shortDigest(`sha256:${"3a".repeat(32)}`)}`,
     "Published ports: 443:8443",
-    "Image: ghcr.io/alphacompute/alpha-runtime",
+    "Image: alpha-runtime",
   ]) {
     assert.ok(text.includes(line), `${line}\n${text}`);
   }

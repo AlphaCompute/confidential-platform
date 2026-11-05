@@ -82,6 +82,43 @@ body::after {
   }
 }
 
+.approval,
+.decision {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+
+@media (min-width: 960px) {
+  .panel:has(.approval) {
+    width: 1100px;
+    max-width: calc(100vw - 48px);
+  }
+
+  .approval {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 340px;
+    gap: 48px;
+    align-items: start;
+  }
+
+  .decision {
+    position: sticky;
+    top: 16px;
+    padding: 20px;
+    border: 1px solid var(--border);
+  }
+}
+
+@media (max-width: 959px) {
+  .decision.ready .step {
+    position: sticky;
+    bottom: 0;
+    padding: 12px 0;
+    background: #0c0c0c;
+  }
+}
+
 .brand {
   display: flex;
   align-items: center;
@@ -228,6 +265,13 @@ pre {
   max-height: 320px;
   overflow: auto;
   white-space: pre-wrap;
+}
+
+.fact > button.copy {
+  width: auto;
+  min-height: 0;
+  padding: 2px 8px;
+  font-size: 10px;
 }
 
 .service {
