@@ -816,18 +816,44 @@ function parsedLaunch(read, compose, extra) {
   }
 }
 
-function imageLines(image) {
+// The image's repository, its last path segment with the tag, and its digest, which is empty
+// when the image is not pinned.
+function splitImage(image) {
   const at = (image || "").indexOf("@sha256:");
-  return at < 0
-    ? [fact("Image", image || "none"), fact("Digest", "none (not pinned)", "digest")]
-    : [fact("Image", image.slice(0, at)), fact("Digest", image.slice(at + 1), "digest")];
+  const named = at < 0 ? image || "" : image.slice(0, at);
+  const tagAt = named.lastIndexOf(":");
+  const slashAt = named.lastIndexOf("/");
+  return {
+    repo: tagAt > slashAt ? named.slice(0, tagAt) : named,
+    short: named.slice(slashAt + 1),
+    digest: at < 0 ? "" : image.slice(at + 1),
+  };
 }
 
-function serviceBlock(name, service) {
+function imageLines(image) {
+  const { repo, short, digest } = splitImage(image);
+  const name = el("span", short || "none");
+  name.title = repo;
+  const row = el("p", undefined, "fact");
+  row.append(el("span", "Image: "), name);
+  if (!digest) return [row, fact("Digest", "none (not pinned)", "digest")];
+  // The full digest is under Technical details.
+  const copy = button("Copy", () => navigator.clipboard.writeText(digest), "copy");
+  copy.ariaLabel = `Copy the digest of ${short}`;
+  const shown = el("p", undefined, "fact");
+  shown.append(
+    el("span", "Digest: "),
+    el("span", `${digest.slice(0, 15)}…${digest.slice(-6)}`, "digest"),
+    copy,
+  );
+  return [row, shown];
+}
+
+function serviceBlock(name, service, ports = service.ports) {
   const block = el("div", undefined, "service");
   block.append(el("h3", name), ...imageLines(service.image));
   const lists = [
-    ["Published ports", service.ports],
+    ["Published ports", ports],
     ["Named volumes", service.volumes],
     ["Receives secrets", service.secrets],
   ];
@@ -837,36 +863,61 @@ function serviceBlock(name, service) {
   return block;
 }
 
+// ponytail: a service is the platform's by its image path (a `platform/` segment) or by being the
+// runtime, until the read marks them; the upgrade is a flag from the service or the catalog.
+function isPlatform(name, service) {
+  return name === "alpha-runtime" || splitImage(service.image).repo.split("/").slice(0, -1).includes("platform");
+}
+
+function runtimeBlock(runtime) {
+  const upstream = runtime.environment.ALPHACOMPUTE_TLS_UPSTREAM;
+  // The runtime terminates TLS only on its container port 8443 over TCP; a port without a host
+  // side is published on a random host port, so neither names an endpoint.
+  const hostOfTls = (p) => upstream && /^(.+):8443(\/tcp)?$/.exec(p)?.[1];
+  const hosts = runtime.ports.map(hostOfTls).filter(Boolean);
+  const block = serviceBlock(
+    "AlphaCompute runtime",
+    runtime,
+    runtime.ports.filter((p) => !hostOfTls(p)),
+  );
+  if (hosts.length) {
+    block.append(fact("Endpoint", `HTTPS on ${hosts.join(", ")}, forwarded to ${upstream}`));
+  }
+  return block;
+}
+
 function describeLaunch(a) {
   const { read, launch } = a;
   const nodes = [];
   if (launch.heading) nodes.push(el("p", launch.heading));
   for (const line of launch.notes || []) nodes.push(el("p", line, "warning"));
+  const services = Object.entries(launch.services);
+  const publicName = launch.services["alpha-runtime"]?.environment.ALPHACOMPUTE_PUBLIC_NAME;
+  const summary = el("div", undefined, "summary");
+  if (publicName) summary.append(fact("Public URL", `https://${publicName}`));
+  summary.append(fact("Organization", a.orgName), fact("Machine", launch.machine));
+  nodes.push(summary);
+  if (launch.machineNote) nodes.push(el("p", launch.machineNote, "muted"));
   nodes.push(fact("App", read.app_id), fact("Revision", read.compose_hash, "digest"));
   nodes.push(el("h2", "What will run"));
-  const runtime = launch.services["alpha-runtime"];
-  for (const [name, service] of Object.entries(launch.services)) {
-    if (name !== "alpha-runtime") nodes.push(serviceBlock(name, service));
+  const provided = services.filter(([n, s]) => isPlatform(n, s));
+  for (const [n, s] of services) {
+    if (!isPlatform(n, s)) nodes.push(serviceBlock(n, s));
   }
-  if (runtime) {
-    const block = el("div", undefined, "service");
-    block.append(el("h3", "AlphaCompute runtime"), ...imageLines(runtime.image));
-    const upstream = runtime.environment.ALPHACOMPUTE_TLS_UPSTREAM;
-    // The runtime terminates TLS only on its container port 8443 over TCP; a port without a host
-    // side is published on a random host port, so neither names an endpoint.
-    const hostOfTls = (p) => upstream && /^(.+):8443(\/tcp)?$/.exec(p)?.[1];
-    const hosts = runtime.ports.map(hostOfTls).filter(Boolean);
-    const published = runtime.ports.filter((p) => !hostOfTls(p));
-    if (hosts.length) {
-      block.append(fact("Endpoint", `HTTPS on ${hosts.join(", ")}, forwarded to ${upstream}`));
+  if (provided.length) {
+    const platform = el("details");
+    platform.append(el("summary", `Provided by AlphaCompute (${provided.length})`));
+    for (const [n, s] of provided) {
+      platform.append(n === "alpha-runtime" ? runtimeBlock(s) : serviceBlock(splitImage(s.image).short, s));
     }
-    if (published.length) block.append(fact("Published ports", published.join(", ")));
-    nodes.push(block);
+    nodes.push(platform);
   }
-  nodes.push(fact("Machine", launch.machine));
-  if (launch.machineNote) nodes.push(el("p", launch.machineNote, "muted"));
   const details = el("details");
-  details.append(el("summary", "Technical details"), el("pre", launch.compose));
+  details.append(el("summary", "Technical details"));
+  for (const [n, s] of services) {
+    details.append(fact(n, splitImage(s.image).digest || "not pinned", "digest"));
+  }
+  details.append(el("pre", launch.compose));
   nodes.push(details);
   return nodes;
 }
@@ -892,11 +943,7 @@ async function startApproval(view, viewText, ticket) {
 
   const orgName = typeof read.org_name === "string" ? read.org_name : read.org_id;
   const progress = read.root_principal_id != null ? el("p") : null;
-  const ui = screen(
-    el("p", `Launch approval for ${orgName}`, "eyebrow"),
-    el("h1", read.title),
-    ...(progress ? [progress] : []),
-  );
+  const ui = screen();
   const a = { view, viewText, read, ticket, ui, launch, orgName, progress, credential: null, values: null };
   a.signedIn = backFromSignIn(ticket);
   let note = a.signedIn ? MESSAGES.signed_in : undefined;
@@ -913,7 +960,25 @@ async function startApproval(view, viewText, ticket) {
   a.fields = secretFields(launch.services, before, putSecrets(read));
   a.secretsBox = el("div");
   a.secretsBox.append(...a.fields.map((f) => f.node));
-  ui.facts.replaceChildren(...describeLaunch(a), a.secretsBox);
+  ui.facts.replaceChildren(...describeLaunch(a));
+  // The decision sits beside what the App is on a wide page, and pins its buttons to the bottom
+  // of a narrow one once every Secret is filled.
+  const decision = el("div", undefined, "decision");
+  const sync = () => {
+    const filled = a.fields.every((f) => f.keep?.value === "keep" || f.input.value);
+    decision.className = filled ? "decision ready" : "decision";
+  };
+  for (const f of a.fields) {
+    f.input.addEventListener("input", sync);
+    f.keep?.addEventListener("change", sync);
+  }
+  sync();
+  decision.append(a.secretsBox, ui.step, ui.status);
+  const layout = el("div", undefined, "approval");
+  layout.append(ui.facts, decision);
+  document
+    .getElementById("main")
+    .replaceChildren(el("p", `Launch approval for ${orgName}`, "eyebrow"), el("h1", read.title), ...(progress ? [progress] : []), layout);
   const shown = offerApproval(a, note);
   if (a.signedIn) shown.create?.focus();
 }
