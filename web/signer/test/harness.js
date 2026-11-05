@@ -329,10 +329,10 @@ class Node {
     for (const c of this.children) yield* c.walk();
   }
 
-  // One line per block, for assertions and failure messages; a span is inline, part of its line.
+  // One line per block, for assertions and failure messages; a span or button is inline, part of its line.
   lines() {
     if (this.tagName === "#TEXT") return this.own ? [this.own] : [];
-    if (this.children.every((c) => c.tagName === "#TEXT" || c.tagName === "SPAN")) {
+    if (this.children.every((c) => c.tagName === "#TEXT" || c.tagName === "SPAN" || c.tagName === "BUTTON")) {
       const t = this.textContent;
       return t ? [t] : [];
     }
@@ -380,6 +380,7 @@ async function loadPage(options = {}) {
   const timers = [];
   const prompts = [];
   const clicks = [];
+  const copied = [];
   const assigned = [];
   const authenticator = options.authenticator || new SoftwareAuthenticator();
   // The passkey provider the next prompt reaches; `page.use` moves to another device.
@@ -457,6 +458,7 @@ async function loadPage(options = {}) {
     localStorage: options.localStorage || memoryStorage(),
     sessionStorage: options.sessionStorage || memoryStorage(),
     navigator: {
+      clipboard: { writeText: async (text) => copied.push(text) },
       credentials: {
         create: (o) => {
           prompts.push({ kind: "create", fetches: fetches.length, click: clicks[clicks.length - 1] });
@@ -541,6 +543,7 @@ async function loadPage(options = {}) {
     fetches,
     timers,
     prompts,
+    copied,
     authenticator,
     consoleCalls,
     seals,
@@ -556,7 +559,7 @@ async function loadPage(options = {}) {
     wasm: () => vm.runInContext("wasm_bindgen", context),
     text: () => main.lines().join("\n"),
     buttons: () =>
-      [...main.walk()].filter((n) => n.tagName === "BUTTON").map((n) => n.textContent),
+      [...main.walk()].filter((n) => n.tagName === "BUTTON" && n.className !== "copy").map((n) => n.textContent),
     find(predicate) {
       return [...main.walk()].find(predicate);
     },
