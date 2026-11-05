@@ -14,6 +14,7 @@ use crate::InitDataError;
 
 const MAX_PER_DIRECTION: usize = 32;
 const MAX_JUSTIFICATION: usize = 200;
+const MAX_MARKS_IN_A_ROW: u8 = 4;
 
 /// The ranges IANA marks not globally reachable, apart from documentation, plus the IPv6 prefixes that embed IPv4 (IPv4-compatible, IPv4-mapped, NAT64, 6to4).
 const NON_PUBLIC: [(IpAddr, u8); 26] = [
@@ -80,7 +81,8 @@ pub struct Openings {
 impl Openings {
     /// The openings in `toml`, each checked: a nonzero port; a canonical network address with no
     /// host bits set; a cidr not inside a non-public range; a justification of 1 to 200 visible
-    /// characters (letters, marks, numbers, punctuation, symbols, spaces) with a letter or digit;
+    /// characters (letters, marks, numbers, punctuation, symbols, spaces) with a letter or digit
+    /// and at most 4 combining marks in a row;
     /// at most 32 per direction, none twice.
     pub fn parse(toml: &str) -> Result<Self, InitDataError> {
         let openings: Self = toml::from_str(toml).map_err(|e| bad("network.toml", e))?;
@@ -104,6 +106,7 @@ fn justification_ok(text: &str) -> bool {
         )
     };
     let mut prev = ' ';
+    let mut marks = 0u8;
     text.chars().count() <= MAX_JUSTIFICATION
         && text
             .chars()
@@ -123,8 +126,14 @@ fn justification_ok(text: &str) -> bool {
                             | GeneralCategoryGroup::Punctuation
                             | GeneralCategoryGroup::Symbol
                     );
+                // A joiner neither counts nor resets, so it cannot restart a stack of marks.
+                if c.general_category_group() == GeneralCategoryGroup::Mark {
+                    marks = marks.saturating_add(1);
+                } else if !joiner {
+                    marks = 0;
+                }
                 prev = c;
-                ok
+                ok && marks <= MAX_MARKS_IN_A_ROW
             })
         && text.chars().any(|c| {
             c.is_alphanumeric() && !matches!(c, '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}')
@@ -149,7 +158,7 @@ fn check(direction: &str, list: &[Opening]) -> Result<(), InitDataError> {
             return Err(bad(
                 entry,
                 format!(
-                    "justification is not 1 to {MAX_JUSTIFICATION} characters of letters, marks, numbers, punctuation, symbols and spaces, with a letter or digit"
+                    "justification is not 1 to {MAX_JUSTIFICATION} characters of letters, marks, numbers, punctuation, symbols and spaces, with a letter or digit, and at most 4 combining marks in a row"
                 ),
             ));
         }
@@ -232,9 +241,23 @@ mod tests {
             "a\\u2800b",
             "می\\u200cخواهم",
             "क्\\u200dष",
+            "Vi\\u0302\\u0323t",
+            "a\\u0301 b\\u0301",
+            "a\\u0346\\u0346\\u0346\\u0346",
         ] {
             assert!(Openings::parse(&entry(80, "198.51.100.0/24", why)).is_ok());
         }
+    }
+
+    #[test]
+    fn a_tall_stack_of_marks_is_refused() {
+        for n in [5, 150] {
+            let why = format!("a{}", "\\u0346".repeat(n));
+            let err = Openings::parse(&entry(80, "198.51.100.0/24", &why)).unwrap_err();
+            assert!(err.to_string().contains("combining marks"));
+        }
+        let joined = format!("a{}\\u200d{}", "\\u0346".repeat(3), "\\u0346".repeat(2));
+        assert!(Openings::parse(&entry(80, "198.51.100.0/24", &joined)).is_err());
     }
 
     #[test]
