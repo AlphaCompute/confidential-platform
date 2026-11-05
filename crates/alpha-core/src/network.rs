@@ -16,7 +16,7 @@ const MAX_PER_DIRECTION: usize = 32;
 const MAX_JUSTIFICATION: usize = 200;
 
 /// The ranges IANA marks not globally reachable, apart from documentation, plus the IPv6 prefixes that embed IPv4.
-const NON_PUBLIC: [(IpAddr, u8); 24] = [
+const NON_PUBLIC: [(IpAddr, u8); 25] = [
     (IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 8),
     (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8),
     (IpAddr::V4(Ipv4Addr::new(100, 64, 0, 0)), 10),
@@ -24,6 +24,7 @@ const NON_PUBLIC: [(IpAddr, u8); 24] = [
     (IpAddr::V4(Ipv4Addr::new(169, 254, 0, 0)), 16),
     (IpAddr::V4(Ipv4Addr::new(172, 16, 0, 0)), 12),
     (IpAddr::V4(Ipv4Addr::new(192, 0, 0, 0)), 24),
+    (IpAddr::V4(Ipv4Addr::new(192, 88, 99, 0)), 24),
     (IpAddr::V4(Ipv4Addr::new(192, 168, 0, 0)), 16),
     (IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 15),
     (IpAddr::V4(Ipv4Addr::new(224, 0, 0, 0)), 4),
@@ -95,9 +96,18 @@ fn bad(entry: impl std::fmt::Display, why: impl std::fmt::Display) -> InitDataEr
 /// The approver signs this text, so it must render as what it says: no controls, separators,
 /// private-use or unassigned code points, and a real letter or digit (not a blank-rendering filler).
 fn justification_ok(text: &str) -> bool {
+    let mut prev = ' ';
     text.chars().count() <= MAX_JUSTIFICATION
         && text.chars().all(|c| {
-            c == ' '
+            // ZWNJ and ZWJ (format characters) are needed to spell Persian and Indic words, but
+            // only joining a letter or mark; anywhere else they would be invisible.
+            let joiner = matches!(c, '\u{200C}' | '\u{200D}')
+                && matches!(
+                    prev.general_category_group(),
+                    GeneralCategoryGroup::Letter | GeneralCategoryGroup::Mark
+                );
+            let ok = c == ' '
+                || joiner
                 || matches!(
                     c.general_category_group(),
                     GeneralCategoryGroup::Letter
@@ -105,7 +115,9 @@ fn justification_ok(text: &str) -> bool {
                         | GeneralCategoryGroup::Number
                         | GeneralCategoryGroup::Punctuation
                         | GeneralCategoryGroup::Symbol
-                )
+                );
+            prev = c;
+            ok
         })
         && text.chars().any(|c| {
             c.is_alphanumeric() && !matches!(c, '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}')
@@ -211,6 +223,8 @@ mod tests {
             "á accent",
             "Port 443 — HTTPS (TLS 1.3)",
             "a\\u2800b",
+            "می\\u200cخواهم",
+            "क्\\u200dष",
         ] {
             assert!(Openings::parse(&entry(80, "198.51.100.0/24", why)).is_ok());
         }
@@ -255,6 +269,16 @@ mod tests {
             ),
             (entry(80, "198.51.100.0/24", "a\\u200Bb"), "justification"),
             (entry(80, "198.51.100.0/24", "\\uFEFFx"), "justification"),
+            (entry(80, "198.51.100.0/24", "\\u200Cabc"), "justification"),
+            (entry(80, "198.51.100.0/24", " \\u200Dx"), "justification"),
+            (
+                entry(80, "192.88.99.2/32", ok),
+                "non-public range 192.88.99.0/24",
+            ),
+            (
+                entry(80, "192.88.99.0/24", ok),
+                "non-public range 192.88.99.0/24",
+            ),
             (format!("{one}{one}"), "repeats"),
             (
                 entry(80, "100:0:0:1::/64", ok),

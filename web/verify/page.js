@@ -94,15 +94,15 @@ function images(initData) {
 function network(initData) {
   try {
     const o = JSON.parse(wasm_bindgen.revisionOpenings(initData));
-    const lines = [
-      ...o.ingress.map((x) => `ingress ${x.protocol} ${x.port} ${x.cidr} \u2014 ${x.justification}`),
-      ...o.egress.map((x) => `egress ${x.protocol} ${x.port} ${x.cidr} \u2014 ${x.justification}`),
-    ];
+    if (o === null) return "";
+    const lines = ["ingress", "egress"].flatMap((dir) =>
+      o[dir].map((x) => `${dir} ${x.protocol} ${x.port} ${x.cidr} \u2014 ${x.justification}`),
+    );
     return lines.length
       ? lines.join("\n")
       : "None: the App is network-dark apart from the platform's own connections.";
   } catch {
-    return "";
+    return "Unreadable: the init-data's network openings could not be read.";
   }
 }
 
