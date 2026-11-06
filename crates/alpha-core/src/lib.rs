@@ -15,6 +15,7 @@ pub mod catalog;
 pub mod compose;
 pub mod id;
 pub mod initdata;
+mod network;
 pub mod phala;
 pub mod platform;
 pub mod signing;
@@ -25,6 +26,7 @@ pub use compose::{
 };
 pub use id::{AppId, KeyId, OrgId, PrincipalId, RequestId, SecretId};
 pub use initdata::{InitData, InitDataError, MAX_INIT_DATA, registry_auth};
+pub use network::{Opening, Openings, Protocol};
 pub use platform::{CatalogKey, KataPolicy, KmsRevision, Signer};
 pub use signing::{context, jcs, parse, signing_digest};
 

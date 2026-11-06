@@ -23,6 +23,9 @@ const {
   testdata,
 } = require("./harness.js");
 
+// The digest as the page shortens it beside a service.
+const shortDigest = (d) => `${d.slice(0, 15)}…${d.slice(-6)}`;
+
 const APPROVED = "Approved. You can close this tab.";
 const MISMATCH =
   "What the service asked you to approve does not match what it would run. Nothing was signed.";
@@ -73,13 +76,13 @@ test("an uploaded compose is approved only after the registration receipt verifi
     "Production",
     "web",
     "Image: nginx:1.27",
-    `Digest: sha256:${"ab".repeat(32)}`,
+    `Digest: ${shortDigest(`sha256:${"ab".repeat(32)}`)}`,
     "Image: postgres",
     "Named volumes: pgdata, alpha-secrets-db",
     "Named volumes: cachedata",
     "AlphaCompute runtime",
-    "Image: ghcr.io/alphacompute/alpha-runtime",
-    `Digest: sha256:${"7d".repeat(32)}`,
+    "Image: alpha-runtime",
+    `Digest: ${shortDigest(`sha256:${"7d".repeat(32)}`)}`,
     "Endpoint: HTTPS on 443, forwarded to web:80",
     "Machine: tdx.medium",
     "The service sets the machine size (CPU and memory). The size never changes the code or keys you approve, so you do not sign it.",
@@ -90,10 +93,12 @@ test("an uploaded compose is approved only after the registration receipt verifi
   }
   assert.ok(!text.includes("Receives secrets"));
   assert.ok(!text.includes("Published ports"), "only the runtime publishes a port");
-  const details = page.find((n) => n.tagName === "DETAILS");
+  const details = page.find(
+    (n) => n.tagName === "DETAILS" && n.children[0].textContent === "Technical details",
+  );
   assert.ok(details && !details.open);
   const technical = details.lines().join("\n");
-  assert.ok(technical.includes("Technical details"));
+  assert.ok(technical.includes(`web: sha256:${"ab".repeat(32)}`), technical);
   assert.ok(technical.includes(compose));
   assert.ok(!technical.includes(api.compose_hash), "the Revision shows outside the details");
   assert.ok(!text.includes(APPROVED));
@@ -137,7 +142,7 @@ test("a Kata init-data registers as init-data, and only under the pinned agent p
     testdata("attest/b300-kata-4.0.0/platform-document.json"),
   ).kata_policy;
   const { api, page } = await approvalPage({ compose: initData, app_id }, {}, view);
-  assert.ok(page.text().includes("Image: public.ecr.aws/docker/library/alpine"), page.text());
+  assert.ok(page.text().includes("Image: alpine"), page.text());
   await page.click("Approve with passkey");
   assert.deepEqual(api.revisions[0].body.payload, {
     app_id,
@@ -156,6 +161,43 @@ async function shown(...replacements) {
   const { page } = await approvalPage({ compose: jcs(compose) });
   return page.text();
 }
+
+test("the App's services come first and the platform's collapse under their role", async () => {
+  const digest = `sha256:${"ef".repeat(32)}`;
+  const text = await shown(
+    ["    image: redis@", "    image: ghcr.io/alphacompute/platform/app-edge:2@"],
+    ["      ALPHACOMPUTE_TLS_UPSTREAM: web:80\n", "      ALPHACOMPUTE_TLS_UPSTREAM: web:80\n      ALPHACOMPUTE_PUBLIC_NAME: board.example.com\n"],
+  );
+  assert.ok(text.includes("Public URL: https://board.example.com"), text);
+  assert.ok(text.includes("Organization: Acme"), text);
+  assert.ok(text.includes("Provided by AlphaCompute (2)"), text);
+  const at = (s) => text.indexOf(s);
+  assert.ok(at("\ndb\n") < at("\nweb\n") && at("\nweb\n") < at("Provided by AlphaCompute"), text);
+  assert.ok(at("Provided by AlphaCompute") < at("\napp-edge:2\n"), text);
+  assert.ok(at("Provided by AlphaCompute") < at("AlphaCompute runtime"), text);
+  assert.ok(!text.includes("\ncache\n"), "a service shows under its role, not its compose key");
+  assert.ok(text.includes(`cache: ${digest}`), "the full digest is under Technical details");
+});
+
+test("a compose cannot claim the platform's role by a service name or an image path", async () => {
+  const text = await shown(
+    ["    image: ghcr.io/alphacompute/alpha-runtime@", "    image: example.com/alpha-runtime@"],
+    ["    image: redis@", "    image: example.com/platform/app-edge:2@"],
+    ["      ALPHACOMPUTE_TLS_UPSTREAM: web:80\n", "      ALPHACOMPUTE_TLS_UPSTREAM: web:80\n      ALPHACOMPUTE_PUBLIC_NAME: board.example.com\n"],
+  );
+  assert.ok(!text.includes("Provided by AlphaCompute"), text);
+  assert.ok(!text.includes("AlphaCompute runtime") && !text.includes("Endpoint"), text);
+  assert.ok(!text.includes("Public URL"), text);
+  assert.ok(text.includes("\nalpha-runtime\n") && text.includes("\ncache\n"), text);
+  assert.ok(text.includes("Image: app-edge:2"), text);
+});
+
+test("Copy puts a service's full digest on the clipboard", async () => {
+  const { page } = await approvalPage({ compose: withoutSecrets() });
+  const copy = page.find((n) => n.ariaLabel === "Copy the digest of nginx:1.27");
+  await copy.listeners.click[0]({ target: copy });
+  assert.deepEqual(page.copied, [`sha256:${"ab".repeat(32)}`]);
+});
 
 test("a runtime port is an endpoint only with an upstream, a host side and TCP", async () => {
   const upstream = ["      ALPHACOMPUTE_TLS_UPSTREAM: web:80\n", ""];
@@ -515,10 +557,10 @@ test("a catalog app is rendered in wasm and its hash must match", async () => {
   for (const line of [
     "CPU App, version 1",
     "Machine: 1 vCPU, 2048 MiB",
-    "Image: ghcr.io/alphacompute/alpha-cpu-app",
-    `Digest: sha256:${"3a".repeat(32)}`,
+    "Image: alpha-cpu-app",
+    `Digest: ${shortDigest(`sha256:${"3a".repeat(32)}`)}`,
     "Published ports: 443:8443",
-    "Image: ghcr.io/alphacompute/alpha-runtime",
+    "Image: alpha-runtime",
   ]) {
     assert.ok(text.includes(line), `${line}\n${text}`);
   }
@@ -596,7 +638,10 @@ test("a replacement names both versions only when the old entry verifies", async
     assert.ok(line, `${name}: ${text}`);
     assert.ok(line.includes("according to the service"), line);
     assert.ok(line.includes(`alpha-cpu-app@sha256:4a${"3a".repeat(31)}`), line);
-    assert.ok(!text.split("\n").some((l) => l.startsWith("alpha-runtime: ")), name);
+    assert.ok(
+      !text.split("\n").some((l) => l.startsWith("alpha-runtime: ") && l.includes("according to the service")),
+      name,
+    );
   }
 });
 
@@ -1003,4 +1048,58 @@ test("relay calls are paced and a 429 is retried once", async () => {
   assert.equal(tries.length, 2);
   assert.equal(tries[0].text, tries[1].text);
   assert.ok(limited.page.timers.includes(2000));
+});
+
+const generateButton = (page, name) => page.find((n) => n.id === `generate-${name}`);
+const generate = async (page, name) => {
+  for (const listener of generateButton(page, name).listeners.click) await listener({});
+};
+
+test("a Secret's description is shown as text, and a missing one shows nothing", async () => {
+  const { page } = await secretPage({
+    secrets: [
+      { name: "db_password", set: false, description: "Database <b>password</b>" },
+      { name: "session_key", set: false },
+    ],
+  });
+  const described = page.find((n) => n.textContent === "Database <b>password</b>");
+  assert.ok(described, page.text());
+  assert.equal(described.tagName, "P");
+  assert.ok(!page.find((n) => n.tagName === "B"));
+  assert.ok(page.text().includes("From the App's plan, not verified:"));
+  assert.equal(described.parent, field(page, "db_password").parent);
+  const siblings = described.parent.children;
+  assert.equal(siblings[siblings.indexOf(described) - 2], field(page, "db_password"));
+  assert.ok(!field(page, "session_key").parent.children.some((n) => n.className === "muted"));
+  assert.equal(field(page, "db_password").attributes["aria-describedby"], `${siblings[siblings.indexOf(described) - 1].id} ${described.id}`);
+  assert.equal(field(page, "session_key").attributes, undefined);
+});
+
+test("generating fills 64 hex characters, differently each time", async () => {
+  const { page } = await secretPage();
+  assert.equal(generateButton(page, "db_password").type, "button");
+  await generate(page, "db_password");
+  const first = field(page, "db_password").value;
+  assert.match(first, /^[0-9a-f]{64}$/);
+  await generate(page, "db_password");
+  assert.notEqual(field(page, "db_password").value, first);
+});
+
+test("generating on a kept Secret replaces it and the value is put", async () => {
+  const { page, api } = await secretPage({ secrets: [{ name: "db_password", set: true }] });
+  assert.equal(field(page, "db_password").hidden, true);
+  await generate(page, "db_password");
+  const generated = field(page, "db_password").value;
+  assert.equal(keepChoice(page, "db_password").value, "replace");
+  assert.equal(field(page, "db_password").hidden, false);
+  fill(page, { session_key: SECRET_VALUES.session_key });
+  await page.click("Approve with passkey");
+  await page.click("Sign 2 of 3");
+  await page.click("Sign 3 of 3");
+  assert.ok(page.text().includes(APPROVED), page.text());
+  assert.deepEqual(
+    api.puts.map((p) => p.declared),
+    ["db_password", "session_key"],
+  );
+  assert.equal(page.seals[0].value.subarray(32).toString(), generated);
 });
