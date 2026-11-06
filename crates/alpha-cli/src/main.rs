@@ -292,6 +292,10 @@ enum CocoCommand {
         /// `--registry-auth`, it takes the KMS CA from the platform document.
         #[arg(long)]
         pull_proxy: Option<String>,
+        /// The pod's declared network openings, a TOML file of `[[ingress]]` and `[[egress]]`
+        /// entries (protocol, port, cidr, justification); without it the pod is network-dark.
+        #[arg(long)]
+        network: Option<PathBuf>,
         /// A Pod, or a StatefulSet or Deployment rendered for its pod template, whose images are all pinned
         /// `@sha256:` and whose supplementalGroups are explicit.
         pod: PathBuf,
@@ -670,6 +674,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                     out,
                     registry_auth,
                     pull_proxy,
+                    network,
                     pod,
                 },
         } => {
@@ -677,6 +682,11 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 fs::read(&pod).map_err(|e| Exit::Usage(format!("{}: {e}", pod.display())))?;
             let pod = coco::parse(&bytes)?;
             let policy = coco::Kata::read(&kata)?.genpolicy(&pod)?;
+            let network = network
+                .map(|p| {
+                    fs::read_to_string(&p).map_err(|e| Exit::Usage(format!("{}: {e}", p.display())))
+                })
+                .transpose()?;
             let kms_ca_pem = match (&registry_auth, &pull_proxy) {
                 (None, None) => None,
                 _ => Some(platform_document(config, now).await?.kms_ca_pem),
@@ -690,6 +700,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                     pull_proxy: pull_proxy.as_deref(),
                     kms_ca_pem,
                 }),
+                network.as_deref(),
             )?;
             fs::write(&out, &rendered.pod)
                 .map_err(|e| Exit::Refused(format!("{}: {e}", out.display())))?;

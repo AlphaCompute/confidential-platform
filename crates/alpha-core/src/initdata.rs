@@ -4,7 +4,7 @@
 
 use serde::Deserialize;
 
-use crate::{AppId, ComposeHash, KataPolicy, compose_hash};
+use crate::{AppId, ComposeHash, KataPolicy, Openings, compose_hash};
 
 #[derive(Debug)]
 pub struct InitData(String);
@@ -22,9 +22,11 @@ pub enum InitDataError {
     #[error("init-data [data] has no \"policy.rego\" string")]
     NoPolicy,
     #[error(
-        "init-data [data] key {0:?} is none of \"aa.toml\", \"app_id\", \"cdh.toml\", \"policy.rego\""
+        "init-data [data] key {0:?} is none of \"aa.toml\", \"app_id\", \"cdh.toml\", \"network.toml\", \"policy.rego\""
     )]
     UnknownKey(String),
+    #[error("init-data network openings: {0}")]
+    Network(String),
     #[error("init-data aa.toml and cdh.toml are not the platform's guest pull template: {0}")]
     GuestPull(&'static str),
     #[error("policy.rego has no \"\\npolicy_data := \"")]
@@ -170,12 +172,15 @@ impl InitData {
     /// [`guest_pull`] renders them for one Secret name or pull proxy and `kms_ca_pem`: any other content could
     /// point the guest at another key broker, and only alpha-kms releases keys.
     ///
+    /// `"network.toml"` must be valid [`Openings`].
+    ///
     /// No container may list `exec_commands`, the argv of its exec probes and hooks: the agent
     /// runs them whenever the host asks.
     pub fn check_policy(&self, pinned: &KataPolicy, kms_ca_pem: &str) -> Result<(), InitDataError> {
         let table = self.data()?;
         let (rules, data, containers) = policy(&table)?;
         check_guest_pull(&table, kms_ca_pem)?;
+        openings(&table)?;
         if rules != pinned.rules_sha256 {
             return Err(InitDataError::Rules(rules));
         }
@@ -201,6 +206,12 @@ impl InitData {
         credential_name(&cdh_image(&data)?)
     }
 
+    /// The network openings the Revision declares in `[data] "network.toml"`: none, a fully dark
+    /// pod, when the key is absent.
+    pub fn openings(&self) -> Result<Openings, InitDataError> {
+        openings(&self.data()?)
+    }
+
     fn data(&self) -> Result<toml::Table, InitDataError> {
         #[derive(Deserialize)]
         struct WithData {
@@ -215,6 +226,16 @@ impl InitData {
     /// the pod create. The pins are not checked: that is [`Self::check_policy`]'s job.
     pub fn containers(&self) -> Result<serde_json::Value, InitDataError> {
         Ok(policy(&self.data()?)?.2)
+    }
+}
+
+fn openings(data: &toml::Table) -> Result<Openings, InitDataError> {
+    match data.get("network.toml") {
+        None => Ok(Openings::default()),
+        Some(toml::Value::String(toml)) => Openings::parse(toml),
+        Some(_) => Err(InitDataError::Network(
+            "network.toml is not a string".into(),
+        )),
     }
 }
 
@@ -270,7 +291,7 @@ fn policy(
     if let Some(key) = data.keys().find(|k| {
         !matches!(
             k.as_str(),
-            "aa.toml" | "app_id" | "cdh.toml" | "policy.rego"
+            "aa.toml" | "app_id" | "cdh.toml" | "network.toml" | "policy.rego"
         )
     }) {
         return Err(InitDataError::UnknownKey(key.clone()));
@@ -415,6 +436,35 @@ mod tests {
                 .to_string();
             assert!(err.contains(fragment), "{fragment}: {err}");
         }
+    }
+
+    #[test]
+    fn network_openings_are_read_and_checked_by_the_policy_check() {
+        assert_eq!(
+            InitData::parse(K3.into()).unwrap().openings().unwrap(),
+            Openings::default()
+        );
+        let with = |toml: &str| {
+            InitData::parse(K3.replace(
+                "[data]\n",
+                &format!("[data]\n\"network.toml\" = '''\n{toml}'''\n"),
+            ))
+            .unwrap()
+        };
+        let ok = with(
+            "[[egress]]\nprotocol = \"tcp\"\nport = 443\ncidr = \"0.0.0.0/0\"\njustification = \"Updates\"\n",
+        );
+        ok.check_policy(&pinned(), PEM).unwrap();
+        assert_eq!(ok.openings().unwrap().egress[0].port, 443);
+
+        let bad = with(
+            "[[egress]]\nprotocol = \"tcp\"\nport = 0\ncidr = \"0.0.0.0/0\"\njustification = \"Updates\"\n",
+        );
+        let err = bad.check_policy(&pinned(), PEM).unwrap_err().to_string();
+        assert!(err.contains("port is 0"), "{err}");
+        let not_string =
+            InitData::parse(K3.replace("[data]\n", "[data]\n\"network.toml\" = 1\n")).unwrap();
+        assert!(not_string.openings().is_err());
     }
 
     #[test]

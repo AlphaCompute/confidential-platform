@@ -410,11 +410,13 @@ pub struct GuestPull<'a> {
 /// the same inputs could give two Revisions. `guest_pull` is the Secret the guest pulls private
 /// images with, the proxy it pulls through, and the KMS CA, which [`alpha_core::guest_pull`]
 /// renders into `[data]`.
+/// `network` is the content of `"network.toml"`, validated as `Openings` before it is used.
 pub fn render(
     mut pod: Pod,
     app_id: AppId,
     policy: &str,
     guest_pull: Option<GuestPull>,
+    network: Option<&str>,
 ) -> Result<Rendered, String> {
     let (rules, data) = policy
         .split_once(POLICY_DATA)
@@ -452,13 +454,23 @@ pub fn render(
         }
         None => Default::default(),
     };
+    let net = match network {
+        Some(n) if n.contains("'''") => {
+            return Err("--network: contains ''', which a TOML literal string cannot hold".into());
+        }
+        Some(n) => format!("\"network.toml\" = '''\n{n}'''\n"),
+        None => String::new(),
+    };
     let toml = format!(
-        "algorithm = \"sha256\"\nversion = \"0.1.0\"\n\n[data]\n{aa}\"app_id\" = \"{app_id}\"\n{cdh}\"policy.rego\" = '''\n{policy}'''\n"
+        "algorithm = \"sha256\"\nversion = \"0.1.0\"\n\n[data]\n{aa}\"app_id\" = \"{app_id}\"\n{net}{cdh}\"policy.rego\" = '''\n{policy}'''\n"
     );
     let init_data = InitData::parse(toml.clone()).map_err(|e| format!("init-data: {e}"))?;
     if init_data.app_id() != Some(app_id) {
         return Err("init-data: app_id does not read back".into());
     }
+    init_data
+        .openings()
+        .map_err(|e| format!("--network: {e}"))?;
     let mut gzip = GzEncoder::new(Vec::new(), Compression::best());
     gzip.write_all(toml.as_bytes())
         .map_err(|e| format!("gzip: {e}"))?;
@@ -503,6 +515,7 @@ mod tests {
             parse(POD.as_bytes()).unwrap(),
             APP_ID.parse().unwrap(),
             GENPOLICY,
+            None,
             None,
         )
         .unwrap()
@@ -554,6 +567,7 @@ mod tests {
                 pull_proxy: None,
                 kms_ca_pem: pem,
             }),
+            None,
         )
         .unwrap();
         let expected: Value = serde_json::from_str(EXPECTED).unwrap();
@@ -572,7 +586,13 @@ mod tests {
                 pull_proxy,
                 kms_ca_pem: pem,
             };
-            render(pod, APP_ID.parse().unwrap(), GENPOLICY, Some(guest_pull))
+            render(
+                pod,
+                APP_ID.parse().unwrap(),
+                GENPOLICY,
+                Some(guest_pull),
+                None,
+            )
         };
         assert!(reg(Some("Reg"), None).is_err());
         assert!(reg(None, None).is_err());
@@ -592,6 +612,7 @@ mod tests {
                 pull_proxy: Some(proxy),
                 kms_ca_pem: pem,
             }),
+            None,
         )
         .unwrap();
         assert!(rendered.init_data.contains(&format!(
@@ -604,6 +625,32 @@ mod tests {
         let init_data = InitData::parse(rendered.init_data).unwrap();
         init_data.check_policy(&pinned, pem).unwrap();
         assert_eq!(init_data.registry_credential(), None);
+    }
+
+    #[test]
+    fn declared_openings_are_part_of_the_revision_and_read_back() {
+        let net = "[[egress]]\nprotocol = \"tcp\"\nport = 5432\ncidr = \"203.0.113.10/32\"\njustification = \"The App's Postgres\"\n";
+        let render_with = |net| {
+            render(
+                parse(POD.as_bytes()).unwrap(),
+                APP_ID.parse().unwrap(),
+                GENPOLICY,
+                None,
+                Some(net),
+            )
+        };
+        let golden = render_golden();
+        let rendered = render_with(net).unwrap();
+        assert_ne!(rendered.revision, golden.revision);
+        assert!(
+            rendered
+                .init_data
+                .contains(&format!("\n\"network.toml\" = '''\n{net}'''\n"))
+        );
+        let read_back = InitData::parse(rendered.init_data).unwrap();
+        assert_eq!(read_back.openings().unwrap().egress[0].port, 5432);
+        assert!(render_with("[[egress]]\nport = 1\n").is_err());
+        assert!(render_with("# '''\n").is_err());
     }
 
     #[test]
@@ -671,7 +718,7 @@ mod tests {
                     .get("automountServiceAccountToken")
                     .is_none()
             );
-            let rendered = render(parsed, APP_ID.parse().unwrap(), GENPOLICY, None).unwrap();
+            let rendered = render(parsed, APP_ID.parse().unwrap(), GENPOLICY, None, None).unwrap();
             assert_eq!(rendered.revision, render_golden().revision);
             let out: Yaml = serde_yaml_ng::from_str(&rendered.pod).unwrap();
             assert!(out["metadata"].get("annotations").is_none());
@@ -762,7 +809,7 @@ mod tests {
         );
         let other_rules = GENPOLICY.replacen("package agent_policy", "package other", 1);
         let pod = parse(POD.as_bytes()).unwrap();
-        let err = render(pod, APP_ID.parse().unwrap(), &other_rules, None).unwrap_err();
+        let err = render(pod, APP_ID.parse().unwrap(), &other_rules, None, None).unwrap_err();
         assert!(err.contains("pinned rules"));
     }
 
@@ -859,6 +906,7 @@ mod tests {
             parse(DIND_POD.as_bytes()).unwrap(),
             APP_ID.parse().unwrap(),
             DIND_GENPOLICY,
+            None,
             None,
         )
         .unwrap();
@@ -1204,6 +1252,7 @@ mod tests {
             parse(B300_POD.as_bytes()).unwrap(),
             APP_ID.parse().unwrap(),
             B300_GENPOLICY,
+            None,
             None,
         )
         .unwrap();

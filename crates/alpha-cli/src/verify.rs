@@ -9,7 +9,7 @@ use alpha_channel::binding::{self, SignedBinding};
 use alpha_channel::cert;
 use alpha_client::tls::{self, InstanceSans};
 use alpha_client::{Client, Pin, system_time_provider};
-use alpha_core::{AppId, InitData};
+use alpha_core::{AppId, InitData, Openings};
 use serde_json::{Value, json};
 
 use crate::{node, rfc3339};
@@ -17,7 +17,7 @@ use crate::{node, rfc3339};
 /// The leaf `url` presents must chain to the document's KMS CA, be valid now and belong to
 /// `app`; with `init_data`, that file must be the leaf's Revision and pass the document's
 /// `kata_policy`; with `public`, the browser-trusted certificate on `url`'s name must be bound
-/// to an Instance of that Revision.
+/// to an Instance of that Revision. The report lists the init-data's network openings, and has no `network` key without it.
 pub async fn instance(
     url: &str,
     app: AppId,
@@ -26,15 +26,15 @@ pub async fn instance(
     doc: &PlatformDocument,
 ) -> Result<Value, String> {
     let (sans, leaf) = app_leaf(url, app, &doc.kms_ca_pem).await?;
-    if let Some(init_data) = init_data {
-        check_init_data(&sans, init_data, doc)?;
-    }
+    let network = init_data
+        .map(|init_data| check_init_data(&sans, init_data, doc))
+        .transpose()?;
     let public = if public {
         Some(public_binding(url, &sans, doc).await?)
     } else {
         None
     };
-    Ok(json!({
+    let mut report = json!({
         "public": public,
         "platform_document_version": doc.version,
         "org_id": sans.org_id,
@@ -42,7 +42,12 @@ pub async fn instance(
         "revision": sans.compose_hash,
         "runtime_pubkey_sha256": sans.runtime_pubkey_sha256_hex,
         "appraisal": appraisal(&leaf, &doc.kms_ca_pem)?,
-    }))
+    });
+    // Absent, not null, without `--init-data`: "not checked" must differ from "checked, none".
+    if let (Some(network), Some(report)) = (network, report.as_object_mut()) {
+        report.insert("network".to_owned(), json!(network));
+    }
+    Ok(report)
 }
 
 /// The KMS appraised the Instance when it issued the leaf, under the platform document it held
@@ -138,7 +143,7 @@ fn check_init_data(
     sans: &InstanceSans,
     init_data: &InitData,
     doc: &PlatformDocument,
-) -> Result<(), String> {
+) -> Result<Openings, String> {
     if init_data.digest() != sans.compose_hash {
         return Err(format!(
             "the init-data is Revision {}, the leaf names {}",
@@ -152,6 +157,7 @@ fn check_init_data(
         .ok_or("the platform document pins no kata_policy")?;
     init_data
         .check_policy(policy, &doc.kms_ca_pem)
+        .and_then(|()| init_data.openings())
         .map_err(|e| format!("init-data: {e}"))
 }
 
@@ -207,7 +213,8 @@ mod tests {
     fn the_init_data_must_be_the_leafs_revision_within_the_policy() {
         let init_data = InitData::parse(K3.into()).unwrap();
         let sans = leaf(&init_data);
-        check_init_data(&sans, &init_data, &doc()).unwrap();
+        let network = check_init_data(&sans, &init_data, &doc()).unwrap();
+        assert_eq!(network, Openings::default());
 
         let other = InitData::parse(K3.replacen("(c) 2023", "(c) 2024", 1)).unwrap();
         let err = check_init_data(&sans, &other, &doc()).unwrap_err();
