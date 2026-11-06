@@ -50,7 +50,7 @@ fn init_data(h: &Harness) -> String {
         .as_str()
         .unwrap()
         .to_owned();
-    let (aa, cdh) = alpha_core::registry_auth("regcred", &ca);
+    let (aa, cdh) = alpha_core::guest_pull(Some("regcred"), None, &ca).unwrap();
     text(KATA, "k3-app.toml").replace(
         "[data]\n",
         &format!("[data]\n\"aa.toml\" = '''\n{aa}'''\n\"cdh.toml\" = '''\n{cdh}'''\n"),

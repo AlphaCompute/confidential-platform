@@ -399,15 +399,23 @@ pub fn rendered_init_data(pod: &str) -> Result<(AppId, ComposeHash, String), Str
     Ok((app_id, init_data.digest(), toml))
 }
 
+/// What the guest's `aa.toml` and `cdh.toml` are rendered from, at least one of the first two.
+pub struct GuestPull<'a> {
+    pub credential: Option<&'a str>,
+    pub pull_proxy: Option<&'a str>,
+    pub kms_ca_pem: &'a str,
+}
+
 /// Builds the init-data in one fixed layout: genpolicy's own keeps `[data]` in a hash map, so
-/// the same inputs could give two Revisions. `registry_auth` is the Secret the guest pulls private
-/// images with and the KMS CA, which [`alpha_core::registry_auth`] renders into `[data]`.
+/// the same inputs could give two Revisions. `guest_pull` is the Secret the guest pulls private
+/// images with, the proxy it pulls through, and the KMS CA, which [`alpha_core::guest_pull`]
+/// renders into `[data]`.
 /// `network` is the content of `"network.toml"`, validated as `Openings` before it is used.
 pub fn render(
     mut pod: Pod,
     app_id: AppId,
     policy: &str,
-    registry_auth: Option<(&str, &str)>,
+    guest_pull: Option<GuestPull>,
     network: Option<&str>,
 ) -> Result<Rendered, String> {
     let (rules, data) = policy
@@ -428,12 +436,17 @@ pub fn render(
             "genpolicy: its output contains ''', which a TOML literal string cannot hold".into(),
         );
     }
-    let (aa, cdh) = match registry_auth {
-        Some((name, kms_ca_pem)) => {
-            if !alpha_core::is_secret_name(name) {
-                return Err(format!("--registry-auth {name:?}: not a Secret name"));
+    let (aa, cdh) = match guest_pull {
+        Some(GuestPull {
+            credential,
+            pull_proxy,
+            kms_ca_pem,
+        }) => {
+            if credential.is_some_and(|name| !alpha_core::is_secret_name(name)) {
+                return Err("--registry-auth: not a Secret name".into());
             }
-            let (aa, cdh) = alpha_core::registry_auth(name, kms_ca_pem);
+            let (aa, cdh) = alpha_core::guest_pull(credential, pull_proxy, kms_ca_pem)
+                .map_err(|e| format!("guest pull: {e}"))?;
             (
                 format!("\"aa.toml\" = '''\n{aa}'''\n"),
                 format!("\"cdh.toml\" = '''\n{cdh}'''\n"),
@@ -549,7 +562,11 @@ mod tests {
             pod,
             APP_ID.parse().unwrap(),
             GENPOLICY,
-            Some(("regcred", pem)),
+            Some(GuestPull {
+                credential: Some("regcred"),
+                pull_proxy: None,
+                kms_ca_pem: pem,
+            }),
             None,
         )
         .unwrap();
@@ -562,17 +579,52 @@ mod tests {
         let init_data = InitData::parse(rendered.init_data).unwrap();
         init_data.check_policy(&pinned, pem).unwrap();
         assert!(init_data.check_policy(&pinned, "other").is_err());
-        let pod = parse(POD.as_bytes()).unwrap();
-        assert!(
+        let reg = |credential, pull_proxy| {
+            let pod = parse(POD.as_bytes()).unwrap();
+            let guest_pull = GuestPull {
+                credential,
+                pull_proxy,
+                kms_ca_pem: pem,
+            };
             render(
                 pod,
                 APP_ID.parse().unwrap(),
                 GENPOLICY,
-                Some(("Reg", pem)),
-                None
+                Some(guest_pull),
+                None,
             )
-            .is_err()
-        );
+        };
+        assert!(reg(Some("Reg"), None).is_err());
+        assert!(reg(None, None).is_err());
+        assert!(reg(None, Some("https://p.svc")).is_err());
+    }
+
+    #[test]
+    fn a_pull_proxy_renders_into_an_init_data_the_kms_accepts() {
+        let pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+        let proxy = "http://pull-proxy.alpha-egress.svc:3128";
+        let rendered = render(
+            parse(POD.as_bytes()).unwrap(),
+            APP_ID.parse().unwrap(),
+            GENPOLICY,
+            Some(GuestPull {
+                credential: None,
+                pull_proxy: Some(proxy),
+                kms_ca_pem: pem,
+            }),
+            None,
+        )
+        .unwrap();
+        assert!(rendered.init_data.contains(&format!(
+            "image_pull_proxy = {{ https_proxy = \"{proxy}\" }}"
+        )));
+        let pinned = alpha_core::KataPolicy {
+            rules_sha256: rendered.rules_sha256.parse().unwrap(),
+            data_sha256: rendered.policy_data_sha256.parse().unwrap(),
+        };
+        let init_data = InitData::parse(rendered.init_data).unwrap();
+        init_data.check_policy(&pinned, pem).unwrap();
+        assert_eq!(init_data.registry_credential(), None);
     }
 
     #[test]
