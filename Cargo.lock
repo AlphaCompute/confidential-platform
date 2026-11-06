@@ -218,6 +218,7 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror",
  "toml",
+ "unicode-properties",
  "uuid",
  "yaml-rust2",
 ]

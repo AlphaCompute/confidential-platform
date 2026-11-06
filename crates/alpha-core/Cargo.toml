@@ -16,5 +16,6 @@ serde_json_canonicalizer = "0.3"
 sha2 = "0.11"
 thiserror = "2"
 toml = { version = "1", default-features = false, features = ["parse", "serde", "std"] }
+unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }
 uuid = { version = "1", features = ["v7", "serde"] }
 yaml-rust2 = "0.13"
