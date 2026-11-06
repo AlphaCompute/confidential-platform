@@ -309,7 +309,7 @@ mod tests {
             rustls::client::verify_server_name(&parsed, &name).is_ok()
         };
         assert!(named(&node_leaf, "kms.alpha-kms.svc"));
-        let (aa, _) = alpha_core::registry_auth("regcred", "");
+        let (aa, _) = alpha_core::guest_pull(Some("regcred"), None, "").unwrap();
         assert!(aa.contains(&format!("url = \"https://{}:8443\"", KMS_DNS_NAMES[0])));
         assert!(named(&node_leaf, "kms.alpha-kms.svc.cluster.local"));
         assert!(!named(&node_leaf, "kms.other.svc"));
