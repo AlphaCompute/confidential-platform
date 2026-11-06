@@ -106,6 +106,12 @@ pub fn compose_services(compose: &str) -> Result<String, JsError> {
     to_json(&compose::services(compose).map_err(js)?)
 }
 
+/// `{ingress, egress}`, the network openings of a Kata init-data, or `null` for a compose.
+#[wasm_bindgen(js_name = revisionOpenings)]
+pub fn revision_openings(revision: &str) -> Result<String, JsError> {
+    to_json(&compose::openings(revision).map_err(js)?)
+}
+
 /// The payload to sign under `revision` that registers `revision` for `app_id`:
 /// `{app_id, compose}` or `{app_id, init_data, digest}`, refused when the KMS would refuse it.
 /// `kata_policy_json` is the verified platform document's `kata_policy`, or `null` when it has
