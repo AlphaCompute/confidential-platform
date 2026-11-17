@@ -401,7 +401,7 @@ the manifest against the pinned digest and each blob against the manifest, so a 
 pull but not change what runs. It combines with `--registry-auth`; either flag makes `render` read the
 KMS CA from the platform document. An image input is the image's reference in the release's
 `images.json` ([`../README.md`](../README.md#what-a-release-produces)), for example
-`RUNTIME_IMAGE=$(jq -r '."alpha-runtime"' images.json)`. A new package is private until a package admin makes it
+`export RUNTIME_IMAGE=$(jq -r '."alpha-runtime"' images.json)`. A new package is private until a package admin makes it
 public in its package settings; a workflow cannot.
 
 | Input | Templates | What |
