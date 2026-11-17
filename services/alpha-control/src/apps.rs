@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{AppState, Caller, Error, audit};
 
-pub const APP_DOMAIN: &str = "app.alphacompute.cc";
+const APP_DOMAIN: &str = "app.alphacompute.cc";
 const RESERVED: [&str; 13] = [
     "api",
     "sign",

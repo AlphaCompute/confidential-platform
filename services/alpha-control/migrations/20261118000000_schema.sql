@@ -3,8 +3,7 @@ create table organizations (
   name               text not null,
   owner_email        text not null,
   created_by         text not null,
-  created_at         timestamptz not null default now(),
-  disabled_at        timestamptz
+  created_at         timestamptz not null default now()
 );
 
 create table org_links (
@@ -22,8 +21,7 @@ create table api_keys (
   scopes       text[] not null,
   label        text not null,
   created_by   text not null,
-  created_at   timestamptz not null default now(),
-  revoked_at   timestamptz
+  created_at   timestamptz not null default now()
 );
 
 create table apps (

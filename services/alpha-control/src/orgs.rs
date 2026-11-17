@@ -64,17 +64,10 @@ fn text(field: &str, value: &str) -> Result<(), Error> {
 
 fn email(value: &str) -> Result<(), Error> {
     text("owner_email", value)?;
-    match value.split_once('@') {
-        Some((local, domain))
-            if !local.is_empty()
-                && domain.contains('.')
-                && !domain.contains('@')
-                && !value.contains(char::is_whitespace) =>
-        {
-            Ok(())
-        }
-        _ => Err(Error::Malformed("owner_email is not an address".into())),
+    if value.contains(char::is_whitespace) || !value.trim_start_matches('@').contains('@') {
+        return Err(Error::Malformed("owner_email is not an address".into()));
     }
+    Ok(())
 }
 
 /// An onboarding key cannot hand out another onboarding key.

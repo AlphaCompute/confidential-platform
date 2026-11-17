@@ -13,8 +13,8 @@
     )
 )]
 
-pub mod apps;
-pub mod orgs;
+mod apps;
+mod orgs;
 
 use std::sync::Arc;
 
@@ -29,6 +29,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 pub async fn migrate(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
     sqlx::migrate!("./migrations").run(pool).await
@@ -110,20 +111,16 @@ impl IntoResponse for Error {
     }
 }
 
-pub fn random<const N: usize>() -> Result<[u8; N], Error> {
-    let mut out = [0u8; N];
-    getrandom::fill(&mut out).map_err(|e| Error::internal(format!("rng: {e}")))?;
-    Ok(out)
-}
-
 pub const SCOPES: [&str; 5] = ["apps:read", "apps:write", "deploy", "org:admin", "onboard"];
 
 /// A new operational API key `alpha_<base32>` and the SHA-256 its row keeps.
 pub fn mint_token() -> Result<(String, [u8; 32]), Error> {
+    let mut secret = Zeroizing::new([0u8; 32]);
+    getrandom::fill(secret.as_mut_slice()).map_err(|e| Error::internal(format!("rng: {e}")))?;
     let token = format!(
         "alpha_{}",
         data_encoding::BASE32_NOPAD
-            .encode(&random::<32>()?)
+            .encode(secret.as_slice())
             .to_ascii_lowercase()
     );
     let hash = Sha256::digest(token.as_bytes()).into();
@@ -186,16 +183,12 @@ impl FromRequestParts<Arc<AppState>> for Caller {
         if hash == state.operator_token_sha256 {
             return Ok(Caller::Operator);
         }
-        sqlx::query_as(
-            "select k.id, k.org_id, k.scopes from api_keys k \
-             left join organizations o on o.id = k.org_id \
-             where k.token_sha256 = $1 and k.revoked_at is null and o.disabled_at is null",
-        )
-        .bind(hash.as_slice())
-        .fetch_optional(&state.pool)
-        .await?
-        .map(Caller::Key)
-        .ok_or(Error::Unauthorized)
+        sqlx::query_as("select id, org_id, scopes from api_keys where token_sha256 = $1")
+            .bind(hash.as_slice())
+            .fetch_optional(&state.pool)
+            .await?
+            .map(Caller::Key)
+            .ok_or(Error::Unauthorized)
     }
 }
 
@@ -233,18 +226,21 @@ async fn ready(State(state): State<Arc<AppState>>) -> Result<StatusCode, Error> 
 
 /// `/healthz` and `/ready` alone, for the kubelet on a plain port: the API port serves no
 /// certificate until the first ACME order, and the CA reaches the pod only once it is ready.
-pub fn probes(state: Arc<AppState>) -> Router {
+fn probe_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/ready", get(ready))
-        .with_state(state)
+}
+
+pub fn probes(state: Arc<AppState>) -> Router {
+    probe_routes().with_state(state)
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/orgs", post(orgs::create))
         .route("/v1/apps/{slug}", put(apps::put))
-        .with_state(state.clone())
         .layer(DefaultBodyLimit::max(64 * 1024))
-        .merge(probes(state))
+        .merge(probe_routes())
+        .with_state(state)
 }
