@@ -710,7 +710,7 @@ function claimApi(options = {}) {
     const key = keyBody(req.body);
     api.registrations.push({ ...key, op, body: req.body });
     if (op === "root" && req.headers["Alpha-Claim-Session"] !== api.owner_session) {
-      return failed(403, "session_required");
+      return failed(403, "session_refused");
     }
     if (api.keysReply) return api.keysReply(key.registrationText);
     const response = registerKey(api, key);

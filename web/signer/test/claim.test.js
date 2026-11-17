@@ -485,6 +485,47 @@ test("a root claim makes no passkey until the owner's sign-in is bound to the ti
   assert.equal(root.headers["Alpha-Claim-Session"], api.owner_session);
 });
 
+test("a root whose answer was lost is confirmed again, never added as a second key", async () => {
+  const api = claimApi();
+  const tab = seedOwner(memoryStorage(), api);
+  const first = await loadPage({ routes: api.routes, sessionStorage: tab });
+  await first.startClaim();
+  await first.click("Create passkey");
+  const honest = api.receiptFor;
+  api.receiptFor = () => undefined;
+  await first.click("Confirm with passkey");
+  assert.ok(first.text().includes(NOT_CONFIRMED), first.text());
+  assert.equal(api.rooted, true);
+
+  api.receiptFor = honest;
+  const reloaded = await loadPage({ routes: api.routes, sessionStorage: tab, authenticator: first.authenticator });
+  await reloaded.startClaim();
+  assert.deepEqual(reloaded.buttons(), ["Confirm with passkey"]);
+  await reloaded.click("Confirm with passkey");
+  assert.deepEqual(api.registrations.map((r) => r.op), ["root", "root"]);
+  assert.ok(reloaded.text().includes(YOURS), reloaded.text());
+});
+
+test("a root another key holds stops, and a refused owner session asks to sign in again", async () => {
+  const taken = await claimPage();
+  taken.api.keysReply = () => failed(409, "already_exists");
+  await taken.page.click("Create passkey");
+  await taken.page.click("Confirm with passkey");
+  assert.equal(
+    taken.page.text(),
+    "Your organization was claimed by another key. Do not continue. Contact AlphaCompute.",
+  );
+
+  const tab = memoryStorage();
+  const stale = await claimPage({}, { sessionStorage: tab });
+  stale.api.owner_session = "another-session";
+  await stale.page.click("Create passkey");
+  await stale.page.click("Confirm with passkey");
+  assert.ok(stale.page.text().includes("That sign-in is not the owner of this organization."));
+  assert.deepEqual(stale.page.buttons(), ["Sign in as owner@acme.example to claim this organization."]);
+  assert.ok(!tab.getItem(`alphacompute-claim-sha256:${sha256(TICKET).toString("hex")}`).includes("owner"));
+});
+
 test("a device-bound passkey is named as such", async () => {
   // 0x0d is eligible for backup but not backed up yet.
   for (const flags of [0x05, 0x0d]) {

@@ -370,11 +370,13 @@ test("a new Revision shows its changes and revokes the one it replaces unless ke
   await page.click("Approve with passkey");
   assert.equal(api.revisions.length, 1);
   assert.equal(api.revokes.length, 0);
-  await page.click("Sign 2 of 2");
+  await page.click(`Sign 2 of 2: revoke the previous Revision ${predecessor.compose_hash}`);
   assert.ok(page.text().includes(NOT_CONFIRMED), page.text());
   assert.ok(!page.text().includes(APPROVED));
+  assert.ok(page.text().includes("Revoking stops the KMS from giving these launches keys"), page.text());
+  assert.ok(!page.buttons().includes("Decline"), "a registered Revision cannot be declined");
   api.revokeReceipt = (text, response) => mintReceipt("revision.revoke", text, response);
-  await page.click("Sign 2 of 2");
+  await page.click(`Sign 2 of 2: revoke the previous Revision ${predecessor.compose_hash}`);
   const payload = api.revokes[1].body.payload;
   assert.deepEqual(Object.keys(payload).sort(), ["compose_hash", "issued_at"]);
   assert.equal(payload.compose_hash, predecessor.compose_hash);
@@ -707,7 +709,7 @@ test("a re-approval keeps current values unless replaced", async () => {
   fill(kept.page, { session_key: SECRET_VALUES.session_key });
   await kept.page.click("Approve with passkey");
   await kept.page.click("Sign 2 of 3");
-  await kept.page.click("Sign 3 of 3");
+  await kept.page.click(`Sign 3 of 3: revoke the previous Revision ${predecessor.compose_hash}`);
   assert.ok(kept.page.text().includes(APPROVED), kept.page.text());
   assert.deepEqual(
     kept.api.puts.map((p) => p.declared),
@@ -726,7 +728,7 @@ test("a re-approval keeps current values unless replaced", async () => {
   assert.equal(field(replaced.page, "session_key").value, SECRET_VALUES.session_key);
   fill(replaced.page, { db_password: SECRET_VALUES.db_password });
   await approveAll(replaced.page, 4);
-  await replaced.page.click("Sign 4 of 4");
+  await replaced.page.click(`Sign 4 of 4: revoke the previous Revision ${predecessor.compose_hash}`);
   assert.ok(replaced.page.text().includes(APPROVED));
   assert.deepEqual(
     replaced.api.puts.map((p) => p.declared),

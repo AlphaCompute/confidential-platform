@@ -67,6 +67,9 @@ const MESSAGES = {
   no_storage: "This browser does not let the page keep the sign-in in this tab. Allow site data and try again.",
   root_statement: (email, org, id) =>
     `You, ${email}, are making this passkey the root key of ${org} (${id}).`,
+  add_statement: (principal, org) =>
+    `This passkey becomes a key of principal ${principal} in ${org}, approved by one of its passkeys.`,
+  root_taken: "Your organization was claimed by another key. Do not continue. Contact AlphaCompute.",
   yours: "This organization is yours.",
   unrooted:
     "This organization has no passkey yet. Finish onboarding from the email we sent, then open this link again.",
@@ -90,7 +93,7 @@ const MESSAGES = {
   catalog: "The catalog entry for this launch is not signed by AlphaCompute. Nothing was signed.",
   revision_revoked: "The KMS refuses this launch because it was revoked before. Nothing was approved.",
   requester: "From the requester, not verified:",
-  no_change: "No change to images, published ports, environment, Secrets or network openings.",
+  no_change: "No change to images, published ports, volumes, environment, Secrets or network openings.",
   keep_predecessor: (hash) => `Keep the previous Revision ${hash} runnable`,
   revoke_effect:
     "Revoking stops the KMS from giving these launches keys, Secrets or certificates: no copy can start, and a running copy gets none again. It cannot be undone; the same launch can never be approved again.",
@@ -272,7 +275,7 @@ function ticketRefusal(read, kind) {
     !UUID.test(read.org_id) ||
     typeof read.org_name !== "string" ||
     !Array.isArray(read.credentials) ||
-    !read.credentials.every((c) => typeof c?.credential_id === "string")
+    !read.credentials.every((c) => typeof c?.credential_id === "string" && typeof c.key_id === "string")
   ) {
     return MESSAGES.unavailable;
   }
@@ -481,7 +484,13 @@ async function startClaim(view, ticket, note) {
   const c = { view, read, ticket, ui, session: loadSession(ticket) || {}, checked: new Set() };
   const s = c.session;
   if (s.first?.key_id) return s.root ? rooted(c) : added(c);
-  if (read.rooted) return s.first ? offerAddApproval(c, note) : offerFirst(c, note);
+  // A root this tab signed may have reached the KMS without the tab learning its key id; the KMS
+  // answers the same key with the stored root, so it is offered again, never as an added key.
+  if (s.root && s.first && s.owner) return offerRoot(c, note);
+  if (read.rooted) {
+    ui.facts.replaceChildren(el("p", MESSAGES.add_statement(read.principal_id, read.org_name), "warning"));
+    return s.first ? offerAddApproval(c, note) : offerFirst(c, note);
+  }
   ui.facts.replaceChildren(
     el("p", MESSAGES.root_statement(read.owner_email, read.org_name, read.org_id), "warning"),
   );
@@ -601,6 +610,13 @@ function offerRegistration(c, note, step) {
     const body = `{"credential_id":${JSON.stringify(step.key.id)},"registration":${registration}}`;
     const owner = step.op === "root" ? { "Alpha-Claim-Session": c.session.owner.session } : {};
     const reply = await api(c.view, "POST", ticketPath(c.ticket, step.op), body, owner);
+    const code = reply.body?.error?.code;
+    if (step.op === "root" && code === "already_exists") return stop(MESSAGES.root_taken);
+    if (step.op === "root" && code === "session_refused") {
+      delete c.session.owner;
+      saveSession(c);
+      return offerSignIn(c, MESSAGES.not_owner);
+    }
     if (reply.status !== 200) return step.retry(failure(reply));
     const signed = receipt(c.view, reply, "key.register", registration, {
       org_id: c.read.org_id,
@@ -960,6 +976,7 @@ function changes(before, after) {
       if (!(k in s.environment)) lines.push([`${n}: ${k} removed`, false]);
       else lines.push([`${n}: ${k}=${s.environment[k]}`, true]);
     }
+    for (const v of s.volumes.filter((x) => !b.volumes.includes(x))) lines.push([`${n}: mounts volume ${v}`, true]);
     for (const secret of s.secrets.filter((x) => !b.secrets.includes(x))) {
       lines.push([`${n}: receives Secret ${secret}`, true]);
     }
@@ -1041,7 +1058,7 @@ async function startApproval(view, viewText, ticket) {
   }
   sync();
   decision.append(a.secretsBox);
-  if (before) decision.append(keepBox(a));
+  if (before) decision.append(...keepBox(a));
   decision.append(ui.step, ui.status);
   const layout = el("div", undefined, "approval");
   layout.append(ui.facts, decision);
@@ -1061,7 +1078,7 @@ function keepBox(a) {
   label.htmlFor = a.keep.id;
   const row = el("p", undefined, "keep");
   row.append(a.keep, label);
-  return row;
+  return [row, el("p", MESSAGES.revoke_effect, "warning")];
 }
 
 function declaredSecrets(services) {
@@ -1174,13 +1191,17 @@ function offerApproval(a, note) {
   const total = (a.values ? a.values.length : 0) + 1 + (revoke ? 1 : 0);
   const left = pending.length + (a.registered ? 0 : 1) + (revoke ? 1 : 0);
   const step = total - left + 1;
-  const label = step === 1 ? "Approve with passkey" : `Sign ${step} of ${total}`;
+  let label = step === 1 ? "Approve with passkey" : `Sign ${step} of ${total}`;
   let run;
   if (!a.values) run = firstAction(a);
   else if (pending.length) run = stepAction(a, pending[0]);
   else if (!a.registered) run = stepAction(a);
-  else run = revokeAction(a);
-  offer(a.ui, note, button(label, run), declineButton(a));
+  else {
+    label = `${label}: revoke the previous Revision ${a.before.compose_hash}`;
+    run = revokeAction(a);
+  }
+  // Once the Revision is registered, declining would no longer undo anything.
+  offer(a.ui, note, button(label, run), ...(a.registered ? [] : [declineButton(a)]));
 }
 
 // The first click reads the Secret values and fixes the choice of the predecessor, so its inputs
