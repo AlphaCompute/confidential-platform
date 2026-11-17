@@ -29,7 +29,7 @@ use p256::{NonZeroScalar, Scalar, SecretKey};
 use parking_lot::RwLock;
 use rcgen::PublicKeyData;
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer, DnsName, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
 use sha2::{Digest, Sha256};
 use x509_parser::prelude::{FromDer, X509Certificate};
@@ -60,6 +60,32 @@ const ACCOUNT_KEY_LABEL: &[u8] = b"alphacompute-runtime/acme-account-key/v1";
 const POLL: RetryPolicy = RetryPolicy::new()
     .initial_delay(Duration::from_secs(1))
     .timeout(Duration::from_secs(120));
+
+/// `ALPHACOMPUTE_PUBLIC_NAME`; None when it is not set.
+pub fn parse_public_name(
+    name: Option<&str>,
+    upstream: Option<&str>,
+    callers: &[alpha_core::AppId],
+) -> Result<Option<String>, String> {
+    let refused = |m: &str| format!("ALPHACOMPUTE_PUBLIC_NAME: {m}");
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    if !name.contains('.')
+        || name.bytes().any(|b| b.is_ascii_uppercase())
+        || DnsName::try_from(name).is_err()
+    {
+        return Err(refused("is not a lowercase DNS name"));
+    }
+    if upstream.is_none() {
+        return Err(refused("set without ALPHACOMPUTE_TLS_UPSTREAM"));
+    }
+    // A browser and the ACME CA present no Instance leaf.
+    if !callers.is_empty() {
+        return Err(refused("set with ALPHACOMPUTE_TLS_CALLER_APPS"));
+    }
+    Ok(Some(name.to_owned()))
+}
 
 /// The public certificate and the pending challenge's, replaced by the issuance task while the
 /// listener serves them.
@@ -394,6 +420,32 @@ mod tests {
         ];
         for (sni, alpn, expected) in cases {
             assert_eq!(routed(sni, alpn), expected, "{sni:?} {alpn:?}");
+        }
+    }
+
+    #[test]
+    fn a_public_name_is_one_lowercase_dns_name_on_an_endpoint_open_to_any_client() {
+        let upstream = Some("app:8080");
+        assert_eq!(
+            parse_public_name(Some(NAME), upstream, &[])
+                .unwrap()
+                .as_deref(),
+            Some(NAME)
+        );
+        assert!(parse_public_name(None, upstream, &[]).unwrap().is_none());
+
+        let caller = [alpha_core::AppId::mint()];
+        for (name, upstream, callers) in [
+            ("Hello.alphacompute.cc", upstream, &[][..]),
+            ("localhost", upstream, &[]),
+            ("10.0.0.1", upstream, &[]),
+            (NAME, None, &[]),
+            (NAME, upstream, &caller),
+        ] {
+            assert!(
+                parse_public_name(Some(name), upstream, callers).is_err(),
+                "{name:?} {upstream:?}"
+            );
         }
     }
 

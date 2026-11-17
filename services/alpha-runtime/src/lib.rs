@@ -256,32 +256,6 @@ pub struct InferenceFront {
     pub revisions: Vec<ComposeHash>,
 }
 
-/// `ALPHACOMPUTE_PUBLIC_NAME`; None when it is not set.
-pub fn parse_public_name(
-    name: Option<&str>,
-    upstream: Option<&str>,
-    callers: &[AppId],
-) -> Result<Option<String>, Error> {
-    let refused = |m: &str| Error::Config(format!("ALPHACOMPUTE_PUBLIC_NAME: {m}"));
-    let Some(name) = name else {
-        return Ok(None);
-    };
-    if !name.contains('.')
-        || name.bytes().any(|b| b.is_ascii_uppercase())
-        || rustls::pki_types::DnsName::try_from(name).is_err()
-    {
-        return Err(refused("is not a lowercase DNS name"));
-    }
-    if upstream.is_none() {
-        return Err(refused("set without ALPHACOMPUTE_TLS_UPSTREAM"));
-    }
-    // A browser and the ACME CA present no Instance leaf.
-    if !callers.is_empty() {
-        return Err(refused("set with ALPHACOMPUTE_TLS_CALLER_APPS"));
-    }
-    Ok(Some(name.to_owned()))
-}
-
 /// `ALPHACOMPUTE_INFERENCE_URL` and `ALPHACOMPUTE_INFERENCE_REVISIONS`, both or neither.
 pub fn parse_inference(
     url: Option<&str>,
@@ -416,11 +390,12 @@ impl Config {
                 .ok()
                 .as_deref(),
         )?;
-        let public = parse_public_name(
+        let public = alpha_client::acme::parse_public_name(
             optional("ALPHACOMPUTE_PUBLIC_NAME").as_deref(),
             config.tls_upstream.as_deref(),
             &config.tls_callers,
-        )?;
+        )
+        .map_err(Error::Config)?;
         let inference = parse_inference(
             optional("ALPHACOMPUTE_INFERENCE_URL").as_deref(),
             optional("ALPHACOMPUTE_INFERENCE_REVISIONS").as_deref(),
@@ -1099,33 +1074,6 @@ mod tests {
     use super::*;
 
     const HASH: &str = "sha256:ee097e09c4824eb6424202fe20ed882d19a33a563f3b3dd5988f3ff8ee1b8335";
-    const PUBLIC_NAME: &str = "hello.alphacompute.cc";
-
-    #[test]
-    fn a_public_name_is_one_lowercase_dns_name_on_an_endpoint_open_to_any_client() {
-        let upstream = Some("app:8080");
-        assert_eq!(
-            parse_public_name(Some(PUBLIC_NAME), upstream, &[])
-                .unwrap()
-                .as_deref(),
-            Some(PUBLIC_NAME)
-        );
-        assert!(parse_public_name(None, upstream, &[]).unwrap().is_none());
-
-        let caller = [alpha_core::AppId::mint()];
-        for (name, upstream, callers) in [
-            ("Hello.alphacompute.cc", upstream, &[][..]),
-            ("localhost", upstream, &[]),
-            ("10.0.0.1", upstream, &[]),
-            (PUBLIC_NAME, None, &[]),
-            (PUBLIC_NAME, upstream, &caller),
-        ] {
-            assert!(
-                parse_public_name(Some(name), upstream, callers).is_err(),
-                "{name:?} {upstream:?}"
-            );
-        }
-    }
 
     fn listed() -> KmsRevisions {
         KmsRevisions::parse(Some(HASH), None, None).unwrap()
