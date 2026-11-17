@@ -90,7 +90,7 @@ const MESSAGES = {
   catalog: "The catalog entry for this launch is not signed by AlphaCompute. Nothing was signed.",
   revision_revoked: "The KMS refuses this launch because it was revoked before. Nothing was approved.",
   requester: "From the requester, not verified:",
-  no_change: "No change to images, environment, Secrets or network openings.",
+  no_change: "No change to images, published ports, environment, Secrets or network openings.",
   keep_predecessor: (hash) => `Keep the previous Revision ${hash} runnable`,
   revoke_effect:
     "Revoking stops the KMS from giving these launches keys, Secrets or certificates: no copy can start, and a running copy gets none again. It cannot be undone; the same launch can never be approved again.",
@@ -209,8 +209,8 @@ function storeVersion(version) {
 let lastCall = -Infinity;
 
 // One call to alpha-control. A 429 is answered before anything is relayed, so the identical request
-// is sent once more after Retry-After.
-async function api(view, method, path, bodyText) {
+// is sent once more after Retry-After. `headers` adds to the content type.
+async function api(view, method, path, bodyText, headers = {}) {
   for (let attempt = 0; ; attempt += 1) {
     const wait = lastCall + PACE_MS - Date.now();
     if (wait > 0) await sleep(wait);
@@ -219,7 +219,7 @@ async function api(view, method, path, bodyText) {
     try {
       reply = await fetch(view.signer.api_origin + path, {
         method,
-        headers: bodyText === undefined ? {} : { "Content-Type": "application/json" },
+        headers: bodyText === undefined ? headers : { "Content-Type": "application/json", ...headers },
         body: bodyText,
         cache: "no-store",
         credentials: "omit",
@@ -445,21 +445,22 @@ function loadSession(ticket) {
   }
 }
 
+// Whether the tab kept it: without storage a reload cannot resume, and a sign-in cannot be used.
 function saveSession(c) {
   try {
     sessionStorage.setItem(sessionKey(c.ticket), JSON.stringify(c.session));
+    return true;
   } catch (_) {
-    // Without storage a reload cannot resume; the claim itself is unaffected.
+    return false;
   }
 }
 
-// A root needs the owner's session, which alpha-control binds to the ticket and then names the
-// owner's principal; a key added to a rooted organization needs a signature by one of its keys.
+// A root needs the owner's session, which only the tab that redeemed the sign-in holds; a key
+// added to a rooted organization needs a signature by one of its keys.
 function claimRefusal(read) {
   if (typeof read.rooted !== "boolean") return MESSAGES.unavailable;
-  if (read.principal_id != null && !UUID.test(read.principal_id)) return MESSAGES.unavailable;
   if (read.rooted) {
-    if (read.principal_id == null) return MESSAGES.unavailable;
+    if (!UUID.test(read.principal_id)) return MESSAGES.unavailable;
     return read.credentials.length ? null : MESSAGES.no_credentials;
   }
   const o = read.oidc;
@@ -484,8 +485,13 @@ async function startClaim(view, ticket, note) {
   ui.facts.replaceChildren(
     el("p", MESSAGES.root_statement(read.owner_email, read.org_name, read.org_id), "warning"),
   );
-  if (read.principal_id == null) return offerSignIn(c, note);
+  if (!s.owner) return offerSignIn(c, note);
   return s.first ? offerRoot(c, note) : offerFirst(c, note);
+}
+
+// The owner's principal once this tab signed in, else the one the ticket names for a new key.
+function principalOf(c) {
+  return c.session.owner?.principal_id ?? c.read.principal_id;
 }
 
 function redirectUri() {
@@ -501,7 +507,8 @@ function offerSignIn(c, note) {
 }
 
 // Authorization code with PKCE: the identity provider sends the person back to this path with
-// the code, and alpha-control redeems it and binds the owner's session to the ticket.
+// the code, and alpha-control redeems it and returns a session secret that the root relay needs,
+// so a second holder of the ticket cannot root the organization after the owner signed in.
 async function signIn(c) {
   const state = b64u(random(32));
   const verifier = b64u(random(32));
@@ -541,7 +548,14 @@ async function finishSignIn(view) {
   if (!code) return startClaim(view, saved.ticket, MESSAGES.sign_in_failed);
   const body = JSON.stringify({ code, code_verifier: saved.verifier, redirect_uri: redirectUri() });
   const reply = await api(view, "POST", `/v1/tickets/${saved.ticket}/session`, body);
-  return startClaim(view, saved.ticket, reply.status === 200 ? undefined : failure(reply));
+  if (reply.status !== 200) return startClaim(view, saved.ticket, failure(reply));
+  const owner = reply.body;
+  if (!TICKET.test(owner?.session) || !UUID.test(owner.principal_id)) {
+    return startClaim(view, saved.ticket, MESSAGES.unavailable);
+  }
+  const session = { session: owner.session, principal_id: owner.principal_id };
+  const c = { ticket: saved.ticket, session: { ...loadSession(saved.ticket), owner: session } };
+  return saveSession(c) ? startClaim(view, saved.ticket) : stop(MESSAGES.no_storage);
 }
 
 // A button that creates one passkey and hands its key to `next`, or offers `retry` a note.
@@ -563,7 +577,7 @@ function offerFirst(c, note) {
   const exclude = c.read.credentials.map((x) => x.credential_id);
   const options = createOptions(c.view, c.read.org_name, exclude);
   const next = (key) => {
-    c.session = { first: key, root: !c.read.rooted };
+    c.session = { ...c.session, first: key, root: !c.read.rooted };
     saveSession(c);
     return c.read.rooted ? offerAddApproval(c) : offerRoot(c);
   };
@@ -585,7 +599,8 @@ function offerRegistration(c, note, step) {
       JSON.stringify({ payload: step.payload, signature: signatureObject(credential, keyId) }),
     );
     const body = `{"credential_id":${JSON.stringify(step.key.id)},"registration":${registration}}`;
-    const reply = await api(c.view, "POST", ticketPath(c.ticket, step.op), body);
+    const owner = step.op === "root" ? { "Alpha-Claim-Session": c.session.owner.session } : {};
+    const reply = await api(c.view, "POST", ticketPath(c.ticket, step.op), body, owner);
     if (reply.status !== 200) return step.retry(failure(reply));
     const signed = receipt(c.view, reply, "key.register", registration, {
       org_id: c.read.org_id,
@@ -620,7 +635,7 @@ function rootStep(orgId, principalId, key) {
 
 function offerRoot(c, note) {
   offerRegistration(c, note, {
-    ...rootStep(c.read.org_id, c.read.principal_id, c.session.first),
+    ...rootStep(c.read.org_id, principalOf(c), c.session.first),
     retry: (n) => offerRoot(c, n),
     next: () => rooted(c),
   });
@@ -642,7 +657,7 @@ function offerAddApproval(c, note) {
 }
 
 function principalKey(c, key, label) {
-  return { principal_id: c.read.principal_id, public_key: key.spki, label, issued_at: issuedAt() };
+  return { principal_id: principalOf(c), public_key: key.spki, label, issued_at: issuedAt() };
 }
 
 function describeKey(title, key) {
@@ -937,6 +952,8 @@ function changes(before, after) {
       continue;
     }
     if (b.image !== s.image) lines.push([`${n}: image ${b.image} → ${s.image}`, true]);
+    for (const p of s.ports.filter((x) => !b.ports.includes(x))) lines.push([`${n}: publishes ${p}`, true]);
+    for (const p of b.ports.filter((x) => !s.ports.includes(x))) lines.push([`${n}: stops publishing ${p}`, false]);
     const keys = [...new Set([...Object.keys(b.environment), ...Object.keys(s.environment)])];
     for (const k of keys.sort()) {
       if (b.environment[k] === s.environment[k]) continue;

@@ -414,7 +414,7 @@ async function loadPage(options = {}) {
   async function fakeFetch(resource, init = {}) {
     const url = String(resource);
     const method = (init.method || "GET").toUpperCase();
-    fetches.push({ method, url, body: init.body, credentials: init.credentials, time: clock.now });
+    fetches.push({ method, url, body: init.body, headers: init.headers, credentials: init.credentials, time: clock.now });
     if (url === b.wasmName) {
       assert.equal(init.integrity, wasmSri, "the page fetched the wasm without its integrity");
       return new Response(b.wasm, { headers: { "Content-Type": "application/wasm" } });
@@ -443,6 +443,7 @@ async function loadPage(options = {}) {
         method,
         path: pathname,
         body: init.body,
+        headers: init.headers || {},
         credentials: init.credentials,
       });
       if (answer instanceof Error) throw new TypeError("network");
@@ -676,13 +677,15 @@ function ticketApi(kind, options, api, fields) {
 
 // A claim ticket, with the KMS behind it answering every key registration with a receipt.
 // `api.receiptFor(registrationText, response)` may be replaced to return a receipt that must
-// fail. An unrooted organization's ticket names the owner's principal only once the owner's
-// session is bound, which `POST …/session` does when `api.owner_code` is its code.
+// fail. `POST …/session` with `api.owner_code` answers the owner's session secret, which a root
+// relay must carry; `options.session` (default true) means a tab already holds it, which
+// `seedOwner` puts in that tab's storage.
 function claimApi(options = {}) {
   const api = ticketApi("claim", options, {
     principal_id: crypto.randomUUID(),
     rooted: Boolean(options.rooted),
     session: options.session ?? true,
+    owner_session: b64u(crypto.randomBytes(32)),
     owner_email: "owner@acme.example",
     owner_code: "the-owners-code",
     oidc: { authorization_endpoint: "https://id.example/authorize", client_id: "signer" },
@@ -694,20 +697,21 @@ function claimApi(options = {}) {
   const read = api.routes[`GET ${BASE}`];
   api.routes[`GET ${BASE}`] = () => {
     const answer = read();
-    if (answer.body && !api.rooted && !api.session) answer.body.principal_id = null;
+    if (answer.body && !api.rooted) answer.body.principal_id = null;
     return answer;
   };
   api.routes[`POST ${BASE}/session`] = (req) => {
     const body = JSON.parse(req.body);
     api.sessions.push(body);
     if (body.code !== api.owner_code) return failed(403, "session_refused");
-    api.session = true;
-    return { status: 200, body: {} };
+    return { status: 200, body: { session: api.owner_session, principal_id: api.principal_id } };
   };
   const register = (op) => (req) => {
     const key = keyBody(req.body);
     api.registrations.push({ ...key, op, body: req.body });
-    if (op === "root" && !api.session) return failed(403, "session_required");
+    if (op === "root" && req.headers["Alpha-Claim-Session"] !== api.owner_session) {
+      return failed(403, "session_required");
+    }
     if (api.keysReply) return api.keysReply(key.registrationText);
     const response = registerKey(api, key);
     if (op === "root") api.rooted = true;
@@ -720,6 +724,15 @@ function claimApi(options = {}) {
   api.routes[`POST ${BASE}/kms/key`] = register("key");
   return api;
 }
+
+// Puts the owner's session secret in `tab`, as a tab back from signing in holds it.
+function seedOwner(tab, api) {
+  const key = `alphacompute-claim-sha256:${sha256(TICKET).toString("hex")}`;
+  const owner = { session: api.owner_session, principal_id: api.principal_id };
+  tab.setItem(key, JSON.stringify({ owner }));
+  return tab;
+}
+
 
 function revokeRoute(api) {
   return (req) => {
@@ -841,6 +854,7 @@ module.exports = {
   memoryStorage,
   mintReceipt,
   revocationApi,
+  seedOwner,
   sha256,
   testView,
   testdata,

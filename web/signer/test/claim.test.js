@@ -18,6 +18,7 @@ const {
   mintReceipt,
   ids,
   plain,
+  seedOwner,
   sha256,
   testView,
   TICKET,
@@ -26,9 +27,12 @@ const {
 const YOURS = "This organization is yours.";
 const SYNCED = "Synced passkey (backed up by your provider)";
 
+// A claim page in a tab that holds the owner's session unless `apiOptions.session` is false.
 async function claimPage(apiOptions = {}, pageOptions = {}) {
   const api = claimApi(apiOptions);
-  const page = await loadPage({ routes: api.routes, ...pageOptions });
+  const tab = pageOptions.sessionStorage || memoryStorage();
+  if (api.session) seedOwner(tab, api);
+  const page = await loadPage({ routes: api.routes, ...pageOptions, sessionStorage: tab });
   await page.startClaim();
   return { api, page };
 }
@@ -349,7 +353,7 @@ test("skipping the second passkey leaves a permanent warning", async () => {
 
 test("a reload in the same tab resumes, and another tab adds a key only with an existing one", async () => {
   const api = claimApi();
-  const tab = memoryStorage();
+  const tab = seedOwner(memoryStorage(), api);
   const first = await loadPage({ routes: api.routes, sessionStorage: tab });
   await first.startClaim();
   await first.click("Create passkey");
@@ -468,6 +472,17 @@ test("a root claim makes no passkey until the owner's sign-in is bound to the ti
   assert.deepEqual(owner.replaced, [`/sign/claim#${TICKET}`]);
   assert.equal(tab.getItem(key), null);
   assert.deepEqual(owner.buttons(), ["Create passkey"]);
+
+  // Another holder of the ticket, after the owner signed in elsewhere, is still only asked to sign in.
+  const other = await loadPage({ routes: api.routes, sessionStorage: memoryStorage() });
+  await other.startClaim();
+  assert.deepEqual(other.buttons(), [SIGN_IN]);
+
+  await owner.click("Create passkey");
+  await owner.click("Confirm with passkey");
+  assert.ok(owner.text().includes(YOURS), owner.text());
+  const root = owner.fetches.find((f) => f.url.endsWith("/kms/root"));
+  assert.equal(root.headers["Alpha-Claim-Session"], api.owner_session);
 });
 
 test("a device-bound passkey is named as such", async () => {

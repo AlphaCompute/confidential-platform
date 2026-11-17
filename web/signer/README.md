@@ -52,14 +52,18 @@ revocation verified.
 
 ## Claim
 
-A ticket alone never adds a key. A `claim` ticket adds `rooted`, `principal_id`, and, for an
-organization without a root, `owner_email` and `oidc` (`{authorization_endpoint, client_id}`).
+A ticket alone never adds a key. A `claim` ticket adds `rooted`; for a rooted organization
+`principal_id`, the principal of the key to add; and for an organization without a root
+`owner_email` and `oidc` (`{authorization_endpoint, client_id}`), but no principal.
 To root the organization the owner first signs in: the page sends the person to the identity
 provider with an authorization code request and PKCE, keeps the verifier in the tab's
 `sessionStorage` under the request's `state`, and on the return to the same path posts
 `{code, code_verifier, redirect_uri}` to `POST /v1/tickets/{ticket}/session`. `alpha-control`
-redeems the code, checks that the ID token is the owner's, and from then on names the owner's
-`principal_id` in the read. Only then does the page create a passkey, state "You, `<owner email>`,
+redeems the code, checks that the ID token is the owner's, and answers `{session, principal_id}`:
+`session` is 32 random bytes as base64url, which the tab keeps and sends as the
+`Alpha-Claim-Session` header of the `kms/root` relay, and `alpha-control` refuses a root relay
+without it. So another holder of the ticket cannot root the organization once the owner has signed
+in elsewhere. Only then does the page create a passkey, state "You, `<owner email>`,
 are making this passkey the root key of `<organization>`", sign the `org-root-key` document with
 it and relay it (`kms/root`). A key added to a rooted organization is signed by one of its
 passkeys and relayed as `kms/key`; the page offers a second passkey after a root, and checks each
@@ -121,7 +125,8 @@ The page lives at `<origin>/claim#<ticket>`, `<origin>/approve#<ticket>`,
 path prefix, such as `/sign/`. All of them serve the same `index.html`, which picks its mode
 from the last path segment; the ticket stays in
 the fragment, so it never reaches a server. The identity provider sends an owner back to
-`<origin>/claim`, so that path is the OIDC client's redirect URI. The assets are served next to the page, with
+`<origin><prefix>/claim` (`<origin>/claim` without a prefix, `<origin>/sign/claim` under `/sign/`),
+so that URL is the OIDC client's redirect URI. The assets are served next to the page, with
 the types `text/javascript`, `application/wasm`, `text/css` and `font/woff2`, and may be cached forever because
 their names change with their content. `platform.json` beside the page is the release-signed platform
 document, and `catalog/<64 hex>.json` serves each catalog entry under the SHA-256 of its

@@ -354,6 +354,16 @@ test("a new Revision shows its changes and revokes the one it replaces unless ke
   const { api, page, laptop } = await approvalPage({ revision, predecessor });
   const added = [...page.main.walk()].filter((n) => n.className === "added").map((n) => n.textContent);
   assert.deepEqual(added, [`web: image ${was} → ${now}`]);
+
+  const local = revision.replace("- 443:8443", "- 127.0.0.1:443:8443");
+  assert.notEqual(local, revision);
+  const exposed = await approvalPage({
+    revision,
+    predecessor: { compose_hash: `sha256:${hex(local)}`, revision: local },
+  });
+  const marked = [...exposed.page.main.walk()].filter((n) => n.className === "added").map((n) => n.textContent);
+  assert.deepEqual(marked, ["alpha-runtime: publishes 443:8443"]);
+  assert.ok(exposed.page.text().includes("alpha-runtime: stops publishing 127.0.0.1:443:8443"));
   assert.ok(!page.find((n) => n.id === "keep-predecessor").checked);
 
   api.revokeReceipt = (text, response) => mintReceipt("revision.register", text, response);
