@@ -1,0 +1,5 @@
+[[egress]]
+protocol = "tcp"
+port = 443
+cidr = "0.0.0.0/0"
+justification = "Pull the images from ghcr.io, fetch the platform document, and get the public name's certificate from the ACME CA"

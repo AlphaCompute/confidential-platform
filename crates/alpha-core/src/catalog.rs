@@ -198,7 +198,7 @@ pub fn render(
         .map_err(|e| CatalogError::Malformed(format!("template: {e}")))?;
     if parsed.app_id() != Some(app_id) {
         return Err(CatalogError::Malformed(
-            "template: [data] app_id is not the nil App id".into(),
+            "template: [data] app_id does not name the App".into(),
         ));
     }
     Ok(Rendered {

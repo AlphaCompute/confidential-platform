@@ -3,7 +3,9 @@
 //! annotation is the pod.
 
 use alpha_core::catalog::{CatalogFile, Entry, Resources, Substitutions};
-use alpha_core::{AppId, compose_hash};
+use std::collections::BTreeMap;
+
+use alpha_core::{AppId, InitData, compose_hash};
 use ed25519_dalek::SigningKey;
 use serde_yaml_ng::Value as Yaml;
 
@@ -35,6 +37,11 @@ pub fn sign(
     let pod = without_init_data(rendered_pod)?;
     // Re-check in case the file was edited: refuses a tagged image.
     coco::parse(pod.as_bytes())?;
+    if pod_images(&pod)? != policy_images(&template)? {
+        return Err(
+            "the Pod's images are not the ones its init-data policy admits; render it again".into(),
+        );
+    }
     let entry = Entry {
         catalog_id: catalog_id.into(),
         version: version.into(),
@@ -58,13 +65,66 @@ fn without_init_data(pod: &str) -> Result<String, String> {
     serde_yaml_ng::to_string(&spec).map_err(|e| format!("pod spec: {e}"))
 }
 
+/// Container name to image, as the Pod declares them.
+fn pod_images(pod: &str) -> Result<BTreeMap<String, String>, String> {
+    let spec: Yaml = serde_yaml_ng::from_str(pod).map_err(|e| format!("pod spec: {e}"))?;
+    ["initContainers", "containers"]
+        .into_iter()
+        .filter_map(|list| spec.get("spec")?.get(list)?.as_sequence())
+        .flatten()
+        .map(|c| {
+            let field = |key: &str| c.get(key).and_then(Yaml::as_str).map(str::to_owned);
+            field("name")
+                .zip(field("image"))
+                .ok_or_else(|| "pod spec: a container has no name or image".to_owned())
+        })
+        .collect()
+}
+
+/// Container name to image, as the agent policy admits them; the pause container is not the Pod's.
+fn policy_images(template: &str) -> Result<BTreeMap<String, String>, String> {
+    let containers = InitData::parse(template.to_owned())
+        .and_then(|i| i.containers())
+        .map_err(|e| format!("init-data: {e}"))?;
+    let annotations = containers
+        .as_array()
+        .ok_or("init-data: policy containers are not a list")?
+        .iter()
+        .filter_map(|c| c.get("OCI")?.get("Annotations"));
+    let mut images = BTreeMap::new();
+    for a in annotations {
+        let field = |key: &str| a.get(key).and_then(serde_json::Value::as_str);
+        if field("io.kubernetes.cri.container-type") != Some("container") {
+            continue;
+        }
+        let (Some(name), Some(image)) = (
+            field("io.kubernetes.cri.container-name"),
+            field("io.kubernetes.cri.image-name"),
+        ) else {
+            return Err("init-data: a policy container has no name or image".into());
+        };
+        images.insert(name.to_owned(), image.to_owned());
+    }
+    Ok(images)
+}
+
 /// The TD Kata boots for the Pod: 1 vCPU and 2048 MiB plus the summed container limits. Only whole
 /// vCPUs and `Mi` or `Gi` memory are accepted, so the signed shape is exactly the TD's.
 fn shape(pod: &str) -> Result<Resources, String> {
     let spec: Yaml = serde_yaml_ng::from_str(pod).map_err(|e| format!("pod spec: {e}"))?;
-    let containers = spec
-        .get("spec")
-        .and_then(|s| s.get("containers"))
+    let pod_spec = spec.get("spec").ok_or("pod spec: no spec")?;
+    // Kata sizes the TD from the containers' limits only, so any other sizing would not be signed.
+    let init_sized = pod_spec
+        .get("initContainers")
+        .and_then(Yaml::as_sequence)
+        .into_iter()
+        .flatten()
+        .any(|c| c.get("resources").is_some());
+    if init_sized || pod_spec.get("resources").is_some() {
+        return Err("pod spec: set resources on containers only".into());
+    }
+    let containers = pod_spec
+        .get("containers")
         .and_then(Yaml::as_sequence)
         .ok_or("pod spec: no spec.containers")?;
     let mut shape = Resources {
@@ -276,6 +336,10 @@ mod tests {
             );
         assert_eq!(template.matches(PUBLIC_NAME).count(), 1);
         coco::parse(template.as_bytes()).unwrap();
+        alpha_core::Openings::parse(include_str!(
+            "../../../deploy/kata/catalog/confidential-container.network.toml"
+        ))
+        .unwrap();
         assert_eq!(
             shape(&template).unwrap(),
             Resources {
@@ -308,6 +372,8 @@ mod tests {
         ] {
             assert!(shape(&with(limits)).is_err(), "{limits}");
         }
+        let pod_level = K3_POD.replace("spec:\n", "spec:\n  resources: {limits: {cpu: 1}}\n");
+        assert!(shape(&pod_level).is_err());
     }
 
     #[test]
@@ -337,6 +403,15 @@ mod tests {
         assert!(err.contains("--app-id"), "{err}");
 
         let image = "public.ecr.aws/docker/library/alpine@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8";
+        let swapped = pod.replace(
+            image,
+            &format!(
+                "public.ecr.aws/docker/library/alpine@sha256:{}",
+                "4b".repeat(32)
+            ),
+        );
+        let err = signed(&swapped, LABELS).unwrap_err();
+        assert!(err.contains("policy admits"), "{err}");
         let tagged = pod.replace(image, "public.ecr.aws/docker/library/alpine:3");
         let err = signed(&tagged, LABELS).unwrap_err();
         assert!(err.contains("sha256"), "{err}");

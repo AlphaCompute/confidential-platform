@@ -544,7 +544,8 @@ the cluster is the operator's choice of ingress, in TLS passthrough: each termin
 ## Catalog entries
 
 A catalog entry is a Revision template. The catalog key signs it once, and each App that
-launches it gets its own Revision. `catalog/` holds the pod spec of each entry. An entry varies only in two values: the App id and the public name
+launches it gets its own Revision. `catalog/` holds the pod spec and the network openings of each
+entry. An entry varies only in two values: the App id and the public name
 `<slug>.app.alphacompute.cc`. The pod spec writes the public name as
 `__ALPHACOMPUTE_PUBLIC_NAME__`, and `alpha coco render` writes the nil App id into the init-data.
 `alpha-control` and the signer page put in the two values with the same `alpha-core` function. The
@@ -556,7 +557,8 @@ key file:
 ```sh
 envsubst '$RUNTIME_IMAGE $KMS_CA_SPKI_SHA256 $PLATFORM_DOCUMENT_URL $PLATFORM_MIN_VERSION $KMS_ENDPOINTS' \
   < deploy/kata/catalog/confidential-container.yaml > cc.yaml
-alpha coco render --app-id 00000000-0000-0000-0000-000000000000 --kata <opt/kata> --out cc-rendered.yaml cc.yaml
+alpha coco render --app-id 00000000-0000-0000-0000-000000000000 --kata <opt/kata> \
+  --network deploy/kata/catalog/confidential-container.network.toml --out cc-rendered.yaml cc.yaml
 alpha catalog sign --id confidential-container --version 1 --title "Confidential container" \
   --key catalog.key --out-dir catalog cc-rendered.yaml
 ```
