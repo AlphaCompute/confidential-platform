@@ -14,7 +14,10 @@ A tag `v*` runs `.github/workflows/release.yml`: every image (`alpha-runtime`, `
 `alpha-kms-dev`, `alpha-inference`, `alpha-broker`, `alpha-guard`, `alpha-cpu-app`) is built
 with `--no-cache` on two fresh runners, and an image is pushed as `ghcr.io/<owner>/<name>:<tag>`
 only when the CI checks pass on the tagged commit and both runners give one image id and one
-layer set. Each pushed digest carries a signed GitHub build-provenance attestation, stored beside the
+layer set. The artifact `release-images` holds `images.json`, which maps each pushed image's
+name to its `ghcr.io/…@sha256:…` reference; the job summary shows the same list. Copy the
+`alpha-runtime` and other image pins of a platform document or a catalog entry from it.
+Each pushed digest carries a signed GitHub build-provenance attestation, stored beside the
 image in ghcr. Check it against this workflow at the tag, since `--repo` alone also accepts an
 attestation from a dispatch of an edited workflow on any branch:
 

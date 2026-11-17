@@ -171,6 +171,36 @@ jobs:
           path: pushed
           if-no-files-found: error
 
+  # Every pushed image by name, the list a platform document's pins and a catalog entry's
+  # runtime image are copied from. An image whose build failed is missing, and its image job has
+  # already failed the run.
+  digests:
+    needs: image
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: "*-digest"
+          path: pushed
+      - name: List the pushed images by digest
+        run: |
+          mkdir release
+          for f in pushed/*-digest/digest; do
+            name=${f#pushed/}
+            jq -n --arg name "${name%-digest/digest}" --rawfile ref "$f" '{($name): ($ref | rtrimstr("\n"))}'
+          done | jq -s 'add' > release/images.json
+          {
+            echo '```json'
+            cat release/images.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-images
+          path: release
+          if-no-files-found: error
+
   # The renders run the CLI and its dependencies' build scripts, and the Kata tools, so they get
   # the pushed digest from an artifact and no credential.
   render:
