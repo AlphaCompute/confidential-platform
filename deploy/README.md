@@ -1,10 +1,8 @@
 # The KMS nodes on Phala Cloud
 
 Two CVMs in two regions run one Revision of `alpha-kms` over one trust-zone Postgres. The
-production nodes are deployed neither by CI nor by shroud-go's deploy route: the operator creates
-and upgrades the two CVMs by hand through the Phala Cloud API (or the `phala` CLI), one at a
-time, with the compose the release workflow rendered. The dev node is deployed the same way.
-This directory is the runbook; the compose itself is a
+operator creates and upgrades the CVMs by hand through the Phala Cloud API (or the `phala` CLI),
+one at a time, with the compose the release workflow rendered. This directory is the runbook; the compose itself is a
 release artifact, because it names the image by digest and the digest exists only after the
 build.
 
@@ -47,6 +45,8 @@ dev `01a09f07-8d09-7aff-b257-83dbd9e6e641`); `testdata/manifest/06-kms-node` pin
 `alpha-kms-dev` is the image of the dev KMS App: the `dev-root` cargo feature, compiled in, takes
 the root KEK from `ALPHACOMPUTE_KMS_DEV_ROOT_KEK` instead of the custodians' shares. It is a
 different image with a different `compose_hash`; a production platform document never lists it.
+`.github/workflows/dev-image.yml` builds it and `alpha-runtime` once with the build cache and
+pushes `dev-<commit>`, minutes instead of a release's double build.
 
 ## Release keys
 
@@ -71,12 +71,6 @@ runs the previous Revision's images under the new measurement for about a second
 ten. It keeps the images: without a script the API
 inserts its own, which prunes every image before pulling, and a CVM rebooted afterwards would
 lose the image it runs.
-
-## Dev images
-
-`.github/workflows/dev-image.yml` builds `alpha-kms-dev` and `alpha-runtime` once with the build
-cache and pushes `dev-<commit>`, minutes instead of a release's double build. Dev images are
-never listed in a production platform document.
 
 ## Signing the Revision
 
