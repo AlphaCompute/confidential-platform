@@ -16,7 +16,7 @@ use crate::{AppState, Caller, Error, SCOPES, audit, mint_token};
 
 const TEXT_MAX: usize = 256;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Link {
     pub issuer: String,
@@ -152,13 +152,8 @@ pub async fn create(
         }
         None => None,
     };
-    let links: Vec<_> = new
-        .links
-        .iter()
-        .map(|l| json!({ "issuer": l.issuer, "external_id": l.external_id }))
-        .collect();
     let details = json!({
-        "links": links,
+        "links": new.links,
         "deploy_key": deploy_key.as_ref().map(|k| json!({ "id": k.id, "scopes": k.scopes })),
     });
     audit(

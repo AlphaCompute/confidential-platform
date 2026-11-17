@@ -37,10 +37,16 @@ fn env(name: &str) -> Result<String, Error> {
 }
 
 fn hex_env<const N: usize>(name: &str) -> Result<Zeroizing<[u8; N]>, Error> {
-    let mut out = Zeroizing::new([0u8; N]);
-    hex::decode_to_slice(env(name)?.trim(), out.as_mut_slice())
-        .map_err(|_| Error::internal(format!("{name} must be {N} hex-encoded bytes")))?;
-    Ok(out)
+    let decoded = Zeroizing::new(
+        data_encoding::HEXLOWER_PERMISSIVE
+            .decode(env(name)?.trim().as_bytes())
+            .unwrap_or_default(),
+    );
+    decoded
+        .as_slice()
+        .try_into()
+        .map(Zeroizing::new)
+        .map_err(|_| Error::internal(format!("{name} must be {N} hex-encoded bytes")))
 }
 
 /// The challenge certificate for the CA's validation, the public one for everyone else.

@@ -216,7 +216,6 @@ dependencies = [
  "axum",
  "data-encoding",
  "getrandom 0.4.3",
- "hex",
  "rustls",
  "serde",
  "serde_json",
