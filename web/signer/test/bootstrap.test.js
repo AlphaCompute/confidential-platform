@@ -2,8 +2,10 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const {
   TICKET,
+  approvalApi,
   deniedStorage,
   loadPage,
   memoryStorage,
@@ -87,10 +89,10 @@ test("a link with another path or a malformed ticket is not valid", async () => 
   const cases = [
     { path: "/sign/other" },
     { path: "/sign/" },
+    { path: "/sign/other", hash: "" },
     { hash: "short" },
     { hash: `${TICKET}A` },
     { hash: `${TICKET.slice(1)}+` },
-    { hash: "" },
   ];
   for (const options of cases) {
     const page = await booted(options);
@@ -101,4 +103,22 @@ test("a link with another path or a malformed ticket is not valid", async () => 
     const page = await booted({ path });
     assert.equal(page.text(), NOT_SIGNER, path);
   }
+});
+
+test("a typed code opens the ticket it stands for", async () => {
+  const api = approvalApi({ app_id: crypto.randomUUID(), revision: "x" });
+  api.routes["GET /v1/tickets/by-code/7K3MQ2ZX"] = () => ({
+    status: 200,
+    body: { kind: "approve", ticket: TICKET },
+  });
+  const page = await loadPage({ routes: api.routes, path: "/", hash: "" });
+  await page.init();
+  page.call("offerCode", testView());
+  page.find((n) => n.id === "code").value = "7k3m-q2zl";
+  await page.click("Continue");
+  assert.ok(page.text().includes("Enter the 8 characters of your code."), page.text());
+  page.find((n) => n.id === "code").value = "7k3m-q2zx";
+  await page.click("Continue");
+  assert.deepEqual(page.replaced, [`./approve#${TICKET}`]);
+  assert.ok(page.fetches.some((f) => f.url.endsWith(`/v1/tickets/${TICKET}`)));
 });

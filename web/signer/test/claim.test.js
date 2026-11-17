@@ -11,6 +11,7 @@ const {
   b64u,
   claimApi,
   contextDigest,
+  failed,
   iso,
   loadPage,
   memoryStorage,
@@ -18,6 +19,8 @@ const {
   ids,
   plain,
   sha256,
+  testView,
+  TICKET,
 } = require("./harness.js");
 
 const YOURS = "This organization is yours.";
@@ -45,7 +48,10 @@ test("a root claim registers the first passkey and says the organization is your
   assert.match(text, /Acme/);
   assert.match(text, /Claim this organization/);
   assert.ok(text.includes(api.expires_at));
-  assert.equal(api.reveals, 0);
+  assert.ok(
+    text.includes(`You, owner@acme.example, are making this passkey the root key of Acme (${api.org_id}).`),
+    text,
+  );
 
   await page.click("Create passkey");
   const created = page.authenticator.log[0];
@@ -67,7 +73,6 @@ test("a root claim registers the first passkey and says the organization is your
     plain(o.excludeCredentials.map((c) => [c.type, b64u(Buffer.from(c.id))])),
     [["public-key", earlier.id]],
   );
-  assert.equal(api.reveals, 1);
   assert.ok(!page.text().includes(YOURS));
 
   await page.click("Confirm with passkey");
@@ -83,6 +88,7 @@ test("a root claim registers the first passkey and says the organization is your
 
   assert.equal(api.registrations.length, 1);
   const sent = api.registrations[0];
+  assert.equal(sent.op, "root");
   assert.equal(sent.credentialId, key.id);
   const issuedAt = sent.registration.payload.issued_at;
   assert.match(issuedAt, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/);
@@ -147,14 +153,11 @@ test("a receipt that does not verify reads not confirmed", async () => {
     assert.ok(!text.includes(YOURS), name);
   }
   const { api, page } = await claimPage();
-  api.keysReply = () => ({
-    status: 502,
-    body: { error: "<b>upstream</b>", error_code: "SHROUD_UPSTREAM_INVALID" },
-  });
+  api.keysReply = () => failed(502, "upstream_invalid");
   await page.click("Create passkey");
   await page.click("Confirm with passkey");
   assert.ok(page.text().includes(NOT_CONFIRMED));
-  assert.ok(!page.text().includes("upstream"));
+  assert.ok(!page.text().includes("<b>"));
   assert.ok(!page.text().includes(YOURS));
 });
 
@@ -174,7 +177,7 @@ test("a cancelled or refused passkey prompt spends nothing", async () => {
     page.authenticator.fault = { ...fault };
     await page.click("Create passkey");
     assert.ok(page.text().includes(sentence), `${JSON.stringify(fault)}: ${page.text()}`);
-    assert.equal(api.reveals, 0);
+    assert.equal(api.registrations.length, 0);
     assert.ok(page.find((n) => n.tagName === "BUTTON" && n.textContent === "Create passkey" && !n.disabled));
   }
 });
@@ -202,21 +205,15 @@ test("a claim read that never arrives reads unavailable", async () => {
   assert.equal(page.text(), "The service is unavailable. Try again in a minute.");
 });
 
-test("a closed, expired or unknown claim is refused", async () => {
+test("a closed, expired, unknown or keyless claim is refused", async () => {
   const now = Date.now();
   const cases = [
-    [{ state: "closed" }, "This claim link is closed. Ask your AlphaCompute contact for a new link."],
-    [{ state: "expired" }, "This claim link has expired. Ask your AlphaCompute contact for a new link."],
-    [{ expires_at: iso(now - 1000) }, "This claim link has expired. Ask your AlphaCompute contact for a new link."],
-    [{ keys_left: 0 }, "This claim link is closed. Ask your AlphaCompute contact for a new link."],
-    [
-      { read: { status: 404, body: { error: "claim not found", error_code: "SHROUD_NOT_FOUND" } } },
-      "This link is not valid.",
-    ],
-    [
-      { read: { status: 503, body: { error: "x", error_code: "SHROUD_SERVICE_UNAVAILABLE" } } },
-      "The service is unavailable. Try again in a minute.",
-    ],
+    [{ state: "done" }, "This link was already used, declined or closed."],
+    [{ state: "expired" }, "This link has expired."],
+    [{ expires_at: iso(now - 1000) }, "This link has expired."],
+    [{ read: failed(404, "ticket_not_found") }, "This link is not valid."],
+    [{ read: failed(503, "unavailable") }, "The service is unavailable. Try again in a minute."],
+    [{ rooted: true }, "No passkey of this organization is known. Ask your AlphaCompute contact."],
   ];
   for (const [apiOptions, sentence] of cases) {
     const { page } = await claimPage({ now, ...apiOptions }, { now });
@@ -350,7 +347,7 @@ test("skipping the second passkey leaves a permanent warning", async () => {
   assert.equal(api.registrations.length, 1);
 });
 
-test("a reload in the same tab resumes and another tab is sent back to the contact", async () => {
+test("a reload in the same tab resumes, and another tab adds a key only with an existing one", async () => {
   const api = claimApi();
   const tab = memoryStorage();
   const first = await loadPage({ routes: api.routes, sessionStorage: tab });
@@ -364,8 +361,7 @@ test("a reload in the same tab resumes and another tab is sent back to the conta
   await confirming.startClaim();
   assert.deepEqual(confirming.buttons(), ["Confirm with passkey"]);
   await confirming.click("Confirm with passkey");
-  assert.equal(api.reveals, 1);
-  assert.equal(api.state, "rooted");
+  assert.equal(api.rooted, true);
 
   const reloaded = await loadPage({ routes: api.routes, sessionStorage: tab });
   await reloaded.startClaim();
@@ -374,26 +370,17 @@ test("a reload in the same tab resumes and another tab is sent back to the conta
 
   const other = await loadPage({ routes: api.routes, sessionStorage: memoryStorage() });
   await other.startClaim();
-  assert.equal(
-    other.text(),
-    "This link was already opened in another tab or on another device. Ask your AlphaCompute contact for a new link.",
-  );
+  assert.ok(other.text().includes("Add a passkey to this organization"), other.text());
+  await other.click("Create passkey");
+  assert.deepEqual(other.buttons(), ["Approve it with a passkey of this organization"]);
 });
 
-test("a reload after the last key spent the link still offers the checks", async () => {
+test("a reload after both keys are registered still offers the checks", async () => {
   const tab = memoryStorage();
-  const { api } = await twoKeys({ keys_left: 2 }, { sessionStorage: tab });
-  assert.equal(api.keys_left, 0);
+  const { api } = await twoKeys({}, { sessionStorage: tab });
   const reloaded = await loadPage({ routes: api.routes, sessionStorage: tab });
   await reloaded.startClaim();
   assert.deepEqual(reloaded.buttons(), ["Check passkey 1", "Check passkey 2"]);
-
-  const other = await loadPage({ routes: api.routes, sessionStorage: memoryStorage() });
-  await other.startClaim();
-  assert.equal(
-    other.text(),
-    "This claim link is closed. Ask your AlphaCompute contact for a new link.",
-  );
 });
 
 test("an add ticket registers a key signed by an existing passkey", async () => {
@@ -403,7 +390,7 @@ test("an add ticket registers a key signed by an existing passkey", async () => 
   const keyA = "01920000-0000-7000-8000-00000000000a";
   const keyB = "01920000-0000-7000-8000-00000000000b";
   const api = claimApi({
-    kind: "add",
+    rooted: true,
     credentials: [
       { credential_id: a.id, key_id: keyA },
       { credential_id: b.id, key_id: keyB },
@@ -416,7 +403,6 @@ test("an add ticket registers a key signed by an existing passkey", async () => 
   await page.click("Create passkey");
   const created = phone.log[0];
   assert.deepEqual(ids(created.options.excludeCredentials), [a.id, b.id]);
-  assert.equal(api.reveals, 1);
 
   laptop.prefer = b.id;
   page.use(laptop);
@@ -424,6 +410,7 @@ test("an add ticket registers a key signed by an existing passkey", async () => 
   const approval = laptop.log[0];
   assert.deepEqual(ids(approval.options.allowCredentials), [a.id, b.id]);
   const sent = api.registrations[0];
+  assert.equal(sent.op, "key");
   assert.equal(sent.credentialId, created.result.id);
   assert.equal(sent.registration.signature.key_id, keyB);
   assert.equal(sent.registration.payload.public_key, created.result.spki);
@@ -439,6 +426,48 @@ test("an add ticket registers a key signed by an existing passkey", async () => 
   page.use(phone);
   await page.click("Check passkey 1");
   assert.ok(page.text().includes("Done. The new passkey signs as expected."), page.text());
+});
+
+test("a root claim makes no passkey until the owner's sign-in is bound to the ticket", async () => {
+  const tab = memoryStorage();
+  const { api, page } = await claimPage({ session: false }, { sessionStorage: tab });
+  const SIGN_IN = "Sign in as owner@acme.example to claim this organization.";
+  assert.deepEqual(page.buttons(), [SIGN_IN]);
+  await page.click(SIGN_IN);
+  assert.equal(page.authenticator.log.length, 0);
+  const url = new URL(page.assigned[0]);
+  assert.equal(`${url.origin}${url.pathname}`, "https://id.example/authorize");
+  const q = url.searchParams;
+  assert.equal(q.get("response_type"), "code");
+  assert.equal(q.get("client_id"), "signer");
+  assert.equal(q.get("redirect_uri"), "https://signer.test/sign/claim");
+  assert.equal(q.get("code_challenge_method"), "S256");
+  const key = `alphacompute-oidc-${q.get("state")}`;
+  const saved = JSON.parse(tab.getItem(key));
+  assert.equal(saved.ticket, TICKET);
+  assert.equal(q.get("code_challenge"), b64u(sha256(saved.verifier)));
+
+  const back = async (code) => {
+    tab.setItem(key, JSON.stringify(saved));
+    const search = `?code=${code}&state=${q.get("state")}`;
+    const p = await loadPage({ routes: api.routes, sessionStorage: tab, hash: "", search });
+    await p.init();
+    await p.call("finishSignIn", testView().view);
+    return p;
+  };
+  const stranger = await back("someone-elses-code");
+  assert.ok(stranger.text().includes("That sign-in is not the owner of this organization."), stranger.text());
+  assert.deepEqual(stranger.buttons(), [SIGN_IN]);
+
+  const owner = await back(api.owner_code);
+  assert.deepEqual(plain(api.sessions[1]), {
+    code: api.owner_code,
+    code_verifier: saved.verifier,
+    redirect_uri: "https://signer.test/sign/claim",
+  });
+  assert.deepEqual(owner.replaced, [`/sign/claim#${TICKET}`]);
+  assert.equal(tab.getItem(key), null);
+  assert.deepEqual(owner.buttons(), ["Create passkey"]);
 });
 
 test("a device-bound passkey is named as such", async () => {

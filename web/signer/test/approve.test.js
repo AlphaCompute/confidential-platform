@@ -5,28 +5,23 @@ const assert = require("node:assert/strict");
 const {
   NOT_CONFIRMED,
   SoftwareAuthenticator,
-  TICKET,
   approvalApi,
   b64u,
-  catalogFile,
   contextDigest,
-  deniedStorage,
+  failed,
   iso,
   jcs,
   loadPage,
   memoryStorage,
   mintReceipt,
   ids,
-  plain,
   sha256,
   testView,
   testdata,
 } = require("./harness.js");
 
-// The digest as the page shortens it beside a service.
-const shortDigest = (d) => `${d.slice(0, 15)}…${d.slice(-6)}`;
-
 const APPROVED = "Approved. You can close this tab.";
+const CLOSED = "This link was already used, declined or closed.";
 const MISMATCH =
   "What the service asked you to approve does not match what it would run. Nothing was signed.";
 
@@ -70,19 +65,18 @@ async function approvalPage(apiOptions = {}, pageOptions = {}, view = undefined)
 
 test("an uploaded compose is approved only after the registration receipt verifies", async () => {
   const compose = withoutSecrets();
-  const { api, page, laptop, credentials } = await approvalPage({ compose });
+  const { api, page, laptop, credentials } = await approvalPage({ revision: compose });
   const text = page.text();
   for (const line of [
     "Production",
     "web",
-    "Image: nginx:1.27",
-    `Digest: ${shortDigest(`sha256:${"ab".repeat(32)}`)}`,
+    `Image: nginx:1.27@sha256:${"ab".repeat(32)}`,
     "Image: postgres",
     "Named volumes: pgdata, alpha-secrets-db",
     "Named volumes: cachedata",
     "AlphaCompute runtime",
-    "Image: alpha-runtime",
-    `Digest: ${shortDigest(`sha256:${"7d".repeat(32)}`)}`,
+    `Image: ghcr.io/alphacompute/alpha-runtime@sha256:${"7d".repeat(32)}`,
+    "ALPHACOMPUTE_TLS_UPSTREAM=web:80",
     "Endpoint: HTTPS on 443, forwarded to web:80",
     "Machine: tdx.medium",
     "The service sets the machine size (CPU and memory). The size never changes the code or keys you approve, so you do not sign it.",
@@ -94,13 +88,9 @@ test("an uploaded compose is approved only after the registration receipt verifi
   assert.ok(!text.includes("Receives secrets"));
   assert.ok(!text.includes("Published ports"), "only the runtime publishes a port");
   const details = page.find(
-    (n) => n.tagName === "DETAILS" && n.children[0].textContent === "Technical details",
+    (n) => n.tagName === "DETAILS" && n.children[0].textContent === "The exact bytes you sign",
   );
-  assert.ok(details && !details.open);
-  const technical = details.lines().join("\n");
-  assert.ok(technical.includes(`web: sha256:${"ab".repeat(32)}`), technical);
-  assert.ok(technical.includes(compose));
-  assert.ok(!technical.includes(api.compose_hash), "the Revision shows outside the details");
+  assert.equal(details.children[1].textContent, compose);
   assert.ok(!text.includes(APPROVED));
 
   await page.click("Approve with passkey");
@@ -133,7 +123,7 @@ test("an uploaded compose is approved only after the registration receipt verifi
 test("a Kata init-data registers as init-data, and only under the pinned agent policy", async () => {
   const initData = testdata("attest/b300-kata-4.0.0/k3-app.toml");
   const app_id = "0199e000-0000-7000-8000-00000000a11d";
-  const unpinned = await approvalPage({ compose: initData, app_id });
+  const unpinned = await approvalPage({ revision: initData, app_id });
   assert.ok(unpinned.page.text().includes("The KMS would refuse to register"), unpinned.page.text());
   assert.equal(unpinned.laptop.log.length, 0);
 
@@ -141,8 +131,8 @@ test("a Kata init-data registers as init-data, and only under the pinned agent p
   view.view.kata_policy = JSON.parse(
     testdata("attest/b300-kata-4.0.0/platform-document.json"),
   ).kata_policy;
-  const { api, page } = await approvalPage({ compose: initData, app_id }, {}, view);
-  assert.ok(page.text().includes("Image: alpine"), page.text());
+  const { api, page } = await approvalPage({ revision: initData, app_id }, {}, view);
+  assert.ok(page.text().includes("Image: public.ecr.aws/docker/library/alpine@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8"), page.text());
   await page.click("Approve with passkey");
   assert.deepEqual(api.revisions[0].body.payload, {
     app_id,
@@ -158,25 +148,19 @@ async function shown(...replacements) {
   for (const [from, to] of replacements) {
     compose.docker_compose_file = compose.docker_compose_file.replace(from, to);
   }
-  const { page } = await approvalPage({ compose: jcs(compose) });
+  const { page } = await approvalPage({ revision: jcs(compose) });
   return page.text();
 }
 
-test("the App's services come first and the platform's collapse under their role", async () => {
-  const digest = `sha256:${"ef".repeat(32)}`;
+test("no service is folded away, the platform's included", async () => {
   const text = await shown(
     ["    image: redis@", "    image: ghcr.io/alphacompute/platform/app-edge:2@"],
     ["      ALPHACOMPUTE_TLS_UPSTREAM: web:80\n", "      ALPHACOMPUTE_TLS_UPSTREAM: web:80\n      ALPHACOMPUTE_PUBLIC_NAME: board.example.com\n"],
   );
   assert.ok(text.includes("Public URL: https://board.example.com"), text);
   assert.ok(text.includes("Organization: Acme"), text);
-  assert.ok(text.includes("Provided by AlphaCompute (2)"), text);
-  const at = (s) => text.indexOf(s);
-  assert.ok(at("\ndb\n") < at("\nweb\n") && at("\nweb\n") < at("Provided by AlphaCompute"), text);
-  assert.ok(at("Provided by AlphaCompute") < at("\napp-edge:2\n"), text);
-  assert.ok(at("Provided by AlphaCompute") < at("AlphaCompute runtime"), text);
-  assert.ok(!text.includes("\ncache\n"), "a service shows under its role, not its compose key");
-  assert.ok(text.includes(`cache: ${digest}`), "the full digest is under Technical details");
+  assert.ok(text.includes(`\ncache\nImage: ghcr.io/alphacompute/platform/app-edge:2@sha256:${"ef".repeat(32)}`), text);
+  assert.ok(text.includes("ALPHACOMPUTE_PUBLIC_NAME=board.example.com"), text);
 });
 
 test("a compose cannot claim the platform's role by a service name or an image path", async () => {
@@ -185,18 +169,17 @@ test("a compose cannot claim the platform's role by a service name or an image p
     ["    image: redis@", "    image: example.com/platform/app-edge:2@"],
     ["      ALPHACOMPUTE_TLS_UPSTREAM: web:80\n", "      ALPHACOMPUTE_TLS_UPSTREAM: web:80\n      ALPHACOMPUTE_PUBLIC_NAME: board.example.com\n"],
   );
-  assert.ok(!text.includes("Provided by AlphaCompute"), text);
   assert.ok(!text.includes("AlphaCompute runtime") && !text.includes("Endpoint"), text);
   assert.ok(!text.includes("Public URL"), text);
   assert.ok(text.includes("\nalpha-runtime\n") && text.includes("\ncache\n"), text);
-  assert.ok(text.includes("Image: app-edge:2"), text);
+  assert.ok(text.includes("Image: example.com/platform/app-edge:2@sha256:"), text);
 });
 
-test("Copy puts a service's full digest on the clipboard", async () => {
-  const { page } = await approvalPage({ compose: withoutSecrets() });
-  const copy = page.find((n) => n.ariaLabel === "Copy the digest of nginx:1.27");
+test("Copy puts a service's full image reference on the clipboard", async () => {
+  const { page } = await approvalPage({ revision: withoutSecrets() });
+  const copy = page.find((n) => n.ariaLabel === "Copy the image of web");
   await copy.listeners.click[0]({ target: copy });
-  assert.deepEqual(page.copied, [`sha256:${"ab".repeat(32)}`]);
+  assert.deepEqual(page.copied, [`nginx:1.27@sha256:${"ab".repeat(32)}`]);
 });
 
 test("a runtime port is an endpoint only with an upstream, a host side and TCP", async () => {
@@ -235,20 +218,17 @@ test("a registration receipt that does not verify never reads approved", async (
       }),
   };
   for (const [name, fault] of Object.entries(faults)) {
-    const { api, page } = await approvalPage({ compose });
+    const { api, page } = await approvalPage({ revision: compose });
     api.revisionReceipt = fault;
     await page.click("Approve with passkey");
     assert.ok(page.text().includes(NOT_CONFIRMED), `${name}: ${page.text()}`);
     assert.ok(!page.text().includes(APPROVED), name);
   }
-  const { api, page } = await approvalPage({ compose });
-  api.reply.revision = () => ({
-    status: 502,
-    body: { error: "<script>x</script>", error_code: "SHROUD_UPSTREAM_INVALID" },
-  });
+  const { api, page } = await approvalPage({ revision: compose });
+  api.reply.revision = () => failed(502, "upstream_invalid");
   await page.click("Approve with passkey");
   assert.ok(page.text().includes(NOT_CONFIRMED));
-  assert.ok(!page.text().includes("<script>"));
+  assert.ok(!page.text().includes("<b>"));
   assert.ok(!page.text().includes(APPROVED));
 });
 
@@ -257,8 +237,8 @@ test("a compose that does not hash to the request is refused before any prompt",
   const changed = compose.replace("nginx:1.27", "nginx:1.28");
   assert.notEqual(changed, compose);
   const { page, laptop } = await approvalPage({
-    compose: changed,
-    compose_hash: approvalApi({ compose }).compose_hash,
+    revision: changed,
+    compose_hash: approvalApi({ revision: compose }).compose_hash,
   });
   assert.equal(page.text(), MISMATCH);
   assert.deepEqual(page.buttons(), []);
@@ -268,264 +248,13 @@ test("a compose that does not hash to the request is refused before any prompt",
 test("a compose that hashes to the request but cannot be read is refused as unreadable", async () => {
   const compose = JSON.parse(withoutSecrets());
   compose.docker_compose_file = "services: [";
-  const { page, laptop } = await approvalPage({ compose: jcs(compose) });
+  const { page, laptop } = await approvalPage({ revision: jcs(compose) });
   assert.equal(
     page.text(),
     "This page cannot read what the service asked you to approve, so it cannot show it to you. Nothing was signed.",
   );
   assert.deepEqual(page.buttons(), []);
   assert.equal(laptop.log.length, 0);
-});
-
-const CREATE = "Create a passkey for this organization";
-const SIGN_IN =
-  "Sign in with your AlphaCompute account to create a passkey for this organization.";
-const ENROLL_LOGIN =
-  `${testView().view.signer.api_origin}/v1/approval-requests/${TICKET}/enroll-login`;
-const ENROLL_MARK = `alphacompute-enroll-sha256:${sha256(TICKET).toString("hex")}`;
-// A tab back from the service's sign-in, which the page marked before it left.
-const signedIn = () => ({ sessionStorage: memoryStorage({ [ENROLL_MARK]: "1" }) });
-const focused = (page, label) =>
-  page.find((n) => n.tagName === "BUTTON" && n.textContent === label)?.focused;
-
-test("creating a passkey signs in first, before any passkey is made", async () => {
-  const session = memoryStorage();
-  const { api, page, laptop } = await approvalPage(
-    { compose: withoutSecrets(), credentials: [] },
-    { sessionStorage: session },
-  );
-  assert.ok(page.text().includes(SIGN_IN), page.text());
-  await page.click(CREATE);
-  assert.deepEqual(page.assigned, [ENROLL_LOGIN]);
-  assert.equal(session.getItem(ENROLL_MARK), "1");
-  assert.equal(laptop.log.length, 0);
-  assert.equal(api.enrolled.length, 0);
-
-  const expired = await approvalPage({ compose: withoutSecrets(), credentials: [] });
-  expired.api.reply.login = () => ({ status: 410, body: { error: { code: "request_expired" } } });
-  await expired.page.click(CREATE);
-  assert.equal(expired.page.text(), "This approval link has expired.");
-  assert.deepEqual(expired.page.assigned, []);
-
-  const stale = await approvalPage({ compose: withoutSecrets(), credentials: [] }, signedIn());
-  stale.laptop.prefer = undefined;
-  stale.api.reply.enroll = () => ({ status: 401, body: { error: { code: "sign_in_required" } } });
-  await stale.page.click(CREATE);
-  assert.ok(stale.page.text().includes("Sign-in did not complete. Try again."), stale.page.text());
-  assert.deepEqual(stale.page.assigned, []);
-});
-
-test("back from signing in, a new passkey is enrolled and then the only one asked", async () => {
-  const pageOptions = signedIn();
-  const { api, page, laptop } = await approvalPage(
-    { compose: withoutSecrets(), credentials: [] },
-    pageOptions,
-  );
-  laptop.prefer = undefined;
-  assert.equal(pageOptions.sessionStorage.getItem(ENROLL_MARK), null);
-  assert.ok(page.text().includes("Signed in. Create your passkey to continue."), page.text());
-  assert.ok(focused(page, CREATE), page.text());
-  await page.click(CREATE);
-  const created = laptop.log[0].result;
-  assert.deepEqual(api.enrolled, [{ credential_id: created.id, public_key: created.spki }]);
-  const post = page.fetches.find((f) => f.url.endsWith("/passkey"));
-  assert.equal(post.credentials, "same-origin");
-  assert.ok(focused(page, "Approve with passkey"), page.text());
-  await page.click("Approve with passkey");
-  const got = laptop.log[1];
-  assert.deepEqual(ids(got.options.allowCredentials), [created.id]);
-  assert.equal(api.revisions[0].body.signature.key_id, api.credentials[0].key_id);
-  assert.ok(page.text().includes(APPROVED), page.text());
-  assert.deepEqual(page.assigned, []);
-});
-
-test("a prompt that gave no passkey of the request offers to create one", async () => {
-  const { page } = await approvalPage({ compose: withoutSecrets() });
-  page.use(new SoftwareAuthenticator());
-  assert.deepEqual(page.buttons(), ["Approve with passkey", "Decline"]);
-  await page.click("Approve with passkey");
-  assert.ok(page.text().includes(SIGN_IN), page.text());
-  await page.click(CREATE);
-  assert.deepEqual(page.assigned, [ENROLL_LOGIN]);
-});
-
-test("a passkey the service will not enroll leaves the contact sentence", async () => {
-  const { api, page } = await approvalPage(
-    { compose: withoutSecrets(), credentials: [] },
-    signedIn(),
-  );
-  api.reply.enroll = () => ({ status: 403, body: { error: { code: "enroll_not_allowed" } } });
-  await page.click(CREATE);
-  assert.ok(
-    page.text().includes("No passkey of this organization is known. Ask your AlphaCompute contact."),
-    page.text(),
-  );
-  assert.deepEqual(page.buttons(), ["Decline"]);
-  assert.equal(api.revisions.length, 0);
-
-  const other = await approvalPage({ compose: withoutSecrets(), credentials: [] }, signedIn());
-  const elsewhere = other.laptop.enroll();
-  other.api.reply.enroll = () => {
-    other.api.credentials = [{ credential_id: elsewhere.id, key_id: crypto.randomUUID() }];
-    return { status: 409, body: { error: { code: "already_enrolled" } } };
-  };
-  await other.page.click(CREATE);
-  assert.deepEqual(other.page.buttons(), ["Approve with passkey", "Decline"]);
-
-  const crossOrigin = await approvalPage(
-    { compose: withoutSecrets(), credentials: [] },
-    { origin: "https://other-signer.test" },
-  );
-  assert.ok(
-    crossOrigin.page.text().includes(
-      "No passkey of this organization is known. Ask your AlphaCompute contact.",
-    ),
-    crossOrigin.page.text(),
-  );
-  assert.deepEqual(crossOrigin.page.buttons(), ["Decline"]);
-});
-
-const CREATE_ROOT = "Create your organization's passkey to approve this App";
-const SYNCED_ROOT = "This passkey is saved to your account's password manager.";
-const DEVICE_ROOT =
-  "This passkey is only on this device. If you lose it, you lose access to your organization.";
-const ROOT_TAKEN =
-  "Your organization was claimed by another key. Do not approve. Contact AlphaCompute.";
-const STEP_ONE = "Step 1 of 2: create your organization's passkey";
-const STEP_TWO = "Step 2 of 2: approve this App";
-const approveRoot = (api) => `Approve Production, revision ${api.compose_hash.slice(7, 19)}`;
-// A request of an organization without a key, on a device that holds none of its passkeys.
-async function rootPage(pageOptions, apiOptions = {}) {
-  const request = {
-    compose: withoutSecrets(),
-    credentials: [],
-    root_principal_id: crypto.randomUUID(),
-    ...apiOptions,
-  };
-  const opened = await approvalPage(request, pageOptions);
-  opened.laptop.prefer = undefined;
-  return opened;
-}
-
-test("an organization without a key is rooted by its new passkey, which then approves", async () => {
-  const { api, page, laptop } = await rootPage(signedIn());
-  assert.deepEqual(page.buttons(), [CREATE_ROOT, "Decline"]);
-  assert.ok(focused(page, CREATE_ROOT), page.text());
-  assert.ok(page.text().includes(STEP_ONE), page.text());
-  await page.click(CREATE_ROOT);
-  const created = laptop.log[0].result;
-  assert.ok(page.text().includes(SYNCED_ROOT), page.text());
-  assert.deepEqual(page.buttons(), ["Confirm with passkey", "Decline"]);
-  assert.ok(focused(page, "Confirm with passkey"), page.text());
-
-  const principal = api.root_principal_id;
-  await page.click("Confirm with passkey");
-  const confirm = laptop.log[1];
-  assert.deepEqual(ids(confirm.options.allowCredentials), [created.id]);
-  const { payload, signature } = api.roots[0].registration;
-  assert.deepEqual(payload, {
-    org_id: api.org_id,
-    principal_id: principal,
-    public_key: created.spki,
-    label: "passkey-1",
-    issued_at: payload.issued_at,
-  });
-  assert.deepEqual(
-    Buffer.from(confirm.options.challenge),
-    contextDigest("alphacompute/org-root-key/v1", jcs(payload)),
-  );
-  assert.equal(signature.key_id, undefined);
-  assert.equal(
-    api.roots[0].text,
-    `{"credential_id":"${created.id}","registration":${jcs({ payload, signature })}}`,
-  );
-  const post = page.fetches.find((f) => f.url.endsWith("/root"));
-  assert.equal(post.credentials, "same-origin");
-  assert.ok(focused(page, approveRoot(api)), page.text());
-  assert.ok(page.text().includes(SYNCED_ROOT), page.text());
-  assert.ok(page.text().includes(STEP_TWO), page.text());
-  assert.ok(!page.text().includes(STEP_ONE), page.text());
-
-  await page.click(approveRoot(api));
-  assert.equal(laptop.log.length, 3);
-  assert.deepEqual(ids(laptop.log[2].options.allowCredentials), [created.id]);
-  assert.equal(api.revisions[0].body.signature.key_id, api.credentials[0].key_id);
-  assert.ok(page.text().includes(APPROVED), page.text());
-  assert.deepEqual(page.assigned, []);
-});
-
-test("a device-bound root passkey is named as the only copy", async () => {
-  const { page } = await rootPage({
-    ...signedIn(),
-    authenticator: new SoftwareAuthenticator({ flags: 0x05 }),
-  });
-  await page.click(CREATE_ROOT);
-  assert.ok(page.text().includes(DEVICE_ROOT), page.text());
-  assert.ok(!page.text().includes(SYNCED_ROOT), page.text());
-});
-
-test("a root the service wants signed in for sends the person to sign in", async () => {
-  const { api, page } = await rootPage({ sessionStorage: deniedStorage() });
-  api.reply.root = () => ({ status: 401, body: { error: { code: "sign_in_required" } } });
-  await page.click(CREATE_ROOT);
-  await page.click("Confirm with passkey");
-  assert.deepEqual(page.assigned, [ENROLL_LOGIN]);
-  assert.equal(api.revisions.length, 0);
-});
-
-test("an owner the service does not know as signed in signs in before the root", async () => {
-  const anonymous = await rootPage({}, { signedIn: false });
-  const read = anonymous.page.fetches.find((f) => f.method === "GET" && f.url.endsWith(TICKET));
-  assert.equal(read.credentials, "same-origin");
-  assert.ok(anonymous.page.text().includes(SIGN_IN), anonymous.page.text());
-  await anonymous.page.click(CREATE_ROOT);
-  assert.deepEqual(anonymous.page.assigned, [ENROLL_LOGIN]);
-  assert.equal(anonymous.laptop.log.length, 0);
-
-  const back = await rootPage(signedIn(), { signedIn: false });
-  assert.ok(back.page.text().includes("Sign-in did not complete. Try again."), back.page.text());
-  await back.page.click(CREATE_ROOT);
-  assert.deepEqual(back.page.assigned, [ENROLL_LOGIN]);
-  assert.equal(back.laptop.log.length, 0);
-
-  const unmarked = await rootPage({ sessionStorage: deniedStorage() }, { signedIn: false });
-  await unmarked.page.click(CREATE_ROOT);
-  assert.deepEqual(unmarked.page.assigned, [ENROLL_LOGIN]);
-  assert.equal(unmarked.laptop.log.length, 0);
-});
-
-test("a root post that may have reached the KMS is sent again unchanged", async () => {
-  const { api, page, laptop } = await rootPage(signedIn());
-  const refused = { status: 502, body: { error: { code: "kms_refused" } } };
-  const unconfirmed = { status: 201, body: {} };
-  const failures = [new Error("network"), refused, unconfirmed];
-  api.reply.root = () => failures.shift();
-  await page.click(CREATE_ROOT);
-  await page.click("Confirm with passkey");
-  for (let i = 0; i < 3; i += 1) {
-    assert.deepEqual(page.buttons(), ["Try again", "Decline"]);
-    await page.click("Try again");
-  }
-  assert.equal(api.roots.length, 4);
-  assert.ok(api.roots.every((r) => r.text === api.roots[0].text));
-  assert.equal(laptop.log.length, 2);
-  await page.click(approveRoot(api));
-  assert.ok(page.text().includes(APPROVED), page.text());
-});
-
-test("an organization another key already rooted stops the approval", async () => {
-  const { api, page } = await rootPage(signedIn());
-  api.reply.root = () => ({ status: 409, body: { error: { code: "root_taken" } } });
-  await page.click(CREATE_ROOT);
-  await page.click("Confirm with passkey");
-  assert.equal(page.text(), ROOT_TAKEN);
-  assert.deepEqual(page.buttons(), []);
-  assert.equal(api.revisions.length, 0);
-});
-
-test("a page on another origin than the API offers no root but keeps Decline", async () => {
-  const { page } = await rootPage({ origin: "https://other-signer.test" });
-  assert.deepEqual(page.buttons(), ["Decline"]);
 });
 
 const CATALOG = JSON.parse(testdata("catalog/expected.json"));
@@ -535,7 +264,6 @@ const TEMPLATE_HEX = VALID_FILE.entry.template_sha256.slice("sha256:".length);
 const CATALOG_COMPOSE = testdata("catalog/app-compose.json");
 const CATALOG_REFUSED =
   "The catalog entry for this launch is not signed by AlphaCompute. Nothing was signed.";
-const NIL_NAME = '"name":"00000000-0000-0000-0000-000000000000"';
 const hex = (text) => sha256(text).toString("hex");
 
 function catalogPage(files, apiOptions = {}, pageOptions = {}) {
@@ -557,10 +285,9 @@ test("a catalog app is rendered in wasm and its hash must match", async () => {
   for (const line of [
     "CPU App, version 1",
     "Machine: 1 vCPU, 2048 MiB",
-    "Image: alpha-cpu-app",
-    `Digest: ${shortDigest(`sha256:${"3a".repeat(32)}`)}`,
+    `alpha-cpu-app@sha256:${"3a".repeat(32)}`,
     "Published ports: 443:8443",
-    "Image: alpha-runtime",
+    "ghcr.io/alphacompute/alpha-runtime@sha256:",
   ]) {
     assert.ok(text.includes(line), `${line}\n${text}`);
   }
@@ -606,98 +333,98 @@ test("a catalog entry that does not verify is refused", async () => {
   assert.equal(other.laptop.log.length, 0);
 });
 
-test("a replacement names both versions only when the old entry verifies", async () => {
-  const oldTemplate = VALID_FILE.template.replace(
-    "alpha-cpu-app@sha256:3a",
-    "alpha-cpu-app@sha256:4a",
+test("an organization without a passkey is refused before any prompt", async () => {
+  const api = approvalApi({ app_id: WRAP_APP, revision: withoutSecrets() });
+  const page = await loadPage({ routes: api.routes, path: "/sign/approve" });
+  await page.startApproval();
+  assert.equal(
+    page.text(),
+    "This organization has no passkey yet. Finish onboarding from the email we sent, then open this link again.",
   );
-  assert.notEqual(oldTemplate, VALID_FILE.template);
-  const oldEntry = { ...VALID_FILE.entry, version: "0", template_sha256: `sha256:${hex(oldTemplate)}` };
-  const oldCompose = oldTemplate.replace(NIL_NAME, `"name":"${CATALOG.app_id}"`);
-  const current = { compose_hash: `sha256:${hex(oldCompose)}`, compose: oldCompose };
-  const files = (old) => ({ [`${TEMPLATE_HEX}.json`]: VALID, [`${hex(oldTemplate)}.json`]: old });
-
-  const named = await catalogPage(files(catalogFile(oldEntry, oldTemplate)), { current });
-  assert.ok(named.page.text().includes("CPU App, version 0 → 1"), named.page.text());
-  assert.ok(!named.page.text().includes("not from this catalog"));
-
-  const forged = JSON.parse(catalogFile(oldEntry, oldTemplate));
-  forged.signature.signature = `A${forged.signature.signature.slice(1)}`;
-  const elsewhere = catalogFile({ ...oldEntry, catalog_id: "gpu-app" }, oldTemplate);
-  for (const [name, old] of [
-    ["no catalog file", undefined],
-    ["a forged signature", JSON.stringify(forged)],
-    ["another catalog id", elsewhere],
-  ]) {
-    const { page } = await catalogPage(files(old), { current });
-    const text = page.text();
-    assert.ok(text.includes("replacing a launch not from this catalog"), `${name}: ${text}`);
-    assert.ok(!text.includes("version 0"), name);
-    assert.ok(text.includes("CPU App, version 1"), name);
-    const line = text.split("\n").find((l) => l.startsWith("app: "));
-    assert.ok(line, `${name}: ${text}`);
-    assert.ok(line.includes("according to the service"), line);
-    assert.ok(line.includes(`alpha-cpu-app@sha256:4a${"3a".repeat(31)}`), line);
-    assert.ok(
-      !text.split("\n").some((l) => l.startsWith("alpha-runtime: ") && l.includes("according to the service")),
-      name,
-    );
-  }
+  assert.equal(page.authenticator.log.length, 0);
 });
 
-test("decline cancels the request", async () => {
-  const { api, page, laptop } = await approvalPage({ compose: withoutSecrets() });
+test("a new Revision shows its changes and revokes the one it replaces unless kept", async () => {
+  const revision = withoutSecrets();
+  const now = `nginx:1.27@sha256:${"ab".repeat(32)}`;
+  const was = `nginx:1.26@sha256:${"cd".repeat(32)}`;
+  const old = revision.replace(now, was);
+  assert.notEqual(old, revision);
+  const predecessor = { compose_hash: `sha256:${hex(old)}`, revision: old };
+  const { api, page, laptop } = await approvalPage({ revision, predecessor });
+  const added = [...page.main.walk()].filter((n) => n.className === "added").map((n) => n.textContent);
+  assert.deepEqual(added, [`web: image ${was} → ${now}`]);
+  assert.equal(page.find((n) => n.id === "keep-predecessor").checked, false);
+
+  api.revokeReceipt = (text, response) => mintReceipt("revision.register", text, response);
+  await page.click("Approve with passkey");
+  assert.equal(api.revisions.length, 1);
+  assert.equal(api.revokes.length, 0);
+  await page.click("Sign 2 of 2");
+  assert.ok(page.text().includes(NOT_CONFIRMED), page.text());
+  assert.ok(!page.text().includes(APPROVED));
+  api.revokeReceipt = (text, response) => mintReceipt("revision.revoke", text, response);
+  await page.click("Sign 2 of 2");
+  const payload = api.revokes[1].body.payload;
+  assert.deepEqual(Object.keys(payload).sort(), ["compose_hash", "issued_at"]);
+  assert.equal(payload.compose_hash, predecessor.compose_hash);
+  assert.deepEqual(
+    Buffer.from(laptop.log[2].options.challenge),
+    contextDigest("alphacompute/control/v1", page.wasm().canonicalJson(JSON.stringify(payload))),
+  );
+  assert.ok(page.text().includes(APPROVED), page.text());
+
+  const kept = await approvalPage({ revision, predecessor });
+  kept.page.find((n) => n.id === "keep-predecessor").checked = true;
+  await kept.page.click("Approve with passkey");
+  assert.equal(kept.api.revokes.length, 0);
+  assert.ok(kept.page.text().includes(APPROVED), kept.page.text());
+});
+
+test("decline closes the ticket", async () => {
+  const { api, page, laptop } = await approvalPage({ revision: withoutSecrets() });
   await page.click("Decline");
   assert.ok(page.text().includes("Declined. You can close this tab."), page.text());
-  assert.equal(api.state, "cancelled");
+  assert.equal(api.state, "declined");
   assert.equal(laptop.log.length, 0);
   assert.equal(api.revisions.length, 0);
 
-  const late = await approvalPage({ compose: withoutSecrets() });
-  late.api.state = "approved";
+  const late = await approvalPage({ revision: withoutSecrets() });
+  late.api.state = "done";
   await late.page.click("Decline");
-  assert.ok(
-    late.page.text().includes("This request was already approved, declined or cancelled."),
-    late.page.text(),
-  );
+  assert.ok(late.page.text().includes(CLOSED), late.page.text());
 });
 
 test("every refusal is one fixed sentence", async () => {
   const now = Date.now();
-  const EXPIRED = "This approval link has expired.";
-  const DECIDED = "This request was already approved, declined or cancelled.";
+  const EXPIRED = "This link has expired.";
   const read = [
     [{ state: "expired" }, EXPIRED],
     [{ expires_at: iso(now - 1000) }, EXPIRED],
-    [{ state: "approved" }, DECIDED],
-    [{ state: "cancelled" }, DECIDED],
-    [{ read: { status: 404, body: { error: "x", error_code: "SHROUD_NOT_FOUND" } } }, "This link is not valid."],
-    [
-      { read: { status: 503, body: { error: "x", error_code: "SHROUD_SERVICE_UNAVAILABLE" } } },
-      "The service is unavailable. Try again in a minute.",
-    ],
+    [{ state: "done" }, CLOSED],
+    [{ state: "declined" }, CLOSED],
+    [{ read: failed(404, "ticket_not_found") }, "This link is not valid."],
+    [{ read: failed(503, "unavailable") }, "The service is unavailable. Try again in a minute."],
+    [{ predecessor: { compose_hash: "sha256:00", revision: "x" } }, "The service is unavailable. Try again in a minute."],
+    [{ predecessor: { compose_hash: `sha256:${"0".repeat(64)}`, revision: WRAP } }, MISMATCH],
     [
       { server_time: iso(now + 7 * 60 * 1000) },
       "Your device clock is off by about 7 minutes. Correct it and reload.",
     ],
   ];
   for (const [options, sentence] of read) {
-    const { page } = await approvalPage({ compose: withoutSecrets(), now, ...options }, { now });
+    const { page } = await approvalPage({ revision: withoutSecrets(), now, ...options }, { now });
     assert.equal(page.text(), sentence, JSON.stringify(options));
   }
 
   const { laptop, credentials } = organization();
-  const api = approvalApi({ app_id: WRAP_APP, compose: withoutSecrets(), credentials });
+  const api = approvalApi({ app_id: WRAP_APP, revision: withoutSecrets(), credentials });
   const get = api.routes[Object.keys(api.routes).find((k) => k.startsWith("GET "))];
   let reads = 0;
   api.routes[Object.keys(api.routes).find((k) => k.startsWith("GET "))] = (req) => {
     reads += 1;
     if (reads === 1) {
-      return {
-        status: 429,
-        body: { error: "slow down", error_code: "SHROUD_RATE_LIMITED" },
-        headers: { "Retry-After": "2" },
-      };
+      return { ...failed(429, "rate_limited"), headers: { "Retry-After": "2" } };
     }
     return get(req);
   };
@@ -720,13 +447,10 @@ test("every refusal is one fixed sentence", async () => {
       { status: 400, body: { error: { code: "strange_thing", message: "<i>no</i>" } } },
       "The KMS refused this request (strange_thing).",
     ],
-    [
-      { status: 400, body: { error: "<img src=x onerror=alert(1)>", error_code: "<b>x</b>" } },
-      "The service is unavailable. Try again in a minute.",
-    ],
+    [failed(400, "<b>x</b>"), "The service is unavailable. Try again in a minute."],
   ];
   for (const [reply, sentence] of kms) {
-    const { api: kmsApi, page } = await approvalPage({ compose: withoutSecrets() });
+    const { api: kmsApi, page } = await approvalPage({ revision: withoutSecrets() });
     kmsApi.reply.revision = () => reply;
     await page.click("Approve with passkey");
     const text = page.text();
@@ -741,7 +465,7 @@ test("every refusal is one fixed sentence", async () => {
 const SECRET_VALUES = { db_password: "pw-correct-horse-1", session_key: "sk-battery-staple-2" };
 
 function secretPage(apiOptions = {}, pageOptions = {}) {
-  return approvalPage({ compose: WRAP, ...apiOptions }, { sealer: true, ...pageOptions });
+  return approvalPage({ revision: WRAP, ...apiOptions }, { sealer: true, ...pageOptions });
 }
 
 const field = (page, name) => page.find((n) => n.id === `secret-${name}`);
@@ -751,8 +475,8 @@ function fill(page, values) {
   for (const [name, value] of Object.entries(values)) field(page, name).value = value;
 }
 
-// The same declared names, with only db_password delivered: the launch a re-approval replaces.
-function currentWithDbPassword() {
+// The same declared names, with only db_password delivered: the Revision a re-approval replaces.
+function previousWithDbPassword() {
   const compose = JSON.parse(WRAP);
   compose.docker_compose_file = compose.docker_compose_file.replace(
     `ALPHACOMPUTE_SECRETS: '{"db":["db_password"],"web":["db_password","session_key"]}'`,
@@ -760,13 +484,13 @@ function currentWithDbPassword() {
   );
   const text = jcs(compose);
   assert.notEqual(text, WRAP);
-  return { compose_hash: `sha256:${hex(text)}`, compose: text };
+  return { compose_hash: `sha256:${hex(text)}`, revision: text };
 }
 
-async function approveAll(page) {
+async function approveAll(page, total = 3) {
   await page.click("Approve with passkey");
-  await page.click("Sign 2 of 3");
-  await page.click("Sign 3 of 3");
+  await page.click(`Sign 2 of ${total}`);
+  await page.click(`Sign 3 of ${total}`);
 }
 
 test("every secret is put and confirmed before the registration", async () => {
@@ -882,10 +606,7 @@ test("a failed put stops before the registration", async () => {
     [
       "a 503",
       (api) => {
-        api.reply.put = () => ({
-          status: 503,
-          body: { error: "down", error_code: "SHROUD_SERVICE_UNAVAILABLE" },
-        });
+        api.reply.put = () => failed(503, "unavailable");
       },
       "The service is unavailable. Try again in a minute.",
     ],
@@ -895,7 +616,7 @@ test("a failed put stops before the registration", async () => {
     const original = api.putReceipt;
     fault(api);
     // The failed step is offered again as soon as it fails; two seconds later its issued_at is new.
-    const putRoute = Object.keys(api.routes).find((k) => k.startsWith("PUT "));
+    const putRoute = Object.keys(api.routes).find((k) => k.endsWith("/kms/secret"));
     const relay = api.routes[putRoute];
     api.routes[putRoute] = (req) => {
       page.clock.now += 2000;
@@ -959,8 +680,8 @@ test("secret values are never echoed or stored", async () => {
 });
 
 test("a re-approval keeps current values unless replaced", async () => {
-  const current = currentWithDbPassword();
-  const kept = await secretPage({ current });
+  const predecessor = previousWithDbPassword();
+  const kept = await secretPage({ predecessor });
   const choice = keepChoice(kept.page, "db_password");
   assert.ok(choice, kept.page.text());
   assert.equal(choice.value, "keep");
@@ -975,14 +696,15 @@ test("a re-approval keeps current values unless replaced", async () => {
 
   fill(kept.page, { session_key: SECRET_VALUES.session_key });
   await kept.page.click("Approve with passkey");
-  await kept.page.click("Sign 2 of 2");
+  await kept.page.click("Sign 2 of 3");
+  await kept.page.click("Sign 3 of 3");
   assert.ok(kept.page.text().includes(APPROVED), kept.page.text());
   assert.deepEqual(
     kept.api.puts.map((p) => p.declared),
     ["session_key"],
   );
 
-  const replaced = await secretPage({ current });
+  const replaced = await secretPage({ predecessor });
   const replace = keepChoice(replaced.page, "db_password");
   replace.value = "replace";
   for (const listener of replace.listeners.change) listener();
@@ -993,7 +715,8 @@ test("a re-approval keeps current values unless replaced", async () => {
   assert.equal(replaced.laptop.log.length, 0);
   assert.equal(field(replaced.page, "session_key").value, SECRET_VALUES.session_key);
   fill(replaced.page, { db_password: SECRET_VALUES.db_password });
-  await approveAll(replaced.page);
+  await approveAll(replaced.page, 4);
+  await replaced.page.click("Sign 4 of 4");
   assert.ok(replaced.page.text().includes(APPROVED));
   assert.deepEqual(
     replaced.api.puts.map((p) => p.declared),
@@ -1035,11 +758,7 @@ test("relay calls are paced and a 429 is retried once", async () => {
   limited.api.reply.put = () => {
     if (!first) return null;
     first = false;
-    return {
-      status: 429,
-      body: { error: "slow down", error_code: "SHROUD_RATE_LIMITED" },
-      headers: { "Retry-After": "2" },
-    };
+    return { ...failed(429, "rate_limited"), headers: { "Retry-After": "2" } };
   };
   fill(limited.page, SECRET_VALUES);
   await approveAll(limited.page);
@@ -1066,7 +785,7 @@ test("a Secret's description is shown as text, and a missing one shows nothing",
   assert.ok(described, page.text());
   assert.equal(described.tagName, "P");
   assert.ok(!page.find((n) => n.tagName === "B"));
-  assert.ok(page.text().includes("From the App's plan, not verified:"));
+  assert.ok(page.text().includes("From the requester, not verified:"));
   assert.equal(described.parent, field(page, "db_password").parent);
   const siblings = described.parent.children;
   assert.equal(siblings[siblings.indexOf(described) - 2], field(page, "db_password"));
