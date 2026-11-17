@@ -70,6 +70,8 @@ const MESSAGES = {
   add_statement: (principal, org) =>
     `This passkey becomes a key of principal ${principal} in ${org}, approved by one of its passkeys.`,
   root_taken: "Your organization was claimed by another key. Do not continue. Contact AlphaCompute.",
+  root_unconfirmed:
+    "This organization already has a root key, and this sign-in can no longer confirm it. Contact AlphaCompute.",
   yours: "This organization is yours.",
   unrooted:
     "This organization has no passkey yet. Finish onboarding from the email we sent, then open this link again.",
@@ -613,7 +615,8 @@ function offerRegistration(c, note, step) {
     if (step.op === "root" && code === "session_refused") {
       delete c.session.owner;
       saveSession(c);
-      return offerSignIn(c, MESSAGES.not_owner);
+      // A rooted read names no owner to sign in as; only the session that rooted it can confirm.
+      return c.read.rooted ? stop(MESSAGES.root_unconfirmed) : offerSignIn(c, MESSAGES.not_owner);
     }
     if (reply.status !== 200) return step.retry(failure(reply));
     const signed = receipt(c.view, reply, "key.register", registration, {

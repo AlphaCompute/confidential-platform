@@ -502,12 +502,20 @@ test("a root whose answer was lost is confirmed again, never added as a second k
   assert.ok(first.text().includes(NOT_CONFIRMED), first.text());
   assert.equal(api.rooted, true);
 
+  const expired = await loadPage({ routes: api.routes, sessionStorage: memoryStorage(Object.fromEntries(tab.data)), authenticator: first.authenticator });
+  await expired.startClaim();
+  const session = api.owner_session;
+  api.owner_session = "expired";
+  await expired.click("Confirm with passkey");
+  assert.equal(expired.text(), "This organization already has a root key, and this sign-in can no longer confirm it. Contact AlphaCompute.");
+  api.owner_session = session;
+
   api.receiptFor = honest;
   const reloaded = await loadPage({ routes: api.routes, sessionStorage: tab, authenticator: first.authenticator });
   await reloaded.startClaim();
   assert.deepEqual(reloaded.buttons(), ["Confirm with passkey"]);
   await reloaded.click("Confirm with passkey");
-  assert.deepEqual(api.registrations.map((r) => r.op), ["root", "root"]);
+  assert.deepEqual(api.registrations.map((r) => r.op), ["root", "root", "root"]);
   assert.ok(reloaded.text().includes(YOURS), reloaded.text());
 });
 
