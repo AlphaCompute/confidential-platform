@@ -210,7 +210,9 @@ To add the broker to a running Postgres CVM, update that CVM through the Phala A
 `["POSTGRES_PASSWORD", "ALPHA_BROKER_PASSWORD"]`, with both variables in the encrypted env. A
 commit that carries env rewrites the stored `allowed_envs`, so every name goes out, and
 `POSTGRES_PASSWORD` must be the value the volume was created with. The update restarts Postgres;
-the KMS nodes reconnect.
+the KMS nodes reconnect. After the commit, check that the stored compose still hashes to the file;
+if it does not, recreate the CVM, because the rewritten `allowed_envs` changes what the CVM
+measures.
 
 The broker's Secret `database-url` is
 `postgres://alpha_broker:<ALPHA_BROKER_PASSWORD>@<pg app id>-5432s.<gateway base>:443/alpha_broker?sslmode=require&sslnegotiation=direct`,
