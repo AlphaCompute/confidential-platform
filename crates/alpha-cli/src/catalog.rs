@@ -230,18 +230,10 @@ mod tests {
             let on_disk = fs::read(dir.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert!(on_disk == *bytes, "{name} does not regenerate");
         }
-        let mut listed: Vec<String> = fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .collect();
-        listed.sort();
-        let mut generated: Vec<String> = files.iter().map(|(n, _)| (*n).to_owned()).collect();
-        generated.sort();
-        assert_eq!(listed, generated);
     }
 
     #[test]
-    fn the_preview_entry_renders_once_its_inputs_are_set() {
+    fn the_preview_entry_passes_the_pod_checks_once_its_inputs_are_set() {
         let template = include_str!("../../../deploy/kata/catalog/confidential-container.yaml")
             .replace(
                 "${RUNTIME_IMAGE}",

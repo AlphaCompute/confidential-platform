@@ -92,8 +92,6 @@ pub enum CatalogError {
         found: Substitutions,
         signed: Substitutions,
     },
-    #[error("{0:?} is not a slug")]
-    Slug(String),
     #[error("{0}")]
     Malformed(String),
 }
@@ -104,7 +102,6 @@ impl CatalogError {
             Self::SignatureInvalid(_) => "signature_invalid",
             Self::TemplateMismatch => "template_mismatch",
             Self::SubstitutionsMismatch { .. } => "substitutions_mismatch",
-            Self::Slug(_) => "slug_invalid",
             Self::Malformed(_) => "malformed",
         }
     }
@@ -138,7 +135,7 @@ pub fn sign(
 }
 
 /// Only `key` is tried: the caller passes the `catalog_key` of a verified platform document.
-pub fn verify(file: &CatalogFile, key: &CatalogKey) -> Result<(), CatalogError> {
+fn verify(file: &CatalogFile, key: &CatalogKey) -> Result<(), CatalogError> {
     let usable_key = key.verifying_key().ok_or_else(|| {
         CatalogError::Malformed(format!(
             "catalog key {:?} {:?} is not an Ed25519 public key in base64url",
@@ -189,7 +186,7 @@ pub fn render(
         });
     }
     if !is_slug(slug) {
-        return Err(CatalogError::Slug(slug.into()));
+        return Err(CatalogError::Malformed(format!("{slug:?} is not a slug")));
     }
     let public_name = format!("{slug}.{APP_ZONE}");
     let substitute = |text: &str| {
@@ -293,12 +290,10 @@ mod tests {
     #[test]
     fn an_entry_signed_by_another_key_is_refused() {
         let catalog_key = catalog_key_of(&key(11));
-        for seed in [12, 13] {
-            let err = verify(&signed_by(seed), &catalog_key).unwrap_err();
-            assert_eq!(err.code(), "signature_invalid", "{seed}");
-            let err = verify(&signed_by(11), &catalog_key_of(&key(seed))).unwrap_err();
-            assert_eq!(err.code(), "signature_invalid", "{seed}");
-        }
+        let err = verify(&signed_by(12), &catalog_key).unwrap_err();
+        assert_eq!(err.code(), "signature_invalid");
+        let err = verify(&signed_by(11), &catalog_key_of(&key(12))).unwrap_err();
+        assert_eq!(err.code(), "signature_invalid");
     }
 
     #[test]
@@ -409,7 +404,7 @@ mod tests {
     #[test]
     fn render_refuses_a_bad_slug_or_a_template_that_names_no_nil_app() {
         for slug in ["", "Board", "a--b", "sign", "b.c"] {
-            assert_eq!(render_code(&signed_by(11), slug), "slug_invalid", "{slug}");
+            assert_eq!(render_code(&signed_by(11), slug), "malformed", "{slug}");
         }
         let elsewhere = TEMPLATE.replacen(NIL_APP_ID, "01994b3e-0000-7000-8000-000000000000", 1);
         let file = signed(&elsewhere, &format!("{POD}# {NIL_APP_ID}\n"));

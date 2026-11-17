@@ -327,8 +327,7 @@ context; `canonicalJson(text)`, the JCS text of a body, refusing a repeated key,
 `verifyCatalog(text, catalogKeyJson, appId, slug)`, which verifies a catalog file under the
 platform document's `catalog_key` and returns `{entry, init_data, revision}`, the init-data
 rendered for the App and its Endpoint `<slug>.app.alphacompute.cc`, or an error starting with
-`signature_invalid`, `template_mismatch`, `substitutions_mismatch`, `slug_invalid` or
-`malformed`; `signable(context, fieldsJson, nowMs)`, `bodySha256(bytes)`,
+`signature_invalid`, `template_mismatch`, `substitutions_mismatch` or `malformed`; `signable(context, fieldsJson, nowMs)`, `bodySha256(bytes)`,
 `verifyMemberRequest(context, documentJson, memberKeyB64, signatureJson, nowMs)`, which checks
 the signature, the document's shape and its freshness and returns the member key's SHA-256 in hex, and `verifyGrant(wire, spkiB64)`, which returns the grant as
 JSON.
