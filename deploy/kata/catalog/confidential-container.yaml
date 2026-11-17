@@ -1,0 +1,59 @@
+# The catalog entry "Confidential container": a static web page behind the runtime, which
+# terminates TLS for the App's public name with a certificate whose key never leaves the TD.
+# Kata sizes the TD as 1 vCPU and 2048 MiB plus the limits: 2 vCPU, 4096 MiB.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: app
+spec:
+  runtimeClassName: kata-qemu-tdx
+  automountServiceAccountToken: false
+  enableServiceLinks: false
+  securityContext:
+    supplementalGroups: [1, 2, 3, 4, 6, 10, 11, 20, 26, 27]
+  containers:
+  - name: alpha-runtime
+    image: ${RUNTIME_IMAGE}
+    ports:
+    - {name: https, containerPort: 8443}
+    env:
+    - {name: ALPHACOMPUTE_KMS_CA_SPKI_SHA256, value: "${KMS_CA_SPKI_SHA256}"}
+    - {name: ALPHACOMPUTE_PLATFORM_DOCUMENT_URL, value: "${PLATFORM_DOCUMENT_URL}"}
+    - {name: ALPHACOMPUTE_PLATFORM_MIN_VERSION, value: "${PLATFORM_MIN_VERSION}"}
+    - {name: ALPHACOMPUTE_KMS_ENDPOINTS, value: "${KMS_ENDPOINTS}"}
+    # An address, not a name: the host writes the pod's /etc/hosts.
+    - {name: ALPHACOMPUTE_TLS_UPSTREAM, value: "127.0.0.1:8080"}
+    - {name: ALPHACOMPUTE_PUBLIC_NAME, value: __ALPHACOMPUTE_PUBLIC_NAME__}
+    securityContext:
+      runAsUser: 0
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: [ALL]
+      readOnlyRootFilesystem: true
+    volumeMounts:
+    - {name: tsm, mountPath: /sys/kernel/config}
+    - {name: alpha, mountPath: /run/alpha}
+  - name: web
+    # nginx-unprivileged 1.29-alpine; it listens on 8080 and writes only under /tmp.
+    image: public.ecr.aws/nginx/nginx-unprivileged@sha256:0c79d56aee561a1d81c63f00eee5fb5fe29279560cdc55e91425133104c7fbe6
+    resources:
+      limits:
+        cpu: "1"
+        memory: 2Gi
+    securityContext:
+      runAsUser: 101
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: [ALL]
+      readOnlyRootFilesystem: true
+    volumeMounts:
+    - {name: tmp, mountPath: /tmp}
+  volumes:
+  - name: tsm
+    hostPath:
+      path: /sys/kernel/config
+      type: Directory
+  - name: alpha
+    emptyDir: {medium: Memory}
+  - name: tmp
+    emptyDir: {medium: Memory}

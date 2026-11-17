@@ -118,19 +118,6 @@ function mintReceipt(route, requestText, response, options = {}) {
   };
 }
 
-// The catalog test key: Ed25519 from the seed of 32 bytes 11, as the CLI's catalog tests use.
-const CATALOG_KEY = crypto.createPrivateKey({
-  key: Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), Buffer.alloc(32, 11)]),
-  format: "der",
-  type: "pkcs8",
-});
-
-// A catalog file whose entry the catalog test key signs.
-function catalogFile(entry, template) {
-  const signature = crypto.sign(null, contextDigest("alphacompute/catalog/v1", jcs(entry)), CATALOG_KEY);
-  return JSON.stringify({ entry, signature: { algorithm: "ed25519", signature: b64u(signature) }, template });
-}
-
 function testView() {
   const catalog = JSON.parse(testdata("catalog/expected.json"));
   const view = {
@@ -715,6 +702,7 @@ function approvalApi(options = {}) {
     title: "Production",
     compose_hash: options.compose_hash || `sha256:${sha256(compose || "").toString("hex")}`,
     catalog_template_sha256: options.catalog_template_sha256 || null,
+    slug: options.slug,
     compose: options.catalog_template_sha256 ? null : compose,
     machine: "tdx.medium",
     credentials: options.credentials || [],
@@ -744,6 +732,7 @@ function approvalApi(options = {}) {
     "title",
     "compose_hash",
     "catalog_template_sha256",
+    "slug",
     "compose",
     "machine",
     "credentials",
@@ -895,7 +884,6 @@ module.exports = {
   plain,
   ids,
   approvalApi,
-  catalogFile,
   RP_ID,
   TICKET,
   SoftwareAuthenticator,

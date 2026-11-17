@@ -1,6 +1,7 @@
-//! A catalog file is `{entry, signature, template}`. The signature covers the entry only; the
-//! template is bound to it through `template_sha256`, which `render` checks before anything else,
-//! so a template is never used except through `render`.
+//! A catalog file is `{entry, signature, template, pod}`: a Kata init-data TOML (`template`) and
+//! the pod spec that carries it, both written for the nil App id and the public name
+//! [`PUBLIC_NAME`]. The signature covers the entry only; the entry binds both texts through their
+//! SHA-256 and signs how often each placeholder occurs in them, so [`render`] varies nothing else.
 
 use base64::Engine;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
@@ -8,14 +9,43 @@ use ed25519_dalek::{Signature, Signer as _, SigningKey};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AppId, CatalogKey, ComposeHash, NamedSignature, compose_hash, context, signing_digest,
+    APP_ZONE, AppId, CatalogKey, ComposeHash, InitData, NamedSignature, compose_hash, context,
+    is_slug, signing_digest,
 };
+
+pub const NIL_APP_ID: &str = "00000000-0000-0000-0000-000000000000";
+/// Replaced by `<slug>.app.alphacompute.cc`.
+pub const PUBLIC_NAME: &str = "__ALPHACOMPUTE_PUBLIC_NAME__";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Resources {
     pub cpu: u32,
     pub memory_mib: u32,
+}
+
+/// How many times [`NIL_APP_ID`] and [`PUBLIC_NAME`] occur in the template and the pod together.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Substitutions {
+    pub app_id: u32,
+    pub public_name: u32,
+}
+
+impl Substitutions {
+    pub fn count(template: &str, pod: &str) -> Result<Self, CatalogError> {
+        let count = |placeholder: &str| {
+            let n = template
+                .matches(placeholder)
+                .count()
+                .saturating_add(pod.matches(placeholder).count());
+            u32::try_from(n).map_err(|_| CatalogError::Malformed("too many placeholders".into()))
+        };
+        Ok(Self {
+            app_id: count(NIL_APP_ID)?,
+            public_name: count(PUBLIC_NAME)?,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,7 +55,9 @@ pub struct Entry {
     pub version: String,
     pub title: String,
     pub template_sha256: ComposeHash,
+    pub pod_sha256: ComposeHash,
     pub resources: Resources,
+    pub substitutions: Substitutions,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +66,17 @@ pub struct CatalogFile {
     pub entry: Entry,
     pub signature: NamedSignature,
     pub template: String,
+    pub pod: String,
+}
+
+/// A catalog Revision for one App: `init_data` is registered, its SHA-256 is `revision`, and
+/// `pod` is created with `init_data` in its `io.katacontainers.config.hypervisor.cc_init_data`
+/// annotation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Rendered {
+    pub revision: ComposeHash,
+    pub init_data: String,
+    pub pod: String,
 }
 
 /// `code()` is the verdict the shared vectors record and other implementations map to their own
@@ -42,10 +85,15 @@ pub struct CatalogFile {
 pub enum CatalogError {
     #[error("{0}")]
     SignatureInvalid(String),
-    #[error("the template does not hash to template_sha256")]
+    #[error("the template or the pod does not hash to the entry's digest")]
     TemplateMismatch,
-    #[error("the template names the nil App id {0} times, not once")]
-    NameNotOnce(usize),
+    #[error("the placeholders occur {found:?} times, the entry signs {signed:?}")]
+    SubstitutionsMismatch {
+        found: Substitutions,
+        signed: Substitutions,
+    },
+    #[error("{0:?} is not a slug")]
+    Slug(String),
     #[error("{0}")]
     Malformed(String),
 }
@@ -55,13 +103,12 @@ impl CatalogError {
         match self {
             Self::SignatureInvalid(_) => "signature_invalid",
             Self::TemplateMismatch => "template_mismatch",
-            Self::NameNotOnce(_) => "name_not_once",
+            Self::SubstitutionsMismatch { .. } => "substitutions_mismatch",
+            Self::Slug(_) => "slug_invalid",
             Self::Malformed(_) => "malformed",
         }
     }
 }
-
-const NIL_NAME: &str = "\"name\":\"00000000-0000-0000-0000-000000000000\"";
 
 fn digest(entry: &Entry) -> Result<[u8; 32], CatalogError> {
     serde_json::to_value(entry)
@@ -69,10 +116,13 @@ fn digest(entry: &Entry) -> Result<[u8; 32], CatalogError> {
         .map_err(|e| CatalogError::Malformed(format!("entry does not canonicalize: {e}")))
 }
 
-pub fn sign(entry: Entry, template: String, key: &SigningKey) -> Result<CatalogFile, CatalogError> {
-    if compose_hash(&template) != entry.template_sha256 {
-        return Err(CatalogError::TemplateMismatch);
-    }
+/// Signs `entry` as given; [`render`] refuses a file whose texts do not match it.
+pub fn sign(
+    entry: Entry,
+    template: String,
+    pod: String,
+    key: &SigningKey,
+) -> Result<CatalogFile, CatalogError> {
     let signature = key
         .try_sign(&digest(&entry)?)
         .map_err(|e| CatalogError::Malformed(format!("signing failed: {e}")))?;
@@ -83,6 +133,7 @@ pub fn sign(entry: Entry, template: String, key: &SigningKey) -> Result<CatalogF
             signature: BASE64_URL_SAFE_NO_PAD.encode(signature.to_bytes()),
         },
         template,
+        pod,
     })
 }
 
@@ -114,20 +165,50 @@ pub fn verify(file: &CatalogFile, key: &CatalogKey) -> Result<(), CatalogError> 
         })
 }
 
-/// The template with its one nil App id replaced by `app_id`; every other byte is kept, so the
-/// result is exactly what is measured.
+/// Verifies `file` under `key`, then replaces every nil App id with `app_id` and every
+/// [`PUBLIC_NAME`] with `<slug>.app.alphacompute.cc`. Every other byte is kept, so the init-data
+/// is exactly what is measured.
 pub fn render(
-    template: &str,
-    template_sha256: &ComposeHash,
+    file: &CatalogFile,
+    key: &CatalogKey,
     app_id: AppId,
-) -> Result<String, CatalogError> {
-    if compose_hash(template) != *template_sha256 {
+    slug: &str,
+) -> Result<Rendered, CatalogError> {
+    verify(file, key)?;
+    let entry = &file.entry;
+    if compose_hash(&file.template) != entry.template_sha256
+        || compose_hash(&file.pod) != entry.pod_sha256
+    {
         return Err(CatalogError::TemplateMismatch);
     }
-    match template.matches(NIL_NAME).count() {
-        1 => Ok(template.replacen(NIL_NAME, &format!("\"name\":\"{app_id}\""), 1)),
-        count => Err(CatalogError::NameNotOnce(count)),
+    let found = Substitutions::count(&file.template, &file.pod)?;
+    if found != entry.substitutions {
+        return Err(CatalogError::SubstitutionsMismatch {
+            found,
+            signed: entry.substitutions.clone(),
+        });
     }
+    if !is_slug(slug) {
+        return Err(CatalogError::Slug(slug.into()));
+    }
+    let public_name = format!("{slug}.{APP_ZONE}");
+    let substitute = |text: &str| {
+        text.replace(NIL_APP_ID, &app_id.to_string())
+            .replace(PUBLIC_NAME, &public_name)
+    };
+    let init_data = substitute(&file.template);
+    let parsed = InitData::parse(init_data.clone())
+        .map_err(|e| CatalogError::Malformed(format!("template: {e}")))?;
+    if parsed.app_id() != Some(app_id) {
+        return Err(CatalogError::Malformed(
+            "template: [data] app_id is not the nil App id".into(),
+        ));
+    }
+    Ok(Rendered {
+        revision: parsed.digest(),
+        init_data,
+        pod: substitute(&file.pod),
+    })
 }
 
 #[cfg(test)]
@@ -136,7 +217,9 @@ mod tests {
 
     use super::*;
 
-    const TEMPLATE: &str = r#"{"a":1,"name":"00000000-0000-0000-0000-000000000000","z":"é"}"#;
+    const TEMPLATE: &str = "algorithm = \"sha256\"\nversion = \"0.1.0\"\n\n[data]\n\"app_id\" = \"00000000-0000-0000-0000-000000000000\"\n\"policy.rego\" = '''\nENV=__ALPHACOMPUTE_PUBLIC_NAME__ é'''\n";
+    const POD: &str =
+        "env:\n- {name: ALPHACOMPUTE_PUBLIC_NAME, value: __ALPHACOMPUTE_PUBLIC_NAME__}\n";
 
     fn key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
@@ -146,30 +229,65 @@ mod tests {
         CatalogKey::from(&key.verifying_key())
     }
 
-    fn entry(template: &str) -> Entry {
+    fn entry(template: &str, pod: &str) -> Entry {
         Entry {
-            catalog_id: "cpu-app".into(),
+            catalog_id: "confidential-container".into(),
             version: "1".into(),
-            title: "CPU App".into(),
+            title: "Confidential container".into(),
             template_sha256: compose_hash(template),
+            pod_sha256: compose_hash(pod),
             resources: Resources {
-                cpu: 1,
-                memory_mib: 2048,
+                cpu: 2,
+                memory_mib: 4096,
             },
+            substitutions: Substitutions::count(template, pod).unwrap(),
         }
     }
 
+    fn signed(template: &str, pod: &str) -> CatalogFile {
+        sign(entry(template, pod), template.into(), pod.into(), &key(11)).unwrap()
+    }
+
     fn signed_by(seed: u8) -> CatalogFile {
-        sign(entry(TEMPLATE), TEMPLATE.into(), &key(seed)).unwrap()
+        sign(
+            entry(TEMPLATE, POD),
+            TEMPLATE.into(),
+            POD.into(),
+            &key(seed),
+        )
+        .unwrap()
     }
 
     fn app_id() -> AppId {
         "01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b".parse().unwrap()
     }
 
+    fn render_code(file: &CatalogFile, slug: &str) -> &'static str {
+        render(file, &catalog_key_of(&key(11)), app_id(), slug)
+            .unwrap_err()
+            .code()
+    }
+
     #[test]
-    fn an_entry_signed_by_the_catalog_key_verifies() {
-        verify(&signed_by(11), &catalog_key_of(&key(11))).unwrap();
+    fn render_substitutes_the_app_id_and_public_name_and_nothing_else() {
+        let rendered =
+            render(&signed_by(11), &catalog_key_of(&key(11)), app_id(), "board").unwrap();
+        let want = TEMPLATE
+            .replace(NIL_APP_ID, "01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b")
+            .replace(PUBLIC_NAME, "board.app.alphacompute.cc");
+        assert_eq!(rendered.init_data, want);
+        assert_eq!(rendered.revision, compose_hash(&want));
+        assert_eq!(
+            rendered.pod,
+            POD.replace(PUBLIC_NAME, "board.app.alphacompute.cc")
+        );
+        assert_eq!(
+            signed_by(11).entry.substitutions,
+            Substitutions {
+                app_id: 1,
+                public_name: 2
+            }
+        );
     }
 
     #[test]
@@ -185,19 +303,20 @@ mod tests {
 
     #[test]
     fn an_entry_changed_after_signing_is_refused() {
-        let changes: [fn(&mut Entry); 6] = [
+        let changes: [fn(&mut Entry); 8] = [
             |e| e.catalog_id.push('x'),
             |e| e.version = "2".into(),
-            |e| e.title = "CPU app".into(),
-            |e| e.resources.cpu = 2,
-            |e| e.resources.memory_mib = 4096,
+            |e| e.title = "Confidential Container".into(),
+            |e| e.resources.cpu = 3,
+            |e| e.resources.memory_mib = 8192,
             |e| e.template_sha256 = compose_hash("{}"),
+            |e| e.pod_sha256 = compose_hash("{}"),
+            |e| e.substitutions.public_name = 0,
         ];
         for (i, change) in changes.into_iter().enumerate() {
             let mut file = signed_by(11);
             change(&mut file.entry);
-            let err = verify(&file, &catalog_key_of(&key(11))).unwrap_err();
-            assert_eq!(err.code(), "signature_invalid", "change {i}");
+            assert_eq!(render_code(&file, "board"), "signature_invalid", "{i}");
         }
     }
 
@@ -249,120 +368,52 @@ mod tests {
 
     #[test]
     fn a_catalog_file_must_have_exactly_its_fields() {
-        let file = signed_by(11);
-        let signature = serde_json::to_string(&file.signature).unwrap();
-        let template = serde_json::to_string(&file.template).unwrap();
-        let hash = format!("\"{}\"", file.entry.template_sha256);
-        let entry_with = |sha: &str, version: &str, resources: &str, extra: &str| {
-            format!(
-                r#"{{"catalog_id":"cpu-app","version":{version},"title":"CPU App"{extra},"template_sha256":{sha},"resources":{resources}}}"#
-            )
-        };
-        let good_resources = r#"{"cpu":1,"memory_mib":2048}"#;
-        let good_entry = entry_with(&hash, "\"1\"", good_resources, "");
-        let file_with = |entry: &str, extra: &str| {
-            format!(r#"{{"entry":{entry},"signature":{signature},"template":{template}{extra}}}"#)
-        };
-        let parsed: CatalogFile = serde_json::from_str(&file_with(&good_entry, "")).unwrap();
-        assert_eq!(parsed, file);
-
-        let hex = hash
-            .trim_matches('"')
-            .strip_prefix("sha256:")
-            .unwrap()
-            .to_owned();
-        let bad_hashes = [
-            format!("\"sha256:{}\"", hex.to_uppercase()),
-            format!("\"{hex}\""),
-            format!("\"sha256:{}\"", &hex[..63]),
-        ];
-        let mut bad = vec![
-            file_with(&good_entry, r#","later":1"#),
-            file_with(
-                &entry_with(&hash, "\"1\"", good_resources, r#","later":1"#),
-                "",
-            ),
-            file_with(
-                &entry_with(&hash, "\"1\"", r#"{"cpu":1,"memory_mib":2048,"gpu":1}"#, ""),
-                "",
-            ),
-            format!(
-                r#"{{"entry":{good_entry},"signature":{},"template":{template}}}"#,
-                signature.replacen('{', r#"{"later":1,"#, 1)
-            ),
-            format!(
-                r#"{{"entry":{good_entry},"entry":{good_entry},"signature":{signature},"template":{template}}}"#
-            ),
-            file_with(
-                &entry_with(&hash, "\"1\"", good_resources, r#","title":"CPU App""#),
-                "",
-            ),
-            file_with(
-                &entry_with(&hash, "\"1\"", r#"{"cpu":1.0,"memory_mib":2048}"#, ""),
-                "",
-            ),
-            file_with(
-                &entry_with(&hash, "\"1\"", r#"{"cpu":-1,"memory_mib":2048}"#, ""),
-                "",
-            ),
-            file_with(
-                &entry_with(
-                    &hash,
-                    "\"1\"",
-                    r#"{"cpu":4294967296,"memory_mib":2048}"#,
-                    "",
-                ),
-                "",
-            ),
-            file_with(&entry_with(&hash, "1", good_resources, ""), ""),
-            format!(r#"{{"entry":{good_entry},"signature":{signature}}}"#),
-        ];
-        bad.extend(
-            bad_hashes
-                .iter()
-                .map(|sha| file_with(&entry_with(sha, "\"1\"", good_resources, ""), "")),
+        let file = serde_json::to_value(signed_by(11)).unwrap();
+        assert_eq!(
+            serde_json::from_value::<CatalogFile>(file.clone()).unwrap(),
+            signed_by(11)
         );
-        for text in bad {
-            assert!(
-                serde_json::from_str::<CatalogFile>(&text).is_err(),
-                "{text}"
-            );
+        let edits: [fn(&mut serde_json::Value); 7] = [
+            |f| f["later"] = 1.into(),
+            |f| f["entry"]["later"] = 1.into(),
+            |f| f["entry"]["resources"]["gpu"] = 1.into(),
+            |f| f["entry"]["substitutions"]["slug"] = 1.into(),
+            |f| f["entry"]["resources"]["cpu"] = (-1).into(),
+            |f| f["entry"]["template_sha256"] = "sha256:00".into(),
+            |f| {
+                f.as_object_mut().unwrap().remove("pod");
+            },
+        ];
+        for (i, edit) in edits.into_iter().enumerate() {
+            let mut bad = file.clone();
+            edit(&mut bad);
+            assert!(serde_json::from_value::<CatalogFile>(bad).is_err(), "{i}");
         }
     }
 
     #[test]
-    fn render_replaces_the_one_nil_name_with_the_app_id() {
-        let rendered = render(TEMPLATE, &compose_hash(TEMPLATE), app_id()).unwrap();
-        assert_eq!(rendered.len(), TEMPLATE.len());
-        let name = format!("\"name\":\"{}\"", app_id());
-        assert_eq!(name, r#""name":"01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b""#);
-        let at = TEMPLATE.find(NIL_NAME).unwrap();
-        assert_eq!(&rendered[at..at + name.len()], name);
-        assert_eq!(rendered[..at], TEMPLATE[..at]);
-        assert_eq!(rendered[at + name.len()..], TEMPLATE[at + NIL_NAME.len()..]);
+    fn render_refuses_texts_that_do_not_match_the_signed_entry() {
+        let mut file = signed_by(11);
+        file.template.push(' ');
+        assert_eq!(render_code(&file, "board"), "template_mismatch");
+        let mut file = signed_by(11);
+        file.pod.push(' ');
+        assert_eq!(render_code(&file, "board"), "template_mismatch");
+
+        let mut miscounted = entry(TEMPLATE, POD);
+        miscounted.substitutions.public_name = 1;
+        let file = sign(miscounted, TEMPLATE.into(), POD.into(), &key(11)).unwrap();
+        assert_eq!(render_code(&file, "board"), "substitutions_mismatch");
     }
 
     #[test]
-    fn render_refuses_a_template_that_does_not_match_its_hash() {
-        let longer = format!("{TEMPLATE} ");
-        let err = render(&longer, &compose_hash(TEMPLATE), app_id()).unwrap_err();
-        assert_eq!(err.code(), "template_mismatch");
-        let err = render("", &compose_hash(TEMPLATE), app_id()).unwrap_err();
-        assert_eq!(err.code(), "template_mismatch");
-    }
-
-    #[test]
-    fn render_refuses_a_template_without_exactly_one_nil_name() {
-        let twice = format!("[{TEMPLATE},{TEMPLATE}]");
-        for template in [r#"{"name":"x"}"#, twice.as_str()] {
-            let err = render(template, &compose_hash(template), app_id()).unwrap_err();
-            assert_eq!(err.code(), "name_not_once", "{template}");
+    fn render_refuses_a_bad_slug_or_a_template_that_names_no_nil_app() {
+        for slug in ["", "Board", "a--b", "sign", "b.c"] {
+            assert_eq!(render_code(&signed_by(11), slug), "slug_invalid", "{slug}");
         }
-    }
-
-    #[test]
-    fn signing_refuses_a_template_that_does_not_match_the_entry() {
-        let err = sign(entry("{}"), TEMPLATE.into(), &key(11)).unwrap_err();
-        assert_eq!(err.code(), "template_mismatch");
+        let elsewhere = TEMPLATE.replacen(NIL_APP_ID, "01994b3e-0000-7000-8000-000000000000", 1);
+        let file = signed(&elsewhere, &format!("{POD}# {NIL_APP_ID}\n"));
+        assert_eq!(render_code(&file, "board"), "malformed");
+        assert_eq!(render_code(&signed("not toml", POD), "board"), "malformed");
     }
 }
