@@ -30,7 +30,7 @@ const RESERVED: [&str; 13] = [
 
 /// `^[a-z][a-z0-9-]{1,46}[a-z0-9]$` without `--`, which Instance names use as their separator,
 /// and outside the names the platform keeps for itself.
-pub fn valid_slug(slug: &str) -> bool {
+fn valid_slug(slug: &str) -> bool {
     let bytes = slug.as_bytes();
     (3..=48).contains(&bytes.len())
         && bytes.first().is_some_and(u8::is_ascii_lowercase)

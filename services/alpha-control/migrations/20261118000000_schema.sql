@@ -32,7 +32,7 @@ create table audit_log (
   seq     bigint generated always as identity primary key,
   ts      timestamptz not null default now(),
   actor   text not null,
-  org_id  uuid,
+  org_id  uuid not null,
   action  text not null,
   object  text,
   details jsonb not null default '{}'

@@ -144,7 +144,7 @@ pub enum Caller {
 }
 
 impl Caller {
-    pub fn actor(&self) -> String {
+    fn actor(&self) -> String {
         match self {
             Caller::Operator => "operator".to_owned(),
             Caller::Key(key) => format!("key:{}", key.id),
