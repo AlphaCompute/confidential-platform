@@ -97,15 +97,12 @@ async fn an_organization_is_created_unrooted_by_the_operator_or_an_onboarding_ke
     }
 
     let onboard = "alpha_onboard";
-    sqlx::query(
-        "insert into api_keys (id, token_sha256, scopes, created_by) \
-         values ($1, $2, '{onboard}', 'test')",
-    )
-    .bind(Uuid::now_v7())
-    .bind(Sha256::digest(onboard).as_slice())
-    .execute(&api.1)
-    .await
-    .unwrap();
+    sqlx::query("insert into api_keys (id, token_sha256, scopes) values ($1, $2, '{onboard}')")
+        .bind(Uuid::now_v7())
+        .bind(Sha256::digest(onboard).as_slice())
+        .execute(&api.1)
+        .await
+        .unwrap();
     let escalate = json!({ "name": "Acme", "owner_email": "o@acme.test", "deploy_key": { "scopes": ["onboard"] } });
     let (status, _) = api.call(Method::POST, "/v1/orgs", onboard, escalate).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);

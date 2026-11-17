@@ -36,17 +36,14 @@ fn env(name: &str) -> Result<String, Error> {
     std::env::var(name).map_err(|_| Error::internal(format!("{name} is required")))
 }
 
-fn hex_env<const N: usize>(name: &str) -> Result<Zeroizing<[u8; N]>, Error> {
-    let decoded = Zeroizing::new(
-        data_encoding::HEXLOWER_PERMISSIVE
-            .decode(env(name)?.trim().as_bytes())
-            .unwrap_or_default(),
-    );
-    decoded
-        .as_slice()
-        .try_into()
+/// 32 bytes in hex.
+fn hex_env(name: &str) -> Result<Zeroizing<Vec<u8>>, Error> {
+    data_encoding::HEXLOWER_PERMISSIVE
+        .decode(env(name)?.trim().as_bytes())
+        .ok()
+        .filter(|bytes| bytes.len() == 32)
         .map(Zeroizing::new)
-        .map_err(|_| Error::internal(format!("{name} must be {N} hex-encoded bytes")))
+        .ok_or_else(|| Error::internal(format!("{name} must be 64 hex digits")))
 }
 
 /// The challenge certificate for the CA's validation, the public one for everyone else.
@@ -77,11 +74,14 @@ async fn run() -> Result<(), Error> {
             .await
             .map_err(|e| Error::internal(format!("migrate: {e}")));
     }
-    let operator_token_sha256 = *hex_env::<32>("ALPHACOMPUTE_OPERATOR_TOKEN_SHA256")?;
+    let operator_token_sha256 = <[u8; 32]>::try_from(
+        hex_env("ALPHACOMPUTE_OPERATOR_TOKEN_SHA256")?.as_slice(),
+    )
+    .map_err(|_| Error::internal("ALPHACOMPUTE_OPERATOR_TOKEN_SHA256 must be 64 hex digits"))?;
     let public_name = env("ALPHACOMPUTE_PUBLIC_NAME")?;
     // The certificate and ACME account keys derive from it, so a restart finds its certificate
     // in CT instead of spending one of the CA's five duplicate orders a week.
-    let acme_key = Zeroizing::new(hex_env::<32>("ALPHACOMPUTE_ACME_KEY")?.to_vec());
+    let acme_key = hex_env("ALPHACOMPUTE_ACME_KEY")?;
 
     let pool = PgPoolOptions::new()
         .max_connections(8)

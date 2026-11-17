@@ -104,17 +104,13 @@ pub async fn create(
     }
 
     let org_id = Uuid::now_v7();
-    let actor = caller.actor();
     let mut tx = state.pool.begin().await?;
-    sqlx::query(
-        "insert into organizations (id, name, owner_email, created_by) values ($1, $2, $3, $4)",
-    )
-    .bind(org_id)
-    .bind(&new.name)
-    .bind(&new.owner_email)
-    .bind(&actor)
-    .execute(&mut *tx)
-    .await?;
+    sqlx::query("insert into organizations (id, name, owner_email) values ($1, $2, $3)")
+        .bind(org_id)
+        .bind(&new.name)
+        .bind(&new.owner_email)
+        .execute(&mut *tx)
+        .await?;
     for link in &new.links {
         let inserted = sqlx::query(
             "insert into org_links (issuer, external_id, org_id) values ($1, $2, $3) \
@@ -134,14 +130,12 @@ pub async fn create(
             let (token, hash) = mint_token()?;
             let id = Uuid::now_v7();
             sqlx::query(
-                "insert into api_keys (id, org_id, token_sha256, scopes, created_by) \
-                 values ($1, $2, $3, $4, $5)",
+                "insert into api_keys (id, org_id, token_sha256, scopes) values ($1, $2, $3, $4)",
             )
             .bind(id)
             .bind(org_id)
             .bind(hash.as_slice())
             .bind(&request.scopes)
-            .bind(&actor)
             .execute(&mut *tx)
             .await?;
             Some(DeployKey {
