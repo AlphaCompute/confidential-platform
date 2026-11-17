@@ -441,6 +441,11 @@ test("a root claim makes no passkey until the owner's sign-in is bound to the ti
   assert.equal(page.authenticator.log.length, 0);
   const url = new URL(page.assigned[0]);
   assert.equal(`${url.origin}${url.pathname}`, "https://id.example/authorize");
+  const { view } = testView();
+  delete view.signer.oidc;
+  const unnamed = await loadPage({ routes: api.routes });
+  await unnamed.startClaim(undefined, { view, viewText: JSON.stringify(view) });
+  assert.equal(unnamed.text(), "The service is unavailable. Try again in a minute.");
   const q = url.searchParams;
   assert.equal(q.get("response_type"), "code");
   assert.equal(q.get("client_id"), "signer");

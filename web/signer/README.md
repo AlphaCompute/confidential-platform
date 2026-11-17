@@ -54,9 +54,11 @@ revocation verified.
 
 A ticket alone never adds a key. A `claim` ticket adds `rooted`; for a rooted organization
 `principal_id`, the principal of the key to add; and for an organization without a root
-`owner_email` and `oidc` (`{authorization_endpoint, client_id}`), but no principal.
+`owner_email`, but no principal.
 To root the organization the owner first signs in: the page sends the person to the identity
-provider with an authorization code request and PKCE, keeps the verifier in the tab's
+provider that the platform document names in `signer.oidc` (`{authorization_endpoint,
+client_id}`), never one a ticket names, with an authorization code request and PKCE; without
+`signer.oidc` it offers no root, keeps the verifier in the tab's
 `sessionStorage` under the request's `state`, and on the return to the same path posts
 `{code, code_verifier, redirect_uri}` to `POST /v1/tickets/{ticket}/session`. `alpha-control`
 redeems the code, checks that the ID token is the owner's, and answers `{session, principal_id}`:

@@ -466,11 +466,7 @@ function claimRefusal(read) {
     if (!UUID.test(read.principal_id)) return MESSAGES.unavailable;
     return read.credentials.length ? null : MESSAGES.no_credentials;
   }
-  const o = read.oidc;
-  if (typeof read.owner_email !== "string" || typeof o?.client_id !== "string") {
-    return MESSAGES.unavailable;
-  }
-  return /^https:\/\//.test(o.authorization_endpoint) ? null : MESSAGES.unavailable;
+  return typeof read.owner_email === "string" ? null : MESSAGES.unavailable;
 }
 
 async function startClaim(view, ticket, note) {
@@ -494,7 +490,7 @@ async function startClaim(view, ticket, note) {
   ui.facts.replaceChildren(
     el("p", MESSAGES.root_statement(read.owner_email, read.org_name, read.org_id), "warning"),
   );
-  if (!s.owner) return offerSignIn(c, note);
+  if (!s.owner) return view.signer.oidc ? offerSignIn(c, note) : stop(MESSAGES.unavailable);
   return s.first ? offerRoot(c, note) : offerFirst(c, note);
 }
 
@@ -527,10 +523,12 @@ async function signIn(c) {
     return offerSignIn(c, MESSAGES.no_storage);
   }
   const challenge = b64u(await crypto.subtle.digest("SHA-256", utf8(verifier)));
-  const url = new URL(c.read.oidc.authorization_endpoint);
+  // The identity provider comes from the release-signed document, never from the ticket.
+  const oidc = c.view.signer.oidc;
+  const url = new URL(oidc.authorization_endpoint);
   url.search = new URLSearchParams({
     response_type: "code",
-    client_id: c.read.oidc.client_id,
+    client_id: oidc.client_id,
     redirect_uri: redirectUri(),
     scope: "openid email",
     state,

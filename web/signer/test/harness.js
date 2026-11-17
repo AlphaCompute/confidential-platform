@@ -143,6 +143,7 @@ function testView() {
       rp_id: RP_ID,
       api_origin: ORIGIN,
       bundle_sha256: `sha256:${"0".repeat(64)}`,
+      oidc: { authorization_endpoint: "https://id.example/authorize", client_id: "signer" },
     },
     catalog_key: catalog.catalog_key,
   };
@@ -688,12 +689,11 @@ function claimApi(options = {}) {
     owner_session: b64u(crypto.randomBytes(32)),
     owner_email: "owner@acme.example",
     owner_code: "the-owners-code",
-    oidc: { authorization_endpoint: "https://id.example/authorize", client_id: "signer" },
     registrations: [],
     sessions: [],
     receiptFor: (registrationText, response) =>
       mintReceipt("key.register", registrationText, response),
-  }, ["rooted", "owner_email", "oidc", "principal_id"]);
+  }, ["rooted", "owner_email", "principal_id"]);
   const read = api.routes[`GET ${BASE}`];
   api.routes[`GET ${BASE}`] = () => {
     const answer = read();
