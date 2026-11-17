@@ -134,8 +134,8 @@ pub async fn create(
             let (token, hash) = mint_token()?;
             let id = Uuid::now_v7();
             sqlx::query(
-                "insert into api_keys (id, org_id, token_sha256, scopes, label, created_by) \
-                 values ($1, $2, $3, $4, 'deploy', $5)",
+                "insert into api_keys (id, org_id, token_sha256, scopes, created_by) \
+                 values ($1, $2, $3, $4, $5)",
             )
             .bind(id)
             .bind(org_id)

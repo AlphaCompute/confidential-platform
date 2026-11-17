@@ -19,7 +19,6 @@ create table api_keys (
   org_id       uuid references organizations(id),
   token_sha256 bytea not null unique check (length(token_sha256) = 32),
   scopes       text[] not null,
-  label        text not null,
   created_by   text not null,
   created_at   timestamptz not null default now()
 );

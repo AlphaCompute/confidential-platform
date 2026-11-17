@@ -117,10 +117,7 @@ async fn run() -> Result<(), Error> {
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .map_err(|e| Error::internal(format!("sigterm: {e}")))?;
     alpha_client::tls::serve(bind(PORT).await?, Arc::new(tls), app, async {
-        tokio::select! {
-            _ = term.recv() => {}
-            _ = tokio::signal::ctrl_c() => {}
-        }
+        term.recv().await;
     })
     .await;
     Ok(())

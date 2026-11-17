@@ -98,8 +98,8 @@ async fn an_organization_is_created_unrooted_by_the_operator_or_an_onboarding_ke
 
     let onboard = "alpha_onboard";
     sqlx::query(
-        "insert into api_keys (id, token_sha256, scopes, label, created_by) \
-         values ($1, $2, '{onboard}', 'rafay', 'test')",
+        "insert into api_keys (id, token_sha256, scopes, created_by) \
+         values ($1, $2, '{onboard}', 'test')",
     )
     .bind(Uuid::now_v7())
     .bind(Sha256::digest(onboard).as_slice())
