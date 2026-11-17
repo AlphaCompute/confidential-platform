@@ -1,7 +1,7 @@
 name: dev-image
 
 # The dev KMS and runtime images, built once with the build cache and pushed as dev-<commit>,
-# so a fix reaches the dev node in minutes. A release builds every image twice from nothing and
+# so a fix reaches the stand in minutes. A release builds every image twice from nothing and
 # fails on any difference; these images have no such check, and a production platform document
 # never lists them.
 on:

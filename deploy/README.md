@@ -3,8 +3,8 @@
 Two CVMs in two regions run one Revision of `alpha-kms` over one trust-zone Postgres. The
 production nodes are deployed neither by CI nor by shroud-go's deploy route: the operator creates
 and upgrades the two CVMs by hand through the Phala Cloud API (or the `phala` CLI), one at a
-time, with the compose the release workflow rendered. Only the dev node is deployed by a
-workflow (below). This directory is the runbook; the compose itself is a
+time, with the compose the release workflow rendered. The dev node is deployed the same way.
+This directory is the runbook; the compose itself is a
 release artifact, because it names the image by digest and the digest exists only after the
 build.
 
