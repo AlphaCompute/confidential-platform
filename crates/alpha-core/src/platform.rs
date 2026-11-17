@@ -26,6 +26,17 @@ pub struct Signer {
     pub rp_id: String,
     pub bundle_sha256: String,
     pub api_origin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc: Option<Oidc>,
+}
+
+/// The identity provider the signer page sends an owner to before a root claim. Only the
+/// release-signed document names it, so the service that issues tickets cannot send an owner's
+/// sign-in to a page of its choosing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Oidc {
+    pub authorization_endpoint: String,
+    pub client_id: String,
 }
 
 #[derive(Deserialize)]
@@ -34,6 +45,8 @@ struct SignerFields {
     rp_id: String,
     bundle_sha256: String,
     api_origin: String,
+    #[serde(default)]
+    oidc: Option<Oidc>,
 }
 
 impl TryFrom<SignerFields> for Signer {
@@ -76,11 +89,24 @@ impl TryFrom<SignerFields> for Signer {
                 f.bundle_sha256
             ));
         }
+        if let Some(o) = &f.oidc {
+            let endpoint = &o.authorization_endpoint;
+            let https = endpoint
+                .strip_prefix("https://")
+                .map(|rest| rest.split_once('/').map_or(rest, |(host, _)| host))
+                .is_some_and(|host| origin_host(&format!("https://{host}")).is_some());
+            if !https || endpoint.contains(['?', '#']) || o.client_id.is_empty() {
+                return Err(format!(
+                    "signer.oidc {o:?} needs an https authorization_endpoint without query or fragment and a client_id"
+                ));
+            }
+        }
         Ok(Self {
             origins: f.origins,
             rp_id: f.rp_id,
             bundle_sha256: f.bundle_sha256,
             api_origin: f.api_origin,
+            oidc: f.oidc,
         })
     }
 }
@@ -284,6 +310,31 @@ mod tests {
             "https://sign.example",
         ] {
             assert!(signer("rp_id", json!(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn signer_oidc_names_an_https_endpoint_and_a_client() {
+        let oidc = |endpoint: &str, client: &str| {
+            signer(
+                "oidc",
+                json!({ "authorization_endpoint": endpoint, "client_id": client }),
+            )
+        };
+        assert!(oidc("https://id.example/authorize", "signer").is_ok());
+        assert!(
+            signer("api_origin", json!("https://api.example"))
+                .unwrap()
+                .oidc
+                .is_none()
+        );
+        for (endpoint, client) in [
+            ("http://id.example/authorize", "signer"),
+            ("https://id.example/authorize?x=1", "signer"),
+            ("https://ID.example/authorize", "signer"),
+            ("https://id.example/authorize", ""),
+        ] {
+            assert!(oidc(endpoint, client).is_err(), "{endpoint:?} {client:?}");
         }
     }
 

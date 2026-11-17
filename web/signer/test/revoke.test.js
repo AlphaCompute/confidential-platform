@@ -7,6 +7,7 @@ const {
   NOT_CONFIRMED,
   SoftwareAuthenticator,
   contextDigest,
+  failed,
   ids,
   iso,
   loadPage,
@@ -135,15 +136,15 @@ test("a revoke receipt that does not verify never reads revoked; the step is sig
 
 test("every refusal is one fixed sentence", async () => {
   const now = Date.now();
-  const EXPIRED = "This revocation link has expired.";
+  const EXPIRED = "This link has expired.";
   const UNAVAILABLE = "The service is unavailable. Try again in a minute.";
   const hash = `sha256:${"ab".repeat(32)}`;
   const read = [
     [{ state: "expired" }, EXPIRED],
     [{ expires_at: iso(now - 1000) }, EXPIRED],
-    [{ state: "revoked" }, "This link is not valid."],
-    [{ read: { status: 404, body: { error: "x", error_code: "SHROUD_NOT_FOUND" } } }, "This link is not valid."],
-    [{ read: { status: 503, body: { error: "x", error_code: "SHROUD_SERVICE_UNAVAILABLE" } } }, UNAVAILABLE],
+    [{ state: "done" }, "This link was already used, declined or closed."],
+    [{ read: failed(404, "ticket_not_found") }, "This link is not valid."],
+    [{ read: failed(503, "unavailable") }, UNAVAILABLE],
     [{ revisions: [] }, UNAVAILABLE],
     [{ revisions: [hash, hash] }, UNAVAILABLE],
     [{ revisions: [hash.toUpperCase()] }, UNAVAILABLE],
@@ -175,15 +176,15 @@ test("every refusal is one fixed sentence", async () => {
       "The KMS refused this request (not_found).",
     ],
     [
-      { status: 409, body: { error: "x", error_code: "SHROUD_CONFLICT", details: { state: "expired" } } },
+      failed(409, "ticket_expired"),
       EXPIRED,
     ],
-    [{ status: 400, body: { error: "<img src=x onerror=alert(1)>", error_code: "<b>x</b>" } }, UNAVAILABLE],
+    [failed(400, "<b>x</b>"), UNAVAILABLE],
     [new Error("network"), UNAVAILABLE],
   ];
   for (const [reply, sentence] of kms) {
     const { api, page } = await revocationPage();
-    api.reply = () => reply;
+    api.reply.revoke = () => reply;
     await page.click("Revoke with passkey");
     const text = page.text();
     assert.ok(text.includes(sentence), `${sentence}\n${text}`);

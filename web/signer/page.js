@@ -7,10 +7,13 @@ const FONT_SRI = "@FONT_SRI@";
 
 const VERSION_KEY = "alphacompute-platform-version";
 const TICKET = /^[A-Za-z0-9_-]{43}$/;
+const TICKET_CODE = /^[0-9A-HJKMNP-TV-Z]{8}$/;
+const MODES = ["claim", "approve", "revoke"];
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const NIL_APP = "00000000-0000-0000-0000-000000000000";
+const HASH = /^sha256:[0-9a-f]{64}$/;
+const PINNED = /@sha256:[0-9a-f]{64}$/;
 const CODE = /^[A-Za-z_]{1,64}$/;
-// shroud-go limits its public routes to 5 requests per second per IP.
+// alpha-control limits its ticket routes to 5 requests per second per IP.
 const PACE_MS = 250;
 const MAX_RETRY_AFTER_S = 10;
 // The KMS accepts issued_at within five minutes of its clock; one minute is left for the network.
@@ -40,10 +43,9 @@ const MESSAGES = {
   rate_limited: "Too many requests from this network. Wait a minute and try again.",
   clock: (minutes) =>
     `Your device clock is off by about ${minutes} minutes. Correct it and reload.`,
-  claim_closed: "This claim link is closed. Ask your AlphaCompute contact for a new link.",
-  claim_expired: "This claim link has expired. Ask your AlphaCompute contact for a new link.",
-  other_tab:
-    "This link was already opened in another tab or on another device. Ask your AlphaCompute contact for a new link.",
+  closed: "This link was already used, declined or closed.",
+  expired: "This link has expired.",
+  bad_code: "Enter the 8 characters of your code.",
   prompt_closed: "The passkey prompt was closed. Try again.",
   passkey_failed: "The passkey prompt failed. Try again, or open this link in another browser.",
   already_registered:
@@ -59,22 +61,20 @@ const MESSAGES = {
   no_credentials: "No passkey of this organization is known. Ask your AlphaCompute contact.",
   foreign_passkey: "That passkey does not belong to this organization. Use one that does.",
   check_failed: "This passkey did not sign as expected. Try again.",
-  already_enrolled:
-    "A passkey was already created through this link. Approve with that passkey, or ask your AlphaCompute contact.",
-  credential_known: "This passkey is already registered. Approve with it.",
-  enroll_limit:
-    "This account already has the maximum number of passkeys for this organization. Use one of them.",
-  sign_in: "Sign in with your AlphaCompute account to create a passkey for this organization.",
-  signed_in: "Signed in. Create your passkey to continue.",
+  sign_in: (email) => `Sign in as ${email} to claim this organization.`,
   sign_in_failed: "Sign-in did not complete. Try again.",
-  root_taken: "Your organization was claimed by another key. Do not approve. Contact AlphaCompute.",
-  root_synced: "This passkey is saved to your account's password manager.",
-  root_device_bound:
-    "This passkey is only on this device. If you lose it, you lose access to your organization.",
+  not_owner: "That sign-in is not the owner of this organization. Sign in as the owner.",
+  no_storage: "This browser does not let the page keep the sign-in in this tab. Allow site data and try again.",
+  root_statement: (email, org, id) =>
+    `You, ${email}, are making this passkey the root key of ${org} (${id}).`,
+  add_statement: (principal, org) =>
+    `This passkey becomes a key of principal ${principal} in ${org}, approved by one of its passkeys.`,
+  root_taken: "Your organization was claimed by another key. Do not continue. Contact AlphaCompute.",
+  root_unconfirmed:
+    "This organization already has a root key, and this sign-in can no longer confirm it. Contact AlphaCompute.",
   yours: "This organization is yours.",
-  root_first:
-    "Step 1 of 2: create your organization's passkey and confirm it. It controls the organization, so keep it. In step 2 you approve this App with it.",
-  root_then: "Step 2 of 2: approve this App with your organization's new passkey.",
+  unrooted:
+    "This organization has no passkey yet. Finish onboarding from the email we sent, then open this link again.",
   machine:
     "The service sets the machine size (CPU and memory). The size never changes the code or keys you approve, so you do not sign it.",
   added: "The new passkey is registered.",
@@ -82,8 +82,6 @@ const MESSAGES = {
   device_bound: "Device-bound passkey: if you lose this device you lose this key",
   two_keys: "Done. Your organization has two passkeys.",
   added_done: "Done. The new passkey signs as expected.",
-  approval_expired: "This approval link has expired.",
-  decided: "This request was already approved, declined or cancelled.",
   mismatch:
     "What the service asked you to approve does not match what it would run. Nothing was signed.",
   unreadable:
@@ -95,9 +93,10 @@ const MESSAGES = {
   secret_missing: "Enter a value for every secret.",
   not_sealed: "The KMS node did not prove itself, so the secret was not sent. Try again.",
   catalog: "The catalog entry for this launch is not signed by AlphaCompute. Nothing was signed.",
-  not_from_catalog: "This launch is replacing a launch not from this catalog.",
   revision_revoked: "The KMS refuses this launch because it was revoked before. Nothing was approved.",
-  revoke_expired: "This revocation link has expired.",
+  requester: "From the requester, not verified:",
+  no_change: "No change to images, published ports, volumes, environment, Secrets or network openings.",
+  keep_predecessor: (hash) => `Keep the previous Revision ${hash} runnable`,
   revoke_effect:
     "Revoking stops the KMS from giving these launches keys, Secrets or certificates: no copy can start, and a running copy gets none again. It cannot be undone; the same launch can never be approved again.",
   revoked: "Revoked. You can close this tab.",
@@ -106,12 +105,14 @@ const MESSAGES = {
 };
 
 const CODES = {
-  SHROUD_NOT_FOUND: MESSAGES.bad_link,
-  SHROUD_SERVICE_UNAVAILABLE: MESSAGES.unavailable,
-  SHROUD_RATE_LIMITED: MESSAGES.rate_limited,
-  SHROUD_UPSTREAM_INVALID: MESSAGES.not_confirmed,
-  SHROUD_CONFLICT: MESSAGES.conflict,
+  ticket_not_found: MESSAGES.bad_link,
+  unavailable: MESSAGES.unavailable,
   rate_limited: MESSAGES.rate_limited,
+  upstream_invalid: MESSAGES.not_confirmed,
+  conflict: MESSAGES.conflict,
+  ticket_expired: MESSAGES.expired,
+  ticket_closed: MESSAGES.closed,
+  session_refused: MESSAGES.not_owner,
   sealed: MESSAGES.unavailable,
   signature_invalid: MESSAGES.signature_invalid,
   already_exists: MESSAGES.already_exists,
@@ -212,9 +213,9 @@ function storeVersion(version) {
 
 let lastCall = -Infinity;
 
-// One call to shroud-go. A 429 is answered before anything is relayed, so the identical request
-// is sent once more after Retry-After.
-async function api(view, method, path, bodyText, credentials = "omit") {
+// One call to alpha-control. A 429 is answered before anything is relayed, so the identical request
+// is sent once more after Retry-After. `headers` adds to the content type.
+async function api(view, method, path, bodyText, headers = {}) {
   for (let attempt = 0; ; attempt += 1) {
     const wait = lastCall + PACE_MS - Date.now();
     if (wait > 0) await sleep(wait);
@@ -223,10 +224,10 @@ async function api(view, method, path, bodyText, credentials = "omit") {
     try {
       reply = await fetch(view.signer.api_origin + path, {
         method,
-        headers: bodyText === undefined ? {} : { "Content-Type": "application/json" },
+        headers: bodyText === undefined ? headers : { "Content-Type": "application/json", ...headers },
         body: bodyText,
         cache: "no-store",
-        credentials,
+        credentials: "omit",
         referrerPolicy: "no-referrer",
       });
     } catch (_) {
@@ -247,32 +248,15 @@ async function api(view, method, path, bodyText, credentials = "omit") {
   }
 }
 
-function errorCode(body) {
-  if (!body || typeof body !== "object") return "";
-  if (typeof body.error_code === "string") return body.error_code;
-  if (body.error && typeof body.error === "object" && typeof body.error.code === "string") {
-    return body.error.code;
-  }
-  return "";
-}
-
 // The fixed sentence for a failed call; the server's own text never reaches the page.
 function failure(reply) {
   if (reply.status === 0) return MESSAGES.unavailable;
-  const code = errorCode(reply.body);
+  const raw = reply.body?.error?.code;
+  const code = typeof raw === "string" ? raw : "";
   if (Object.hasOwn(CODES, code)) return CODES[code];
   if (CODE.test(code)) return MESSAGES.kms_refused(code);
   if (reply.status === 404) return MESSAGES.bad_link;
   return MESSAGES.unavailable;
-}
-
-// As `failure`, but a request that is no longer pending names its state.
-function approvalFailure(reply) {
-  const details = reply.status === 409 && reply.body?.details;
-  if (details && typeof details.state === "string") {
-    return details.state === "expired" ? MESSAGES.approval_expired : MESSAGES.decided;
-  }
-  return failure(reply);
 }
 
 function clockRefusal(serverTime) {
@@ -282,8 +266,35 @@ function clockRefusal(serverTime) {
   return skew > MAX_SKEW_MS ? MESSAGES.clock(Math.round(skew / 60000)) : null;
 }
 
-function revisionsJson(view) {
-  return JSON.stringify(view.kms_revisions.map((r) => r.compose_hash));
+function ticketRefusal(read, kind) {
+  if (!read || typeof read !== "object") return MESSAGES.unavailable;
+  if (read.kind !== kind) return MESSAGES.bad_link;
+  if (read.state === "expired") return MESSAGES.expired;
+  if (read.state !== "open") return MESSAGES.closed;
+  const expires = Date.parse(read.expires_at);
+  if (!Number.isFinite(expires) || expires <= Date.now()) return MESSAGES.expired;
+  if (
+    !UUID.test(read.org_id) ||
+    typeof read.org_name !== "string" ||
+    !Array.isArray(read.credentials) ||
+    !read.credentials.every((c) => typeof c?.credential_id === "string" && typeof c.key_id === "string")
+  ) {
+    return MESSAGES.unavailable;
+  }
+  return clockRefusal(read.server_time);
+}
+
+// The ticket, with the sentence that refuses it when the read failed, it is of another kind or
+// it is not open; `check` adds the kind's own refusals.
+async function readTicket(view, ticket, kind, check) {
+  const reply = await api(view, "GET", `/v1/tickets/${ticket}`);
+  if (reply.status !== 200) return { refusal: failure(reply) };
+  const read = reply.body;
+  return { read, refusal: ticketRefusal(read, kind) || check(read) };
+}
+
+function ticketPath(ticket, op) {
+  return `/v1/tickets/${ticket}/kms/${op}`;
 }
 
 // The response the KMS signed for exactly `sentText`, or null.
@@ -293,7 +304,7 @@ function receipt(view, reply, route, sentText, response) {
     const signed = wasm_bindgen.verifyKmsReceipt(
       JSON.stringify(reply.body.receipt),
       view.kms_ca_pem,
-      revisionsJson(view),
+      JSON.stringify(view.kms_revisions.map((r) => r.compose_hash)),
       JSON.stringify(expected),
     );
     return JSON.parse(signed);
@@ -425,8 +436,7 @@ function screen(...head) {
   return ui;
 }
 
-// The claim's progress in this tab, under the ticket's hash: the organization is revealed once
-// per ticket, so a reload must find it here.
+// The passkeys this tab made for a claim, under the ticket's hash, so that a reload resumes.
 function sessionKey(ticket) {
   return `alphacompute-claim-${wasm_bindgen.bodySha256(utf8(ticket))}`;
 }
@@ -440,59 +450,121 @@ function loadSession(ticket) {
   }
 }
 
+// Whether the tab kept it: without storage a reload cannot resume, and a sign-in cannot be used.
 function saveSession(c) {
   try {
     sessionStorage.setItem(sessionKey(c.ticket), JSON.stringify(c.session));
+    return true;
   } catch (_) {
-    // Without storage a reload cannot resume; the claim itself is unaffected.
+    return false;
   }
 }
 
-function claimRefusal(read, resuming) {
-  if (!read || typeof read !== "object") return MESSAGES.unavailable;
-  if (read.kind !== "root" && read.kind !== "add") return MESSAGES.bad_link;
-  if (read.state === "closed") return MESSAGES.claim_closed;
-  if (read.state === "expired") return MESSAGES.claim_expired;
-  if (read.state !== "open" && read.state !== "rooted") return MESSAGES.bad_link;
-  const expires = Date.parse(read.expires_at);
-  if (!Number.isFinite(expires) || expires <= Date.now()) return MESSAGES.claim_expired;
-  if (read.keys_left === 0 && !resuming) return MESSAGES.claim_closed;
-  if (typeof read.org_name !== "string" || !Array.isArray(read.credentials)) {
-    return MESSAGES.unavailable;
+// A root needs the owner's session, which only the tab that redeemed the sign-in holds; a key
+// added to a rooted organization needs a signature by one of its keys.
+function claimRefusal(read) {
+  if (typeof read.rooted !== "boolean") return MESSAGES.unavailable;
+  if (read.rooted) {
+    if (!UUID.test(read.principal_id)) return MESSAGES.unavailable;
+    return read.credentials.length ? null : MESSAGES.no_credentials;
   }
-  return clockRefusal(read.server_time);
+  return typeof read.owner_email === "string" ? null : MESSAGES.unavailable;
 }
 
-async function startClaim(view, ticket) {
-  const reply = await api(view, "GET", `/v1/claims/${ticket}`);
-  if (reply.status !== 200) return stop(failure(reply));
-  const read = reply.body;
-  const session = loadSession(ticket);
-  // The last key registered spends the link, and a reload in this tab still owes the checks.
-  const refusal = claimRefusal(read, Boolean(session?.first?.key_id));
+async function startClaim(view, ticket, note) {
+  const { read, refusal } = await readTicket(view, ticket, "claim", claimRefusal);
   if (refusal) return stop(refusal);
-  if (read.kind === "add" && read.credentials.length === 0) return stop(MESSAGES.no_credentials);
-
   const ui = screen(
-    el(
-      "p",
-      read.kind === "root" ? "Claim this organization" : "Add a passkey to this organization",
-      "eyebrow",
-    ),
+    el("p", read.rooted ? "Add a passkey to this organization" : "Claim this organization", "eyebrow"),
     el("h1", read.org_name),
     el("p", `This link stays open until ${read.expires_at}.`),
   );
-  const c = { view, read, ticket, ui, session, checked: new Set() };
+  const c = { view, read, ticket, ui, session: loadSession(ticket) || {}, checked: new Set() };
   const s = c.session;
-  const revealed = Boolean(s?.org_id && s.first);
-  const registered = revealed && Boolean(s.first.key_id);
-  if (read.kind === "add") {
-    if (registered) return added(c);
-    return revealed ? offerAddApproval(c) : offerFirst(c);
+  if (s.first?.key_id) return s.root ? rooted(c) : added(c);
+  // A root this tab signed may have reached the KMS without the tab learning its key id; the KMS
+  // answers the same key with the stored root, so it is offered again, never as an added key.
+  if (s.root && s.first && s.owner) return offerRoot(c, note);
+  if (read.rooted) {
+    ui.facts.replaceChildren(el("p", MESSAGES.add_statement(read.principal_id, read.org_name), "warning"));
+    return s.first ? offerAddApproval(c, note) : offerFirst(c, note);
   }
-  if (registered) return rooted(c);
-  if (read.state === "rooted") return stop(MESSAGES.other_tab);
-  return revealed ? offerRoot(c) : offerFirst(c);
+  ui.facts.replaceChildren(
+    el("p", MESSAGES.root_statement(read.owner_email, read.org_name, read.org_id), "warning"),
+  );
+  if (!s.owner) return view.signer.oidc ? offerSignIn(c, note) : stop(MESSAGES.unavailable);
+  return s.first ? offerRoot(c, note) : offerFirst(c, note);
+}
+
+// The owner's principal once this tab signed in, else the one the ticket names for a new key.
+function principalOf(c) {
+  return c.session.owner?.principal_id ?? c.read.principal_id;
+}
+
+function redirectUri() {
+  return `${location.origin}${location.pathname}`;
+}
+
+function oidcKey(state) {
+  return `alphacompute-oidc-${state}`;
+}
+
+function offerSignIn(c, note) {
+  offer(c.ui, note, button(MESSAGES.sign_in(c.read.owner_email), () => signIn(c)));
+}
+
+// Authorization code with PKCE: the identity provider sends the person back to this path with
+// the code, and alpha-control redeems it and returns a session secret that the root relay needs,
+// so a second holder of the ticket cannot root the organization after the owner signed in.
+async function signIn(c) {
+  const state = b64u(random(32));
+  const verifier = b64u(random(32));
+  try {
+    sessionStorage.setItem(oidcKey(state), JSON.stringify({ ticket: c.ticket, verifier }));
+  } catch (_) {
+    return offerSignIn(c, MESSAGES.no_storage);
+  }
+  const challenge = b64u(await crypto.subtle.digest("SHA-256", utf8(verifier)));
+  // The identity provider comes from the release-signed document, never from the ticket.
+  const oidc = c.view.signer.oidc;
+  const url = new URL(oidc.authorization_endpoint);
+  url.search = new URLSearchParams({
+    response_type: "code",
+    client_id: oidc.client_id,
+    redirect_uri: redirectUri(),
+    scope: "openid email",
+    state,
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    login_hint: c.read.owner_email,
+  }).toString();
+  location.assign(url.href);
+}
+
+async function finishSignIn(view) {
+  const query = new URLSearchParams(location.search);
+  const key = oidcKey(query.get("state") || "");
+  let saved = null;
+  try {
+    saved = JSON.parse(sessionStorage.getItem(key));
+    sessionStorage.removeItem(key);
+  } catch (_) {
+    // A tab that kept nothing cannot finish this sign-in.
+  }
+  if (!saved || !TICKET.test(saved.ticket)) return stop(MESSAGES.sign_in_failed);
+  history.replaceState(null, "", `${location.pathname}#${saved.ticket}`);
+  const code = query.get("code");
+  if (!code) return startClaim(view, saved.ticket, MESSAGES.sign_in_failed);
+  const body = JSON.stringify({ code, code_verifier: saved.verifier, redirect_uri: redirectUri() });
+  const reply = await api(view, "POST", `/v1/tickets/${saved.ticket}/session`, body);
+  if (reply.status !== 200) return startClaim(view, saved.ticket, failure(reply));
+  const owner = reply.body;
+  if (!TICKET.test(owner?.session) || !UUID.test(owner.principal_id)) {
+    return startClaim(view, saved.ticket, MESSAGES.unavailable);
+  }
+  const session = { session: owner.session, principal_id: owner.principal_id };
+  const c = { ticket: saved.ticket, session: { ...loadSession(saved.ticket), owner: session } };
+  return saveSession(c) ? startClaim(view, saved.ticket) : stop(MESSAGES.no_storage);
 }
 
 // A button that creates one passkey and hands its key to `next`, or offers `retry` a note.
@@ -513,62 +585,20 @@ function createButton(label, options, retry, next, className) {
 function offerFirst(c, note) {
   const exclude = c.read.credentials.map((x) => x.credential_id);
   const options = createOptions(c.view, c.read.org_name, exclude);
-  offer(
-    c.ui,
-    note,
-    createButton("Create passkey", options, (n) => offerFirst(c, n), (key) => reveal(c, key)),
-  );
+  const next = (key) => {
+    c.session = { ...c.session, first: key, root: !c.read.rooted };
+    saveSession(c);
+    return c.read.rooted ? offerAddApproval(c) : offerRoot(c);
+  };
+  offer(c.ui, note, createButton("Create passkey", options, (n) => offerFirst(c, n), next));
 }
 
-// Asked only once a passkey exists, so a closed prompt never spends the one reveal.
-async function reveal(c, key) {
-  const reply = await api(c.view, "POST", `/v1/claims/${c.ticket}/org`);
-  if (reply.status === 409) {
-    const state = reply.body?.details?.state;
-    if (state === "closed") return stop(MESSAGES.claim_closed);
-    if (state === "expired") return stop(MESSAGES.claim_expired);
-    return stop(MESSAGES.other_tab);
-  }
-  const b = reply.body;
-  if (reply.status !== 200 || !b || !UUID.test(b.org_id) || !UUID.test(b.principal_id)) {
-    const note = reply.status === 200 ? MESSAGES.unavailable : failure(reply);
-    return offer(c.ui, note, button("Try again", () => reveal(c, key)));
-  }
-  c.session = { org_id: b.org_id, principal_id: b.principal_id, first: key };
-  saveSession(c);
-  return c.read.kind === "root" ? offerRoot(c) : offerAddApproval(c);
-}
-
-// Relays one key registration; `signed` is the response the KMS signed for it, or null.
-async function relayKey(view, path, orgId, key, registration, credentials) {
-  const body = `{"credential_id":${JSON.stringify(key.id)},"registration":${registration}}`;
-  const reply = await api(view, "POST", path, body, credentials);
-  const signed = receipt(view, reply, "key.register", registration, {
-    org_id: orgId,
-    public_key: key.spki,
-  });
-  return { reply, signed: typeof signed?.id === "string" ? signed : null };
-}
-
-// One step that signs a key document and relays it: `allow` limits the passkeys asked, `keyIdFor`
-// maps the one that answered to its KMS key id (undefined for the root's self-signature), `relay`
-// sends the signed document and takes the next step, and `next` runs once the receipt verified.
-// Returns the button that signs.
+// One step that signs a key document and relays it as `op` (`root` or `key`): `allow` limits the
+// passkeys asked, `keyIdFor` maps the one that answered to its KMS key id (undefined for the
+// root's self-signature), and `next` runs once the receipt verified.
 function offerRegistration(c, note, step) {
   const signable = wasm_bindgen.signingDigest(step.context, JSON.stringify(step.payload));
   const options = getOptions(c.view, signable.digest, step.allow);
-  const relay =
-    step.relay ||
-    (async (registration) => {
-      const path = `/v1/claims/${c.ticket}/keys`;
-      const orgId = c.session.org_id;
-      const { reply, signed } = await relayKey(c.view, path, orgId, step.key, registration);
-      if (reply.status !== 200) return step.retry(failure(reply));
-      if (!signed) return step.retry(MESSAGES.not_confirmed);
-      step.key.key_id = signed.id;
-      saveSession(c);
-      return step.next();
-    });
   const sign = button(step.label, async () => {
     const { credential, note } = await passkey("get", options);
     if (!credential) return step.retry(note);
@@ -577,10 +607,28 @@ function offerRegistration(c, note, step) {
     const registration = wasm_bindgen.canonicalJson(
       JSON.stringify({ payload: step.payload, signature: signatureObject(credential, keyId) }),
     );
-    return relay(registration);
+    const body = `{"credential_id":${JSON.stringify(step.key.id)},"registration":${registration}}`;
+    const owner = step.op === "root" ? { "Alpha-Claim-Session": c.session.owner.session } : {};
+    const reply = await api(c.view, "POST", ticketPath(c.ticket, step.op), body, owner);
+    const code = reply.body?.error?.code;
+    if (step.op === "root" && code === "already_exists") return stop(MESSAGES.root_taken);
+    if (step.op === "root" && code === "session_refused") {
+      delete c.session.owner;
+      saveSession(c);
+      // A rooted read names no owner to sign in as; only the session that rooted it can confirm.
+      return c.read.rooted ? stop(MESSAGES.root_unconfirmed) : offerSignIn(c, MESSAGES.not_owner);
+    }
+    if (reply.status !== 200) return step.retry(failure(reply));
+    const signed = receipt(c.view, reply, "key.register", registration, {
+      org_id: c.read.org_id,
+      public_key: step.key.spki,
+    });
+    if (typeof signed?.id !== "string") return step.retry(MESSAGES.not_confirmed);
+    step.key.key_id = signed.id;
+    saveSession(c);
+    return step.next();
   });
   offer(c.ui, note, sign);
-  return sign;
 }
 
 // The self-signed document that makes `key` the first key of an organization.
@@ -588,6 +636,7 @@ function rootStep(orgId, principalId, key) {
   return {
     label: "Confirm with passkey",
     context: "org-root-key",
+    op: "root",
     payload: {
       org_id: orgId,
       principal_id: principalId,
@@ -602,9 +651,8 @@ function rootStep(orgId, principalId, key) {
 }
 
 function offerRoot(c, note) {
-  const s = c.session;
   offerRegistration(c, note, {
-    ...rootStep(s.org_id, s.principal_id, s.first),
+    ...rootStep(c.read.org_id, principalOf(c), c.session.first),
     retry: (n) => offerRoot(c, n),
     next: () => rooted(c),
   });
@@ -615,7 +663,8 @@ function offerAddApproval(c, note) {
   offerRegistration(c, note, {
     label: "Approve it with a passkey of this organization",
     context: "principal-key",
-    payload: principalKey(s, s.first, "passkey-1"),
+    op: "key",
+    payload: principalKey(c, s.first, "passkey-1"),
     key: s.first,
     allow: c.read.credentials.map((x) => x.credential_id),
     keyIdFor: (credential) => keyIdOf(credential.rawId, c.read.credentials),
@@ -624,8 +673,8 @@ function offerAddApproval(c, note) {
   });
 }
 
-function principalKey(s, key, label) {
-  return { principal_id: s.principal_id, public_key: key.spki, label, issued_at: issuedAt() };
+function principalKey(c, key, label) {
+  return { principal_id: principalOf(c), public_key: key.spki, label, issued_at: issuedAt() };
 }
 
 function describeKey(title, key) {
@@ -686,7 +735,8 @@ function offerSecondApproval(c, note) {
   offerRegistration(c, note, {
     label: "Approve it with your first passkey",
     context: "principal-key",
-    payload: principalKey(s, s.second, "passkey-2"),
+    op: "key",
+    payload: principalKey(c, s.second, "passkey-2"),
     key: s.second,
     allow: [s.first.id],
     keyIdFor: () => s.first.key_id,
@@ -776,31 +826,24 @@ async function signedAsExpected(view, key, challenge, assertion) {
   }
 }
 
+// An approval carries only bodies signed by a key already in the organization's roster, so a
+// ticket of an organization without one is refused rather than offered a new key.
 function approvalRefusal(read) {
-  if (!read || typeof read !== "object") return MESSAGES.unavailable;
-  if (read.state === "expired") return MESSAGES.approval_expired;
-  if (read.state !== "pending") return MESSAGES.decided;
-  const expires = Date.parse(read.expires_at);
-  if (!Number.isFinite(expires) || expires <= Date.now()) return MESSAGES.approval_expired;
-  const root = read.root_principal_id != null;
   if (
-    !(UUID.test(read.org_id) || (root && read.org_id == null)) ||
     !UUID.test(read.app_id) ||
-    !/^sha256:[0-9a-f]{64}$/.test(read.compose_hash) ||
-    typeof read.title !== "string" ||
-    !Array.isArray(read.credentials) ||
-    (root && !UUID.test(read.root_principal_id))
+    !HASH.test(read.compose_hash) ||
+    typeof read.title !== "string"
   ) {
     return MESSAGES.unavailable;
   }
-  return clockRefusal(read.server_time);
+  return read.credentials.length ? null : MESSAGES.unrooted;
 }
 
-// What the request asks to run, or a refusal: the compose bytes it names, only if they hash to
+// What the request asks to run, or a refusal: the Revision bytes it names, only if they hash to
 // its compose_hash, parsed for display from those same bytes.
 function uploadedLaunch(read) {
-  if (typeof read.compose !== "string") return { refusal: MESSAGES.mismatch };
-  return parsedLaunch(read, read.compose, {
+  if (typeof read.revision !== "string") return { refusal: MESSAGES.mismatch };
+  return parsedLaunch(read, read.revision, {
     machine: read.machine || "not stated",
     machineNote: MESSAGES.machine,
   });
@@ -822,43 +865,31 @@ function parsedLaunch(read, compose, extra) {
   }
 }
 
-// The image's repository, its last path segment with the tag, and its digest, which is empty
-// when the image is not pinned.
-function splitImage(image) {
-  const at = (image || "").indexOf("@sha256:");
-  const named = at < 0 ? image || "" : image.slice(0, at);
-  const tagAt = named.lastIndexOf(":");
-  const slashAt = named.lastIndexOf("/");
-  return {
-    repo: tagAt > slashAt ? named.slice(0, tagAt) : named,
-    short: named.slice(slashAt + 1),
-    digest: at < 0 ? "" : image.slice(at + 1),
-  };
+// The App's registered Revision that this approval replaces, parsed from bytes that hash to the
+// compose_hash the page revokes, or null when there is none.
+function previousLaunch(read) {
+  const p = read.predecessor;
+  if (p == null) return null;
+  if (!HASH.test(p.compose_hash) || typeof p.revision !== "string") {
+    return { refusal: MESSAGES.unavailable };
+  }
+  return parsedLaunch(p, p.revision, { compose_hash: p.compose_hash });
 }
 
-function imageLines(image) {
-  const { repo, short, digest } = splitImage(image);
-  const name = el("span", short || "none");
-  name.title = repo;
-  const row = el("p", undefined, "fact");
-  row.append(el("span", "Image: "), name);
-  if (!digest) return [row, fact("Digest", "none (not pinned)", "digest")];
+// The full image reference, never shortened: a digest is compared with the customer's own build.
+function imageLine(name, image) {
+  const row = fact("Image", image || "none", "digest");
+  if (!PINNED.test(image || "")) row.append(el("span", "not pinned", "warning"));
   // A refused clipboard must not replace the approval with an error, so the write's failure is dropped.
-  // The full digest is under Technical details.
-  const copy = button("Copy", () => navigator.clipboard.writeText(digest).catch(() => {}), "copy");
-  copy.ariaLabel = `Copy the digest of ${short}`;
-  const shown = el("p", undefined, "fact");
-  shown.append(
-    el("span", "Digest: "),
-    el("span", `${digest.slice(0, 15)}…${digest.slice(-6)}`, "digest"),
-    copy,
-  );
-  return [row, shown];
+  const copy = button("Copy", () => navigator.clipboard.writeText(image).catch(() => {}), "copy");
+  copy.ariaLabel = `Copy the image of ${name}`;
+  row.append(copy);
+  return row;
 }
 
 function serviceBlock(name, service, ports = service.ports) {
   const block = el("div", undefined, "service");
-  block.append(el("h3", name), ...imageLines(service.image));
+  block.append(el("h3", name), imageLine(name, service.image));
   const lists = [
     ["Published ports", ports],
     ["Named volumes", service.volumes],
@@ -867,14 +898,17 @@ function serviceBlock(name, service, ports = service.ports) {
   for (const [title, items] of lists) {
     if (items.length) block.append(fact(title, items.join(", ")));
   }
+  for (const [k, v] of Object.entries(service.environment)) {
+    block.append(el("p", `${k}=${v}`, "env"));
+  }
   return block;
 }
 
 // ponytail: a service is AlphaCompute's only when its image is in the AlphaCompute registry, where
 // only AlphaCompute publishes, and pinned by digest, which fixes the exact code; the compose's own
 // names and paths are requester-controlled and prove nothing. Ceiling: every pinned image in that
-// registry counts, with no per-image allowlist; the upgrade is a signed list of platform images in
-// the platform document or the catalog.
+// registry counts, with no per-image allowlist; the upgrade is the release-signed list of runtime
+// images in the platform document.
 const PLATFORM_IMAGE = /^ghcr\.io\/alphacompute\/[^@]+@sha256:[0-9a-f]{64}$/;
 function isPlatform(service) {
   return PLATFORM_IMAGE.test(service.image || "");
@@ -897,66 +931,103 @@ function runtimeBlock(runtime) {
   return block;
 }
 
+function openingLine(direction, o) {
+  return `${direction} ${o.protocol} ${o.port} ${o.cidr} — ${o.justification}`;
+}
+
+function openingLines(openings) {
+  if (!openings) return [];
+  return [
+    ...openings.ingress.map((o) => openingLine("ingress", o)),
+    ...openings.egress.map((o) => openingLine("egress", o)),
+  ];
+}
+
 // A Kata Revision's declared openings, one line each; a compose has none to show (null).
 function networkBlock(openings) {
   const block = el("div", undefined, "service");
   block.append(el("h3", "Network"));
-  const lines = [
-    ...openings.ingress.map((o) => ["ingress", o]),
-    ...openings.egress.map((o) => ["egress", o]),
-  ].map(([direction, o]) =>
-    el("p", `${direction} ${o.protocol} ${o.port} ${o.cidr} \u2014 ${o.justification}`),
-  );
+  const lines = openingLines(openings).map((line) => el("p", line));
   block.append(...(lines.length ? lines : [el("p", MESSAGES.network_dark)]));
   return block;
 }
 
+// What this Revision adds or changes against the one it replaces, each `[text, added]`. An
+// addition widens what runs or what it may reach, so the page marks it.
+function changes(before, after) {
+  const lines = [];
+  const names = [...new Set([...Object.keys(before.services), ...Object.keys(after.services)])];
+  for (const n of names.sort()) {
+    const b = before.services[n];
+    const s = after.services[n];
+    if (!s) {
+      lines.push([`${n}: removed`, false]);
+      continue;
+    }
+    if (!b) {
+      lines.push([`${n}: added, image ${s.image}`, true]);
+      continue;
+    }
+    if (b.image !== s.image) lines.push([`${n}: image ${b.image} → ${s.image}`, true]);
+    for (const p of s.ports.filter((x) => !b.ports.includes(x))) lines.push([`${n}: publishes ${p}`, true]);
+    for (const p of b.ports.filter((x) => !s.ports.includes(x))) lines.push([`${n}: stops publishing ${p}`, false]);
+    const keys = [...new Set([...Object.keys(b.environment), ...Object.keys(s.environment)])];
+    for (const k of keys.sort()) {
+      if (b.environment[k] === s.environment[k]) continue;
+      if (!(k in s.environment)) lines.push([`${n}: ${k} removed`, false]);
+      else lines.push([`${n}: ${k}=${s.environment[k]}`, true]);
+    }
+    for (const v of s.volumes.filter((x) => !b.volumes.includes(x))) lines.push([`${n}: mounts volume ${v}`, true]);
+    for (const secret of s.secrets.filter((x) => !b.secrets.includes(x))) {
+      lines.push([`${n}: receives Secret ${secret}`, true]);
+    }
+  }
+  const was = openingLines(before.openings);
+  const now = openingLines(after.openings);
+  for (const line of now.filter((x) => !was.includes(x))) lines.push([`opens ${line}`, true]);
+  for (const line of was.filter((x) => !now.includes(x))) lines.push([`closes ${line}`, false]);
+  return lines;
+}
+
+function diffBlock(before, launch) {
+  const block = el("div", undefined, "service");
+  block.append(el("h2", "Changes from the previous Revision"), fact("Previous", before.compose_hash, "digest"));
+  const lines = changes(before, launch).map(([text, added]) => el("p", text, added ? "added" : undefined));
+  block.append(...(lines.length ? lines : [el("p", MESSAGES.no_change)]));
+  return block;
+}
+
 function describeLaunch(a) {
-  const { read, launch } = a;
+  const { read, launch, before } = a;
   const nodes = [];
-  if (launch.heading) nodes.push(el("p", launch.heading));
-  for (const line of launch.notes || []) nodes.push(el("p", line, "warning"));
-  const services = Object.entries(launch.services);
+  if (before) nodes.push(diffBlock(before, launch));
   const runtime = launch.services["alpha-runtime"];
   const publicName = runtime && isPlatform(runtime) ? runtime.environment.ALPHACOMPUTE_PUBLIC_NAME : undefined;
   const summary = el("div", undefined, "summary");
   if (publicName) summary.append(fact("Public URL", `https://${publicName}`));
-  summary.append(fact("Organization", a.orgName), fact("Machine", launch.machine));
+  summary.append(fact("Organization", read.org_name), fact("Machine", launch.machine));
   nodes.push(summary);
   if (launch.machineNote) nodes.push(el("p", launch.machineNote, "muted"));
   nodes.push(fact("App", read.app_id), fact("Revision", read.compose_hash, "digest"));
+  nodes.push(el("p", MESSAGES.requester, "muted"), el("p", read.title));
   nodes.push(el("h2", "What will run"));
-  const provided = services.filter(([, s]) => isPlatform(s));
-  for (const [n, s] of services) {
-    if (!isPlatform(s)) nodes.push(serviceBlock(n, s));
-  }
-  if (provided.length) {
-    const platform = el("details");
-    platform.append(el("summary", `Provided by AlphaCompute (${provided.length})`));
-    for (const [n, s] of provided) {
-      platform.append(n === "alpha-runtime" ? runtimeBlock(s) : serviceBlock(splitImage(s.image).short, s));
-    }
-    nodes.push(platform);
+  for (const [n, s] of Object.entries(launch.services)) {
+    nodes.push(n === "alpha-runtime" && isPlatform(s) ? runtimeBlock(s) : serviceBlock(n, s));
   }
   if (launch.openings) nodes.push(networkBlock(launch.openings));
   const details = el("details");
-  details.append(el("summary", "Technical details"));
-  for (const [n, s] of services) {
-    details.append(fact(n, splitImage(s.image).digest || "not pinned", "digest"));
-  }
-  details.append(el("pre", launch.compose));
+  details.append(el("summary", "The exact bytes you sign"), el("pre", launch.compose));
   nodes.push(details);
   return nodes;
 }
 
 async function startApproval(view, viewText, ticket) {
-  const { read, refusal } = await reread(view, ticket);
+  const { read, refusal } = await readTicket(view, ticket, "approve", approvalRefusal);
   if (refusal) return stop(refusal);
-  const before = currentServices(read.current);
+  const before = previousLaunch(read);
+  if (before?.refusal) return stop(before.refusal);
   const launch =
-    read.catalog_template_sha256 == null
-      ? uploadedLaunch(read)
-      : await catalogLaunch(view, read, before);
+    read.catalog_template_sha256 == null ? uploadedLaunch(read) : await catalogLaunch(view, read);
   if (launch.refusal) return stop(launch.refusal);
   // Built before any Secret is stored: a launch the KMS would not register stops here.
   try {
@@ -968,23 +1039,9 @@ async function startApproval(view, viewText, ticket) {
     return stop(MESSAGES.not_registrable);
   }
 
-  const orgName = typeof read.org_name === "string" ? read.org_name : read.org_id;
-  const progress = read.root_principal_id != null ? el("p") : null;
   const ui = screen();
-  const a = { view, viewText, read, ticket, ui, launch, orgName, progress, credential: null, values: null };
-  a.signedIn = backFromSignIn(ticket);
-  let note = a.signedIn ? MESSAGES.signed_in : undefined;
-  // The service names an organization without a key only to its signed-in owner, who signs the
-  // root document with that name.
-  if (read.root_principal_id != null && read.org_id == null) {
-    if (a.signedIn) note = MESSAGES.sign_in_failed;
-    a.signedIn = false;
-  }
-  if (!sameOrigin(view)) {
-    a.canEnroll = false;
-    note = read.credentials.length ? undefined : MESSAGES.no_credentials;
-  }
-  a.fields = secretFields(launch.services, before, putSecrets(read), read.secrets);
+  const a = { view, viewText, read, ticket, ui, launch, before, credential: null, values: null };
+  a.fields = secretFields(launch.services, before?.services, putSecrets(read), read.secrets);
   a.secretsBox = el("div", undefined, "secrets");
   a.secretsBox.append(...a.fields.map((f) => f.node));
   ui.facts.replaceChildren(...describeLaunch(a));
@@ -1001,14 +1058,28 @@ async function startApproval(view, viewText, ticket) {
     f.keep?.addEventListener("change", sync);
   }
   sync();
-  decision.append(a.secretsBox, ui.step, ui.status);
+  decision.append(a.secretsBox);
+  if (before) decision.append(...keepBox(a));
+  decision.append(ui.step, ui.status);
   const layout = el("div", undefined, "approval");
   layout.append(ui.facts, decision);
   document
     .getElementById("main")
-    .replaceChildren(el("p", `Launch approval for ${orgName}`, "eyebrow"), el("h1", read.title), ...(progress ? [progress] : []), layout);
-  const shown = offerApproval(a, note);
-  if (a.signedIn) shown.create?.focus();
+    .replaceChildren(el("p", `Launch approval for ${read.org_name}`, "eyebrow"), el("h1", launch.heading || read.app_id), layout);
+  offerApproval(a);
+}
+
+// Unticked by default, and the default lives here rather than in the ticket: approving a new
+// Revision revokes the one it replaces unless the person keeps it.
+function keepBox(a) {
+  a.keep = el("input");
+  a.keep.type = "checkbox";
+  a.keep.id = "keep-predecessor";
+  const label = el("label", MESSAGES.keep_predecessor(a.before.compose_hash));
+  label.htmlFor = a.keep.id;
+  const row = el("p", undefined, "keep");
+  row.append(a.keep, label);
+  return [row, el("p", MESSAGES.revoke_effect, "warning")];
 }
 
 function declaredSecrets(services) {
@@ -1021,8 +1092,8 @@ function putSecrets(read) {
   return read.secrets.filter((s) => s && s.set === true).map((s) => s.name);
 }
 
-// One password field per declared Secret. A Secret the current launch also declares is already
-// held by the KMS, because approving that launch put it, and so is one the service reports as
+// One password field per declared Secret. A Secret the previous Revision also declares is already
+// held by the KMS, because approving that Revision put it, and so is one the service reports as
 // put; either defaults to keeping that value.
 // The description is unsigned display text: shown as text, never used to choose which Secrets are asked.
 function secretFields(services, before, put, reported) {
@@ -1043,7 +1114,7 @@ function secretFields(services, before, put, reported) {
     if (typeof description === "string" && description) {
       describedBy = el("p", description, "muted");
       describedBy.id = `description-${index}`; // the other ids start with secret-, keep- or generate- plus a Secret name; this prefix cannot match them
-      caption = el("p", "From the App's plan, not verified:", "muted");
+      caption = el("p", MESSAGES.requester, "muted");
       caption.id = `caption-${index}`;
       describedIds = `${caption.id} ${describedBy.id}`;
       input.setAttribute("aria-describedby", describedIds);
@@ -1113,204 +1184,36 @@ async function approvalSignature(a, options) {
   return { signature: signatureObject(credential, keyId) };
 }
 
-// The next step: each Secret put, then the registration, which shroud-go refuses Secrets after.
-// Returns the buttons that sign next and that create a passkey, where shown.
+// The next step, in the order the KMS needs them: each Secret put, then the registration, then
+// the predecessor's revocation unless the person keeps it.
 function offerApproval(a, note) {
-  // The browser cannot tell a closed prompt from one that offered no passkey of the organization.
-  const missed = note === MESSAGES.prompt_closed || note === MESSAGES.foreign_passkey;
-  if (missed || a.signedIn || !a.read.credentials.length) a.canEnroll ??= true;
+  const revoke = Boolean(a.keep) && !a.keep.checked;
   const pending = a.values ? a.values.filter((v) => !v.done) : [];
-  const total = a.values ? a.values.length + 1 : 1;
-  const step = total - pending.length;
-  // An organization rooted on this page has a passkey once the root is confirmed.
-  const rooted = a.progress && a.read.credentials.length > 0;
-  if (a.progress) a.progress.textContent = rooted ? MESSAGES.root_then : MESSAGES.root_first;
-  const approve = rooted
-    ? `Approve ${a.read.title}, revision ${a.read.compose_hash.slice(7, 19)}`
-    : "Approve with passkey";
-  const label = step === 1 ? approve : `Sign ${step} of ${total}`;
-  const run = a.values ? stepAction(a, pending[0]) : firstAction(a);
-  const sign = a.read.credentials.length ? button(label, run) : null;
-  const nodes = sign ? [sign] : [];
-  let create = null;
-  if (a.canEnroll && !a.credential) {
-    const root = a.read.root_principal_id != null;
-    const label = root
-      ? "Create your organization's passkey to approve this App"
-      : "Create a passkey for this organization";
-    const className = sign ? "secondary" : undefined;
-    // Signing in comes first, so that a passkey is never created that the service then refuses.
-    // A page that cannot tell whether it came back from signing in creates one and lets the
-    // service answer.
-    if (a.signedIn === false) {
-      create = button(label, () => signIn(a), className);
-      nodes.push(el("p", MESSAGES.sign_in));
-    } else {
-      const exclude = a.read.credentials.map((x) => x.credential_id);
-      const options = createOptions(a.view, a.orgName, exclude);
-      const retry = (n) => offerApproval(a, n);
-      const next = (key) => (root ? offerOrgRoot(a, key).focus() : enroll(a, key));
-      create = createButton(label, options, retry, next, className);
-    }
-    nodes.push(create);
+  const total = (a.values ? a.values.length : 0) + 1 + (revoke ? 1 : 0);
+  const left = pending.length + (a.registered ? 0 : 1) + (revoke ? 1 : 0);
+  const step = total - left + 1;
+  let label = step === 1 ? "Approve with passkey" : `Sign ${step} of ${total}`;
+  let run;
+  if (!a.values) run = firstAction(a);
+  else if (pending.length) run = stepAction(a, pending[0]);
+  else if (!a.registered) run = stepAction(a);
+  else {
+    label = `${label}: revoke the previous Revision ${a.before.compose_hash}`;
+    run = revokeAction(a);
   }
-  offer(a.ui, note, ...nodes, declineButton(a));
-  return { sign, create };
+  // Once the Revision is registered, declining would no longer undo anything.
+  offer(a.ui, note, button(label, run), ...(a.registered ? [] : [declineButton(a)]));
 }
 
-// The sign-in cookie that lets a ticket enroll a passkey is host-only and SameSite=Strict.
-function sameOrigin(view) {
-  return new URL(view.signer.api_origin).origin === location.origin;
-}
-
-function enrollKey(ticket) {
-  return `alphacompute-enroll-${wasm_bindgen.bodySha256(utf8(ticket))}`;
-}
-
-// The service sends a person back from signing in to the bare approval link, so only this tab's
-// mark tells a return from a first visit. Null when the page cannot keep a mark.
-function backFromSignIn(ticket) {
-  const key = enrollKey(ticket);
-  try {
-    const back = sessionStorage.getItem(key) === "1";
-    // A tab that can read but not write could never come back marked.
-    sessionStorage.setItem(key, "0");
-    sessionStorage.removeItem(key);
-    return back;
-  } catch (_) {
-    return null;
-  }
-}
-
-// The sign-in route answers an expired or ineligible request itself, so it is asked before the
-// tab leaves; a redirect to the identity provider is all that sends the person on.
-async function signIn(a) {
-  const url = `${a.view.signer.api_origin}/v1/approval-requests/${a.ticket}/enroll-login`;
-  let status;
-  try {
-    const reply = await fetch(url, { redirect: "manual", cache: "no-store" });
-    status = reply.type === "opaqueredirect" ? 302 : reply.status;
-  } catch (_) {
-    return offerApproval(a, MESSAGES.unavailable);
-  }
-  if (status === 410) return stop(MESSAGES.approval_expired);
-  if (status === 403) {
-    a.canEnroll = false;
-    return offerApproval(a, MESSAGES.no_credentials);
-  }
-  if (status !== 302) return offerApproval(a, MESSAGES.unavailable);
-  try {
-    sessionStorage.setItem(enrollKey(a.ticket), "1");
-  } catch (_) {
-    // Without the mark the page creates the passkey and lets the service ask for a sign-in.
-  }
-  a.ui.status.textContent = MESSAGES.sign_in;
-  location.assign(url);
-}
-
-// The request, with the sentence that refuses it when the read failed or it is not open. The
-// service names an organization without a key only to its signed-in owner.
-async function reread(view, ticket) {
-  const credentials = sameOrigin(view) ? "same-origin" : "omit";
-  const reply = await api(view, "GET", `/v1/approval-requests/${ticket}`, undefined, credentials);
-  return {
-    read: reply.body,
-    refusal: reply.status === 200 ? approvalRefusal(reply.body) : failure(reply),
-  };
-}
-
-// Registers a passkey created here through the ticket, then limits every touch to it.
-async function enroll(a, key) {
-  const body = JSON.stringify({ credential_id: key.id, public_key: key.spki });
-  // The service's sign-in cookie is what lets this ticket enroll a passkey.
-  const path = `/v1/approval-requests/${a.ticket}/passkey`;
-  const reply = await api(a.view, "POST", path, body, "same-origin");
-  if (reply.status !== 201 || reply.body?.credential_id !== key.id) return refusedKey(a, reply);
-  return useNewKey(a, key);
-}
-
-// The next step after the service refused a passkey created through the ticket; `otherwise`
-// answers a refusal the page has no sentence for.
-async function refusedKey(a, reply, otherwise = () => offerApproval(a, approvalFailure(reply))) {
-  const code = errorCode(reply.body);
-  if (code === "request_expired") return stop(MESSAGES.approval_expired);
-  if (code === "root_taken") return stop(MESSAGES.root_taken);
-  if (code === "sign_in_required") {
-    // Just back from signing in, a second redirect would only loop.
-    if (!a.signedIn) return signIn(a);
-    a.signedIn = false;
-    return offerApproval(a, MESSAGES.sign_in_failed);
-  }
-  const notes = {
-    enroll_not_allowed: MESSAGES.no_credentials,
-    already_enrolled: MESSAGES.already_enrolled,
-    already_rooted: MESSAGES.already_enrolled,
-    credential_known: MESSAGES.credential_known,
-    enroll_limit: MESSAGES.enroll_limit,
-  };
-  if (Object.hasOwn(notes, code)) {
-    a.canEnroll = false;
-    // A passkey enrolled elsewhere is on the ticket now, so the page reads which ones to ask.
-    const { read, refusal } = await reread(a.view, a.ticket);
-    if (!refusal) a.read.credentials = read.credentials;
-    return offerApproval(a, notes[code]);
-  }
-  return otherwise();
-}
-
-// Limits every touch to a passkey the service has just put on the ticket.
-async function useNewKey(a, key) {
-  // A failed read stops here: a reload finds the new passkey on the ticket.
-  const { read, refusal } = await reread(a.view, a.ticket);
-  if (refusal) return stop(refusal);
-  if (!read.credentials.some((c) => c.credential_id === key.id)) return stop(MESSAGES.unavailable);
-  a.read.credentials = read.credentials;
-  a.credential = key.id;
-  offerApproval(a, MESSAGES.added).sign.focus();
-}
-
-// The second touch: the new passkey signs the document that makes it the organization's root.
-function offerOrgRoot(a, key, note) {
-  const sign = offerRegistration(a, note ?? syncSentence(key), {
-    ...rootStep(a.read.org_id, a.read.root_principal_id, key),
-    relay: (registration) => postRoot(a, key, registration),
-    retry: (n) => offerOrgRoot(a, key, n),
-  });
-  a.ui.step.append(declineButton(a));
-  return sign;
-}
-
-function syncSentence(key) {
-  return key.backed_up ? MESSAGES.root_synced : MESSAGES.root_device_bound;
-}
-
-async function postRoot(a, key, registration) {
-  const path = `/v1/approval-requests/${a.ticket}/root`;
-  const orgId = a.read.org_id;
-  const { reply, signed } = await relayKey(a.view, path, orgId, key, registration, "same-origin");
-  // The KMS may hold this key already, and then no other passkey can become the root: the same
-  // document is sent again, which the service answers as the first time.
-  const again = (note) =>
-    offer(
-      a.ui,
-      note,
-      button("Try again", () => postRoot(a, key, registration)),
-      declineButton(a),
-    );
-  if (reply.status !== 201) return refusedKey(a, reply, () => again(approvalFailure(reply)));
-  // The receipt covers the public key; only the body names the credential the service stored.
-  if (!signed || reply.body.credential_id !== key.id) return again(MESSAGES.not_confirmed);
-  a.ui.facts.append(el("p", syncSentence(key), key.backed_up ? "muted" : "warning"));
-  return useNewKey(a, key);
-}
-
-// The first click reads the Secret values, so its inputs are built in the click, before any await.
+// The first click reads the Secret values and fixes the choice of the predecessor, so its inputs
+// are built in the click, before any await.
 function firstAction(a) {
   return () => {
     const taken = takeValues(a);
     if (taken.note) return offerApproval(a, taken.note);
     a.values = taken.values;
-    return stepAction(a, a.values[0])();
+    if (a.keep) a.keep.disabled = true;
+    return a.values.length ? stepAction(a, a.values[0])() : stepAction(a)();
   };
 }
 
@@ -1334,8 +1237,8 @@ async function put(a, item, inputs) {
   const { signature, note } = await approvalSignature(a, inputs.options);
   if (!signature) return offerApproval(a, note);
   const sealer = new wasm_bindgen.KmsSecretSealer();
-  const channel = await api(a.view, "POST", `/v1/approval-requests/${a.ticket}/kms-channel`, sealer.hello());
-  if (channel.status !== 200) return offerApproval(a, approvalFailure(channel));
+  const channel = await api(a.view, "POST", ticketPath(a.ticket, "channel"), sealer.hello());
+  if (channel.status !== 200) return offerApproval(a, failure(channel));
   let sealed;
   try {
     sealed = sealer.seal(
@@ -1352,8 +1255,8 @@ async function put(a, item, inputs) {
   const body = wasm_bindgen.canonicalJson(
     JSON.stringify({ payload: inputs.payload, signature, sealed: JSON.parse(sealed) }),
   );
-  const reply = await api(a.view, "PUT", `/v1/approval-requests/${a.ticket}/secrets/${item.name}`, body);
-  if (reply.status !== 200) return offerApproval(a, approvalFailure(reply));
+  const reply = await api(a.view, "POST", ticketPath(a.ticket, "secret"), body);
+  if (reply.status !== 200) return offerApproval(a, failure(reply));
   const signed = receipt(a.view, reply, "secret.put", body, {
     name: inputs.payload.name,
     org_id: a.read.org_id,
@@ -1376,24 +1279,50 @@ async function registerRevision(a, inputs) {
   const { signature, note } = await approvalSignature(a, inputs.options);
   if (!signature) return offerApproval(a, note);
   const body = wasm_bindgen.canonicalJson(JSON.stringify({ payload: inputs.payload, signature }));
-  const reply = await api(a.view, "POST", `/v1/approval-requests/${a.ticket}/revision`, body);
-  if (reply.status !== 200) return offerApproval(a, approvalFailure(reply));
+  const reply = await api(a.view, "POST", ticketPath(a.ticket, "revision"), body);
+  if (reply.status !== 200) return offerApproval(a, failure(reply));
   const signed = receipt(a.view, reply, "revision.register", body, {
     app_id: read.app_id,
     compose_hash: read.compose_hash,
     org_id: read.org_id,
   });
   if (!signed) return offerApproval(a, MESSAGES.not_confirmed);
+  a.registered = true;
+  if (a.keep && !a.keep.checked) return offerApproval(a);
   return offer(a.ui, "", el("p", MESSAGES.approved, "confirmed"));
+}
+
+function revokeAction(a) {
+  return async () => {
+    const { note } = await revokeOne(a, a.before.compose_hash);
+    if (note) return offerApproval(a, note);
+    return offer(a.ui, "", el("p", MESSAGES.approved, "confirmed"));
+  };
+}
+
+// Signs `{compose_hash, issued_at}` under the Control context and relays it; `{revokedAt}` once
+// the receipt verified, or `{note}`. issued_at is taken before the prompt's await, so a page left
+// open stays inside the KMS's five minutes.
+async function revokeOne(x, hash) {
+  const payload = { compose_hash: hash, issued_at: issuedAt() };
+  const signable = wasm_bindgen.signingDigest("control", JSON.stringify(payload));
+  const { signature, note } = await approvalSignature(x, getOptions(x.view, signable.digest, allowed(x)));
+  if (!signature) return { note };
+  const body = wasm_bindgen.canonicalJson(JSON.stringify({ payload, signature }));
+  const reply = await api(x.view, "POST", ticketPath(x.ticket, "revoke"), body);
+  if (reply.status !== 200) return { note: failure(reply) };
+  const signed = receipt(x.view, reply, "revision.revoke", body, { compose_hash: hash });
+  if (!signed || typeof signed.revoked_at !== "string") return { note: MESSAGES.not_confirmed };
+  return { revokedAt: signed.revoked_at };
 }
 
 function declineButton(a) {
   return button(
     "Decline",
     async () => {
-      const reply = await api(a.view, "POST", `/v1/approval-requests/${a.ticket}/decline`);
+      const reply = await api(a.view, "POST", `/v1/tickets/${a.ticket}/decline`);
       if (reply.status === 200) return offer(a.ui, "", el("p", MESSAGES.declined, "confirmed"));
-      a.ui.status.textContent = approvalFailure(reply);
+      a.ui.status.textContent = failure(reply);
     },
     "secondary",
   );
@@ -1413,106 +1342,38 @@ async function catalogEntry(view, templateHex, appId) {
   }
 }
 
-async function catalogLaunch(view, read, before) {
+async function catalogLaunch(view, read) {
   const hex = /^(?:sha256:)?([0-9a-f]{64})$/.exec(read.catalog_template_sha256);
   const found = view.catalog_key && hex ? await catalogEntry(view, hex[1], read.app_id) : null;
   if (!found) return { refusal: MESSAGES.catalog };
   const { entry, compose } = found;
   const r = entry.resources || {};
-  const launch = parsedLaunch(read, compose, {
+  return parsedLaunch(read, compose, {
     machine: `${r.cpu} vCPU, ${r.memory_mib} MiB`,
     heading: `${entry.title}, version ${entry.version}`,
   });
-  if (launch.refusal || !read.current) return launch;
-  const previous = await previousEntry(view, read);
-  if (previous && previous.entry.catalog_id === entry.catalog_id) {
-    launch.heading = `${entry.title}, version ${previous.entry.version} → ${entry.version}`;
-    return launch;
-  }
-  launch.notes = [MESSAGES.not_from_catalog, ...imageChanges(before, launch.services)];
-  return launch;
-}
-
-// The verified entry `current` was rendered from: the render replaced the template's one nil
-// App id with this App's, so putting the nil id back gives the template's exact bytes.
-async function previousEntry(view, read) {
-  const compose = read.current.compose;
-  const name = `"name":"${read.app_id}"`;
-  if (typeof compose !== "string" || compose.split(name).length !== 2) return null;
-  const template = compose.replace(name, `"name":"${NIL_APP}"`);
-  const hex = wasm_bindgen.bodySha256(utf8(template)).slice("sha256:".length);
-  const found = await catalogEntry(view, hex, read.app_id);
-  return found && found.compose === compose ? found : null;
-}
-
-// The services of the compose the service says runs today, or null when it sent none or it does
-// not parse.
-function currentServices(current) {
-  try {
-    return current ? JSON.parse(wasm_bindgen.composeServices(current.compose)) : null;
-  } catch (_) {
-    return null;
-  }
-}
-
-// What `current` claims runs today, only where its image differs from this launch's.
-function imageChanges(before, services) {
-  if (!before) return [];
-  const names = [...new Set([...Object.keys(before), ...Object.keys(services)])].sort();
-  const image = (s) => (s && s.image) || "nothing";
-  return names
-    .filter((n) => image(before[n]) !== image(services[n]))
-    .map(
-      (n) =>
-        `${n}: ${image(before[n])} today, according to the service; ${image(services[n])} in this launch.`,
-    );
-}
-
-function revocationRefusal(read) {
-  if (!read || typeof read !== "object") return MESSAGES.unavailable;
-  if (read.state === "expired") return MESSAGES.revoke_expired;
-  if (read.state !== "pending") return MESSAGES.bad_link;
-  const expires = Date.parse(read.expires_at);
-  if (!Number.isFinite(expires) || expires <= Date.now()) return MESSAGES.revoke_expired;
-  if (
-    !UUID.test(read.org_id) ||
-    !UUID.test(read.app_id) ||
-    typeof read.title !== "string" ||
-    !Array.isArray(read.revisions) ||
-    !read.revisions.length ||
-    !read.revisions.every((h) => /^sha256:[0-9a-f]{64}$/.test(h)) ||
-    new Set(read.revisions).size !== read.revisions.length ||
-    !Array.isArray(read.credentials) ||
-    !read.credentials.every((c) => typeof c?.credential_id === "string")
-  ) {
-    return MESSAGES.unavailable;
-  }
-  return clockRefusal(read.server_time) || (read.credentials.length ? null : MESSAGES.no_credentials);
-}
-
-// As `failure`, but a link that expired after the page read it says so.
-function revocationFailure(reply) {
-  return reply.status === 409 && reply.body?.details?.state === "expired"
-    ? MESSAGES.revoke_expired
-    : failure(reply);
 }
 
 // Which Revisions to revoke is the service's word: revoking only takes away, and the page can
 // confirm a revocation but not that the list is complete.
+function revocationRefusal(read) {
+  if (
+    !UUID.test(read.app_id) ||
+    typeof read.title !== "string" ||
+    !Array.isArray(read.revisions) ||
+    !read.revisions.length ||
+    !read.revisions.every((h) => HASH.test(h)) ||
+    new Set(read.revisions).size !== read.revisions.length
+  ) {
+    return MESSAGES.unavailable;
+  }
+  return read.credentials.length ? null : MESSAGES.no_credentials;
+}
+
 async function startRevocation(view, ticket) {
-  const reply = await api(view, "GET", `/v1/revocations/${ticket}`);
-  if (reply.status !== 200) return stop(failure(reply));
-  const read = reply.body;
-  const refusal = revocationRefusal(read);
+  const { read, refusal } = await readTicket(view, ticket, "revoke", revocationRefusal);
   if (refusal) return stop(refusal);
-  const ui = screen(
-    el(
-      "p",
-      `Revocation for ${typeof read.org_name === "string" ? read.org_name : read.org_id}`,
-      "eyebrow",
-    ),
-    el("h1", read.title),
-  );
+  const ui = screen(el("p", `Revocation for ${read.org_name}`, "eyebrow"), el("h1", read.title));
   const r = { view, read, ticket, ui, credential: null, revoked: new Map(), rows: el("div") };
   ui.facts.replaceChildren(
     el("p", MESSAGES.revoke_effect, "warning"),
@@ -1538,25 +1399,40 @@ function offerRevocation(r, note) {
   offer(r.ui, note, button(label, () => revoke(r, pending[0])));
 }
 
-// issued_at is taken in the click, before the prompt's await, so a page left open stays inside
-// the KMS's five minutes.
 async function revoke(r, hash) {
-  const payload = { compose_hash: hash, issued_at: issuedAt() };
-  const signable = wasm_bindgen.signingDigest("control", JSON.stringify(payload));
-  const options = getOptions(r.view, signable.digest, allowed(r));
-  const { signature, note } = await approvalSignature(r, options);
-  if (!signature) return offerRevocation(r, note);
-  const body = wasm_bindgen.canonicalJson(JSON.stringify({ payload, signature }));
-  const reply = await api(r.view, "POST", `/v1/revocations/${r.ticket}/revoke`, body);
-  if (reply.status !== 200) return offerRevocation(r, revocationFailure(reply));
-  const signed = receipt(r.view, reply, "revision.revoke", body, {
-    compose_hash: payload.compose_hash,
-  });
-  if (!signed || typeof signed.revoked_at !== "string") {
-    return offerRevocation(r, MESSAGES.not_confirmed);
-  }
-  r.revoked.set(payload.compose_hash, signed.revoked_at);
+  const { note, revokedAt } = await revokeOne(r, hash);
+  if (note) return offerRevocation(r, note);
+  r.revoked.set(hash, revokedAt);
   return offerRevocation(r);
+}
+
+// A code typed at the signer address stands for the ticket of a link.
+function offerCode(platform, note) {
+  const ui = screen(el("h1", "Enter your code"));
+  const input = el("input");
+  input.id = "code";
+  input.autocomplete = "off";
+  const label = el("label", "Code");
+  label.htmlFor = input.id;
+  const go = button("Continue", async () => {
+    const code = input.value.toUpperCase().replace(/[\s-]/g, "");
+    if (!TICKET_CODE.test(code)) return offerCode(platform, MESSAGES.bad_code);
+    const reply = await api(platform.view, "GET", `/v1/tickets/by-code/${code}`);
+    const t = reply.body;
+    if (reply.status !== 200) return offerCode(platform, failure(reply));
+    if (!MODES.includes(t?.kind) || !TICKET.test(t.ticket)) {
+      return offerCode(platform, MESSAGES.unavailable);
+    }
+    history.replaceState(null, "", `./${t.kind}#${t.ticket}`);
+    return start(platform, t.kind, t.ticket);
+  });
+  offer(ui, note, label, input, go);
+}
+
+function start(platform, mode, ticket) {
+  if (mode === "claim") return startClaim(platform.view, ticket);
+  if (mode === "revoke") return startRevocation(platform.view, ticket);
+  return startApproval(platform.view, platform.viewText, ticket);
 }
 
 function servedBySigner(view) {
@@ -1591,22 +1467,22 @@ async function boot() {
 
   const mode = location.pathname.split("/").pop();
   const ticket = location.hash.slice(1);
-  if (!["claim", "approve", "revoke"].includes(mode) || !TICKET.test(ticket)) {
+  if (!(mode === "" || MODES.includes(mode)) || (ticket && !(mode && TICKET.test(ticket)))) {
     return stop(MESSAGES.bad_link);
   }
 
   const platform = await verifiedPlatform();
   if (!platform) return stop(MESSAGES.platform);
-  const { view, viewText } = platform;
+  const { view } = platform;
 
   if (view.version < storedVersion()) return stop(MESSAGES.older_platform);
   storeVersion(view.version);
 
   if (!servedBySigner(view)) return stop(MESSAGES.not_signer);
 
-  if (mode === "claim") return startClaim(view, ticket);
-  if (mode === "revoke") return startRevocation(view, ticket);
-  return startApproval(view, viewText, ticket);
+  if (ticket) return start(platform, mode, ticket);
+  if (mode === "claim" && location.search) return finishSignIn(view);
+  return offerCode(platform);
 }
 
 document.addEventListener("DOMContentLoaded", () => {

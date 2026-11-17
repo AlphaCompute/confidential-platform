@@ -143,6 +143,7 @@ function testView() {
       rp_id: RP_ID,
       api_origin: ORIGIN,
       bundle_sha256: `sha256:${"0".repeat(64)}`,
+      oidc: { authorization_endpoint: "https://id.example/authorize", client_id: "signer" },
     },
     catalog_key: catalog.catalog_key,
   };
@@ -386,6 +387,7 @@ async function loadPage(options = {}) {
   const clicks = [];
   const copied = [];
   const assigned = [];
+  const replaced = [];
   const authenticator = options.authenticator || new SoftwareAuthenticator();
   // The passkey provider the next prompt reaches; `page.use` moves to another device.
   const device = { current: authenticator };
@@ -413,7 +415,7 @@ async function loadPage(options = {}) {
   async function fakeFetch(resource, init = {}) {
     const url = String(resource);
     const method = (init.method || "GET").toUpperCase();
-    fetches.push({ method, url, body: init.body, credentials: init.credentials, time: clock.now });
+    fetches.push({ method, url, body: init.body, headers: init.headers, credentials: init.credentials, time: clock.now });
     if (url === b.wasmName) {
       assert.equal(init.integrity, wasmSri, "the page fetched the wasm without its integrity");
       return new Response(b.wasm, { headers: { "Content-Type": "application/wasm" } });
@@ -437,11 +439,12 @@ async function loadPage(options = {}) {
         (k) => k.endsWith("*") && key.startsWith(k.slice(0, -1)),
       );
       const route = routes[key] || routes[prefix];
-      if (!route) return jsonReply(404, { error: "no route", error_code: "SHROUD_NOT_FOUND" });
+      if (!route) return jsonReply(404, failed(404, "ticket_not_found").body);
       const answer = await route({
         method,
         path: pathname,
         body: init.body,
+        headers: init.headers || {},
         credentials: init.credentials,
       });
       if (answer instanceof Error) throw new TypeError("network");
@@ -456,9 +459,12 @@ async function loadPage(options = {}) {
     location: {
       origin: options.origin || ORIGIN,
       pathname: options.path || "/sign/claim",
-      hash: `#${options.hash === undefined ? TICKET : options.hash}`,
+      search: options.search || "",
+      hash: options.hash === "" ? "" : `#${options.hash === undefined ? TICKET : options.hash}`,
       assign: (url) => assigned.push(url),
     },
+    history: { replaceState: (_, __, url) => replaced.push(url) },
+    URLSearchParams,
     localStorage: options.localStorage || memoryStorage(),
     sessionStorage: options.sessionStorage || memoryStorage(),
     navigator: {
@@ -552,6 +558,7 @@ async function loadPage(options = {}) {
     consoleCalls,
     seals,
     assigned,
+    replaced,
     main,
     use(other) {
       device.current = other;
@@ -612,6 +619,11 @@ function iso(ms) {
   return new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
+// An alpha-control error reply; the message is markup the page must never show.
+function failed(status, code) {
+  return { status, body: { error: { code, message: "<b>x</b>", request_id: "r" } } };
+}
+
 // The parts of a `{"credential_id":…,"registration":…}` body, with the registration's exact text.
 function keyBody(text) {
   const prefix = /^\{"credential_id":("[A-Za-z0-9_-]+"),"registration":/.exec(text);
@@ -637,158 +649,131 @@ function registerKey(api, key) {
   return response;
 }
 
-// shroud-go's claim routes for one ticket, with the KMS behind them answering every key
-// registration with a receipt. `api.receiptFor(registrationText, response)` may be replaced to
-// return a receipt that must fail.
-function claimApi(options = {}) {
+const BASE = `/v1/tickets/${TICKET}`;
+
+// alpha-control's ticket routes for one ticket of `kind`: the read returns `fields` of `api`, and
+// a test may set `api.read` to answer it instead.
+function ticketApi(kind, options, api, fields) {
   const now = options.now === undefined ? Date.now() : options.now;
-  const api = {
-    org_id: crypto.randomUUID(),
-    principal_id: crypto.randomUUID(),
-    kind: options.kind || "root",
-    state: options.state || "open",
+  Object.assign(api, {
+    kind,
+    org_id: api.org_id || crypto.randomUUID(),
     org_name: "Acme",
-    expires_at: options.expires_at || iso(now + 72 * 3600 * 1000),
-    server_time: options.server_time || iso(now),
-    keys_left: options.keys_left === undefined ? 3 : options.keys_left,
     credentials: options.credentials || [],
-    reveals: 0,
-    registrations: [],
+    expires_at: options.expires_at || iso(now + 24 * 3600 * 1000),
+    state: options.state || "open",
+    server_time: options.server_time || iso(now),
     read: options.read,
-    receiptFor: (registrationText, response) =>
-      mintReceipt("key.register", registrationText, response),
-  };
-  const base = `/v1/claims/${TICKET}`;
+  });
+  const common = ["kind", "org_id", "org_name", "credentials", "expires_at", "state", "server_time"];
   api.routes = {
-    [`GET ${base}`]: () =>
+    [`GET ${BASE}`]: () =>
       api.read || {
         status: 200,
-        body: {
-          org_name: api.org_name,
-          kind: api.kind,
-          state: api.state,
-          keys_left: api.keys_left,
-          expires_at: api.expires_at,
-          server_time: api.server_time,
-          credentials: api.credentials,
-        },
+        body: Object.fromEntries([...common, ...fields].map((k) => [k, api[k]])),
       },
-    [`POST ${base}/org`]: () => {
-      api.reveals += 1;
-      if (api.reveals > 1) {
-        return {
-          status: 409,
-          body: {
-            error: "this claim's organization was already handed out",
-            error_code: "SHROUD_CONFLICT",
-          },
-        };
-      }
-      return { status: 200, body: { org_id: api.org_id, principal_id: api.principal_id } };
-    },
-    [`POST ${base}/keys`]: (req) => {
-      const key = keyBody(req.body);
-      api.registrations.push({ ...key, body: req.body });
-      if (api.keysReply) return api.keysReply(key.registrationText);
-      const response = registerKey(api, key);
-      api.keys_left -= 1;
-      if (!key.registration.signature.key_id) api.state = "rooted";
-      return {
-        status: 200,
-        body: { ...response, receipt: api.receiptFor(key.registrationText, response) },
-      };
-    },
   };
   return api;
 }
 
-// shroud-go's approval routes for one ticket, with the KMS behind them. Receipts come from
-// `api.revisionReceipt` and `api.putReceipt`, which a test may replace; `api.reply[route]` may
-// answer a route instead (route: "revision", "put", "enroll", "login").
+// A claim ticket, with the KMS behind it answering every key registration with a receipt.
+// `api.receiptFor(registrationText, response)` may be replaced to return a receipt that must
+// fail. `POST …/session` with `api.owner_code` answers the owner's session secret, which a root
+// relay must carry; `options.session` (default true) means a tab already holds it, which
+// `seedOwner` puts in that tab's storage.
+function claimApi(options = {}) {
+  const api = ticketApi("claim", options, {
+    principal_id: crypto.randomUUID(),
+    rooted: Boolean(options.rooted),
+    session: options.session ?? true,
+    owner_session: b64u(crypto.randomBytes(32)),
+    owner_email: "owner@acme.example",
+    owner_code: "the-owners-code",
+    registrations: [],
+    sessions: [],
+    receiptFor: (registrationText, response) =>
+      mintReceipt("key.register", registrationText, response),
+  }, ["rooted", "owner_email", "principal_id"]);
+  const read = api.routes[`GET ${BASE}`];
+  api.routes[`GET ${BASE}`] = () => {
+    const answer = read();
+    if (answer.body && !api.rooted) answer.body.principal_id = null;
+    return answer;
+  };
+  api.routes[`POST ${BASE}/session`] = (req) => {
+    const body = JSON.parse(req.body);
+    api.sessions.push(body);
+    if (body.code !== api.owner_code) return failed(403, "session_refused");
+    return { status: 200, body: { session: api.owner_session, principal_id: api.principal_id } };
+  };
+  const register = (op) => (req) => {
+    const key = keyBody(req.body);
+    api.registrations.push({ ...key, op, body: req.body });
+    if (op === "root" && req.headers["Alpha-Claim-Session"] !== api.owner_session) {
+      return failed(403, "session_refused");
+    }
+    if (api.keysReply) return api.keysReply(key.registrationText);
+    const response = registerKey(api, key);
+    if (op === "root") api.rooted = true;
+    return {
+      status: 200,
+      body: { ...response, receipt: api.receiptFor(key.registrationText, response) },
+    };
+  };
+  api.routes[`POST ${BASE}/kms/root`] = register("root");
+  api.routes[`POST ${BASE}/kms/key`] = register("key");
+  return api;
+}
+
+// Puts the owner's session secret in `tab`, as a tab back from signing in holds it.
+function seedOwner(tab, api) {
+  const key = `alphacompute-claim-sha256:${sha256(TICKET).toString("hex")}`;
+  const owner = { session: api.owner_session, principal_id: api.principal_id };
+  tab.setItem(key, JSON.stringify({ owner }));
+  return tab;
+}
+
+
+function revokeRoute(api) {
+  return (req) => {
+    const body = JSON.parse(req.body);
+    api.revokes.push({ text: req.body, body });
+    if (api.reply.revoke) return api.reply.revoke(req.body);
+    const response = { compose_hash: body.payload.compose_hash, revoked_at: RECEIPT_TIME };
+    return { status: 200, body: { ...response, receipt: api.revokeReceipt(req.body, response) } };
+  };
+}
+
+// An approve ticket, with the KMS behind it. Receipts come from `api.revisionReceipt`,
+// `api.putReceipt` and `api.revokeReceipt`, which a test may replace; `api.reply[op]` may answer
+// a relay instead (op: "revision", "put", "revoke").
 function approvalApi(options = {}) {
-  const now = options.now === undefined ? Date.now() : options.now;
-  const compose = options.compose;
-  const api = {
-    org_id: crypto.randomUUID(),
-    org_name: "Acme",
+  const revision = options.revision;
+  const api = ticketApi("approve", options, {
     app_id: options.app_id,
     title: "Production",
-    compose_hash: options.compose_hash || `sha256:${sha256(compose || "").toString("hex")}`,
+    compose_hash: options.compose_hash || `sha256:${sha256(revision || "").toString("hex")}`,
     catalog_template_sha256: options.catalog_template_sha256 || null,
-    compose: options.catalog_template_sha256 ? null : compose,
+    revision: options.catalog_template_sha256 ? null : revision,
     machine: "tdx.medium",
-    credentials: options.credentials || [],
-    current: options.current || null,
+    predecessor: options.predecessor || null,
     secrets: options.secrets || [],
-    expires_at: options.expires_at || iso(now + 24 * 3600 * 1000),
-    state: options.state || "pending",
-    server_time: options.server_time || iso(now),
-    read: options.read,
     revisions: [],
     puts: [],
     channels: [],
-    enrolled: [],
-    roots: [],
-    root_principal_id: options.root_principal_id,
-    // Whether the browser holds the service's sign-in cookie for this ticket.
-    signedIn: options.signedIn ?? true,
+    revokes: [],
     reply: {},
     revisionReceipt: (text, response) => mintReceipt("revision.register", text, response),
     putReceipt: (text, response) => mintReceipt("secret.put", text, response),
-  };
-  const base = `/v1/approval-requests/${TICKET}`;
-  const fields = [
-    "org_id",
-    "org_name",
-    "app_id",
-    "title",
-    "compose_hash",
-    "catalog_template_sha256",
-    "compose",
-    "machine",
-    "credentials",
-    "current",
-    "secrets",
-    "expires_at",
-    "state",
-    "server_time",
-    "root_principal_id",
-  ];
-  api.routes = {
-    [`GET ${base}`]: (req) => {
-      if (api.read) return api.read;
-      const body = Object.fromEntries(fields.map((k) => [k, api[k]]));
-      const owner = api.signedIn && req.credentials === "same-origin";
-      if (api.root_principal_id != null && !owner) delete body.org_id;
-      return { status: 200, body };
+    revokeReceipt: (text, response) => mintReceipt("revision.revoke", text, response),
+  }, ["app_id", "title", "compose_hash", "catalog_template_sha256", "revision", "machine", "predecessor", "secrets"]);
+  Object.assign(api.routes, {
+    [`POST ${BASE}/decline`]: () => {
+      if (api.state !== "open") return failed(409, "ticket_closed");
+      api.state = "declined";
+      return { status: 200, body: { state: "declined" } };
     },
-    [`POST ${base}/root`]: (req) => {
-      const key = keyBody(req.body);
-      api.roots.push({ ...key, text: req.body });
-      const answer = api.reply.root && api.reply.root();
-      if (answer) return answer;
-      const response = registerKey(api, key);
-      return {
-        status: 201,
-        body: {
-          credential_id: key.credentialId,
-          key_id: response.id,
-          public_key: response.public_key,
-          receipt: mintReceipt("key.register", key.registrationText, response),
-        },
-      };
-    },
-    [`POST ${base}/decline`]: () => {
-      if (api.state !== "pending") {
-        return {
-          status: 409,
-          body: { error: "conflict", error_code: "SHROUD_CONFLICT", details: { state: api.state } },
-        };
-      }
-      api.state = "cancelled";
-      return { status: 200, body: { state: "cancelled" } };
-    },
-    [`POST ${base}/revision`]: (req) => {
+    [`POST ${BASE}/kms/revision`]: (req) => {
       const body = JSON.parse(req.body);
       api.revisions.push({ text: req.body, body, puts: api.puts.length });
       if (api.reply.revision) return api.reply.revision(req.body);
@@ -798,30 +783,19 @@ function approvalApi(options = {}) {
         org_id: api.org_id,
         created_at: RECEIPT_TIME,
       };
-      api.state = "approved";
       return {
         status: 200,
         body: { ...response, receipt: api.revisionReceipt(req.body, response) },
       };
     },
-    [`GET ${base}/enroll-login`]: () =>
-      (api.reply.login && api.reply.login()) || { status: 302, body: "" },
-    [`POST ${base}/passkey`]: (req) => {
-      const body = JSON.parse(req.body);
-      api.enrolled.push(body);
-      if (api.reply.enroll) return api.reply.enroll(body);
-      api.credentials.push({ credential_id: body.credential_id, key_id: crypto.randomUUID() });
-      return { status: 201, body: { credential_id: body.credential_id } };
-    },
-    [`POST ${base}/kms-channel`]: (req) => {
+    [`POST ${BASE}/kms/channel`]: (req) => {
       api.channels.push(req.body);
       return { status: 200, body: { server_hello: api.channels.length } };
     },
-    [`PUT ${base}/secrets/*`]: (req) => {
-      const declared = req.path.slice(`${base}/secrets/`.length);
+    [`POST ${BASE}/kms/secret`]: (req) => {
       const body = JSON.parse(req.body);
-      api.puts.push({ declared, text: req.body, body });
-      const answer = api.reply.put && api.reply.put(req.body, declared);
+      api.puts.push({ declared: body.payload.name.split(".").pop(), text: req.body, body });
+      const answer = api.reply.put && api.reply.put(req.body);
       if (answer) return answer;
       const p = body.payload;
       const response = {
@@ -834,54 +808,24 @@ function approvalApi(options = {}) {
       };
       return { status: 200, body: { ...response, receipt: api.putReceipt(req.body, response) } };
     },
-  };
+    [`POST ${BASE}/kms/revoke`]: revokeRoute(api),
+  });
   return api;
 }
 
-// shroud-go's revocation routes for one ticket, with the KMS behind them answering every revoke
-// with a receipt from `api.revokeReceipt`, which a test may replace; `api.reply` may answer the
-// revoke route instead.
+// A revoke ticket, with the KMS behind it answering every revoke with a receipt from
+// `api.revokeReceipt`, which a test may replace; `api.reply.revoke` may answer instead.
 function revocationApi(options = {}) {
-  const now = options.now === undefined ? Date.now() : options.now;
-  const api = {
-    org_id: crypto.randomUUID(),
-    org_name: "Acme",
+  const api = ticketApi("revoke", options, {
     app_id: crypto.randomUUID(),
     title: "Production",
     revisions:
       options.revisions || ["one", "two"].map((n) => `sha256:${sha256(n).toString("hex")}`),
-    credentials: options.credentials || [],
-    expires_at: options.expires_at || iso(now + 24 * 3600 * 1000),
-    state: options.state || "pending",
-    server_time: options.server_time || iso(now),
-    read: options.read,
     revokes: [],
-    reply: null,
+    reply: {},
     revokeReceipt: (text, response) => mintReceipt("revision.revoke", text, response),
-  };
-  const base = `/v1/revocations/${TICKET}`;
-  const fields = [
-    "org_id",
-    "org_name",
-    "app_id",
-    "title",
-    "revisions",
-    "credentials",
-    "expires_at",
-    "state",
-    "server_time",
-  ];
-  api.routes = {
-    [`GET ${base}`]: () =>
-      api.read || { status: 200, body: Object.fromEntries(fields.map((k) => [k, api[k]])) },
-    [`POST ${base}/revoke`]: (req) => {
-      const body = JSON.parse(req.body);
-      api.revokes.push({ text: req.body, body });
-      if (api.reply) return api.reply(req.body);
-      const response = { compose_hash: body.payload.compose_hash, revoked_at: RECEIPT_TIME };
-      return { status: 200, body: { ...response, receipt: api.revokeReceipt(req.body, response) } };
-    },
-  };
+  }, ["app_id", "title", "revisions"]);
+  api.routes[`POST ${BASE}/kms/revoke`] = revokeRoute(api);
   return api;
 }
 
@@ -903,12 +847,14 @@ module.exports = {
   claimApi,
   contextDigest,
   deniedStorage,
+  failed,
   iso,
   jcs,
   loadPage,
   memoryStorage,
   mintReceipt,
   revocationApi,
+  seedOwner,
   sha256,
   testView,
   testdata,

@@ -232,6 +232,28 @@ summary,
   color: #8d8d8d;
 }
 
+.env {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.added {
+  color: #ff6467;
+  overflow-wrap: anywhere;
+}
+
+.keep {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.keep input {
+  width: auto;
+  min-height: 0;
+}
+
 .fact {
   display: flex;
   flex-wrap: wrap;
