@@ -1,11 +1,12 @@
 name: dev-image
 
 # The dev KMS and runtime images, built once with the build cache and pushed as dev-<commit>,
-# so a fix reaches the stand in minutes. Nothing deploys them: the operator puts the pushed
-# image@sha256 reference into a deploy/kata template in place of the release digest, renders it,
-# registers it as the App's Revision and applies it by hand, as deploy/kata/README.md describes.
-# A release builds every image twice from nothing and fails on any difference; these images
-# have no such check, and a production platform document never lists them.
+# so a fix reaches the stand in minutes. Nothing deploys them: the operator puts the
+# image@sha256 reference after `pushed` in the run summary into a deploy/kata template in place
+# of the release digest, renders it, registers it as the App's Revision and applies it by hand,
+# as deploy/kata/README.md describes. A release builds every image twice from nothing and fails
+# on any difference; these images have no such check, and a production platform document never
+# lists them.
 on:
   workflow_dispatch:
 
@@ -48,7 +49,8 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      - id: push
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -61,4 +63,4 @@ jobs:
             FEATURES=${{ matrix.features }}
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,mode=max,scope=${{ matrix.name }}
-      - run: echo "pushed ghcr.io/alphacompute/${{ matrix.name }}:${{ steps.meta.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+      - run: echo "pushed ghcr.io/alphacompute/${{ matrix.name }}@${{ steps.push.outputs.digest }} (${{ steps.meta.outputs.tag }})" >> "$GITHUB_STEP_SUMMARY"
