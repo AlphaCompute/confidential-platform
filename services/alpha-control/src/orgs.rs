@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::{AppState, Caller, Error, SCOPES, audit, mint_token};
 
 const TEXT_MAX: usize = 256;
+const LINKS_MAX: usize = 16;
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -64,10 +65,17 @@ fn text(field: &str, value: &str) -> Result<(), Error> {
 
 fn email(value: &str) -> Result<(), Error> {
     text("owner_email", value)?;
-    if value.contains(char::is_whitespace) || !value.trim_start_matches('@').contains('@') {
-        return Err(Error::Malformed("owner_email is not an address".into()));
+    match value.split_once('@') {
+        Some((local, domain))
+            if !local.is_empty()
+                && !domain.is_empty()
+                && !domain.contains('@')
+                && !value.contains(char::is_whitespace) =>
+        {
+            Ok(())
+        }
+        _ => Err(Error::Malformed("owner_email is not an address".into())),
     }
-    Ok(())
 }
 
 /// An onboarding key cannot hand out another onboarding key.
@@ -95,6 +103,10 @@ pub async fn create(
     let Json(new) = body?;
     text("name", &new.name)?;
     email(&new.owner_email)?;
+    // Each link is one insert while the transaction holds a pool connection.
+    if new.links.len() > LINKS_MAX {
+        return Err(Error::Malformed(format!("at most {LINKS_MAX} links")));
+    }
     for link in &new.links {
         text("links.issuer", &link.issuer)?;
         text("links.external_id", &link.external_id)?;

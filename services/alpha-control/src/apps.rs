@@ -109,20 +109,9 @@ mod tests {
         for ok in ["abc", "rafay-01h2x3", "a-1", longest.as_str()] {
             assert!(valid_slug(ok), "{ok}");
         }
-        let too_long = format!("a{}", "b".repeat(48));
+        assert!(!valid_slug(&format!("{longest}b")));
         for bad in [
-            "ab",
-            too_long.as_str(),
-            "1ab",
-            "-ab",
-            "ab-",
-            "a--b",
-            "Abc",
-            "a_b",
-            "a.b",
-            "api",
-            "sign",
-            "admin",
+            "ab", "1ab", "-ab", "ab-", "a--b", "Abc", "a_b", "a.b", "api", "sign", "admin",
         ] {
             assert!(!valid_slug(bad), "{bad}");
         }

@@ -24,7 +24,9 @@ async fn main() {
     let code = match run().await {
         Ok(()) => 0,
         Err(e) => {
-            alpha_client::error!("exit", error = e.code());
+            // No message here carries a setting's value: the URL's parse error is dropped.
+            let detail = e.to_string();
+            alpha_client::error!("exit", error = alpha_client::log::Field::text(&detail));
             1
         }
     };
@@ -65,7 +67,7 @@ impl ResolvesServerCert for Resolver {
 
 async fn run() -> Result<(), Error> {
     let options = PgConnectOptions::from_str(&env("ALPHACOMPUTE_DATABASE_URL")?)
-        .map_err(|e| Error::internal(format!("ALPHACOMPUTE_DATABASE_URL: {e}")))?;
+        .map_err(|_| Error::internal("ALPHACOMPUTE_DATABASE_URL is not a Postgres URL"))?;
     if std::env::args().nth(1).as_deref() == Some("migrate") {
         let pool = PgPoolOptions::new()
             .max_connections(1)

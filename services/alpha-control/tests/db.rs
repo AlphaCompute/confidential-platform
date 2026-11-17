@@ -103,9 +103,18 @@ async fn an_organization_is_created_unrooted_by_the_operator_or_an_onboarding_ke
         .execute(&api.1)
         .await
         .unwrap();
-    let escalate = json!({ "name": "Acme", "owner_email": "o@acme.test", "deploy_key": { "scopes": ["onboard"] } });
-    let (status, _) = api.call(Method::POST, "/v1/orgs", onboard, escalate).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let link = json!({ "issuer": "i", "external_id": "e" });
+    for bad in [
+        json!({ "name": "Acme", "owner_email": "o@acme.test", "deploy_key": { "scopes": ["onboard"] } }),
+        json!({ "name": "Acme", "owner_email": "owner@" }),
+        json!({ "name": "Acme", "owner_email": "a@b@c" }),
+        json!({ "name": "Acme", "owner_email": "o@acme.test", "links": vec![link; 17] }),
+    ] {
+        let (status, _) = api
+            .call(Method::POST, "/v1/orgs", onboard, bad.clone())
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+    }
     let linked = json!({
         "name": "Acme", "owner_email": "owner@acme.test",
         "links": [{ "issuer": "rafay:console.example", "external_id": "org-1" }],
