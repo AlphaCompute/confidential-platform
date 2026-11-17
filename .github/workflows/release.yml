@@ -152,7 +152,7 @@ jobs:
           digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$repository:$GITHUB_REF_NAME")
           echo "pushed $digest" >> "$GITHUB_STEP_SUMMARY"
           mkdir pushed
-          echo "$digest" > pushed/digest
+          echo "$digest" > "pushed/$NAME"
           {
             echo "repository=$repository"
             echo "sha256=${digest#*@}"
@@ -183,12 +183,12 @@ jobs:
         with:
           pattern: "*-digest"
           path: pushed
+          merge-multiple: true
       - name: List the pushed images by digest
         run: |
           mkdir release
-          for f in pushed/*-digest/digest; do
-            name=${f#pushed/}
-            jq -n --arg name "${name%-digest/digest}" --rawfile ref "$f" '{($name): ($ref | rtrimstr("\n"))}'
+          for f in pushed/*; do
+            jq -n --arg name "${f#pushed/}" --rawfile ref "$f" '{($name): ($ref | rtrimstr("\n"))}'
           done | jq -s 'add' > release/images.json
           {
             echo '```json'
@@ -229,7 +229,7 @@ jobs:
         with:
           name: ${{ matrix.name }}-digest
           path: pushed
-      - run: echo "KMS_IMAGE=$(cat pushed/digest)" >> "$GITHUB_ENV"
+      - run: echo "KMS_IMAGE=$(cat "pushed/$NAME")" >> "$GITHUB_ENV"
       # The unsigned release manifest: the compose of the KMS node with this image, in the bytes
       # Phala measures, and its compose_hash for the release-key holder to sign into kms_revisions.
       - name: Render the KMS compose from the pushed digest
