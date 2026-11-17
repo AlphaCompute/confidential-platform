@@ -12,6 +12,8 @@
         clippy::arithmetic_side_effects
     )
 )]
+#[cfg(feature = "acme")]
+pub mod acme;
 pub mod log;
 pub mod metrics;
 pub mod platform;

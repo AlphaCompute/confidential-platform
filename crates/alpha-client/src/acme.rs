@@ -1,9 +1,10 @@
 //! A browser-trusted certificate for the Endpoint's public name, from an ACME CA through
 //! TLS-ALPN-01 on the Endpoint's own port, the one port the public path forwards.
 //!
-//! The certificate key and the ACME account key are derived from the App's `edge-tls` key, which
-//! only Instances of the App receive. So every restart, renewal and Revision of the App holds the
-//! same key, and every current certificate for the name in Certificate Transparency holds it too.
+//! The certificate key and the ACME account key are derived from a 32-byte key the caller holds
+//! (in the runtime, the App's `edge-tls` key, which only Instances of the App receive). So every
+//! restart, renewal and Revision of the App holds the same key, and every current certificate for
+//! the name in Certificate Transparency holds it too.
 //! At start the runtime looks up the newest such certificate through Cert Spotter and fetches its
 //! chain from the CA, so a restart orders nothing. [`alpha_channel::binding`] ties the key to the
 //! Instance leaf.
@@ -11,8 +12,8 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use alpha_client::log::Field;
-use alpha_client::tls;
+use crate::log::Field;
+use crate::tls;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use hkdf::Hkdf;
@@ -28,13 +29,11 @@ use p256::{NonZeroScalar, Scalar, SecretKey};
 use parking_lot::RwLock;
 use rcgen::PublicKeyData;
 use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, DnsName, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::sign::CertifiedKey;
 use sha2::{Digest, Sha256};
 use x509_parser::prelude::{FromDer, X509Certificate};
 use zeroize::{Zeroize, Zeroizing};
-
-use crate::{Error, Runtime};
 
 pub const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
 const LETS_ENCRYPT: &str = "https://acme-v02.api.letsencrypt.org/directory";
@@ -53,8 +52,6 @@ const ROUTABLE_AFTER: Duration = Duration::from_secs(30);
 /// too. Let's Encrypt refills one duplicate per name every 34 hours, so wait two days and never
 /// order faster than the refill.
 const EXPIRED_BACKOFF: Duration = Duration::from_secs(48 * 60 * 60);
-const KEY_PURPOSE: &str = "edge-tls";
-const KEY_RETRY: Duration = Duration::from_secs(5);
 // ponytail: one key per name and one account per App for as long as the label stays. A leaked
 // key or a key rotation means a new label version, and the certificates of the old key stay in
 // CT until they expire.
@@ -63,32 +60,6 @@ const ACCOUNT_KEY_LABEL: &[u8] = b"alphacompute-runtime/acme-account-key/v1";
 const POLL: RetryPolicy = RetryPolicy::new()
     .initial_delay(Duration::from_secs(1))
     .timeout(Duration::from_secs(120));
-
-/// `ALPHACOMPUTE_PUBLIC_NAME`; None when it is not set.
-pub fn parse_public_name(
-    name: Option<&str>,
-    upstream: Option<&str>,
-    callers: &[alpha_core::AppId],
-) -> Result<Option<String>, Error> {
-    let refused = |m: &str| Error::Config(format!("ALPHACOMPUTE_PUBLIC_NAME: {m}"));
-    let Some(name) = name else {
-        return Ok(None);
-    };
-    if !name.contains('.')
-        || name.bytes().any(|b| b.is_ascii_uppercase())
-        || DnsName::try_from(name).is_err()
-    {
-        return Err(refused("is not a lowercase DNS name"));
-    }
-    if upstream.is_none() {
-        return Err(refused("set without ALPHACOMPUTE_TLS_UPSTREAM"));
-    }
-    // A browser and the ACME CA present no Instance leaf.
-    if !callers.is_empty() {
-        return Err(refused("set with ALPHACOMPUTE_TLS_CALLER_APPS"));
-    }
-    Ok(Some(name.to_owned()))
-}
 
 /// The public certificate and the pending challenge's, replaced by the issuance task while the
 /// listener serves them.
@@ -132,14 +103,13 @@ pub fn route<'a>(
 // ponytail: one copy per App with a public name. Each copy keeps its own challenge and orders
 // on its own, so the CA's validation routed to another copy fails; the upgrade is one copy that
 // orders and the others that find its certificate in CT.
-pub async fn issue_forever(edge: Arc<Edge>, name: String, runtime: Arc<Runtime>) {
-    let app_key = edge_tls_key(&runtime).await;
+pub async fn issue_forever(edge: Arc<Edge>, name: String, app_key: Zeroizing<Vec<u8>>) {
     let keys = derive_p256(&app_key, &[CERT_KEY_LABEL, name.as_bytes()].concat())
         .and_then(|cert| Ok((cert, derive_p256(&app_key, ACCOUNT_KEY_LABEL)?)));
     let (cert_key, account_key) = match keys {
         Ok(keys) => keys,
         Err(e) => {
-            alpha_client::error!("public_certificate_key_failed", error = Field::text(&e));
+            crate::error!("public_certificate_key_failed", error = Field::text(&e));
             return;
         }
     };
@@ -149,7 +119,7 @@ pub async fn issue_forever(edge: Arc<Edge>, name: String, runtime: Arc<Runtime>)
     {
         Ok(reused) => reused,
         Err(e) => {
-            alpha_client::warn!("public_certificate_lookup_failed", error = Field::text(&e));
+            crate::warn!("public_certificate_lookup_failed", error = Field::text(&e));
             None
         }
     };
@@ -158,7 +128,7 @@ pub async fn issue_forever(edge: Arc<Edge>, name: String, runtime: Arc<Runtime>)
         match account(&account_key).await {
             Ok(account) => break account,
             Err(e) => {
-                alpha_client::warn!("acme_account_failed", error = Field::text(&e));
+                crate::warn!("acme_account_failed", error = Field::text(&e));
                 tokio::time::sleep(RETRY_AFTER).await;
             }
         }
@@ -166,11 +136,11 @@ pub async fn issue_forever(edge: Arc<Edge>, name: String, runtime: Arc<Runtime>)
     loop {
         let wait = match issue(&edge, &name, &account, &cert_key).await {
             Ok(not_after) => {
-                alpha_client::info!("public_certificate_issued", not_after = not_after);
+                crate::info!("public_certificate_issued", not_after = not_after);
                 renewal_delay(not_after, SystemTime::now())
             }
             Err(e) => {
-                alpha_client::warn!("public_certificate_failed", error = Field::text(&e));
+                crate::warn!("public_certificate_failed", error = Field::text(&e));
                 RETRY_AFTER
             }
         };
@@ -187,23 +157,6 @@ fn renewal_delay(not_after: SystemTime, now: SystemTime) -> Duration {
             .saturating_mul(2)
             .max(RETRY_AFTER),
         _ => EXPIRED_BACKOFF,
-    }
-}
-
-/// At start the runtime may not have its first leaf yet; nothing can be served or ordered
-/// without the key.
-async fn edge_tls_key(runtime: &Runtime) -> Zeroizing<Vec<u8>> {
-    loop {
-        let decoded = runtime
-            .key(KEY_PURPOSE)
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|k| alpha_client::decode("key", &k.key).map_err(|e| e.to_string()));
-        match decoded {
-            Ok(key) => return Zeroizing::new(key),
-            Err(e) => alpha_client::warn!("edge_tls_key_failed", error = Field::text(&e)),
-        }
-        tokio::time::sleep(KEY_RETRY).await;
     }
 }
 
@@ -302,7 +255,7 @@ fn install(edge: &Edge, pkcs8: &[u8], chain_pem: &str) -> Result<SystemTime, Str
 /// App. Cert Spotter or the CA can only withhold or break the certificate, and a new order
 /// replaces it.
 async fn reuse(edge: &Edge, name: &str, pkcs8: &[u8]) -> Result<Option<Duration>, String> {
-    let http = alpha_client::http().build().map_err(|e| e.to_string())?;
+    let http = crate::http().build().map_err(|e| e.to_string())?;
     let spki = spki_sha256(pkcs8)?;
     let now = SystemTime::now();
     let mut newest = None;
@@ -328,7 +281,7 @@ async fn reuse(edge: &Edge, name: &str, pkcs8: &[u8]) -> Result<Option<Duration>
     let chain = get(&http, &format!("{LETS_ENCRYPT_CERT}{}", found.serial)).await?;
     let chain = String::from_utf8(chain).map_err(|_| "the chain is not PEM")?;
     install(edge, pkcs8, &chain)?;
-    alpha_client::info!("public_certificate_reused", not_after = found.not_after);
+    crate::info!("public_certificate_reused", not_after = found.not_after);
     // Past its renewal time the certificate is still served while the new order runs.
     let renew_at = found
         .not_before
@@ -349,7 +302,7 @@ async fn get(http: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
         .await
         .and_then(reqwest::Response::error_for_status)
         .map_err(|e| e.to_string())?;
-    alpha_client::read_capped(response, 1 << 20).await
+    crate::read_capped(response, 1 << 20).await
 }
 
 #[derive(Debug)]
@@ -441,32 +394,6 @@ mod tests {
         ];
         for (sni, alpn, expected) in cases {
             assert_eq!(routed(sni, alpn), expected, "{sni:?} {alpn:?}");
-        }
-    }
-
-    #[test]
-    fn a_public_name_is_one_lowercase_dns_name_on_an_endpoint_open_to_any_client() {
-        let upstream = Some("app:8080");
-        assert_eq!(
-            parse_public_name(Some(NAME), upstream, &[])
-                .unwrap()
-                .as_deref(),
-            Some(NAME)
-        );
-        assert!(parse_public_name(None, upstream, &[]).unwrap().is_none());
-
-        let caller = [alpha_core::AppId::mint()];
-        for (name, upstream, callers) in [
-            ("Hello.alphacompute.cc", upstream, &[][..]),
-            ("localhost", upstream, &[]),
-            ("10.0.0.1", upstream, &[]),
-            (NAME, None, &[]),
-            (NAME, upstream, &caller),
-        ] {
-            assert!(
-                parse_public_name(Some(name), upstream, callers).is_err(),
-                "{name:?} {upstream:?}"
-            );
         }
     }
 

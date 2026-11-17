@@ -30,9 +30,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_rustls::LazyConfigAcceptor;
+use zeroize::Zeroizing;
 
-use crate::acme::{self, Edge, Route};
 use crate::{Attested, Error, Exit, Runtime};
+use alpha_client::acme::{self, Edge, Route};
 
 const HANDSHAKE: Duration = Duration::from_secs(10);
 pub(crate) const CONNECT: Duration = Duration::from_secs(10);
@@ -46,6 +47,28 @@ const ATTESTATION_PATH: &str = "/.well-known/alphacompute/attestation";
 /// binding key signs back, so the answer cannot be a replay.
 const CHALLENGE: &str = "?challenge=";
 const CHALLENGE_LEN: usize = 43;
+
+const KEY_PURPOSE: &str = "edge-tls";
+const KEY_RETRY: Duration = Duration::from_secs(5);
+/// At start the runtime may not have its first leaf yet; nothing can be served or ordered
+/// without the key.
+async fn edge_tls_key(runtime: &Runtime) -> Zeroizing<Vec<u8>> {
+    loop {
+        let decoded = runtime
+            .key(KEY_PURPOSE)
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|k| alpha_client::decode("key", &k.key).map_err(|e| e.to_string()));
+        match decoded {
+            Ok(key) => return Zeroizing::new(key),
+            Err(e) => alpha_client::warn!(
+                "edge_tls_key_failed",
+                error = alpha_client::log::Field::text(&e)
+            ),
+        }
+        tokio::time::sleep(KEY_RETRY).await;
+    }
+}
 
 /// What a fresh connection to the public name asks the runtime itself for.
 #[derive(Debug, PartialEq, Eq)]
@@ -254,11 +277,10 @@ impl Endpoint {
     pub async fn serve(self, stop: impl Future<Output = Exit>) {
         let mut stop = std::pin::pin!(stop);
         let issuer = self.configs.public.as_ref().map(|(name, edge)| {
-            tokio::spawn(acme::issue_forever(
-                edge.clone(),
-                name.clone(),
-                self.runtime.clone(),
-            ))
+            let (edge, name, runtime) = (edge.clone(), name.clone(), self.runtime.clone());
+            tokio::spawn(async move {
+                acme::issue_forever(edge, name, edge_tls_key(&runtime).await).await
+            })
         });
         let mut open = JoinSet::new();
         let how = loop {
