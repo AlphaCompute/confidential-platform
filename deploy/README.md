@@ -2,9 +2,9 @@
 
 Two CVMs in two regions run one Revision of `alpha-kms` over one trust-zone Postgres. The
 operator creates and upgrades the CVMs by hand through the Phala Cloud API (or the `phala` CLI),
-one at a time, with the compose the release workflow rendered. This directory is the runbook; the compose itself is a
-release artifact, because it names the image by digest and the digest exists only after the
-build.
+one at a time, with the compose the release workflow rendered. This directory is the runbook;
+the compose itself is a release artifact, because it names the image by digest and the digest
+exists only after the build.
 
 ## What a release produces
 
