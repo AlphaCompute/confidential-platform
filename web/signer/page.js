@@ -913,7 +913,6 @@ function describeLaunch(a) {
   const { read, launch } = a;
   const nodes = [];
   if (launch.heading) nodes.push(el("p", launch.heading));
-  for (const line of launch.notes || []) nodes.push(el("p", line, "warning"));
   const services = Object.entries(launch.services);
   const runtime = launch.services["alpha-runtime"];
   const publicName = runtime && isPlatform(runtime) ? runtime.environment.ALPHACOMPUTE_PUBLIC_NAME : undefined;

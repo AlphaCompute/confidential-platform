@@ -9,22 +9,18 @@ use serde_yaml_ng::Value as Yaml;
 
 use crate::coco;
 
-pub struct Labels<'a> {
-    pub catalog_id: &'a str,
-    pub version: &'a str,
-    pub title: &'a str,
-}
-
 pub fn sign(
     rendered_pod: &str,
-    labels: Labels,
+    catalog_id: &str,
+    version: &str,
+    title: &str,
     resources: Resources,
     key: &SigningKey,
 ) -> Result<CatalogFile, String> {
     for (flag, value) in [
-        ("--id", labels.catalog_id),
-        ("--version", labels.version),
-        ("--title", labels.title),
+        ("--id", catalog_id),
+        ("--version", version),
+        ("--title", title),
     ] {
         if value.is_empty() {
             return Err(format!("{flag} is empty"));
@@ -44,9 +40,9 @@ pub fn sign(
     // Refuses a tagged image, among the rest of what render refuses, in case the file was edited.
     coco::parse(pod.as_bytes())?;
     let entry = Entry {
-        catalog_id: labels.catalog_id.into(),
-        version: labels.version.into(),
-        title: labels.title.into(),
+        catalog_id: catalog_id.into(),
+        version: version.into(),
+        title: title.into(),
         template_sha256: compose_hash(&template),
         pod_sha256: compose_hash(&pod),
         resources,
@@ -101,12 +97,14 @@ mod tests {
         SigningKey::from_bytes(&[11u8; 32])
     }
 
-    fn labels() -> Labels<'static> {
-        Labels {
-            catalog_id: "confidential-container",
-            version: "1",
-            title: "Confidential container",
-        }
+    const LABELS: [&str; 3] = ["confidential-container", "1", "Confidential container"];
+
+    fn signed(
+        pod: &str,
+        [id, version, title]: [&str; 3],
+        resources: Resources,
+    ) -> Result<CatalogFile, String> {
+        sign(pod, id, version, title, resources, &signing_key())
     }
 
     fn resources() -> Resources {
@@ -161,7 +159,7 @@ mod tests {
     /// Every file under `testdata/catalog`. The page renders `valid.json` in wasm and must get
     /// `init-data.toml`; each other catalog file differs from it in one respect only.
     fn vectors() -> Vec<(&'static str, Vec<u8>)> {
-        let valid = sign(&template_pod(), labels(), resources(), &signing_key()).unwrap();
+        let valid = signed(&template_pod(), LABELS, resources()).unwrap();
         let catalog_key = CatalogKey::from(&signing_key().verifying_key());
         let rendered = render(&valid, &catalog_key, APP_ID.parse().unwrap(), SLUG).unwrap();
         assert!(rendered.init_data.contains("board.app.alphacompute.cc"));
@@ -258,7 +256,7 @@ mod tests {
 
     #[test]
     fn the_pod_drops_only_the_init_data_annotation() {
-        let file = sign(&template_pod(), labels(), resources(), &signing_key()).unwrap();
+        let file = signed(&template_pod(), LABELS, resources()).unwrap();
         assert!(!file.pod.contains(coco::ANNOTATION));
         assert!(file.pod.contains(PUBLIC_NAME));
         let name = file_name(&file);
@@ -271,39 +269,26 @@ mod tests {
     #[test]
     fn signing_refuses_empty_labels_another_app_or_a_tagged_image() {
         let pod = template_pod();
-        let key = signing_key();
-        for (labels, fragment) in [
-            (
-                Labels {
-                    catalog_id: "",
-                    ..labels()
-                },
-                "--id",
-            ),
-            (
-                Labels {
-                    title: "",
-                    ..labels()
-                },
-                "--title",
-            ),
+        for (labels, flag) in [
+            (["", "1", "Confidential container"], "--id"),
+            (["confidential-container", "1", ""], "--title"),
         ] {
-            let err = sign(&pod, labels, resources(), &key).unwrap_err();
-            assert!(err.contains(fragment), "{err}");
+            let err = signed(&pod, labels, resources()).unwrap_err();
+            assert!(err.contains(flag), "{err}");
         }
         let zero = Resources {
             cpu: 0,
             memory_mib: 4096,
         };
-        assert!(sign(&pod, labels(), zero, &key).is_err());
+        assert!(signed(&pod, LABELS, zero).is_err());
 
         let other_app = rendered_pod(APP_ID.parse().unwrap());
-        let err = sign(&other_app, labels(), resources(), &key).unwrap_err();
+        let err = signed(&other_app, LABELS, resources()).unwrap_err();
         assert!(err.contains("--app-id"), "{err}");
 
         let image = "public.ecr.aws/docker/library/alpine@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8";
         let tagged = pod.replace(image, "public.ecr.aws/docker/library/alpine:3");
-        let err = sign(&tagged, labels(), resources(), &key).unwrap_err();
+        let err = signed(&tagged, LABELS, resources()).unwrap_err();
         assert!(err.contains("sha256"), "{err}");
     }
 }
