@@ -49,8 +49,6 @@ pub enum Error {
     Forbidden,
     #[error("{0}")]
     Malformed(String),
-    #[error("not found")]
-    NotFound,
     #[error("{0}")]
     Conflict(&'static str),
     #[error("{0}")]
@@ -67,7 +65,6 @@ impl Error {
             Error::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Error::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
             Error::Malformed(_) => (StatusCode::BAD_REQUEST, "malformed"),
-            Error::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             Error::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
             Error::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         }
@@ -130,6 +127,8 @@ pub struct Key {
     /// None for an onboarding key.
     pub org_id: Option<Uuid>,
     pub scopes: Vec<String>,
+    /// The only link issuer an onboarding key may claim.
+    pub issuer: Option<String>,
 }
 
 /// Who presented the bearer.
@@ -176,10 +175,10 @@ impl FromRequestParts<Arc<AppState>> for Caller {
             .and_then(|v| v.strip_prefix("Bearer "))
             .ok_or(Error::Unauthorized)?;
         let hash: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
-        if hash == state.operator_token_sha256 {
+        if alpha_client::bearer_matches(&hash, &state.operator_token_sha256) {
             return Ok(Caller::Operator);
         }
-        sqlx::query_as("select id, org_id, scopes from api_keys where token_sha256 = $1")
+        sqlx::query_as("select id, org_id, scopes, issuer from api_keys where token_sha256 = $1")
             .bind(hash.as_slice())
             .fetch_optional(&state.pool)
             .await?

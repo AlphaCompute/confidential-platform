@@ -126,12 +126,12 @@ pub fn route<'a>(
     Route::Public
 }
 
-// ponytail: one copy per App with a public name. Each copy keeps its own challenge and orders
-// on its own, so the CA's validation routed to another copy fails; the upgrade is one copy that
-// orders and the others that find its certificate in CT.
-pub async fn issue_forever(edge: Arc<Edge>, name: String, app_key: Zeroizing<Vec<u8>>) {
-    let keys = derive_p256(&app_key, &[CERT_KEY_LABEL, name.as_bytes()].concat())
-        .and_then(|cert| Ok((cert, derive_p256(&app_key, ACCOUNT_KEY_LABEL)?)));
+// ponytail: one process per name. Each process keeps its own challenge and orders on its own,
+// so the CA's validation routed to another process fails; the upgrade is one process that
+// orders and the others that find its certificate in CT. `key` is the caller's 32-byte key.
+pub async fn issue_forever(edge: Arc<Edge>, name: String, key: Zeroizing<Vec<u8>>) {
+    let keys = derive_p256(&key, &[CERT_KEY_LABEL, name.as_bytes()].concat())
+        .and_then(|cert| Ok((cert, derive_p256(&key, ACCOUNT_KEY_LABEL)?)));
     let (cert_key, account_key) = match keys {
         Ok(keys) => keys,
         Err(e) => {

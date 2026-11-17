@@ -5,28 +5,13 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{Path, State};
-use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{AppState, Caller, Error, audit};
 
 const APP_DOMAIN: &str = "app.alphacompute.cc";
-const RESERVED: [&str; 13] = [
-    "api",
-    "sign",
-    "verify",
-    "kms",
-    "registry",
-    "inference",
-    "app",
-    "apps",
-    "www",
-    "mail",
-    "docs",
-    "status",
-    "admin",
-];
+const RESERVED: &str = "api sign verify kms registry inference app apps www mail docs status admin";
 
 /// `^[a-z][a-z0-9-]{1,46}[a-z0-9]$` without `--`, which Instance names use as their separator,
 /// and outside the names the platform keeps for itself.
@@ -39,21 +24,14 @@ fn valid_slug(slug: &str) -> bool {
             .iter()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
         && !slug.contains("--")
-        && !RESERVED.contains(&slug)
-}
-
-#[derive(Serialize)]
-pub struct App {
-    pub app_id: Uuid,
-    pub slug: String,
-    pub endpoint: String,
+        && !RESERVED.split(' ').any(|reserved| reserved == slug)
 }
 
 pub async fn put(
     State(state): State<Arc<AppState>>,
     caller: Caller,
     Path(slug): Path<String>,
-) -> Result<Json<App>, Error> {
+) -> Result<Json<Value>, Error> {
     let org_id = caller.org("apps:write")?;
     if !valid_slug(&slug) {
         return Err(Error::Malformed(
@@ -92,11 +70,10 @@ pub async fn put(
             .ok_or(Error::Conflict("the slug is taken"))?,
     };
     tx.commit().await?;
-    Ok(Json(App {
-        app_id,
-        endpoint: format!("https://{slug}.{APP_DOMAIN}"),
-        slug,
-    }))
+    let endpoint = format!("https://{slug}.{APP_DOMAIN}");
+    Ok(Json(
+        json!({ "app_id": app_id, "slug": slug, "endpoint": endpoint }),
+    ))
 }
 
 #[cfg(test)]

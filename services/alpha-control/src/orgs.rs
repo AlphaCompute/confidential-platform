@@ -9,7 +9,7 @@ use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{AppState, Caller, Error, SCOPES, audit, mint_token};
@@ -38,20 +38,6 @@ pub struct NewOrg {
     #[serde(default)]
     pub links: Vec<Link>,
     pub deploy_key: Option<DeployKeyRequest>,
-}
-
-#[derive(Serialize)]
-pub struct DeployKey {
-    pub id: Uuid,
-    pub token: String,
-    pub scopes: Vec<String>,
-}
-
-#[derive(Serialize)]
-pub struct Created {
-    pub org_id: Uuid,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deploy_key: Option<DeployKey>,
 }
 
 fn text(field: &str, value: &str) -> Result<(), Error> {
@@ -96,7 +82,7 @@ pub async fn create(
     State(state): State<Arc<AppState>>,
     caller: Caller,
     body: Result<Json<NewOrg>, JsonRejection>,
-) -> Result<(StatusCode, Json<Created>), Error> {
+) -> Result<(StatusCode, Json<Value>), Error> {
     if !matches!(caller, Caller::Operator) && !caller.has("onboard") {
         return Err(Error::Forbidden);
     }
@@ -110,6 +96,15 @@ pub async fn create(
     for link in &new.links {
         text("links.issuer", &link.issuer)?;
         text("links.external_id", &link.external_id)?;
+    }
+    // A partner's onboarding key links only under the issuer its row names.
+    if let Caller::Key(key) = &caller
+        && new
+            .links
+            .iter()
+            .any(|l| key.issuer.as_deref() != Some(l.issuer.as_str()))
+    {
+        return Err(Error::Forbidden);
     }
     if let Some(key) = &new.deploy_key {
         deploy_scopes(&key.scopes)?;
@@ -134,34 +129,29 @@ pub async fn create(
         .execute(&mut *tx)
         .await?;
         if inserted.rows_affected() == 0 {
-            return Err(Error::Conflict("a link names another Organization"));
+            return Err(Error::Conflict(
+                "a link names another Organization or repeats",
+            ));
         }
     }
-    let deploy_key = match new.deploy_key {
-        Some(request) => {
-            let (token, hash) = mint_token()?;
-            let id = Uuid::now_v7();
-            sqlx::query(
-                "insert into api_keys (id, org_id, token_sha256, scopes) values ($1, $2, $3, $4)",
-            )
-            .bind(id)
-            .bind(org_id)
-            .bind(hash.as_slice())
-            .bind(&request.scopes)
-            .execute(&mut *tx)
-            .await?;
-            Some(DeployKey {
-                id,
-                token,
-                scopes: request.scopes,
-            })
-        }
-        None => None,
-    };
-    let details = json!({
-        "links": new.links,
-        "deploy_key": deploy_key.as_ref().map(|k| json!({ "id": k.id, "scopes": k.scopes })),
-    });
+    let mut created = json!({ "org_id": org_id });
+    let mut details = json!({ "links": new.links });
+    if let Some(request) = new.deploy_key {
+        let (token, hash) = mint_token()?;
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "insert into api_keys (id, org_id, token_sha256, scopes) values ($1, $2, $3, $4)",
+        )
+        .bind(id)
+        .bind(org_id)
+        .bind(hash.as_slice())
+        .bind(&request.scopes)
+        .execute(&mut *tx)
+        .await?;
+        details =
+            json!({ "links": new.links, "deploy_key": { "id": id, "scopes": request.scopes } });
+        created = json!({ "org_id": org_id, "deploy_key": { "id": id, "token": token, "scopes": request.scopes } });
+    }
     audit(
         &mut tx,
         &caller,
@@ -172,5 +162,5 @@ pub async fn create(
     )
     .await?;
     tx.commit().await?;
-    Ok((StatusCode::CREATED, Json(Created { org_id, deploy_key })))
+    Ok((StatusCode::CREATED, Json(created)))
 }

@@ -101,6 +101,9 @@ async fn run() -> Result<(), Error> {
     let probe_router = probes(state.clone());
     tokio::spawn(async move { axum::serve(probe_listener, probe_router).await });
 
+    // ponytail: one replica. The challenge lives in this process, so the CA's validation can reach
+    // a second replica that lacks it; the upgrade is one replica that orders and the others that
+    // find its certificate in CT.
     let edge = Arc::new(Edge::default());
     tokio::spawn(acme::issue_forever(
         edge.clone(),

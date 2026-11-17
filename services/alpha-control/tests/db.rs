@@ -97,7 +97,7 @@ async fn an_organization_is_created_unrooted_by_the_operator_or_an_onboarding_ke
     }
 
     let onboard = "alpha_onboard";
-    sqlx::query("insert into api_keys (id, token_sha256, scopes) values ($1, $2, '{onboard}')")
+    sqlx::query("insert into api_keys (id, token_sha256, scopes, issuer) values ($1, $2, '{onboard}', 'rafay:console.example')")
         .bind(Uuid::now_v7())
         .bind(Sha256::digest(onboard).as_slice())
         .execute(&api.1)
@@ -115,6 +115,9 @@ async fn an_organization_is_created_unrooted_by_the_operator_or_an_onboarding_ke
             .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
     }
+    let foreign = json!({ "name": "Acme", "owner_email": "o@acme.test", "links": [{ "issuer": "other", "external_id": "org-1" }] });
+    let (status, _) = api.call(Method::POST, "/v1/orgs", onboard, foreign).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
     let linked = json!({
         "name": "Acme", "owner_email": "owner@acme.test",
         "links": [{ "issuer": "rafay:console.example", "external_id": "org-1" }],

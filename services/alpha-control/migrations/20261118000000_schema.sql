@@ -12,12 +12,13 @@ create table org_links (
   primary key (issuer, external_id)
 );
 
--- org_id is null for an onboarding key.
+-- org_id is null for an onboarding key; issuer is the only link issuer it may claim.
 create table api_keys (
   id           uuid primary key,
   org_id       uuid references organizations(id),
   token_sha256 bytea not null unique check (length(token_sha256) = 32),
   scopes       text[] not null,
+  issuer       text,
   created_at   timestamptz not null default now()
 );
 
