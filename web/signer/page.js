@@ -243,15 +243,11 @@ async function api(view, method, path, bodyText) {
   }
 }
 
-function errorCode(body) {
-  const code = body?.error?.code;
-  return typeof code === "string" ? code : "";
-}
-
 // The fixed sentence for a failed call; the server's own text never reaches the page.
 function failure(reply) {
   if (reply.status === 0) return MESSAGES.unavailable;
-  const code = errorCode(reply.body);
+  const raw = reply.body?.error?.code;
+  const code = typeof raw === "string" ? raw : "";
   if (Object.hasOwn(CODES, code)) return CODES[code];
   if (CODE.test(code)) return MESSAGES.kms_refused(code);
   if (reply.status === 404) return MESSAGES.bad_link;
