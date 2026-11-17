@@ -244,11 +244,8 @@ async function api(view, method, path, bodyText) {
 }
 
 function errorCode(body) {
-  if (!body || typeof body !== "object") return "";
-  if (body.error && typeof body.error === "object" && typeof body.error.code === "string") {
-    return body.error.code;
-  }
-  return "";
+  const code = body?.error?.code;
+  return typeof code === "string" ? code : "";
 }
 
 // The fixed sentence for a failed call; the server's own text never reaches the page.
@@ -849,7 +846,7 @@ function parsedLaunch(read, compose, extra) {
 function previousLaunch(read) {
   const p = read.predecessor;
   if (p == null) return null;
-  if (!HASH.test(p?.compose_hash) || typeof p.revision !== "string") {
+  if (!HASH.test(p.compose_hash) || typeof p.revision !== "string") {
     return { refusal: MESSAGES.unavailable };
   }
   return parsedLaunch(p, p.revision, { compose_hash: p.compose_hash });
@@ -981,7 +978,7 @@ function describeLaunch(a) {
   const publicName = runtime && isPlatform(runtime) ? runtime.environment.ALPHACOMPUTE_PUBLIC_NAME : undefined;
   const summary = el("div", undefined, "summary");
   if (publicName) summary.append(fact("Public URL", `https://${publicName}`));
-  summary.append(fact("Organization", a.orgName), fact("Machine", launch.machine));
+  summary.append(fact("Organization", read.org_name), fact("Machine", launch.machine));
   nodes.push(summary);
   if (launch.machineNote) nodes.push(el("p", launch.machineNote, "muted"));
   nodes.push(fact("App", read.app_id), fact("Revision", read.compose_hash, "digest"));
@@ -1015,9 +1012,8 @@ async function startApproval(view, viewText, ticket) {
     return stop(MESSAGES.not_registrable);
   }
 
-  const orgName = read.org_name;
   const ui = screen();
-  const a = { view, viewText, read, ticket, ui, launch, before, orgName, credential: null, values: null };
+  const a = { view, viewText, read, ticket, ui, launch, before, credential: null, values: null };
   a.fields = secretFields(launch.services, before?.services, putSecrets(read), read.secrets);
   a.secretsBox = el("div", undefined, "secrets");
   a.secretsBox.append(...a.fields.map((f) => f.node));
@@ -1042,7 +1038,7 @@ async function startApproval(view, viewText, ticket) {
   layout.append(ui.facts, decision);
   document
     .getElementById("main")
-    .replaceChildren(el("p", `Launch approval for ${orgName}`, "eyebrow"), el("h1", launch.heading || read.app_id), layout);
+    .replaceChildren(el("p", `Launch approval for ${read.org_name}`, "eyebrow"), el("h1", launch.heading || read.app_id), layout);
   offerApproval(a);
 }
 
