@@ -196,7 +196,7 @@ impl FromRequestParts<Arc<AppState>> for Caller {
 pub async fn audit(
     tx: &mut Transaction<'_, Postgres>,
     caller: &Caller,
-    org_id: Option<Uuid>,
+    org_id: Uuid,
     action: &str,
     object: &str,
     details: serde_json::Value,

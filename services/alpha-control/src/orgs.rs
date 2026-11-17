@@ -159,7 +159,7 @@ pub async fn create(
     audit(
         &mut tx,
         &caller,
-        Some(org_id),
+        org_id,
         "org.create",
         &org_id.to_string(),
         details,

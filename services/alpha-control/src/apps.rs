@@ -76,7 +76,7 @@ pub async fn put(
             audit(
                 &mut tx,
                 &caller,
-                Some(org_id),
+                org_id,
                 "app.create",
                 &app_id.to_string(),
                 json!({ "slug": slug }),
