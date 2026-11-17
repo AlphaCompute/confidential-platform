@@ -137,8 +137,6 @@ pub struct Key {
     /// None for an onboarding key.
     pub org_id: Option<Uuid>,
     pub scopes: Vec<String>,
-    /// Set for a key that may act on one App only.
-    pub app_id: Option<Uuid>,
 }
 
 /// Who presented the bearer.
@@ -169,13 +167,6 @@ impl Caller {
             _ => Err(Error::Forbidden),
         }
     }
-
-    pub fn app_id(&self) -> Option<Uuid> {
-        match self {
-            Caller::Operator => None,
-            Caller::Key(key) => key.app_id,
-        }
-    }
 }
 
 impl FromRequestParts<Arc<AppState>> for Caller {
@@ -196,7 +187,7 @@ impl FromRequestParts<Arc<AppState>> for Caller {
             return Ok(Caller::Operator);
         }
         sqlx::query_as(
-            "select k.id, k.org_id, k.scopes, k.app_id from api_keys k \
+            "select k.id, k.org_id, k.scopes from api_keys k \
              left join organizations o on o.id = k.org_id \
              where k.token_sha256 = $1 and k.revoked_at is null and o.disabled_at is null",
         )
@@ -218,8 +209,8 @@ pub async fn audit(
     details: serde_json::Value,
 ) -> Result<(), Error> {
     sqlx::query(
-        "insert into audit_log (actor, org_id, action, object, outcome, details) \
-         values ($1, $2, $3, $4, 'ok', $5)",
+        "insert into audit_log (actor, org_id, action, object, details) \
+         values ($1, $2, $3, $4, $5)",
     )
     .bind(caller.actor())
     .bind(org_id)

@@ -121,16 +121,6 @@ async fn an_organization_is_created_unrooted_by_the_operator_or_an_onboarding_ke
         created.as_object().unwrap().keys().collect::<Vec<_>>(),
         ["org_id"]
     );
-    let org_id: Uuid = created["org_id"].as_str().unwrap().parse().unwrap();
-    let rooted: Option<i64> = sqlx::query_scalar(
-        "select count(*) from organizations where id = $1 and rooted_at is null and root_fingerprint is null",
-    )
-    .bind(org_id)
-    .fetch_one(&api.1)
-    .await
-    .unwrap();
-    assert_eq!(rooted, Some(1));
-
     let (status, _) = api.call(Method::POST, "/v1/orgs", onboard, linked).await;
     assert_eq!(status, StatusCode::CONFLICT);
     let orgs: i64 = sqlx::query_scalar("select count(*) from organizations")

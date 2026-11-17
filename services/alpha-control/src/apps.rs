@@ -62,20 +62,15 @@ pub async fn put(
         ));
     }
     let mut tx = state.pool.begin().await?;
-    let created: Option<Uuid> = match caller.app_id() {
-        Some(_) => None,
-        None => {
-            sqlx::query_scalar(
-                "insert into apps (id, org_id, slug) values ($1, $2, $3) \
-                 on conflict (slug) do nothing returning id",
-            )
-            .bind(Uuid::now_v7())
-            .bind(org_id)
-            .bind(&slug)
-            .fetch_optional(&mut *tx)
-            .await?
-        }
-    };
+    let created: Option<Uuid> = sqlx::query_scalar(
+        "insert into apps (id, org_id, slug) values ($1, $2, $3) \
+         on conflict (slug) do nothing returning id",
+    )
+    .bind(Uuid::now_v7())
+    .bind(org_id)
+    .bind(&slug)
+    .fetch_optional(&mut *tx)
+    .await?;
     let app_id = match created {
         Some(app_id) => {
             audit(
@@ -89,21 +84,12 @@ pub async fn put(
             .await?;
             app_id
         }
-        None => {
-            let found: Option<Uuid> = sqlx::query_scalar(
-                "select id from apps where slug = $1 and org_id = $2 and deleted_at is null",
-            )
+        None => sqlx::query_scalar("select id from apps where slug = $1 and org_id = $2")
             .bind(&slug)
             .bind(org_id)
             .fetch_optional(&mut *tx)
-            .await?;
-            match (found, caller.app_id()) {
-                (Some(app_id), None) => app_id,
-                (Some(app_id), Some(bound)) if app_id == bound => app_id,
-                (_, Some(_)) => return Err(Error::Forbidden),
-                (None, None) => return Err(Error::Conflict("the slug is taken")),
-            }
-        }
+            .await?
+            .ok_or(Error::Conflict("the slug is taken"))?,
     };
     tx.commit().await?;
     Ok(Json(App {
