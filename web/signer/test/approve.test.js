@@ -354,7 +354,7 @@ test("a new Revision shows its changes and revokes the one it replaces unless ke
   const { api, page, laptop } = await approvalPage({ revision, predecessor });
   const added = [...page.main.walk()].filter((n) => n.className === "added").map((n) => n.textContent);
   assert.deepEqual(added, [`web: image ${was} → ${now}`]);
-  assert.equal(page.find((n) => n.id === "keep-predecessor").checked, false);
+  assert.ok(!page.find((n) => n.id === "keep-predecessor").checked);
 
   api.revokeReceipt = (text, response) => mintReceipt("revision.register", text, response);
   await page.click("Approve with passkey");

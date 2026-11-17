@@ -296,10 +296,6 @@ function ticketPath(ticket, op) {
   return `/v1/tickets/${ticket}/kms/${op}`;
 }
 
-function revisionsJson(view) {
-  return JSON.stringify(view.kms_revisions.map((r) => r.compose_hash));
-}
-
 // The response the KMS signed for exactly `sentText`, or null.
 function receipt(view, reply, route, sentText, response) {
   try {
@@ -307,7 +303,7 @@ function receipt(view, reply, route, sentText, response) {
     const signed = wasm_bindgen.verifyKmsReceipt(
       JSON.stringify(reply.body.receipt),
       view.kms_ca_pem,
-      revisionsJson(view),
+      JSON.stringify(view.kms_revisions.map((r) => r.compose_hash)),
       JSON.stringify(expected),
     );
     return JSON.parse(signed);
@@ -1048,7 +1044,6 @@ function keepBox(a) {
   a.keep = el("input");
   a.keep.type = "checkbox";
   a.keep.id = "keep-predecessor";
-  a.keep.checked = false;
   const label = el("label", MESSAGES.keep_predecessor(a.before.compose_hash));
   label.htmlFor = a.keep.id;
   const row = el("p", undefined, "keep");
