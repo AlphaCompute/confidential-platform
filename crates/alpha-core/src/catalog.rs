@@ -241,15 +241,11 @@ mod tests {
         }
     }
 
-    fn signed(template: &str, pod: &str) -> CatalogFile {
-        sign(entry(template, pod), template.into(), pod.into(), &key(11)).unwrap()
-    }
-
-    fn signed_by(seed: u8) -> CatalogFile {
+    fn signed(template: &str, pod: &str, seed: u8) -> CatalogFile {
         sign(
-            entry(TEMPLATE, POD),
-            TEMPLATE.into(),
-            POD.into(),
+            entry(template, pod),
+            template.into(),
+            pod.into(),
             &key(seed),
         )
         .unwrap()
@@ -267,8 +263,13 @@ mod tests {
 
     #[test]
     fn render_substitutes_the_app_id_and_public_name_and_nothing_else() {
-        let rendered =
-            render(&signed_by(11), &catalog_key_of(&key(11)), app_id(), "board").unwrap();
+        let rendered = render(
+            &signed(TEMPLATE, POD, 11),
+            &catalog_key_of(&key(11)),
+            app_id(),
+            "board",
+        )
+        .unwrap();
         let want = TEMPLATE
             .replace(NIL_APP_ID, "01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b")
             .replace(PUBLIC_NAME, "board.app.alphacompute.cc");
@@ -279,7 +280,7 @@ mod tests {
             POD.replace(PUBLIC_NAME, "board.app.alphacompute.cc")
         );
         assert_eq!(
-            signed_by(11).entry.substitutions,
+            signed(TEMPLATE, POD, 11).entry.substitutions,
             Substitutions {
                 app_id: 1,
                 public_name: 2
@@ -290,9 +291,9 @@ mod tests {
     #[test]
     fn an_entry_signed_by_another_key_is_refused() {
         let catalog_key = catalog_key_of(&key(11));
-        let err = verify(&signed_by(12), &catalog_key).unwrap_err();
+        let err = verify(&signed(TEMPLATE, POD, 12), &catalog_key).unwrap_err();
         assert_eq!(err.code(), "signature_invalid");
-        let err = verify(&signed_by(11), &catalog_key_of(&key(12))).unwrap_err();
+        let err = verify(&signed(TEMPLATE, POD, 11), &catalog_key_of(&key(12))).unwrap_err();
         assert_eq!(err.code(), "signature_invalid");
     }
 
@@ -309,7 +310,7 @@ mod tests {
             |e| e.substitutions.public_name = 0,
         ];
         for (i, change) in changes.into_iter().enumerate() {
-            let mut file = signed_by(11);
+            let mut file = signed(TEMPLATE, POD, 11);
             change(&mut file.entry);
             assert_eq!(render_code(&file, "board"), "signature_invalid", "{i}");
         }
@@ -317,7 +318,7 @@ mod tests {
 
     #[test]
     fn a_signature_in_another_form_is_refused() {
-        let good = signed_by(11);
+        let good = signed(TEMPLATE, POD, 11);
         let bytes = BASE64_URL_SAFE_NO_PAD
             .decode(&good.signature.signature)
             .unwrap();
@@ -356,17 +357,17 @@ mod tests {
                 algorithm: algorithm.into(),
                 public_key: public_key.clone(),
             };
-            let err = verify(&signed_by(11), &catalog_key).unwrap_err();
+            let err = verify(&signed(TEMPLATE, POD, 11), &catalog_key).unwrap_err();
             assert_eq!(err.code(), "malformed", "{algorithm:?} {public_key:?}");
         }
     }
 
     #[test]
     fn a_catalog_file_must_have_exactly_its_fields() {
-        let file = serde_json::to_value(signed_by(11)).unwrap();
+        let file = serde_json::to_value(signed(TEMPLATE, POD, 11)).unwrap();
         assert_eq!(
             serde_json::from_value::<CatalogFile>(file.clone()).unwrap(),
-            signed_by(11)
+            signed(TEMPLATE, POD, 11)
         );
         let edits: [fn(&mut serde_json::Value); 7] = [
             |f| f["later"] = 1.into(),
@@ -388,10 +389,10 @@ mod tests {
 
     #[test]
     fn render_refuses_texts_that_do_not_match_the_signed_entry() {
-        let mut file = signed_by(11);
+        let mut file = signed(TEMPLATE, POD, 11);
         file.template.push(' ');
         assert_eq!(render_code(&file, "board"), "template_mismatch");
-        let mut file = signed_by(11);
+        let mut file = signed(TEMPLATE, POD, 11);
         file.pod.push(' ');
         assert_eq!(render_code(&file, "board"), "template_mismatch");
 
@@ -404,11 +405,18 @@ mod tests {
     #[test]
     fn render_refuses_a_bad_slug_or_a_template_that_names_no_nil_app() {
         for slug in ["", "Board", "a--b", "sign", "b.c"] {
-            assert_eq!(render_code(&signed_by(11), slug), "malformed", "{slug}");
+            assert_eq!(
+                render_code(&signed(TEMPLATE, POD, 11), slug),
+                "malformed",
+                "{slug}"
+            );
         }
         let elsewhere = TEMPLATE.replacen(NIL_APP_ID, "01994b3e-0000-7000-8000-000000000000", 1);
-        let file = signed(&elsewhere, &format!("{POD}# {NIL_APP_ID}\n"));
+        let file = signed(&elsewhere, &format!("{POD}# {NIL_APP_ID}\n"), 11);
         assert_eq!(render_code(&file, "board"), "malformed");
-        assert_eq!(render_code(&signed("not toml", POD), "board"), "malformed");
+        assert_eq!(
+            render_code(&signed("not toml", POD, 11), "board"),
+            "malformed"
+        );
     }
 }

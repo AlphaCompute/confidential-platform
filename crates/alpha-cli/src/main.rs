@@ -782,7 +782,6 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             Ok(json!({
                 "file": path,
                 "template_sha256": file.entry.template_sha256,
-                "substitutions": file.entry.substitutions,
                 "catalog_key": alpha_core::CatalogKey::from(&key.verifying_key()),
             }))
         }

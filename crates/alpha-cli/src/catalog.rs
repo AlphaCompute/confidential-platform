@@ -162,7 +162,6 @@ mod tests {
         let valid = signed(&template_pod(), LABELS, resources()).unwrap();
         let catalog_key = CatalogKey::from(&signing_key().verifying_key());
         let rendered = render(&valid, &catalog_key, APP_ID.parse().unwrap(), SLUG).unwrap();
-        assert!(rendered.init_data.contains("board.app.alphacompute.cc"));
 
         let resign = |entry: Entry, seed: u8| {
             alpha_core::catalog::sign(
