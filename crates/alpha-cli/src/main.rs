@@ -344,11 +344,6 @@ enum CatalogCommand {
         version: String,
         #[arg(long)]
         title: String,
-        /// The shape the signers approve; the pod's limits must give the same.
-        #[arg(long)]
-        cpu: u32,
-        #[arg(long)]
-        memory_mib: u32,
         /// The catalog key: an Ed25519 key file from `alpha keygen --admin`.
         #[arg(long)]
         key: PathBuf,
@@ -764,8 +759,6 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                     id,
                     version,
                     title,
-                    cpu,
-                    memory_mib,
                     key,
                     out_dir,
                     pod,
@@ -774,8 +767,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
             let rendered = fs::read_to_string(&pod)
                 .map_err(|e| Exit::Usage(format!("{}: {e}", pod.display())))?;
             let key = read_ed25519(&key)?;
-            let resources = alpha_core::catalog::Resources { cpu, memory_mib };
-            let file = alpha_cli::catalog::sign(&rendered, &id, &version, &title, resources, &key)?;
+            let file = alpha_cli::catalog::sign(&rendered, &id, &version, &title, &key)?;
             let path = out_dir.join(alpha_cli::catalog::file_name(&file));
             fs::write(&path, alpha_cli::catalog::file_bytes(&file)?)
                 .map_err(|e| Exit::Refused(format!("{}: {e}", path.display())))?;
@@ -1001,10 +993,6 @@ mod tests {
             "1",
             "--title",
             "CPU App",
-            "--cpu",
-            "2",
-            "--memory-mib",
-            "4096",
             "--key",
             "k",
         ];

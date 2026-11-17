@@ -558,9 +558,9 @@ envsubst '$RUNTIME_IMAGE $KMS_CA_SPKI_SHA256 $PLATFORM_DOCUMENT_URL $PLATFORM_MI
   < deploy/kata/catalog/confidential-container.yaml > cc.yaml
 alpha coco render --app-id 00000000-0000-0000-0000-000000000000 --kata <opt/kata> --out cc-rendered.yaml cc.yaml
 alpha catalog sign --id confidential-container --version 1 --title "Confidential container" \
-  --cpu 2 --memory-mib 4096 --key catalog.key --out-dir catalog cc-rendered.yaml
+  --key catalog.key --out-dir catalog cc-rendered.yaml
 ```
 
-`--cpu` and `--memory-mib` are the TD's shape: 1 vCPU and 2048 MiB plus the summed limits of the
-pod. The platform document must list the reference values of that shape. Serve the output file at
+The entry signs the TD's shape: 1 vCPU and 2048 MiB plus the summed limits of the pod. The
+platform document must list the reference values of that shape. Serve the output file at
 `/sign/catalog/<64 hex>.json`; the hex is the SHA-256 of the entry's init-data template.

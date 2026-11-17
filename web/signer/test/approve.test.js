@@ -557,7 +557,7 @@ test("a catalog app is rendered in wasm for its App and slug and its hash must m
   const { api, page } = await catalogPage({ [`${TEMPLATE_HEX}.json`]: VALID });
   assert.ok(page.fetches.some((f) => f.url === `./catalog/${TEMPLATE_HEX}.json`));
   const text = page.text();
-  for (const line of ["Confidential container, version 1", "Machine: 2 vCPU, 4096 MiB", "Image: alpine"]) {
+  for (const line of ["Confidential container, version 1", "Machine: 1 vCPU, 2048 MiB", "Image: alpine"]) {
     assert.ok(text.includes(line), `${line}\n${text}`);
   }
   await page.click("Approve with passkey");

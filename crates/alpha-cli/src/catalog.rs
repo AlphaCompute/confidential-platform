@@ -14,7 +14,6 @@ pub fn sign(
     catalog_id: &str,
     version: &str,
     title: &str,
-    resources: Resources,
     key: &SigningKey,
 ) -> Result<CatalogFile, String> {
     for (flag, value) in [
@@ -25,9 +24,6 @@ pub fn sign(
         if value.is_empty() {
             return Err(format!("{flag} is empty"));
         }
-    }
-    if resources.cpu == 0 || resources.memory_mib == 0 {
-        return Err("--cpu and --memory-mib must be positive".into());
     }
     let (app_id, _, template) = coco::rendered_init_data(rendered_pod)?;
     if app_id != AppId::from(uuid::Uuid::nil()) {
@@ -45,7 +41,7 @@ pub fn sign(
         title: title.into(),
         template_sha256: compose_hash(&template),
         pod_sha256: compose_hash(&pod),
-        resources,
+        resources: shape(&pod)?,
         substitutions: Substitutions::count(&template, &pod).map_err(|e| e.to_string())?,
     };
     alpha_core::catalog::sign(entry, template, pod, key).map_err(|e| e.to_string())
@@ -60,6 +56,54 @@ fn without_init_data(pod: &str) -> Result<String, String> {
         annotations.remove(coco::ANNOTATION);
     }
     serde_yaml_ng::to_string(&spec).map_err(|e| format!("pod spec: {e}"))
+}
+
+/// The TD Kata boots for the Pod: 1 vCPU and 2048 MiB plus the summed container limits. Only whole
+/// vCPUs and `Mi` or `Gi` memory are accepted, so the signed shape is exactly the TD's.
+fn shape(pod: &str) -> Result<Resources, String> {
+    let spec: Yaml = serde_yaml_ng::from_str(pod).map_err(|e| format!("pod spec: {e}"))?;
+    let containers = spec
+        .get("spec")
+        .and_then(|s| s.get("containers"))
+        .and_then(Yaml::as_sequence)
+        .ok_or("pod spec: no spec.containers")?;
+    let mut shape = Resources {
+        cpu: 1,
+        memory_mib: 2048,
+    };
+    for limits in containers
+        .iter()
+        .filter_map(|c| c.get("resources")?.get("limits")?.as_mapping())
+    {
+        for (name, value) in limits {
+            let value = match value {
+                Yaml::String(s) => s.clone(),
+                Yaml::Number(n) => n.to_string(),
+                _ => String::new(),
+            };
+            let (total, add) = match name.as_str() {
+                Some("cpu") => (&mut shape.cpu, value.parse().ok()),
+                Some("memory") => (
+                    &mut shape.memory_mib,
+                    value
+                        .strip_suffix("Gi")
+                        .and_then(|g| g.parse::<u32>().ok()?.checked_mul(1024))
+                        .or_else(|| value.strip_suffix("Mi")?.parse().ok()),
+                ),
+                _ => {
+                    return Err(format!(
+                        "limits: {name:?}; a catalog Pod limits only cpu and memory"
+                    ));
+                }
+            };
+            *total = add.and_then(|n| total.checked_add(n)).ok_or_else(|| {
+                format!(
+                    "limits: {name:?} {value:?}; write whole vCPUs, and memory as <n>Mi or <n>Gi"
+                )
+            })?;
+        }
+    }
+    Ok(shape)
 }
 
 /// The bare hex of `template_sha256`: a colon does not belong in a file name.
@@ -99,19 +143,8 @@ mod tests {
 
     const LABELS: [&str; 3] = ["confidential-container", "1", "Confidential container"];
 
-    fn signed(
-        pod: &str,
-        [id, version, title]: [&str; 3],
-        resources: Resources,
-    ) -> Result<CatalogFile, String> {
-        sign(pod, id, version, title, resources, &signing_key())
-    }
-
-    fn resources() -> Resources {
-        Resources {
-            cpu: 2,
-            memory_mib: 4096,
-        }
+    fn signed(pod: &str, [id, version, title]: [&str; 3]) -> Result<CatalogFile, String> {
+        sign(pod, id, version, title, &signing_key())
     }
 
     /// k3's Pod and init-data, which genpolicy wrote for that Pod, with the public name in the
@@ -159,7 +192,7 @@ mod tests {
     /// Every file under `testdata/catalog`. The page renders `valid.json` in wasm and must get
     /// `init-data.toml`; each other catalog file differs from it in one respect only.
     fn vectors() -> Vec<(&'static str, Vec<u8>)> {
-        let valid = signed(&template_pod(), LABELS, resources()).unwrap();
+        let valid = signed(&template_pod(), LABELS).unwrap();
         let catalog_key = CatalogKey::from(&signing_key().verifying_key());
         let rendered = render(&valid, &catalog_key, APP_ID.parse().unwrap(), SLUG).unwrap();
 
@@ -243,11 +276,43 @@ mod tests {
             );
         assert_eq!(template.matches(PUBLIC_NAME).count(), 1);
         coco::parse(template.as_bytes()).unwrap();
+        assert_eq!(
+            shape(&template).unwrap(),
+            Resources {
+                cpu: 2,
+                memory_mib: 4096
+            }
+        );
+    }
+
+    #[test]
+    fn the_shape_refuses_limits_the_td_does_not_get_exactly() {
+        let with = |limits: &str| {
+            K3_POD.replace(
+                "    image: public",
+                &format!("    resources:\n      limits: {{{limits}}}\n    image: public"),
+            )
+        };
+        assert_eq!(
+            shape(&with("cpu: 2, memory: 512Mi")).unwrap(),
+            Resources {
+                cpu: 3,
+                memory_mib: 2560
+            }
+        );
+        for limits in [
+            "cpu: 500m",
+            "memory: 1G",
+            "memory: 4194304Gi",
+            "nvidia.com/pgpu: 1",
+        ] {
+            assert!(shape(&with(limits)).is_err(), "{limits}");
+        }
     }
 
     #[test]
     fn the_pod_drops_only_the_init_data_annotation() {
-        let file = signed(&template_pod(), LABELS, resources()).unwrap();
+        let file = signed(&template_pod(), LABELS).unwrap();
         assert!(!file.pod.contains(coco::ANNOTATION));
         assert!(file.pod.contains(PUBLIC_NAME));
         let name = file_name(&file);
@@ -264,22 +329,16 @@ mod tests {
             (["", "1", "Confidential container"], "--id"),
             (["confidential-container", "1", ""], "--title"),
         ] {
-            let err = signed(&pod, labels, resources()).unwrap_err();
+            let err = signed(&pod, labels).unwrap_err();
             assert!(err.contains(flag), "{err}");
         }
-        let zero = Resources {
-            cpu: 0,
-            memory_mib: 4096,
-        };
-        assert!(signed(&pod, LABELS, zero).is_err());
-
         let other_app = rendered_pod(APP_ID.parse().unwrap());
-        let err = signed(&other_app, LABELS, resources()).unwrap_err();
+        let err = signed(&other_app, LABELS).unwrap_err();
         assert!(err.contains("--app-id"), "{err}");
 
         let image = "public.ecr.aws/docker/library/alpine@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8";
         let tagged = pod.replace(image, "public.ecr.aws/docker/library/alpine:3");
-        let err = signed(&tagged, LABELS, resources()).unwrap_err();
+        let err = signed(&tagged, LABELS).unwrap_err();
         assert!(err.contains("sha256"), "{err}");
     }
 }
