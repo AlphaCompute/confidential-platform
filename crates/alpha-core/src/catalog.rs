@@ -72,7 +72,7 @@ pub struct CatalogFile {
 /// A catalog Revision for one App: `init_data` is registered, its SHA-256 is `revision`, and
 /// `pod` is created with `init_data` in its `io.katacontainers.config.hypervisor.cc_init_data`
 /// annotation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rendered {
     pub revision: ComposeHash,
     pub init_data: String,

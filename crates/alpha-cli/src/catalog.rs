@@ -33,7 +33,7 @@ pub fn sign(
         ));
     }
     let pod = without_init_data(rendered_pod)?;
-    // Refuses a tagged image, among the rest of what render refuses, in case the file was edited.
+    // Re-check in case the file was edited: refuses a tagged image.
     coco::parse(pod.as_bytes())?;
     let entry = Entry {
         catalog_id: catalog_id.into(),
