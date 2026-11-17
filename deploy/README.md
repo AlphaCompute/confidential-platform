@@ -70,23 +70,13 @@ the containers left on the disk, and powers the CVM off when it cannot, so that 
 runs the previous Revision's images under the new measurement for about a second instead of
 ten. It keeps the images: without a script the API
 inserts its own, which prunes every image before pulling, and a CVM rebooted afterwards would
-lose the image it runs. `deploy/phala.py` is the create/update
-call itself (exact compose, `compose_hash` check, encrypted env) for a deploy run by hand.
+lose the image it runs.
 
-## Deploying the dev node
+## Dev images
 
-`.github/workflows/deploy.yml` renders the dev node's compose from an `alpha-kms-dev` image,
-creates or updates the CVM through `deploy/phala.py`, and waits until the container runs. The
-image is a release tag (`v…`) or a dev-image tag: `.github/workflows/dev-image.yml` builds
-`alpha-kms-dev` and `alpha-runtime` once with the build cache and pushes `dev-<commit>`, minutes
-instead of a release's double build. Dev images are never listed in a production platform
-document.
-
-`deploy/phala.py` sends every `allowed_envs` name on each commit and then reads back the compose
-Phala stored: a commit that carries env can rewrite the stored `allowed_envs` (drop names,
-reorder them), which changes what the CVM measures after the provision-time check passed. When
-the stored compose is not the file, the script refuses; recreate that CVM rather than updating it
-again, since an env update does not restore the order.
+`.github/workflows/dev-image.yml` builds `alpha-kms-dev` and `alpha-runtime` once with the build
+cache and pushes `dev-<commit>`, minutes instead of a release's double build. Dev images are
+never listed in a production platform document.
 
 ## Signing the Revision
 
@@ -142,7 +132,7 @@ the platform-document URL are served; the signed document lists the Revision.
    `ALPHACOMPUTE_DATABASE_URL` (as the service user), `ALPHACOMPUTE_KMS_ENDPOINTS` (both nodes'
    URLs, `https://<app id>-8443s.<gateway base>`, so provision the second CVM first to learn its
    app id: the values are not measured, but a later env update rewrites the stored
-   `allowed_envs` and changes what the CVM measures, see "Deploying the dev node"),
+   `allowed_envs`, dropping or reordering names, and changes what the CVM measures),
    `ALPHACOMPUTE_PCCS_URL`, `ALPHACOMPUTE_PLATFORM_DOCUMENT_URL`, and after the commit check that
    the stored compose still hashes to `manifest.json`'s `compose_hash`. The node comes up
    `sealed`: `GET /ready` answers 503 `{"sealed": true}`.
@@ -223,11 +213,10 @@ the service exit 1 naming it; Postgres itself is unaffected.
 
 To add the broker to a running Postgres CVM, update that CVM through the Phala API: its
 `app-compose.json` with `docker_compose_file` set to this compose and `allowed_envs` set to
-`["POSTGRES_PASSWORD", "ALPHA_BROKER_PASSWORD"]`, then `deploy/phala.py update <pg cvm id>
-<app-compose.json>` with both variables in the environment. A commit that carries env rewrites
-the stored `allowed_envs`, so every name goes out, and `POSTGRES_PASSWORD` must be the value the
-volume was created with. The update restarts Postgres; the KMS nodes reconnect. `deploy/phala.py
-wait` does not apply to this CVM, because the init container exits by design.
+`["POSTGRES_PASSWORD", "ALPHA_BROKER_PASSWORD"]`, with both variables in the encrypted env. A
+commit that carries env rewrites the stored `allowed_envs`, so every name goes out, and
+`POSTGRES_PASSWORD` must be the value the volume was created with. The update restarts Postgres;
+the KMS nodes reconnect.
 
 The broker's Secret `database-url` is
 `postgres://alpha_broker:<ALPHA_BROKER_PASSWORD>@<pg app id>-5432s.<gateway base>:443/alpha_broker?sslmode=require&sslnegotiation=direct`,
