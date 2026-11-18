@@ -96,8 +96,7 @@ pub async fn relay(
     let response = confirm(&document, "key.register", &registration, expected, &reply)?;
     let key_id: Uuid = response
         .get("id")
-        .and_then(Value::as_str)
-        .and_then(|id| id.parse().ok())
+        .and_then(|id| Uuid::deserialize(id).ok())
         .ok_or(Error::UpstreamInvalid)?;
     sqlx::query(
         "insert into credentials (key_id, org_id, credential_id) values ($1, $2, $3) \

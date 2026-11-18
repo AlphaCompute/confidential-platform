@@ -933,16 +933,10 @@ async fn only_the_owners_session_roots_and_only_roster_keys_of_the_organization_
     let code = |reply: &Value| reply["error"]["code"].clone();
 
     // A ticket alone never adds a key: not without the session, nor as a self-signed key step.
-    for headers in [vec![], vec![("alpha-claim-session", "x".repeat(43))]] {
-        let headers: Vec<(&str, &str)> = headers.iter().map(|(n, v)| (*n, v.as_str())).collect();
+    let wrong = "x".repeat(43);
+    for headers in [&[][..], &[("alpha-claim-session", wrong.as_str())][..]] {
         let (status, refused) = api
-            .call_with(
-                Method::POST,
-                &relay("root"),
-                "",
-                &headers,
-                root_body.clone(),
-            )
+            .call_with(Method::POST, &relay("root"), "", headers, root_body.clone())
             .await;
         assert_eq!(
             (status, code(&refused)),
