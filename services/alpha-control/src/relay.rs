@@ -113,25 +113,16 @@ pub async fn relay(
         return Err(Error::Forbidden);
     }
     // The KMS answers a repeated root for the same key with its stored row and a new receipt,
-    // so a root checks the version after the reply and a retry after `stale` still records it.
+    // so a root checks the version and the expiry after the reply: a refusal there records
+    // nothing, and a retry on a new ticket records the root.
     // A repeated other key is `already_exists`, so a key checks the version before the call.
     if op == "key" {
-        current(&mut tx, version).await?;
-        // The version lock may have waited past the ticket's expiry.
-        let open: bool = sqlx::query_scalar(
-            "select expires_at > clock_timestamp() from tickets where ticket = $1",
-        )
-        .bind(&ticket)
-        .fetch_one(&mut *tx)
-        .await?;
-        if !open {
-            return Err(Error::TicketExpired);
-        }
+        current(&mut tx, version, &ticket).await?;
     }
     let reply = kms(&state, &document, "/v1/keys", &registration).await?;
     let response = confirm(&document, "key.register", &registration, expected, &reply)?;
     if op == "root" {
-        current(&mut tx, version).await?;
+        current(&mut tx, version, &ticket).await?;
     }
     let key_id: Uuid = response
         .get("id")
@@ -180,15 +171,29 @@ pub async fn relay(
     Ok(Json(reply))
 }
 
-/// Refuses a step checked under a document older than the accepted one. The share lock holds to
-/// the commit, so no newer version is accepted before the step is recorded.
-async fn current(tx: &mut Transaction<'_, Postgres>, version: i64) -> Result<(), Error> {
+/// Refuses a step checked under a document older than the accepted one, or on a ticket that has
+/// expired. The share lock holds to the commit, so no newer version is accepted before the step
+/// is recorded.
+async fn current(
+    tx: &mut Transaction<'_, Postgres>,
+    version: i64,
+    ticket: &str,
+) -> Result<(), Error> {
     let accepted: i64 =
         sqlx::query_scalar("select version from platform_version where one = 1 for share")
             .fetch_one(&mut **tx)
             .await?;
     if version < accepted {
         return Err(stale(version, accepted));
+    }
+    // The KMS call or the version lock may have outlasted the ticket.
+    let open: bool =
+        sqlx::query_scalar("select expires_at > clock_timestamp() from tickets where ticket = $1")
+            .bind(ticket)
+            .fetch_one(&mut **tx)
+            .await?;
+    if !open {
+        return Err(Error::TicketExpired);
     }
     Ok(())
 }
