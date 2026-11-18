@@ -331,12 +331,11 @@ pub async fn session(
         .execute(&mut *tx)
         .await?;
     sqlx::query(
-        "insert into audit_log (actor, org_id, action, object) \
-         values ($1, $2, 'ticket.session', $3)",
+        "insert into audit_log (actor, org_id, action) \
+         values ($1, $2, 'ticket.session')",
     )
     .bind(format!("principal:{principal_id}"))
     .bind(org_id)
-    .bind(principal_id.to_string())
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
