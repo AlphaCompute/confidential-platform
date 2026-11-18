@@ -17,15 +17,9 @@ use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::{AppState, Caller, Error, audit};
+use crate::{AppState, Caller, Error, audit, random};
 
 const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-
-fn random<const N: usize>() -> Result<[u8; N], Error> {
-    let mut bytes = [0u8; N];
-    getrandom::fill(&mut bytes).map_err(|e| Error::internal(format!("rng: {e}")))?;
-    Ok(bytes)
-}
 
 /// Opens a ticket and answers it and its 8-character code.
 pub async fn open(
@@ -56,24 +50,14 @@ pub async fn open(
     Ok((ticket, code))
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NewTicket {
-    pub kind: String,
-}
-
 /// `POST /v1/orgs/{org}/tickets`: a `claim` ticket, sent to the owner out of band.
 pub async fn claim(
     State(state): State<Arc<AppState>>,
     caller: Caller,
     Path(org_id): Path<Uuid>,
-    body: Result<Json<NewTicket>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), Error> {
     if !matches!(caller, Caller::Operator) && caller.org("org:admin")? != org_id {
         return Err(Error::Forbidden);
-    }
-    if body?.kind != "claim" {
-        return Err(Error::Malformed("kind must be claim".into()));
     }
     let mut tx = state.pool.begin().await?;
     let found: Option<i32> =
@@ -138,7 +122,6 @@ pub async fn read(
         "credentials": [],
     });
     let extra = match row.kind.as_str() {
-        // Nothing roots an Organization until the KMS relay carries its root claim.
         "claim" => json!({ "rooted": false, "owner_email": row.owner_email }),
         _ => {
             let compose_hash = row
@@ -302,20 +285,20 @@ pub async fn session(
 ) -> Result<Json<Value>, Error> {
     let Json(request) = body?;
     // Checked before the code is spent, and again under the lock below.
-    usable(&mut state.pool.begin().await?, &ticket).await?;
+    let (kind, _) = usable(&mut state.pool.begin().await?, &ticket).await?;
+    if kind != "claim" {
+        return Err(Error::SessionRefused);
+    }
     let claims = redeem(&state, &request).await?;
 
     let mut tx = state.pool.begin().await?;
-    let (kind, org_id) = usable(&mut tx, &ticket).await?;
+    let (_, org_id) = usable(&mut tx, &ticket).await?;
     let (owner_email, owner): (String, Option<Uuid>) = sqlx::query_as(
         "select owner_email, owner_principal_id from organizations where id = $1 for update",
     )
     .bind(org_id)
     .fetch_one(&mut *tx)
     .await?;
-    if kind != "claim" {
-        return Err(Error::SessionRefused);
-    }
     let principal_id: Uuid = sqlx::query_scalar(
         "insert into principals (id, issuer, subject) values ($1, $2, $3) \
          on conflict (issuer, subject) do update set issuer = excluded.issuer returning id",
@@ -342,8 +325,7 @@ pub async fn session(
         .bind(org_id)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("update tickets set principal_id = $1, session_sha256 = $2 where ticket = $3")
-        .bind(principal_id)
+    sqlx::query("update tickets set session_sha256 = $1 where ticket = $2")
         .bind(Sha256::digest(secret.as_bytes()).as_slice())
         .bind(&ticket)
         .execute(&mut *tx)

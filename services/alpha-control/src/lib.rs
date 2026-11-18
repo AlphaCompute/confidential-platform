@@ -138,10 +138,15 @@ impl IntoResponse for Error {
 
 pub const SCOPES: [&str; 5] = ["apps:read", "apps:write", "deploy", "org:admin", "onboard"];
 
+fn random<const N: usize>() -> Result<[u8; N], Error> {
+    let mut bytes = [0u8; N];
+    getrandom::fill(&mut bytes).map_err(|e| Error::internal(format!("rng: {e}")))?;
+    Ok(bytes)
+}
+
 /// A new operational API key `alpha_<base32>` and the SHA-256 its row keeps.
 pub fn mint_token() -> Result<(String, [u8; 32]), Error> {
-    let mut secret = Zeroizing::new([0u8; 32]);
-    getrandom::fill(secret.as_mut_slice()).map_err(|e| Error::internal(format!("rng: {e}")))?;
+    let secret = Zeroizing::new(random::<32>()?);
     let token = format!(
         "alpha_{}",
         data_encoding::BASE32_NOPAD

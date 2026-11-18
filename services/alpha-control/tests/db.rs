@@ -615,7 +615,7 @@ async fn claim_ticket(api: &Api, org: &str) -> String {
             Method::POST,
             &format!("/v1/orgs/{org}/tickets"),
             OPERATOR,
-            json!({ "kind": "claim" }),
+            Value::Null,
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
@@ -638,7 +638,7 @@ async fn only_the_owners_verified_sign_in_binds_a_session_to_a_claim_ticket() {
                 Method::POST,
                 &format!("/v1/orgs/{org}/tickets"),
                 bearer,
-                json!({ "kind": "claim" }),
+                Value::Null,
             )
             .await;
         assert_eq!(status, StatusCode::FORBIDDEN);

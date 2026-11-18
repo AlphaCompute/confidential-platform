@@ -15,7 +15,6 @@ create table tickets (
   kind           text not null check (kind in ('approve', 'claim')),
   org_id         uuid not null references organizations(id),
   compose_hash   bytea references revisions(compose_hash),
-  principal_id   uuid,
   session_sha256 bytea check (length(session_sha256) = 32),
   state          text not null default 'open' check (state in ('open', 'done', 'declined')),
   expires_at     timestamptz not null,
