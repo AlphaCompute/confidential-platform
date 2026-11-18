@@ -65,11 +65,13 @@ function askName(raw) {
   const label = el("label", "", "The App's public name or a link to it");
   label.append(input);
   form.append(label, el("button", "", "Verify"));
+  input.addEventListener("input", () => input.setCustomValidity(""));
   form.addEventListener("submit", (event) => {
     event.preventDefault();
     const name = asciiName(input.value);
-    if (NAME.test(name)) location.search = new URLSearchParams({ name });
-    else form.parentElement.replaceChildren(...askName(input.value.trim()));
+    if (NAME.test(name)) return (location.search = new URLSearchParams({ name }));
+    input.setCustomValidity("Enter an https link or the App's public name.");
+    input.reportValidity();
   });
   return raw ? [el("p", "notes", `${raw} is not an https link to a public name.`), form] : [form];
 }
