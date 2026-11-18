@@ -16,6 +16,7 @@
 mod apps;
 mod orgs;
 mod revisions;
+mod tickets;
 
 use std::sync::Arc;
 
@@ -41,6 +42,16 @@ pub struct AppState {
     pub operator_token_sha256: [u8; 32],
     pub platform_document_url: String,
     pub release_keys: alpha_client::platform::ReleaseKeys,
+    /// Where the signer page lives, for example `https://sign.alphacompute.cc`.
+    pub signer_url: String,
+    pub oidc: Oidc,
+}
+
+/// The identity provider's public client that the signer page signs owners in with.
+pub struct Oidc {
+    pub issuer: String,
+    pub token_endpoint: String,
+    pub client_id: String,
 }
 
 /// The closed set of error codes; no message carries a token.
@@ -58,6 +69,14 @@ pub enum Error {
     Conflict(&'static str),
     #[error("{0}")]
     Unavailable(String),
+    #[error("no such ticket")]
+    TicketNotFound,
+    #[error("the ticket has expired")]
+    TicketExpired,
+    #[error("the ticket is closed")]
+    TicketClosed,
+    #[error("the sign-in is not the Organization's owner")]
+    SessionRefused,
     #[error("{0}")]
     Internal(String),
 }
@@ -75,6 +94,10 @@ impl Error {
             Error::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             Error::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
             Error::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+            Error::TicketNotFound => (StatusCode::NOT_FOUND, "ticket_not_found"),
+            Error::TicketExpired => (StatusCode::GONE, "ticket_expired"),
+            Error::TicketClosed => (StatusCode::CONFLICT, "ticket_closed"),
+            Error::SessionRefused => (StatusCode::FORBIDDEN, "session_refused"),
             Error::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         }
     }
@@ -249,6 +272,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/orgs", post(orgs::create))
         .route("/v1/orgs/{org}/disable", post(orgs::disable))
         .route("/v1/orgs/{org}/keys/{id}", delete(orgs::revoke_key))
+        .route("/v1/orgs/{org}/tickets", post(tickets::claim))
         .route("/v1/apps/{slug}", put(apps::put))
         .route(
             "/v1/apps/{slug}/revisions",
@@ -256,6 +280,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(revisions::create).layer(DefaultBodyLimit::max(2 << 20)),
         )
         .route("/v1/apps/{slug}/revisions/{hash}", get(revisions::get))
+        .route("/v1/tickets/{ticket}", get(tickets::read))
+        .route("/v1/tickets/by-code/{code}", get(tickets::by_code))
+        .route("/v1/tickets/{ticket}/session", post(tickets::session))
+        .route("/v1/tickets/{ticket}/decline", post(tickets::decline))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .merge(probe_routes())
         .with_state(state)

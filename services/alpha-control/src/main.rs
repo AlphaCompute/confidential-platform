@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alpha_client::acme::{self, ACME_TLS_ALPN, Edge, Route};
-use alpha_control::{AppState, Error, migrate, probes, router};
+use alpha_control::{AppState, Error, Oidc, migrate, probes, router};
 use rustls::ServerConfig;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -80,6 +80,12 @@ async fn run() -> Result<(), Error> {
     let operator_token_sha256 = *hex_env("ALPHACOMPUTE_OPERATOR_TOKEN_SHA256")?;
     let public_name = env("ALPHACOMPUTE_PUBLIC_NAME")?;
     let platform_document_url = env("ALPHACOMPUTE_PLATFORM_DOCUMENT_URL")?;
+    let signer_url = env("ALPHACOMPUTE_SIGNER_URL")?;
+    let oidc = Oidc {
+        issuer: env("ALPHACOMPUTE_OIDC_ISSUER")?,
+        token_endpoint: env("ALPHACOMPUTE_OIDC_TOKEN_ENDPOINT")?,
+        client_id: env("ALPHACOMPUTE_OIDC_CLIENT_ID")?,
+    };
     let release_keys = alpha_client::platform::release_keys()
         .map_err(|e| Error::internal(format!("release keys: {e}")))?;
     // The certificate and ACME account keys derive from it, so a restart finds its certificate
@@ -95,6 +101,8 @@ async fn run() -> Result<(), Error> {
         operator_token_sha256,
         platform_document_url,
         release_keys,
+        signer_url,
+        oidc,
     });
 
     let bind = |port: u16| async move {

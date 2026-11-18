@@ -2,10 +2,11 @@
 
 use std::sync::{Arc, Mutex};
 
-use alpha_control::{AppState, router};
+use alpha_control::{AppState, Oidc, router};
 use alpha_core::{InitData, InitDataError, KataPolicy};
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
+use data_encoding::BASE64URL_NOPAD;
 use ed25519_dalek::SigningKey;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -70,8 +71,17 @@ fn platform_document(release: &SigningKey, version: u64) -> Value {
     serde_json::to_value(alpha_client::platform::sign(document, release).unwrap()).unwrap()
 }
 
-/// The router, its database, and the platform document its URL serves.
-struct Api(axum::Router, PgPool, Arc<Mutex<Value>>, SigningKey);
+const ISSUER: &str = "https://login.example";
+
+/// The router, its database, the platform document its URL serves, and the claims of the ID
+/// token the fake token endpoint answers.
+struct Api(
+    axum::Router,
+    PgPool,
+    Arc<Mutex<Value>>,
+    SigningKey,
+    Arc<Mutex<Value>>,
+);
 
 impl Api {
     async fn new() -> Option<Self> {
@@ -80,19 +90,53 @@ impl Api {
         let served = Arc::new(Mutex::new(platform_document(&release, 2)));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/platform.json", listener.local_addr().unwrap());
+        let base = format!("http://{}", listener.local_addr().unwrap());
         let document = served.clone();
-        let host = axum::Router::new().route(
-            "/platform.json",
-            axum::routing::get(move || async move { axum::Json(document.lock().unwrap().clone()) }),
-        );
+        let claims = Arc::new(Mutex::new(json!({})));
+        let id_claims = claims.clone();
+        // A public client: the code is redeemed with its PKCE verifier and no secret.
+        let token = move |form: String| async move {
+            let expected = [
+                "grant_type=authorization_code",
+                "code=good",
+                "client_id=signer",
+                "code_verifier=verifier",
+                "redirect_uri=https%3A%2F%2Fsign.example%2Fclaim",
+            ];
+            if !expected
+                .iter()
+                .all(|pair| form.split('&').any(|p| p == *pair))
+            {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            let payload = id_claims.lock().unwrap().to_string();
+            let id_token = format!("e30.{}.sig", BASE64URL_NOPAD.encode(payload.as_bytes()));
+            Ok(axum::Json(
+                json!({ "id_token": id_token, "token_type": "Bearer" }),
+            ))
+        };
+        let host = axum::Router::new()
+            .route(
+                "/platform.json",
+                axum::routing::get(
+                    move || async move { axum::Json(document.lock().unwrap().clone()) },
+                ),
+            )
+            .route("/token", axum::routing::post(token));
         tokio::spawn(async move { axum::serve(listener, host).await });
         let state = Arc::new(AppState {
             pool: pool.clone(),
             operator_token_sha256: Sha256::digest(OPERATOR).into(),
             platform_document_url: url,
             release_keys: release.verifying_key().into(),
+            signer_url: "https://sign.example".into(),
+            oidc: Oidc {
+                issuer: ISSUER.into(),
+                token_endpoint: format!("{base}/token"),
+                client_id: "signer".into(),
+            },
         });
-        Some(Api(router(state), pool, served, release))
+        Some(Api(router(state), pool, served, release, claims))
     }
 
     async fn call(
@@ -460,4 +504,228 @@ async fn a_create_waits_for_an_open_create_with_the_same_links_in_any_order() {
     assert!(queued && !waiting.is_finished());
     open.commit().await.unwrap();
     assert_eq!(waiting.await.unwrap(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn an_approve_ticket_reads_as_the_signer_page_expects_and_closes_once() {
+    let Some(api) = Api::new().await else { return };
+    let (org, a) = api.org(&["apps:write"]).await;
+    api.call(Method::PUT, "/v1/apps/board", &a, Value::Null)
+        .await;
+    let catalog: Value = serde_json::from_str(CATALOG).unwrap();
+    let (status, created) = api
+        .call(
+            Method::POST,
+            "/v1/apps/board/revisions",
+            &a,
+            json!({ "catalog": catalog }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let ticket = created["ticket"].as_str().unwrap();
+    assert_eq!(ticket.len(), 43);
+    assert_eq!(
+        created["approval_url"],
+        format!("https://sign.example/approve#{ticket}")
+    );
+    let code = created["code"].as_str().unwrap();
+    assert!(
+        code.len() == 8
+            && code
+                .bytes()
+                .all(|b| b"0123456789ABCDEFGHJKMNPQRSTVWXYZ".contains(&b)),
+        "{code}"
+    );
+    let (status, found) = api
+        .call(
+            Method::GET,
+            &format!("/v1/tickets/by-code/{code}"),
+            "",
+            Value::Null,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(found, json!({ "kind": "approve", "ticket": ticket }));
+
+    let (status, read) = api
+        .call(
+            Method::GET,
+            &format!("/v1/tickets/{ticket}"),
+            "",
+            Value::Null,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    for key in ["expires_at", "server_time"] {
+        assert!(read[key].as_str().unwrap().ends_with('Z'), "{read}");
+    }
+    let app_id = read["app_id"].clone();
+    let mut fixed = read.clone();
+    for key in ["expires_at", "server_time", "app_id"] {
+        fixed.as_object_mut().unwrap().remove(key);
+    }
+    assert_eq!(
+        fixed,
+        json!({
+            "kind": "approve", "state": "open", "org_id": org, "org_name": "Acme",
+            "credentials": [], "slug": "board", "compose_hash": created["compose_hash"],
+            "title": catalog["entry"]["title"],
+            "catalog_template_sha256": catalog["entry"]["template_sha256"],
+            "secrets": [], "predecessor": null,
+        })
+    );
+    assert!(app_id.is_string());
+
+    let decline = format!("/v1/tickets/{ticket}/decline");
+    let (status, _) = api.call(Method::POST, &decline, "", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, closed) = api.call(Method::POST, &decline, "", Value::Null).await;
+    assert_eq!(
+        (status, &closed["error"]["code"]),
+        (StatusCode::CONFLICT, &json!("ticket_closed"))
+    );
+    let (_, read) = api
+        .call(
+            Method::GET,
+            &format!("/v1/tickets/{ticket}"),
+            "",
+            Value::Null,
+        )
+        .await;
+    assert_eq!(read["state"], "declined");
+    let (status, missing) = api
+        .call(Method::GET, "/v1/tickets/unknown", "", Value::Null)
+        .await;
+    assert_eq!(
+        (status, &missing["error"]["code"]),
+        (StatusCode::NOT_FOUND, &json!("ticket_not_found"))
+    );
+}
+
+fn with(claims: &Value, key: &str, value: Value) -> Value {
+    let mut claims = claims.clone();
+    claims[key] = value;
+    claims
+}
+
+/// Opens a claim ticket of `org` as the operator and answers it.
+async fn claim_ticket(api: &Api, org: &str) -> String {
+    let (status, created) = api
+        .call(
+            Method::POST,
+            &format!("/v1/orgs/{org}/tickets"),
+            OPERATOR,
+            json!({ "kind": "claim" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let ticket = created["ticket"].as_str().unwrap().to_owned();
+    assert_eq!(
+        created["url"],
+        format!("https://sign.example/claim#{ticket}")
+    );
+    ticket
+}
+
+#[tokio::test]
+async fn only_the_owners_verified_sign_in_binds_a_session_to_a_claim_ticket() {
+    let Some(api) = Api::new().await else { return };
+    let (org, deploy) = api.org(&["apps:write"]).await;
+    let (_, other_admin) = api.org(&["org:admin"]).await;
+    for bearer in [deploy.as_str(), other_admin.as_str()] {
+        let (status, _) = api
+            .call(
+                Method::POST,
+                &format!("/v1/orgs/{org}/tickets"),
+                bearer,
+                json!({ "kind": "claim" }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    let ticket = claim_ticket(&api, &org).await;
+    let (_, read) = api
+        .call(
+            Method::GET,
+            &format!("/v1/tickets/{ticket}"),
+            "",
+            Value::Null,
+        )
+        .await;
+    assert_eq!(
+        (&read["kind"], &read["rooted"], &read["owner_email"]),
+        (&json!("claim"), &json!(false), &json!("owner@acme.test"))
+    );
+    assert!(read.get("principal_id").is_none(), "{read}");
+
+    let path = format!("/v1/tickets/{ticket}/session");
+    let request = |code: &str| json!({ "code": code, "code_verifier": "verifier", "redirect_uri": "https://sign.example/claim" });
+    let exp = 4_000_000_000u64;
+    let owner = json!({
+        "iss": ISSUER, "aud": "signer", "exp": exp, "sub": "owner",
+        "email": "Owner@acme.test", "email_verified": true,
+    });
+    let refused = [
+        ("bad", owner.clone()),
+        ("good", with(&owner, "email_verified", json!(false))),
+        ("good", with(&owner, "aud", json!("other"))),
+        ("good", with(&owner, "iss", json!("https://other.example"))),
+        ("good", with(&owner, "exp", json!(1))),
+        ("good", with(&owner, "email", json!("someone@acme.test"))),
+    ];
+    for (code, claims) in refused {
+        *api.4.lock().unwrap() = claims.clone();
+        let (status, reply) = api.call(Method::POST, &path, "", request(code)).await;
+        assert_eq!(
+            (status, &reply["error"]["code"]),
+            (StatusCode::FORBIDDEN, &json!("session_refused")),
+            "{code} {claims}"
+        );
+    }
+
+    *api.4.lock().unwrap() = owner.clone();
+    let (status, bound) = api.call(Method::POST, &path, "", request("good")).await;
+    assert_eq!(status, StatusCode::OK, "{bound}");
+    let session = bound["session"].as_str().unwrap();
+    assert_eq!(
+        BASE64URL_NOPAD.decode(session.as_bytes()).unwrap().len(),
+        32
+    );
+    let stored: Vec<u8> =
+        sqlx::query_scalar("select session_sha256 from tickets where ticket = $1")
+            .bind(&ticket)
+            .fetch_one(&api.1)
+            .await
+            .unwrap();
+    assert_eq!(stored, Sha256::digest(session.as_bytes()).as_slice());
+
+    // The owner is now that principal: the same address from another account is refused.
+    *api.4.lock().unwrap() = with(&owner, "sub", json!("someone-else"));
+    let (status, _) = api.call(Method::POST, &path, "", request("good")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    *api.4.lock().unwrap() = owner;
+    let (status, again) = api.call(Method::POST, &path, "", request("good")).await;
+    assert_eq!(
+        (status, &again["principal_id"]),
+        (StatusCode::OK, &bound["principal_id"])
+    );
+
+    sqlx::query("update tickets set expires_at = now() - interval '1 second'")
+        .execute(&api.1)
+        .await
+        .unwrap();
+    let (_, read) = api
+        .call(
+            Method::GET,
+            &format!("/v1/tickets/{ticket}"),
+            "",
+            Value::Null,
+        )
+        .await;
+    assert_eq!(read["state"], "expired");
+    let (status, expired) = api.call(Method::POST, &path, "", request("good")).await;
+    assert_eq!(
+        (status, &expired["error"]["code"]),
+        (StatusCode::GONE, &json!("ticket_expired"))
+    );
 }
