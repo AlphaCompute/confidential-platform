@@ -1,6 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
-use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 
 use alpha_control::{AppState, router};
@@ -92,7 +91,6 @@ impl Api {
             operator_token_sha256: Sha256::digest(OPERATOR).into(),
             platform_document_url: url,
             release_keys: release.verifying_key().into(),
-            platform_version: AtomicU64::new(0),
         });
         Some(Api(router(state), pool, served, release))
     }
@@ -400,6 +398,16 @@ async fn a_catalog_revision_is_rendered_for_its_app_and_stored_once() {
         refused.to_string().contains("signature_invalid"),
         "{refused}"
     );
+
+    // The same init-data stored with another pod is another entry, not a replay.
+    sqlx::query("update revisions set pod = 'other'")
+        .execute(&api.1)
+        .await
+        .unwrap();
+    let (status, _) = api
+        .call(Method::POST, "/v1/apps/board/revisions", &a, body.clone())
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
 
     *api.2.lock().unwrap() = platform_document(&api.3, 1);
     let (status, _) = api

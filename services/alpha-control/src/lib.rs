@@ -18,7 +18,6 @@ mod orgs;
 mod revisions;
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, FromRequestParts, State};
@@ -42,8 +41,6 @@ pub struct AppState {
     pub operator_token_sha256: [u8; 32],
     pub platform_document_url: String,
     pub release_keys: alpha_client::platform::ReleaseKeys,
-    /// The highest platform document version accepted, so a served older document is refused.
-    pub platform_version: AtomicU64,
 }
 
 /// The closed set of error codes; no message carries a token.

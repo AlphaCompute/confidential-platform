@@ -8,6 +8,13 @@ alter table api_keys
   add column label      text,
   add column revoked_at timestamptz;
 
+-- The highest platform document version accepted, so neither a restart nor another replica takes
+-- an older one again.
+create table platform_version (
+  one     int primary key check (one = 1),
+  version bigint not null
+);
+
 create table revisions (
   compose_hash bytea primary key check (length(compose_hash) = 32),
   app_id       uuid not null references apps(id),

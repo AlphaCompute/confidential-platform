@@ -4,7 +4,6 @@
 //! repeats its own checks.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 
 use alpha_core::catalog::{self, CatalogFile};
@@ -25,10 +24,10 @@ pub struct NewRevision {
     pub catalog: CatalogFile,
 }
 
-/// The catalog key, the agent policy and the KMS CA of the current platform document. Each call
+/// The version, catalog key, agent policy and KMS CA of the current platform document. Each call
 /// fetches it, and a version below one already accepted is refused, so a stale copy cannot bring
 /// back a rotated key.
-async fn platform(state: &AppState) -> Result<(CatalogKey, KataPolicy, String), Error> {
+async fn platform(state: &AppState) -> Result<(i64, CatalogKey, KataPolicy, String), Error> {
     let unavailable =
         |e: alpha_client::Error| Error::Unavailable(format!("platform document: {e}"));
     let signed = alpha_client::platform::fetch_signed(&state.platform_document_url)
@@ -36,21 +35,31 @@ async fn platform(state: &AppState) -> Result<(CatalogKey, KataPolicy, String), 
         .map_err(unavailable)?;
     let document = alpha_client::platform::verify(&signed, &state.release_keys, SystemTime::now())
         .map_err(unavailable)?;
-    let accepted = state
-        .platform_version
-        .fetch_max(document.version, Ordering::Relaxed);
-    if document.version < accepted {
-        return Err(Error::Unavailable(format!(
-            "platform document version {} is below the accepted {accepted}",
-            document.version
-        )));
+    let version = i64::try_from(document.version)
+        .map_err(|_| Error::Unavailable("platform document version overflows".into()))?;
+    let accepted: i64 = sqlx::query_scalar(
+        "insert into platform_version (one, version) values (1, $1) on conflict (one) \
+         do update set version = greatest(platform_version.version, excluded.version) \
+         returning version",
+    )
+    .bind(version)
+    .fetch_one(&state.pool)
+    .await?;
+    if version < accepted {
+        return Err(stale(version, accepted));
     }
     match (document.catalog_key, document.kata_policy) {
-        (Some(key), Some(policy)) => Ok((key, policy, document.kms_ca_pem)),
+        (Some(key), Some(policy)) => Ok((version, key, policy, document.kms_ca_pem)),
         _ => Err(Error::Unavailable(
             "the platform document names no catalog_key or kata_policy".into(),
         )),
     }
+}
+
+fn stale(version: i64, accepted: i64) -> Error {
+    Error::Unavailable(format!(
+        "platform document version {version} is below the accepted {accepted}"
+    ))
 }
 
 pub async fn create(
@@ -67,7 +76,7 @@ pub async fn create(
         .fetch_optional(&state.pool)
         .await?
         .ok_or(Error::NotFound)?;
-    let (catalog_key, kata_policy, kms_ca_pem) = platform(&state).await?;
+    let (version, catalog_key, kata_policy, kms_ca_pem) = platform(&state).await?;
     let rendered = catalog::render(&new.catalog, &catalog_key, app_id.into(), &slug)
         .map_err(|e| Error::Malformed(format!("catalog {}: {e}", e.code())))?;
     InitData::parse(rendered.init_data.clone())
@@ -79,6 +88,15 @@ pub async fn create(
         json!({ "catalog_id": entry.catalog_id, "version": entry.version, "title": entry.title });
     let shape = json!(entry.resources);
     let mut tx = state.pool.begin().await?;
+    // Held until commit, so a newer document accepted meanwhile cannot leave this Revision checked
+    // under the key it replaced.
+    let accepted: i64 =
+        sqlx::query_scalar("select version from platform_version where one = 1 for share")
+            .fetch_one(&mut *tx)
+            .await?;
+    if version < accepted {
+        return Err(stale(version, accepted));
+    }
     let inserted = sqlx::query(
         "insert into revisions (compose_hash, app_id, init_data, pod, shape, catalog) \
          values ($1, $2, $3, $4, $5, $6) on conflict (compose_hash) do nothing",
@@ -92,6 +110,22 @@ pub async fn create(
     .execute(&mut *tx)
     .await?;
     let status = if inserted.rows_affected() == 0 {
+        // The digest covers the init-data only; another entry with the same template but another
+        // pod or shape is not this Revision.
+        let same: bool = sqlx::query_scalar(
+            "select pod = $2 and shape = $3 and catalog = $4 from revisions where compose_hash = $1",
+        )
+        .bind(rendered.revision.as_bytes().as_slice())
+        .bind(&rendered.pod)
+        .bind(&shape)
+        .bind(&catalog)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !same {
+            return Err(Error::Conflict(
+                "the Revision is stored from another catalog entry",
+            ));
+        }
         StatusCode::OK
     } else {
         audit(

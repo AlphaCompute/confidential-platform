@@ -114,6 +114,14 @@ pub async fn create(
     }
 
     let mut tx = state.pool.begin().await?;
+    // A retry that arrives while the first create still runs waits for it, then finds it.
+    if let Some(first) = new.links.first() {
+        sqlx::query("select pg_advisory_xact_lock(hashtext($1), hashtext($2))")
+            .bind(&first.issuer)
+            .bind(&first.external_id)
+            .execute(&mut *tx)
+            .await?;
+    }
     let (status, action, org_id) = match retried(&mut tx, &caller, &new).await? {
         Some(org_id) => (StatusCode::OK, "org.retry", org_id),
         None => (
@@ -178,7 +186,8 @@ async fn retried(
         "select o.id from org_links l join organizations o on o.id = l.org_id \
          where l.issuer = $1 and l.external_id = $2 and o.name = $3 and o.owner_email = $4 \
            and o.created_by = $5 and o.disabled_at is null \
-           and o.created_at > now() - interval '1 hour'",
+           and o.created_at > now() - interval '1 hour' \
+         for update of o",
     )
     .bind(&first.issuer)
     .bind(&first.external_id)

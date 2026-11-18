@@ -23,7 +23,7 @@ Errors are `{"error": {"code", "message", "request_id"}}`. The codes are `unauth
 | `ALPHACOMPUTE_DATABASE_URL` | Postgres, database `alpha_control` |
 | `ALPHACOMPUTE_OPERATOR_TOKEN_SHA256` | 64 hex digits: the SHA-256 of the operator's bearer |
 | `ALPHACOMPUTE_PUBLIC_NAME` | the API's DNS name, for example `api.alphacompute.cc` |
-| `ALPHACOMPUTE_PLATFORM_DOCUMENT_URL` | the release-signed platform document. Each Revision request fetches it. A version below one already accepted, or a failed fetch, is `503`. Build with feature `dev` to verify it under the dev release keys |
+| `ALPHACOMPUTE_PLATFORM_DOCUMENT_URL` | the release-signed platform document. `POST /v1/apps/{slug}/revisions` fetches it on each call; a version below the highest one accepted (kept in the database), or a failed fetch, is `503`. Build with feature `dev` to verify it under the dev release keys |
 | `ALPHACOMPUTE_ACME_KEY` | 64 hex digits; the ACME account key and the certificate key derive from it |
 
 `alpha-control migrate` applies `migrations/` and returns. Otherwise the API listens on `:8443` (TLS 1.3, `http/1.1`) and gets a Let's Encrypt certificate for the public name through TLS-ALPN-01 on the same port, behind the SNI passthrough Gateway. `/healthz` and `/ready` also listen on plain `:8080` for the kubelet, because the API port has no certificate until the first order completes. SIGTERM drains open connections for at most ten seconds. Run one replica: the ACME challenge lives in the process.

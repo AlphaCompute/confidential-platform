@@ -5,7 +5,6 @@
 
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use alpha_client::acme::{self, ACME_TLS_ALPN, Edge, Route};
@@ -96,7 +95,6 @@ async fn run() -> Result<(), Error> {
         operator_token_sha256,
         platform_document_url,
         release_keys,
-        platform_version: AtomicU64::new(0),
     });
 
     let bind = |port: u16| async move {
