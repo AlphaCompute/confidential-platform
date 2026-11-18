@@ -244,10 +244,8 @@ async fn a_retried_create_returns_the_same_organization_and_replaces_the_lost_de
     let (status, retry) = api
         .call(Method::POST, "/v1/orgs", OPERATOR, create.clone())
         .await;
-    assert_eq!(
-        (status, &retry["org_id"]),
-        (StatusCode::OK, &first["org_id"])
-    );
+    let org_id = |reply: &Value| reply["org_id"].as_str().unwrap().parse::<Uuid>().unwrap();
+    assert_eq!((status, org_id(&retry)), (StatusCode::OK, org_id(&first)));
     let lost = first["deploy_key"]["token"].as_str().unwrap();
     let kept = retry["deploy_key"]["token"].as_str().unwrap();
     for (token, expected) in [(lost, StatusCode::UNAUTHORIZED), (kept, StatusCode::OK)] {
