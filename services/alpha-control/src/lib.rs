@@ -16,6 +16,7 @@
 mod apps;
 mod orgs;
 mod revisions;
+mod tickets;
 
 use std::sync::Arc;
 
@@ -41,6 +42,42 @@ pub struct AppState {
     pub operator_token_sha256: [u8; 32],
     pub platform_document_url: String,
     pub release_keys: alpha_client::platform::ReleaseKeys,
+    /// Where the signer page lives, for example `https://sign.alphacompute.cc`.
+    pub signer_url: String,
+    pub oidc: Oidc,
+    pub code_lookups: Limiter,
+}
+
+/// ponytail: one count per process, so it bounds the code lookups of the single replica; with
+/// more replicas the count moves to Postgres or the edge.
+#[derive(Default)]
+pub struct Limiter(parking_lot::Mutex<Option<(std::time::Instant, u32)>>);
+
+/// A code has 40 bits, so a guess finds an open ticket only after billions of tries at this rate.
+const CODE_LOOKUPS_PER_SECOND: u32 = 20;
+
+impl Limiter {
+    fn allow(&self) -> bool {
+        let mut window = self.0.lock();
+        let now = std::time::Instant::now();
+        match &mut *window {
+            Some((start, count)) if now.duration_since(*start).as_secs() == 0 => {
+                *count = count.saturating_add(1);
+                *count <= CODE_LOOKUPS_PER_SECOND
+            }
+            _ => {
+                *window = Some((now, 1));
+                true
+            }
+        }
+    }
+}
+
+/// The identity provider's public client that the signer page signs owners in with.
+pub struct Oidc {
+    pub issuer: String,
+    pub token_endpoint: String,
+    pub client_id: String,
 }
 
 /// The closed set of error codes; no message carries a token.
@@ -58,6 +95,16 @@ pub enum Error {
     Conflict(&'static str),
     #[error("{0}")]
     Unavailable(String),
+    #[error("no such ticket")]
+    TicketNotFound,
+    #[error("the ticket has expired")]
+    TicketExpired,
+    #[error("the ticket is closed")]
+    TicketClosed,
+    #[error("the sign-in is not the Organization's owner")]
+    SessionRefused,
+    #[error("too many requests; retry in a second")]
+    RateLimited,
     #[error("{0}")]
     Internal(String),
 }
@@ -75,6 +122,11 @@ impl Error {
             Error::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             Error::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
             Error::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+            Error::TicketNotFound => (StatusCode::NOT_FOUND, "ticket_not_found"),
+            Error::TicketExpired => (StatusCode::GONE, "ticket_expired"),
+            Error::TicketClosed => (StatusCode::CONFLICT, "ticket_closed"),
+            Error::SessionRefused => (StatusCode::FORBIDDEN, "session_refused"),
+            Error::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
             Error::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         }
     }
@@ -109,16 +161,32 @@ impl IntoResponse for Error {
         };
         let body =
             json!({ "error": { "code": code, "message": message, "request_id": request_id } });
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        if matches!(self, Error::RateLimited) {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+        }
+        response
     }
 }
 
 pub const SCOPES: [&str; 5] = ["apps:read", "apps:write", "deploy", "org:admin", "onboard"];
 
+fn fill(bytes: &mut [u8]) -> Result<(), Error> {
+    getrandom::fill(bytes).map_err(|e| Error::internal(format!("rng: {e}")))
+}
+
+fn random<const N: usize>() -> Result<[u8; N], Error> {
+    let mut bytes = [0u8; N];
+    fill(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// A new operational API key `alpha_<base32>` and the SHA-256 its row keeps.
 pub fn mint_token() -> Result<(String, [u8; 32]), Error> {
     let mut secret = Zeroizing::new([0u8; 32]);
-    getrandom::fill(secret.as_mut_slice()).map_err(|e| Error::internal(format!("rng: {e}")))?;
+    fill(secret.as_mut_slice())?;
     let token = format!(
         "alpha_{}",
         data_encoding::BASE32_NOPAD
@@ -249,6 +317,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/orgs", post(orgs::create))
         .route("/v1/orgs/{org}/disable", post(orgs::disable))
         .route("/v1/orgs/{org}/keys/{id}", delete(orgs::revoke_key))
+        .route("/v1/orgs/{org}/tickets", post(tickets::claim))
         .route("/v1/apps/{slug}", put(apps::put))
         .route(
             "/v1/apps/{slug}/revisions",
@@ -256,6 +325,10 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(revisions::create).layer(DefaultBodyLimit::max(2 << 20)),
         )
         .route("/v1/apps/{slug}/revisions/{hash}", get(revisions::get))
+        .route("/v1/tickets/{ticket}", get(tickets::read))
+        .route("/v1/tickets/by-code/{code}", get(tickets::by_code))
+        .route("/v1/tickets/{ticket}/session", post(tickets::session))
+        .route("/v1/tickets/{ticket}/decline", post(tickets::decline))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .merge(probe_routes())
         .with_state(state)

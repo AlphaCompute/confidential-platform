@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::{AppState, Caller, Error, audit};
+use crate::{AppState, Caller, Error, audit, tickets};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -97,8 +97,10 @@ pub async fn create(
         .map_err(|e| Error::Malformed(format!("init-data: {e}")))?;
 
     let entry = &new.catalog.entry;
-    let catalog =
-        json!({ "catalog_id": entry.catalog_id, "version": entry.version, "title": entry.title });
+    let catalog = json!({
+        "catalog_id": entry.catalog_id, "version": entry.version, "title": entry.title,
+        "template_sha256": entry.template_sha256,
+    });
     let shape = json!(entry.resources);
     let mut tx = state.pool.begin().await?;
     // Held until commit, so a newer document accepted meanwhile cannot leave this Revision checked
@@ -152,8 +154,33 @@ pub async fn create(
         .await?;
         StatusCode::CREATED
     };
+    let (ticket, code) = tickets::open(
+        &mut tx,
+        "approve",
+        org_id,
+        Some(&rendered.revision),
+        "30 minutes",
+    )
+    .await?;
+    let object = rendered.revision.to_string();
+    audit(
+        &mut tx,
+        &caller,
+        org_id,
+        "ticket.approve",
+        &object,
+        json!({}),
+    )
+    .await?;
     tx.commit().await?;
-    Ok((status, Json(json!({ "compose_hash": rendered.revision }))))
+    let approval_url = format!("{}/approve#{ticket}", state.signer_url);
+    Ok((
+        status,
+        Json(json!({
+            "compose_hash": rendered.revision, "ticket": ticket, "code": code,
+            "approval_url": approval_url,
+        })),
+    ))
 }
 
 pub async fn get(
