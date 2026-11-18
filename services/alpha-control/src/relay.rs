@@ -182,7 +182,11 @@ async fn kms(
     path: &str,
     body: &Value,
 ) -> Result<Value, Error> {
-    let unavailable = |e: alpha_client::Error| Error::Unavailable(format!("kms: {e}"));
+    // The error text names the endpoint, so the caller gets a fixed message and the log the kind.
+    let unavailable = |e: alpha_client::Error| {
+        alpha_client::warn!("kms_unavailable", error = e.kind());
+        Error::Unavailable("the KMS is unavailable".into())
+    };
     let ca = alpha_client::tls::cert_from_pem(&document.kms_ca_pem).map_err(unavailable)?;
     let pin = Pin::CaAndRevisions(ca, kms_revisions(document));
     let client = Client::new(state.kms_endpoints.clone(), pin).map_err(unavailable)?;
