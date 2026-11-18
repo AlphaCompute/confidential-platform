@@ -277,8 +277,7 @@ async fn redeem(state: &AppState, request: &SessionRequest) -> Result<Claims, Er
 }
 
 /// `POST /v1/tickets/{ticket}/session`: binds the owner's sign-in to an unrooted Organization's
-/// `claim` ticket. The secret it answers is the only proof the root relay accepts that the owner
-/// stands behind the passkey, and a later sign-in replaces it.
+/// `claim` ticket. A later sign-in replaces its session.
 pub async fn session(
     State(state): State<Arc<AppState>>,
     Path(ticket): Path<String>,
