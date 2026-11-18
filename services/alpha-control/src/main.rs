@@ -39,13 +39,21 @@ fn env(name: &str) -> Result<String, Error> {
 }
 
 /// The token endpoint is trusted because TLS authenticates it, and links to the signer page must
-/// be absolute.
+/// be absolute. Neither carries a query or a fragment; the signer URL is a base that ticket paths
+/// follow.
 fn https_env(name: &str) -> Result<String, Error> {
     let value = env(name)?;
     match reqwest::Url::parse(&value) {
-        Ok(url) if url.scheme() == "https" && url.host_str().is_some() => Ok(value),
+        Ok(url)
+            if url.scheme() == "https"
+                && url.host_str().is_some()
+                && url.query().is_none()
+                && url.fragment().is_none() =>
+        {
+            Ok(value.trim_end_matches('/').to_owned())
+        }
         _ => Err(Error::internal(format!(
-            "{name} must be an https URL with a host"
+            "{name} must be an https URL with a host and no query or fragment"
         ))),
     }
 }

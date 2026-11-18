@@ -548,7 +548,8 @@ async fn an_approve_ticket_reads_as_the_signer_page_expects_and_closes_once() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(found, json!({ "kind": "approve", "ticket": ticket }));
     let mut limited = None;
-    for _ in 0..25 {
+    // Enough lookups that, even split across two one-second windows, one window exceeds 20.
+    for _ in 0..60 {
         let (status, _) = api
             .call(Method::GET, "/v1/tickets/by-code/00000000", "", Value::Null)
             .await;
