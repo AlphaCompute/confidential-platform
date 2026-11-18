@@ -16,7 +16,7 @@ use axum::http::{HeaderMap, StatusCode};
 use data_encoding::BASE64URL_NOPAD;
 use reqwest::Method;
 use serde::Deserialize;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
@@ -424,10 +424,7 @@ impl Relay<'_> {
         let expected = Expected {
             route: route.into(),
             request_sha256: receipt::request_sha256(request).map_err(|_| Error::UpstreamInvalid)?,
-            response: match expected {
-                Value::Object(expected) => expected,
-                _ => Map::new(),
-            },
+            response: expected.as_object().cloned().unwrap_or_default(),
         };
         let receipt = serde_json::to_vec(receipt).map_err(|_| Error::UpstreamInvalid)?;
         receipt::verify(
