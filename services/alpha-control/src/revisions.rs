@@ -28,8 +28,11 @@ pub struct NewRevision {
 /// fetches it, and a version below one already accepted is refused, so a stale copy cannot bring
 /// back a rotated key.
 async fn platform(state: &AppState) -> Result<(i64, CatalogKey, KataPolicy, String), Error> {
-    let unavailable =
-        |e: alpha_client::Error| Error::Unavailable(format!("platform document: {e}"));
+    // The URL may carry a read credential, so neither the caller nor the log sees the error text.
+    let unavailable = |e: alpha_client::Error| {
+        alpha_client::warn!("platform_document_unavailable", error = e.kind());
+        Error::Unavailable("the platform document is unavailable".into())
+    };
     let signed = alpha_client::platform::fetch_signed(&state.platform_document_url)
         .await
         .map_err(unavailable)?;
@@ -37,14 +40,24 @@ async fn platform(state: &AppState) -> Result<(i64, CatalogKey, KataPolicy, Stri
         .map_err(unavailable)?;
     let version = i64::try_from(document.version)
         .map_err(|_| Error::Unavailable("platform document version overflows".into()))?;
-    let accepted: i64 = sqlx::query_scalar(
-        "insert into platform_version (one, version) values (1, $1) on conflict (one) \
-         do update set version = greatest(platform_version.version, excluded.version) \
-         returning version",
-    )
-    .bind(version)
-    .fetch_one(&state.pool)
-    .await?;
+    // Read first, so a create under the current version takes no row lock.
+    let stored: Option<i64> =
+        sqlx::query_scalar("select version from platform_version where one = 1")
+            .fetch_optional(&state.pool)
+            .await?;
+    let accepted = match stored {
+        Some(stored) if stored >= version => stored,
+        _ => {
+            sqlx::query_scalar(
+                "insert into platform_version (one, version) values (1, $1) on conflict (one) \
+                 do update set version = greatest(platform_version.version, excluded.version) \
+                 returning version",
+            )
+            .bind(version)
+            .fetch_one(&state.pool)
+            .await?
+        }
+    };
     if version < accepted {
         return Err(stale(version, accepted));
     }
