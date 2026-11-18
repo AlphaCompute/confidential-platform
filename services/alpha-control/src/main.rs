@@ -39,8 +39,7 @@ fn env(name: &str) -> Result<String, Error> {
 }
 
 /// The token endpoint is trusted because TLS authenticates it, and links to the signer page must
-/// be absolute. Neither carries a query or a fragment; the signer URL is a base that ticket paths
-/// follow.
+/// be absolute. Neither carries a query or a fragment.
 fn https_env(name: &str) -> Result<String, Error> {
     let value = env(name)?;
     match reqwest::Url::parse(&value) {
@@ -50,7 +49,7 @@ fn https_env(name: &str) -> Result<String, Error> {
                 && url.query().is_none()
                 && url.fragment().is_none() =>
         {
-            Ok(value.trim_end_matches('/').to_owned())
+            Ok(value)
         }
         _ => Err(Error::internal(format!(
             "{name} must be an https URL with a host and no query or fragment"
@@ -100,7 +99,9 @@ async fn run() -> Result<(), Error> {
     let operator_token_sha256 = *hex_env("ALPHACOMPUTE_OPERATOR_TOKEN_SHA256")?;
     let public_name = env("ALPHACOMPUTE_PUBLIC_NAME")?;
     let platform_document_url = env("ALPHACOMPUTE_PLATFORM_DOCUMENT_URL")?;
-    let signer_url = https_env("ALPHACOMPUTE_SIGNER_URL")?;
+    let signer_url = https_env("ALPHACOMPUTE_SIGNER_URL")?
+        .trim_end_matches('/')
+        .to_owned();
     let oidc = Oidc {
         issuer: env("ALPHACOMPUTE_OIDC_ISSUER")?,
         token_endpoint: https_env("ALPHACOMPUTE_OIDC_TOKEN_ENDPOINT")?,
