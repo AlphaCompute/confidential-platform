@@ -121,7 +121,8 @@ pub async fn create(
         .iter()
         .min_by(|a, b| (&a.issuer, &a.external_id).cmp(&(&b.issuer, &b.external_id)));
     if let Some(lowest) = lowest {
-        // A stalled holder must not keep every waiter's pool connection.
+        // A stalled holder must not keep every waiter's pool connection; the bound covers this
+        // wait alone, not the link inserts after it.
         sqlx::query("set local lock_timeout = '5s'")
             .execute(&mut *tx)
             .await?;
@@ -130,6 +131,7 @@ pub async fn create(
             .bind(&lowest.external_id)
             .execute(&mut *tx)
             .await?;
+        sqlx::query("reset lock_timeout").execute(&mut *tx).await?;
     }
     let (status, action, org_id) = match retried(&mut tx, &caller, &new).await? {
         Some(org_id) => (StatusCode::OK, "org.retry", org_id),

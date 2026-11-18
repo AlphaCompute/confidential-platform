@@ -442,8 +442,24 @@ async fn a_create_waits_for_an_open_create_with_the_same_links_in_any_order() {
             .unwrap();
         router.oneshot(request).await.unwrap().status()
     });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    assert!(!waiting.is_finished());
+    // The request waits on exactly that lock, not on anything else.
+    let mut queued = false;
+    for _ in 0..50 {
+        queued = sqlx::query_scalar(
+            "select exists (select 1 from pg_locks where locktype = 'advisory' and not granted \
+               and classid = hashtext($1)::oid and objid = hashtext($2)::oid and objsubid = 2)",
+        )
+        .bind("rafay:console.example")
+        .bind("org-a")
+        .fetch_one(&api.1)
+        .await
+        .unwrap();
+        if queued {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(queued && !waiting.is_finished());
     open.commit().await.unwrap();
     assert_eq!(waiting.await.unwrap(), StatusCode::CREATED);
 }
