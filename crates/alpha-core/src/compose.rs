@@ -143,38 +143,40 @@ const NODE_BYTES: usize = 64;
 /// would refuse real files.
 pub fn load_yaml(yaml: &str) -> Result<Vec<Yaml>, RegistrationError> {
     let mut parser = Parser::new_from_str(yaml);
-    let mut total = 0usize;
+    // `tree` is what the documents hold, `copies` the loader's anchor table; an anchor's size is
+    // its share of `tree` only, as the table entry does not hold its descendants' entries.
+    let mut tree = 0usize;
+    let mut copies = 0usize;
     let mut open: Vec<(usize, usize)> = Vec::new();
     let mut anchors: HashMap<usize, usize> = HashMap::new();
     loop {
-        let size = match parser.next_token()?.0 {
+        let anchored = match parser.next_token()?.0 {
             Event::StreamEnd => break,
             Event::Scalar(text, _, anchor, _) => {
                 let size = NODE_BYTES.saturating_add(text.len());
-                if anchor == 0 {
-                    size
-                } else {
-                    anchors.insert(anchor, size);
-                    size.saturating_mul(2)
-                }
+                tree = tree.saturating_add(size);
+                Some((anchor, size))
             }
             Event::SequenceStart(anchor, _) | Event::MappingStart(anchor, _) => {
-                open.push((anchor, total));
-                NODE_BYTES
+                open.push((anchor, tree));
+                tree = tree.saturating_add(NODE_BYTES);
+                None
             }
-            Event::SequenceEnd | Event::MappingEnd => match open.pop() {
-                Some((anchor, start)) if anchor != 0 => {
-                    let size = total.saturating_sub(start);
-                    anchors.insert(anchor, size);
-                    size
-                }
-                _ => 0,
-            },
-            Event::Alias(anchor) => anchors.get(&anchor).copied().unwrap_or(NODE_BYTES),
-            _ => 0,
+            Event::SequenceEnd | Event::MappingEnd => open
+                .pop()
+                .map(|(anchor, start)| (anchor, tree.saturating_sub(start))),
+            Event::Alias(anchor) => {
+                let size = anchors.get(&anchor).copied().unwrap_or(NODE_BYTES);
+                tree = tree.saturating_add(size);
+                None
+            }
+            _ => None,
         };
-        total = total.saturating_add(size);
-        if total > MAX_YAML_BYTES {
+        if let Some((anchor, size)) = anchored.filter(|(anchor, _)| *anchor != 0) {
+            anchors.insert(anchor, size);
+            copies = copies.saturating_add(size);
+        }
+        if tree.saturating_add(copies) > MAX_YAML_BYTES {
             return Err(RegistrationError::TooLarge);
         }
     }
