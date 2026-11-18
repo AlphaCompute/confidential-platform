@@ -179,21 +179,36 @@ pub async fn by_code(
     Ok(Json(json!({ "kind": kind, "ticket": ticket })))
 }
 
-/// The open ticket's kind and Organization, locked for the transaction.
+#[derive(sqlx::FromRow)]
+pub(crate) struct Ticket {
+    pub kind: String,
+    pub org_id: Uuid,
+    /// The state-changing relay ops it already drove.
+    pub used: Vec<String>,
+    pub session_sha256: Option<Vec<u8>>,
+    pub owner: Option<Uuid>,
+    pub rooted: bool,
+    state: String,
+    expired: bool,
+}
+
+/// The open ticket, locked for the transaction.
 pub(crate) async fn usable(
     tx: &mut Transaction<'_, Postgres>,
     ticket: &str,
-) -> Result<(String, Uuid), Error> {
-    let (kind, state, expired, org_id): (String, String, bool, Uuid) = sqlx::query_as(
-        "select kind, state, expires_at <= clock_timestamp(), org_id from tickets \
-         where ticket = $1 for update",
+) -> Result<Ticket, Error> {
+    let found: Ticket = sqlx::query_as(
+        "select t.kind, t.org_id, t.used, t.session_sha256, o.owner_principal_id as owner, \
+           o.rooted_at is not null as rooted, t.state, t.expires_at <= clock_timestamp() as expired \
+         from tickets t join organizations o on o.id = t.org_id \
+         where t.ticket = $1 for update of t",
     )
     .bind(ticket)
     .fetch_optional(&mut **tx)
     .await?
     .ok_or(Error::TicketNotFound)?;
-    match (state.as_str(), expired) {
-        ("open", false) => Ok((kind, org_id)),
+    match (found.state.as_str(), found.expired) {
+        ("open", false) => Ok(found),
         ("open", true) => Err(Error::TicketExpired),
         _ => Err(Error::TicketClosed),
     }
@@ -204,7 +219,7 @@ pub async fn decline(
     Path(ticket): Path<String>,
 ) -> Result<Json<Value>, Error> {
     let mut tx = state.pool.begin().await?;
-    let (kind, org_id) = usable(&mut tx, &ticket).await?;
+    let Ticket { kind, org_id, .. } = usable(&mut tx, &ticket).await?;
     let declined = sqlx::query(
         "update tickets set state = 'declined' where ticket = $1 and expires_at > clock_timestamp()",
     )
@@ -322,14 +337,14 @@ pub async fn session(
 ) -> Result<Json<Value>, Error> {
     let Json(request) = body?;
     // Checked before the code is spent, and again under the lock below.
-    let (kind, _) = usable(&mut state.pool.begin().await?, &ticket).await?;
-    if kind != "claim" {
+    let found = usable(&mut state.pool.begin().await?, &ticket).await?;
+    if found.kind != "claim" {
         return Err(Error::SessionRefused);
     }
     let claims = redeem(&state, &request).await?;
 
     let mut tx = state.pool.begin().await?;
-    let (_, org_id) = usable(&mut tx, &ticket).await?;
+    let org_id = usable(&mut tx, &ticket).await?.org_id;
     let (owner_email, owner, rooted): (String, Option<Uuid>, bool) = sqlx::query_as(
         "select owner_email, owner_principal_id, rooted_at is not null from organizations \
          where id = $1 and disabled_at is null for update",

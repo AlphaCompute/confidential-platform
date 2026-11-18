@@ -19,7 +19,8 @@ use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::{AppState, Error, platform, tickets};
+use crate::tickets::{self, Ticket};
+use crate::{AppState, Error, platform};
 
 pub async fn relay(
     State(state): State<Arc<AppState>>,
@@ -30,20 +31,14 @@ pub async fn relay(
     let Json(body) = body?;
     // The row stays locked until the step is recorded, so two relays of one op cannot both run.
     let mut tx = state.pool.begin().await?;
-    let (kind, org_id) = tickets::usable(&mut tx, &ticket).await?;
-    let used: Vec<String> = sqlx::query_scalar("select used from tickets where ticket = $1")
-        .bind(&ticket)
-        .fetch_one(&mut *tx)
-        .await?;
-    if used.contains(&op) {
+    let found = tickets::usable(&mut tx, &ticket).await?;
+    if found.used.contains(&op) {
         return Err(Error::TicketClosed);
     }
-    let reply = match (kind.as_str(), op.as_str()) {
-        ("claim", "root" | "key") => {
-            register_key(&state, &mut tx, &ticket, org_id, &op, &headers, body).await?
-        }
-        _ => return Err(Error::Forbidden),
-    };
+    if found.kind != "claim" || !matches!(op.as_str(), "root" | "key") {
+        return Err(Error::Forbidden);
+    }
+    let reply = register_key(&state, &mut tx, &ticket, &found, &op, &headers, body).await?;
     tx.commit().await?;
     Ok(Json(reply))
 }
@@ -61,7 +56,7 @@ async fn register_key(
     state: &AppState,
     tx: &mut Transaction<'_, Postgres>,
     ticket: &str,
-    org_id: Uuid,
+    found: &Ticket,
     op: &str,
     headers: &HeaderMap,
     body: Value,
@@ -80,29 +75,22 @@ async fn register_key(
         return Err(Error::Malformed("credential_id is not base64url".into()));
     }
     let signed: Signed = serde_json::from_value(registration.clone()).map_err(malformed)?;
+    let org_id = found.org_id;
     let mut expected = Map::new();
     expected.insert("org_id".into(), json!(org_id));
     if op == "root" {
         // A ticket alone never roots: the owner's sign-in must stand behind this very request.
-        let (session_sha256, owner, rooted): (Option<Vec<u8>>, Option<Uuid>, bool) =
-            sqlx::query_as(
-                "select t.session_sha256, o.owner_principal_id, o.rooted_at is not null \
-                 from tickets t join organizations o on o.id = t.org_id where t.ticket = $1",
-            )
-            .bind(ticket)
-            .fetch_one(&mut **tx)
-            .await?;
         let presented = headers
             .get("alpha-claim-session")
             .map(|v| Sha256::digest(v.as_bytes()));
-        let bound = matches!((presented, session_sha256), (Some(p), Some(s))
-            if alpha_client::bearer_matches(&p, &s));
-        if !bound || rooted {
+        let bound = matches!((presented, &found.session_sha256), (Some(p), Some(s))
+            if alpha_client::bearer_matches(&p, s));
+        if !bound || found.rooted {
             return Err(Error::SessionRefused);
         }
         if signed.signature.key_id.is_some()
             || signed.payload.get("org_id") != Some(&json!(org_id))
-            || signed.payload.get("principal_id") != owner.map(|o| json!(o)).as_ref()
+            || signed.payload.get("principal_id") != found.owner.map(|o| json!(o)).as_ref()
         {
             return Err(Error::Malformed(
                 "a root registration is self-signed for this Organization and its owner".into(),
