@@ -151,9 +151,7 @@ impl Relay<'_> {
         }
         let signed = signed(&registration)?;
         let org_id = self.found.org_id;
-        let mut expected = Map::new();
-        expected.insert("org_id".into(), json!(org_id));
-        if op == "root" {
+        let expected = if op == "root" {
             // A ticket alone never roots: the owner's sign-in must stand behind this request.
             let presented = headers
                 .get("alpha-claim-session")
@@ -171,14 +169,11 @@ impl Relay<'_> {
                     "a root registration is self-signed for this Organization and its owner".into(),
                 ));
             }
-            let public_key = signed
-                .payload
-                .get("public_key")
-                .cloned()
-                .unwrap_or_default();
-            expected.insert("public_key".into(), public_key);
             // The KMS answers a repeated key with its stored row, which may name another holder.
-            expected.insert("principal_id".into(), json!(self.found.owner));
+            json!({
+                "org_id": org_id, "public_key": signed.payload.get("public_key"),
+                "principal_id": self.found.owner,
+            })
         } else {
             // Without a signer in the roster the KMS would take it as a root claim; and the key is
             // the one of the holder the ticket names.
@@ -188,7 +183,8 @@ impl Relay<'_> {
                 return Err(Error::Forbidden);
             }
             self.own_signer(&signed).await?;
-        }
+            json!({ "org_id": org_id })
+        };
         // The KMS answers a repeated root for the same key with its stored row and a new
         // receipt, so a root checks the version and the expiry after the reply: a refusal there
         // records nothing, and a retry on a new ticket records the root. A repeated other key is `already_exists`, so it checks before the call.
@@ -252,9 +248,7 @@ impl Relay<'_> {
         let reply = self
             .kms(Method::PUT, &format!("/v1/secrets/{full}"), &body)
             .await?;
-        let mut expected = Map::new();
-        expected.insert("name".into(), json!(full));
-        expected.insert("org_id".into(), json!(self.found.org_id));
+        let expected = json!({ "name": full, "org_id": self.found.org_id });
         self.confirm("secret.put", &body, expected, &reply)?;
         sqlx::query(
             "insert into app_secrets (app_id, name) values ($1, $2) on conflict do nothing",
@@ -281,10 +275,8 @@ impl Relay<'_> {
         }
         self.own_signer(&signed).await?;
         let reply = self.kms(Method::POST, "/v1/revisions", &body).await?;
-        let mut expected = Map::new();
-        expected.insert("compose_hash".into(), json!(hash));
-        expected.insert("app_id".into(), json!(app_id));
-        expected.insert("org_id".into(), json!(self.found.org_id));
+        let expected =
+            json!({ "compose_hash": hash, "app_id": app_id, "org_id": self.found.org_id });
         self.confirm("revision.register", &body, expected, &reply)?;
         sqlx::query(
             "update revisions set registered_at = coalesce(registered_at, now()) \
@@ -311,8 +303,7 @@ impl Relay<'_> {
         let reply = self
             .kms(Method::POST, &format!("/v1/revisions/{hash}/revoke"), &body)
             .await?;
-        let mut expected = Map::new();
-        expected.insert("compose_hash".into(), json!(hash));
+        let expected = json!({ "compose_hash": hash });
         self.confirm("revision.revoke", &body, expected, &reply)?;
         sqlx::query(
             "update revisions set revoked_at = coalesce(revoked_at, now()) where compose_hash = $1",
@@ -426,14 +417,17 @@ impl Relay<'_> {
         &self,
         route: &str,
         request: &Value,
-        expected: Map<String, Value>,
+        expected: Value,
         reply: &Value,
     ) -> Result<Value, Error> {
         let receipt = reply.get("receipt").ok_or(Error::UpstreamInvalid)?;
         let expected = Expected {
             route: route.into(),
             request_sha256: receipt::request_sha256(request).map_err(|_| Error::UpstreamInvalid)?,
-            response: expected,
+            response: match expected {
+                Value::Object(expected) => expected,
+                _ => Map::new(),
+            },
         };
         let receipt = serde_json::to_vec(receipt).map_err(|_| Error::UpstreamInvalid)?;
         receipt::verify(
