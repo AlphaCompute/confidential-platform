@@ -101,8 +101,8 @@ pub enum RegistrationError {
     ImageWithoutDigest(String),
     #[error("a build: key is present; every service must resolve to a pinned image")]
     BuildNotAllowed,
-    #[error("docker_compose_file expands to more than {MAX_YAML_NODES} YAML nodes")]
-    TooManyNodes,
+    #[error("docker_compose_file expands to more than {MAX_YAML_BYTES} bytes")]
+    TooLarge,
 }
 
 impl RegistrationError {
@@ -133,41 +133,49 @@ pub fn check_registration(compose: &str, app_id: AppId) -> Result<ComposeHash, R
 }
 
 /// Far above any real compose, far below what hurts a node.
-const MAX_YAML_NODES: usize = 100_000;
+const MAX_YAML_BYTES: usize = 8 << 20;
+/// A rough size of one `Yaml` node before its scalar text.
+const NODE_BYTES: usize = 64;
 
-/// `YamlLoader` copies the anchored node for every alias, so nested aliases grow exponentially
-/// ("billion laughs"). Count the expanded nodes on the event stream first; compose files use
-/// anchors with `<<:` merges, so refusing aliases outright would refuse real files.
+/// `YamlLoader` copies the anchored node into its anchor table and again for every alias, so
+/// nested aliases grow exponentially ("billion laughs"). Estimate the bytes it would build on the
+/// event stream first; compose files use anchors with `<<:` merges, so refusing aliases outright
+/// would refuse real files.
 pub fn load_yaml(yaml: &str) -> Result<Vec<Yaml>, RegistrationError> {
     let mut parser = Parser::new_from_str(yaml);
-    let mut nodes = 0usize;
+    let mut total = 0usize;
     let mut open: Vec<(usize, usize)> = Vec::new();
     let mut anchors: HashMap<usize, usize> = HashMap::new();
     loop {
         let size = match parser.next_token()?.0 {
             Event::StreamEnd => break,
-            Event::Scalar(_, _, anchor, _) => {
-                if anchor != 0 {
-                    anchors.insert(anchor, 1);
+            Event::Scalar(text, _, anchor, _) => {
+                let size = NODE_BYTES.saturating_add(text.len());
+                if anchor == 0 {
+                    size
+                } else {
+                    anchors.insert(anchor, size);
+                    size.saturating_mul(2)
                 }
-                1
             }
             Event::SequenceStart(anchor, _) | Event::MappingStart(anchor, _) => {
-                open.push((anchor, nodes));
-                1
+                open.push((anchor, total));
+                NODE_BYTES
             }
-            Event::SequenceEnd | Event::MappingEnd => {
-                if let Some((anchor, start)) = open.pop().filter(|(anchor, _)| *anchor != 0) {
-                    anchors.insert(anchor, nodes.saturating_sub(start));
+            Event::SequenceEnd | Event::MappingEnd => match open.pop() {
+                Some((anchor, start)) if anchor != 0 => {
+                    let size = total.saturating_sub(start);
+                    anchors.insert(anchor, size);
+                    size
                 }
-                0
-            }
-            Event::Alias(anchor) => anchors.get(&anchor).copied().unwrap_or(1),
+                _ => 0,
+            },
+            Event::Alias(anchor) => anchors.get(&anchor).copied().unwrap_or(NODE_BYTES),
             _ => 0,
         };
-        nodes = nodes.saturating_add(size);
-        if nodes > MAX_YAML_NODES {
-            return Err(RegistrationError::TooManyNodes);
+        total = total.saturating_add(size);
+        if total > MAX_YAML_BYTES {
+            return Err(RegistrationError::TooLarge);
         }
     }
     Ok(YamlLoader::load_from_str(yaml)?)
@@ -276,22 +284,26 @@ mod tests {
 
     #[test]
     fn an_alias_bomb_is_refused_before_it_expands() {
-        let mut yaml = "a0: &a0 [x, x, x, x, x, x, x, x, x, x]\n".to_owned();
+        let mut nested = "a0: &a0 [x, x, x, x, x, x, x, x, x, x]\n".to_owned();
         for i in 1..9 {
             let p = i - 1;
-            yaml += &format!("a{i}: &a{i} [{}]\n", vec![format!("*a{p}"); 10].join(", "));
+            nested += &format!("a{i}: &a{i} [{}]\n", vec![format!("*a{p}"); 10].join(", "));
         }
-        assert!(matches!(
-            load_yaml(&yaml),
-            Err(RegistrationError::TooManyNodes)
-        ));
+        let wide = format!(
+            "a: &a {}\nb: [{}]\n",
+            "x".repeat(10_000),
+            vec!["*a"; 1000].join(", ")
+        );
+        for bomb in [nested, wide] {
+            assert!(matches!(load_yaml(&bomb), Err(RegistrationError::TooLarge)));
+        }
     }
 
     #[test]
     fn images_are_found_anywhere_in_the_yaml() {
         let ok = "@sha256:".to_owned() + &"0".repeat(64);
         let merged = format!("x-base: &b\n  image: a{ok}\nservices:\n  app:\n    <<: *b\n");
-        assert!(check_images(&YamlLoader::load_from_str(&merged).unwrap()[0]).is_ok());
+        assert!(check_images(&load_yaml(&merged).unwrap()[0]).is_ok());
         let upper = format!(
             "services:\n  app:\n    image: a@sha256:{}\n",
             "A".repeat(64)
