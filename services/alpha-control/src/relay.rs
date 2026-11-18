@@ -74,7 +74,7 @@ async fn register_key(
     {
         return Err(Error::Malformed("credential_id is not base64url".into()));
     }
-    let signed: Signed = serde_json::from_value(registration.clone()).map_err(malformed)?;
+    let signed = Signed::deserialize(&registration).map_err(malformed)?;
     let org_id = found.org_id;
     let mut expected = Map::new();
     expected.insert("org_id".into(), json!(org_id));
@@ -96,8 +96,12 @@ async fn register_key(
                 "a root registration is self-signed for this Organization and its owner".into(),
             ));
         }
-        let public_key = signed.payload.get("public_key").cloned();
-        expected.insert("public_key".into(), public_key.unwrap_or_default());
+        let public_key = signed
+            .payload
+            .get("public_key")
+            .cloned()
+            .unwrap_or_default();
+        expected.insert("public_key".into(), public_key);
     } else if signed.signature.key_id.is_none() {
         // Without a signer in the roster the KMS would take it as a root claim.
         return Err(Error::Forbidden);

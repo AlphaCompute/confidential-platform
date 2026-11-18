@@ -105,6 +105,7 @@ async fn run() -> Result<(), Error> {
     let kms_endpoints = env("ALPHACOMPUTE_KMS_ENDPOINTS")?
         .split(',')
         .map(|e| e.trim().to_owned())
+        .filter(|e| !e.is_empty())
         .collect();
     let oidc = Oidc {
         issuer: env("ALPHACOMPUTE_OIDC_ISSUER")?,

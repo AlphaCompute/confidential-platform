@@ -27,6 +27,7 @@ pub async fn open(
     kind: &str,
     org_id: Uuid,
     compose_hash: Option<&ComposeHash>,
+    principal_id: Option<Uuid>,
     lifetime: &str,
 ) -> Result<(String, String), Error> {
     let ticket = BASE64URL_NOPAD.encode(&random::<32>()?);
@@ -36,14 +37,15 @@ pub async fn open(
         .filter_map(|b| CROCKFORD.get(usize::from(b & 31)).map(|c| char::from(*c)))
         .collect();
     sqlx::query(
-        "insert into tickets (ticket, code, kind, org_id, compose_hash, expires_at) \
-         values ($1, $2, $3, $4, $5, now() + $6::interval)",
+        "insert into tickets (ticket, code, kind, org_id, compose_hash, principal_id, expires_at) \
+         values ($1, $2, $3, $4, $5, $6, now() + $7::interval)",
     )
     .bind(&ticket)
     .bind(&code)
     .bind(kind)
     .bind(org_id)
     .bind(compose_hash.map(|h| h.as_bytes().to_vec()))
+    .bind(principal_id)
     .bind(lifetime)
     .execute(&mut **tx)
     .await?;
@@ -67,16 +69,10 @@ pub async fn claim(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(Error::NotFound)?;
-    let (ticket, code) = open(&mut tx, "claim", org_id, None, "72 hours").await?;
     // A rooted Organization adds a key for a new holder; an unrooted one learns its owner at the
     // sign-in.
-    if rooted {
-        sqlx::query("update tickets set principal_id = $1 where ticket = $2")
-            .bind(Uuid::now_v7())
-            .bind(&ticket)
-            .execute(&mut *tx)
-            .await?;
-    }
+    let holder = rooted.then(Uuid::now_v7);
+    let (ticket, code) = open(&mut tx, "claim", org_id, None, holder, "72 hours").await?;
     // The code redeems the ticket, so the audit row names only the Organization.
     let object = org_id.to_string();
     audit(&mut tx, &caller, org_id, "ticket.claim", &object, json!({})).await?;
