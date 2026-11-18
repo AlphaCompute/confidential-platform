@@ -119,9 +119,7 @@ pub async fn create(
     .bind(rendered.revision.as_bytes().as_slice())
     .fetch_optional(&mut *tx)
     .await?;
-    let predecessor = predecessor
-        .and_then(|h| <[u8; 32]>::try_from(h).ok())
-        .map(ComposeHash::from);
+    let predecessor = tickets::hash(predecessor.as_deref());
     let (ticket, code) = tickets::open(
         &mut tx,
         "approve",

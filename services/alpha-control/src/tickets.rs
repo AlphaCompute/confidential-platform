@@ -109,7 +109,7 @@ struct Row {
     predecessor_revision: Option<String>,
 }
 
-fn hash(bytes: Option<Vec<u8>>) -> Option<ComposeHash> {
+pub(crate) fn hash(bytes: Option<&[u8]>) -> Option<ComposeHash> {
     bytes
         .and_then(|h| <[u8; 32]>::try_from(h).ok())
         .map(ComposeHash::from)
@@ -156,12 +156,12 @@ pub async fn read(
         "claim" if row.rooted => json!({ "rooted": true, "principal_id": row.principal_id }),
         "claim" => json!({ "rooted": false, "owner_email": row.owner_email }),
         kind => {
-            let compose_hash = hash(row.compose_hash)
+            let compose_hash = hash(row.compose_hash.as_deref())
                 .ok_or_else(|| Error::internal("ticket without a Revision"))?;
             if kind == "revoke" {
                 json!({ "app_id": row.app_id, "title": row.title, "revisions": [compose_hash] })
             } else {
-                let predecessor = hash(row.predecessor)
+                let predecessor = hash(row.predecessor.as_deref())
                     .map(|p| json!({ "compose_hash": p, "revision": row.predecessor_revision }));
                 json!({
                     "app_id": row.app_id, "slug": row.slug, "compose_hash": compose_hash,

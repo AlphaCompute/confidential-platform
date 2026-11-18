@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::tickets::{self, Ticket};
+use crate::tickets::{self, Ticket, hash};
 use crate::{AppState, Error, platform, stale};
 
 /// One relayed call: the KMS and the document it is pinned to, the ticket, its locked row.
@@ -103,13 +103,6 @@ fn signed(body: &Value) -> Result<Signed, Error> {
     let part = |name| body.get(name).cloned().unwrap_or_default();
     Signed::deserialize(json!({ "payload": part("payload"), "signature": part("signature") }))
         .map_err(|e| Error::Malformed(format!("body: {e}")))
-}
-
-fn compose_hash(bytes: &Option<Vec<u8>>) -> Option<ComposeHash> {
-    bytes
-        .as_deref()
-        .and_then(|b| <[u8; 32]>::try_from(b).ok())
-        .map(ComposeHash::from)
 }
 
 impl Relay<'_> {
@@ -250,8 +243,7 @@ impl Relay<'_> {
         let name = full
             .strip_prefix(&format!("{app_id}."))
             .filter(|name| alpha_core::is_secret_name(name))
-            .ok_or_else(|| Error::Malformed(format!("name must be {app_id}.<name>")))?
-            .to_owned();
+            .ok_or_else(|| Error::Malformed(format!("name must be {app_id}.<name>")))?;
         if signed.payload.get("app_ids") != Some(&json!([app_id])) {
             return Err(Error::Malformed(format!("app_ids must be [{app_id}]")));
         }
@@ -268,7 +260,7 @@ impl Relay<'_> {
             "insert into app_secrets (app_id, name) values ($1, $2) on conflict do nothing",
         )
         .bind(app_id)
-        .bind(&name)
+        .bind(name)
         .execute(&mut *self.tx)
         .await?;
         Ok((tag, reply))
@@ -278,7 +270,7 @@ impl Relay<'_> {
     async fn revision(&mut self, body: Value) -> Result<(String, Value), Error> {
         let tag = self.fresh("revision".into())?;
         let signed = signed(&body)?;
-        let hash = compose_hash(&self.found.compose_hash).ok_or(Error::Forbidden)?;
+        let hash = hash(self.found.compose_hash.as_deref()).ok_or(Error::Forbidden)?;
         let app_id = self.found.app_id.ok_or(Error::Forbidden)?;
         if signed.payload.get("app_id") != Some(&json!(app_id))
             || signed.payload.get("digest") != Some(&json!(hash))
@@ -308,8 +300,8 @@ impl Relay<'_> {
     async fn revoke(&mut self, body: Value) -> Result<(String, Value), Error> {
         let signed = signed(&body)?;
         let allowed = match self.found.kind.as_str() {
-            "approve" => compose_hash(&self.found.predecessor),
-            _ => compose_hash(&self.found.compose_hash),
+            "approve" => hash(self.found.predecessor.as_deref()),
+            _ => hash(self.found.compose_hash.as_deref()),
         };
         let hash = allowed
             .filter(|h| signed.payload.get("compose_hash") == Some(&json!(h)))
@@ -342,9 +334,9 @@ impl Relay<'_> {
             "claim" => tag == "key",
             "approve" => {
                 used.contains(&"revision".to_owned())
-                    && revoked(compose_hash(&self.found.predecessor))
+                    && revoked(hash(self.found.predecessor.as_deref()))
             }
-            _ => revoked(compose_hash(&self.found.compose_hash)),
+            _ => revoked(hash(self.found.compose_hash.as_deref())),
         };
         sqlx::query(
             "update tickets set used = $1, state = case when $2 then 'done' else state end \
