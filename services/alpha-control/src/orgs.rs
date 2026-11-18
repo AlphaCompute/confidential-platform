@@ -173,26 +173,23 @@ async fn retried(
     let Some(first) = new.links.first() else {
         return Ok(None);
     };
-    let linked: Option<Uuid> =
-        sqlx::query_scalar("select org_id from org_links where issuer = $1 and external_id = $2")
-            .bind(&first.issuer)
-            .bind(&first.external_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-    let Some(org_id) = linked else {
-        return Ok(None);
-    };
-    let fresh: bool = sqlx::query_scalar(
-        "select exists (select 1 from organizations where id = $1 and name = $2 \
-         and owner_email = $3 and created_by = $4 and disabled_at is null \
-         and created_at > now() - interval '1 hour')",
+    // A used link that matches no retry falls through to the insert, which refuses it.
+    let linked: Option<Uuid> = sqlx::query_scalar(
+        "select o.id from org_links l join organizations o on o.id = l.org_id \
+         where l.issuer = $1 and l.external_id = $2 and o.name = $3 and o.owner_email = $4 \
+           and o.created_by = $5 and o.disabled_at is null \
+           and o.created_at > now() - interval '1 hour'",
     )
-    .bind(org_id)
+    .bind(&first.issuer)
+    .bind(&first.external_id)
     .bind(&new.name)
     .bind(&new.owner_email)
     .bind(caller.actor())
-    .fetch_one(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
+    let Some(org_id) = linked else {
+        return Ok(None);
+    };
     let mut stored: Vec<(String, String)> =
         sqlx::query_as("select issuer, external_id from org_links where org_id = $1")
             .bind(org_id)
@@ -205,7 +202,7 @@ async fn retried(
         .collect();
     stored.sort_unstable();
     asked.sort_unstable();
-    if !fresh || stored != asked {
+    if stored != asked {
         return Err(LINK_TAKEN);
     }
     Ok(Some(org_id))

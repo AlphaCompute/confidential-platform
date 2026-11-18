@@ -252,13 +252,13 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/orgs", post(orgs::create))
         .route("/v1/orgs/{org}/disable", post(orgs::disable))
         .route("/v1/orgs/{org}/keys/{id}", delete(orgs::revoke_key))
-        .route("/v1/apps/{app}", put(apps::put))
+        .route("/v1/apps/{slug}", put(apps::put))
         .route(
-            "/v1/apps/{app}/revisions",
+            "/v1/apps/{slug}/revisions",
             // A catalog file carries a whole init-data, up to 1 MiB.
             post(revisions::create).layer(DefaultBodyLimit::max(2 << 20)),
         )
-        .route("/v1/apps/{app}/revisions/{hash}", get(revisions::get))
+        .route("/v1/apps/{slug}/revisions/{hash}", get(revisions::get))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .merge(probe_routes())
         .with_state(state)
