@@ -97,7 +97,6 @@ pub async fn create(
         .map_err(|e| Error::Malformed(format!("init-data: {e}")))?;
 
     let entry = &new.catalog.entry;
-    // The signer page fetches the catalog file by `template_sha256` and renders it itself.
     let catalog = json!({
         "catalog_id": entry.catalog_id, "version": entry.version, "title": entry.title,
         "template_sha256": entry.template_sha256,
