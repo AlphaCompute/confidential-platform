@@ -38,7 +38,8 @@ fn env(name: &str) -> Result<String, Error> {
     std::env::var(name).map_err(|_| Error::internal(format!("{name} is required")))
 }
 
-/// The ID token is trusted because TLS authenticates the endpoint that returns it.
+/// The token endpoint is trusted because TLS authenticates it, and links to the signer page must
+/// be absolute.
 fn https_env(name: &str) -> Result<String, Error> {
     let value = env(name)?;
     match reqwest::Url::parse(&value) {
@@ -91,7 +92,7 @@ async fn run() -> Result<(), Error> {
     let operator_token_sha256 = *hex_env("ALPHACOMPUTE_OPERATOR_TOKEN_SHA256")?;
     let public_name = env("ALPHACOMPUTE_PUBLIC_NAME")?;
     let platform_document_url = env("ALPHACOMPUTE_PLATFORM_DOCUMENT_URL")?;
-    let signer_url = env("ALPHACOMPUTE_SIGNER_URL")?;
+    let signer_url = https_env("ALPHACOMPUTE_SIGNER_URL")?;
     let oidc = Oidc {
         issuer: env("ALPHACOMPUTE_OIDC_ISSUER")?,
         token_endpoint: https_env("ALPHACOMPUTE_OIDC_TOKEN_ENDPOINT")?,
