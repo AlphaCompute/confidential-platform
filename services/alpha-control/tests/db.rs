@@ -994,7 +994,7 @@ async fn only_the_owners_session_roots_and_only_roster_keys_of_the_organization_
     );
     let forged = registration(&second, &org, &owner, Some((&root_id, &foreign)));
     for (body, expected) in [
-        (by_foreign, (StatusCode::BAD_GATEWAY, "upstream_invalid")),
+        (by_foreign, (StatusCode::FORBIDDEN, "forbidden")),
         (forged, (StatusCode::BAD_REQUEST, "signature_invalid")),
     ] {
         let (status, refused) = api
@@ -1126,4 +1126,245 @@ async fn a_relay_refuses_an_unknown_ticket_or_op_without_reading_the_platform_do
         )
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// Roots `org` through its owner's claim ticket and answers the root key's id and key.
+async fn rooted(api: &Api, org: &str) -> (String, SigningKey) {
+    let ticket = claim_ticket(api, org).await;
+    *api.4.lock().unwrap() = json!({
+        "iss": ISSUER, "aud": "signer", "exp": 4_000_000_000u64, "sub": "owner",
+        "email": "owner@acme.test", "email_verified": true,
+    });
+    let (_, bound) = api
+        .call(
+            Method::POST,
+            &format!("/v1/tickets/{ticket}/session"),
+            "",
+            json!({ "code": "good", "code_verifier": "verifier",
+                    "redirect_uri": "https://sign.example/claim" }),
+        )
+        .await;
+    let root = SigningKey::from_bytes(&[31; 32]);
+    let body = json!({ "credential_id": "root",
+        "registration": registration(&root, org, &bound["principal_id"], None) });
+    let (status, reply) = api
+        .call_with(
+            Method::POST,
+            &format!("/v1/tickets/{ticket}/kms/root"),
+            "",
+            &[("alpha-claim-session", bound["session"].as_str().unwrap())],
+            body,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    (reply["id"].as_str().unwrap().to_owned(), root)
+}
+
+#[tokio::test]
+async fn an_approval_registers_its_revision_only_with_a_passkey_of_the_organization() {
+    let Some(api) = Api::start(true).await else {
+        return;
+    };
+    let (org, deploy) = api.org(&["apps:read", "apps:write"]).await;
+    let (root_id, root) = rooted(&api, &org).await;
+    let (_, app) = api
+        .call(Method::PUT, "/v1/apps/board", &deploy, Value::Null)
+        .await;
+    let app_id = app["app_id"].as_str().unwrap().to_owned();
+    let catalog: Value = serde_json::from_str(CATALOG).unwrap();
+    let (_, created) = api
+        .call(
+            Method::POST,
+            "/v1/apps/board/revisions",
+            &deploy,
+            json!({ "catalog": catalog }),
+        )
+        .await;
+    let ticket = created["ticket"].as_str().unwrap().to_owned();
+    let hash = created["compose_hash"].as_str().unwrap().to_owned();
+    let revision_path = format!("/v1/apps/board/revisions/{hash}");
+    let (_, stored) = api
+        .call(Method::GET, &revision_path, &deploy, Value::Null)
+        .await;
+    let relay = |op: &str| format!("/v1/tickets/{ticket}/kms/{op}");
+    let code = |reply: &Value| reply["error"]["code"].clone();
+    let now = || alpha_kms::rfc3339(SystemTime::now());
+
+    let value = [&[0u8; 32][..], b"s3cret"].concat();
+    let secret = |key: &SigningKey, key_id: &str| {
+        let payload = json!({
+            "name": format!("{app_id}.token"), "app_ids": [app_id],
+            "content_sha256": alpha_core::compose_hash(&value),
+            "issued_at": now(),
+        });
+        let mut body = json!(
+            alpha_client::sign(
+                alpha_core::context::SECRET,
+                payload,
+                key_id.parse().unwrap(),
+                key
+            )
+            .unwrap()
+        );
+        body["value"] = json!(BASE64URL_NOPAD.encode(&value));
+        body
+    };
+    let (status, put) = api
+        .call(Method::POST, &relay("secret"), "", secret(&root, &root_id))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{put}");
+    let (status, again) = api
+        .call(Method::POST, &relay("secret"), "", secret(&root, &root_id))
+        .await;
+    assert_eq!(
+        (status, code(&again)),
+        (StatusCode::CONFLICT, json!("ticket_closed"))
+    );
+    let read = api.read_ticket(&ticket).await;
+    assert_eq!(
+        (&read["secrets"], &read["predecessor"]),
+        (&json!([{ "name": "token", "set": true }]), &Value::Null)
+    );
+
+    let revision = |key: &SigningKey, key_id: &str, digest: &str| {
+        let payload =
+            json!({ "app_id": app_id, "init_data": stored["init_data"], "digest": digest });
+        json!(
+            alpha_client::sign(
+                alpha_core::context::REVISION,
+                payload,
+                key_id.parse().unwrap(),
+                key
+            )
+            .unwrap()
+        )
+    };
+    // Another Organization's key, a bearer with a forged signature, or other bytes register nothing.
+    let (kms_url, _) = api.5.as_ref().unwrap();
+    let foreign = SigningKey::from_bytes(&[32; 32]);
+    let (_, foreign_root) = send_kms(
+        kms_url,
+        "/v1/keys",
+        registration(
+            &foreign,
+            &Uuid::now_v7().to_string(),
+            &json!(Uuid::now_v7()),
+            None,
+        ),
+    )
+    .await;
+    let other = format!("sha256:{}", "0".repeat(64));
+    for (bearer, body, expected) in [
+        (
+            "",
+            revision(&foreign, foreign_root["id"].as_str().unwrap(), &hash),
+            "forbidden",
+        ),
+        (
+            deploy.as_str(),
+            revision(&foreign, &root_id, &hash),
+            "signature_invalid",
+        ),
+        ("", revision(&root, &root_id, &other), "malformed"),
+    ] {
+        let (_, refused) = api
+            .call(Method::POST, &relay("revision"), bearer, body)
+            .await;
+        assert_eq!(code(&refused), json!(expected));
+    }
+    let (_, unchanged) = api
+        .call(Method::GET, &revision_path, &deploy, Value::Null)
+        .await;
+    assert_eq!(unchanged["state"], "awaiting_approval");
+
+    let (status, registered) = api
+        .call(
+            Method::POST,
+            &relay("revision"),
+            "",
+            revision(&root, &root_id, &hash),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{registered}");
+    let (_, stored_now) = api
+        .call(Method::GET, &revision_path, &deploy, Value::Null)
+        .await;
+    assert_eq!(stored_now["state"], "registered");
+    assert_eq!(api.read_ticket(&ticket).await["state"], "done");
+
+    // The next approval of the App names the newest registered Revision as the one it replaces,
+    // and may revoke that one only.
+    let predecessor = format!("sha256:{}", "1".repeat(64));
+    sqlx::query(
+        "insert into revisions (compose_hash, app_id, init_data, pod, shape, catalog, registered_at) \
+         select decode($1, 'hex'), app_id, 'previous', pod, shape, catalog, now() + interval '1 second' \
+         from revisions where app_id = $2::uuid",
+    )
+    .bind("1".repeat(64))
+    .bind(&app_id)
+    .execute(&api.1)
+    .await
+    .unwrap();
+    let (_, next) = api
+        .call(
+            Method::POST,
+            "/v1/apps/board/revisions",
+            &deploy,
+            json!({ "catalog": catalog }),
+        )
+        .await;
+    let next = next["ticket"].as_str().unwrap();
+    assert_eq!(
+        api.read_ticket(next).await["predecessor"],
+        json!({ "compose_hash": predecessor, "revision": "previous" })
+    );
+    let revoke = |target: &str| {
+        json!(
+            alpha_client::sign(
+                alpha_core::context::CONTROL,
+                json!({ "compose_hash": target, "issued_at": now() }),
+                root_id.parse().unwrap(),
+                &root,
+            )
+            .unwrap()
+        )
+    };
+    let (status, _) = api
+        .call(
+            Method::POST,
+            &format!("/v1/tickets/{next}/kms/revoke"),
+            "",
+            revoke(&hash),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // A revoke ticket revokes its own Revision and nothing else.
+    let (status, opened) = api
+        .call(
+            Method::POST,
+            &format!("{revision_path}/revoke"),
+            &deploy,
+            Value::Null,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{opened}");
+    let revoke_ticket = opened["ticket"].as_str().unwrap();
+    let read = api.read_ticket(revoke_ticket).await;
+    assert_eq!(
+        (&read["kind"], &read["app_id"], &read["revisions"]),
+        (&json!("revoke"), &json!(app_id), &json!([hash]))
+    );
+    let path = format!("/v1/tickets/{revoke_ticket}/kms/revoke");
+    let (status, _) = api
+        .call(Method::POST, &path, "", revoke(&predecessor))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, revoked) = api.call(Method::POST, &path, "", revoke(&hash)).await;
+    assert_eq!(status, StatusCode::OK, "{revoked}");
+    let (_, stored_now) = api
+        .call(Method::GET, &revision_path, &deploy, Value::Null)
+        .await;
+    assert_eq!(stored_now["state"], "revoked");
+    assert_eq!(api.read_ticket(revoke_ticket).await["state"], "done");
 }
