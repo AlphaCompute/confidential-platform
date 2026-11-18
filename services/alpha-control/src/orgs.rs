@@ -114,11 +114,16 @@ pub async fn create(
     }
 
     let mut tx = state.pool.begin().await?;
-    // A retry that arrives while the first create still runs waits for it, then finds it.
-    if let Some(first) = new.links.first() {
+    // A retry that arrives while the first create still runs waits for it, then finds it. The
+    // lowest link names the lock, so the order of the links in the request does not matter.
+    let lowest = new
+        .links
+        .iter()
+        .min_by(|a, b| (&a.issuer, &a.external_id).cmp(&(&b.issuer, &b.external_id)));
+    if let Some(lowest) = lowest {
         sqlx::query("select pg_advisory_xact_lock(hashtext($1), hashtext($2))")
-            .bind(&first.issuer)
-            .bind(&first.external_id)
+            .bind(&lowest.issuer)
+            .bind(&lowest.external_id)
             .execute(&mut *tx)
             .await?;
     }
