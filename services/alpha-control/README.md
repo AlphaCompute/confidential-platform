@@ -6,7 +6,7 @@ The control plane: Organizations, their operational API keys and their Apps. It 
 
 | Method and path | Bearer | Answer |
 |---|---|---|
-| `POST /v1/orgs` | operator token, or a key with scope `onboard` | Creates an unrooted Organization from `{name, owner_email, links?: [{issuer, external_id}], deploy_key?: {scopes}}` and answers `{org_id, deploy_key?: {id, token, scopes}}`. The token shows only once. An onboarding key may only claim links under the `issuer` on its row (`403` otherwise). A link that names another Organization, or repeats in the request, is `409`. A retry is not idempotent: after a lost response, the same link gets `409` for good, so the caller asks the operator for the `org_id` and a new deploy key. |
+| `POST /v1/orgs` | operator token, or a key with scope `onboard` | Creates an unrooted Organization from `{name, owner_email, links?: [{issuer, external_id}], deploy_key?: {scopes}}` and answers `{org_id, deploy_key?: {id, token, scopes}}`. The token shows only once. An onboarding key may only claim links under the `issuer` on its row (`403` otherwise). A link that names another Organization, or repeats in the request, is `409`. A link names one Organization for good, so a repeated create with a used link, a retry after a lost response included, answers `409`. The deploy key token is shown once and cannot be recovered; the operator mints a new key once that route exists. |
 | `PUT /v1/apps/{slug}` | a key with scope `apps:write` | Finds or creates the App and answers `{app_id, slug, endpoint}`. A slug of another Organization is `409`. Slugs are global and never reused. |
 | `GET /healthz`, `GET /ready` | none | The process; the database. |
 
