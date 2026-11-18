@@ -560,7 +560,7 @@ envsubst '$RUNTIME_IMAGE $KMS_CA_SPKI_SHA256 $PLATFORM_DOCUMENT_URL $PLATFORM_MI
 alpha coco render --app-id 00000000-0000-0000-0000-000000000000 --kata <opt/kata> \
   --network deploy/kata/catalog/confidential-container.network.toml --out cc-rendered.yaml cc.yaml
 alpha catalog sign --id confidential-container --version 1 --title "Confidential container" \
-  --key catalog.key --out-dir catalog cc-rendered.yaml
+  --key catalog.key cc-rendered.yaml
 ```
 
 The entry signs the TD's shape: 1 vCPU and 2048 MiB plus the summed limits of the pod. The
