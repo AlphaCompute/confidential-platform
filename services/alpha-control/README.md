@@ -23,4 +23,4 @@ Errors are `{"error": {"code", "message", "request_id"}}`. The codes are `unauth
 
 `alpha-control migrate` applies `migrations/` and returns. Otherwise the API listens on `:8443` (TLS 1.3, `http/1.1`) and gets a Let's Encrypt certificate for the public name through TLS-ALPN-01 on the same port, behind the SNI passthrough Gateway. `/healthz` and `/ready` also listen on plain `:8080` for the kubelet, because the API port has no certificate until the first order completes. SIGTERM drains open connections for at most ten seconds. Run one replica: the ACME challenge lives in the process.
 
-No route mints an onboarding key. The operator inserts one: `insert into api_keys (id, token_sha256, scopes, issuer) values (<uuid>, decode('<hex SHA-256 of the token>', 'hex'), '{onboard}', '<partner issuer>')`, with a null `org_id`.
+No route mints an onboarding key. The operator inserts one: `insert into api_keys (id, token_sha256, scopes, issuer) values ('<uuid>', decode('<hex SHA-256 of the token>', 'hex'), '{onboard}', '<partner issuer>')`, with a null `org_id`.
