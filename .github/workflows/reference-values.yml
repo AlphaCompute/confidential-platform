@@ -20,7 +20,13 @@ defaults:
     shell: bash
 
 jobs:
+  hacktron-wait:
+    permissions:
+      checks: read
+    uses: ./.github/workflows/hacktron-wait.yml
+
   compute:
+    needs: hacktron-wait
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
