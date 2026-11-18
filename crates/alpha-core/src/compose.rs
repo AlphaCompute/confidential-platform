@@ -1,11 +1,10 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-
 use yaml_rust2::parser::{Event, Parser};
 use yaml_rust2::{Yaml, YamlLoader};
 
@@ -134,7 +133,7 @@ pub fn check_registration(compose: &str, app_id: AppId) -> Result<ComposeHash, R
 }
 
 /// Far above any real compose, far below what hurts a node.
-pub const MAX_YAML_NODES: usize = 100_000;
+const MAX_YAML_NODES: usize = 100_000;
 
 /// `YamlLoader` copies the anchored node for every alias, so nested aliases grow exponentially
 /// ("billion laughs"). Count the expanded nodes on the event stream first; compose files use
@@ -148,7 +147,9 @@ pub fn load_yaml(yaml: &str) -> Result<Vec<Yaml>, RegistrationError> {
         let size = match parser.next_token()?.0 {
             Event::StreamEnd => break,
             Event::Scalar(_, _, anchor, _) => {
-                anchors.insert(anchor, 1);
+                if anchor != 0 {
+                    anchors.insert(anchor, 1);
+                }
                 1
             }
             Event::SequenceStart(anchor, _) | Event::MappingStart(anchor, _) => {
@@ -156,7 +157,7 @@ pub fn load_yaml(yaml: &str) -> Result<Vec<Yaml>, RegistrationError> {
                 1
             }
             Event::SequenceEnd | Event::MappingEnd => {
-                if let Some((anchor, start)) = open.pop() {
+                if let Some((anchor, start)) = open.pop().filter(|(anchor, _)| *anchor != 0) {
                     anchors.insert(anchor, nodes.saturating_sub(start));
                 }
                 0
