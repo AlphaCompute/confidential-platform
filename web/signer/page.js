@@ -8,7 +8,6 @@ const FONT_SRI = "@FONT_SRI@";
 const VERSION_KEY = "alphacompute-platform-version";
 const TICKET = /^[A-Za-z0-9_-]{43}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const NIL_APP = "00000000-0000-0000-0000-000000000000";
 const CODE = /^[A-Za-z_]{1,64}$/;
 // shroud-go limits its public routes to 5 requests per second per IP.
 const PACE_MS = 250;
@@ -95,7 +94,6 @@ const MESSAGES = {
   secret_missing: "Enter a value for every secret.",
   not_sealed: "The KMS node did not prove itself, so the secret was not sent. Try again.",
   catalog: "The catalog entry for this launch is not signed by AlphaCompute. Nothing was signed.",
-  not_from_catalog: "This launch is replacing a launch not from this catalog.",
   revision_revoked: "The KMS refuses this launch because it was revoked before. Nothing was approved.",
   revoke_expired: "This revocation link has expired.",
   revoke_effect:
@@ -915,7 +913,6 @@ function describeLaunch(a) {
   const { read, launch } = a;
   const nodes = [];
   if (launch.heading) nodes.push(el("p", launch.heading));
-  for (const line of launch.notes || []) nodes.push(el("p", line, "warning"));
   const services = Object.entries(launch.services);
   const runtime = launch.services["alpha-runtime"];
   const publicName = runtime && isPlatform(runtime) ? runtime.environment.ALPHACOMPUTE_PUBLIC_NAME : undefined;
@@ -956,7 +953,7 @@ async function startApproval(view, viewText, ticket) {
   const launch =
     read.catalog_template_sha256 == null
       ? uploadedLaunch(read)
-      : await catalogLaunch(view, read, before);
+      : await catalogLaunch(view, read);
   if (launch.refusal) return stop(launch.refusal);
   // Built before any Secret is stored: a launch the KMS would not register stops here.
   try {
@@ -1399,50 +1396,27 @@ function declineButton(a) {
   );
 }
 
-// The verified catalog entry named by a template hash, rendered for `appId`, or null.
-async function catalogEntry(view, templateHex, appId) {
+// The ticket's catalog entry, verified and rendered for its App and slug.
+async function catalogLaunch(view, read) {
+  const hex = /^(?:sha256:)?([0-9a-f]{64})$/.exec(read.catalog_template_sha256);
+  if (!view.catalog_key || !hex || typeof read.slug !== "string") return { refusal: MESSAGES.catalog };
+  let found;
   try {
-    const reply = await fetch(`./catalog/${templateHex}.json`, { cache: "no-store" });
-    if (!reply.ok) return null;
+    const reply = await fetch(`./catalog/${hex[1]}.json`, { cache: "no-store" });
+    if (!reply.ok) return { refusal: MESSAGES.catalog };
     const text = await reply.text();
-    return JSON.parse(
-      wasm_bindgen.verifyCatalog(text, JSON.stringify(view.catalog_key), appId),
+    found = JSON.parse(
+      wasm_bindgen.verifyCatalog(text, JSON.stringify(view.catalog_key), read.app_id, read.slug),
     );
   } catch (_) {
-    return null;
+    return { refusal: MESSAGES.catalog };
   }
-}
-
-async function catalogLaunch(view, read, before) {
-  const hex = /^(?:sha256:)?([0-9a-f]{64})$/.exec(read.catalog_template_sha256);
-  const found = view.catalog_key && hex ? await catalogEntry(view, hex[1], read.app_id) : null;
-  if (!found) return { refusal: MESSAGES.catalog };
-  const { entry, compose } = found;
-  const r = entry.resources || {};
-  const launch = parsedLaunch(read, compose, {
+  const { entry, init_data } = found;
+  const r = entry.resources;
+  return parsedLaunch(read, init_data, {
     machine: `${r.cpu} vCPU, ${r.memory_mib} MiB`,
     heading: `${entry.title}, version ${entry.version}`,
   });
-  if (launch.refusal || !read.current) return launch;
-  const previous = await previousEntry(view, read);
-  if (previous && previous.entry.catalog_id === entry.catalog_id) {
-    launch.heading = `${entry.title}, version ${previous.entry.version} → ${entry.version}`;
-    return launch;
-  }
-  launch.notes = [MESSAGES.not_from_catalog, ...imageChanges(before, launch.services)];
-  return launch;
-}
-
-// The verified entry `current` was rendered from: the render replaced the template's one nil
-// App id with this App's, so putting the nil id back gives the template's exact bytes.
-async function previousEntry(view, read) {
-  const compose = read.current.compose;
-  const name = `"name":"${read.app_id}"`;
-  if (typeof compose !== "string" || compose.split(name).length !== 2) return null;
-  const template = compose.replace(name, `"name":"${NIL_APP}"`);
-  const hex = wasm_bindgen.bodySha256(utf8(template)).slice("sha256:".length);
-  const found = await catalogEntry(view, hex, read.app_id);
-  return found && found.compose === compose ? found : null;
 }
 
 // The services of the compose the service says runs today, or null when it sent none or it does
@@ -1453,19 +1427,6 @@ function currentServices(current) {
   } catch (_) {
     return null;
   }
-}
-
-// What `current` claims runs today, only where its image differs from this launch's.
-function imageChanges(before, services) {
-  if (!before) return [];
-  const names = [...new Set([...Object.keys(before), ...Object.keys(services)])].sort();
-  const image = (s) => (s && s.image) || "nothing";
-  return names
-    .filter((n) => image(before[n]) !== image(services[n]))
-    .map(
-      (n) =>
-        `${n}: ${image(before[n])} today, according to the service; ${image(services[n])} in this launch.`,
-    );
 }
 
 function revocationRefusal(read) {

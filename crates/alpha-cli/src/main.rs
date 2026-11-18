@@ -335,8 +335,8 @@ enum CocoCommand {
 
 #[derive(Subcommand)]
 enum CatalogCommand {
-    /// Tenant YAML → template (the compose for the nil App id) → signed entry, written as
-    /// `<template hash hex>.json`.
+    /// The Pod `alpha coco render --app-id 00000000-0000-0000-0000-000000000000` wrote → signed
+    /// entry, written as `<template hash hex>.json`.
     Sign {
         #[arg(long)]
         id: String,
@@ -349,8 +349,7 @@ enum CatalogCommand {
         key: PathBuf,
         #[arg(long, default_value = ".")]
         out_dir: PathBuf,
-        /// The spec `alpha deploy` reads; its `app_id` is ignored.
-        app: PathBuf,
+        pod: PathBuf,
     },
 }
 
@@ -762,12 +761,13 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                     title,
                     key,
                     out_dir,
-                    app,
+                    pod,
                 },
         } => {
-            let spec = read_spec(&app)?;
+            let rendered = fs::read_to_string(&pod)
+                .map_err(|e| Exit::Usage(format!("{}: {e}", pod.display())))?;
             let key = read_ed25519(&key)?;
-            let file = alpha_cli::catalog::sign(spec, &id, &version, &title, &key)?;
+            let file = alpha_cli::catalog::sign(&rendered, &id, &version, &title, &key)?;
             let path = out_dir.join(alpha_cli::catalog::file_name(&file));
             fs::write(&path, alpha_cli::catalog::file_bytes(&file)?)
                 .map_err(|e| Exit::Refused(format!("{}: {e}", path.display())))?;
@@ -984,7 +984,7 @@ mod tests {
     fn catalog_sign_takes_its_flags() {
         let sign = |flags: &[&str]| {
             let args = ["alpha", "catalog", "sign"];
-            Cli::try_parse_from(args.iter().chain(flags).chain(&["app.yaml"])).is_ok()
+            Cli::try_parse_from(args.iter().chain(flags).chain(&["pod.yaml"])).is_ok()
         };
         let all = [
             "--id",
