@@ -103,6 +103,8 @@ pub enum RegistrationError {
     BuildNotAllowed,
     #[error("docker_compose_file expands to more than {MAX_YAML_BYTES} bytes")]
     TooLarge,
+    #[error("docker_compose_file nests deeper than {MAX_YAML_DEPTH} levels")]
+    TooDeep,
 }
 
 impl RegistrationError {
@@ -136,6 +138,8 @@ pub fn check_registration(compose: &str, app_id: AppId) -> Result<ComposeHash, R
 const MAX_YAML_BYTES: usize = 8 << 20;
 /// A rough size of one `Yaml` node before its scalar text.
 const NODE_BYTES: usize = 64;
+/// The loader and `check_images` recurse once per level, so depth is bounded by the stack.
+const MAX_YAML_DEPTH: usize = 64;
 
 /// `YamlLoader` copies the anchored node into its anchor table and again for every alias, so
 /// nested aliases grow exponentially ("billion laughs"). Estimate the bytes it would build on the
@@ -158,6 +162,9 @@ pub fn load_yaml(yaml: &str) -> Result<Vec<Yaml>, RegistrationError> {
                 Some((anchor, size))
             }
             Event::SequenceStart(anchor, _) | Event::MappingStart(anchor, _) => {
+                if open.len() >= MAX_YAML_DEPTH {
+                    return Err(RegistrationError::TooDeep);
+                }
                 open.push((anchor, tree));
                 tree = tree.saturating_add(NODE_BYTES);
                 None
@@ -299,6 +306,13 @@ mod tests {
         for bomb in [nested, wide] {
             assert!(matches!(load_yaml(&bomb), Err(RegistrationError::TooLarge)));
         }
+        assert!(matches!(
+            load_yaml(&format!("{}{}", "[".repeat(100), "]".repeat(100))),
+            Err(RegistrationError::TooDeep)
+        ));
+        let anchors: String = (0..16).map(|i| format!("&n{i} [")).collect();
+        let nested = format!("a: {anchors}x{}\nb: *n0\n", "]".repeat(16));
+        assert!(load_yaml(&nested).is_ok());
     }
 
     #[test]
