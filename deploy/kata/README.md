@@ -542,3 +542,29 @@ A pod turns ready once its runtime has attested and its service answers: the fro
 default model passes the gateway check or its model server lists it, the guard and the broker once they reach the front and the
 database, a model server once vLLM's `/health` answers. Exposing the broker or the front outside
 the cluster is the operator's choice of ingress, in TLS passthrough: each terminates its own TLS.
+
+## Catalog entries
+
+A catalog entry is a Revision template. The catalog key signs it once, and each App that
+launches it gets its own Revision. `catalog/` holds the pod spec and the network openings of each
+entry. An entry varies only in two values: the App id and the public name
+`<slug>.app.alphacompute.cc`. The pod spec writes the public name as
+`__ALPHACOMPUTE_PUBLIC_NAME__`, and `alpha coco render` writes the nil App id into the init-data.
+`alpha-control` and the signer page put in the two values with the same `alpha-core` function. The
+entry signs how often each placeholder occurs, so nothing else changes.
+
+On Linux x86_64, make the entry from the inputs of [Platform services](#inputs) and the catalog
+key file:
+
+```sh
+envsubst '$RUNTIME_IMAGE $KMS_CA_SPKI_SHA256 $PLATFORM_DOCUMENT_URL $PLATFORM_MIN_VERSION $KMS_ENDPOINTS' \
+  < deploy/kata/catalog/confidential-container.yaml > cc.yaml
+alpha coco render --app-id 00000000-0000-0000-0000-000000000000 --kata <opt/kata> \
+  --network deploy/kata/catalog/confidential-container.network.toml --out cc-rendered.yaml cc.yaml
+alpha catalog sign --id confidential-container --version 1 --title "Confidential container" \
+  --key catalog.key cc-rendered.yaml
+```
+
+The entry signs the TD's shape: 1 vCPU and 2048 MiB plus the summed limits of the pod. The
+platform document must list the reference values of that shape. Serve the output file at
+`/sign/catalog/<64 hex>.json`; the hex is the SHA-256 of the entry's init-data template.

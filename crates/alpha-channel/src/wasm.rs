@@ -183,22 +183,28 @@ fn catalog_error(e: alpha_core::catalog::CatalogError) -> JsError {
     JsError::new(&format!("{}: {e}", e.code()))
 }
 
-/// `{entry, compose}` of a catalog file whose entry verifies under `catalog_key_json`, with the
-/// template rendered for `app_id`. The key must be the `catalog_key` of a verified platform
-/// document, and the caller must still compare the SHA-256 of `compose` with the hash it was
-/// asked to approve.
+/// `{entry, init_data, revision}` of a catalog file whose entry verifies under `catalog_key_json`,
+/// rendered for `app_id` and `slug`. The key must be the `catalog_key` of a verified platform
+/// document, and the caller must still compare `revision` with the hash it was asked to approve.
 #[wasm_bindgen(js_name = verifyCatalog)]
-pub fn verify_catalog(text: &str, catalog_key_json: &str, app_id: &str) -> Result<String, JsError> {
+pub fn verify_catalog(
+    text: &str,
+    catalog_key_json: &str,
+    app_id: &str,
+    slug: &str,
+) -> Result<String, JsError> {
     use alpha_core::catalog::{self, CatalogFile};
     let file: CatalogFile = parse("catalog file", text)?;
     let key: alpha_core::CatalogKey = parse("catalog key", catalog_key_json)?;
     let app_id: alpha_core::AppId = app_id
         .parse()
         .map_err(|_| js(Error::Malformed(format!("app_id {app_id:?} is not a UUID"))))?;
-    catalog::verify(&file, &key).map_err(catalog_error)?;
-    let compose = catalog::render(&file.template, &file.entry.template_sha256, app_id)
-        .map_err(catalog_error)?;
-    to_json(&json!({"entry": file.entry, "compose": compose}))
+    let rendered = catalog::render(&file, &key, app_id, slug).map_err(catalog_error)?;
+    to_json(&json!({
+        "entry": file.entry,
+        "init_data": rendered.init_data,
+        "revision": rendered.revision,
+    }))
 }
 
 #[wasm_bindgen]

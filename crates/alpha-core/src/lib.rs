@@ -30,6 +30,9 @@ pub use network::{Opening, Openings, Protocol};
 pub use platform::{CatalogKey, KataPolicy, KmsRevision, Signer};
 pub use signing::{context, jcs, parse, signing_digest};
 
+/// The zone every App Endpoint `<slug>.app.alphacompute.cc` lives under.
+pub const APP_ZONE: &str = "app.alphacompute.cc";
+
 /// `{algorithm, signature}`, the signature in base64url.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,6 +57,37 @@ pub fn is_secret_name(name: &str) -> bool {
 /// `content_sha256`, so the signed document stored beside the ciphertext does not let a reader
 /// of the database test guesses of a weak value against it.
 pub const SECRET_SALT_LEN: usize = 32;
+
+/// An App's slug, the first label of its Endpoint `<slug>.app.alphacompute.cc`: 3 to 48 lowercase
+/// letters, digits or `-`, starting with a letter, not ending with `-`. `--` is refused because it
+/// separates an Instance id from the slug in an Instance Endpoint; the reserved words name
+/// platform hosts.
+pub fn is_slug(slug: &str) -> bool {
+    const RESERVED: [&str; 13] = [
+        "api",
+        "sign",
+        "verify",
+        "kms",
+        "registry",
+        "inference",
+        "app",
+        "apps",
+        "www",
+        "mail",
+        "docs",
+        "status",
+        "admin",
+    ];
+    let bytes = slug.as_bytes();
+    (3..=48).contains(&bytes.len())
+        && bytes.first().is_some_and(u8::is_ascii_lowercase)
+        && bytes.last().is_some_and(|b| *b != b'-')
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+        && !slug.contains("--")
+        && !RESERVED.contains(&slug)
+}
 
 fn is_segment(name: &str, max: usize) -> bool {
     let bytes = name.as_bytes();
@@ -90,6 +124,32 @@ mod tests {
             "a\u{0}",
         ] {
             assert!(!is_key_purpose(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn slug_is_one_dns_label_that_names_no_platform_host() {
+        let longest = format!("a{}", "0".repeat(47));
+        for ok in ["abc", "rafay-0123abcd", "a-b", "a10", longest.as_str()] {
+            assert!(is_slug(ok), "{ok:?}");
+        }
+        let too_long = format!("{longest}0");
+        for bad in [
+            "",
+            "ab",
+            too_long.as_str(),
+            "1abc",
+            "-abc",
+            "abc-",
+            "a--b",
+            "Abc",
+            "a_b",
+            "a.b",
+            "sign",
+            "api",
+            "app",
+        ] {
+            assert!(!is_slug(bad), "{bad:?}");
         }
     }
 

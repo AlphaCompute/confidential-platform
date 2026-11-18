@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 
 use crate::deploy::RUNTIME_SERVICE;
 
-const ANNOTATION: &str = "io.katacontainers.config.hypervisor.cc_init_data";
+pub const ANNOTATION: &str = "io.katacontainers.config.hypervisor.cc_init_data";
 
 /// `bin/genpolicy` of `kata-tools-static-4.0.0-amd64.tar.zst`, the Kata 4.0.0 release build.
 const GENPOLICY_SHA256: &str = "4fa1cabd8d6e757c271caa991b889e1c2ccdbbdce58872b8b581720b3867be36";
