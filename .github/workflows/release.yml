@@ -152,7 +152,7 @@ jobs:
           digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$repository:$GITHUB_REF_NAME")
           echo "pushed $digest" >> "$GITHUB_STEP_SUMMARY"
           mkdir pushed
-          echo "$digest" > pushed/digest
+          echo "$digest" > "pushed/$NAME"
           {
             echo "repository=$repository"
             echo "sha256=${digest#*@}"
@@ -169,6 +169,36 @@ jobs:
         with:
           name: ${{ matrix.image.name }}-digest
           path: pushed
+          if-no-files-found: error
+
+  # Every pushed and attested image by name, the list a platform document's pins and a catalog
+  # entry's runtime image are copied from. An image whose build, push or attestation failed is
+  # missing, and its image job has already failed the run.
+  digests:
+    needs: image
+    if: ${{ !cancelled() && needs.image.result != 'skipped' && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: "*-digest"
+          path: pushed
+          merge-multiple: true
+      - name: List the pushed images by digest
+        run: |
+          mkdir release
+          for f in pushed/*; do
+            jq -n --arg name "${f#pushed/}" --rawfile ref "$f" '{($name): ($ref | rtrimstr("\n"))}'
+          done | jq -S -s 'add' > release/images.json
+          {
+            echo '```json'
+            cat release/images.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-images
+          path: release
           if-no-files-found: error
 
   # The renders run the CLI and its dependencies' build scripts, and the Kata tools, so they get
@@ -199,7 +229,7 @@ jobs:
         with:
           name: ${{ matrix.name }}-digest
           path: pushed
-      - run: echo "KMS_IMAGE=$(cat pushed/digest)" >> "$GITHUB_ENV"
+      - run: echo "KMS_IMAGE=$(cat "pushed/$NAME")" >> "$GITHUB_ENV"
       # The unsigned release manifest: the compose of the KMS node with this image, in the bytes
       # Phala measures, and its compose_hash for the release-key holder to sign into kms_revisions.
       - name: Render the KMS compose from the pushed digest
