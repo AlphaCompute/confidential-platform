@@ -469,52 +469,56 @@ fn canonical_json_gives_the_recorded_digest_for_every_jcs_vector() {
 }
 
 #[wasm_bindgen_test]
-fn verify_catalog_gives_the_recorded_verdicts_and_the_rendered_compose() {
+fn verify_catalog_gives_the_recorded_verdicts_and_the_rendered_init_data() {
     let expected: Value =
         serde_json::from_str(include_str!("../../../testdata/catalog/expected.json")).unwrap();
     let key = expected["catalog_key"].to_string();
     let app_id = expected["app_id"].as_str().unwrap();
+    let slug = expected["slug"].as_str().unwrap();
     let vectors = [
-        vector!("catalog", "name-absent.json"),
-        vector!("catalog", "name-repeated.json"),
         vector!("catalog", "signed-by-other-key.json"),
-        vector!("catalog", "signed-by-release-key.json"),
+        vector!("catalog", "substitutions-miscounted.json"),
         vector!("catalog", "template-tampered.json"),
         vector!("catalog", "valid.json"),
     ];
     for (name, text) in vectors {
-        let verdicts = &expected["vectors"][name];
-        let code = [&verdicts["signature"], &verdicts["render"]]
-            .into_iter()
-            .map(|v| v.as_str().unwrap())
-            .find(|v| *v != "ok");
-        match (verify_catalog(text, &key, app_id), code) {
-            (Ok(out), None) => {
+        match (
+            verify_catalog(text, &key, app_id, slug),
+            expected["vectors"][name].as_str().unwrap(),
+        ) {
+            (Ok(out), "ok") => {
                 let out: Value = serde_json::from_str(&out).unwrap();
                 let file: Value = serde_json::from_str(text).unwrap();
                 assert_eq!(out["entry"], file["entry"], "{name}");
                 assert_eq!(
-                    out["compose"].as_str().unwrap().as_bytes(),
-                    include_bytes!("../../../testdata/catalog/app-compose.json"),
+                    out["init_data"],
+                    include_str!("../../../testdata/catalog/init-data.toml"),
                     "{name}"
                 );
+                assert_eq!(out["revision"], expected["compose_hash"], "{name}");
             }
-            (Err(e), Some(code)) => {
+            (Err(e), code) if code != "ok" => {
                 let m = message(e);
                 assert!(m.starts_with(&format!("{code}:")), "{name}: {m}");
             }
-            (Ok(_), Some(code)) => panic!("{name}: accepted, expected {code}"),
-            (Err(e), None) => panic!("{name}: refused: {}", message(e)),
+            (Ok(_), code) => panic!("{name}: accepted, expected {code}"),
+            (Err(e), _) => panic!("{name}: refused: {}", message(e)),
         }
     }
 
     let valid = include_str!("../../../testdata/catalog/valid.json");
     let repeated = valid.replacen('{', r#"{"template":"x","#, 1);
-    let m = message(verify_catalog(&repeated, &key, app_id).err().unwrap());
+    let m = message(verify_catalog(&repeated, &key, app_id, slug).err().unwrap());
     assert!(m.starts_with("malformed:"), "{m}");
     let not_ed25519 =
         json!({"algorithm": "ecdsa-p256", "public_key": expected["catalog_key"]["public_key"]})
             .to_string();
-    let m = message(verify_catalog(valid, &not_ed25519, app_id).err().unwrap());
+    let m = message(
+        verify_catalog(valid, &not_ed25519, app_id, slug)
+            .err()
+            .unwrap(),
+    );
+    assert!(m.starts_with("malformed:"), "{m}");
+    let m = message(verify_catalog(valid, &key, app_id, "a--b").err().unwrap());
     assert!(m.starts_with("malformed:"), "{m}");
 }

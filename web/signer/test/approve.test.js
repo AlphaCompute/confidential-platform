@@ -8,7 +8,6 @@ const {
   TICKET,
   approvalApi,
   b64u,
-  catalogFile,
   contextDigest,
   deniedStorage,
   iso,
@@ -532,117 +531,57 @@ const CATALOG = JSON.parse(testdata("catalog/expected.json"));
 const VALID = testdata("catalog/valid.json");
 const VALID_FILE = JSON.parse(VALID);
 const TEMPLATE_HEX = VALID_FILE.entry.template_sha256.slice("sha256:".length);
-const CATALOG_COMPOSE = testdata("catalog/app-compose.json");
+const CATALOG_INIT_DATA = testdata("catalog/init-data.toml");
 const CATALOG_REFUSED =
   "The catalog entry for this launch is not signed by AlphaCompute. Nothing was signed.";
-const NIL_NAME = '"name":"00000000-0000-0000-0000-000000000000"';
 const hex = (text) => sha256(text).toString("hex");
 
 function catalogPage(files, apiOptions = {}, pageOptions = {}) {
+  const view = testView();
+  view.view.kata_policy = JSON.parse(testdata("attest/b300-kata-4.0.0/platform-document.json")).kata_policy;
+  view.viewText = JSON.stringify(view.view);
   return approvalPage(
     {
       app_id: CATALOG.app_id,
+      slug: CATALOG.slug,
       compose_hash: CATALOG.compose_hash,
       catalog_template_sha256: VALID_FILE.entry.template_sha256,
       ...apiOptions,
     },
     { catalog: files, ...pageOptions },
+    view,
   );
 }
 
-test("a catalog app is rendered in wasm and its hash must match", async () => {
+test("a catalog app is rendered in wasm for its App and slug and its hash must match", async () => {
   const { api, page } = await catalogPage({ [`${TEMPLATE_HEX}.json`]: VALID });
   assert.ok(page.fetches.some((f) => f.url === `./catalog/${TEMPLATE_HEX}.json`));
   const text = page.text();
-  for (const line of [
-    "CPU App, version 1",
-    "Machine: 1 vCPU, 2048 MiB",
-    "Image: alpha-cpu-app",
-    `Digest: ${shortDigest(`sha256:${"3a".repeat(32)}`)}`,
-    "Published ports: 443:8443",
-    "Image: alpha-runtime",
-  ]) {
+  for (const line of ["Confidential container, version 1", "Machine: 1 vCPU, 2048 MiB", "Image: alpine"]) {
     assert.ok(text.includes(line), `${line}\n${text}`);
   }
-  assert.ok(!text.includes("The service sets the machine size"));
   await page.click("Approve with passkey");
-  assert.equal(api.revisions[0].body.payload.compose, CATALOG_COMPOSE);
+  assert.equal(api.revisions[0].body.payload.init_data, CATALOG_INIT_DATA);
   assert.ok(page.text().includes(APPROVED), page.text());
 });
 
-test("a catalog entry that does not verify is refused", async () => {
-  for (const name of [
-    "signed-by-other-key.json",
-    "signed-by-release-key.json",
-    "template-tampered.json",
-    "name-repeated.json",
-    "name-absent.json",
-  ]) {
+test("a catalog entry that does not verify or render is refused", async () => {
+  for (const name of Object.keys(CATALOG.vectors).filter((n) => CATALOG.vectors[n] !== "ok")) {
     const { page, laptop } = await catalogPage({ [`${TEMPLATE_HEX}.json`]: testdata(`catalog/${name}`) });
     assert.equal(page.text(), CATALOG_REFUSED, name);
     assert.equal(laptop.log.length, 0, name);
   }
+  const files = { [`${TEMPLATE_HEX}.json`]: VALID };
+  for (const options of [{ slug: undefined }, { slug: "a--b" }]) {
+    const { page } = await catalogPage(files, options);
+    assert.equal(page.text(), CATALOG_REFUSED, JSON.stringify(options));
+  }
   const missing = await catalogPage({});
   assert.equal(missing.page.text(), CATALOG_REFUSED);
 
-  const { view } = testView();
-  delete view.catalog_key;
-  const { page } = await approvalPage(
-    {
-      app_id: CATALOG.app_id,
-      compose_hash: CATALOG.compose_hash,
-      catalog_template_sha256: VALID_FILE.entry.template_sha256,
-    },
-    { catalog: { [`${TEMPLATE_HEX}.json`]: VALID } },
-    { view, viewText: JSON.stringify(view) },
-  );
-  assert.equal(page.text(), CATALOG_REFUSED);
-
-  const other = await catalogPage(
-    { [`${TEMPLATE_HEX}.json`]: VALID },
-    { compose_hash: `sha256:${"0".repeat(64)}` },
-  );
+  const other = await catalogPage(files, { slug: "other" });
   assert.equal(other.page.text(), MISMATCH);
   assert.equal(other.laptop.log.length, 0);
-});
-
-test("a replacement names both versions only when the old entry verifies", async () => {
-  const oldTemplate = VALID_FILE.template.replace(
-    "alpha-cpu-app@sha256:3a",
-    "alpha-cpu-app@sha256:4a",
-  );
-  assert.notEqual(oldTemplate, VALID_FILE.template);
-  const oldEntry = { ...VALID_FILE.entry, version: "0", template_sha256: `sha256:${hex(oldTemplate)}` };
-  const oldCompose = oldTemplate.replace(NIL_NAME, `"name":"${CATALOG.app_id}"`);
-  const current = { compose_hash: `sha256:${hex(oldCompose)}`, compose: oldCompose };
-  const files = (old) => ({ [`${TEMPLATE_HEX}.json`]: VALID, [`${hex(oldTemplate)}.json`]: old });
-
-  const named = await catalogPage(files(catalogFile(oldEntry, oldTemplate)), { current });
-  assert.ok(named.page.text().includes("CPU App, version 0 → 1"), named.page.text());
-  assert.ok(!named.page.text().includes("not from this catalog"));
-
-  const forged = JSON.parse(catalogFile(oldEntry, oldTemplate));
-  forged.signature.signature = `A${forged.signature.signature.slice(1)}`;
-  const elsewhere = catalogFile({ ...oldEntry, catalog_id: "gpu-app" }, oldTemplate);
-  for (const [name, old] of [
-    ["no catalog file", undefined],
-    ["a forged signature", JSON.stringify(forged)],
-    ["another catalog id", elsewhere],
-  ]) {
-    const { page } = await catalogPage(files(old), { current });
-    const text = page.text();
-    assert.ok(text.includes("replacing a launch not from this catalog"), `${name}: ${text}`);
-    assert.ok(!text.includes("version 0"), name);
-    assert.ok(text.includes("CPU App, version 1"), name);
-    const line = text.split("\n").find((l) => l.startsWith("app: "));
-    assert.ok(line, `${name}: ${text}`);
-    assert.ok(line.includes("according to the service"), line);
-    assert.ok(line.includes(`alpha-cpu-app@sha256:4a${"3a".repeat(31)}`), line);
-    assert.ok(
-      !text.split("\n").some((l) => l.startsWith("alpha-runtime: ") && l.includes("according to the service")),
-      name,
-    );
-  }
 });
 
 test("decline cancels the request", async () => {

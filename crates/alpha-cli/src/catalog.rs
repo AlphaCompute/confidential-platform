@@ -1,14 +1,18 @@
-//! `alpha catalog sign`: the spec `alpha deploy` reads becomes a catalog file whose template is
-//! that command's `app-compose.json` for the nil App id, signed with the catalog key.
+//! `alpha catalog sign`: the Pod `alpha coco render --app-id 00000000-0000-0000-0000-000000000000`
+//! wrote becomes a catalog file: its init-data is the template, and the Pod without the init-data
+//! annotation is the pod.
 
-use alpha_core::catalog::{CatalogFile, Entry, Resources};
-use alpha_core::{AppId, compose_hash};
+use alpha_core::catalog::{CatalogFile, Entry, Resources, Substitutions};
+use std::collections::BTreeMap;
+
+use alpha_core::{AppId, InitData, compose_hash};
 use ed25519_dalek::SigningKey;
+use serde_yaml_ng::Value as Yaml;
 
-use crate::deploy::AppSpec;
+use crate::coco;
 
 pub fn sign(
-    mut spec: AppSpec,
+    rendered_pod: &str,
     catalog_id: &str,
     version: &str,
     title: &str,
@@ -23,18 +27,143 @@ pub fn sign(
             return Err(format!("{flag} is empty"));
         }
     }
-    let resources: Resources =
-        serde_json::from_value(spec.resources.clone()).map_err(|e| format!("resources: {e}"))?;
-    spec.app_id = AppId::from(uuid::Uuid::nil());
-    let template = crate::deploy::compose(&spec)?;
+    let (app_id, _, template) = coco::rendered_init_data(rendered_pod)?;
+    if app_id != AppId::from(uuid::Uuid::nil()) {
+        return Err(format!(
+            "init-data names App {app_id}; render with --app-id {}",
+            alpha_core::catalog::NIL_APP_ID
+        ));
+    }
+    let pod = without_init_data(rendered_pod)?;
+    // Re-check in case the file was edited: refuses a tagged image.
+    coco::parse(pod.as_bytes())?;
+    if pod_images(&pod)? != policy_images(&template)? {
+        return Err(
+            "the Pod's images are not the ones its init-data policy admits; render it again".into(),
+        );
+    }
     let entry = Entry {
         catalog_id: catalog_id.into(),
         version: version.into(),
         title: title.into(),
         template_sha256: compose_hash(&template),
-        resources,
+        pod_sha256: compose_hash(&pod),
+        resources: shape(&pod)?,
+        substitutions: Substitutions::count(&template, &pod).map_err(|e| e.to_string())?,
     };
-    alpha_core::catalog::sign(entry, template, key).map_err(|e| e.to_string())
+    alpha_core::catalog::sign(entry, template, pod, key).map_err(|e| e.to_string())
+}
+
+fn without_init_data(pod: &str) -> Result<String, String> {
+    let mut spec: Yaml = serde_yaml_ng::from_str(pod).map_err(|e| format!("pod spec: {e}"))?;
+    if let Some(Yaml::Mapping(annotations)) = spec
+        .get_mut("metadata")
+        .and_then(|m| m.get_mut("annotations"))
+    {
+        annotations.remove(coco::ANNOTATION);
+    }
+    serde_yaml_ng::to_string(&spec).map_err(|e| format!("pod spec: {e}"))
+}
+
+/// Container name to image, as the Pod declares them.
+fn pod_images(pod: &str) -> Result<BTreeMap<String, String>, String> {
+    let spec: Yaml = serde_yaml_ng::from_str(pod).map_err(|e| format!("pod spec: {e}"))?;
+    ["initContainers", "containers"]
+        .into_iter()
+        .filter_map(|list| spec.get("spec")?.get(list)?.as_sequence())
+        .flatten()
+        .map(|c| {
+            let field = |key: &str| c.get(key).and_then(Yaml::as_str).map(str::to_owned);
+            field("name")
+                .zip(field("image"))
+                .ok_or_else(|| "pod spec: a container has no name or image".to_owned())
+        })
+        .collect()
+}
+
+/// Container name to image, as the agent policy admits them; the pause container is not the Pod's.
+fn policy_images(template: &str) -> Result<BTreeMap<String, String>, String> {
+    let containers = InitData::parse(template.to_owned())
+        .and_then(|i| i.containers())
+        .map_err(|e| format!("init-data: {e}"))?;
+    let annotations = containers
+        .as_array()
+        .ok_or("init-data: policy containers are not a list")?
+        .iter()
+        .filter_map(|c| c.get("OCI")?.get("Annotations"));
+    let mut images = BTreeMap::new();
+    for a in annotations {
+        let field = |key: &str| a.get(key).and_then(serde_json::Value::as_str);
+        if field("io.kubernetes.cri.container-type") != Some("container") {
+            continue;
+        }
+        let (Some(name), Some(image)) = (
+            field("io.kubernetes.cri.container-name"),
+            field("io.kubernetes.cri.image-name"),
+        ) else {
+            return Err("init-data: a policy container has no name or image".into());
+        };
+        images.insert(name.to_owned(), image.to_owned());
+    }
+    Ok(images)
+}
+
+/// The TD Kata boots for the Pod: 1 vCPU and 2048 MiB plus the summed container limits. Only whole
+/// vCPUs and `Mi` or `Gi` memory are accepted, so the signed shape is exactly the TD's.
+fn shape(pod: &str) -> Result<Resources, String> {
+    let spec: Yaml = serde_yaml_ng::from_str(pod).map_err(|e| format!("pod spec: {e}"))?;
+    let pod_spec = spec.get("spec").ok_or("pod spec: no spec")?;
+    // Kata sizes the TD from the containers' limits only, so any other sizing would not be signed.
+    let init_sized = pod_spec
+        .get("initContainers")
+        .and_then(Yaml::as_sequence)
+        .into_iter()
+        .flatten()
+        .any(|c| c.get("resources").is_some());
+    if init_sized || pod_spec.get("resources").is_some() {
+        return Err("pod spec: set resources on containers only".into());
+    }
+    let containers = pod_spec
+        .get("containers")
+        .and_then(Yaml::as_sequence)
+        .ok_or("pod spec: no spec.containers")?;
+    let mut shape = Resources {
+        cpu: 1,
+        memory_mib: 2048,
+    };
+    for limits in containers
+        .iter()
+        .filter_map(|c| c.get("resources")?.get("limits")?.as_mapping())
+    {
+        for (name, value) in limits {
+            let value = match value {
+                Yaml::String(s) => s.clone(),
+                Yaml::Number(n) => n.to_string(),
+                _ => String::new(),
+            };
+            let (total, add) = match name.as_str() {
+                Some("cpu") => (&mut shape.cpu, value.parse().ok()),
+                Some("memory") => (
+                    &mut shape.memory_mib,
+                    value
+                        .strip_suffix("Gi")
+                        .and_then(|g| g.parse::<u32>().ok()?.checked_mul(1024))
+                        .or_else(|| value.strip_suffix("Mi")?.parse().ok()),
+                ),
+                _ => {
+                    return Err(format!(
+                        "limits: {name:?}; a catalog Pod limits only cpu and memory"
+                    ));
+                }
+            };
+            *total = add.and_then(|n| total.checked_add(n)).ok_or_else(|| {
+                format!(
+                    "limits: {name:?} {value:?}; write whole vCPUs, and memory as <n>Mi or <n>Gi"
+                )
+            })?;
+        }
+    }
+    Ok(shape)
 }
 
 /// The bare hex of `template_sha256`: a colon does not belong in a file name.
@@ -59,130 +188,120 @@ mod tests {
     use std::path::PathBuf;
 
     use alpha_core::CatalogKey;
-    use alpha_core::catalog::{render, verify};
+    use alpha_core::catalog::{PUBLIC_NAME, render};
 
     use super::*;
-    use crate::deploy::parse;
 
-    fn vector() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/manifest/05-deploy")
-    }
+    const K3: &str = include_str!("../../../testdata/attest/b300-kata-4.0.0/k3-app.toml");
+    const K3_POD: &str = include_str!("../../../testdata/attest/b300-kata-4.0.0/k3-pod.yaml");
+    const APP_ID: &str = "01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b";
+    const SLUG: &str = "board";
 
     fn signing_key() -> SigningKey {
         SigningKey::from_bytes(&[11u8; 32])
     }
 
-    const SPEC: &str = include_str!("../../../testdata/catalog/app.yaml");
+    const LABELS: [&str; 3] = ["confidential-container", "1", "Confidential container"];
 
-    const APP_ID: &str = "01994b3e-5c8a-7d3e-9a1b-2c3d4e5f6a7b";
+    fn signed(pod: &str, [id, version, title]: [&str; 3]) -> Result<CatalogFile, String> {
+        sign(pod, id, version, title, &signing_key())
+    }
+
+    /// k3's Pod and init-data, which genpolicy wrote for that Pod, with the public name in the
+    /// container's env and `app_id` in `[data]`, as `alpha coco render` writes them.
+    fn rendered_pod(app_id: AppId) -> String {
+        use std::io::Write as _;
+        let (rules, data) = K3.split_once("\npolicy_data := ").unwrap();
+        let data = data.replacen(
+            "\"HOSTNAME=$(host-name)\"",
+            &format!(
+                "\"HOSTNAME=$(host-name)\",\n            \"ALPHACOMPUTE_PUBLIC_NAME={PUBLIC_NAME}\""
+            ),
+            1,
+        );
+        let init_data = format!("{rules}\npolicy_data := {data}").replacen(
+            "0199e000-0000-7000-8000-00000000a11d",
+            &app_id.to_string(),
+            1,
+        );
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        gzip.write_all(init_data.as_bytes()).unwrap();
+        let annotation =
+            base64::Engine::encode(&base64::prelude::BASE64_STANDARD, gzip.finish().unwrap());
+        let pod = K3_POD.replace(
+            "    image: public",
+            &format!(
+                "    env:\n    - {{name: ALPHACOMPUTE_PUBLIC_NAME, value: {PUBLIC_NAME}}}\n    image: public"
+            ),
+        );
+        let mut spec: Yaml = serde_yaml_ng::from_str(&pod).unwrap();
+        spec["metadata"]["annotations"] =
+            serde_yaml_ng::Mapping::from_iter([(coco::ANNOTATION.into(), annotation.into())])
+                .into();
+        serde_yaml_ng::to_string(&spec).unwrap()
+    }
+
+    fn template_pod() -> String {
+        rendered_pod(AppId::from(uuid::Uuid::nil()))
+    }
 
     fn catalog_vectors() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/catalog")
     }
 
-    fn app_id() -> AppId {
-        APP_ID.parse().unwrap()
-    }
-
-    fn valid() -> CatalogFile {
-        sign(
-            parse(SPEC).unwrap(),
-            "cpu-app",
-            "1",
-            "CPU App",
-            &signing_key(),
-        )
-        .unwrap()
-    }
-
-    /// Every file under `testdata/catalog`; each catalog file differs from `valid.json` in one
-    /// respect only, so its refusal can come only from the check that respect exercises.
+    /// Every file under `testdata/catalog`. The page renders `valid.json` in wasm and must get
+    /// `init-data.toml`; each other catalog file differs from it in one respect only.
     fn vectors() -> Vec<(&'static str, Vec<u8>)> {
-        let valid = valid();
-        let rendered = render(&valid.template, &valid.entry.template_sha256, app_id()).unwrap();
-        let signed = |template: String, seed: u8| {
-            let entry = Entry {
-                template_sha256: compose_hash(&template),
-                ..valid.entry.clone()
-            };
-            alpha_core::catalog::sign(entry, template, &SigningKey::from_bytes(&[seed; 32]))
-                .unwrap()
+        let valid = signed(&template_pod(), LABELS).unwrap();
+        let catalog_key = CatalogKey::from(&signing_key().verifying_key());
+        let rendered = render(&valid, &catalog_key, APP_ID.parse().unwrap(), SLUG).unwrap();
+
+        let resign = |entry: Entry, seed: u8| {
+            alpha_core::catalog::sign(
+                entry,
+                valid.template.clone(),
+                valid.pod.clone(),
+                &SigningKey::from_bytes(&[seed; 32]),
+            )
+            .unwrap()
         };
-
-        // `alpha catalog sign` cannot produce a template whose nil name is absent or repeated, since
-        // `deploy::compose` refuses one; these are signed through the core function directly.
-        let mut spec = parse(SPEC).unwrap();
-        spec.app_id = app_id();
-        let deployed = crate::deploy::compose(&spec).unwrap();
-        assert_eq!(rendered, deployed);
-        // Go's encoding/json escapes these unless told not to, so a consumer that re-marshals the
-        // compose fails the byte comparison instead of passing by luck.
-        for raw in ["&&", ">", "$("] {
-            assert!(deployed.contains(raw), "{raw}");
-        }
-        let name_absent = signed(deployed, 11);
-
-        let mut repeated: serde_json::Value = serde_json::from_str(&valid.template).unwrap();
-        let previous = repeated.as_object_mut().unwrap().insert(
-            "labels".into(),
-            serde_json::json!({"name": "00000000-0000-0000-0000-000000000000"}),
-        );
-        assert!(previous.is_none());
-        let name_repeated = signed(alpha_core::phala::canonicalize(&repeated).unwrap(), 11);
-
         let mut tampered = valid.clone();
-        assert_eq!(tampered.template.matches("\"kms_enabled\":true").count(), 1);
-        tampered.template = tampered
-            .template
-            .replace("\"kms_enabled\":true", "\"kms_enabled\":false");
+        tampered.template = tampered.template.replacen("(c) 2023", "(c) 2024", 1);
+        let mut miscounted = valid.entry.clone();
+        miscounted.substitutions.public_name = 1;
 
-        let catalog: Vec<(&'static str, CatalogFile, &str, &str)> = vec![
-            ("valid.json", valid.clone(), "ok", "ok"),
+        let catalog = [
+            ("valid.json", valid.clone(), "ok"),
             (
                 "signed-by-other-key.json",
-                signed(valid.template.clone(), 13),
+                resign(valid.entry.clone(), 13),
                 "signature_invalid",
-                "ok",
             ),
+            ("template-tampered.json", tampered, "template_mismatch"),
             (
-                "signed-by-release-key.json",
-                signed(valid.template.clone(), 12),
-                "signature_invalid",
-                "ok",
-            ),
-            ("name-absent.json", name_absent, "ok", "name_not_once"),
-            ("name-repeated.json", name_repeated, "ok", "name_not_once"),
-            (
-                "template-tampered.json",
-                tampered,
-                "ok",
-                "template_mismatch",
+                "substitutions-miscounted.json",
+                resign(miscounted, 11),
+                "substitutions_mismatch",
             ),
         ];
         let verdicts: serde_json::Map<String, serde_json::Value> = catalog
             .iter()
-            .map(|(name, _, signature, render)| {
-                (
-                    (*name).to_owned(),
-                    serde_json::json!({"signature": signature, "render": render}),
-                )
-            })
+            .map(|(name, _, verdict)| ((*name).to_owned(), (*verdict).into()))
             .collect();
-        let expected = serde_json::json!({
+        let mut expected = alpha_core::jcs(&serde_json::json!({
             "app_id": APP_ID,
-            "compose_hash": compose_hash(&rendered),
-            "catalog_key": CatalogKey::from(&signing_key().verifying_key()),
-            "release_key": CatalogKey::from(&SigningKey::from_bytes(&[12u8; 32]).verifying_key()),
+            "slug": SLUG,
+            "compose_hash": rendered.revision,
+            "catalog_key": catalog_key,
             "vectors": verdicts,
-        });
-        let mut expected = alpha_core::jcs(&expected).unwrap();
+        }))
+        .unwrap();
         expected.push(b'\n');
         let mut files = vec![
-            ("app.yaml", SPEC.as_bytes().to_vec()),
-            ("app-compose.json", rendered.into_bytes()),
+            ("init-data.toml", rendered.init_data.into_bytes()),
             ("expected.json", expected),
         ];
-        for (name, file, _, _) in &catalog {
+        for (name, file, _) in &catalog {
             files.push((*name, file_bytes(file).unwrap()));
         }
         files
@@ -203,88 +322,98 @@ mod tests {
             let on_disk = fs::read(dir.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert!(on_disk == *bytes, "{name} does not regenerate");
         }
-        let mut listed: Vec<String> = fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .collect();
-        listed.sort();
-        let mut generated: Vec<String> = files.iter().map(|(n, _)| (*n).to_owned()).collect();
-        generated.sort();
-        assert_eq!(listed, generated);
     }
 
     #[test]
-    fn a_signed_template_renders_to_the_deploy_vector() {
-        let spec = parse(&fs::read_to_string(vector().join("app.yaml")).unwrap()).unwrap();
-        let app_id = spec.app_id;
-        let key = signing_key();
-        let file = sign(spec, "cpu-app", "1", "CPU App", &key).unwrap();
-        let catalog_key: CatalogKey = serde_json::from_value(
-            serde_json::to_value(CatalogKey::from(&key.verifying_key())).unwrap(),
-        )
+    fn the_preview_entry_passes_the_pod_checks_once_its_inputs_are_set() {
+        let template = include_str!("../../../deploy/kata/catalog/confidential-container.yaml")
+            .replace(
+                "${RUNTIME_IMAGE}",
+                &format!(
+                    "ghcr.io/alphacompute/alpha-runtime@sha256:{}",
+                    "3a".repeat(32)
+                ),
+            );
+        assert_eq!(template.matches(PUBLIC_NAME).count(), 1);
+        coco::parse(template.as_bytes()).unwrap();
+        alpha_core::Openings::parse(include_str!(
+            "../../../deploy/kata/catalog/confidential-container.network.toml"
+        ))
         .unwrap();
-        verify(&file, &catalog_key).unwrap();
         assert_eq!(
-            file.entry.resources,
+            shape(&template).unwrap(),
             Resources {
-                cpu: 1,
-                memory_mib: 2048
+                cpu: 2,
+                memory_mib: 4096
             }
         );
-        let expected = fs::read_to_string(vector().join("app-compose.json")).unwrap();
-        assert_eq!(
-            render(&file.template, &file.entry.template_sha256, app_id).unwrap(),
-            expected
-        );
     }
 
     #[test]
-    fn the_file_is_named_by_its_template_hash() {
-        let spec = parse(&fs::read_to_string(vector().join("app.yaml")).unwrap()).unwrap();
-        let file = sign(spec, "cpu-app", "1", "CPU App", &signing_key()).unwrap();
+    fn the_shape_refuses_limits_the_td_does_not_get_exactly() {
+        let with = |limits: &str| {
+            K3_POD.replace(
+                "    image: public",
+                &format!("    resources:\n      limits: {{{limits}}}\n    image: public"),
+            )
+        };
+        assert_eq!(
+            shape(&with("cpu: 2, memory: 512Mi")).unwrap(),
+            Resources {
+                cpu: 3,
+                memory_mib: 2560
+            }
+        );
+        for limits in [
+            "cpu: 500m",
+            "memory: 1G",
+            "memory: 4194304Gi",
+            "nvidia.com/pgpu: 1",
+        ] {
+            assert!(shape(&with(limits)).is_err(), "{limits}");
+        }
+        let pod_level = K3_POD.replace("spec:\n", "spec:\n  resources: {limits: {cpu: 1}}\n");
+        assert!(shape(&pod_level).is_err());
+    }
+
+    #[test]
+    fn the_pod_drops_only_the_init_data_annotation() {
+        let file = signed(&template_pod(), LABELS).unwrap();
+        assert!(!file.pod.contains(coco::ANNOTATION));
+        assert!(file.pod.contains(PUBLIC_NAME));
         let name = file_name(&file);
-        let hex = name.strip_suffix(".json").unwrap();
         assert_eq!(
             file.entry.template_sha256.to_string(),
-            format!("sha256:{hex}")
+            format!("sha256:{}", name.strip_suffix(".json").unwrap())
         );
-        let bytes = file_bytes(&file).unwrap();
-        assert_eq!(bytes.last(), Some(&b'\n'));
-        assert_eq!(serde_json::from_slice::<CatalogFile>(&bytes).unwrap(), file);
     }
 
     #[test]
-    fn signing_refuses_empty_labels_missing_resources_or_a_tagged_image() {
-        let base = fs::read_to_string(vector().join("app.yaml")).unwrap();
-        let key = signing_key();
-        let sign_yaml = |yaml: &str, id: &str, version: &str, title: &str| {
-            sign(parse(yaml).unwrap(), id, version, title, &key).unwrap_err()
-        };
-        for (id, version, title, flag) in [
-            ("", "1", "CPU App", "--id"),
-            ("cpu-app", "", "CPU App", "--version"),
-            ("cpu-app", "1", "", "--title"),
+    fn signing_refuses_empty_labels_another_app_or_a_tagged_image() {
+        let pod = template_pod();
+        for (labels, flag) in [
+            (["", "1", "Confidential container"], "--id"),
+            (["confidential-container", "1", ""], "--title"),
         ] {
-            let err = sign_yaml(&base, id, version, title);
+            let err = signed(&pod, labels).unwrap_err();
             assert!(err.contains(flag), "{err}");
         }
-        let resources = "resources:\n  cpu: 1\n  memory_mib: 2048\n";
-        assert!(base.contains(resources));
-        for yaml in [
-            base.replace(resources, ""),
-            base.replace(resources, &format!("{resources}  gpu: 1\n")),
-        ] {
-            let err = sign_yaml(&yaml, "cpu-app", "1", "CPU App");
-            assert!(err.starts_with("resources: "), "{err}");
-        }
-        let tagged = base.replace(
-            "ghcr.io/acme/app@sha256:3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a",
-            "ghcr.io/acme/app:latest",
+        let other_app = rendered_pod(APP_ID.parse().unwrap());
+        let err = signed(&other_app, LABELS).unwrap_err();
+        assert!(err.contains("--app-id"), "{err}");
+
+        let image = "public.ecr.aws/docker/library/alpine@sha256:5291449c3df73caf6ed85e649dec1b9e818b39a5d8c871e97afc13e9cd5e8fa8";
+        let swapped = pod.replace(
+            image,
+            &format!(
+                "public.ecr.aws/docker/library/alpine@sha256:{}",
+                "4b".repeat(32)
+            ),
         );
-        let err = sign_yaml(&tagged, "cpu-app", "1", "CPU App");
-        assert!(err.contains("digest"), "{err}");
-        let taken = base.replace("  app:\n", "  alpha-runtime:\n");
-        let err = sign_yaml(&taken, "cpu-app", "1", "CPU App");
-        assert!(err.contains("added by alpha deploy"), "{err}");
+        let err = signed(&swapped, LABELS).unwrap_err();
+        assert!(err.contains("policy admits"), "{err}");
+        let tagged = pod.replace(image, "public.ecr.aws/docker/library/alpine:3");
+        let err = signed(&tagged, LABELS).unwrap_err();
+        assert!(err.contains("sha256"), "{err}");
     }
 }
