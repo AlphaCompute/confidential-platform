@@ -111,9 +111,13 @@ async fn run() -> Result<(), Error> {
         .filter(|e| !e.is_empty())
         .collect::<Vec<_>>();
     // The pin only holds over TLS.
-    if kms_endpoints.is_empty() || kms_endpoints.iter().any(|e| !e.starts_with("https://")) {
+    let https_base = |e: &String| {
+        reqwest::Url::parse(e)
+            .is_ok_and(|u| u.scheme() == "https" && u.host_str().is_some() && u.query().is_none())
+    };
+    if kms_endpoints.is_empty() || !kms_endpoints.iter().all(https_base) {
         return Err(Error::internal(
-            "ALPHACOMPUTE_KMS_ENDPOINTS must list one or more https URLs",
+            "ALPHACOMPUTE_KMS_ENDPOINTS must list one or more https URLs with a host and no query",
         ));
     }
     let oidc = Oidc {

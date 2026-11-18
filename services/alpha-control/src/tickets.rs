@@ -202,7 +202,7 @@ pub(crate) async fn usable(
            o.disabled_at is not null as disabled, t.state, \
            t.expires_at <= clock_timestamp() as expired \
          from tickets t join organizations o on o.id = t.org_id \
-         where t.ticket = $1 for update of t",
+         where t.ticket = $1 for update of t for share of o",
     )
     .bind(ticket)
     .fetch_optional(&mut **tx)

@@ -1046,12 +1046,24 @@ async fn only_the_owners_session_roots_and_only_roster_keys_of_the_organization_
         read["principal_id"].is_string() && read.get("owner_email").is_none(),
         "{read}"
     );
+    // A key for anyone but the holder the ticket names is refused before the KMS.
+    let third = SigningKey::from_bytes(&[24; 32]);
+    let for_owner = json!({ "credential_id": "Y3JlZC0z",
+                            "registration": registration(&third, &org, &owner, Some((&root_id, &root))) });
+    let (status, _) = api
+        .call(
+            Method::POST,
+            &format!("/v1/tickets/{rooted_ticket}/kms/key"),
+            "",
+            for_owner,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
     sqlx::query("update tickets set expires_at = now() where ticket = $1")
         .bind(&rooted_ticket)
         .execute(&api.1)
         .await
         .unwrap();
-    let third = SigningKey::from_bytes(&[24; 32]);
     let body = json!({ "credential_id": "Y3JlZC0z",
                        "registration": registration(&third, &org, &owner, Some((&root_id, &root))) });
     let (status, expired) = api

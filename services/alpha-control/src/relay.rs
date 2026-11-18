@@ -91,6 +91,8 @@ pub async fn relay(
             .cloned()
             .unwrap_or_default();
         expected.insert("public_key".into(), public_key);
+        // The KMS answers a repeated key with its stored row, which may name another holder.
+        expected.insert("principal_id".into(), json!(found.owner));
     } else if signed.signature.key_id.is_none()
         || signed.payload.get("principal_id") != found.principal_id.map(|p| json!(p)).as_ref()
     {
