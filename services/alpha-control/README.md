@@ -11,7 +11,7 @@ The control plane: Organizations, their operational API keys and their Apps. It 
 | `DELETE /v1/orgs/{org}/keys/{id}` | operator token, or a key with scope `org:admin` in that Organization | Revokes the key. `204`. |
 | `PUT /v1/apps/{slug}` | a key with scope `apps:write` | Finds or creates the App and answers `{app_id, slug, endpoint}`. A slug of another Organization is `409`. Slugs are global and never reused. |
 | `POST /v1/apps/{slug}/revisions` | a key with scope `apps:write` | Takes `{catalog: <catalog file>}`. Verifies the file under the `catalog_key` of the current platform document and renders it for the App: its id and `<slug>.app.alphacompute.cc`. Checks the init-data against the document's `kata_policy` and `kms_ca_pem`, then stores it. Answers `201 {compose_hash}`, or `200` for a Revision already stored. It awaits approval by a roster key. A refused file is `400` with the catalog verdict in the message. |
-| `GET /v1/apps/{slug}/revisions/{compose_hash}` | a key with scope `apps:read` | `{compose_hash, app_id, init_data, pod, shape, catalog}`. |
+| `GET /v1/apps/{slug}/revisions/{compose_hash}` | a key with scope `apps:read` | `{compose_hash, init_data, pod, shape, catalog}`. |
 | `GET /healthz`, `GET /ready` | none | The process; the database. |
 
 Errors are `{"error": {"code", "message", "request_id"}}`. The codes are `unauthorized`, `forbidden`, `malformed`, `not_found`, `conflict`, `unavailable` and `internal`. A revoked key, or any key of a disabled Organization, is `401`. Every mutation writes an `audit_log` row in its own transaction.

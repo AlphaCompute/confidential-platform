@@ -14,6 +14,5 @@ create table revisions (
   init_data    text not null,
   pod          text not null,
   shape        jsonb not null,
-  catalog      jsonb not null,
-  created_at   timestamptz not null default now()
+  catalog      jsonb not null
 );

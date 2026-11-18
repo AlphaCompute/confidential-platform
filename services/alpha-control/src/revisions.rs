@@ -121,19 +121,19 @@ pub async fn get(
 ) -> Result<Json<Value>, Error> {
     let org_id = caller.org("apps:read")?;
     let hash: ComposeHash = hash.parse().map_err(|_| Error::NotFound)?;
-    let app_id = app_of(&state, org_id, &slug).await?;
     let (init_data, pod, shape, catalog): (String, String, Value, Value) = sqlx::query_as(
-        "select init_data, pod, shape, catalog from revisions \
-         where compose_hash = $1 and app_id = $2",
+        "select r.init_data, r.pod, r.shape, r.catalog from revisions r \
+         join apps a on a.id = r.app_id \
+         where r.compose_hash = $1 and a.org_id = $2 and a.slug = $3",
     )
     .bind(hash.as_bytes().as_slice())
-    .bind(app_id)
+    .bind(org_id)
+    .bind(&slug)
     .fetch_optional(&state.pool)
     .await?
     .ok_or(Error::NotFound)?;
     Ok(Json(json!({
         "compose_hash": hash,
-        "app_id": app_id,
         "init_data": init_data,
         "pod": pod,
         "shape": shape,
