@@ -342,15 +342,9 @@ async fn a_catalog_revision_is_rendered_for_its_app_and_stored_once() {
         .call(Method::POST, "/v1/apps/board/revisions", &a, body.clone())
         .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
-    assert_eq!(created["state"], "awaiting_approval");
     let hash = created["compose_hash"].as_str().unwrap();
     let (status, again) = api
-        .call(
-            Method::POST,
-            &format!("/v1/apps/{app_id}/revisions"),
-            &a,
-            body.clone(),
-        )
+        .call(Method::POST, "/v1/apps/board/revisions", &a, body.clone())
         .await;
     assert_eq!(
         (status, again["compose_hash"].as_str()),
@@ -377,13 +371,10 @@ async fn a_catalog_revision_is_rendered_for_its_app_and_stored_once() {
     );
     assert_eq!(read["shape"], catalog["entry"]["resources"]);
 
-    for (uri, bearer) in [
-        ("/v1/apps/board/revisions".to_owned(), b.as_str()),
-        (format!("/v1/apps/{app_id}/revisions"), b.as_str()),
-    ] {
-        let (status, _) = api.call(Method::POST, &uri, bearer, body.clone()).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-    }
+    let (status, _) = api
+        .call(Method::POST, "/v1/apps/board/revisions", &b, body.clone())
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _) = api
         .call(
             Method::GET,

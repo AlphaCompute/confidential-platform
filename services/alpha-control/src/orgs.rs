@@ -114,9 +114,13 @@ pub async fn create(
     }
 
     let mut tx = state.pool.begin().await?;
-    let (status, org_id) = match retried(&mut tx, &caller, &new).await? {
-        Some(org_id) => (StatusCode::OK, org_id),
-        None => (StatusCode::CREATED, insert(&mut tx, &caller, &new).await?),
+    let (status, action, org_id) = match retried(&mut tx, &caller, &new).await? {
+        Some(org_id) => (StatusCode::OK, "org.retry", org_id),
+        None => (
+            StatusCode::CREATED,
+            "org.create",
+            insert(&mut tx, &caller, &new).await?,
+        ),
     };
     let mut created = json!({ "org_id": org_id });
     let mut details = json!({ "links": new.links });
@@ -145,11 +149,6 @@ pub async fn create(
             json!({ "links": new.links, "deploy_key": { "id": id, "scopes": request.scopes } });
         created = json!({ "org_id": org_id, "deploy_key": { "id": id, "token": token, "scopes": request.scopes } });
     }
-    let action = if status == StatusCode::OK {
-        "org.retry"
-    } else {
-        "org.create"
-    };
     audit(
         &mut tx,
         &caller,
@@ -183,29 +182,30 @@ async fn retried(
     let Some(org_id) = linked else {
         return Ok(None);
     };
-    let (issuers, external_ids): (Vec<&str>, Vec<&str>) = new
-        .links
-        .iter()
-        .map(|l| (l.issuer.as_str(), l.external_id.as_str()))
-        .unzip();
-    let links = i64::try_from(new.links.len()).map_err(|_| Error::internal("link count"))?;
-    let same: Option<bool> = sqlx::query_scalar(
-        "select count(*) = $5 and count(*) filter (where (l.issuer, l.external_id) in \
-                (select * from unnest($6::text[], $7::text[]))) = $5 \
-         from organizations o join org_links l on l.org_id = o.id \
-         where o.id = $1 and o.name = $2 and o.owner_email = $3 and o.created_by = $4 \
-           and o.disabled_at is null and o.created_at > now() - interval '1 hour'",
+    let fresh: bool = sqlx::query_scalar(
+        "select exists (select 1 from organizations where id = $1 and name = $2 \
+         and owner_email = $3 and created_by = $4 and disabled_at is null \
+         and created_at > now() - interval '1 hour')",
     )
     .bind(org_id)
     .bind(&new.name)
     .bind(&new.owner_email)
     .bind(caller.actor())
-    .bind(links)
-    .bind(issuers)
-    .bind(external_ids)
     .fetch_one(&mut **tx)
     .await?;
-    if same != Some(true) {
+    let mut stored: Vec<(String, String)> =
+        sqlx::query_as("select issuer, external_id from org_links where org_id = $1")
+            .bind(org_id)
+            .fetch_all(&mut **tx)
+            .await?;
+    let mut asked: Vec<(String, String)> = new
+        .links
+        .iter()
+        .map(|l| (l.issuer.clone(), l.external_id.clone()))
+        .collect();
+    stored.sort_unstable();
+    asked.sort_unstable();
+    if !fresh || stored != asked {
         return Err(LINK_TAKEN);
     }
     Ok(Some(org_id))

@@ -25,11 +25,10 @@ pub struct NewRevision {
     pub catalog: CatalogFile,
 }
 
-/// The App named by its slug or its id, if the Organization holds it.
-async fn app_of(state: &AppState, org_id: Uuid, app: &str) -> Result<(Uuid, String), Error> {
-    sqlx::query_as("select id, slug from apps where org_id = $1 and (slug = $2 or id::text = $2)")
+async fn app_of(state: &AppState, org_id: Uuid, slug: &str) -> Result<Uuid, Error> {
+    sqlx::query_scalar("select id from apps where org_id = $1 and slug = $2")
         .bind(org_id)
-        .bind(app)
+        .bind(slug)
         .fetch_optional(&state.pool)
         .await?
         .ok_or(Error::NotFound)
@@ -48,7 +47,7 @@ async fn platform(state: &AppState) -> Result<(CatalogKey, KataPolicy, String), 
         .map_err(unavailable)?;
     let accepted = state
         .platform_version
-        .fetch_max(document.version, Ordering::SeqCst);
+        .fetch_max(document.version, Ordering::Relaxed);
     if document.version < accepted {
         return Err(Error::Unavailable(format!(
             "platform document version {} is below the accepted {accepted}",
@@ -66,12 +65,12 @@ async fn platform(state: &AppState) -> Result<(CatalogKey, KataPolicy, String), 
 pub async fn create(
     State(state): State<Arc<AppState>>,
     caller: Caller,
-    Path(app): Path<String>,
+    Path(slug): Path<String>,
     body: Result<Json<NewRevision>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), Error> {
     let org_id = caller.org("apps:write")?;
     let Json(new) = body?;
-    let (app_id, slug) = app_of(&state, org_id, &app).await?;
+    let app_id = app_of(&state, org_id, &slug).await?;
     let (catalog_key, kata_policy, kms_ca_pem) = platform(&state).await?;
     let rendered = catalog::render(&new.catalog, &catalog_key, app_id.into(), &slug)
         .map_err(|e| Error::Malformed(format!("catalog {}: {e}", e.code())))?;
@@ -112,20 +111,17 @@ pub async fn create(
         StatusCode::CREATED
     };
     tx.commit().await?;
-    Ok((
-        status,
-        Json(json!({ "compose_hash": rendered.revision, "state": "awaiting_approval" })),
-    ))
+    Ok((status, Json(json!({ "compose_hash": rendered.revision }))))
 }
 
 pub async fn get(
     State(state): State<Arc<AppState>>,
     caller: Caller,
-    Path((app, hash)): Path<(String, String)>,
+    Path((slug, hash)): Path<(String, String)>,
 ) -> Result<Json<Value>, Error> {
     let org_id = caller.org("apps:read")?;
     let hash: ComposeHash = hash.parse().map_err(|_| Error::NotFound)?;
-    let (app_id, _) = app_of(&state, org_id, &app).await?;
+    let app_id = app_of(&state, org_id, &slug).await?;
     let (init_data, pod, shape, catalog): (String, String, Value, Value) = sqlx::query_as(
         "select init_data, pod, shape, catalog from revisions \
          where compose_hash = $1 and app_id = $2",
@@ -138,7 +134,6 @@ pub async fn get(
     Ok(Json(json!({
         "compose_hash": hash,
         "app_id": app_id,
-        "state": "awaiting_approval",
         "init_data": init_data,
         "pod": pod,
         "shape": shape,
