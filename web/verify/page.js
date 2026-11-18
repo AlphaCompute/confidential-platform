@@ -47,12 +47,33 @@ function storeVersion(version) {
   }
 }
 
+// The page checks only the name on port 443, so a link it would not open as is gets refused.
 function asciiName(raw) {
   try {
-    return new URL(`https://${raw.trim()}`).hostname;
+    const value = raw.trim();
+    const url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? value : `https://${value}`);
+    return url.protocol === "https:" && !url.username && !url.password && !url.port ? url.hostname : "";
   } catch {
     return "";
   }
+}
+
+function askName(raw) {
+  const form = el("form", "ask");
+  const input = el("input");
+  Object.assign(input, { name: "name", value: raw, required: true, autocomplete: "off", autocapitalize: "off", spellcheck: false });
+  const label = el("label", "", "The App's public name or a link to it");
+  label.append(input);
+  form.append(label, el("button", "", "Verify"));
+  input.addEventListener("input", () => input.setCustomValidity(""));
+  form.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const name = asciiName(input.value);
+    if (NAME.test(name)) return (location.search = new URLSearchParams({ name }));
+    input.setCustomValidity("Enter an https link or the App's public name.");
+    input.reportValidity();
+  });
+  return raw ? [el("p", "notes", `${raw} is not an https link to a public name.`), form] : [form];
 }
 
 async function get(url) {
@@ -170,10 +191,9 @@ function render(root, name, report, warnings) {
 
 async function main() {
   const root = document.getElementById("main");
-  const name = asciiName(new URLSearchParams(location.search).get("name") || "");
-  if (!NAME.test(name)) {
-    return root.replaceChildren(el("p", "", "Open this page with ?name=<the App's public name>."));
-  }
+  const raw = new URLSearchParams(location.search).get("name") || "";
+  const name = asciiName(raw);
+  if (!NAME.test(name)) return root.replaceChildren(...askName(raw));
   root.replaceChildren(el("p", "muted", `Checking ${name}…`));
   const floor = storedVersion();
 
