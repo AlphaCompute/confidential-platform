@@ -927,7 +927,7 @@ async fn only_the_owners_session_roots_and_only_roster_keys_of_the_organization_
     let session = bound["session"].as_str().unwrap();
     let owner = bound["principal_id"].clone();
     let root = SigningKey::from_bytes(&[21; 32]);
-    let root_body = json!({ "credential_id": "cred-1",
+    let root_body = json!({ "credential_id": "Y3JlZC0x",
                             "registration": registration(&root, &org, &owner, None) });
     let relay = |op: &str| format!("/v1/tickets/{ticket}/kms/{op}");
     let code = |reply: &Value| reply["error"]["code"].clone();
@@ -971,7 +971,7 @@ async fn only_the_owners_session_roots_and_only_roster_keys_of_the_organization_
     let read = api.read_ticket(&ticket).await;
     assert_eq!(
         read["credentials"],
-        json!([{ "credential_id": "cred-1", "key_id": root_id }])
+        json!([{ "credential_id": "Y3JlZC0x", "key_id": root_id }])
     );
 
     // Another Organization's roster key, and a bearer with a forged signature, add nothing here.
@@ -994,18 +994,18 @@ async fn only_the_owners_session_roots_and_only_roster_keys_of_the_organization_
     );
     let forged = registration(&second, &org, &owner, Some((&root_id, &foreign)));
     for (body, expected) in [
-        (by_foreign, "upstream_invalid"),
-        (forged, "signature_invalid"),
+        (by_foreign, (StatusCode::BAD_GATEWAY, "upstream_invalid")),
+        (forged, (StatusCode::BAD_REQUEST, "signature_invalid")),
     ] {
         let (status, refused) = api
             .call(
                 Method::POST,
                 &relay("key"),
                 &admin,
-                json!({ "credential_id": "cred-2", "registration": body }),
+                json!({ "credential_id": "Y3JlZC0y", "registration": body }),
             )
             .await;
-        assert_eq!(code(&refused), json!(expected), "{status}");
+        assert_eq!((status, code(&refused)), (expected.0, json!(expected.1)));
     }
     let read = api.read_ticket(&ticket).await;
     assert_eq!(
@@ -1019,7 +1019,7 @@ async fn only_the_owners_session_roots_and_only_roster_keys_of_the_organization_
     // The foreign key step registered `second` under the other Organization at the KMS.
     let own = SigningKey::from_bytes(&[25; 32]);
     let by_root = registration(&own, &org, &owner, Some((&root_id, &root)));
-    let added = json!({ "credential_id": "cred-2", "registration": by_root });
+    let added = json!({ "credential_id": "Y3JlZC0y", "registration": by_root });
     let (status, reply) = api
         .call(Method::POST, &relay("key"), "", added.clone())
         .await;
@@ -1052,7 +1052,7 @@ async fn only_the_owners_session_roots_and_only_roster_keys_of_the_organization_
         .await
         .unwrap();
     let third = SigningKey::from_bytes(&[24; 32]);
-    let body = json!({ "credential_id": "cred-3",
+    let body = json!({ "credential_id": "Y3JlZC0z",
                        "registration": registration(&third, &org, &owner, Some((&root_id, &root))) });
     let (status, expired) = api
         .call(

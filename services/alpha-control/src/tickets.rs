@@ -184,6 +184,9 @@ pub(crate) struct Ticket {
     pub session_sha256: Option<Vec<u8>>,
     pub owner: Option<Uuid>,
     pub rooted: bool,
+    /// The holder whose key a claim ticket adds.
+    pub principal_id: Option<Uuid>,
+    pub disabled: bool,
     state: String,
     expired: bool,
 }
@@ -195,7 +198,9 @@ pub(crate) async fn usable(
 ) -> Result<Ticket, Error> {
     let found: Ticket = sqlx::query_as(
         "select t.kind, t.org_id, t.used, t.session_sha256, o.owner_principal_id as owner, \
-           o.rooted_at is not null as rooted, t.state, t.expires_at <= clock_timestamp() as expired \
+           o.rooted_at is not null as rooted, t.principal_id, \
+           o.disabled_at is not null as disabled, t.state, \
+           t.expires_at <= clock_timestamp() as expired \
          from tickets t join organizations o on o.id = t.org_id \
          where t.ticket = $1 for update of t",
     )
@@ -334,7 +339,7 @@ pub async fn session(
     let Json(request) = body?;
     // Checked before the code is spent, and again under the lock below.
     let found = usable(&mut state.pool.begin().await?, &ticket).await?;
-    if found.kind != "claim" {
+    if found.kind != "claim" || found.rooted {
         return Err(Error::SessionRefused);
     }
     let claims = redeem(&state, &request).await?;

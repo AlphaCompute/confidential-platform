@@ -13,13 +13,14 @@ use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
+use data_encoding::BASE64URL_NOPAD;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::tickets;
-use crate::{AppState, Error, platform};
+use crate::{AppState, Error, platform, stale};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,9 +41,15 @@ pub async fn relay(
         credential_id,
         registration,
     }) = body?;
+    // Fetched before the transaction, so a relay never holds one pool connection while it waits
+    // for another.
+    let (version, document) = platform(&state).await?;
     // The row stays locked until the step is recorded, so two relays of one op cannot both run.
     let mut tx = state.pool.begin().await?;
     let found = tickets::usable(&mut tx, &ticket).await?;
+    if found.disabled {
+        return Err(Error::Forbidden);
+    }
     if found.used.contains(&op) {
         return Err(Error::TicketClosed);
     }
@@ -51,9 +58,7 @@ pub async fn relay(
     }
     if credential_id.is_empty()
         || credential_id.len() > 1024
-        || !credential_id
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        || BASE64URL_NOPAD.decode(credential_id.as_bytes()).is_err()
     {
         return Err(Error::Malformed("credential_id is not base64url".into()));
     }
@@ -86,17 +91,28 @@ pub async fn relay(
             .cloned()
             .unwrap_or_default();
         expected.insert("public_key".into(), public_key);
-    } else if signed.signature.key_id.is_none() {
-        // Without a signer in the roster the KMS would take it as a root claim.
+    } else if signed.signature.key_id.is_none()
+        || signed.payload.get("principal_id") != found.principal_id.map(|p| json!(p)).as_ref()
+    {
+        // Without a signer in the roster the KMS would take it as a root claim; and the key is
+        // the one of the holder the ticket names.
         return Err(Error::Forbidden);
     }
-
-    let (_, document) = platform(&state).await?;
+    // Held to the commit, so a newer document accepted meanwhile cannot leave this step checked
+    // under the builds it retired.
+    let accepted: i64 =
+        sqlx::query_scalar("select version from platform_version where one = 1 for share")
+            .fetch_one(&mut *tx)
+            .await?;
+    if version < accepted {
+        return Err(stale(version, accepted));
+    }
     let reply = kms(&state, &document, "/v1/keys", &registration).await?;
     let response = confirm(&document, "key.register", &registration, expected, &reply)?;
     let key_id: Uuid = response
         .get("id")
         .and_then(|id| Uuid::deserialize(id).ok())
+        .filter(|id| reply.get("id") == Some(&json!(id)))
         .ok_or(Error::UpstreamInvalid)?;
     sqlx::query(
         "insert into credentials (key_id, org_id, credential_id) values ($1, $2, $3) \
@@ -110,6 +126,12 @@ pub async fn relay(
     if op == "root" {
         sqlx::query("update organizations set rooted_at = now() where id = $1")
             .bind(org_id)
+            .execute(&mut *tx)
+            .await?;
+        // The owner may add one more key on this ticket, as the holder it now names.
+        sqlx::query("update tickets set principal_id = $1 where ticket = $2")
+            .bind(found.owner)
+            .bind(&ticket)
             .execute(&mut *tx)
             .await?;
     }

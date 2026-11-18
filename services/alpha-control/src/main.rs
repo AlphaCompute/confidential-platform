@@ -109,7 +109,13 @@ async fn run() -> Result<(), Error> {
         .split(',')
         .map(|e| e.trim().to_owned())
         .filter(|e| !e.is_empty())
-        .collect();
+        .collect::<Vec<_>>();
+    // The pin only holds over TLS.
+    if kms_endpoints.is_empty() || kms_endpoints.iter().any(|e| !e.starts_with("https://")) {
+        return Err(Error::internal(
+            "ALPHACOMPUTE_KMS_ENDPOINTS must list one or more https URLs",
+        ));
+    }
     let oidc = Oidc {
         issuer: env("ALPHACOMPUTE_OIDC_ISSUER")?,
         token_endpoint: https_env("ALPHACOMPUTE_OIDC_TOKEN_ENDPOINT", true)?,
