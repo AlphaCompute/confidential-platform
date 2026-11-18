@@ -51,7 +51,7 @@ function storeVersion(version) {
 function asciiName(raw) {
   try {
     const value = raw.trim();
-    const url = new URL(value.includes("://") ? value : `https://${value}`);
+    const url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? value : `https://${value}`);
     return url.protocol === "https:" && !url.username && !url.password && !url.port ? url.hostname : "";
   } catch {
     return "";
@@ -61,14 +61,15 @@ function asciiName(raw) {
 function askName(raw) {
   const form = el("form", "ask");
   const input = el("input");
-  Object.assign(input, { name: "name", value: raw, required: true, autocomplete: "off", spellcheck: false });
-  input.setAttribute("autocapitalize", "off");
+  Object.assign(input, { name: "name", value: raw, required: true, autocomplete: "off", autocapitalize: "off", spellcheck: false });
   const label = el("label", "", "The App's public name or a link to it");
   label.append(input);
   form.append(label, el("button", "", "Verify"));
   form.addEventListener("submit", (event) => {
     event.preventDefault();
-    location.search = new URLSearchParams({ name: asciiName(input.value) || input.value.trim() });
+    const name = asciiName(input.value);
+    if (NAME.test(name)) location.search = new URLSearchParams({ name });
+    else form.parentElement.replaceChildren(...askName(input.value.trim()));
   });
   return raw ? [el("p", "notes", `${raw} is not an https link to a public name.`), form] : [form];
 }
