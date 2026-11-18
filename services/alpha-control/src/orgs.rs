@@ -5,11 +5,12 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{AppState, Caller, Error, SCOPES, audit, mint_token};
@@ -78,6 +79,8 @@ fn deploy_scopes(scopes: &[String]) -> Result<(), Error> {
     Ok(())
 }
 
+const LINK_TAKEN: Error = Error::Conflict("a link names another Organization or repeats");
+
 pub async fn create(
     State(state): State<Arc<AppState>>,
     caller: Caller,
@@ -110,37 +113,27 @@ pub async fn create(
         deploy_scopes(&key.scopes)?;
     }
 
-    let org_id = Uuid::now_v7();
     let mut tx = state.pool.begin().await?;
-    sqlx::query("insert into organizations (id, name, owner_email) values ($1, $2, $3)")
-        .bind(org_id)
-        .bind(&new.name)
-        .bind(&new.owner_email)
-        .execute(&mut *tx)
-        .await?;
-    for link in &new.links {
-        let inserted = sqlx::query(
-            "insert into org_links (issuer, external_id, org_id) values ($1, $2, $3) \
-             on conflict do nothing",
-        )
-        .bind(&link.issuer)
-        .bind(&link.external_id)
-        .bind(org_id)
-        .execute(&mut *tx)
-        .await?;
-        if inserted.rows_affected() == 0 {
-            return Err(Error::Conflict(
-                "a link names another Organization or repeats",
-            ));
-        }
-    }
+    let (status, org_id) = match retried(&mut tx, &caller, &new).await? {
+        Some(org_id) => (StatusCode::OK, org_id),
+        None => (StatusCode::CREATED, insert(&mut tx, &caller, &new).await?),
+    };
     let mut created = json!({ "org_id": org_id });
     let mut details = json!({ "links": new.links });
     if let Some(request) = new.deploy_key {
+        // The token is shown once, so a retry that lost it gets a new key and the lost one dies.
+        sqlx::query(
+            "update api_keys set revoked_at = now() \
+             where org_id = $1 and label = 'deploy' and revoked_at is null",
+        )
+        .bind(org_id)
+        .execute(&mut *tx)
+        .await?;
         let (token, hash) = mint_token()?;
         let id = Uuid::now_v7();
         sqlx::query(
-            "insert into api_keys (id, org_id, token_sha256, scopes) values ($1, $2, $3, $4)",
+            "insert into api_keys (id, org_id, token_sha256, scopes, label) \
+             values ($1, $2, $3, $4, 'deploy')",
         )
         .bind(id)
         .bind(org_id)
@@ -152,15 +145,152 @@ pub async fn create(
             json!({ "links": new.links, "deploy_key": { "id": id, "scopes": request.scopes } });
         created = json!({ "org_id": org_id, "deploy_key": { "id": id, "token": token, "scopes": request.scopes } });
     }
+    let action = if status == StatusCode::OK {
+        "org.retry"
+    } else {
+        "org.create"
+    };
     audit(
         &mut tx,
         &caller,
         org_id,
-        "org.create",
+        action,
         &org_id.to_string(),
         details,
     )
     .await?;
     tx.commit().await?;
-    Ok((StatusCode::CREATED, Json(created)))
+    Ok((status, Json(created)))
+}
+
+/// The Organization that an earlier create by the same caller made from the same name, owner and
+/// links within the hour, so a storefront that timed out can retry. Without links nothing tells a
+/// retry from a second Organization.
+async fn retried(
+    tx: &mut Transaction<'_, Postgres>,
+    caller: &Caller,
+    new: &NewOrg,
+) -> Result<Option<Uuid>, Error> {
+    let Some(first) = new.links.first() else {
+        return Ok(None);
+    };
+    let linked: Option<Uuid> =
+        sqlx::query_scalar("select org_id from org_links where issuer = $1 and external_id = $2")
+            .bind(&first.issuer)
+            .bind(&first.external_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some(org_id) = linked else {
+        return Ok(None);
+    };
+    let (issuers, external_ids): (Vec<&str>, Vec<&str>) = new
+        .links
+        .iter()
+        .map(|l| (l.issuer.as_str(), l.external_id.as_str()))
+        .unzip();
+    let links = i64::try_from(new.links.len()).map_err(|_| Error::internal("link count"))?;
+    let same: Option<bool> = sqlx::query_scalar(
+        "select count(*) = $5 and count(*) filter (where (l.issuer, l.external_id) in \
+                (select * from unnest($6::text[], $7::text[]))) = $5 \
+         from organizations o join org_links l on l.org_id = o.id \
+         where o.id = $1 and o.name = $2 and o.owner_email = $3 and o.created_by = $4 \
+           and o.disabled_at is null and o.created_at > now() - interval '1 hour'",
+    )
+    .bind(org_id)
+    .bind(&new.name)
+    .bind(&new.owner_email)
+    .bind(caller.actor())
+    .bind(links)
+    .bind(issuers)
+    .bind(external_ids)
+    .fetch_one(&mut **tx)
+    .await?;
+    if same != Some(true) {
+        return Err(LINK_TAKEN);
+    }
+    Ok(Some(org_id))
+}
+
+async fn insert(
+    tx: &mut Transaction<'_, Postgres>,
+    caller: &Caller,
+    new: &NewOrg,
+) -> Result<Uuid, Error> {
+    let org_id = Uuid::now_v7();
+    sqlx::query(
+        "insert into organizations (id, name, owner_email, created_by) values ($1, $2, $3, $4)",
+    )
+    .bind(org_id)
+    .bind(&new.name)
+    .bind(&new.owner_email)
+    .bind(caller.actor())
+    .execute(&mut **tx)
+    .await?;
+    for link in &new.links {
+        let inserted = sqlx::query(
+            "insert into org_links (issuer, external_id, org_id) values ($1, $2, $3) \
+             on conflict do nothing",
+        )
+        .bind(&link.issuer)
+        .bind(&link.external_id)
+        .bind(org_id)
+        .execute(&mut **tx)
+        .await?;
+        if inserted.rows_affected() == 0 {
+            return Err(LINK_TAKEN);
+        }
+    }
+    Ok(org_id)
+}
+
+/// Operator only: every key of the Organization stops working at once. Its id stays claimed.
+pub async fn disable(
+    State(state): State<Arc<AppState>>,
+    caller: Caller,
+    Path(org_id): Path<Uuid>,
+) -> Result<StatusCode, Error> {
+    if !matches!(caller, Caller::Operator) {
+        return Err(Error::Forbidden);
+    }
+    let mut tx = state.pool.begin().await?;
+    let disabled = sqlx::query(
+        "update organizations set disabled_at = coalesce(disabled_at, now()) where id = $1",
+    )
+    .bind(org_id)
+    .execute(&mut *tx)
+    .await?;
+    if disabled.rows_affected() == 0 {
+        return Err(Error::NotFound);
+    }
+    let object = org_id.to_string();
+    audit(&mut tx, &caller, org_id, "org.disable", &object, json!({})).await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// The operator, or a key with `org:admin` in the same Organization.
+pub async fn revoke_key(
+    State(state): State<Arc<AppState>>,
+    caller: Caller,
+    Path((org_id, key_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, Error> {
+    if !matches!(caller, Caller::Operator) && caller.org("org:admin")? != org_id {
+        return Err(Error::Forbidden);
+    }
+    let mut tx = state.pool.begin().await?;
+    let revoked = sqlx::query(
+        "update api_keys set revoked_at = coalesce(revoked_at, now()) \
+         where id = $1 and org_id = $2",
+    )
+    .bind(key_id)
+    .bind(org_id)
+    .execute(&mut *tx)
+    .await?;
+    if revoked.rows_affected() == 0 {
+        return Err(Error::NotFound);
+    }
+    let object = key_id.to_string();
+    audit(&mut tx, &caller, org_id, "key.revoke", &object, json!({})).await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
 }

@@ -5,6 +5,7 @@
 
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use alpha_client::acme::{self, ACME_TLS_ALPN, Edge, Route};
@@ -79,6 +80,9 @@ async fn run() -> Result<(), Error> {
     }
     let operator_token_sha256 = *hex_env("ALPHACOMPUTE_OPERATOR_TOKEN_SHA256")?;
     let public_name = env("ALPHACOMPUTE_PUBLIC_NAME")?;
+    let platform_document_url = env("ALPHACOMPUTE_PLATFORM_DOCUMENT_URL")?;
+    let release_keys = alpha_client::platform::release_keys()
+        .map_err(|e| Error::internal(format!("release keys: {e}")))?;
     // The certificate and ACME account keys derive from it, so a restart finds its certificate
     // in CT instead of spending one of the CA's five duplicate orders a week.
     let acme_key = Zeroizing::new(hex_env("ALPHACOMPUTE_ACME_KEY")?.to_vec());
@@ -90,6 +94,9 @@ async fn run() -> Result<(), Error> {
     let state = Arc::new(AppState {
         pool,
         operator_token_sha256,
+        platform_document_url,
+        release_keys,
+        platform_version: AtomicU64::new(0),
     });
 
     let bind = |port: u16| async move {

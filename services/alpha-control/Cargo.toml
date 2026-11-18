@@ -7,8 +7,14 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Verifies platform documents under release-keys/dev.pub: the stand's control plane, never a release.
+dev = ["alpha-channel/dev"]
+
 [dependencies]
+alpha-channel = { path = "../../crates/alpha-channel" }
 alpha-client = { path = "../../crates/alpha-client", features = ["acme"] }
+alpha-core = { path = "../../crates/alpha-core" }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 data-encoding = "2"
 getrandom = "0.4"
@@ -23,4 +29,6 @@ uuid = { version = "1", features = ["v7", "serde"] }
 zeroize = "1"
 
 [dev-dependencies]
+alpha-channel = { path = "../../crates/alpha-channel", features = ["dev"] }
+ed25519-dalek = "3"
 tower = { version = "0.5", default-features = false, features = ["util"] }
