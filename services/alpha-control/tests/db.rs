@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use alpha_control::{AppState, Oidc, router};
 use alpha_core::{InitData, InitDataError, KataPolicy};
@@ -12,12 +13,13 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
+use tokio::sync::oneshot;
 use tower::ServiceExt;
 use uuid::Uuid;
 
 const OPERATOR: &str = "operator-token";
 
-/// A fresh database per test, migrated; `None` when `DATABASE_URL` is unset.
+/// A fresh database per test, empty; `None` when `DATABASE_URL` is unset.
 async fn fresh_database() -> Option<PgPool> {
     let admin_url = std::env::var("DATABASE_URL").ok()?;
     let admin = PgPoolOptions::new().connect(&admin_url).await.unwrap();
@@ -31,8 +33,96 @@ async fn fresh_database() -> Option<PgPool> {
         .connect(&format!("{base}/{name}"))
         .await
         .unwrap();
-    alpha_control::migrate(&pool).await.unwrap();
     Some(pool)
+}
+
+const KEYED: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../testdata/attest/phala-0.5.9-1c-2g-keyed"
+);
+
+fn capture(name: &str) -> Vec<u8> {
+    std::fs::read(format!("{KEYED}/{name}")).unwrap()
+}
+
+/// An alpha-kms node in this process, as the keyed capture's CVM, on its own database, reading
+/// its platform document from `url` and bootstrapped with throwaway custodians. Answers the node,
+/// its URL, its CA and the sender that keeps it serving.
+async fn start_kms(
+    url: &str,
+    release: &SigningKey,
+) -> (Arc<alpha_kms::Node>, String, String, oneshot::Sender<()>) {
+    let pool = fresh_database().await.unwrap();
+    // The migrations create the cluster-wide `alpha_kms` role; two at once both try.
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&std::env::var("DATABASE_URL").unwrap())
+        .await
+        .unwrap();
+    sqlx::query("select pg_advisory_lock(0)")
+        .execute(&admin)
+        .await
+        .unwrap();
+    alpha_kms::migrate(&pool).await.unwrap();
+    sqlx::query("select pg_advisory_unlock(0)")
+        .execute(&admin)
+        .await
+        .unwrap();
+    let event_log: Vec<alpha_attest::EventLogEntry> =
+        serde_json::from_slice(&capture("event_log.json")).unwrap();
+    let nonce_key = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../testdata/attest/capture/nonce_key.hex"
+    ))
+    .unwrap();
+    let config = alpha_kms::Config {
+        substrate: alpha_tsm::Substrate::Dstack,
+        kms_endpoints: vec![],
+        platform_document_url: url.to_owned(),
+        nvidia_ocsp_url: String::new(),
+    };
+    let node = alpha_kms::Node::new(
+        pool,
+        config,
+        Arc::new(SystemTime::now),
+        alpha_kms::CollateralSource::Fixed(Box::new(
+            serde_json::from_slice(&capture("collateral.json")).unwrap(),
+        )),
+        alpha_core::hex_bytes(nonce_key.trim()).unwrap(),
+        alpha_attest::event_log_compose_hash(&event_log).unwrap(),
+        release.verifying_key().into(),
+    )
+    .unwrap();
+    alpha_kms::platform::start(&node).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("https://{}", listener.local_addr().unwrap());
+    let (shutdown, stopped) = oneshot::channel::<()>();
+    let app = alpha_kms::router(node.clone());
+    let tls = alpha_kms::tls::server_config(node.server_cert.clone()).unwrap();
+    tokio::spawn(async move {
+        alpha_client::tls::serve(listener, tls, app, async {
+            let _ = stopped.await;
+        })
+        .await
+    });
+    let identity = alpha_cli::node::NodeIdentity {
+        runtime_spki: node.runtime_spki.clone(),
+        xwing: node.xwing_key.public(),
+    };
+    let custodians = [(); 3].map(|_| alpha_crypto::PrivateKey::generate().unwrap().public());
+    let dir = std::env::temp_dir().join(format!("alpha-control-kms-{}", Uuid::now_v7()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let client = alpha_client::Client::new(
+        vec![base.clone()],
+        alpha_client::Pin::Spki(node.runtime_spki.clone()),
+    )
+    .unwrap();
+    let bootstrap = alpha_cli::node::bootstrap(&client, &identity, custodians, None, 2, &dir)
+        .await
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let ca = bootstrap["kms_ca_pem"].as_str().unwrap().to_owned();
+    (node, base, ca, shutdown)
 }
 
 const CATALOG: &str = include_str!("../../../testdata/catalog/valid.json");
@@ -57,37 +147,44 @@ fn kata_policy(template: &str) -> KataPolicy {
     pinned
 }
 
-/// A platform document of `version` that names the catalog test key, signed by `release`.
-fn platform_document(release: &SigningKey, version: u64) -> Value {
+/// The keyed capture's platform document at `version`, naming the catalog test key and `kms`'s
+/// fields over the capture's, signed by `release`.
+fn platform_document(release: &SigningKey, version: u64, kms: Value) -> Value {
     let catalog: Value = serde_json::from_str(CATALOG).unwrap();
     let expected: Value = serde_json::from_str(CATALOG_EXPECTED).unwrap();
-    let document = json!({
-        "version": version, "issued_at": "2026-11-01T00:00:00Z",
-        "policy": { "tcb_statuses": ["UpToDate"], "tolerated_advisories": [] },
-        "reference_values": [], "kms_ca_pem": "", "kms_revisions": [],
-        "catalog_key": expected["catalog_key"],
-        "kata_policy": kata_policy(catalog["template"].as_str().unwrap()),
-    });
+    let mut document: Value = serde_json::from_slice(&capture("platform-document.json")).unwrap();
+    document["version"] = json!(version);
+    document["catalog_key"] = expected["catalog_key"].clone();
+    document["kata_policy"] = json!(kata_policy(catalog["template"].as_str().unwrap()));
+    for (key, value) in kms.as_object().unwrap() {
+        document[key] = value.clone();
+    }
     serde_json::to_value(alpha_client::platform::sign(document, release).unwrap()).unwrap()
 }
 
 const ISSUER: &str = "https://login.example";
 
-/// The router, its database, the platform document its URL serves, and the claims of the ID
-/// token the fake token endpoint answers.
+/// The router, its database, the platform document its URL serves, the claims of the ID token
+/// the fake token endpoint answers, and the KMS node behind the relay, if any.
 struct Api(
     axum::Router,
     PgPool,
     Arc<Mutex<Value>>,
     SigningKey,
     Arc<Mutex<Value>>,
+    Option<(Arc<alpha_kms::Node>, String, oneshot::Sender<()>)>,
 );
 
 impl Api {
     async fn new() -> Option<Self> {
+        Self::start(false).await
+    }
+
+    async fn start(with_kms: bool) -> Option<Self> {
         let pool = fresh_database().await?;
+        alpha_control::migrate(&pool).await.unwrap();
         let release = SigningKey::from_bytes(&[7; 32]);
-        let served = Arc::new(Mutex::new(platform_document(&release, 2)));
+        let served = Arc::new(Mutex::new(platform_document(&release, 2, json!({}))));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/platform.json", listener.local_addr().unwrap());
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -124,11 +221,23 @@ impl Api {
             )
             .route("/token", axum::routing::post(token));
         tokio::spawn(async move { axum::serve(listener, host).await });
+        let mut kms = None;
+        if with_kms {
+            let (node, kms_url, ca, shutdown) = start_kms(&url, &release).await;
+            let pins = json!({
+                "kms_ca_pem": ca,
+                "kms_revisions": [{ "compose_hash": node.compose_hash, "build": "test",
+                                    "source_url": "https://example.test" }],
+            });
+            *served.lock().unwrap() = platform_document(&release, 2, pins);
+            kms = Some((node, kms_url, shutdown));
+        }
         let state = Arc::new(AppState {
             pool: pool.clone(),
             operator_token_sha256: Sha256::digest(OPERATOR).into(),
             platform_document_url: url,
             release_keys: release.verifying_key().into(),
+            kms_endpoints: kms.iter().map(|(_, url, _)| url.clone()).collect(),
             signer_url: "https://sign.example".into(),
             code_lookups: Default::default(),
             oidc: Oidc {
@@ -137,7 +246,7 @@ impl Api {
                 client_id: "signer".into(),
             },
         });
-        Some(Api(router(state), pool, served, release, claims))
+        Some(Api(router(state), pool, served, release, claims, kms))
     }
 
     async fn call(
@@ -147,10 +256,25 @@ impl Api {
         bearer: &str,
         body: Value,
     ) -> (StatusCode, Value) {
-        let request = Request::builder()
+        self.call_with(method, uri, bearer, &[], body).await
+    }
+
+    async fn call_with(
+        &self,
+        method: Method,
+        uri: &str,
+        bearer: &str,
+        headers: &[(&str, &str)],
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let mut request = Request::builder()
             .method(method)
             .uri(uri)
-            .header("authorization", format!("Bearer {bearer}"))
+            .header("authorization", format!("Bearer {bearer}"));
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let request = request
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap();
@@ -452,7 +576,7 @@ async fn a_catalog_revision_is_rendered_for_its_app_and_stored_once() {
         .await;
     assert_eq!(status, StatusCode::CONFLICT);
 
-    *api.2.lock().unwrap() = platform_document(&api.3, 1);
+    *api.2.lock().unwrap() = platform_document(&api.3, 1, json!({}));
     let (status, _) = api
         .call(Method::POST, "/v1/apps/board/revisions", &a, body)
         .await;
@@ -762,4 +886,251 @@ async fn only_the_owners_verified_sign_in_binds_a_session_to_a_claim_ticket() {
         (status, &expired["error"]["code"]),
         (StatusCode::GONE, &json!("ticket_expired"))
     );
+}
+
+fn spki(key: &SigningKey) -> String {
+    use ed25519_dalek::pkcs8::EncodePublicKey;
+    BASE64URL_NOPAD.encode(key.verifying_key().to_public_key_der().unwrap().as_bytes())
+}
+
+/// A key registration: self-signed for `org`'s root when `signer` is `None`, else signed by the
+/// roster key `signer`.
+fn registration(
+    key: &SigningKey,
+    org: &str,
+    principal: &Value,
+    signer: Option<(&str, &SigningKey)>,
+) -> Value {
+    let issued_at = alpha_kms::rfc3339(SystemTime::now());
+    let signed = match signer {
+        None => alpha_client::sign_self(
+            alpha_core::context::ORG_ROOT_KEY,
+            json!({ "org_id": org, "principal_id": principal, "public_key": spki(key),
+                    "label": "passkey-1", "issued_at": issued_at }),
+            key,
+        ),
+        Some((key_id, signer)) => alpha_client::sign(
+            alpha_core::context::PRINCIPAL_KEY,
+            json!({ "principal_id": principal, "public_key": spki(key), "label": "passkey-2",
+                    "issued_at": issued_at }),
+            key_id.parse().unwrap(),
+            signer,
+        ),
+    };
+    json!(signed.unwrap())
+}
+
+#[tokio::test]
+async fn only_the_owners_session_roots_and_only_roster_keys_of_the_organization_add_keys() {
+    let Some(api) = Api::start(true).await else {
+        return;
+    };
+    let (org, admin) = api.org(&["org:admin"]).await;
+    let ticket = claim_ticket(&api, &org).await;
+    *api.4.lock().unwrap() = json!({
+        "iss": ISSUER, "aud": "signer", "exp": 4_000_000_000u64, "sub": "owner",
+        "email": "owner@acme.test", "email_verified": true,
+    });
+    let (_, bound) = api
+        .call(
+            Method::POST,
+            &format!("/v1/tickets/{ticket}/session"),
+            "",
+            json!({ "code": "good", "code_verifier": "verifier",
+                    "redirect_uri": "https://sign.example/claim" }),
+        )
+        .await;
+    let session = bound["session"].as_str().unwrap();
+    let owner = bound["principal_id"].clone();
+    let root = SigningKey::from_bytes(&[21; 32]);
+    let root_body = json!({ "credential_id": "cred-1",
+                            "registration": registration(&root, &org, &owner, None) });
+    let relay = |op: &str| format!("/v1/tickets/{ticket}/kms/{op}");
+    let code = |reply: &Value| reply["error"]["code"].clone();
+
+    // A ticket alone never adds a key: not without the session, nor as a self-signed key step.
+    for headers in [vec![], vec![("alpha-claim-session", "x".repeat(43))]] {
+        let headers: Vec<(&str, &str)> = headers.iter().map(|(n, v)| (*n, v.as_str())).collect();
+        let (status, refused) = api
+            .call_with(
+                Method::POST,
+                &relay("root"),
+                "",
+                &headers,
+                root_body.clone(),
+            )
+            .await;
+        assert_eq!(
+            (status, code(&refused)),
+            (StatusCode::FORBIDDEN, json!("session_refused"))
+        );
+    }
+    let (status, _) = api
+        .call(Method::POST, &relay("key"), &admin, root_body.clone())
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let session_header = [("alpha-claim-session", session)];
+    let (status, rooted) = api
+        .call_with(
+            Method::POST,
+            &relay("root"),
+            "",
+            &session_header,
+            root_body.clone(),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{rooted}");
+    assert!(rooted["receipt"].is_object());
+    let root_id = rooted["id"].as_str().unwrap().to_owned();
+    let (status, again) = api
+        .call_with(Method::POST, &relay("root"), "", &session_header, root_body)
+        .await;
+    assert_eq!(
+        (status, code(&again)),
+        (StatusCode::CONFLICT, json!("ticket_closed"))
+    );
+    let (_, read) = api
+        .call(
+            Method::GET,
+            &format!("/v1/tickets/{ticket}"),
+            "",
+            Value::Null,
+        )
+        .await;
+    assert_eq!(
+        read["credentials"],
+        json!([{ "credential_id": "cred-1", "key_id": root_id }])
+    );
+
+    // Another Organization's roster key, and a bearer with a forged signature, add nothing here.
+    let (_, kms_url, _) = api.5.as_ref().unwrap();
+    let foreign = SigningKey::from_bytes(&[22; 32]);
+    let foreign_org = Uuid::now_v7().to_string();
+    let (status, foreign_root) = send_kms(
+        kms_url,
+        "/v1/keys",
+        registration(&foreign, &foreign_org, &json!(Uuid::now_v7()), None),
+    )
+    .await;
+    assert_eq!(status, 200, "{foreign_root}");
+    let second = SigningKey::from_bytes(&[23; 32]);
+    let by_foreign = registration(
+        &second,
+        &org,
+        &owner,
+        Some((foreign_root["id"].as_str().unwrap(), &foreign)),
+    );
+    let forged = registration(&second, &org, &owner, Some((&root_id, &foreign)));
+    for (body, expected) in [
+        (by_foreign, "upstream_invalid"),
+        (forged, "signature_invalid"),
+    ] {
+        let (status, refused) = api
+            .call(
+                Method::POST,
+                &relay("key"),
+                &admin,
+                json!({ "credential_id": "cred-2", "registration": body }),
+            )
+            .await;
+        assert_eq!(code(&refused), json!(expected), "{status}");
+    }
+    let (_, read) = api
+        .call(
+            Method::GET,
+            &format!("/v1/tickets/{ticket}"),
+            "",
+            Value::Null,
+        )
+        .await;
+    assert_eq!(
+        (
+            read["state"].clone(),
+            read["credentials"].as_array().unwrap().len()
+        ),
+        (json!("open"), 1)
+    );
+
+    // The foreign key step registered `second` under the other Organization at the KMS.
+    let own = SigningKey::from_bytes(&[25; 32]);
+    let by_root = registration(&own, &org, &owner, Some((&root_id, &root)));
+    let added = json!({ "credential_id": "cred-2", "registration": by_root });
+    let (status, reply) = api
+        .call(Method::POST, &relay("key"), "", added.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let (status, closed) = api.call(Method::POST, &relay("key"), "", added).await;
+    assert_eq!(
+        (status, code(&closed)),
+        (StatusCode::CONFLICT, json!("ticket_closed"))
+    );
+    let (_, read) = api
+        .call(
+            Method::GET,
+            &format!("/v1/tickets/{ticket}"),
+            "",
+            Value::Null,
+        )
+        .await;
+    assert_eq!(
+        (
+            read["state"].clone(),
+            read["credentials"].as_array().unwrap().len()
+        ),
+        (json!("done"), 2)
+    );
+
+    // A rooted Organization's claim ticket names the holder of the key it adds and takes no root.
+    let rooted_ticket = claim_ticket(&api, &org).await;
+    let (_, read) = api
+        .call(
+            Method::GET,
+            &format!("/v1/tickets/{rooted_ticket}"),
+            "",
+            Value::Null,
+        )
+        .await;
+    assert_eq!(read["rooted"], true);
+    assert!(
+        read["principal_id"].is_string() && read.get("owner_email").is_none(),
+        "{read}"
+    );
+    sqlx::query("update tickets set expires_at = now() where ticket = $1")
+        .bind(&rooted_ticket)
+        .execute(&api.1)
+        .await
+        .unwrap();
+    let third = SigningKey::from_bytes(&[24; 32]);
+    let body = json!({ "credential_id": "cred-3",
+                       "registration": registration(&third, &org, &owner, Some((&root_id, &root))) });
+    let (status, expired) = api
+        .call(
+            Method::POST,
+            &format!("/v1/tickets/{rooted_ticket}/kms/key"),
+            "",
+            body,
+        )
+        .await;
+    assert_eq!(
+        (status, code(&expired)),
+        (StatusCode::GONE, json!("ticket_expired"))
+    );
+}
+
+/// A request straight to the KMS, as another Organization's own CLI would make it.
+async fn send_kms(url: &str, path: &str, body: Value) -> (u16, Value) {
+    let reply = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+        .post(format!("{url}{path}"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    (
+        reply.status().as_u16(),
+        reply.json().await.unwrap_or(Value::Null),
+    )
 }

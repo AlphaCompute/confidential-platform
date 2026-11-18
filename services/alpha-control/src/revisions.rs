@@ -4,10 +4,9 @@
 //! repeats its own checks.
 
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use alpha_core::catalog::{self, CatalogFile};
-use alpha_core::{CatalogKey, ComposeHash, InitData, KataPolicy};
+use alpha_core::{ComposeHash, InitData};
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
@@ -16,63 +15,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::{AppState, Caller, Error, audit, tickets};
+use crate::{AppState, Caller, Error, audit, platform, stale, tickets};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NewRevision {
     pub catalog: CatalogFile,
-}
-
-/// The version, catalog key, agent policy and KMS CA of the current platform document. Each call
-/// fetches it, and a version below one already accepted is refused, so a stale copy cannot bring
-/// back a rotated key.
-async fn platform(state: &AppState) -> Result<(i64, CatalogKey, KataPolicy, String), Error> {
-    // The URL may carry a read credential, so neither the caller nor the log sees the error text.
-    let unavailable = |e: alpha_client::Error| {
-        alpha_client::warn!("platform_document_unavailable", error = e.kind());
-        Error::Unavailable("the platform document is unavailable".into())
-    };
-    let signed = alpha_client::platform::fetch_signed(&state.platform_document_url)
-        .await
-        .map_err(unavailable)?;
-    let document = alpha_client::platform::verify(&signed, &state.release_keys, SystemTime::now())
-        .map_err(unavailable)?;
-    let version = i64::try_from(document.version)
-        .map_err(|_| Error::Unavailable("platform document version overflows".into()))?;
-    // Read first, so a create under the current version takes no row lock.
-    let stored: Option<i64> =
-        sqlx::query_scalar("select version from platform_version where one = 1")
-            .fetch_optional(&state.pool)
-            .await?;
-    let accepted = match stored {
-        Some(stored) if stored >= version => stored,
-        _ => {
-            sqlx::query_scalar(
-                "insert into platform_version (one, version) values (1, $1) on conflict (one) \
-                 do update set version = greatest(platform_version.version, excluded.version) \
-                 returning version",
-            )
-            .bind(version)
-            .fetch_one(&state.pool)
-            .await?
-        }
-    };
-    if version < accepted {
-        return Err(stale(version, accepted));
-    }
-    match (document.catalog_key, document.kata_policy) {
-        (Some(key), Some(policy)) => Ok((version, key, policy, document.kms_ca_pem)),
-        _ => Err(Error::Unavailable(
-            "the platform document names no catalog_key or kata_policy".into(),
-        )),
-    }
-}
-
-fn stale(version: i64, accepted: i64) -> Error {
-    Error::Unavailable(format!(
-        "platform document version {version} is below the accepted {accepted}"
-    ))
 }
 
 pub async fn create(
@@ -89,7 +37,14 @@ pub async fn create(
         .fetch_optional(&state.pool)
         .await?
         .ok_or(Error::NotFound)?;
-    let (version, catalog_key, kata_policy, kms_ca_pem) = platform(&state).await?;
+    let (version, document) = platform(&state).await?;
+    let (Some(catalog_key), Some(kata_policy)) = (document.catalog_key, document.kata_policy)
+    else {
+        return Err(Error::Unavailable(
+            "the platform document names no catalog_key or kata_policy".into(),
+        ));
+    };
+    let kms_ca_pem = document.kms_ca_pem;
     let rendered = catalog::render(&new.catalog, &catalog_key, app_id.into(), &slug)
         .map_err(|e| Error::Malformed(format!("catalog {}: {e}", e.code())))?;
     InitData::parse(rendered.init_data.clone())

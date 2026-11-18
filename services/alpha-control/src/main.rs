@@ -102,6 +102,10 @@ async fn run() -> Result<(), Error> {
     let signer_url = https_env("ALPHACOMPUTE_SIGNER_URL")?
         .trim_end_matches('/')
         .to_owned();
+    let kms_endpoints = env("ALPHACOMPUTE_KMS_ENDPOINTS")?
+        .split(',')
+        .map(|e| e.trim().to_owned())
+        .collect();
     let oidc = Oidc {
         issuer: env("ALPHACOMPUTE_OIDC_ISSUER")?,
         token_endpoint: https_env("ALPHACOMPUTE_OIDC_TOKEN_ENDPOINT")?,
@@ -122,6 +126,7 @@ async fn run() -> Result<(), Error> {
         operator_token_sha256,
         platform_document_url,
         release_keys,
+        kms_endpoints,
         signer_url,
         oidc,
         code_lookups: Default::default(),

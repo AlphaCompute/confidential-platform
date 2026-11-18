@@ -13,6 +13,7 @@ dev = ["alpha-channel/dev"]
 
 [dependencies]
 alpha-channel = { path = "../../crates/alpha-channel" }
+alpha-attest = { path = "../../crates/alpha-attest" }
 alpha-client = { path = "../../crates/alpha-client", features = ["acme"] }
 alpha-core = { path = "../../crates/alpha-core" }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
@@ -32,5 +33,9 @@ zeroize = "1"
 
 [dev-dependencies]
 alpha-channel = { path = "../../crates/alpha-channel", features = ["dev"] }
-ed25519-dalek = "3"
+alpha-cli = { path = "../../crates/alpha-cli" }
+alpha-crypto = { path = "../../crates/alpha-crypto" }
+alpha-kms = { path = "../alpha-kms" }
+alpha-tsm = { path = "../../crates/alpha-tsm" }
+ed25519-dalek = { version = "3", features = ["pkcs8", "alloc"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }

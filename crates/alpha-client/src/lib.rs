@@ -547,7 +547,7 @@ impl Client {
 
     /// Walks the endpoints: a connection failure, an unreadable reply or a 5xx moves to the next
     /// one, a 4xx is final.
-    async fn request<T: DeserializeOwned>(
+    pub async fn request<T: DeserializeOwned>(
         &self,
         method: Method,
         path: &str,

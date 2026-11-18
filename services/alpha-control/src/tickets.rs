@@ -60,14 +60,23 @@ pub async fn claim(
         return Err(Error::Forbidden);
     }
     let mut tx = state.pool.begin().await?;
-    sqlx::query_scalar::<_, i32>(
-        "select 1 from organizations where id = $1 and disabled_at is null",
+    let rooted: bool = sqlx::query_scalar(
+        "select rooted_at is not null from organizations where id = $1 and disabled_at is null",
     )
     .bind(org_id)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(Error::NotFound)?;
     let (ticket, code) = open(&mut tx, "claim", org_id, None, "72 hours").await?;
+    // A rooted Organization adds a key for a new holder; an unrooted one learns its owner at the
+    // sign-in.
+    if rooted {
+        sqlx::query("update tickets set principal_id = $1 where ticket = $2")
+            .bind(Uuid::now_v7())
+            .bind(&ticket)
+            .execute(&mut *tx)
+            .await?;
+    }
     // The code redeems the ticket, so the audit row names only the Organization.
     let object = org_id.to_string();
     audit(&mut tx, &caller, org_id, "ticket.claim", &object, json!({})).await?;
@@ -88,6 +97,9 @@ struct Row {
     org_id: Uuid,
     org_name: String,
     owner_email: String,
+    rooted: bool,
+    principal_id: Option<Uuid>,
+    credentials: Value,
     compose_hash: Option<Vec<u8>>,
     app_id: Option<Uuid>,
     slug: Option<String>,
@@ -106,7 +118,11 @@ pub async fn read(
              as state, \
            to_char(t.expires_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as expires_at, \
            to_char(now() at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as server_time, \
-           t.org_id, o.name as org_name, o.owner_email, r.compose_hash, r.app_id, a.slug, \
+           t.org_id, o.name as org_name, o.owner_email, o.rooted_at is not null as rooted, \
+           t.principal_id, r.compose_hash, r.app_id, a.slug, \
+           (select coalesce(jsonb_agg(jsonb_build_object( \
+              'credential_id', c.credential_id, 'key_id', c.key_id) order by c.created_at), '[]') \
+            from credentials c where c.org_id = t.org_id) as credentials, \
            r.catalog ->> 'title' as title, r.catalog ->> 'template_sha256' as template_sha256 \
          from tickets t join organizations o on o.id = t.org_id \
          left join revisions r on r.compose_hash = t.compose_hash \
@@ -117,14 +133,15 @@ pub async fn read(
     .fetch_optional(&state.pool)
     .await?
     .ok_or(Error::TicketNotFound)?;
-    // ponytail: the KMS lists no Organization's passkeys, so none are known until the relay
-    // records the ones it carries; until then an approve ticket shows an unrooted Organization.
+    // ponytail: only passkeys the relay carried are listed, because the KMS lists none; a key an
+    // Organization adds with the CLI is missing until the KMS can answer a credential lookup.
     let mut read = json!({
         "kind": row.kind, "state": row.state, "expires_at": row.expires_at,
         "server_time": row.server_time, "org_id": row.org_id, "org_name": row.org_name,
-        "credentials": [],
+        "credentials": row.credentials,
     });
     let extra = match row.kind.as_str() {
+        "claim" if row.rooted => json!({ "rooted": true, "principal_id": row.principal_id }),
         "claim" => json!({ "rooted": false, "owner_email": row.owner_email }),
         _ => {
             let compose_hash = row
@@ -163,7 +180,10 @@ pub async fn by_code(
 }
 
 /// The open ticket's kind and Organization, locked for the transaction.
-async fn usable(tx: &mut Transaction<'_, Postgres>, ticket: &str) -> Result<(String, Uuid), Error> {
+pub(crate) async fn usable(
+    tx: &mut Transaction<'_, Postgres>,
+    ticket: &str,
+) -> Result<(String, Uuid), Error> {
     let (kind, state, expired, org_id): (String, String, bool, Uuid) = sqlx::query_as(
         "select kind, state, expires_at <= clock_timestamp(), org_id from tickets \
          where ticket = $1 for update",
@@ -310,14 +330,17 @@ pub async fn session(
 
     let mut tx = state.pool.begin().await?;
     let (_, org_id) = usable(&mut tx, &ticket).await?;
-    let (owner_email, owner): (String, Option<Uuid>) = sqlx::query_as(
-        "select owner_email, owner_principal_id from organizations \
+    let (owner_email, owner, rooted): (String, Option<Uuid>, bool) = sqlx::query_as(
+        "select owner_email, owner_principal_id, rooted_at is not null from organizations \
          where id = $1 and disabled_at is null for update",
     )
     .bind(org_id)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(Error::SessionRefused)?;
+    if rooted {
+        return Err(Error::SessionRefused);
+    }
     let principal_id: Uuid = sqlx::query_scalar(
         "insert into principals (id, issuer, subject) values ($1, $2, $3) \
          on conflict (issuer, subject) do update set issuer = excluded.issuer returning id",
