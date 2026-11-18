@@ -12,12 +12,14 @@ A tag `v*` runs `.github/workflows/release.yml`: every image (`alpha-runtime`, `
 `alpha-kms-dev`, `alpha-inference`, `alpha-broker`, `alpha-guard`, `alpha-cpu-app`) is built
 with `--no-cache` on two fresh runners, and an image is pushed as `ghcr.io/<owner>/<name>:<tag>`
 only when the CI checks pass on the tagged commit and both runners give one image id and one
-layer set. The artifact `release-images` holds `images.json`, which maps each pushed image's
-name to its `ghcr.io/…@sha256:…` reference; the job summary shows the same list. Copy the
-`alpha-runtime` and other image pins of a platform document or a catalog entry from it.
-Each pushed digest carries a signed GitHub build-provenance attestation, stored beside the
-image in ghcr. Check it against this workflow at the tag, since `--repo` alone also accepts an
-attestation from a dispatch of an edited workflow on any branch:
+layer set. Each pushed image then gets a signed GitHub build-provenance attestation, stored
+beside the image in ghcr. The artifact `release-images` holds `images.json`, which maps the name
+of each image that was pushed and attested to its `ghcr.io/…@sha256:…` reference; the job
+summary shows the same list. An image whose build, push or attestation failed is not in the
+list, and its failed image job fails the run. Copy the `alpha-runtime` and other image pins of
+a platform document or a catalog entry from the list. Check an image's attestation against this
+workflow at the tag, since `--repo` alone also accepts an attestation from a dispatch of an
+edited workflow on any branch:
 
 ```sh
 IMAGE='PASTE_IMAGE_REFERENCE'   # ghcr.io/…/<name>@sha256:…

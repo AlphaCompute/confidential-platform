@@ -171,9 +171,9 @@ jobs:
           path: pushed
           if-no-files-found: error
 
-  # Every pushed image by name, the list a platform document's pins and a catalog entry's
-  # runtime image are copied from. An image whose build failed is missing, and its image job has
-  # already failed the run.
+  # Every pushed and attested image by name, the list a platform document's pins and a catalog
+  # entry's runtime image are copied from. An image whose build, push or attestation failed is
+  # missing, and its image job has already failed the run.
   digests:
     needs: image
     if: ${{ !cancelled() && needs.image.result != 'skipped' && startsWith(github.ref, 'refs/tags/v') }}
