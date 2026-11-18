@@ -340,9 +340,13 @@ impl NodeEvidence {
 }
 
 /// A presented bearer against the expected one, compared by SHA-256 digest in constant time so
-/// neither the value nor its length shows in the timing.
+/// neither the value nor its length shows in the timing. An empty expected bearer matches nothing:
+/// a Secret stored empty must not open the route to an empty token.
 pub fn bearer_matches(presented: &[u8], expected: &[u8]) -> bool {
     use sha2::{Digest, Sha256};
+    if expected.is_empty() {
+        return false;
+    }
     let (a, b) = (Sha256::digest(presented), Sha256::digest(expected));
     a.iter()
         .zip(b.iter())
@@ -775,6 +779,12 @@ mod tests {
         assert!(!super::bearer_matches(b"right", b"wrong"));
         assert!(!super::bearer_matches(b"right", b"right-longer"));
         assert!(!super::bearer_matches(b"", b"right"));
+    }
+
+    #[test]
+    fn an_empty_expected_bearer_matches_nothing() {
+        assert!(!super::bearer_matches(b"", b""));
+        assert!(!super::bearer_matches(b"right", b""));
     }
 
     use super::*;
