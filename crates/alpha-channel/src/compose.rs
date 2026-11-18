@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use alpha_core::{AppId, InitData, KataPolicy, MAX_INIT_DATA, Openings};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use yaml_rust2::{Yaml, YamlLoader};
+use yaml_rust2::Yaml;
 
 use crate::Error;
 
@@ -109,7 +109,7 @@ fn compose_services(compose: &str) -> Result<BTreeMap<String, Service>, Error> {
         .get("docker_compose_file")
         .and_then(Value::as_str)
         .ok_or_else(|| malformed("docker_compose_file is missing or not a string"))?;
-    let docs = YamlLoader::load_from_str(yaml).map_err(|e| malformed(&e.to_string()))?;
+    let docs = alpha_core::compose::load_yaml(yaml).map_err(|e| malformed(&e.to_string()))?;
     let [Yaml::Hash(root)] = docs.as_slice() else {
         return Err(malformed("docker_compose_file is not one YAML map"));
     };

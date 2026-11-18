@@ -239,9 +239,9 @@ pub async fn register_revision(
     audited_route!(node, body, request, "revision.register", async {
         let keys = node.intermediates()?;
         let doc = node.platform_document();
+        let chain = authorize(&node, &keys, context::REVISION, &body, node.now_utc()).await?;
         let (compose_hash, app_id, compose, init_data) =
             revision_payload(&body.payload, doc.as_deref())?;
-        let chain = authorize(&node, &keys, context::REVISION, &body, node.now_utc()).await?;
         let org_id = chain.key.org_id;
         let mut tx = node.pool.begin().await?;
         if let Some(existing) = load_revision(&mut *tx, compose_hash).await? {

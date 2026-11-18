@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use yaml_rust2::parser::{Event, Parser};
 use yaml_rust2::{Yaml, YamlLoader};
 
 use crate::AppId;
@@ -99,6 +101,10 @@ pub enum RegistrationError {
     ImageWithoutDigest(String),
     #[error("a build: key is present; every service must resolve to a pinned image")]
     BuildNotAllowed,
+    #[error("docker_compose_file expands to more than {MAX_YAML_BYTES} bytes")]
+    TooLarge,
+    #[error("docker_compose_file nests deeper than {MAX_YAML_DEPTH} levels")]
+    TooDeep,
 }
 
 impl RegistrationError {
@@ -124,10 +130,64 @@ pub fn check_registration(compose: &str, app_id: AppId) -> Result<ComposeHash, R
         .get("docker_compose_file")
         .and_then(Value::as_str)
         .ok_or(RegistrationError::NoDockerComposeFile)?;
-    YamlLoader::load_from_str(yaml)?
-        .iter()
-        .try_for_each(check_images)?;
+    load_yaml(yaml)?.iter().try_for_each(check_images)?;
     Ok(compose_hash(compose))
+}
+
+/// Far above any real compose, far below what hurts a node.
+const MAX_YAML_BYTES: usize = 8 << 20;
+/// A rough size of one `Yaml` node before its scalar text.
+const NODE_BYTES: usize = 64;
+/// The loader and `check_images` recurse once per level, so depth is bounded by the stack.
+const MAX_YAML_DEPTH: usize = 64;
+
+/// `YamlLoader` copies the anchored node into its anchor table and again for every alias, so
+/// nested aliases grow exponentially ("billion laughs"). Estimate the bytes it would build on the
+/// event stream first; compose files use anchors with `<<:` merges, so refusing aliases outright
+/// would refuse real files.
+pub fn load_yaml(yaml: &str) -> Result<Vec<Yaml>, RegistrationError> {
+    let mut parser = Parser::new_from_str(yaml);
+    // `tree` is what the documents hold, `copies` the loader's anchor table; an anchor's size is
+    // its share of `tree` only, as the table entry does not hold its descendants' entries.
+    let mut tree = 0usize;
+    let mut copies = 0usize;
+    let mut open: Vec<(usize, usize)> = Vec::new();
+    let mut anchors: HashMap<usize, usize> = HashMap::new();
+    loop {
+        let anchored = match parser.next_token()?.0 {
+            Event::StreamEnd => break,
+            Event::Scalar(text, _, anchor, _) => {
+                let size = NODE_BYTES.saturating_add(text.len());
+                tree = tree.saturating_add(size);
+                Some((anchor, size))
+            }
+            Event::SequenceStart(anchor, _) | Event::MappingStart(anchor, _) => {
+                if open.len() >= MAX_YAML_DEPTH {
+                    return Err(RegistrationError::TooDeep);
+                }
+                open.push((anchor, tree));
+                tree = tree.saturating_add(NODE_BYTES);
+                None
+            }
+            Event::SequenceEnd | Event::MappingEnd => open
+                .pop()
+                .map(|(anchor, start)| (anchor, tree.saturating_sub(start))),
+            Event::Alias(anchor) => {
+                let size = anchors.get(&anchor).copied().unwrap_or(NODE_BYTES);
+                tree = tree.saturating_add(size);
+                None
+            }
+            _ => None,
+        };
+        if let Some((anchor, size)) = anchored.filter(|(anchor, _)| *anchor != 0) {
+            anchors.insert(anchor, size);
+            copies = copies.saturating_add(size);
+        }
+        if tree.saturating_add(copies) > MAX_YAML_BYTES {
+            return Err(RegistrationError::TooLarge);
+        }
+    }
+    Ok(YamlLoader::load_from_str(yaml)?)
 }
 
 fn check_images(node: &Yaml) -> Result<(), RegistrationError> {
@@ -232,10 +292,34 @@ mod tests {
     }
 
     #[test]
+    fn an_alias_bomb_is_refused_before_it_expands() {
+        let mut nested = "a0: &a0 [x, x, x, x, x, x, x, x, x, x]\n".to_owned();
+        for i in 1..9 {
+            let p = i - 1;
+            nested += &format!("a{i}: &a{i} [{}]\n", vec![format!("*a{p}"); 10].join(", "));
+        }
+        let wide = format!(
+            "a: &a {}\nb: [{}]\n",
+            "x".repeat(10_000),
+            vec!["*a"; 1000].join(", ")
+        );
+        for bomb in [nested, wide] {
+            assert!(matches!(load_yaml(&bomb), Err(RegistrationError::TooLarge)));
+        }
+        assert!(matches!(
+            load_yaml(&format!("{}{}", "[".repeat(100), "]".repeat(100))),
+            Err(RegistrationError::TooDeep)
+        ));
+        let anchors: String = (0..16).map(|i| format!("&n{i} [")).collect();
+        let nested = format!("a: {anchors}x{}\nb: *n0\n", "]".repeat(16));
+        assert!(load_yaml(&nested).is_ok());
+    }
+
+    #[test]
     fn images_are_found_anywhere_in_the_yaml() {
         let ok = "@sha256:".to_owned() + &"0".repeat(64);
         let merged = format!("x-base: &b\n  image: a{ok}\nservices:\n  app:\n    <<: *b\n");
-        assert!(check_images(&YamlLoader::load_from_str(&merged).unwrap()[0]).is_ok());
+        assert!(check_images(&load_yaml(&merged).unwrap()[0]).is_ok());
         let upper = format!(
             "services:\n  app:\n    image: a@sha256:{}\n",
             "A".repeat(64)
