@@ -109,6 +109,15 @@ pub async fn relay(
     if version < accepted {
         return Err(stale(version, accepted));
     }
+    // The version lock may have waited past the ticket's expiry.
+    let open: bool =
+        sqlx::query_scalar("select expires_at > clock_timestamp() from tickets where ticket = $1")
+            .bind(&ticket)
+            .fetch_one(&mut *tx)
+            .await?;
+    if !open {
+        return Err(Error::TicketExpired);
+    }
     let reply = kms(&state, &document, "/v1/keys", &registration).await?;
     let response = confirm(&document, "key.register", &registration, expected, &reply)?;
     let key_id: Uuid = response

@@ -191,7 +191,8 @@ pub(crate) struct Ticket {
     expired: bool,
 }
 
-/// The open ticket, locked for the transaction.
+/// The open ticket, locked for the transaction with its Organization, so steps that change the
+/// Organization (sign-in, root, disable) run one after another.
 pub(crate) async fn usable(
     tx: &mut Transaction<'_, Postgres>,
     ticket: &str,
@@ -202,7 +203,7 @@ pub(crate) async fn usable(
            o.disabled_at is not null as disabled, t.state, \
            t.expires_at <= clock_timestamp() as expired \
          from tickets t join organizations o on o.id = t.org_id \
-         where t.ticket = $1 for update of t for share of o",
+         where t.ticket = $1 for update of t for no key update of o",
     )
     .bind(ticket)
     .fetch_optional(&mut **tx)
@@ -339,7 +340,7 @@ pub async fn session(
     let Json(request) = body?;
     // Checked before the code is spent, and again under the lock below.
     let found = usable(&mut state.pool.begin().await?, &ticket).await?;
-    if found.kind != "claim" || found.rooted {
+    if found.kind != "claim" || found.rooted || found.disabled {
         return Err(Error::SessionRefused);
     }
     let claims = redeem(&state, &request).await?;
@@ -348,7 +349,7 @@ pub async fn session(
     let org_id = usable(&mut tx, &ticket).await?.org_id;
     let (owner_email, owner, rooted): (String, Option<Uuid>, bool) = sqlx::query_as(
         "select owner_email, owner_principal_id, rooted_at is not null from organizations \
-         where id = $1 and disabled_at is null for update",
+         where id = $1 and disabled_at is null for no key update",
     )
     .bind(org_id)
     .fetch_optional(&mut *tx)
