@@ -16,19 +16,30 @@ use axum::http::{HeaderMap, StatusCode};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::tickets::{self, Ticket};
+use crate::tickets;
 use crate::{AppState, Error, platform};
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyBody {
+    credential_id: String,
+    registration: Value,
+}
+
+/// A `claim` ticket's `root` makes the owner's passkey the Organization's first key; its `key`
+/// adds one that a key already in the roster signed.
 pub async fn relay(
     State(state): State<Arc<AppState>>,
     Path((ticket, op)): Path<(String, String)>,
     headers: HeaderMap,
-    body: Result<Json<Value>, JsonRejection>,
+    body: Result<Json<KeyBody>, JsonRejection>,
 ) -> Result<Json<Value>, Error> {
-    let Json(body) = body?;
+    let Json(KeyBody {
+        credential_id,
+        registration,
+    }) = body?;
     // The row stays locked until the step is recorded, so two relays of one op cannot both run.
     let mut tx = state.pool.begin().await?;
     let found = tickets::usable(&mut tx, &ticket).await?;
@@ -38,34 +49,6 @@ pub async fn relay(
     if found.kind != "claim" || !matches!(op.as_str(), "root" | "key") {
         return Err(Error::Forbidden);
     }
-    let reply = register_key(&state, &mut tx, &ticket, &found, &op, &headers, body).await?;
-    tx.commit().await?;
-    Ok(Json(reply))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct KeyBody {
-    credential_id: String,
-    registration: Value,
-}
-
-/// `root` makes the owner's passkey the Organization's first key; `key` adds one that a key
-/// already in the roster signed.
-async fn register_key(
-    state: &AppState,
-    tx: &mut Transaction<'_, Postgres>,
-    ticket: &str,
-    found: &Ticket,
-    op: &str,
-    headers: &HeaderMap,
-    body: Value,
-) -> Result<Value, Error> {
-    let malformed = |e: serde_json::Error| Error::Malformed(format!("body: {e}"));
-    let KeyBody {
-        credential_id,
-        registration,
-    } = serde_json::from_value(body).map_err(malformed)?;
     if credential_id.is_empty()
         || credential_id.len() > 1024
         || !credential_id
@@ -74,7 +57,8 @@ async fn register_key(
     {
         return Err(Error::Malformed("credential_id is not base64url".into()));
     }
-    let signed = Signed::deserialize(&registration).map_err(malformed)?;
+    let signed = Signed::deserialize(&registration)
+        .map_err(|e| Error::Malformed(format!("registration: {e}")))?;
     let org_id = found.org_id;
     let mut expected = Map::new();
     expected.insert("org_id".into(), json!(org_id));
@@ -107,8 +91,8 @@ async fn register_key(
         return Err(Error::Forbidden);
     }
 
-    let (_, document) = platform(state).await?;
-    let reply = kms(state, &document, "/v1/keys", &registration).await?;
+    let (_, document) = platform(&state).await?;
+    let reply = kms(&state, &document, "/v1/keys", &registration).await?;
     let response = confirm(&document, "key.register", &registration, expected, &reply)?;
     let key_id: Uuid = response
         .get("id")
@@ -122,12 +106,12 @@ async fn register_key(
     .bind(key_id)
     .bind(org_id)
     .bind(&credential_id)
-    .execute(&mut **tx)
+    .execute(&mut *tx)
     .await?;
     if op == "root" {
         sqlx::query("update organizations set rooted_at = now() where id = $1")
             .bind(org_id)
-            .execute(&mut **tx)
+            .execute(&mut *tx)
             .await?;
     }
     // A claim ends with the key it adds; after a root the owner may still add one.
@@ -135,9 +119,9 @@ async fn register_key(
         "update tickets set used = array_append(used, $1), \
          state = case when $1 = 'key' then 'done' else state end where ticket = $2",
     )
-    .bind(op)
-    .bind(ticket)
-    .execute(&mut **tx)
+    .bind(&op)
+    .bind(&ticket)
+    .execute(&mut *tx)
     .await?;
     sqlx::query(
         "insert into audit_log (actor, org_id, action, object) values ('ticket', $1, $2, $3)",
@@ -145,9 +129,10 @@ async fn register_key(
     .bind(org_id)
     .bind(format!("relay.{op}"))
     .bind(key_id.to_string())
-    .execute(&mut **tx)
+    .execute(&mut *tx)
     .await?;
-    Ok(reply)
+    tx.commit().await?;
+    Ok(Json(reply))
 }
 
 fn kms_revisions(document: &PlatformDocument) -> Vec<ComposeHash> {
