@@ -25,15 +25,6 @@ pub struct NewRevision {
     pub catalog: CatalogFile,
 }
 
-async fn app_of(state: &AppState, org_id: Uuid, slug: &str) -> Result<Uuid, Error> {
-    sqlx::query_scalar("select id from apps where org_id = $1 and slug = $2")
-        .bind(org_id)
-        .bind(slug)
-        .fetch_optional(&state.pool)
-        .await?
-        .ok_or(Error::NotFound)
-}
-
 /// The catalog key, the agent policy and the KMS CA of the current platform document. Each call
 /// fetches it, and a version below one already accepted is refused, so a stale copy cannot bring
 /// back a rotated key.
@@ -70,7 +61,12 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<Value>), Error> {
     let org_id = caller.org("apps:write")?;
     let Json(new) = body?;
-    let app_id = app_of(&state, org_id, &slug).await?;
+    let app_id: Uuid = sqlx::query_scalar("select id from apps where org_id = $1 and slug = $2")
+        .bind(org_id)
+        .bind(&slug)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(Error::NotFound)?;
     let (catalog_key, kata_policy, kms_ca_pem) = platform(&state).await?;
     let rendered = catalog::render(&new.catalog, &catalog_key, app_id.into(), &slug)
         .map_err(|e| Error::Malformed(format!("catalog {}: {e}", e.code())))?;
@@ -98,13 +94,12 @@ pub async fn create(
     let status = if inserted.rows_affected() == 0 {
         StatusCode::OK
     } else {
-        let object = rendered.revision.to_string();
         audit(
             &mut tx,
             &caller,
             org_id,
             "revision.create",
-            &object,
+            &rendered.revision.to_string(),
             catalog,
         )
         .await?;

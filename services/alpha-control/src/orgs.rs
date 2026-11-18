@@ -259,8 +259,15 @@ pub async fn disable(
     if disabled.rows_affected() == 0 {
         return Err(Error::NotFound);
     }
-    let object = org_id.to_string();
-    audit(&mut tx, &caller, org_id, "org.disable", &object, json!({})).await?;
+    audit(
+        &mut tx,
+        &caller,
+        org_id,
+        "org.disable",
+        &org_id.to_string(),
+        json!({}),
+    )
+    .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -286,8 +293,15 @@ pub async fn revoke_key(
     if revoked.rows_affected() == 0 {
         return Err(Error::NotFound);
     }
-    let object = key_id.to_string();
-    audit(&mut tx, &caller, org_id, "key.revoke", &object, json!({})).await?;
+    audit(
+        &mut tx,
+        &caller,
+        org_id,
+        "key.revoke",
+        &key_id.to_string(),
+        json!({}),
+    )
+    .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
