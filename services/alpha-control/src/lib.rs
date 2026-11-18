@@ -15,6 +15,7 @@
 
 mod apps;
 mod orgs;
+mod revisions;
 
 use std::sync::Arc;
 
@@ -23,7 +24,7 @@ use axum::extract::{DefaultBodyLimit, FromRequestParts, State};
 use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -38,6 +39,8 @@ pub async fn migrate(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
 pub struct AppState {
     pub pool: PgPool,
     pub operator_token_sha256: [u8; 32],
+    pub platform_document_url: String,
+    pub release_keys: alpha_client::platform::ReleaseKeys,
 }
 
 /// The closed set of error codes; no message carries a token.
@@ -49,8 +52,12 @@ pub enum Error {
     Forbidden,
     #[error("{0}")]
     Malformed(String),
+    #[error("not found")]
+    NotFound,
     #[error("{0}")]
     Conflict(&'static str),
+    #[error("{0}")]
+    Unavailable(String),
     #[error("{0}")]
     Internal(String),
 }
@@ -65,7 +72,9 @@ impl Error {
             Error::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Error::Forbidden => (StatusCode::FORBIDDEN, "forbidden"),
             Error::Malformed(_) => (StatusCode::BAD_REQUEST, "malformed"),
+            Error::NotFound => (StatusCode::NOT_FOUND, "not_found"),
             Error::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
+            Error::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
             Error::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         }
     }
@@ -178,12 +187,16 @@ impl FromRequestParts<Arc<AppState>> for Caller {
         if alpha_client::bearer_matches(&hash, &state.operator_token_sha256) {
             return Ok(Caller::Operator);
         }
-        sqlx::query_as("select id, org_id, scopes, issuer from api_keys where token_sha256 = $1")
-            .bind(hash.as_slice())
-            .fetch_optional(&state.pool)
-            .await?
-            .map(Caller::Key)
-            .ok_or(Error::Unauthorized)
+        sqlx::query_as(
+            "select k.id, k.org_id, k.scopes, k.issuer from api_keys k \
+             left join organizations o on o.id = k.org_id \
+             where k.token_sha256 = $1 and k.revoked_at is null and o.disabled_at is null",
+        )
+        .bind(hash.as_slice())
+        .fetch_optional(&state.pool)
+        .await?
+        .map(Caller::Key)
+        .ok_or(Error::Unauthorized)
     }
 }
 
@@ -234,7 +247,15 @@ pub fn probes(state: Arc<AppState>) -> Router {
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/orgs", post(orgs::create))
+        .route("/v1/orgs/{org}/disable", post(orgs::disable))
+        .route("/v1/orgs/{org}/keys/{id}", delete(orgs::revoke_key))
         .route("/v1/apps/{slug}", put(apps::put))
+        .route(
+            "/v1/apps/{slug}/revisions",
+            // A catalog file carries a whole init-data, up to 1 MiB.
+            post(revisions::create).layer(DefaultBodyLimit::max(2 << 20)),
+        )
+        .route("/v1/apps/{slug}/revisions/{hash}", get(revisions::get))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .merge(probe_routes())
         .with_state(state)
