@@ -41,10 +41,12 @@ fn env(name: &str) -> Result<String, Error> {
 /// The ID token is trusted because TLS authenticates the endpoint that returns it.
 fn https_env(name: &str) -> Result<String, Error> {
     let value = env(name)?;
-    if !value.starts_with("https://") {
-        return Err(Error::internal(format!("{name} must be an https URL")));
+    match reqwest::Url::parse(&value) {
+        Ok(url) if url.scheme() == "https" && url.host_str().is_some() => Ok(value),
+        _ => Err(Error::internal(format!(
+            "{name} must be an https URL with a host"
+        ))),
     }
-    Ok(value)
 }
 
 fn hex_env(name: &str) -> Result<Zeroizing<[u8; 32]>, Error> {

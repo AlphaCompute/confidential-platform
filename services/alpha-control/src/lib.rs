@@ -51,22 +51,25 @@ pub struct AppState {
 /// ponytail: one count per process, so it bounds the code lookups of the single replica; with
 /// more replicas the count moves to Postgres or the edge.
 #[derive(Default)]
-pub struct Limiter(parking_lot::Mutex<(u64, u32)>);
+pub struct Limiter(parking_lot::Mutex<Option<(std::time::Instant, u32)>>);
 
 /// A code has 40 bits, so a guess finds an open ticket only after billions of tries at this rate.
 const CODE_LOOKUPS_PER_SECOND: u32 = 20;
 
 impl Limiter {
     fn allow(&self) -> bool {
-        let second = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |t| t.as_secs());
         let mut window = self.0.lock();
-        if window.0 != second {
-            *window = (second, 0);
+        let now = std::time::Instant::now();
+        match &mut *window {
+            Some((start, count)) if now.duration_since(*start).as_secs() == 0 => {
+                *count = count.saturating_add(1);
+                *count <= CODE_LOOKUPS_PER_SECOND
+            }
+            _ => {
+                *window = Some((now, 1));
+                true
+            }
         }
-        window.1 = window.1.saturating_add(1);
-        window.1 <= CODE_LOOKUPS_PER_SECOND
     }
 }
 
