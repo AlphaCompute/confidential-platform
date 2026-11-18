@@ -38,6 +38,15 @@ fn env(name: &str) -> Result<String, Error> {
     std::env::var(name).map_err(|_| Error::internal(format!("{name} is required")))
 }
 
+/// The ID token is trusted because TLS authenticates the endpoint that returns it.
+fn https_env(name: &str) -> Result<String, Error> {
+    let value = env(name)?;
+    if !value.starts_with("https://") {
+        return Err(Error::internal(format!("{name} must be an https URL")));
+    }
+    Ok(value)
+}
+
 fn hex_env(name: &str) -> Result<Zeroizing<[u8; 32]>, Error> {
     let bytes = Zeroizing::new(
         data_encoding::HEXLOWER_PERMISSIVE
@@ -83,7 +92,7 @@ async fn run() -> Result<(), Error> {
     let signer_url = env("ALPHACOMPUTE_SIGNER_URL")?;
     let oidc = Oidc {
         issuer: env("ALPHACOMPUTE_OIDC_ISSUER")?,
-        token_endpoint: env("ALPHACOMPUTE_OIDC_TOKEN_ENDPOINT")?,
+        token_endpoint: https_env("ALPHACOMPUTE_OIDC_TOKEN_ENDPOINT")?,
         client_id: env("ALPHACOMPUTE_OIDC_CLIENT_ID")?,
     };
     let release_keys = alpha_client::platform::release_keys()
@@ -103,6 +112,7 @@ async fn run() -> Result<(), Error> {
         release_keys,
         signer_url,
         oidc,
+        code_lookups: Default::default(),
     });
 
     let bind = |port: u16| async move {

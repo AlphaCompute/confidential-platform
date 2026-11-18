@@ -45,6 +45,29 @@ pub struct AppState {
     /// Where the signer page lives, for example `https://sign.alphacompute.cc`.
     pub signer_url: String,
     pub oidc: Oidc,
+    pub code_lookups: Limiter,
+}
+
+/// ponytail: one count per process, so it bounds the code lookups of the single replica; with
+/// more replicas the count moves to Postgres or the edge.
+#[derive(Default)]
+pub struct Limiter(parking_lot::Mutex<(u64, u32)>);
+
+/// A code has 40 bits, so a guess finds an open ticket only after billions of tries at this rate.
+const CODE_LOOKUPS_PER_SECOND: u32 = 20;
+
+impl Limiter {
+    fn allow(&self) -> bool {
+        let second = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |t| t.as_secs());
+        let mut window = self.0.lock();
+        if window.0 != second {
+            *window = (second, 0);
+        }
+        window.1 = window.1.saturating_add(1);
+        window.1 <= CODE_LOOKUPS_PER_SECOND
+    }
 }
 
 /// The identity provider's public client that the signer page signs owners in with.
@@ -77,6 +100,8 @@ pub enum Error {
     TicketClosed,
     #[error("the sign-in is not the Organization's owner")]
     SessionRefused,
+    #[error("too many requests; retry in a second")]
+    RateLimited,
     #[error("{0}")]
     Internal(String),
 }
@@ -98,6 +123,7 @@ impl Error {
             Error::TicketExpired => (StatusCode::GONE, "ticket_expired"),
             Error::TicketClosed => (StatusCode::CONFLICT, "ticket_closed"),
             Error::SessionRefused => (StatusCode::FORBIDDEN, "session_refused"),
+            Error::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
             Error::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         }
     }
@@ -132,21 +158,32 @@ impl IntoResponse for Error {
         };
         let body =
             json!({ "error": { "code": code, "message": message, "request_id": request_id } });
-        (status, Json(body)).into_response()
+        let mut response = (status, Json(body)).into_response();
+        if matches!(self, Error::RateLimited) {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+        }
+        response
     }
 }
 
 pub const SCOPES: [&str; 5] = ["apps:read", "apps:write", "deploy", "org:admin", "onboard"];
 
+fn fill(bytes: &mut [u8]) -> Result<(), Error> {
+    getrandom::fill(bytes).map_err(|e| Error::internal(format!("rng: {e}")))
+}
+
 fn random<const N: usize>() -> Result<[u8; N], Error> {
     let mut bytes = [0u8; N];
-    getrandom::fill(&mut bytes).map_err(|e| Error::internal(format!("rng: {e}")))?;
+    fill(&mut bytes)?;
     Ok(bytes)
 }
 
 /// A new operational API key `alpha_<base32>` and the SHA-256 its row keeps.
 pub fn mint_token() -> Result<(String, [u8; 32]), Error> {
-    let secret = Zeroizing::new(random::<32>()?);
+    let mut secret = Zeroizing::new([0u8; 32]);
+    fill(secret.as_mut_slice())?;
     let token = format!(
         "alpha_{}",
         data_encoding::BASE32_NOPAD

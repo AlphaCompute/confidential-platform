@@ -162,6 +162,16 @@ pub async fn create(
         "30 minutes",
     )
     .await?;
+    let object = rendered.revision.to_string();
+    audit(
+        &mut tx,
+        &caller,
+        org_id,
+        "ticket.approve",
+        &object,
+        json!({}),
+    )
+    .await?;
     tx.commit().await?;
     let approval_url = format!("{}/approve#{ticket}", state.signer_url);
     Ok((

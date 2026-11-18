@@ -130,6 +130,7 @@ impl Api {
             platform_document_url: url,
             release_keys: release.verifying_key().into(),
             signer_url: "https://sign.example".into(),
+            code_lookups: Default::default(),
             oidc: Oidc {
                 issuer: ISSUER.into(),
                 token_endpoint: format!("{base}/token"),
@@ -546,6 +547,17 @@ async fn an_approve_ticket_reads_as_the_signer_page_expects_and_closes_once() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(found, json!({ "kind": "approve", "ticket": ticket }));
+    let mut limited = None;
+    for _ in 0..25 {
+        let (status, _) = api
+            .call(Method::GET, "/v1/tickets/by-code/00000000", "", Value::Null)
+            .await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            limited = Some(status);
+            break;
+        }
+    }
+    assert!(limited.is_some(), "code lookups are not limited");
 
     let (status, read) = api
         .call(
@@ -669,6 +681,7 @@ async fn only_the_owners_verified_sign_in_binds_a_session_to_a_claim_ticket() {
         ("bad", owner.clone()),
         ("good", with(&owner, "email_verified", json!(false))),
         ("good", with(&owner, "aud", json!("other"))),
+        ("good", with(&owner, "aud", json!(["signer", "other"]))),
         ("good", with(&owner, "iss", json!("https://other.example"))),
         ("good", with(&owner, "exp", json!(1))),
         ("good", with(&owner, "email", json!("someone@acme.test"))),
@@ -709,6 +722,26 @@ async fn only_the_owners_verified_sign_in_binds_a_session_to_a_claim_ticket() {
         (status, &again["principal_id"]),
         (StatusCode::OK, &bound["principal_id"])
     );
+    let renewed = again["session"].as_str().unwrap();
+    let stored: Vec<u8> =
+        sqlx::query_scalar("select session_sha256 from tickets where ticket = $1")
+            .bind(&ticket)
+            .fetch_one(&api.1)
+            .await
+            .unwrap();
+    assert!(renewed != session && stored == Sha256::digest(renewed.as_bytes()).as_slice());
+
+    // A disabled Organization binds no owner.
+    sqlx::query("update organizations set disabled_at = now()")
+        .execute(&api.1)
+        .await
+        .unwrap();
+    let (status, _) = api.call(Method::POST, &path, "", request("good")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    sqlx::query("update organizations set disabled_at = null")
+        .execute(&api.1)
+        .await
+        .unwrap();
 
     sqlx::query("update tickets set expires_at = now() - interval '1 second'")
         .execute(&api.1)

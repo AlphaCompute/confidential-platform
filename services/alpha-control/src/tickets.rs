@@ -68,7 +68,9 @@ pub async fn claim(
     .await?
     .ok_or(Error::NotFound)?;
     let (ticket, code) = open(&mut tx, "claim", org_id, None, "72 hours").await?;
-    audit(&mut tx, &caller, org_id, "ticket.claim", &code, json!({})).await?;
+    // The code redeems the ticket, so the audit row names only the Organization.
+    let object = org_id.to_string();
+    audit(&mut tx, &caller, org_id, "ticket.claim", &object, json!({})).await?;
     tx.commit().await?;
     let url = format!("{}/claim#{ticket}", state.signer_url);
     Ok((
@@ -148,6 +150,9 @@ pub async fn by_code(
     State(state): State<Arc<AppState>>,
     Path(code): Path<String>,
 ) -> Result<Json<Value>, Error> {
+    if !state.code_lookups.allow() {
+        return Err(Error::RateLimited);
+    }
     let (kind, ticket): (String, String) =
         sqlx::query_as("select kind, ticket from tickets where code = $1")
             .bind(&code)
@@ -160,7 +165,8 @@ pub async fn by_code(
 /// The open ticket's kind and Organization, locked for the transaction.
 async fn usable(tx: &mut Transaction<'_, Postgres>, ticket: &str) -> Result<(String, Uuid), Error> {
     let (kind, state, expired, org_id): (String, String, bool, Uuid) = sqlx::query_as(
-        "select kind, state, expires_at <= now(), org_id from tickets where ticket = $1 for update",
+        "select kind, state, expires_at <= clock_timestamp(), org_id from tickets \
+         where ticket = $1 for update",
     )
     .bind(ticket)
     .fetch_optional(&mut **tx)
@@ -179,10 +185,15 @@ pub async fn decline(
 ) -> Result<Json<Value>, Error> {
     let mut tx = state.pool.begin().await?;
     let (kind, org_id) = usable(&mut tx, &ticket).await?;
-    sqlx::query("update tickets set state = 'declined' where ticket = $1")
-        .bind(&ticket)
-        .execute(&mut *tx)
-        .await?;
+    let declined = sqlx::query(
+        "update tickets set state = 'declined' where ticket = $1 and expires_at > clock_timestamp()",
+    )
+    .bind(&ticket)
+    .execute(&mut *tx)
+    .await?;
+    if declined.rows_affected() == 0 {
+        return Err(Error::TicketExpired);
+    }
     sqlx::query(
         "insert into audit_log (actor, org_id, action, details) \
          values ('ticket', $1, 'ticket.decline', $2)",
@@ -245,15 +256,20 @@ async fn redeem(state: &AppState, request: &SessionRequest) -> Result<Claims, Er
     if reply.status().is_client_error() {
         return Err(Error::SessionRefused);
     }
+    if !reply.status().is_success() {
+        return Err(Error::Unavailable(format!(
+            "token endpoint answered {}",
+            reply.status()
+        )));
+    }
     #[derive(Deserialize)]
     struct Tokens {
         id_token: String,
     }
-    let tokens: Tokens = reply
-        .error_for_status()
-        .map_err(|e| Error::Unavailable(format!("token endpoint: {e}")))?
-        .json()
+    let body = alpha_client::read_capped(reply, 64 << 10)
         .await
+        .map_err(|e| Error::Unavailable(format!("token endpoint reply: {e}")))?;
+    let tokens: Tokens = serde_json::from_slice(&body)
         .map_err(|e| Error::Unavailable(format!("token endpoint reply: {e}")))?;
     let claims: Claims = tokens
         .id_token
@@ -262,9 +278,10 @@ async fn redeem(state: &AppState, request: &SessionRequest) -> Result<Claims, Er
         .and_then(|payload| BASE64URL_NOPAD.decode(payload.as_bytes()).ok())
         .and_then(|payload| serde_json::from_slice(&payload).ok())
         .ok_or_else(|| Error::Unavailable("the ID token does not parse".into()))?;
+    // No other audience is trusted, so the client must be the only one.
     let audience = match &claims.aud {
         Audience::One(aud) => aud == &oidc.client_id,
-        Audience::Many(auds) => auds.contains(&oidc.client_id),
+        Audience::Many(auds) => auds.as_slice() == [oidc.client_id.as_str()],
     };
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -294,11 +311,13 @@ pub async fn session(
     let mut tx = state.pool.begin().await?;
     let (_, org_id) = usable(&mut tx, &ticket).await?;
     let (owner_email, owner): (String, Option<Uuid>) = sqlx::query_as(
-        "select owner_email, owner_principal_id from organizations where id = $1 for update",
+        "select owner_email, owner_principal_id from organizations \
+         where id = $1 and disabled_at is null for update",
     )
     .bind(org_id)
-    .fetch_one(&mut *tx)
-    .await?;
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(Error::SessionRefused)?;
     let principal_id: Uuid = sqlx::query_scalar(
         "insert into principals (id, issuer, subject) values ($1, $2, $3) \
          on conflict (issuer, subject) do update set issuer = excluded.issuer returning id",
@@ -325,11 +344,17 @@ pub async fn session(
         .bind(org_id)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("update tickets set session_sha256 = $1 where ticket = $2")
-        .bind(Sha256::digest(secret.as_bytes()).as_slice())
-        .bind(&ticket)
-        .execute(&mut *tx)
-        .await?;
+    // The Organization's lock may have been held past the ticket's expiry.
+    let bound = sqlx::query(
+        "update tickets set session_sha256 = $1 where ticket = $2 and expires_at > clock_timestamp()",
+    )
+    .bind(Sha256::digest(secret.as_bytes()).as_slice())
+    .bind(&ticket)
+    .execute(&mut *tx)
+    .await?;
+    if bound.rows_affected() == 0 {
+        return Err(Error::TicketExpired);
+    }
     sqlx::query(
         "insert into audit_log (actor, org_id, action) \
          values ($1, $2, 'ticket.session')",
