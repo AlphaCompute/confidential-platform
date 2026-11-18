@@ -4,6 +4,9 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+
+use yaml_rust2::parser::{Event, Parser};
 use yaml_rust2::{Yaml, YamlLoader};
 
 use crate::AppId;
@@ -99,6 +102,8 @@ pub enum RegistrationError {
     ImageWithoutDigest(String),
     #[error("a build: key is present; every service must resolve to a pinned image")]
     BuildNotAllowed,
+    #[error("docker_compose_file expands to more than {MAX_YAML_NODES} YAML nodes")]
+    TooManyNodes,
 }
 
 impl RegistrationError {
@@ -124,10 +129,47 @@ pub fn check_registration(compose: &str, app_id: AppId) -> Result<ComposeHash, R
         .get("docker_compose_file")
         .and_then(Value::as_str)
         .ok_or(RegistrationError::NoDockerComposeFile)?;
-    YamlLoader::load_from_str(yaml)?
-        .iter()
-        .try_for_each(check_images)?;
+    load_yaml(yaml)?.iter().try_for_each(check_images)?;
     Ok(compose_hash(compose))
+}
+
+/// Far above any real compose, far below what hurts a node.
+pub const MAX_YAML_NODES: usize = 100_000;
+
+/// `YamlLoader` copies the anchored node for every alias, so nested aliases grow exponentially
+/// ("billion laughs"). Count the expanded nodes on the event stream first; compose files use
+/// anchors with `<<:` merges, so refusing aliases outright would refuse real files.
+pub fn load_yaml(yaml: &str) -> Result<Vec<Yaml>, RegistrationError> {
+    let mut parser = Parser::new_from_str(yaml);
+    let mut nodes = 0usize;
+    let mut open: Vec<(usize, usize)> = Vec::new();
+    let mut anchors: HashMap<usize, usize> = HashMap::new();
+    loop {
+        let size = match parser.next_token()?.0 {
+            Event::StreamEnd => break,
+            Event::Scalar(_, _, anchor, _) => {
+                anchors.insert(anchor, 1);
+                1
+            }
+            Event::SequenceStart(anchor, _) | Event::MappingStart(anchor, _) => {
+                open.push((anchor, nodes));
+                1
+            }
+            Event::SequenceEnd | Event::MappingEnd => {
+                if let Some((anchor, start)) = open.pop() {
+                    anchors.insert(anchor, nodes.saturating_sub(start));
+                }
+                0
+            }
+            Event::Alias(anchor) => anchors.get(&anchor).copied().unwrap_or(1),
+            _ => 0,
+        };
+        nodes = nodes.saturating_add(size);
+        if nodes > MAX_YAML_NODES {
+            return Err(RegistrationError::TooManyNodes);
+        }
+    }
+    Ok(YamlLoader::load_from_str(yaml)?)
 }
 
 fn check_images(node: &Yaml) -> Result<(), RegistrationError> {
@@ -229,6 +271,19 @@ mod tests {
             assert_eq!(kind, expected["error"], "{dir}");
             assert_eq!(err.code(), "malformed");
         }
+    }
+
+    #[test]
+    fn an_alias_bomb_is_refused_before_it_expands() {
+        let mut yaml = "a0: &a0 [x, x, x, x, x, x, x, x, x, x]\n".to_owned();
+        for i in 1..9 {
+            let p = i - 1;
+            yaml += &format!("a{i}: &a{i} [{}]\n", vec![format!("*a{p}"); 10].join(", "));
+        }
+        assert!(matches!(
+            load_yaml(&yaml),
+            Err(RegistrationError::TooManyNodes)
+        ));
     }
 
     #[test]
