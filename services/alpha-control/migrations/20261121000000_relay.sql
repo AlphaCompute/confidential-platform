@@ -13,3 +13,4 @@ create table credentials (
   credential_id text not null,
   created_at    timestamptz not null default now()
 );
+create index on credentials (org_id);

@@ -17,6 +17,7 @@ use data_encoding::BASE64URL_NOPAD;
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
+use sqlx::{Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::tickets;
@@ -41,9 +42,20 @@ pub async fn relay(
         credential_id,
         registration,
     }) = body?;
+    // Refused cheaply before the platform document is fetched: anyone can reach this route.
+    if !matches!(op.as_str(), "root" | "key") {
+        return Err(Error::Forbidden);
+    }
+    let early = tickets::usable(&mut state.pool.begin().await?, &ticket).await?;
+    if early.kind != "claim" || early.disabled {
+        return Err(Error::Forbidden);
+    }
     // Fetched before the transaction, so a relay never holds one pool connection while it waits
     // for another.
     let (version, document) = platform(&state).await?;
+    // ponytail: the ticket and Organization rows stay locked across the KMS call, up to 60 s per
+    // endpoint, so a step and a disable of one Organization wait for each other that long. The
+    // upgrade is a ticket state `sending` committed before the call and settled after it.
     // The row stays locked until the step is recorded, so two relays of one op cannot both run.
     let mut tx = state.pool.begin().await?;
     let found = tickets::usable(&mut tx, &ticket).await?;
@@ -53,7 +65,7 @@ pub async fn relay(
     if found.used.contains(&op) {
         return Err(Error::TicketClosed);
     }
-    if found.kind != "claim" || !matches!(op.as_str(), "root" | "key") {
+    if found.kind != "claim" {
         return Err(Error::Forbidden);
     }
     if credential_id.is_empty()
@@ -100,26 +112,27 @@ pub async fn relay(
         // the one of the holder the ticket names.
         return Err(Error::Forbidden);
     }
-    // Held to the commit, so a newer document accepted meanwhile cannot leave this step checked
-    // under the builds it retired.
-    let accepted: i64 =
-        sqlx::query_scalar("select version from platform_version where one = 1 for share")
-            .fetch_one(&mut *tx)
-            .await?;
-    if version < accepted {
-        return Err(stale(version, accepted));
-    }
-    // The version lock may have waited past the ticket's expiry.
-    let open: bool =
-        sqlx::query_scalar("select expires_at > clock_timestamp() from tickets where ticket = $1")
-            .bind(&ticket)
-            .fetch_one(&mut *tx)
-            .await?;
-    if !open {
-        return Err(Error::TicketExpired);
+    // The KMS answers a repeated root for the same key with its stored row and a new receipt,
+    // so a root checks the version after the reply and a retry after `stale` still records it.
+    // A repeated other key is `already_exists`, so a key checks the version before the call.
+    if op == "key" {
+        current(&mut tx, version).await?;
+        // The version lock may have waited past the ticket's expiry.
+        let open: bool = sqlx::query_scalar(
+            "select expires_at > clock_timestamp() from tickets where ticket = $1",
+        )
+        .bind(&ticket)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !open {
+            return Err(Error::TicketExpired);
+        }
     }
     let reply = kms(&state, &document, "/v1/keys", &registration).await?;
     let response = confirm(&document, "key.register", &registration, expected, &reply)?;
+    if op == "root" {
+        current(&mut tx, version).await?;
+    }
     let key_id: Uuid = response
         .get("id")
         .and_then(|id| Uuid::deserialize(id).ok())
@@ -165,6 +178,19 @@ pub async fn relay(
     .await?;
     tx.commit().await?;
     Ok(Json(reply))
+}
+
+/// Refuses a step checked under a document older than the accepted one. The share lock holds to
+/// the commit, so no newer version is accepted before the step is recorded.
+async fn current(tx: &mut Transaction<'_, Postgres>, version: i64) -> Result<(), Error> {
+    let accepted: i64 =
+        sqlx::query_scalar("select version from platform_version where one = 1 for share")
+            .fetch_one(&mut **tx)
+            .await?;
+    if version < accepted {
+        return Err(stale(version, accepted));
+    }
+    Ok(())
 }
 
 fn kms_revisions(document: &PlatformDocument) -> Vec<ComposeHash> {

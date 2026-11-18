@@ -909,7 +909,7 @@ async fn only_the_owners_session_roots_and_only_roster_keys_of_the_organization_
     let Some(api) = Api::start(true).await else {
         return;
     };
-    let (org, admin) = api.org(&["org:admin"]).await;
+    let (org, _) = api.org(&["org:admin"]).await;
     let ticket = claim_ticket(&api, &org).await;
     *api.4.lock().unwrap() = json!({
         "iss": ISSUER, "aud": "signer", "exp": 4_000_000_000u64, "sub": "owner",
@@ -944,7 +944,7 @@ async fn only_the_owners_session_roots_and_only_roster_keys_of_the_organization_
         );
     }
     let (status, _) = api
-        .call(Method::POST, &relay("key"), &admin, root_body.clone())
+        .call(Method::POST, &relay("key"), "", root_body.clone())
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
@@ -1001,7 +1001,7 @@ async fn only_the_owners_session_roots_and_only_roster_keys_of_the_organization_
             .call(
                 Method::POST,
                 &relay("key"),
-                &admin,
+                "",
                 json!({ "credential_id": "Y3JlZC0y", "registration": body }),
             )
             .await;
@@ -1095,4 +1095,35 @@ async fn send_kms(url: &str, path: &str, body: Value) -> (u16, Value) {
         reply.status().as_u16(),
         reply.json().await.unwrap_or(Value::Null),
     )
+}
+
+#[tokio::test]
+async fn a_relay_refuses_an_unknown_ticket_or_op_without_reading_the_platform_document() {
+    let Some(api) = Api::new().await else { return };
+    // A document that does not verify: a relay that read it would answer 503.
+    *api.2.lock().unwrap() = json!("not a platform document");
+    let body = json!({ "credential_id": "Y3JlZC0x", "registration": {} });
+    let (status, missing) = api
+        .call(
+            Method::POST,
+            "/v1/tickets/unknown/kms/key",
+            "",
+            body.clone(),
+        )
+        .await;
+    assert_eq!(
+        (status, &missing["error"]["code"]),
+        (StatusCode::NOT_FOUND, &json!("ticket_not_found"))
+    );
+    let (org, _) = api.org(&["org:admin"]).await;
+    let ticket = claim_ticket(&api, &org).await;
+    let (status, _) = api
+        .call(
+            Method::POST,
+            &format!("/v1/tickets/{ticket}/kms/other"),
+            "",
+            body,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
