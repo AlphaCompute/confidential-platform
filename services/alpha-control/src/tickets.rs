@@ -60,12 +60,13 @@ pub async fn claim(
         return Err(Error::Forbidden);
     }
     let mut tx = state.pool.begin().await?;
-    let found: Option<i32> =
-        sqlx::query_scalar("select 1 from organizations where id = $1 and disabled_at is null")
-            .bind(org_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-    found.ok_or(Error::NotFound)?;
+    sqlx::query_scalar::<_, i32>(
+        "select 1 from organizations where id = $1 and disabled_at is null",
+    )
+    .bind(org_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(Error::NotFound)?;
     let (ticket, code) = open(&mut tx, "claim", org_id, None, "72 hours").await?;
     audit(&mut tx, &caller, org_id, "ticket.claim", &code, json!({})).await?;
     tx.commit().await?;
@@ -197,9 +198,9 @@ pub async fn decline(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionRequest {
-    pub code: String,
-    pub code_verifier: String,
-    pub redirect_uri: String,
+    code: String,
+    code_verifier: String,
+    redirect_uri: String,
 }
 
 #[derive(Deserialize)]
