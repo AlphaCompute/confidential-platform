@@ -415,3 +415,35 @@ async fn a_catalog_revision_is_rendered_for_its_app_and_stored_once() {
         .await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
+
+#[tokio::test]
+async fn a_create_waits_for_an_open_create_with_the_same_links_in_any_order() {
+    let Some(api) = Api::new().await else { return };
+    let link = |id: &str| json!({ "issuer": "rafay:console.example", "external_id": id });
+    // A create of [a, b] still open holds the lock named after its lowest link.
+    let mut open = api.1.begin().await.unwrap();
+    sqlx::query("select pg_advisory_xact_lock(hashtext($1), hashtext($2))")
+        .bind("rafay:console.example")
+        .bind("org-a")
+        .execute(&mut *open)
+        .await
+        .unwrap();
+    let reordered = json!({
+        "name": "Acme", "owner_email": "owner@acme.test", "links": [link("org-b"), link("org-a")],
+    });
+    let router = api.0.clone();
+    let waiting = tokio::spawn(async move {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/orgs")
+            .header("authorization", format!("Bearer {OPERATOR}"))
+            .header("content-type", "application/json")
+            .body(Body::from(reordered.to_string()))
+            .unwrap();
+        router.oneshot(request).await.unwrap().status()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!waiting.is_finished());
+    open.commit().await.unwrap();
+    assert_eq!(waiting.await.unwrap(), StatusCode::CREATED);
+}

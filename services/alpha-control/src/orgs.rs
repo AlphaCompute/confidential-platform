@@ -121,6 +121,10 @@ pub async fn create(
         .iter()
         .min_by(|a, b| (&a.issuer, &a.external_id).cmp(&(&b.issuer, &b.external_id)));
     if let Some(lowest) = lowest {
+        // A stalled holder must not keep every waiter's pool connection.
+        sqlx::query("set local lock_timeout = '5s'")
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("select pg_advisory_xact_lock(hashtext($1), hashtext($2))")
             .bind(&lowest.issuer)
             .bind(&lowest.external_id)
