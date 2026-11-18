@@ -51,7 +51,7 @@ fn capture(name: &str) -> Vec<u8> {
 async fn start_kms(
     url: &str,
     release: &SigningKey,
-) -> (Arc<alpha_kms::Node>, String, String, oneshot::Sender<()>) {
+) -> (alpha_core::ComposeHash, String, String, oneshot::Sender<()>) {
     let pool = fresh_database().await.unwrap();
     // The migrations create the cluster-wide `alpha_kms` role; two at once both try.
     let admin = PgPoolOptions::new()
@@ -122,7 +122,7 @@ async fn start_kms(
         .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     let ca = bootstrap["kms_ca_pem"].as_str().unwrap().to_owned();
-    (node, base, ca, shutdown)
+    (node.compose_hash, base, ca, shutdown)
 }
 
 const CATALOG: &str = include_str!("../../../testdata/catalog/valid.json");
@@ -172,7 +172,7 @@ struct Api(
     Arc<Mutex<Value>>,
     SigningKey,
     Arc<Mutex<Value>>,
-    Option<(Arc<alpha_kms::Node>, String, oneshot::Sender<()>)>,
+    Option<(String, oneshot::Sender<()>)>,
 );
 
 impl Api {
@@ -223,21 +223,21 @@ impl Api {
         tokio::spawn(async move { axum::serve(listener, host).await });
         let mut kms = None;
         if with_kms {
-            let (node, kms_url, ca, shutdown) = start_kms(&url, &release).await;
+            let (compose_hash, kms_url, ca, shutdown) = start_kms(&url, &release).await;
             let pins = json!({
                 "kms_ca_pem": ca,
-                "kms_revisions": [{ "compose_hash": node.compose_hash, "build": "test",
+                "kms_revisions": [{ "compose_hash": compose_hash, "build": "test",
                                     "source_url": "https://example.test" }],
             });
             *served.lock().unwrap() = platform_document(&release, 2, pins);
-            kms = Some((node, kms_url, shutdown));
+            kms = Some((kms_url, shutdown));
         }
         let state = Arc::new(AppState {
             pool: pool.clone(),
             operator_token_sha256: Sha256::digest(OPERATOR).into(),
             platform_document_url: url,
             release_keys: release.verifying_key().into(),
-            kms_endpoints: kms.iter().map(|(_, url, _)| url.clone()).collect(),
+            kms_endpoints: kms.iter().map(|(url, _)| url.clone()).collect(),
             signer_url: "https://sign.example".into(),
             code_lookups: Default::default(),
             oidc: Oidc {
@@ -287,6 +287,19 @@ impl Api {
             status,
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         )
+    }
+
+    async fn read_ticket(&self, ticket: &str) -> Value {
+        let (status, read) = self
+            .call(
+                Method::GET,
+                &format!("/v1/tickets/{ticket}"),
+                "",
+                Value::Null,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{read}");
+        read
     }
 
     /// An Organization with a deploy key of `scopes`; returns its id and token.
@@ -684,15 +697,7 @@ async fn an_approve_ticket_reads_as_the_signer_page_expects_and_closes_once() {
     }
     assert!(limited.is_some(), "code lookups are not limited");
 
-    let (status, read) = api
-        .call(
-            Method::GET,
-            &format!("/v1/tickets/{ticket}"),
-            "",
-            Value::Null,
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK);
+    let read = api.read_ticket(ticket).await;
     for key in ["expires_at", "server_time"] {
         assert!(read[key].as_str().unwrap().ends_with('Z'), "{read}");
     }
@@ -721,14 +726,7 @@ async fn an_approve_ticket_reads_as_the_signer_page_expects_and_closes_once() {
         (status, &closed["error"]["code"]),
         (StatusCode::CONFLICT, &json!("ticket_closed"))
     );
-    let (_, read) = api
-        .call(
-            Method::GET,
-            &format!("/v1/tickets/{ticket}"),
-            "",
-            Value::Null,
-        )
-        .await;
+    let read = api.read_ticket(ticket).await;
     assert_eq!(read["state"], "declined");
     let (status, missing) = api
         .call(Method::GET, "/v1/tickets/unknown", "", Value::Null)
@@ -781,14 +779,7 @@ async fn only_the_owners_verified_sign_in_binds_a_session_to_a_claim_ticket() {
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
     let ticket = claim_ticket(&api, &org).await;
-    let (_, read) = api
-        .call(
-            Method::GET,
-            &format!("/v1/tickets/{ticket}"),
-            "",
-            Value::Null,
-        )
-        .await;
+    let read = api.read_ticket(&ticket).await;
     assert_eq!(
         (&read["kind"], &read["rooted"], &read["owner_email"]),
         (&json!("claim"), &json!(false), &json!("owner@acme.test"))
@@ -872,14 +863,7 @@ async fn only_the_owners_verified_sign_in_binds_a_session_to_a_claim_ticket() {
         .execute(&api.1)
         .await
         .unwrap();
-    let (_, read) = api
-        .call(
-            Method::GET,
-            &format!("/v1/tickets/{ticket}"),
-            "",
-            Value::Null,
-        )
-        .await;
+    let read = api.read_ticket(&ticket).await;
     assert_eq!(read["state"], "expired");
     let (status, expired) = api.call(Method::POST, &path, "", request("good")).await;
     assert_eq!(
@@ -990,21 +974,14 @@ async fn only_the_owners_session_roots_and_only_roster_keys_of_the_organization_
         (status, code(&again)),
         (StatusCode::CONFLICT, json!("ticket_closed"))
     );
-    let (_, read) = api
-        .call(
-            Method::GET,
-            &format!("/v1/tickets/{ticket}"),
-            "",
-            Value::Null,
-        )
-        .await;
+    let read = api.read_ticket(&ticket).await;
     assert_eq!(
         read["credentials"],
         json!([{ "credential_id": "cred-1", "key_id": root_id }])
     );
 
     // Another Organization's roster key, and a bearer with a forged signature, add nothing here.
-    let (_, kms_url, _) = api.5.as_ref().unwrap();
+    let (kms_url, _) = api.5.as_ref().unwrap();
     let foreign = SigningKey::from_bytes(&[22; 32]);
     let foreign_org = Uuid::now_v7().to_string();
     let (status, foreign_root) = send_kms(
@@ -1036,14 +1013,7 @@ async fn only_the_owners_session_roots_and_only_roster_keys_of_the_organization_
             .await;
         assert_eq!(code(&refused), json!(expected), "{status}");
     }
-    let (_, read) = api
-        .call(
-            Method::GET,
-            &format!("/v1/tickets/{ticket}"),
-            "",
-            Value::Null,
-        )
-        .await;
+    let read = api.read_ticket(&ticket).await;
     assert_eq!(
         (
             read["state"].clone(),
@@ -1065,14 +1035,7 @@ async fn only_the_owners_session_roots_and_only_roster_keys_of_the_organization_
         (status, code(&closed)),
         (StatusCode::CONFLICT, json!("ticket_closed"))
     );
-    let (_, read) = api
-        .call(
-            Method::GET,
-            &format!("/v1/tickets/{ticket}"),
-            "",
-            Value::Null,
-        )
-        .await;
+    let read = api.read_ticket(&ticket).await;
     assert_eq!(
         (
             read["state"].clone(),
@@ -1083,14 +1046,7 @@ async fn only_the_owners_session_roots_and_only_roster_keys_of_the_organization_
 
     // A rooted Organization's claim ticket names the holder of the key it adds and takes no root.
     let rooted_ticket = claim_ticket(&api, &org).await;
-    let (_, read) = api
-        .call(
-            Method::GET,
-            &format!("/v1/tickets/{rooted_ticket}"),
-            "",
-            Value::Null,
-        )
-        .await;
+    let read = api.read_ticket(&rooted_ticket).await;
     assert_eq!(read["rooted"], true);
     assert!(
         read["principal_id"].is_string() && read.get("owner_email").is_none(),

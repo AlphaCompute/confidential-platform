@@ -172,15 +172,12 @@ async fn kms(
     client
         .request(reqwest::Method::POST, path, Some(body))
         .await
-        .map_err(|e| {
-            let code = e.kind();
-            match e {
-                alpha_client::Error::Api(api) => Error::Kms {
-                    status: StatusCode::from_u16(api.status).unwrap_or(StatusCode::BAD_GATEWAY),
-                    code,
-                },
-                other => unavailable(other),
-            }
+        .map_err(|e| match &e {
+            alpha_client::Error::Api(api) => Error::Kms {
+                status: StatusCode::from_u16(api.status).unwrap_or(StatusCode::BAD_GATEWAY),
+                code: e.kind(),
+            },
+            _ => unavailable(e),
         })
 }
 
