@@ -2,14 +2,11 @@ create table principals (
   id         uuid primary key,
   issuer     text not null,
   subject    text not null,
-  email      text,
   created_at timestamptz not null default now(),
   unique (issuer, subject)
 );
 
-alter table organizations
-  add column owner_principal_id uuid references principals(id),
-  add column rooted_at          timestamptz;
+alter table organizations add column owner_principal_id uuid references principals(id);
 
 -- The ticket itself is stored, not its digest, because a typed code must lead back to it.
 create table tickets (
