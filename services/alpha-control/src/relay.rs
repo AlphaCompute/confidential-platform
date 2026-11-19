@@ -185,13 +185,11 @@ impl Relay<'_> {
             self.own_signer(&signed).await?;
             json!({ "org_id": org_id })
         };
-        // The KMS answers a repeated root for the same key with its stored row and a new
-        // receipt, so a root checks the version and the expiry after the reply: a refusal there
-        // records nothing, and a retry on a new ticket records the root. A repeated other key is `already_exists`, so it checks before the call.
+        // A repeated root is answered with its stored row; a repeated other key is
+        // `already_exists`, so only a root may be checked after the call.
         let reply = if op == "root" {
-            let reply = self.send(Method::POST, "/v1/keys", &registration).await?;
-            self.current().await?;
-            reply
+            self.repeatable(Method::POST, "/v1/keys", &registration)
+                .await?
         } else {
             self.kms(Method::POST, "/v1/keys", &registration).await?
         };
@@ -274,7 +272,9 @@ impl Relay<'_> {
             ));
         }
         self.own_signer(&signed).await?;
-        let reply = self.kms(Method::POST, "/v1/revisions", &body).await?;
+        let reply = self
+            .repeatable(Method::POST, "/v1/revisions", &body)
+            .await?;
         let expected =
             json!({ "compose_hash": hash, "app_id": app_id, "org_id": self.found.org_id });
         self.confirm("revision.register", &body, expected, &reply)?;
@@ -301,7 +301,7 @@ impl Relay<'_> {
         let tag = self.fresh(format!("revoke:{hash}"))?;
         self.own_signer(&signed).await?;
         let reply = self
-            .kms(Method::POST, &format!("/v1/revisions/{hash}/revoke"), &body)
+            .repeatable(Method::POST, &format!("/v1/revisions/{hash}/revoke"), &body)
             .await?;
         let expected = json!({ "compose_hash": hash });
         self.confirm("revision.revoke", &body, expected, &reply)?;
@@ -361,6 +361,21 @@ impl Relay<'_> {
     async fn kms(&mut self, method: Method, path: &str, body: &Value) -> Result<Value, Error> {
         self.current().await?;
         self.send(method, path, body).await
+    }
+
+    /// For a call the KMS answers the same way when repeated (a root for the same key, a
+    /// registered Revision, a revocation): the version and the expiry are checked after the
+    /// reply, so the `platform_version` lock is not held across the call, and a step refused
+    /// there records nothing and succeeds on a retry.
+    async fn repeatable(
+        &mut self,
+        method: Method,
+        path: &str,
+        body: &Value,
+    ) -> Result<Value, Error> {
+        let reply = self.send(method, path, body).await?;
+        self.current().await?;
+        Ok(reply)
     }
 
     /// Refuses a step checked under a document older than the accepted one, or a ticket that
