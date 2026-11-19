@@ -2,7 +2,7 @@ alter table revisions
   add column registered_at timestamptz,
   add column revoked_at    timestamptz;
 
--- predecessor: the Revision an approval also revokes, unless its signer keeps it.
+-- predecessor: the Revision an approval also revokes, chosen when the ticket opens.
 alter table tickets
   add column predecessor bytea references revisions(compose_hash),
   drop constraint tickets_kind_check,

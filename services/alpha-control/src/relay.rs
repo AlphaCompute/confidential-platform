@@ -32,6 +32,8 @@ struct Relay<'a> {
     ticket: &'a str,
     found: Ticket,
     tx: Transaction<'static, Postgres>,
+    /// The key a claim step registered, named in its audit row.
+    key_id: Option<Uuid>,
 }
 
 pub async fn relay(
@@ -65,6 +67,7 @@ pub async fn relay(
         ticket: &ticket,
         found,
         tx,
+        key_id: None,
     };
     let kind = relay.found.kind.clone();
     let (tag, reply) = match (kind.as_str(), op.as_str()) {
@@ -199,6 +202,7 @@ impl Relay<'_> {
             .and_then(|id| Uuid::deserialize(id).ok())
             .filter(|id| reply.get("id") == Some(&json!(id)))
             .ok_or(Error::UpstreamInvalid)?;
+        self.key_id = Some(key_id);
         sqlx::query(
             "insert into credentials (key_id, org_id, credential_id) values ($1, $2, $3) \
              on conflict (key_id) do nothing",
@@ -279,7 +283,7 @@ impl Relay<'_> {
             json!({ "compose_hash": hash, "app_id": app_id, "org_id": self.found.org_id });
         self.confirm("revision.register", &body, expected, &reply)?;
         sqlx::query(
-            "update revisions set registered_at = coalesce(registered_at, now()) \
+            "update revisions set registered_at = coalesce(registered_at, clock_timestamp()) \
              where compose_hash = $1",
         )
         .bind(hash.as_bytes().as_slice())
@@ -306,7 +310,7 @@ impl Relay<'_> {
         let expected = json!({ "compose_hash": hash });
         self.confirm("revision.revoke", &body, expected, &reply)?;
         sqlx::query(
-            "update revisions set revoked_at = coalesce(revoked_at, now()) where compose_hash = $1",
+            "update revisions set revoked_at = coalesce(revoked_at, clock_timestamp()) where compose_hash = $1",
         )
         .bind(hash.as_bytes().as_slice())
         .execute(&mut *self.tx)
@@ -343,7 +347,7 @@ impl Relay<'_> {
         )
         .bind(self.found.org_id)
         .bind(format!("relay.{op}"))
-        .bind(&tag)
+        .bind(self.key_id.map_or(tag, |id| id.to_string()))
         .execute(&mut *self.tx)
         .await?;
         self.tx.commit().await?;

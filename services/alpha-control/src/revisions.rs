@@ -109,7 +109,7 @@ pub async fn create(
         .await?;
         StatusCode::CREATED
     };
-    // The approval also revokes the App's newest registered Revision unless its signer keeps it.
+    // The approval also revokes the App's newest registered Revision.
     let predecessor: Option<Vec<u8>> = sqlx::query_scalar(
         "select compose_hash from revisions where app_id = $1 and compose_hash <> $2 \
            and registered_at is not null and revoked_at is null \

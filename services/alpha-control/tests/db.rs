@@ -1226,9 +1226,8 @@ async fn an_approval_registers_its_revision_only_with_a_passkey_of_the_organizat
         (&json!([{ "name": "token", "set": true }]), &Value::Null)
     );
 
-    let revision = |key: &SigningKey, key_id: &str, digest: &str| {
-        let payload =
-            json!({ "app_id": app_id, "init_data": stored["init_data"], "digest": digest });
+    let revision_of = |key: &SigningKey, key_id: &str, init_data: &Value, digest: &str| {
+        let payload = json!({ "app_id": app_id, "init_data": init_data, "digest": digest });
         json!(
             alpha_client::sign(
                 alpha_core::context::REVISION,
@@ -1238,6 +1237,9 @@ async fn an_approval_registers_its_revision_only_with_a_passkey_of_the_organizat
             )
             .unwrap()
         )
+    };
+    let revision = |key: &SigningKey, key_id: &str, digest: &str| {
+        revision_of(key, key_id, &stored["init_data"], digest)
     };
     // Another Organization's key, a bearer with a forged signature, or other bytes register nothing.
     let (kms_url, _) = api.5.as_ref().unwrap();
@@ -1266,6 +1268,11 @@ async fn an_approval_registers_its_revision_only_with_a_passkey_of_the_organizat
             "signature_invalid",
         ),
         ("", revision(&root, &root_id, &other), "malformed"),
+        (
+            "",
+            revision_of(&root, &root_id, &json!("other bytes"), &hash),
+            "malformed",
+        ),
     ] {
         let (_, refused) = api
             .call(Method::POST, &relay("revision"), bearer, body)
