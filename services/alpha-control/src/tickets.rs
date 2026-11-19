@@ -27,6 +27,7 @@ pub async fn open(
     kind: &str,
     org_id: Uuid,
     compose_hash: Option<&ComposeHash>,
+    principal_id: Option<Uuid>,
     lifetime: &str,
 ) -> Result<(String, String), Error> {
     let ticket = BASE64URL_NOPAD.encode(&random::<32>()?);
@@ -36,14 +37,15 @@ pub async fn open(
         .filter_map(|b| CROCKFORD.get(usize::from(b & 31)).map(|c| char::from(*c)))
         .collect();
     sqlx::query(
-        "insert into tickets (ticket, code, kind, org_id, compose_hash, expires_at) \
-         values ($1, $2, $3, $4, $5, now() + $6::interval)",
+        "insert into tickets (ticket, code, kind, org_id, compose_hash, principal_id, expires_at) \
+         values ($1, $2, $3, $4, $5, $6, now() + $7::interval)",
     )
     .bind(&ticket)
     .bind(&code)
     .bind(kind)
     .bind(org_id)
     .bind(compose_hash.map(|h| h.as_bytes().to_vec()))
+    .bind(principal_id)
     .bind(lifetime)
     .execute(&mut **tx)
     .await?;
@@ -60,14 +62,17 @@ pub async fn claim(
         return Err(Error::Forbidden);
     }
     let mut tx = state.pool.begin().await?;
-    sqlx::query_scalar::<_, i32>(
-        "select 1 from organizations where id = $1 and disabled_at is null",
+    let rooted: bool = sqlx::query_scalar(
+        "select rooted_at is not null from organizations where id = $1 and disabled_at is null",
     )
     .bind(org_id)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(Error::NotFound)?;
-    let (ticket, code) = open(&mut tx, "claim", org_id, None, "72 hours").await?;
+    // A rooted Organization adds a key for a new holder; an unrooted one learns its owner at the
+    // sign-in.
+    let holder = rooted.then(Uuid::now_v7);
+    let (ticket, code) = open(&mut tx, "claim", org_id, None, holder, "72 hours").await?;
     // The code redeems the ticket, so the audit row names only the Organization.
     let object = org_id.to_string();
     audit(&mut tx, &caller, org_id, "ticket.claim", &object, json!({})).await?;
@@ -88,6 +93,9 @@ struct Row {
     org_id: Uuid,
     org_name: String,
     owner_email: String,
+    rooted: bool,
+    principal_id: Option<Uuid>,
+    credentials: Value,
     compose_hash: Option<Vec<u8>>,
     app_id: Option<Uuid>,
     slug: Option<String>,
@@ -106,7 +114,11 @@ pub async fn read(
              as state, \
            to_char(t.expires_at at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as expires_at, \
            to_char(now() at time zone 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as server_time, \
-           t.org_id, o.name as org_name, o.owner_email, r.compose_hash, r.app_id, a.slug, \
+           t.org_id, o.name as org_name, o.owner_email, o.rooted_at is not null as rooted, \
+           t.principal_id, r.compose_hash, r.app_id, a.slug, \
+           (select coalesce(jsonb_agg(jsonb_build_object( \
+              'credential_id', c.credential_id, 'key_id', c.key_id) order by c.created_at), '[]') \
+            from credentials c where c.org_id = t.org_id) as credentials, \
            r.catalog ->> 'title' as title, r.catalog ->> 'template_sha256' as template_sha256 \
          from tickets t join organizations o on o.id = t.org_id \
          left join revisions r on r.compose_hash = t.compose_hash \
@@ -117,14 +129,15 @@ pub async fn read(
     .fetch_optional(&state.pool)
     .await?
     .ok_or(Error::TicketNotFound)?;
-    // ponytail: the KMS lists no Organization's passkeys, so none are known until the relay
-    // records the ones it carries; until then an approve ticket shows an unrooted Organization.
+    // ponytail: only passkeys the relay carried are listed, because the KMS lists none; a key an
+    // Organization adds with the CLI is missing until the KMS can answer a credential lookup.
     let mut read = json!({
         "kind": row.kind, "state": row.state, "expires_at": row.expires_at,
         "server_time": row.server_time, "org_id": row.org_id, "org_name": row.org_name,
-        "credentials": [],
+        "credentials": row.credentials,
     });
     let extra = match row.kind.as_str() {
+        "claim" if row.rooted => json!({ "rooted": true, "principal_id": row.principal_id }),
         "claim" => json!({ "rooted": false, "owner_email": row.owner_email }),
         _ => {
             let compose_hash = row
@@ -162,18 +175,42 @@ pub async fn by_code(
     Ok(Json(json!({ "kind": kind, "ticket": ticket })))
 }
 
-/// The open ticket's kind and Organization, locked for the transaction.
-async fn usable(tx: &mut Transaction<'_, Postgres>, ticket: &str) -> Result<(String, Uuid), Error> {
-    let (kind, state, expired, org_id): (String, String, bool, Uuid) = sqlx::query_as(
-        "select kind, state, expires_at <= clock_timestamp(), org_id from tickets \
-         where ticket = $1 for update",
+#[derive(sqlx::FromRow)]
+pub(crate) struct Ticket {
+    pub kind: String,
+    pub org_id: Uuid,
+    /// The state-changing relay ops it already drove.
+    pub used: Vec<String>,
+    pub session_sha256: Option<Vec<u8>>,
+    pub owner: Option<Uuid>,
+    pub rooted: bool,
+    /// The holder whose key a claim ticket adds.
+    pub principal_id: Option<Uuid>,
+    pub disabled: bool,
+    state: String,
+    expired: bool,
+}
+
+/// The open ticket, locked for the transaction with its Organization, so steps that change the
+/// Organization (sign-in, root, disable) run one after another.
+pub(crate) async fn usable(
+    tx: &mut Transaction<'_, Postgres>,
+    ticket: &str,
+) -> Result<Ticket, Error> {
+    let found: Ticket = sqlx::query_as(
+        "select t.kind, t.org_id, t.used, t.session_sha256, o.owner_principal_id as owner, \
+           o.rooted_at is not null as rooted, t.principal_id, \
+           o.disabled_at is not null as disabled, t.state, \
+           t.expires_at <= clock_timestamp() as expired \
+         from tickets t join organizations o on o.id = t.org_id \
+         where t.ticket = $1 for update of t for no key update of o",
     )
     .bind(ticket)
     .fetch_optional(&mut **tx)
     .await?
     .ok_or(Error::TicketNotFound)?;
-    match (state.as_str(), expired) {
-        ("open", false) => Ok((kind, org_id)),
+    match (found.state.as_str(), found.expired) {
+        ("open", false) => Ok(found),
         ("open", true) => Err(Error::TicketExpired),
         _ => Err(Error::TicketClosed),
     }
@@ -184,7 +221,7 @@ pub async fn decline(
     Path(ticket): Path<String>,
 ) -> Result<Json<Value>, Error> {
     let mut tx = state.pool.begin().await?;
-    let (kind, org_id) = usable(&mut tx, &ticket).await?;
+    let Ticket { kind, org_id, .. } = usable(&mut tx, &ticket).await?;
     let declined = sqlx::query(
         "update tickets set state = 'declined' where ticket = $1 and expires_at > clock_timestamp()",
     )
@@ -302,22 +339,25 @@ pub async fn session(
 ) -> Result<Json<Value>, Error> {
     let Json(request) = body?;
     // Checked before the code is spent, and again under the lock below.
-    let (kind, _) = usable(&mut state.pool.begin().await?, &ticket).await?;
-    if kind != "claim" {
+    let found = usable(&mut state.pool.begin().await?, &ticket).await?;
+    if found.kind != "claim" || found.rooted || found.disabled {
         return Err(Error::SessionRefused);
     }
     let claims = redeem(&state, &request).await?;
 
     let mut tx = state.pool.begin().await?;
-    let (_, org_id) = usable(&mut tx, &ticket).await?;
-    let (owner_email, owner): (String, Option<Uuid>) = sqlx::query_as(
-        "select owner_email, owner_principal_id from organizations \
-         where id = $1 and disabled_at is null for update",
+    let org_id = usable(&mut tx, &ticket).await?.org_id;
+    let (owner_email, owner, rooted): (String, Option<Uuid>, bool) = sqlx::query_as(
+        "select owner_email, owner_principal_id, rooted_at is not null from organizations \
+         where id = $1 and disabled_at is null for no key update",
     )
     .bind(org_id)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(Error::SessionRefused)?;
+    if rooted {
+        return Err(Error::SessionRefused);
+    }
     let principal_id: Uuid = sqlx::query_scalar(
         "insert into principals (id, issuer, subject) values ($1, $2, $3) \
          on conflict (issuer, subject) do update set issuer = excluded.issuer returning id",

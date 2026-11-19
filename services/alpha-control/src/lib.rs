@@ -15,11 +15,14 @@
 
 mod apps;
 mod orgs;
+mod relay;
 mod revisions;
 mod tickets;
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
+use alpha_attest::PlatformDocument;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, FromRequestParts, State};
 use axum::http::request::Parts;
@@ -42,6 +45,7 @@ pub struct AppState {
     pub operator_token_sha256: [u8; 32],
     pub platform_document_url: String,
     pub release_keys: alpha_client::platform::ReleaseKeys,
+    pub kms_endpoints: Vec<String>,
     /// Where the signer page lives, for example `https://sign.alphacompute.cc`.
     pub signer_url: String,
     pub oidc: Oidc,
@@ -105,6 +109,13 @@ pub enum Error {
     SessionRefused,
     #[error("too many requests; retry in a second")]
     RateLimited,
+    #[error("the KMS refused: {code}")]
+    Kms {
+        status: StatusCode,
+        code: &'static str,
+    },
+    #[error("the KMS answer is not confirmed by its receipt")]
+    UpstreamInvalid,
     #[error("{0}")]
     Internal(String),
 }
@@ -127,6 +138,8 @@ impl Error {
             Error::TicketClosed => (StatusCode::CONFLICT, "ticket_closed"),
             Error::SessionRefused => (StatusCode::FORBIDDEN, "session_refused"),
             Error::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+            Error::Kms { status, code } => (*status, code),
+            Error::UpstreamInvalid => (StatusCode::BAD_GATEWAY, "upstream_invalid"),
             Error::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         }
     }
@@ -291,6 +304,52 @@ pub async fn audit(
     Ok(())
 }
 
+/// The current platform document and its version. Each call fetches it, and a version below the
+/// highest one accepted is refused, so a stale copy cannot bring back a rotated key or a retired
+/// KMS build.
+pub(crate) async fn platform(state: &AppState) -> Result<(i64, PlatformDocument), Error> {
+    // The URL may carry a read credential, so neither the caller nor the log sees the error text.
+    let unavailable = |e: alpha_client::Error| {
+        alpha_client::warn!("platform_document_unavailable", error = e.kind());
+        Error::Unavailable("the platform document is unavailable".into())
+    };
+    let signed = alpha_client::platform::fetch_signed(&state.platform_document_url)
+        .await
+        .map_err(unavailable)?;
+    let document = alpha_client::platform::verify(&signed, &state.release_keys, SystemTime::now())
+        .map_err(unavailable)?;
+    let version = i64::try_from(document.version)
+        .map_err(|_| Error::Unavailable("platform document version overflows".into()))?;
+    // Read first, so a create under the current version takes no row lock.
+    let stored: Option<i64> =
+        sqlx::query_scalar("select version from platform_version where one = 1")
+            .fetch_optional(&state.pool)
+            .await?;
+    let accepted = match stored {
+        Some(stored) if stored >= version => stored,
+        _ => {
+            sqlx::query_scalar(
+                "insert into platform_version (one, version) values (1, $1) on conflict (one) \
+                 do update set version = greatest(platform_version.version, excluded.version) \
+                 returning version",
+            )
+            .bind(version)
+            .fetch_one(&state.pool)
+            .await?
+        }
+    };
+    if version < accepted {
+        return Err(stale(version, accepted));
+    }
+    Ok((version, document))
+}
+
+pub(crate) fn stale(version: i64, accepted: i64) -> Error {
+    Error::Unavailable(format!(
+        "platform document version {version} is below the accepted {accepted}"
+    ))
+}
+
 async fn healthz() -> StatusCode {
     StatusCode::OK
 }
@@ -329,6 +388,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/tickets/by-code/{code}", get(tickets::by_code))
         .route("/v1/tickets/{ticket}/session", post(tickets::session))
         .route("/v1/tickets/{ticket}/decline", post(tickets::decline))
+        .route("/v1/tickets/{ticket}/kms/{op}", post(relay::relay))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .merge(probe_routes())
         .with_state(state)

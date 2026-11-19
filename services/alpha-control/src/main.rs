@@ -39,20 +39,23 @@ fn env(name: &str) -> Result<String, Error> {
 }
 
 /// The token endpoint is trusted because TLS authenticates it, and links to the signer page must
-/// be absolute. Neither carries a query or a fragment.
-fn https_env(name: &str) -> Result<String, Error> {
+/// be absolute. Neither carries a fragment or surrounding whitespace; a query is allowed only
+/// where `query` says so, because ticket paths follow the signer URL.
+fn https_env(name: &str, query: bool) -> Result<String, Error> {
     let value = env(name)?;
     match reqwest::Url::parse(&value) {
         Ok(url)
             if url.scheme() == "https"
                 && url.host_str().is_some()
-                && url.query().is_none()
-                && url.fragment().is_none() =>
+                && (query || url.query().is_none())
+                && url.fragment().is_none()
+                && value.trim() == value =>
         {
             Ok(value)
         }
         _ => Err(Error::internal(format!(
-            "{name} must be an https URL with a host and no query or fragment"
+            "{name} must be an https URL with a host, no fragment{} and no surrounding whitespace",
+            if query { "" } else { ", no query" }
         ))),
     }
 }
@@ -99,12 +102,33 @@ async fn run() -> Result<(), Error> {
     let operator_token_sha256 = *hex_env("ALPHACOMPUTE_OPERATOR_TOKEN_SHA256")?;
     let public_name = env("ALPHACOMPUTE_PUBLIC_NAME")?;
     let platform_document_url = env("ALPHACOMPUTE_PLATFORM_DOCUMENT_URL")?;
-    let signer_url = https_env("ALPHACOMPUTE_SIGNER_URL")?
+    let signer_url = https_env("ALPHACOMPUTE_SIGNER_URL", false)?
         .trim_end_matches('/')
         .to_owned();
+    let kms_endpoints = env("ALPHACOMPUTE_KMS_ENDPOINTS")?
+        .split(',')
+        .map(|e| e.trim().to_owned())
+        .filter(|e| !e.is_empty())
+        .collect::<Vec<_>>();
+    // The pin only holds over TLS.
+    let https_base = |e: &String| {
+        reqwest::Url::parse(e).is_ok_and(|u| {
+            u.scheme() == "https"
+                && u.host_str().is_some()
+                && u.query().is_none()
+                && u.fragment().is_none()
+                && u.username().is_empty()
+                && u.password().is_none()
+        })
+    };
+    if kms_endpoints.is_empty() || !kms_endpoints.iter().all(https_base) {
+        return Err(Error::internal(
+            "ALPHACOMPUTE_KMS_ENDPOINTS must list one or more https URLs with a host and no credentials, query or fragment",
+        ));
+    }
     let oidc = Oidc {
         issuer: env("ALPHACOMPUTE_OIDC_ISSUER")?,
-        token_endpoint: https_env("ALPHACOMPUTE_OIDC_TOKEN_ENDPOINT")?,
+        token_endpoint: https_env("ALPHACOMPUTE_OIDC_TOKEN_ENDPOINT", true)?,
         client_id: env("ALPHACOMPUTE_OIDC_CLIENT_ID")?,
     };
     let release_keys = alpha_client::platform::release_keys()
@@ -122,6 +146,7 @@ async fn run() -> Result<(), Error> {
         operator_token_sha256,
         platform_document_url,
         release_keys,
+        kms_endpoints,
         signer_url,
         oidc,
         code_lookups: Default::default(),
