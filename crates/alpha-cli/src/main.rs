@@ -324,7 +324,8 @@ enum CocoCommand {
         /// The device certificate chain in PEM, leaf first, as NVML returns it.
         #[arg(long)]
         certificate_chain: PathBuf,
-        /// The XML of `NV_GPU_CC_DRIVER_<chip>_<driver version>` from NVIDIA's RIM service.
+        /// The XML of `NV_GPU_CC_DRIVER_<chip>_<driver version>` from NVIDIA's RIM service, or of
+        /// `NV_GPU_DRIVER_GH100_<driver version>` for a Hopper.
         #[arg(long)]
         driver_rim: PathBuf,
         /// The XML of `NV_GPU_VBIOS_<project>_<project SKU>_<chip SKU>_<VBIOS version>`.

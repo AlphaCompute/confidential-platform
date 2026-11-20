@@ -56,8 +56,9 @@ pub struct GpuReference {
     /// the leaf key for. Without it, an older NVIDIA-signed firmware could sign copied
     /// measurements.
     pub fwid: Measurement,
-    /// The `FEATURE_FLAG` opaque value the GPU must report: 1 for a single GPU passed through,
-    /// other values for the multi-GPU and protected-PCIe modes.
+    /// The `FEATURE_FLAG` opaque value the GPU must report. NVIDIA reads 0 as single-GPU, 1 as
+    /// multi-GPU and 2 as protected-PCIe mode; a B300 in CC mode reports 1 even when passed through
+    /// alone.
     pub feature_flag: u16,
     pub measurements: BTreeMap<u8, Vec<Measurement>>,
 }
@@ -403,9 +404,10 @@ impl Opaque {
             let kind = r.u16()?;
             let len = r.u16()?;
             let value = r.take(len.into())?;
-            // Every type the B300 firmware reports. Any other is refused, so a firmware that
-            // starts reporting something new is looked at before it is accepted.
-            if !matches!(kind, 3 | 4 | 6 | 11..=20 | 33..=36) {
+            // Every type the B300 firmware and an HGX Hopper in protected-PCIe mode report. Any
+            // other is refused, so a firmware that starts reporting something new is looked at
+            // before it is accepted.
+            if !matches!(kind, 3 | 4 | 6 | 11..=22 | 33..=36) {
                 return Err(failed(format!("unknown opaque type {kind}")));
             }
             if fields.insert(kind, value).is_some() {
@@ -438,7 +440,12 @@ impl Opaque {
             _ => return Err(failed("vbios version")),
         };
         Ok(Self {
-            chip: text(tlv::CHIP_INFO)?,
+            // Hopper firmware reports no chip name. NVIDIA's verifier names every Hopper GH100,
+            // and its RIMs carry that product name.
+            chip: match fields.contains_key(&tlv::CHIP_INFO) {
+                true => text(tlv::CHIP_INFO)?,
+                false => "GH100".to_owned(),
+            },
             project: text(tlv::PROJECT)?,
             project_sku: text(tlv::PROJECT_SKU)?,
             chip_sku: text(tlv::CHIP_SKU)?,
@@ -672,7 +679,7 @@ mod tests {
     }
 
     #[test]
-    fn opaque_types_unknown_or_repeated_are_refused() {
+    fn opaque_types_of_b300_and_hopper_parse_and_others_are_refused() {
         let evidence = std::fs::read(
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../testdata/attest/b300-gpu-595.58.03/g1b.spdm.bin"),
@@ -685,6 +692,14 @@ mod tests {
         unknown[0] = 99;
         let mut repeated = opaque[..12].to_vec();
         repeated.extend_from_slice(&opaque);
+        let hopper = std::fs::read(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../testdata/attest/hgx-hopper-ppcie/gpu0.spdm.bin"),
+        )
+        .unwrap();
+        let hopper = Opaque::parse(parse_spdm(&hopper).unwrap().opaque).unwrap();
+        assert_eq!((hopper.chip.as_str(), hopper.feature_flag), ("GH100", 2));
+
         for (data, fragment) in [
             (unknown, "unknown opaque type 99"),
             (repeated, "type 6 repeated"),
