@@ -152,6 +152,8 @@ const BLOCKS: u8 = 64;
 const DMTF_SPEC: u8 = 0x01;
 const SIGNATURE_LEN: usize = 96;
 const TCB_INFO_OID: &str = "2.23.133.5.4.1.1";
+/// The TCG DICE Composite Device Identifier a Hopper leaf carries its FWID in, instead of TcbInfo.
+const DEVICE_ID_OID: &str = "2.23.133.5.4.1";
 
 /// The NVIDIA opaque data types read by name.
 mod tlv {
@@ -553,9 +555,14 @@ fn verify_chain(
                 if depth == 0 {
                     leaf_fwid = tcb_info.fwid;
                 }
+            } else if depth == 0 && ext.oid.to_id_string() == DEVICE_ID_OID {
+                leaf_fwid = Some(
+                    device_id_fwid(ext.value)
+                        .ok_or_else(|| failed("leaf Composite Device Identifier"))?,
+                );
             }
         }
-        if let Some(oid) = unknown_critical(cert, TCB_INFO_OID) {
+        if let Some(oid) = unknown_critical(cert, &[TCB_INFO_OID, DEVICE_ID_OID]) {
             return Err(failed(format!(
                 "certificate {depth} has unknown critical extension {oid}"
             )));
@@ -590,14 +597,14 @@ fn asn1_time(t: SystemTime) -> Result<ASN1Time, AppraisalError> {
 }
 
 /// The first critical extension of `cert` other than basic constraints, key usage and `also`.
-fn unknown_critical(cert: &X509Certificate<'_>, also: &str) -> Option<String> {
+fn unknown_critical(cert: &X509Certificate<'_>, also: &[&str]) -> Option<String> {
     cert.extensions()
         .iter()
         .find(|e| {
             e.critical
                 && e.oid != OID_X509_EXT_BASIC_CONSTRAINTS
                 && e.oid != OID_X509_EXT_KEY_USAGE
-                && e.oid.to_id_string() != also
+                && !also.contains(&e.oid.to_id_string().as_str())
         })
         .map(|e| e.oid.to_id_string())
 }
@@ -605,6 +612,26 @@ fn unknown_critical(cert: &X509Certificate<'_>, also: &str) -> Option<String> {
 fn p384_key(cert: &X509Certificate<'_>) -> Result<VerifyingKey, AppraisalError> {
     VerifyingKey::from_sec1_bytes(&cert.public_key().subject_public_key.data)
         .map_err(|_| failed("certificate key is not P-384"))
+}
+
+/// The SHA-384 FWID of a Composite Device Identifier:
+/// `SEQUENCE { version INTEGER, SubjectPublicKeyInfo, fwid SEQUENCE { hashAlg OID, digest OCTET STRING } }`.
+fn device_id_fwid(value: &[u8]) -> Option<[u8; 48]> {
+    let ([], id) = Any::from_der(value).ok()? else {
+        return None;
+    };
+    let (rest, _version) = Any::from_der(id.data).ok()?;
+    let (rest, _key) = Any::from_der(rest).ok()?;
+    let ([], fwid) = Any::from_der(rest).ok()? else {
+        return None;
+    };
+    let (digest, hash_alg) = Oid::from_der(fwid.data).ok()?;
+    let ([], digest) = Any::from_der(digest).ok()? else {
+        return None;
+    };
+    (hash_alg == OID_NIST_HASH_SHA384 && digest.tag() == Tag::OctetString)
+        .then(|| digest.data.try_into().ok())
+        .flatten()
 }
 
 struct TcbInfo {
@@ -707,5 +734,20 @@ mod tests {
             let err = Opaque::parse(&data).err().unwrap();
             assert!(err.to_string().contains(fragment), "{err}");
         }
+    }
+
+    #[test]
+    fn hopper_leaf_carries_its_fwid_in_the_device_identifier() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/attest/hgx-hopper-ppcie");
+        let gpu = GpuEvidence {
+            evidence: std::fs::read(dir.join("gpu0.spdm.bin")).unwrap(),
+            certificate_chain: std::fs::read(dir.join("gpu0.certchain.pem")).unwrap(),
+        };
+        // NVIDIA Device Identity CA, the root of B300 and Hopper chains alike.
+        let root = "sha256:102bf659d5419614c9d8e6aecebc80454eb26b1df6a769ac720b9a690b167b48";
+        let (leaf, _, opaque) =
+            read_gpu(&gpu, &[root.parse().unwrap()], SystemTime::now()).unwrap();
+        assert_eq!(leaf.fwid, Some(opaque.fwid));
     }
 }
