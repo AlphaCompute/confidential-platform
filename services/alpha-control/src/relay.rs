@@ -353,11 +353,11 @@ impl Relay<'_> {
         let hash = allowed
             .filter(|h| signed.payload.get("compose_hash") == Some(&json!(h)))
             .ok_or(Error::Forbidden)?;
-        // The predecessor goes only while its replacement is registered and live; the share lock
-        // holds off a concurrent revoke of the replacement until this one commits.
+        // The predecessor goes only once its replacement is registered and while it is live; the
+        // share lock holds off a concurrent revoke of the replacement until this one commits.
         if approve {
             let live: Option<bool> = sqlx::query_scalar(
-                "select registered_at is not null and revoked_at is null \
+                "select revoked_at is null \
                  from revisions where compose_hash = $1 for share",
             )
             .bind(self.found.compose_hash.as_deref())
