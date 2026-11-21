@@ -400,7 +400,9 @@ def main():
             print(vcpus, mem, got[-1], flush=True)
     if check is None:
         return
-    want = [e for e in json.load(open(check)) if e["runtime_class"] == CLASS and not e["gpu"]]
+    # The capture comes from a host that gives TDs CET: XFAM 0x61ae7, the value of an entry without `xfam`.
+    want = [e for e in json.load(open(check))
+            if e["runtime_class"] == CLASS and not e["gpu"] and e.get("xfam", 0x61AE7) == 0x61AE7]
     if len(want) != 1:
         sys.exit(f"{check}: not exactly one {CLASS} entry")
     want = want[0]["rtmr0"]

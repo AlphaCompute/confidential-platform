@@ -10,7 +10,8 @@ from datetime import datetime, timezone
 
 
 def registers(entry):
-    return {k: v for k, v in entry.items() if k != "rtmr0"}
+    # An entry without `xfam` means 0x61ae7 to the verifier.
+    return {"xfam": 0x61AE7, **{k: v for k, v in entry.items() if k != "rtmr0"}}
 
 
 def missing(entries, others):
