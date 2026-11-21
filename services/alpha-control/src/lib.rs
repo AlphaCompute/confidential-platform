@@ -388,7 +388,15 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/tickets/by-code/{code}", get(tickets::by_code))
         .route("/v1/tickets/{ticket}/session", post(tickets::session))
         .route("/v1/tickets/{ticket}/decline", post(tickets::decline))
-        .route("/v1/tickets/{ticket}/kms/{op}", post(relay::relay))
+        .route(
+            "/v1/tickets/{ticket}/kms/{op}",
+            // A Revision's registration carries its whole init-data, up to 1 MiB.
+            post(relay::relay).layer(DefaultBodyLimit::max(2 << 20)),
+        )
+        .route(
+            "/v1/apps/{slug}/revisions/{hash}/revoke",
+            post(revisions::revoke),
+        )
         .layer(DefaultBodyLimit::max(64 * 1024))
         .merge(probe_routes())
         .with_state(state)

@@ -82,8 +82,9 @@ pub async fn create(
     let status = if inserted.rows_affected() == 0 {
         // The digest covers the init-data only; another entry with the same template but another
         // pod or shape is not this Revision.
-        let same: bool = sqlx::query_scalar(
-            "select pod = $2 and shape = $3 and catalog = $4 from revisions where compose_hash = $1",
+        let (same, revoked): (bool, bool) = sqlx::query_as(
+            "select pod = $2 and shape = $3 and catalog = $4, revoked_at is not null \
+             from revisions where compose_hash = $1",
         )
         .bind(rendered.revision.as_bytes().as_slice())
         .bind(&rendered.pod)
@@ -95,6 +96,10 @@ pub async fn create(
             return Err(Error::Conflict(
                 "the Revision is stored from another catalog entry",
             ));
+        }
+        // A revoked Revision never registers again; approving it would only revoke the live one.
+        if revoked {
+            return Err(Error::Conflict("the Revision is revoked"));
         }
         StatusCode::OK
     } else {
@@ -109,11 +114,23 @@ pub async fn create(
         .await?;
         StatusCode::CREATED
     };
+    // The approval also revokes the App's newest registered Revision.
+    let predecessor: Option<Vec<u8>> = sqlx::query_scalar(
+        "select compose_hash from revisions where app_id = $1 and compose_hash <> $2 \
+           and registered_at is not null and revoked_at is null \
+         order by registered_at desc limit 1",
+    )
+    .bind(app_id)
+    .bind(rendered.revision.as_bytes().as_slice())
+    .fetch_optional(&mut *tx)
+    .await?;
+    let predecessor = tickets::hash(predecessor.as_deref());
     let (ticket, code) = tickets::open(
         &mut tx,
         "approve",
         org_id,
         Some(&rendered.revision),
+        predecessor.as_ref(),
         None,
         "30 minutes",
     )
@@ -146,22 +163,72 @@ pub async fn get(
 ) -> Result<Json<Value>, Error> {
     let org_id = caller.org("apps:read")?;
     let hash: ComposeHash = hash.parse().map_err(|_| Error::NotFound)?;
-    let (init_data, pod, shape, catalog): (String, String, Value, Value) = sqlx::query_as(
-        "select r.init_data, r.pod, r.shape, r.catalog from revisions r \
+    let (state, init_data, pod, shape, catalog): (String, String, String, Value, Value) =
+        sqlx::query_as(
+            "select case when r.revoked_at is not null then 'revoked' \
+           when r.registered_at is not null then 'registered' else 'awaiting_approval' end, \
+           r.init_data, r.pod, r.shape, r.catalog from revisions r \
+         join apps a on a.id = r.app_id \
+         where r.compose_hash = $1 and a.org_id = $2 and a.slug = $3",
+        )
+        .bind(hash.as_bytes().as_slice())
+        .bind(org_id)
+        .bind(&slug)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(Error::NotFound)?;
+    Ok(Json(json!({
+        "compose_hash": hash,
+        "state": state,
+        "init_data": init_data,
+        "pod": pod,
+        "shape": shape,
+        "catalog": catalog,
+    })))
+}
+
+/// `POST /v1/apps/{slug}/revisions/{hash}/revoke`: opens a `revoke` ticket. Only a roster key can
+/// revoke, so the ticket carries the request to the signer page.
+pub async fn revoke(
+    State(state): State<Arc<AppState>>,
+    caller: Caller,
+    Path((slug, hash)): Path<(String, String)>,
+) -> Result<(StatusCode, Json<Value>), Error> {
+    let org_id = caller.org("apps:write")?;
+    let hash: ComposeHash = hash.parse().map_err(|_| Error::NotFound)?;
+    let mut tx = state.pool.begin().await?;
+    let registered: bool = sqlx::query_scalar(
+        "select r.registered_at is not null and r.revoked_at is null from revisions r \
          join apps a on a.id = r.app_id \
          where r.compose_hash = $1 and a.org_id = $2 and a.slug = $3",
     )
     .bind(hash.as_bytes().as_slice())
     .bind(org_id)
     .bind(&slug)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or(Error::NotFound)?;
-    Ok(Json(json!({
-        "compose_hash": hash,
-        "init_data": init_data,
-        "pod": pod,
-        "shape": shape,
-        "catalog": catalog,
-    })))
+    if !registered {
+        return Err(Error::Conflict(
+            "the Revision is not registered, or already revoked",
+        ));
+    }
+    let (ticket, code) =
+        tickets::open(&mut tx, "revoke", org_id, Some(&hash), None, None, "7 days").await?;
+    let object = hash.to_string();
+    audit(
+        &mut tx,
+        &caller,
+        org_id,
+        "ticket.revoke",
+        &object,
+        json!({}),
+    )
+    .await?;
+    tx.commit().await?;
+    let url = format!("{}/revoke#{ticket}", state.signer_url);
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "ticket": ticket, "code": code, "url": url })),
+    ))
 }

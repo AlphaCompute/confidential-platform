@@ -27,6 +27,7 @@ pub async fn open(
     kind: &str,
     org_id: Uuid,
     compose_hash: Option<&ComposeHash>,
+    predecessor: Option<&ComposeHash>,
     principal_id: Option<Uuid>,
     lifetime: &str,
 ) -> Result<(String, String), Error> {
@@ -37,14 +38,16 @@ pub async fn open(
         .filter_map(|b| CROCKFORD.get(usize::from(b & 31)).map(|c| char::from(*c)))
         .collect();
     sqlx::query(
-        "insert into tickets (ticket, code, kind, org_id, compose_hash, principal_id, expires_at) \
-         values ($1, $2, $3, $4, $5, $6, now() + $7::interval)",
+        "insert into tickets \
+           (ticket, code, kind, org_id, compose_hash, predecessor, principal_id, expires_at) \
+         values ($1, $2, $3, $4, $5, $6, $7, now() + $8::interval)",
     )
     .bind(&ticket)
     .bind(&code)
     .bind(kind)
     .bind(org_id)
     .bind(compose_hash.map(|h| h.as_bytes().to_vec()))
+    .bind(predecessor.map(|h| h.as_bytes().to_vec()))
     .bind(principal_id)
     .bind(lifetime)
     .execute(&mut **tx)
@@ -72,7 +75,7 @@ pub async fn claim(
     // A rooted Organization adds a key for a new holder; an unrooted one learns its owner at the
     // sign-in.
     let holder = rooted.then(Uuid::now_v7);
-    let (ticket, code) = open(&mut tx, "claim", org_id, None, holder, "72 hours").await?;
+    let (ticket, code) = open(&mut tx, "claim", org_id, None, None, holder, "72 hours").await?;
     // The code redeems the ticket, so the audit row names only the Organization.
     let object = org_id.to_string();
     audit(&mut tx, &caller, org_id, "ticket.claim", &object, json!({})).await?;
@@ -101,6 +104,15 @@ struct Row {
     slug: Option<String>,
     title: Option<String>,
     template_sha256: Option<String>,
+    secrets: Value,
+    predecessor: Option<Vec<u8>>,
+    predecessor_revision: Option<String>,
+}
+
+pub(crate) fn hash(bytes: Option<&[u8]>) -> Option<ComposeHash> {
+    bytes
+        .and_then(|h| <[u8; 32]>::try_from(h).ok())
+        .map(ComposeHash::from)
 }
 
 /// `GET /v1/tickets/{ticket}`, in the shapes the signer page reads.
@@ -119,9 +131,13 @@ pub async fn read(
            (select coalesce(jsonb_agg(jsonb_build_object( \
               'credential_id', c.credential_id, 'key_id', c.key_id) order by c.created_at), '[]') \
             from credentials c where c.org_id = t.org_id) as credentials, \
-           r.catalog ->> 'title' as title, r.catalog ->> 'template_sha256' as template_sha256 \
+           r.catalog ->> 'title' as title, r.catalog ->> 'template_sha256' as template_sha256, \
+           (select coalesce(jsonb_agg(jsonb_build_object('name', s.name, 'set', true) \
+              order by s.name), '[]') from app_secrets s where s.app_id = r.app_id) as secrets, \
+           p.compose_hash as predecessor, p.init_data as predecessor_revision \
          from tickets t join organizations o on o.id = t.org_id \
          left join revisions r on r.compose_hash = t.compose_hash \
+         left join revisions p on p.compose_hash = t.predecessor \
          left join apps a on a.id = r.app_id \
          where t.ticket = $1",
     )
@@ -139,17 +155,20 @@ pub async fn read(
     let extra = match row.kind.as_str() {
         "claim" if row.rooted => json!({ "rooted": true, "principal_id": row.principal_id }),
         "claim" => json!({ "rooted": false, "owner_email": row.owner_email }),
-        _ => {
-            let compose_hash = row
-                .compose_hash
-                .and_then(|h| <[u8; 32]>::try_from(h).ok())
-                .map(ComposeHash::from)
-                .ok_or_else(|| Error::internal("approve ticket without a Revision"))?;
-            json!({
-                "app_id": row.app_id, "slug": row.slug, "compose_hash": compose_hash,
-                "title": row.title, "catalog_template_sha256": row.template_sha256,
-                "secrets": [], "predecessor": null,
-            })
+        kind => {
+            let compose_hash = hash(row.compose_hash.as_deref())
+                .ok_or_else(|| Error::internal("ticket without a Revision"))?;
+            if kind == "revoke" {
+                json!({ "app_id": row.app_id, "title": row.title, "revisions": [compose_hash] })
+            } else {
+                let predecessor = hash(row.predecessor.as_deref())
+                    .map(|p| json!({ "compose_hash": p, "revision": row.predecessor_revision }));
+                json!({
+                    "app_id": row.app_id, "slug": row.slug, "compose_hash": compose_hash,
+                    "title": row.title, "catalog_template_sha256": row.template_sha256,
+                    "secrets": row.secrets, "predecessor": predecessor,
+                })
+            }
         }
     };
     if let (Some(read), Value::Object(extra)) = (read.as_object_mut(), extra) {
@@ -187,6 +206,9 @@ pub(crate) struct Ticket {
     /// The holder whose key a claim ticket adds.
     pub principal_id: Option<Uuid>,
     pub disabled: bool,
+    pub compose_hash: Option<Vec<u8>>,
+    pub predecessor: Option<Vec<u8>>,
+    pub app_id: Option<Uuid>,
     state: String,
     expired: bool,
 }
@@ -200,9 +222,10 @@ pub(crate) async fn usable(
     let found: Ticket = sqlx::query_as(
         "select t.kind, t.org_id, t.used, t.session_sha256, o.owner_principal_id as owner, \
            o.rooted_at is not null as rooted, t.principal_id, \
-           o.disabled_at is not null as disabled, t.state, \
-           t.expires_at <= clock_timestamp() as expired \
+           o.disabled_at is not null as disabled, t.compose_hash, t.predecessor, r.app_id, \
+           t.state, t.expires_at <= clock_timestamp() as expired \
          from tickets t join organizations o on o.id = t.org_id \
+         left join revisions r on r.compose_hash = t.compose_hash \
          where t.ticket = $1 for update of t for no key update of o",
     )
     .bind(ticket)
