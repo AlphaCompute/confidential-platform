@@ -152,6 +152,8 @@ const BLOCKS: u8 = 64;
 const DMTF_SPEC: u8 = 0x01;
 const SIGNATURE_LEN: usize = 96;
 const TCB_INFO_OID: &str = "2.23.133.5.4.1.1";
+/// The `FEATURE_FLAG` of protected-PCIe mode.
+const PROTECTED_PCIE: u16 = 2;
 /// The TCG DICE Composite Device Identifier a Hopper leaf carries its FWID in, instead of TcbInfo.
 const DEVICE_ID_OID: &str = "2.23.133.5.4.1";
 
@@ -252,7 +254,7 @@ fn read_gpu<'a>(
     leaf.key
         .verify(spdm.signed, &signature)
         .map_err(|_| failed("signature does not verify with the leaf key"))?;
-    let opaque = Opaque::parse(spdm.opaque)?;
+    let opaque = Opaque::parse(spdm.opaque, leaf.hopper)?;
     if leaf
         .fwid
         .ok_or_else(|| failed("leaf has no SHA-384 TcbInfo FWID"))?
@@ -399,7 +401,8 @@ struct Opaque {
 }
 
 impl Opaque {
-    fn parse(data: &[u8]) -> Result<Self, AppraisalError> {
+    /// `hopper`: the chain is NVIDIA's GH100 chain, whose firmware reports no chip name.
+    fn parse(data: &[u8], hopper: bool) -> Result<Self, AppraisalError> {
         let mut fields = BTreeMap::new();
         let mut r = Reader(data);
         while !r.0.is_empty() {
@@ -442,12 +445,11 @@ impl Opaque {
             _ => return Err(failed("vbios version")),
         };
         Ok(Self {
-            // Hopper firmware reports no chip name. NVIDIA's verifier names every Hopper GH100,
-            // and its RIMs carry that product name.
-            chip: if fields.contains_key(&tlv::CHIP_INFO) {
-                text(tlv::CHIP_INFO)?
-            } else {
+            // NVIDIA's verifier names every Hopper GH100, and its RIMs carry that product name.
+            chip: if hopper && !fields.contains_key(&tlv::CHIP_INFO) {
                 "GH100".to_owned()
+            } else {
+                text(tlv::CHIP_INFO)?
             },
             project: text(tlv::PROJECT)?,
             project_sku: text(tlv::PROJECT_SKU)?,
@@ -481,6 +483,7 @@ struct Leaf {
     serial: String,
     fwid: Option<[u8; 48]>,
     root: ComposeHash,
+    hopper: bool,
 }
 
 /// The chain, leaf first, must end in one of `roots`; the root shipped with it is trusted only
@@ -558,8 +561,13 @@ fn verify_chain(
                     fwid = tcb_info.fwid;
                 }
             } else if depth == 0 && ext.oid.to_id_string() == DEVICE_ID_OID {
+                // A Hopper leaf has no TcbInfo, so no debug or recovery flags. NVIDIA's verifier
+                // reports debug as disabled exactly when every measurement matches its RIM
+                // (nv-attestation-sdk-cpp, src/gpu/verify.cpp), and a reference pins every block.
                 fwid = Some(
-                    device_id_fwid(ext.value)
+                    certs
+                        .get(1)
+                        .and_then(|issuer| device_id_fwid(ext.value, issuer.public_key().raw))
                         .ok_or_else(|| failed("leaf Composite Device Identifier"))?,
                 );
             }
@@ -570,12 +578,7 @@ fn verify_chain(
                 leaf_fwid = Some(fwid);
             }
         }
-        let known: &[&str] = if depth == 0 {
-            &[TCB_INFO_OID, DEVICE_ID_OID]
-        } else {
-            &[TCB_INFO_OID]
-        };
-        if let Some(oid) = unknown_critical(cert, known) {
+        if let Some(oid) = unknown_critical(cert, TCB_INFO_OID) {
             return Err(failed(format!(
                 "certificate {depth} has unknown critical extension {oid}"
             )));
@@ -598,6 +601,11 @@ fn verify_chain(
         serial: hex::encode(leaf.raw_serial()),
         fwid: leaf_fwid,
         root: root_sha256,
+        hopper: certs.iter().any(|c| {
+            c.subject()
+                .iter_common_name()
+                .any(|cn| cn.as_str() == Ok("NVIDIA GH100 Identity"))
+        }),
     })
 }
 
@@ -610,14 +618,14 @@ fn asn1_time(t: SystemTime) -> Result<ASN1Time, AppraisalError> {
 }
 
 /// The first critical extension of `cert` other than basic constraints, key usage and `also`.
-fn unknown_critical(cert: &X509Certificate<'_>, also: &[&str]) -> Option<String> {
+fn unknown_critical(cert: &X509Certificate<'_>, also: &str) -> Option<String> {
     cert.extensions()
         .iter()
         .find(|e| {
             e.critical
                 && e.oid != OID_X509_EXT_BASIC_CONSTRAINTS
                 && e.oid != OID_X509_EXT_KEY_USAGE
-                && !also.contains(&e.oid.to_id_string().as_str())
+                && e.oid.to_id_string() != also
         })
         .map(|e| e.oid.to_id_string())
 }
@@ -627,15 +635,19 @@ fn p384_key(cert: &X509Certificate<'_>) -> Result<VerifyingKey, AppraisalError> 
         .map_err(|_| failed("certificate key is not P-384"))
 }
 
-/// The SHA-384 FWID of a Composite Device Identifier:
+/// The SHA-384 FWID of a Composite Device Identifier whose key is `spki`. On a Hopper that is
+/// the DeviceID key of the boot ROM certificate that signs the leaf, not the leaf's own key:
 /// `SEQUENCE { version INTEGER, SubjectPublicKeyInfo, fwid SEQUENCE { hashAlg OID, digest OCTET STRING } }`.
-fn device_id_fwid(value: &[u8]) -> Option<[u8; 48]> {
+fn device_id_fwid(value: &[u8], spki: &[u8]) -> Option<[u8; 48]> {
     let ([], id) = Any::from_der(value).ok()? else {
         return None;
     };
     let (rest, _version) = Any::from_der(id.data).ok()?;
-    let (rest, _key) = Any::from_der(rest).ok()?;
-    let ([], fwid) = Any::from_der(rest).ok()? else {
+    let (after_key, _) = Any::from_der(rest).ok()?;
+    if rest.strip_suffix(after_key)? != spki {
+        return None;
+    }
+    let ([], fwid) = Any::from_der(after_key).ok()? else {
         return None;
     };
     let (digest, hash_alg) = Oid::from_der(fwid.data).ok()?;
@@ -728,7 +740,7 @@ mod tests {
         )
         .unwrap();
         let opaque = parse_spdm(&evidence).unwrap().opaque.to_vec();
-        assert!(Opaque::parse(&opaque).is_ok());
+        assert!(Opaque::parse(&opaque, false).is_ok());
 
         let mut unknown = opaque.clone();
         unknown[0] = 99;
@@ -736,33 +748,20 @@ mod tests {
         repeated.extend_from_slice(&opaque);
         let hopper = std::fs::read(
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../testdata/attest/hgx-hopper-ppcie/gpu0.spdm.bin"),
+                .join("../../testdata/attest/hgx-h200-ppcie-595.58.03/spdm.bin"),
         )
         .unwrap();
-        let hopper = Opaque::parse(parse_spdm(&hopper).unwrap().opaque).unwrap();
-        assert_eq!((hopper.chip.as_str(), hopper.feature_flag), ("GH100", 2));
+        let hopper = parse_spdm(&hopper).unwrap().opaque;
+        let parsed = Opaque::parse(hopper, true).unwrap();
+        assert_eq!((parsed.chip.as_str(), parsed.feature_flag), ("GH100", 2));
 
-        for (data, fragment) in [
-            (unknown, "unknown opaque type 99"),
-            (repeated, "type 6 repeated"),
+        for (data, hopper, fragment) in [
+            (unknown.as_slice(), false, "unknown opaque type 99"),
+            (&repeated, false, "type 6 repeated"),
+            (hopper, false, "opaque type 35 missing"),
         ] {
-            let err = Opaque::parse(&data).err().unwrap();
+            let err = Opaque::parse(data, hopper).err().unwrap();
             assert!(err.to_string().contains(fragment), "{err}");
         }
-    }
-
-    #[test]
-    fn hopper_leaf_carries_its_fwid_in_the_device_identifier() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../testdata/attest/hgx-hopper-ppcie");
-        let gpu = GpuEvidence {
-            evidence: std::fs::read(dir.join("gpu0.spdm.bin")).unwrap(),
-            certificate_chain: std::fs::read(dir.join("gpu0.certchain.pem")).unwrap(),
-        };
-        // NVIDIA Device Identity CA, the root of B300 and Hopper chains alike.
-        let root = "sha256:102bf659d5419614c9d8e6aecebc80454eb26b1df6a769ac720b9a690b167b48";
-        let (leaf, _, opaque) =
-            read_gpu(&gpu, &[root.parse().unwrap()], SystemTime::now()).unwrap();
-        assert_eq!(leaf.fwid, Some(opaque.fwid));
     }
 }

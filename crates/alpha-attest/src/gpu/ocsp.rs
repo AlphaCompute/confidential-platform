@@ -241,10 +241,8 @@ fn delegated(
     if !responder.validity().is_valid_at(asn1_time(now)?) {
         return Err(failed(format!("responder {name} is outside its validity")));
     }
-    if let Some(oid) = unknown_critical(
-        responder,
-        &[&OID_X509_EXT_EXTENDED_KEY_USAGE.to_id_string()],
-    ) {
+    if let Some(oid) = unknown_critical(responder, &OID_X509_EXT_EXTENDED_KEY_USAGE.to_id_string())
+    {
         return Err(failed(format!(
             "responder {name} has unknown critical extension {oid}"
         )));
