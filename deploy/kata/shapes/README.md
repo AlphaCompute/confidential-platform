@@ -10,6 +10,9 @@ and fails if a value differs. The GPU entries are captured, so the workflow does
   `default_vcpus` (1) and `default_memory` (2048 MiB) to the summed container limits of the pod.
   A pod with no limits gets 1 vCPU and 2048 MiB.
 - **RTMR0**: one value for each VM shape. The KMS refuses a TD whose RTMR0 is not in the document.
+- **XFAM**: the CPU features that the host gives a TD. An entry without `xfam` has 0x61ae7
+  (with CET). A host kernel that does not virtualize CET for TDs gives 0x602e7, so a TD on that
+  host needs an entry with `"xfam": 393959`. The capture and the check are for 0x61ae7.
 
 ## Files
 

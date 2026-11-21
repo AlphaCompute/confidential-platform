@@ -249,6 +249,11 @@ pub struct KataReference {
     pub rtmr0: Vec<Measurement>,
     pub rtmr1: Measurement,
     pub rtmr2: Measurement,
+    /// The XFAM its TDs report, compared whole. QEMU's `-cpu host` yields what the host CPU and
+    /// kernel can give a TD: a host kernel without CET virtualization drops CET, so the same
+    /// guest on another host is another entry.
+    #[serde(default = "cet_xfam")]
+    pub xfam: u64,
     /// Whether the class passes GPUs through, whose evidence the TD quote does not cover.
     /// Required, so that an entry which forgets it cannot pass for a CPU class.
     pub gpu: bool,
@@ -257,16 +262,23 @@ pub struct KataReference {
     pub gpus: Option<KataGpus>,
 }
 
+/// x87, SSE, AVX, AVX-512, PKRU, CET and AMX: what the documents before `xfam` existed meant.
+fn cet_xfam() -> u64 {
+    0x61ae7
+}
+
 impl KataReference {
-    fn matches(&self, m: &Measured) -> bool {
-        self.mrtd == m.mrtd
+    fn matches(&self, m: &Measured, xfam: u64) -> bool {
+        self.xfam == xfam
+            && self.mrtd == m.mrtd
             && self.rtmr1 == m.rtmr1
             && self.rtmr2 == m.rtmr2
             && self.rtmr0.contains(&m.rtmr0)
     }
 
     fn overlaps(&self, other: &KataReference) -> bool {
-        self.mrtd == other.mrtd
+        self.xfam == other.xfam
+            && self.mrtd == other.mrtd
             && self.rtmr1 == other.rtmr1
             && self.rtmr2 == other.rtmr2
             && self.rtmr0.iter().any(|r| other.rtmr0.contains(r))
@@ -570,10 +582,6 @@ pub fn init_data_digest(mr_config_id: &[u8; 48]) -> Result<ComposeHash, InitData
 /// SEPT_VE_DISABLE alone. Compared whole, not as a mask, so DEBUG, MIGRATABLE, PKS, KL or
 /// PERFMON appearing after a QEMU or Kata config change is refused too.
 const KATA_TD_ATTRIBUTES: u64 = 0x1000_0000;
-/// x87, SSE, AVX, AVX-512, PKRU, CET and AMX: what `-cpu host` yields on our B300 hosts.
-// ponytail: one host CPU class, so one XFAM for every runtime class; a second CPU generation
-// moves this into each `kata_reference_values` entry.
-const KATA_XFAM: u64 = 0x61ae7;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KataAppraised {
@@ -681,7 +689,7 @@ fn kata_reference<'a>(
         return Err(PolicyDenied(format!("td_attributes {td_attributes:#x}")));
     }
     let xfam = u64::from_le_bytes(quote.xfam);
-    if xfam != KATA_XFAM {
+    if !references.iter().any(|r| r.xfam == xfam) {
         return Err(PolicyDenied(format!("xfam {xfam:#x}")));
     }
     // Nothing of ours extends RTMR3, and Kata never sets the owner fields.
@@ -698,7 +706,7 @@ fn kata_reference<'a>(
     // Parsing refuses empty and overlapping entries, but a document built in code skips that.
     let mut matching = references
         .iter()
-        .filter(|r| !r.runtime_class.is_empty() && r.matches(&quote.measured));
+        .filter(|r| !r.runtime_class.is_empty() && r.matches(&quote.measured, xfam));
     match (matching.next(), matching.next()) {
         (Some(r), None) => Ok(r),
         (None, _) => Err(Unknown(format!(
@@ -910,6 +918,20 @@ mod tests {
             assert_eq!(err.code(), code, "{err}");
             assert!(err.to_string().contains(fragment), "{err}");
         }
+
+        // A host kernel without CET virtualization: the same guest, XFAM without CET.
+        let mut no_cet = quote.clone();
+        no_cet.xfam = 0x602e7_u64.to_le_bytes();
+        let mut no_cet_refs = refs.clone();
+        no_cet_refs[0].xfam = 0x602e7;
+        assert_eq!(
+            kata_reference(&no_cet, &no_cet_refs).unwrap().runtime_class,
+            "kata-qemu-tdx"
+        );
+        assert_eq!(
+            kata_reference(&quote, &no_cet_refs).unwrap_err().code(),
+            "attestation_unknown"
+        );
     }
 
     #[test]
