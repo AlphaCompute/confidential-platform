@@ -316,13 +316,7 @@ impl Relay<'_> {
         self.own_signer(&signed).await?;
         // The KMS answers a revoked Revision's registration with its stored row, so the relay
         // must not record an approval that would bring nothing back to life.
-        let revoked: bool = sqlx::query_scalar(
-            "select revoked_at is not null from revisions where compose_hash = $1 for share",
-        )
-        .bind(hash.as_bytes().as_slice())
-        .fetch_one(&mut *self.tx)
-        .await?;
-        if revoked {
+        if !self.live().await? {
             return Err(Error::Conflict("the Revision is revoked"));
         }
         let reply = self
@@ -341,6 +335,18 @@ impl Relay<'_> {
         Ok((tag, reply))
     }
 
+    /// Whether the ticket's own Revision is not revoked. The share lock holds off a concurrent
+    /// revoke of it until this step commits.
+    async fn live(&mut self) -> Result<bool, Error> {
+        let live: Option<bool> = sqlx::query_scalar(
+            "select revoked_at is null from revisions where compose_hash = $1 for share",
+        )
+        .bind(self.found.compose_hash.as_deref())
+        .fetch_optional(&mut *self.tx)
+        .await?;
+        Ok(live == Some(true))
+    }
+
     /// An approval revokes only the Revision it replaces; a `revoke` ticket only its own.
     async fn revoke(&mut self, body: Value) -> Result<(String, Value), Error> {
         let signed = signed(&body)?;
@@ -353,19 +359,9 @@ impl Relay<'_> {
         let hash = allowed
             .filter(|h| signed.payload.get("compose_hash") == Some(&json!(h)))
             .ok_or(Error::Forbidden)?;
-        // The predecessor goes only once its replacement is registered and while it is live; the
-        // share lock holds off a concurrent revoke of the replacement until this one commits.
-        if approve {
-            let live: Option<bool> = sqlx::query_scalar(
-                "select revoked_at is null \
-                 from revisions where compose_hash = $1 for share",
-            )
-            .bind(self.found.compose_hash.as_deref())
-            .fetch_optional(&mut *self.tx)
-            .await?;
-            if live != Some(true) || !self.found.used.iter().any(|u| u == "revision") {
-                return Err(Error::Conflict("the replacement Revision is not live"));
-            }
+        // The predecessor goes only once its replacement is registered and while it is live.
+        if approve && (!self.found.used.iter().any(|u| u == "revision") || !self.live().await?) {
+            return Err(Error::Conflict("the replacement Revision is not live"));
         }
         let tag = self.fresh(format!("revoke:{hash}"))?;
         self.own_signer(&signed).await?;
