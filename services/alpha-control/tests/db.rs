@@ -1304,10 +1304,13 @@ async fn an_approval_registers_its_revision_only_with_a_passkey_of_the_organizat
     let predecessor = format!("sha256:{}", "1".repeat(64));
     sqlx::query(
         "insert into revisions (compose_hash, app_id, init_data, pod, shape, catalog, registered_at) \
-         select decode($1, 'hex'), app_id, 'previous', pod, shape, catalog, now() + interval '1 second' \
-         from revisions where app_id = $2::uuid",
+         select decode(v.hash, 'hex'), app_id, v.init_data, pod, shape, catalog, \
+                now() + v.seconds * interval '1 second' \
+         from revisions, (values ($1, 'previous', 2), ($2, 'older', 1)) v(hash, init_data, seconds) \
+         where app_id = $3::uuid",
     )
     .bind("1".repeat(64))
+    .bind("2".repeat(64))
     .bind(&app_id)
     .execute(&api.1)
     .await

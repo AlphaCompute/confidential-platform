@@ -278,7 +278,7 @@ impl Relay<'_> {
             .to_owned();
         let name = full
             .strip_prefix(&format!("{app_id}."))
-            .filter(|name| alpha_core::is_secret_name(name))
+            .filter(|name| alpha_core::is_secret_name(name) && alpha_core::is_secret_name(&full))
             .ok_or_else(|| Error::Malformed(format!("name must be {app_id}.<name>")))?;
         if signed.payload.get("app_ids") != Some(&json!([app_id])) {
             return Err(Error::Malformed(format!("app_ids must be [{app_id}]")));
