@@ -51,6 +51,12 @@ pub async fn relay(
     // Fetched before the transaction, so a relay never holds one pool connection while it waits
     // for another.
     let (version, document) = platform(&state).await?;
+    // The handshake only opens a sealed channel to a node for the Secret puts that follow; it
+    // records nothing, so it holds no lock.
+    if op == "channel" {
+        let reply = send(&state, &document, Method::POST, "/v1/channel", &body).await?;
+        return Ok(Json(reply));
+    }
     // ponytail: the ticket and Organization rows stay locked across the KMS call, up to 60 s per
     // endpoint, so a step and a disable of one Organization wait for each other that long. The
     // upgrade is a ticket state `sending` committed before the call and settled after it.
@@ -71,10 +77,6 @@ pub async fn relay(
     };
     let kind = relay.found.kind.clone();
     let (tag, reply) = match (kind.as_str(), op.as_str()) {
-        // The handshake only opens a sealed channel to a node for the Secret puts that follow.
-        ("approve", "channel") => {
-            return Ok(Json(relay.kms(Method::POST, "/v1/channel", &body).await?));
-        }
         ("claim", "root" | "key") => relay.key(&op, &headers, body).await?,
         ("approve", "secret") => relay.secret(body).await?,
         ("approve", "revision") => relay.revision(body).await?,
@@ -83,6 +85,42 @@ pub async fn relay(
     };
     relay.finish(&op, tag).await?;
     Ok(Json(reply))
+}
+
+fn kms_revisions(document: &PlatformDocument) -> Vec<ComposeHash> {
+    document
+        .kms_revisions
+        .iter()
+        .map(|r| r.compose_hash)
+        .collect()
+}
+
+/// One KMS call, pinned to the document's CA and KMS builds. A KMS refusal keeps its code.
+async fn send(
+    state: &AppState,
+    document: &PlatformDocument,
+    method: Method,
+    path: &str,
+    body: &Value,
+) -> Result<Value, Error> {
+    // The error text names the endpoint, so the caller gets a fixed message and the log the kind.
+    let unavailable = |e: alpha_client::Error| {
+        alpha_client::warn!("kms_unavailable", error = e.kind());
+        Error::Unavailable("the KMS is unavailable".into())
+    };
+    let ca = alpha_client::tls::cert_from_pem(&document.kms_ca_pem).map_err(unavailable)?;
+    let pin = Pin::CaAndRevisions(ca, kms_revisions(document));
+    let client = Client::new(state.kms_endpoints.clone(), pin).map_err(unavailable)?;
+    client
+        .request(method, path, Some(body))
+        .await
+        .map_err(|e| match &e {
+            alpha_client::Error::Api(api) => Error::Kms {
+                status: StatusCode::from_u16(api.status).unwrap_or(StatusCode::BAD_GATEWAY),
+                code: e.kind(),
+            },
+            _ => unavailable(e),
+        })
 }
 
 fn allowed(kind: &str, op: &str) -> bool {
@@ -276,6 +314,17 @@ impl Relay<'_> {
             ));
         }
         self.own_signer(&signed).await?;
+        // The KMS answers a revoked Revision's registration with its stored row, so the relay
+        // must not record an approval that would bring nothing back to life.
+        let revoked: bool = sqlx::query_scalar(
+            "select revoked_at is not null from revisions where compose_hash = $1 for share",
+        )
+        .bind(hash.as_bytes().as_slice())
+        .fetch_one(&mut *self.tx)
+        .await?;
+        if revoked {
+            return Err(Error::Conflict("the Revision is revoked"));
+        }
         let reply = self
             .repeatable(Method::POST, "/v1/revisions", &body)
             .await?;
@@ -295,13 +344,20 @@ impl Relay<'_> {
     /// An approval revokes only the Revision it replaces; a `revoke` ticket only its own.
     async fn revoke(&mut self, body: Value) -> Result<(String, Value), Error> {
         let signed = signed(&body)?;
-        let allowed = match self.found.kind.as_str() {
-            "approve" => hash(self.found.predecessor.as_deref()),
-            _ => hash(self.found.compose_hash.as_deref()),
-        };
+        let approve = self.found.kind == "approve";
+        let allowed = hash(if approve {
+            self.found.predecessor.as_deref()
+        } else {
+            self.found.compose_hash.as_deref()
+        });
         let hash = allowed
             .filter(|h| signed.payload.get("compose_hash") == Some(&json!(h)))
             .ok_or(Error::Forbidden)?;
+        if approve && !self.found.used.iter().any(|u| u == "revision") {
+            return Err(Error::Conflict(
+                "the replacement Revision is not registered yet",
+            ));
+        }
         let tag = self.fresh(format!("revoke:{hash}"))?;
         self.own_signer(&signed).await?;
         let reply = self
@@ -328,7 +384,7 @@ impl Relay<'_> {
         let done = match self.found.kind.as_str() {
             "claim" => tag == "key",
             "approve" => {
-                used.contains(&"revision".to_owned())
+                used.iter().any(|u| u == "revision")
                     && revoked(hash(self.found.predecessor.as_deref()))
             }
             _ => revoked(hash(self.found.compose_hash.as_deref())),
@@ -354,17 +410,9 @@ impl Relay<'_> {
         Ok(())
     }
 
-    fn kms_revisions(&self) -> Vec<ComposeHash> {
-        self.document
-            .kms_revisions
-            .iter()
-            .map(|r| r.compose_hash)
-            .collect()
-    }
-
     async fn kms(&mut self, method: Method, path: &str, body: &Value) -> Result<Value, Error> {
         self.current().await?;
-        self.send(method, path, body).await
+        send(self.state, &self.document, method, path, body).await
     }
 
     /// For a call the KMS answers the same way when repeated (a root for the same key, a
@@ -377,7 +425,7 @@ impl Relay<'_> {
         path: &str,
         body: &Value,
     ) -> Result<Value, Error> {
-        let reply = self.send(method, path, body).await?;
+        let reply = send(self.state, &self.document, method, path, body).await?;
         self.current().await?;
         Ok(reply)
     }
@@ -406,30 +454,6 @@ impl Relay<'_> {
         Ok(())
     }
 
-    /// One KMS call, pinned to the document's CA and KMS builds. A KMS refusal keeps its code.
-    async fn send(&self, method: Method, path: &str, body: &Value) -> Result<Value, Error> {
-        // The error text names the endpoint, so the caller gets a fixed message and the log the
-        // kind.
-        let unavailable = |e: alpha_client::Error| {
-            alpha_client::warn!("kms_unavailable", error = e.kind());
-            Error::Unavailable("the KMS is unavailable".into())
-        };
-        let ca =
-            alpha_client::tls::cert_from_pem(&self.document.kms_ca_pem).map_err(unavailable)?;
-        let pin = Pin::CaAndRevisions(ca, self.kms_revisions());
-        let client = Client::new(self.state.kms_endpoints.clone(), pin).map_err(unavailable)?;
-        client
-            .request(method, path, Some(body))
-            .await
-            .map_err(|e| match &e {
-                alpha_client::Error::Api(api) => Error::Kms {
-                    status: StatusCode::from_u16(api.status).unwrap_or(StatusCode::BAD_GATEWAY),
-                    code: e.kind(),
-                },
-                _ => unavailable(e),
-            })
-    }
-
     /// The response the receipt signs for `request` at `route`, if it carries every `expected`
     /// value.
     fn confirm(
@@ -449,7 +473,7 @@ impl Relay<'_> {
         receipt::verify(
             &receipt,
             &self.document.kms_ca_pem,
-            &self.kms_revisions(),
+            &kms_revisions(&self.document),
             &expected,
         )
         .map_err(|_| Error::UpstreamInvalid)

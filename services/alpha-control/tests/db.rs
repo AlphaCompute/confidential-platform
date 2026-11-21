@@ -1345,6 +1345,16 @@ async fn an_approval_registers_its_revision_only_with_a_passkey_of_the_organizat
         )
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+    // The predecessor stays live until its replacement is registered.
+    let (status, _) = api
+        .call(
+            Method::POST,
+            &format!("/v1/tickets/{next}/kms/revoke"),
+            "",
+            revoke(&predecessor),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
 
     // A revoke ticket revokes its own Revision and nothing else.
     let (status, opened) = api
@@ -1374,4 +1384,25 @@ async fn an_approval_registers_its_revision_only_with_a_passkey_of_the_organizat
         .await;
     assert_eq!(stored_now["state"], "revoked");
     assert_eq!(api.read_ticket(revoke_ticket).await["state"], "done");
+
+    // A revoked Revision is never approved again, so its approval cannot revoke the live one.
+    let (status, _) = api
+        .call(
+            Method::POST,
+            "/v1/apps/board/revisions",
+            &deploy,
+            json!({ "catalog": catalog }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, refused) = api
+        .call(
+            Method::POST,
+            &format!("/v1/tickets/{next}/kms/revision"),
+            "",
+            revision(&root, &root_id, &hash),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert_eq!(api.read_ticket(next).await["state"], "open");
 }

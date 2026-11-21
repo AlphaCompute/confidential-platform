@@ -82,8 +82,9 @@ pub async fn create(
     let status = if inserted.rows_affected() == 0 {
         // The digest covers the init-data only; another entry with the same template but another
         // pod or shape is not this Revision.
-        let same: bool = sqlx::query_scalar(
-            "select pod = $2 and shape = $3 and catalog = $4 from revisions where compose_hash = $1",
+        let (same, revoked): (bool, bool) = sqlx::query_as(
+            "select pod = $2 and shape = $3 and catalog = $4, revoked_at is not null \
+             from revisions where compose_hash = $1",
         )
         .bind(rendered.revision.as_bytes().as_slice())
         .bind(&rendered.pod)
@@ -95,6 +96,10 @@ pub async fn create(
             return Err(Error::Conflict(
                 "the Revision is stored from another catalog entry",
             ));
+        }
+        // A revoked Revision never registers again; approving it would only revoke the live one.
+        if revoked {
+            return Err(Error::Conflict("the Revision is revoked"));
         }
         StatusCode::OK
     } else {
