@@ -1355,6 +1355,24 @@ async fn an_approval_registers_its_revision_only_with_a_passkey_of_the_organizat
         )
         .await;
     assert_eq!(status, StatusCode::CONFLICT);
+    let (status, registered) = api
+        .call(
+            Method::POST,
+            &format!("/v1/tickets/{next}/kms/revision"),
+            "",
+            revision(&root, &root_id, &hash),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{registered}");
+    let (_, last) = api
+        .call(
+            Method::POST,
+            "/v1/apps/board/revisions",
+            &deploy,
+            json!({ "catalog": catalog }),
+        )
+        .await;
+    let last = last["ticket"].as_str().unwrap();
 
     // A revoke ticket revokes its own Revision and nothing else.
     let (status, opened) = api
@@ -1385,7 +1403,17 @@ async fn an_approval_registers_its_revision_only_with_a_passkey_of_the_organizat
     assert_eq!(stored_now["state"], "revoked");
     assert_eq!(api.read_ticket(revoke_ticket).await["state"], "done");
 
-    // A revoked Revision is never approved again, so its approval cannot revoke the live one.
+    // Once the replacement is revoked, its predecessor stays, and the revoked Revision is never
+    // approved again, so no approval can leave the App without a live Revision.
+    let (_, refused) = api
+        .call(
+            Method::POST,
+            &format!("/v1/tickets/{next}/kms/revoke"),
+            "",
+            revoke(&predecessor),
+        )
+        .await;
+    assert_eq!(code(&refused), json!("conflict"));
     let (status, _) = api
         .call(
             Method::POST,
@@ -1395,14 +1423,14 @@ async fn an_approval_registers_its_revision_only_with_a_passkey_of_the_organizat
         )
         .await;
     assert_eq!(status, StatusCode::CONFLICT);
-    let (status, refused) = api
+    let (_, refused) = api
         .call(
             Method::POST,
-            &format!("/v1/tickets/{next}/kms/revision"),
+            &format!("/v1/tickets/{last}/kms/revision"),
             "",
             revision(&root, &root_id, &hash),
         )
         .await;
-    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
-    assert_eq!(api.read_ticket(next).await["state"], "open");
+    assert_eq!(code(&refused), json!("conflict"));
+    assert_eq!(api.read_ticket(last).await["state"], "open");
 }

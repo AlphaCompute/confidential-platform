@@ -353,10 +353,19 @@ impl Relay<'_> {
         let hash = allowed
             .filter(|h| signed.payload.get("compose_hash") == Some(&json!(h)))
             .ok_or(Error::Forbidden)?;
-        if approve && !self.found.used.iter().any(|u| u == "revision") {
-            return Err(Error::Conflict(
-                "the replacement Revision is not registered yet",
-            ));
+        // The predecessor goes only while its replacement is registered and live; the share lock
+        // holds off a concurrent revoke of the replacement until this one commits.
+        if approve {
+            let live: Option<bool> = sqlx::query_scalar(
+                "select registered_at is not null and revoked_at is null \
+                 from revisions where compose_hash = $1 for share",
+            )
+            .bind(self.found.compose_hash.as_deref())
+            .fetch_optional(&mut *self.tx)
+            .await?;
+            if live != Some(true) || !self.found.used.iter().any(|u| u == "revision") {
+                return Err(Error::Conflict("the replacement Revision is not live"));
+            }
         }
         let tag = self.fresh(format!("revoke:{hash}"))?;
         self.own_signer(&signed).await?;
