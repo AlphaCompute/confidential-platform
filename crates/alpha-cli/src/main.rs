@@ -324,12 +324,17 @@ enum CocoCommand {
         /// The device certificate chain in PEM, leaf first, as NVML returns it.
         #[arg(long)]
         certificate_chain: PathBuf,
-        /// The XML of `NV_GPU_CC_DRIVER_<chip>_<driver version>` from NVIDIA's RIM service.
+        /// The XML of `NV_GPU_CC_DRIVER_<chip>_<driver version>` from NVIDIA's RIM service, or of
+        /// `NV_GPU_DRIVER_GH100_<driver version>` for a Hopper.
         #[arg(long)]
         driver_rim: PathBuf,
         /// The XML of `NV_GPU_VBIOS_<project>_<project SKU>_<chip SKU>_<VBIOS version>`.
         #[arg(long)]
         vbios_rim: PathBuf,
+        /// Prints a reference for a GPU in protected-PCIe mode, although nothing attests its
+        /// NVSwitches or checks its switch PDIs against them.
+        #[arg(long)]
+        accept_unattested_nvswitch: bool,
     },
 }
 
@@ -724,6 +729,7 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                     certificate_chain,
                     driver_rim,
                     vbios_rim,
+                    accept_unattested_nvswitch,
                 },
         } => {
             let evidence = alpha_attest::GpuEvidence {
@@ -735,8 +741,14 @@ async fn run(cli: Cli) -> Result<Value, Exit> {
                 &read_file(&driver_rim)?,
                 &read_file(&vbios_rim)?,
                 SystemTime::now(),
+                accept_unattested_nvswitch,
             )
             .map_err(|e| e.to_string())?;
+            if accept_unattested_nvswitch && reference.feature_flag == 2 {
+                eprintln!(
+                    "warning: protected-PCIe mode; NVSwitch evidence and the switch PDI cross-check are not verified, so NVLink traffic between GPUs is not protected"
+                );
+            }
             let http = alpha_client::http()
                 .build()
                 .map_err(|e| format!("http client: {e}"))?;
