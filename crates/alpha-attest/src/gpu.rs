@@ -545,6 +545,7 @@ fn verify_chain(
     let mut leaf_fwid = None;
     for (depth, cert) in certs.iter().enumerate() {
         for ext in cert.extensions() {
+            let mut fwid = None;
             if ext.oid.to_id_string() == TCB_INFO_OID {
                 let tcb_info = tcb_info(ext.value)
                     .ok_or_else(|| failed(format!("certificate {depth} TcbInfo")))?;
@@ -554,16 +555,27 @@ fn verify_chain(
                     )));
                 }
                 if depth == 0 {
-                    leaf_fwid = tcb_info.fwid;
+                    fwid = tcb_info.fwid;
                 }
             } else if depth == 0 && ext.oid.to_id_string() == DEVICE_ID_OID {
-                leaf_fwid = Some(
+                fwid = Some(
                     device_id_fwid(ext.value)
                         .ok_or_else(|| failed("leaf Composite Device Identifier"))?,
                 );
             }
+            if let Some(fwid) = fwid {
+                if leaf_fwid.is_some_and(|f| f != fwid) {
+                    return Err(failed("leaf names two FWIDs"));
+                }
+                leaf_fwid = Some(fwid);
+            }
         }
-        if let Some(oid) = unknown_critical(cert, &[TCB_INFO_OID, DEVICE_ID_OID]) {
+        let known: &[&str] = if depth == 0 {
+            &[TCB_INFO_OID, DEVICE_ID_OID]
+        } else {
+            &[TCB_INFO_OID]
+        };
+        if let Some(oid) = unknown_critical(cert, known) {
             return Err(failed(format!(
                 "certificate {depth} has unknown critical extension {oid}"
             )));
