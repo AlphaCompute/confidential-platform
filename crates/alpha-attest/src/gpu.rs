@@ -444,9 +444,10 @@ impl Opaque {
         Ok(Self {
             // Hopper firmware reports no chip name. NVIDIA's verifier names every Hopper GH100,
             // and its RIMs carry that product name.
-            chip: match fields.contains_key(&tlv::CHIP_INFO) {
-                true => text(tlv::CHIP_INFO)?,
-                false => "GH100".to_owned(),
+            chip: if fields.contains_key(&tlv::CHIP_INFO) {
+                text(tlv::CHIP_INFO)?
+            } else {
+                "GH100".to_owned()
             },
             project: text(tlv::PROJECT)?,
             project_sku: text(tlv::PROJECT_SKU)?,
@@ -629,9 +630,11 @@ fn device_id_fwid(value: &[u8]) -> Option<[u8; 48]> {
     let ([], digest) = Any::from_der(digest).ok()? else {
         return None;
     };
-    (hash_alg == OID_NIST_HASH_SHA384 && digest.tag() == Tag::OctetString)
-        .then(|| digest.data.try_into().ok())
-        .flatten()
+    if hash_alg == OID_NIST_HASH_SHA384 && digest.tag() == Tag::OctetString {
+        digest.data.try_into().ok()
+    } else {
+        None
+    }
 }
 
 struct TcbInfo {
