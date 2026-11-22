@@ -15,7 +15,7 @@ use p384::ecdsa::signature::Signer;
 use p384::pkcs8::DecodePrivateKey;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, CustomExtension, IsCa, KeyPair,
-    KeyUsagePurpose, PKCS_ECDSA_P384_SHA384,
+    KeyUsagePurpose, PKCS_ECDSA_P384_SHA384, PublicKeyData,
 };
 use sha2::{Digest, Sha256};
 
@@ -296,16 +296,18 @@ fn kata_classes_take_gpu_evidence_only_as_pinned() {
 }
 
 /// `g1b`'s evidence re-signed by a leaf under a root of our own, whose TcbInfo is the real
-/// leaf's with `flags` as its operational flags, and which also carries `extra`.
-fn resigned(flags: [u8; 4], extra: Vec<CustomExtension>) -> (GpuEvidence, GpuReference) {
+/// leaf's with `flags` as its operational flags, and which also carries what `extra` makes of
+/// the issuer's SubjectPublicKeyInfo.
+fn resigned(
+    flags: [u8; 4],
+    extra: impl FnOnce(&[u8]) -> Vec<CustomExtension>,
+) -> (GpuEvidence, GpuReference) {
     let mut root = CertificateParams::new(vec![]).unwrap();
     root.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     root.key_usages = vec![KeyUsagePurpose::KeyCertSign];
-    let root = CertifiedIssuer::self_signed(
-        root,
-        KeyPair::generate_for(&PKCS_ECDSA_P384_SHA384).unwrap(),
-    )
-    .unwrap();
+    let root_key = KeyPair::generate_for(&PKCS_ECDSA_P384_SHA384).unwrap();
+    let issuer_spki = root_key.subject_public_key_info();
+    let root = CertifiedIssuer::self_signed(root, root_key).unwrap();
 
     let real = gpu("g1b").certificate_chain;
     let real = x509_parser::pem::Pem::iter_from_buffer(&real)
@@ -332,7 +334,7 @@ fn resigned(flags: [u8; 4], extra: Vec<CustomExtension>) -> (GpuEvidence, GpuRef
         &[2, 23, 133, 5, 4, 1, 1],
         tcb_info,
     )];
-    leaf.custom_extensions.extend(extra);
+    leaf.custom_extensions.extend(extra(&issuer_spki));
     let key = KeyPair::generate_for(&PKCS_ECDSA_P384_SHA384).unwrap();
     let signer: SigningKey = p384::SecretKey::from_pkcs8_der(&key.serialize_der())
         .unwrap()
@@ -361,29 +363,29 @@ fn insecure_tcb_flags_and_unknown_critical_extensions_are_refused() {
     };
     // notConfigured and fixedWidth, as the B300 leaf reports.
     let b300 = [0x80, 0, 0, 0x01];
-    appraise(resigned(b300, Vec::new())).unwrap();
+    appraise(resigned(b300, |_| Vec::new())).unwrap();
 
     let mut critical = CustomExtension::from_oid_content(&[1, 2, 3, 4], vec![0x05, 0x00]);
     critical.set_criticality(true);
     let cases = [
         (
             "notSecure",
-            resigned([0xc0, 0, 0, 0x01], Vec::new()),
+            resigned([0xc0, 0, 0, 0x01], |_| Vec::new()),
             "notSecure, recovery or debug TCB",
         ),
         (
             "recovery",
-            resigned([0xa0, 0, 0, 0x01], Vec::new()),
+            resigned([0xa0, 0, 0, 0x01], |_| Vec::new()),
             "notSecure, recovery or debug TCB",
         ),
         (
             "debug",
-            resigned([0x90, 0, 0, 0x01], Vec::new()),
+            resigned([0x90, 0, 0, 0x01], |_| Vec::new()),
             "notSecure, recovery or debug TCB",
         ),
         (
             "unknown critical extension",
-            resigned(b300, vec![critical]),
+            resigned(b300, |_| vec![critical]),
             "unknown critical extension 1.2.3.4",
         ),
     ];
@@ -392,6 +394,75 @@ fn insecure_tcb_flags_and_unknown_critical_extensions_are_refused() {
         assert_eq!(err.code(), "attestation_failed", "{case}: {err}");
         assert!(err.to_string().contains(fragment), "{case}: {err}");
     }
+}
+
+/// A TCG DICE Composite Device Identifier: version 1, `spki`, and `fwid` as SHA-384.
+fn device_id(spki: &[u8], fwid: &[u8; 48]) -> CustomExtension {
+    let der = |tag: u8, content: &[u8]| {
+        let len = content.len();
+        let mut out = match len {
+            0..0x80 => vec![tag, len as u8],
+            0x80..0x100 => vec![tag, 0x81, len as u8],
+            _ => vec![tag, 0x82, (len >> 8) as u8, len as u8],
+        };
+        out.extend_from_slice(content);
+        out
+    };
+    let sha384 = [
+        0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02,
+    ];
+    let fwid = der(0x30, &[sha384.as_slice(), &der(0x04, fwid)].concat());
+    let id = der(0x30, &[[0x02, 0x01, 0x01].as_slice(), spki, &fwid].concat());
+    CustomExtension::from_oid_content(&[2, 23, 133, 5, 4, 1], id)
+}
+
+#[test]
+fn a_composite_device_identifier_must_name_the_issuer_key_and_the_leaf_fwid() {
+    let appraise = |(gpu, reference): (GpuEvidence, GpuReference)| {
+        appraise_gpus(&[gpu], &nonce("g1b"), 1, &[reference], now())
+    };
+    let b300 = [0x80, 0, 0, 0x01];
+    let fwid = reference().fwid.0;
+    appraise(resigned(b300, |spki| vec![device_id(spki, &fwid)])).unwrap();
+
+    let other_key = KeyPair::generate_for(&PKCS_ECDSA_P384_SHA384)
+        .unwrap()
+        .subject_public_key_info();
+    let err = appraise(resigned(b300, |_| vec![device_id(&other_key, &fwid)])).unwrap_err();
+    assert!(
+        err.to_string().contains("leaf Composite Device Identifier"),
+        "{err}"
+    );
+    let err = appraise(resigned(b300, |spki| vec![device_id(spki, &[0; 48])])).unwrap_err();
+    assert!(err.to_string().contains("leaf names two FWIDs"), "{err}");
+}
+
+#[test]
+fn a_hopper_is_measured_against_its_rims_and_protected_pcie_needs_the_opt_in() {
+    let read = |name: &str| testdata(&format!("hgx-h200-ppcie-595.58.03/{name}"));
+    let evidence = GpuEvidence {
+        evidence: read("spdm.bin"),
+        certificate_chain: read("certchain.pem"),
+    };
+    let driver = read("NV_GPU_DRIVER_GH100_595.58.03.xml");
+    let vbios = read("NV_GPU_VBIOS_G520_0280_895_9600D90002.xml");
+    // 2026-11-20, the day of the capture.
+    let now = UNIX_EPOCH + Duration::from_secs(1_795_132_800);
+
+    let err = gpu_reference(&evidence, &driver, &vbios, now, false).unwrap_err();
+    assert!(
+        err.to_string().contains("NVSwitches are not attested"),
+        "{err}"
+    );
+
+    // Both RIMs verify and are for this GH100's driver and VBIOS, but the GPU reports block 10
+    // nonzero while both RIMs mark its index inactive.
+    let err = gpu_reference(&evidence, &driver, &vbios, now, true).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("gpu measurement block 10 is sha384:1e9501ef"),
+        "{err}"
+    );
 }
 
 #[test]
@@ -406,7 +477,7 @@ fn reference_values_come_from_the_signed_rims() {
     // 2026-10-16, the day of the capture.
     let now = UNIX_EPOCH + Duration::from_secs(1_792_108_800);
     let expected: GpuReference = serde_json::from_slice(&read("gpu-reference.json")).unwrap();
-    let (reference, signers) = gpu_reference(&evidence, &driver, &vbios, now).unwrap();
+    let (reference, signers) = gpu_reference(&evidence, &driver, &vbios, now, false).unwrap();
     assert_eq!(reference, expected);
 
     // NVIDIA's answers for the four signers, captured 2026-10-19 10:06 UTC for this nonce.
@@ -457,7 +528,7 @@ fn reference_values_come_from_the_signed_rims() {
             "driver RIM is for GB110 97.10.7E.00.03",
         ),
     ] {
-        let err = gpu_reference(&evidence, &driver, &vbios, now).unwrap_err();
+        let err = gpu_reference(&evidence, &driver, &vbios, now, false).unwrap_err();
         assert!(err.to_string().contains(fragment), "{err}");
     }
 }

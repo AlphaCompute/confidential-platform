@@ -56,8 +56,9 @@ pub struct GpuReference {
     /// the leaf key for. Without it, an older NVIDIA-signed firmware could sign copied
     /// measurements.
     pub fwid: Measurement,
-    /// The `FEATURE_FLAG` opaque value the GPU must report: 1 for a single GPU passed through,
-    /// other values for the multi-GPU and protected-PCIe modes.
+    /// The `FEATURE_FLAG` opaque value the GPU must report. NVIDIA reads 0 as single-GPU, 1 as
+    /// multi-GPU and 2 as protected-PCIe mode; a B300 in CC mode reports 1 even when passed through
+    /// alone.
     pub feature_flag: u16,
     pub measurements: BTreeMap<u8, Vec<Measurement>>,
 }
@@ -151,6 +152,10 @@ const BLOCKS: u8 = 64;
 const DMTF_SPEC: u8 = 0x01;
 const SIGNATURE_LEN: usize = 96;
 const TCB_INFO_OID: &str = "2.23.133.5.4.1.1";
+/// The `FEATURE_FLAG` of protected-PCIe mode.
+const PROTECTED_PCIE: u16 = 2;
+/// The TCG DICE Composite Device Identifier a Hopper leaf carries its FWID in, instead of TcbInfo.
+const DEVICE_ID_OID: &str = "2.23.133.5.4.1";
 
 /// The NVIDIA opaque data types read by name.
 mod tlv {
@@ -249,7 +254,7 @@ fn read_gpu<'a>(
     leaf.key
         .verify(spdm.signed, &signature)
         .map_err(|_| failed("signature does not verify with the leaf key"))?;
-    let opaque = Opaque::parse(spdm.opaque)?;
+    let opaque = Opaque::parse(spdm.opaque, leaf.hopper)?;
     if leaf
         .fwid
         .ok_or_else(|| failed("leaf has no SHA-384 TcbInfo FWID"))?
@@ -396,16 +401,18 @@ struct Opaque {
 }
 
 impl Opaque {
-    fn parse(data: &[u8]) -> Result<Self, AppraisalError> {
+    /// `hopper`: the chain is NVIDIA's GH100 chain, whose firmware reports no chip name.
+    fn parse(data: &[u8], hopper: bool) -> Result<Self, AppraisalError> {
         let mut fields = BTreeMap::new();
         let mut r = Reader(data);
         while !r.0.is_empty() {
             let kind = r.u16()?;
             let len = r.u16()?;
             let value = r.take(len.into())?;
-            // Every type the B300 firmware reports. Any other is refused, so a firmware that
-            // starts reporting something new is looked at before it is accepted.
-            if !matches!(kind, 3 | 4 | 6 | 11..=20 | 33..=36) {
+            // Every type the B300 firmware and an HGX Hopper in protected-PCIe mode report. Any
+            // other is refused, so a firmware that starts reporting something new is looked at
+            // before it is accepted.
+            if !matches!(kind, 3 | 4 | 6 | 11..=22 | 33..=36) {
                 return Err(failed(format!("unknown opaque type {kind}")));
             }
             if fields.insert(kind, value).is_some() {
@@ -438,7 +445,12 @@ impl Opaque {
             _ => return Err(failed("vbios version")),
         };
         Ok(Self {
-            chip: text(tlv::CHIP_INFO)?,
+            // NVIDIA's verifier names every Hopper GH100, and its RIMs carry that product name.
+            chip: if hopper && !fields.contains_key(&tlv::CHIP_INFO) {
+                "GH100".to_owned()
+            } else {
+                text(tlv::CHIP_INFO)?
+            },
             project: text(tlv::PROJECT)?,
             project_sku: text(tlv::PROJECT_SKU)?,
             chip_sku: text(tlv::CHIP_SKU)?,
@@ -471,6 +483,7 @@ struct Leaf {
     serial: String,
     fwid: Option<[u8; 48]>,
     root: ComposeHash,
+    hopper: bool,
 }
 
 /// The chain, leaf first, must end in one of `roots`; the root shipped with it is trusted only
@@ -535,6 +548,7 @@ fn verify_chain(
     let mut leaf_fwid = None;
     for (depth, cert) in certs.iter().enumerate() {
         for ext in cert.extensions() {
+            let mut fwid = None;
             if ext.oid.to_id_string() == TCB_INFO_OID {
                 let tcb_info = tcb_info(ext.value)
                     .ok_or_else(|| failed(format!("certificate {depth} TcbInfo")))?;
@@ -544,8 +558,24 @@ fn verify_chain(
                     )));
                 }
                 if depth == 0 {
-                    leaf_fwid = tcb_info.fwid;
+                    fwid = tcb_info.fwid;
                 }
+            } else if depth == 0 && ext.oid.to_id_string() == DEVICE_ID_OID {
+                // A Hopper leaf has no TcbInfo, so no debug or recovery flags. NVIDIA's verifier
+                // reports debug as disabled exactly when every measurement matches its RIM
+                // (nv-attestation-sdk-cpp, src/gpu/verify.cpp), and a reference pins every block.
+                fwid = Some(
+                    certs
+                        .get(1)
+                        .and_then(|issuer| device_id_fwid(ext.value, issuer.public_key().raw))
+                        .ok_or_else(|| failed("leaf Composite Device Identifier"))?,
+                );
+            }
+            if let Some(fwid) = fwid {
+                if leaf_fwid.is_some_and(|f| f != fwid) {
+                    return Err(failed("leaf names two FWIDs"));
+                }
+                leaf_fwid = Some(fwid);
             }
         }
         if let Some(oid) = unknown_critical(cert, TCB_INFO_OID) {
@@ -571,6 +601,11 @@ fn verify_chain(
         serial: hex::encode(leaf.raw_serial()),
         fwid: leaf_fwid,
         root: root_sha256,
+        hopper: certs.iter().any(|c| {
+            c.subject()
+                .iter_common_name()
+                .any(|cn| cn.as_str() == Ok("NVIDIA GH100 Identity"))
+        }),
     })
 }
 
@@ -598,6 +633,32 @@ fn unknown_critical(cert: &X509Certificate<'_>, also: &str) -> Option<String> {
 fn p384_key(cert: &X509Certificate<'_>) -> Result<VerifyingKey, AppraisalError> {
     VerifyingKey::from_sec1_bytes(&cert.public_key().subject_public_key.data)
         .map_err(|_| failed("certificate key is not P-384"))
+}
+
+/// The SHA-384 FWID of a Composite Device Identifier whose key is `spki`. On a Hopper that is
+/// the DeviceID key of the boot ROM certificate that signs the leaf, not the leaf's own key:
+/// `SEQUENCE { version INTEGER, SubjectPublicKeyInfo, fwid SEQUENCE { hashAlg OID, digest OCTET STRING } }`.
+fn device_id_fwid(value: &[u8], spki: &[u8]) -> Option<[u8; 48]> {
+    let ([], id) = Any::from_der(value).ok()? else {
+        return None;
+    };
+    let (rest, _version) = Any::from_der(id.data).ok()?;
+    let (after_key, _) = Any::from_der(rest).ok()?;
+    if rest.strip_suffix(after_key)? != spki {
+        return None;
+    }
+    let ([], fwid) = Any::from_der(after_key).ok()? else {
+        return None;
+    };
+    let (digest, hash_alg) = Oid::from_der(fwid.data).ok()?;
+    let ([], digest) = Any::from_der(digest).ok()? else {
+        return None;
+    };
+    if hash_alg == OID_NIST_HASH_SHA384 && digest.tag() == Tag::OctetString {
+        digest.data.try_into().ok()
+    } else {
+        None
+    }
 }
 
 struct TcbInfo {
@@ -672,24 +733,34 @@ mod tests {
     }
 
     #[test]
-    fn opaque_types_unknown_or_repeated_are_refused() {
+    fn opaque_types_of_b300_and_hopper_parse_and_others_are_refused() {
         let evidence = std::fs::read(
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../../testdata/attest/b300-gpu-595.58.03/g1b.spdm.bin"),
         )
         .unwrap();
         let opaque = parse_spdm(&evidence).unwrap().opaque.to_vec();
-        assert!(Opaque::parse(&opaque).is_ok());
+        assert!(Opaque::parse(&opaque, false).is_ok());
 
         let mut unknown = opaque.clone();
         unknown[0] = 99;
         let mut repeated = opaque[..12].to_vec();
         repeated.extend_from_slice(&opaque);
-        for (data, fragment) in [
-            (unknown, "unknown opaque type 99"),
-            (repeated, "type 6 repeated"),
+        let hopper = std::fs::read(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../testdata/attest/hgx-h200-ppcie-595.58.03/spdm.bin"),
+        )
+        .unwrap();
+        let hopper = parse_spdm(&hopper).unwrap().opaque;
+        let parsed = Opaque::parse(hopper, true).unwrap();
+        assert_eq!((parsed.chip.as_str(), parsed.feature_flag), ("GH100", 2));
+
+        for (data, hopper, fragment) in [
+            (unknown.as_slice(), false, "unknown opaque type 99"),
+            (&repeated, false, "type 6 repeated"),
+            (hopper, false, "opaque type 35 missing"),
         ] {
-            let err = Opaque::parse(&data).err().unwrap();
+            let err = Opaque::parse(data, hopper).err().unwrap();
             assert!(err.to_string().contains(fragment), "{err}");
         }
     }

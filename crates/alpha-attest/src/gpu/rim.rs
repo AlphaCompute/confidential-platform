@@ -16,7 +16,10 @@ use p384::ecdsa::signature::Verifier;
 use roxmltree::{Document, Node, NodeType};
 use sha2::{Digest, Sha384};
 
-use super::{BLOCKS, GpuEvidence, GpuReference, OcspQuery, add_queries, read_gpu, verify_chain};
+use super::{
+    BLOCKS, GpuEvidence, GpuReference, OcspQuery, PROTECTED_PCIE, add_queries, read_gpu,
+    verify_chain,
+};
 use crate::{AppraisalError, Measurement};
 
 /// SHA-256 of the DER of "NVIDIA CoRIM signing Root CA", the root NVIDIA's local GPU verifier
@@ -53,14 +56,25 @@ struct Rim {
 /// RIM lists it with, or a nonzero block neither covers.
 /// Also returns an OCSP query for each certificate below the RIM root that signs either RIM;
 /// the reference stands only once each answers `good`.
+///
+/// A GPU in protected-PCIe mode is refused unless `accept_unattested_nvswitch`. In that mode
+/// NVLink traffic between GPUs is not encrypted: it is protected only when every NVSwitch is
+/// attested and each GPU's switch PDIs match the switches' evidence, and nothing here checks
+/// either.
 pub fn gpu_reference(
     evidence: &GpuEvidence,
     driver_rim: &[u8],
     vbios_rim: &[u8],
     now: SystemTime,
+    accept_unattested_nvswitch: bool,
 ) -> Result<(GpuReference, Vec<OcspQuery>), AppraisalError> {
     let device_root = pin(DEVICE_ROOT)?;
     let (leaf, spdm, opaque) = read_gpu(evidence, &[device_root], now)?;
+    if opaque.feature_flag == PROTECTED_PCIE && !accept_unattested_nvswitch {
+        return Err(failed(
+            "the GPU is in protected-PCIe mode, and its NVSwitches are not attested",
+        ));
+    }
     let mut covered = BTreeMap::new();
     let mut signers = Vec::new();
     for (name, xml, version) in [
