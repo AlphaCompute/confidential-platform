@@ -48,7 +48,9 @@ spec:
         - {name: alpha, mountPath: /run/alpha}
       - name: vllm
         image: ${MODEL_IMAGE}
-        command: [vllm, serve, /weights, --served-model-name, "${MODEL_ID}", --host, 127.0.0.1, --port, "8000"]
+        # The agent policy keeps container output from the host, and Kata 4.0.0 then stops reading
+        # it: a vLLM log line blocks the API server's event loop once the 64 KiB pipe is full.
+        command: [sh, -c, 'exec vllm serve /weights --served-model-name "$0" --host 127.0.0.1 --port 8000 >/dev/null 2>&1', "${MODEL_ID}"]
         env:
         - {name: HF_HUB_OFFLINE, value: "1"}
         - {name: DO_NOT_TRACK, value: "1"}
