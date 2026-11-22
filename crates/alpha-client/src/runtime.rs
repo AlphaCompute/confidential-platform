@@ -274,7 +274,7 @@ where
         if last_good.elapsed() >= GIVE_UP_AFTER {
             return Error::Connect(format!("refresh kept failing: {failure}"));
         }
-        eprintln!("refresh failed, retrying: {failure}");
+        crate::warn!("refresh_failed");
         delay = RETRY_AFTER;
     }
 }
